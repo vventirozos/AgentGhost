@@ -2976,9 +2976,13 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
     ]
     try:
         from ..utils.aio import wait_for as _fc_wait_for
+        from ..core.llm import BEFORE_MAIN_DISPATCH_S as _fc_hook_s   # §4SC-c: the side hook's save
         final_res = await _fc_wait_for(llm_client.chat_completion(
             {"model": model_name, "messages": messages, "temperature": 0.1},
-            timeout=_FACTCHECK_VERIFY_S, total_budget=_FACTCHECK_VERIFY_S), _FACTCHECK_VERIFY_S + 5.0)
+            timeout=_FACTCHECK_VERIFY_S, total_budget=_FACTCHECK_VERIFY_S,
+            # §4SC-b: stays on the main model, but it does not open with the
+            # head — a side call: the conversation goes to disk first
+            side_main=True, task_label="fact-check-verify"), _FACTCHECK_VERIFY_S + _fc_hook_s)
         # `or ""`: some OpenAI-compatible servers send content: null — .get's
         # default doesn't cover an EXISTING null key (same coercion bug class
         # fixed in vision.py), which rendered "FACT CHECK COMPLETE:\nNone".

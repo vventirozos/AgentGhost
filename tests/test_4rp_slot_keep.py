@@ -138,11 +138,19 @@ def test_a_call_without_the_head_leaves_the_owner():
     slot_session_context.set("sess-a")
     L.note_main_slot_prompt(c, _head("q"), "stream")
     t_a = c._slot_session_used
+    from ghost_agent.utils.logging import requester_role_context
     for key, p in (("", {"messages": [{"role": "user", "content": "e4"}]}),
                    ("member:U2", _head("hi", system="Member Ghost.")),
                    ("sess-c", _head("look", tools=None))):
         slot_session_context.set(key)
-        L.note_main_slot_prompt(c, p, "vision", background=False)
+        # §4SA: a member's turn is told by the ROLE (its prompt may share the
+        # owner's tool block, as this toy one does — the owner on Slack's does too)
+        _tok = requester_role_context.set("member") if key.startswith("member:") else None
+        try:
+            L.note_main_slot_prompt(c, p, "vision", background=False)
+        finally:
+            if _tok is not None:
+                requester_role_context.reset(_tok)
         assert c._slot_session == "sess-a" and c._slot_session_used == t_a, key
     slot_session_context.set("sess-a")
     L.note_main_slot_prompt(c, _head("cont", tools=None), "continuation", background=False)

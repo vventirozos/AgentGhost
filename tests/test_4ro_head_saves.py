@@ -417,6 +417,7 @@ def warm(mock_context, monkeypatch, tmp_path):
     llm._main_streams_open = 0
     llm._head_displaced = False
     llm._head_displaced_early = False
+    llm._slot_moved_on = False          # §4SA: whose state the slot holds
     mock_context.llm_client = llm
     st = {"fresh": False, "restores": [], "saves": [], "lines": [], "order": [],
           "slot": 28213, "park_ok": True}
@@ -1619,7 +1620,7 @@ async def test_after_a_members_turn_the_owners_call_gets_the_head_back_with_no_o
     await _warm_with_file(agent, st, quiet=True)
     st["order"].clear()
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-a")
-    llm._head_displaced = True
+    llm._head_displaced = llm._slot_moved_on = True
     await agent._slot_switch_before(_turn(st))
     assert st["order"] == ["restore"]
 

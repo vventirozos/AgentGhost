@@ -516,8 +516,11 @@ async def _call_watching_stop(llm, payload, cancelled):
     """The round's model call, cancelled the moment the Stop flag flips
     (review C: a cooperative Stop used to wait for the whole 300 s round).
     Returns None when cancelled."""
+    # §4SC: side_main — the conversation in the slot is saved before this
+    # call and restored by the request's next head call (req 72c2f05d: the
+    # continuation destroyed a 51k-token state; the next turn re-prefilled 41k)
     task = asyncio.ensure_future(llm.chat_completion(payload, timeout=CONTINUATION_TIMEOUT_S,
-                                                     task_label="write-continuation"))
+                                                     task_label="write-continuation", side_main=True))
     try:
         while True:
             done_set, _ = await asyncio.wait({task}, timeout=1.0)

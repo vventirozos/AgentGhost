@@ -131,7 +131,8 @@ class CL {
 }
 class El {
   constructor() { this.children = []; this.dataset = {}; this.classList = new CL(); this.parentNode = null;
-                  this.textContent = ''; this.style = {}; this.disabled = false; }
+                  this.textContent = ''; this.style = {}; this.disabled = false; this.attrs = {}; }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
   set className(v) { this.classList = new CL(); String(v).split(/\s+/).filter(Boolean).forEach(c => this.classList.add(c)); }
   set innerHTML(v) { this.textContent = v; this.children.slice().forEach(c => c.remove()); }
   appendChild(c) { if (c.parentNode) c.parentNode._rm(c); this.children.push(c); c.parentNode = this; return c; }
@@ -160,6 +161,7 @@ const sessionStorage = { getItem: (k) => (k in sstore ? sstore[k] : null), setIt
                          removeItem: (k) => { delete sstore[k]; } };
 const interruptBtn = new El(); interruptBtn.classList.add('hidden');
 const restoreTray = new El(); restoreTray.classList.add('hidden');
+const restoreStatus = new El();          // §4SB: the tray's one-line live status
 // the hand-back tray of the session on screen (r6a7): what the owner can Insert
 const tray = () => restoreTray.children.filter(r => r.classList.contains('restore-item')).map(r => r.children[0].textContent);
 const resyncs = [];
@@ -211,7 +213,7 @@ def _state_block() -> str:
     consts = [re.search(rf"^const {n} = [^\n]*", APP, re.M)
               for n in ("INBOX_TIMEOUT_MS", "STOP_SETTLE_TIMEOUT_MS", "LEFTOVER_TTL_MS", "_OWED_KEY", "_CANCEL_NOTE_RE",
                         "RESTORE_TTL_MS", "_RESTORE_ITEM_PREFIX", "_RESTORE_KEY", "_RESTORE_UNSAVED_KEY",
-                        "_RESTORE_CONFIRMED_KEY")]
+                        "_RESTORE_CONFIRMED_KEY", "_STOP_WORD_RE", "_HOLD_WORD_RE", "_TYPED_KEY")]
     assert all(consts), "a §4RZ client constant is missing"
     return m.group(1) + "".join(c.group(0) + "\n" for c in consts)
 
@@ -224,7 +226,12 @@ _FUNCS = ["_msgKey", "_lcsPairs", "_reconcileWithLocal", "_adoptionChanges", "to
           "_markOwed", "_clearOwed", "_isCleanReply", "_reattachLabelKeys", "_fetchLeftovers", "_queueOwedLeftovers",
           "_collectOwedLeftovers", "_resyncFromSession", "_requestSessionResync", "_holdForAfterTurn",
           "_sendWhileBusy", "_settleQueuedTurn", "_settleQueuedTurnNow", "_drainSendAfterTurn",
-          "interruptRunningTool"]
+          "interruptRunningTool",
+          # §4SB
+          "_foldText", "_holdWordIn", "_isHoldWord", "_holdNote", "_typedList", "_saveTyped", "_rememberTyped",
+          "_forgetTyped", "_navigationType", "_recoverTypedAfterReload", "_shortText", "_trayStatus",
+          "_turnHoldWord", "_unholdTurn", "_leftoverSeqs",   # §4SB r3
+          "_rememberHeld", "_forgetHeld"]                   # §4SB r5
 
 S = "/api/sessions/web-s1"
 L = "/api/turn/inbox/leftovers"
@@ -343,12 +350,13 @@ def test_after_the_turn_history_is_the_agents_session_copy_and_leftovers_go_to_t
                    "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
     out = eval_js(src, "{out: " + _OUT + ", log: " + _log_view() + ", renders}")
     o = out["out"]
-    assert o["hist"] == ["u1", "A", "a"] and o["sent"] == [] and o["composer"] == "B"
+    # §4SB r2 (operator): after a CLEAN reply the leftover is re-sent, not trayed
+    assert o["hist"] == ["u1", "A", "a"] and o["sent"] == ["B"] and o["composer"] == ""
     assert o["calls"] == ["/api/turn/inbox", "/api/turn/inbox", L, S]   # leftovers, then the session copy
     assert out["renders"] == 1
     assert [c["text"] for c in out["log"] if c["cls"] != "message system"] == ["u1", "A", "a"]
     assert not any("queued" in c["cls"] for c in out["log"])
-    assert any("Not read by the agent" in n for n in o["notes"])
+    assert not any("Not read by the agent" in n for n in o["notes"])
 
 
 def test_a_late_inject_answer_after_the_settle_is_never_history_nor_composer():
@@ -605,7 +613,7 @@ def test_an_empty_leftovers_answer_keeps_the_debt_while_the_old_turn_may_run():
                    "chatHistory.push({role:'assistant', content:'a2'});\n"
                    "endTurn(); await _settleQueuedTurn(2, null, 'done');\n")
     out = eval_js(src, "{mid, owed: Object.keys(_owedMap()), tray: tray(), sent}")
-    assert out == {"mid": ["web-s1"], "owed": [], "tray": ["B", "B"], "sent": []}
+    assert out == {"mid": ["web-s1"], "owed": [], "tray": ["B"], "sent": ["B"]}   # §4SB r2: the clean turn re-sends its leftover
 
 
 def test_a_later_clean_turn_settles_the_debt_even_when_empty():
@@ -742,10 +750,11 @@ def test_another_clients_identical_leftover_is_shown_too():
     """r6a7 (probe p2): no counters — every server text is shown."""
     src = _harness(_INJECT + "await send('yes');\n"
                    f"routes['{L}'] = [200, {{ messages: ['yes'] }}];\n"
-                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'ended');\n"
                    "const first = tray(); _trayRemove(first.length ? _restoreMap()['web-s1'][0].id : '');\n"
                    "_restoreToComposer(['yes'], 'Not read by the agent in an earlier turn.', 'web-s1');\n")
-    assert eval_js(src, "{first, tray: tray()}") == {"first": ["yes"], "tray": ["yes"]}
+    # the server leftover AND the unclean end's own hand-back of "yes": both shown, one removed, one added back
+    assert eval_js(src, "{first, tray: tray()}") == {"first": ["yes", "yes"], "tray": ["yes", "yes"]}
 
 
 def test_two_tabs_never_overwrite_each_others_tray():
@@ -925,7 +934,9 @@ def test_notes_wait_for_a_bound_session_and_the_tray_is_announced():
                    "const before = notes.length; window.__ghostSessionId = 'web-s1'; _renderTray();\n")
     out = eval_js(src, "{before, after: notes.length, tray: tray()}")
     assert out == {"before": 0, "after": 1, "tray": ["A"]}
-    assert '<div id="restore-tray" class="hidden" role="region" aria-live="polite"' in INDEX
+    # §4SB: the tray itself is silent; #restore-status carries the announcement
+    assert '<div id="restore-tray" class="hidden" role="region" aria-live="off"' in INDEX
+    assert '<div id="restore-status" role="status" aria-live="polite"></div>' in INDEX
 
 
 # ── r6a9: random ids, removals stick under quota, duplicated tabs ──────────
@@ -1176,3 +1187,993 @@ def test_two_tabs_never_trade_writes_over_a_stuck_migration():
     out = eval_js(src, "{same: keysAfterFirst === Object.keys(store).sort().join(), succeeded: writes}")
     # retries of BIG still attempt (and fail) its own key; nothing new ever lands in localStorage
     assert out["same"] is True
+
+
+# ── §4SB: stop/hold words never auto-sent; the inject debt survives a reload; a11y ──
+
+@pytest.mark.parametrize("text", ["stop", "Stop!", "wait, no", "σταμάτησε"])
+def test_a_stop_or_hold_word_the_agent_queued_goes_to_the_tray_never_sent(text):
+    """§4SB MAJOR 1: the agent answered `queue` (the owner's turn still waits
+    behind the lock) — holding a stop/hold word would auto-send it as a NEW
+    request the model has to answer. The CLI (bin/ghost `_is_hold_word`)
+    already refuses; the web now does too."""
+    src = _harness(_QUEUE + f"await send({json.dumps(text)});\n"
+                   "const heldN = _sendAfterTurn.length;\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{heldN, out: " + _OUT + ", log: " + _log_view() + "}")
+    assert out["heldN"] == 0 and out["out"]["sent"] == []
+    assert out["out"]["composer"] == text
+    assert any(" word — never sent on its own." in n and n.startswith("'") for n in out["out"]["notes"])
+    assert not any("queued" in c["cls"] for c in out["log"])          # no "sends after this turn" bubble
+
+
+def test_a_stop_word_with_no_session_id_is_not_held_either():
+    src = _harness("window.__ghostSessionId = null; _turnInfo.get(1).sid = null;\n"
+                   "await send('stop');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and out["calls"] == [] and out["composer"] == "stop"
+
+
+def test_a_non_hold_text_the_agent_queued_is_still_held_and_sent():
+    src = _harness(_QUEUE + "await send('and the weather tomorrow');\n"
+                   "const heldN = _sendAfterTurn.length;\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{heldN, out: " + _OUT + "}")
+    assert out["heldN"] == 1 and out["out"]["sent"] == ["and the weather tomorrow"] and out["out"]["composer"] == ""
+
+
+def test_the_web_hold_words_are_the_agents_own():
+    """The two regexes are copies of core/queued_messages._STOP_RE and
+    tools/memory._DENY_RE (as in bin/ghost): the alternations must match."""
+    import re as _re
+    # (pin-quality ratchet: the Python side is read from the COMPILED patterns,
+    #  not from the source text — a behavioural parity check)
+    from ghost_agent.core import queued_messages as _qm
+    from ghost_agent.tools import memory as _mem
+    stop_py = _re.search(r"\(\?:([^)]*)\)", _qm._STOP_RE.pattern).group(1)
+    deny_py = _re.search(r"\(\?:([^)]*)\)", _mem._DENY_RE.pattern).group(1)
+    stop_js = _re.search(r"^const _STOP_WORD_RE = /\^\(\?:([^)]*)\)", APP, _re.M).group(1)
+    hold_js = _re.search(r"^const _HOLD_WORD_RE = /\(\?<!\[\\p\{L\}\\p\{N\}_\]\)\(\?:([^)]*)\)", APP, _re.M).group(1)
+    assert stop_js == stop_py
+    assert set(hold_js.split("|")) == set(deny_py.split("|"))
+    out = eval_js(_harness(""), "['stop', 'Stop!', 'wait, no', 'σταμάτησε', 'Όχι', 'nope.', 'hold  on', 'nothing', 'stopwatch', 'and the weather', 'nonstop'].map(_isHoldWord)")
+    assert out == [True, True, True, True, True, True, True, False, False, False, False]
+
+
+def _reload(first_body: str, second_body: str, expr: str):
+    """Run the page twice: the second run is a FRESH script (new _PAGE_LOAD,
+    empty _turnInfo) seeded with the first run's localStorage + sessionStorage."""
+    kept = eval_js(_harness(first_body), "{store, sstore}")
+    seed = (f"Object.assign(store, {json.dumps(kept['store'])}); Object.assign(sstore, {json.dumps(kept['sstore'])});\n"
+            "_leftoversOwed = null; _restoreUnsaved = null;\n")
+    return eval_js(_harness(seed + second_body), expr)
+
+
+def test_an_inject_is_owed_the_moment_the_agent_accepts_it():
+    """§4SB MAJOR 2: before, the debt was marked only at the settle."""
+    src = _harness(_INJECT + "await send('A');\n")
+    out = eval_js(src, "{owed: Object.keys(_owedMap()), typed: JSON.parse(sstore['ghost.queued.typed']).map(x => [x.sid, x.text])}")
+    assert out == {"owed": ["web-s1"], "typed": [["web-s1", "A"]]}
+
+
+def test_a_reload_mid_turn_fetches_the_leftover_and_shows_the_typed_text():
+    """§4SB MAJOR 2: the page reloads while the turn still runs (nothing settled);
+    the fresh page owes the leftover (fetched when the turn's end is known) and
+    the tray already shows what was typed, as 'may or may not have read'."""
+    out = _reload(_INJECT + "await send('A');\n",
+                  f"routes['{L}'] = [200, {{ messages: ['A'] }}];\n"
+                  "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{calls: calls.map(c => c.url), tray: tray(), owed: Object.keys(_owedMap()), notes,"
+                  " typed: sstore['ghost.queued.typed'] || null}")
+    assert L in out["calls"]
+    assert sorted(out["tray"]) == ["A", "A"]                # the orphan AND the agent's leftover (a duplicate is fine)
+    assert out["owed"] == [] and out["typed"] is None     # paid; the orphan is handed back once
+    assert any("The page reloaded during the turn" in n for n in out["notes"])
+
+
+def test_a_reload_while_the_turn_still_runs_keeps_the_debt():
+    out = _reload(_INJECT + "await send('A');\n",
+                  "_onSessionShown(); await _settleChain; await tick();\n"       # leftovers: [] (still running)
+                  "const mid = {owed: Object.keys(_owedMap()), tray: tray()};\n"
+                  "_onSessionShown(); await _settleChain; await tick();\n",       # shown again: no second hand-back
+                  "{mid, tray: tray(), owed: Object.keys(_owedMap())}")
+    assert out["mid"] == {"owed": ["web-s1"], "tray": ["A"]}
+    assert out["tray"] == ["A"] and out["owed"] == ["web-s1"]
+
+
+def test_a_settled_turn_leaves_no_orphan_for_a_later_reload():
+    """A clean end clears the debt it marked and forgets the typed list; a
+    reload afterwards hands nothing back and fetches nothing."""
+    out = _reload(_INJECT + "await send('A');\n"
+                  f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'A'}},{{role:'assistant',content:'a'}}] }}];\n"
+                  "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                  "const after = {owed: Object.keys(_owedMap()), typed: sstore['ghost.queued.typed'] || null, tray: tray()};\n"
+                  "store['after'] = JSON.stringify(after);\n",
+                  "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{after: JSON.parse(store['after']), calls: calls.map(c => c.url), tray: tray()}")
+    assert out["after"] == {"owed": [], "typed": None, "tray": []}
+    assert L not in out["calls"] and out["tray"] == []
+
+
+def test_a_mark_made_after_this_turns_inject_still_needs_a_later_clean_turn():
+    """The §4SB inject mark must not make a clean end swallow a debt another
+    tab marked after it (the r6a5 rule stays)."""
+    src = _harness(_INJECT + "await send('A');\n"
+                   "_markOwed('web-s1'); _owedMap()['web-s1'] += 1000;\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    assert eval_js(src, "Object.keys(_owedMap())") == ["web-s1"]
+
+
+def test_a_lost_turn_forgets_its_typed_list_once_handed_back():
+    src = _harness(_INJECT + "await send('A');\n"
+                   "endTurn(); nextTurn(); await tick();\n")
+    out = eval_js(src, "{tray: tray(), typed: sstore['ghost.queued.typed'] || null}")
+    assert out == {"tray": ["A"], "typed": None}
+
+
+def test_the_page_works_without_session_storage():
+    src = _harness("sessionStorage.getItem = () => { throw new Error('denied'); };\n"
+                   "sessionStorage.setItem = () => { throw new Error('denied'); };\n"
+                   + _INJECT + "await send('A');\n"
+                   "_onSessionShown(); await _settleChain;\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'ended');\n")
+    assert eval_js(src, "tray()") == ["A"]
+
+
+def test_tray_buttons_name_their_text_and_the_status_line_speaks_once_per_change():
+    """§4SB MINOR 3: Insert/Dismiss carry the item's text; the tray is not a
+    live region — one short status line changes when the count does, and a
+    `storage` re-render that changes nothing says nothing."""
+    long = "x" * 80
+    src = _harness(f"_restoreToComposer(['A', {json.dumps(long)}], 'why');\n"
+                   "const s1 = restoreStatus.textContent;\n"
+                   "_renderTray(); _renderTray(); const s2 = restoreStatus.textContent; let changes = 0;\n"
+                   "const rows = restoreTray.children.filter(r => r.classList.contains('restore-item'));\n"
+                   "const labels = rows.map(r => [r.children[1].attrs['aria-label'], r.children[2].attrs['aria-label']]);\n"
+                   "_trayRemove(_restoreMap()['web-s1'][0].id); const s3 = restoreStatus.textContent;\n"
+                   "_trayRemove(_restoreMap()['web-s1'][0].id); const s4 = restoreStatus.textContent;\n")
+    out = eval_js(src, "{s1, s2, s3, s4, labels}")
+    assert out["s1"] == "why 2 messages in the tray above the composer." and out["s2"] == out["s1"]   # r2: the why first
+    assert out["s3"] == "One message in the tray above the composer."
+    assert out["s4"] == "The tray is empty."
+    assert out["labels"][0] == ["Insert: A", "Dismiss: A"]
+    assert out["labels"][1][0] == "Insert: " + "x" * 57 + "…" and len(out["labels"][1][0]) <= 70
+    assert "aria-live" not in extract_js_function(APP, "_renderTray")
+
+
+def test_an_empty_tray_at_load_says_nothing():
+    out = eval_js(_harness("_renderTray(); _renderTray();\n"), "restoreStatus.textContent")
+    assert out == ""
+
+
+def _lum(rgb):
+    def ch(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = rgb
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+
+def _over(fg, a, bg):
+    return tuple(a * f + (1 - a) * b for f, b in zip(fg, bg))
+
+
+def _contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def test_the_queued_label_reads_at_contrast():
+    """§4SB MINOR 3 (r2: composited): the bubble is rgba(9,13,28,.28) over the
+    black page, the whole bubble at its opacity; the label and the bubble text
+    sit on that. 0.55 × 0.5α was ~2.5:1."""
+    user = re.search(r"^\.message\.user \{(.*?)^\}", CSS, re.S | re.M).group(1)
+    bubble = re.search(r"\.message\.user\.queued \{(.*?)\}", CSS, re.S).group(1)
+    label = re.search(r"\.message\.user \.queued-label \{(.*?)\}", CSS, re.S).group(1)
+    page = (0, 0, 0)
+    assert re.search(r"--bg-color:\s*#000000", CSS)
+    br, bgc, bb, ba = (float(x) for x in re.search(r"background: rgba\((\d+), (\d+), (\d+), ([\d.]+)\)", user).groups())
+    op = float(re.search(r"opacity:\s*([\d.]+)", bubble).group(1))
+    glass = _over((br, bgc, bb), ba, page)                      # the bubble's own background
+    bg = _over(glass, op, page)                                 # ...at the bubble's opacity over the page
+    alpha = float(re.search(r"rgba\(255, 255, 255, ([\d.]+)\)", label).group(1))
+    label_rgb = _over(_over((255, 255, 255), alpha, glass), op, page)
+    text_hex = re.search(r"color:\s*#([0-9a-f]{6})", bubble).group(1)
+    text_rgb = _over(tuple(int(text_hex[i:i + 2], 16) for i in (0, 2, 4)), op, page)
+    assert _contrast(label_rgb, bg) >= 4.5
+    assert _contrast(text_rgb, bg) >= 4.5
+    assert float(re.search(r"font-size:\s*([\d.]+)rem", label).group(1)) >= 0.7
+    assert "#restore-status {" in CSS
+
+
+def test_the_inject_bubble_says_read_at_the_next_step_until_the_clean_end_adopts_the_copy():
+    """§4SB item 4 (behavioural): the label stays while the turn runs; a clean
+    end drops the bubble for the session copy and trays nothing of it."""
+    src = _harness(_INJECT + "await send('A'); const during = " + _log_view() + ";\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'A'}},{{role:'assistant',content:'a'}}] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{during, after: " + _log_view() + ", tray: tray(), sent}")
+    assert [c["label"] for c in out["during"] if "queued" in c["cls"]] == ["queued — read at the next step"]
+    assert not any("queued" in c["cls"] for c in out["after"])
+    assert out["tray"] == [] and out["sent"] == []
+
+
+# ── §4SB r2 ───────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("text", ["no sugar", "stop the backup job", "cancel that", "ok no problem"])
+def test_an_instruction_containing_a_hold_word_is_held_and_sent(text):
+    """§4SB r2 MAJOR 1: the whole _DENY_RE on any message trayed "no sugar"."""
+    src = _harness(_QUEUE + f"await send({json.dumps(text)});\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [text] and out["composer"] == ""
+
+
+@pytest.mark.parametrize("text,word,kind", [("wait, no", "wait", "hold"), ("no.", "no", "hold"), ("stop", "stop", "stop"),
+                                            ("hold on", "hold on", "hold"), ("Stop!", "stop", "stop")])
+def test_a_bare_hold_or_stop_is_trayed_with_the_word_named(text, word, kind):
+    src = _harness(_QUEUE + f"await send({json.dumps(text)});\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and out["composer"] == text
+    assert any(n.startswith(f"'{word}' is a {kind} word — never sent on its own.") for n in out["notes"])
+
+
+def test_the_hold_rule_is_nothing_but_hold_words():
+    """r3: no word cap ("no, no, no, no" is a hold, not a request); the named
+    word is single-spaced like the CLI's."""
+    out = eval_js(_harness(""), "['no', 'no no no', 'no, no, no, no', 'wait... no!', 'no thanks', 'μη', 'όχι όχι', 'wait for me', 'hold   on']"
+                  ".map(_holdWordIn)")
+    assert out == ["no", "no", "no", "wait", None, "μη", "οχι", None, "hold on"]
+
+
+def test_an_inject_answered_during_the_settles_fetch_is_trayed_and_keeps_the_debt():
+    """§4SB r2 MAJOR 2: with the turn ended and the settle awaiting leftovers,
+    a late inject used to re-mark the debt the settle then cleared and push
+    to `typed`, which the clean settle wiped: the text was lost."""
+    src = _harness(_INJECT + "await send('A');\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'A'}},{{role:'assistant',content:'a'}}] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   f"hold('{L}'); endTurn(); const settle = _settleQueuedTurn(1, null, 'done'); await tick();\n"
+                   "await send('B'); const typed = [..._turnInfo.get(1).typed];\n"      # lands while the fetch is pending
+                   f"await release('{L}'); await settle; await tick();\n")
+    out = eval_js(src, "{typed, tray: tray(), owed: Object.keys(_owedMap()), sent, stored: sstore['ghost.queued.typed'] || null,"
+                  " hist: chatHistory.map(m => m.content)}")
+    assert out["typed"] == ["A"]                       # the late inject is not this settle's
+    assert out["tray"] == ["B"] and out["owed"] == ["web-s1"] and out["sent"] == []
+    assert out["hist"] == ["u1", "A", "a"]
+
+
+def test_the_status_line_says_why_not_only_how_many():
+    """§4SB r2 MINOR 3: the reason lived only in #chat-log (not live)."""
+    src = _harness("_restoreToComposer(['A'], 'Stopped: not read by the agent.'); const s1 = restoreStatus.textContent;\n"
+                   "_restoreToComposer(['B'], 'The agent may or may not have read these.'); const s2 = restoreStatus.textContent;\n"
+                   "_renderTray(); const s3 = restoreStatus.textContent;\n"
+                   "localStorage.setItem = () => { throw new Error('quota'); };\n"
+                   "_restoreToComposer(['C'], 'why'); const s4 = restoreStatus.textContent;\n")
+    out = eval_js(src, "{s1, s2, s3, s4}")
+    assert out["s1"] == "Stopped: not read by the agent. One message in the tray above the composer."
+    assert out["s2"] == "The agent may or may not have read these. 2 messages in the tray above the composer."
+    assert out["s3"] == out["s2"]                       # a re-render that changes nothing says nothing
+    assert out["s4"].startswith("Browser storage is full") and out["s4"].endswith("3 messages in the tray above the composer.")
+
+
+def test_a_duplicated_tab_recovers_nothing_but_a_reload_or_reopened_tab_does():
+    """§4SB r2 MINOR 4: 'Duplicate tab' copies sessionStorage with a new page
+    load; the original tab still owns those injects."""
+    for nav, expect in (("navigate", []), ("reload", ["A"]), ("back_forward", ["A"]), (None, ["A"])):
+        perf = ("globalThis.performance = { getEntriesByType: () => [] };\n" if nav is None
+                else f"globalThis.performance = {{ getEntriesByType: (k) => k === 'navigation' ? [{{ type: '{nav}' }}] : [] }};\n")
+        out = _reload(_INJECT + "await send('A');\n",
+                      perf + "_onSessionShown(); await _settleChain; await tick();\n",
+                      "{tray: tray(), kept: JSON.parse(sstore['ghost.queued.typed'] || '[]').map(x => x.text)}")
+        assert out["tray"] == expect, nav
+        assert out["kept"] == [], nav       # r3: a duplicate drops them too (else trayed at ITS next reload)
+
+
+@pytest.mark.parametrize("age", ["l[0].at -= LEFTOVER_TTL_MS + 1;", "delete l[0].at;"])
+def test_an_orphan_older_than_the_leftover_ttl_is_still_trayed(age):
+    """§4SB r4 MAJOR 3 (was pinned the other way in r3): past the agent's
+    leftover TTL the orphan is the ONLY copy left — the reason for the tray,
+    not a reason to skip it; an entry without `at` (older storage) too."""
+    out = _reload(_INJECT + "await send('A');\n",
+                  f"const l = JSON.parse(sstore['ghost.queued.typed']); {age}\n"
+                  "sstore['ghost.queued.typed'] = JSON.stringify(l);\n"
+                  "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{tray: tray(), kept: sstore['ghost.queued.typed'] || null}")
+    assert out == {"tray": ["A"], "kept": None}
+
+
+def test_after_a_hold_word_nothing_typed_later_in_the_turn_is_sent():
+    """§4SB r2 MINOR 5 (the CLI's _hold r6): "wait" then "and delete the rest"."""
+    src = _harness(_QUEUE + "await send('wait'); await send('and delete the rest');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and out["composer"].split("\n") == ["wait", "and delete the rest"]
+    assert any(n.startswith("Typed after 'wait' in the same turn") for n in out["notes"])
+
+
+def test_a_hold_word_the_turn_accepted_also_holds_what_follows():
+    src = _harness(_INJECT + "await send('wait');\n" + _QUEUE + "await send('and delete the rest');\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'wait'}},{{role:'assistant',content:'a'}}] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and out["composer"] == "and delete the rest"
+
+
+# ── §4SB r2 (operator): a clean reply re-sends the agent's leftovers ──────
+
+def test_after_a_clean_reply_the_leftovers_are_sent_in_order_not_trayed():
+    src = _harness(_INJECT + "await send('A'); await send('B'); await send('C');\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'A'}},{{role:'assistant',content:'a'}}] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['B', 'C'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "const first = [...sent];\n"
+                   "nextTurn(); endTurn(); await _settleQueuedTurn(2, null, 'done');\n")     # B's own turn ends: C goes
+    out = eval_js(src, "{first, out: " + _OUT + ", left: _sendAfterTurn.length}")
+    assert out["first"] == ["B"] and out["out"]["sent"] == ["B", "C"] and out["left"] == 0
+    assert out["out"]["composer"] == ""
+    assert not any("Not read by the agent" in n for n in out["out"]["notes"])
+
+
+def test_leftovers_go_before_a_message_held_later_in_the_same_turn():
+    src = _harness(_INJECT + "await send('A');\n" + _QUEUE + "await send('H');\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['A'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{sent, next: _sendAfterTurn.map(q => q.text)}")
+    assert out == {"sent": ["A"], "next": ["H"]}
+
+
+@pytest.mark.parametrize("mode", ["stopped", "ended", "unknown"])
+def test_after_a_stop_or_failed_turn_the_leftovers_stay_in_the_tray(mode):
+    src = _harness(_INJECT + "await send('A');\n"
+                   f"routes['{L}'] = [200, {{ messages: ['A'] }}];\n"
+                   f"endTurn(); await _settleQueuedTurn(1, {'Promise.resolve([])' if mode == 'stopped' else 'null'}, '{mode}');\n"
+                   "nextTurn(); endTurn(); await _settleQueuedTurn(2, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and "A" in out["composer"].split("\n")
+
+
+def test_a_leftover_that_is_a_bare_stop_or_hold_word_holds_the_whole_turn():
+    """r3 (CLI r8): a hold anywhere → nothing of the turn is sent, before or after."""
+    src = _harness(_INJECT + "await send('A'); await send('wait'); await send('B');\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['A', 'wait', 'B'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{out: " + _OUT + ", next: _sendAfterTurn.map(q => q.text)}")
+    assert out["out"]["sent"] == [] and out["next"] == []
+    assert out["out"]["composer"].split("\n") == ["A", "wait", "B"]
+    assert any(n.startswith("'wait' was typed during the turn, so nothing of it is sent on its own.") for n in out["out"]["notes"])
+
+
+def test_a_hold_word_the_turn_read_holds_the_unread_leftover_too():
+    """r3 MAJOR 1: inject "wait" (read), inject "and delete the rest" (left
+    over) → clean reply: the leftover used to be auto-sent."""
+    src = _harness(_INJECT + "await send('wait'); await send('and delete the rest');\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'wait'}},{{role:'assistant',content:'a'}}] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['and delete the rest'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and out["composer"] == "and delete the rest"
+    assert any("'wait' was typed during the turn" in n for n in out["notes"])
+
+
+def test_a_hold_word_also_takes_back_what_was_held_before_it():
+    """r3 (CLI r8): queue "X" then queue "wait" → X is not sent either."""
+    src = _harness(_QUEUE + "await send('also do X'); const heldBefore = _sendAfterTurn.length; await send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{heldBefore, out: " + _OUT + "}")
+    assert out["heldBefore"] == 1 and out["out"]["sent"] == []
+    assert out["out"]["composer"].split("\n") == ["also do X", "wait"]      # r4 MINOR 4: typing order, not reversed
+    assert any(n.startswith("Typed before 'wait' and still waiting") for n in out["out"]["notes"])
+
+
+def test_a_held_message_and_a_leftover_are_sent_in_typing_order():
+    """r3 MAJOR 2: "also do X" (queued) typed BEFORE "and Y" (unread inject)
+    used to go out after it."""
+    src = _harness(_QUEUE + "await send('also do X');\n" + _INJECT + "await send('and Y');\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['and Y'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "const first = [...sent];\n"
+                   "nextTurn(); endTurn(); await _settleQueuedTurn(2, null, 'done');\n")
+    out = eval_js(src, "{first, sent, left: _sendAfterTurn.length}")
+    assert out == {"first": ["also do X"], "sent": ["also do X", "and Y"], "left": 0}
+
+
+def test_a_text_typed_twice_keeps_each_occurrences_slot_and_a_foreign_leftover_goes_first():
+    src = _harness(_INJECT + "await send('yes');\n" + _QUEUE + "await send('H');\n" + _INJECT + "await send('yes');\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['yes', 'yes', 'OTHER'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{sent, next: _sendAfterTurn.map(q => q.text)}")
+    assert out == {"sent": ["OTHER"], "next": ["yes", "H", "yes"]}
+
+
+# ── §4SB r4: the re-send chain is stoppable ────────────────────────────────
+
+_CHAIN = (_INJECT + "await send('A'); await send('B'); await send('C');\n"
+          f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+          f"routes['{L}'] = [200, {{ messages: ['A', 'B', 'C'] }}];\n"
+          "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+          "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+          "const first = [...sent];\n"
+          f"nextTurn(); routes['{L}'] = [200, {{ messages: [] }}];\n")
+_CHAIN_OUT = "{first, sent, tray: tray(), left: _sendAfterTurn.map(q => q.text), notes}"
+
+
+@pytest.mark.parametrize("mode", ["stopped", "ended", "unknown"])
+def test_a_stop_during_the_re_send_chain_stops_the_chain(mode):
+    """r4 MAJOR 1: A sent as turn 2, Stop → the drain found gen 1's B (its
+    turn DID end with a reply) and sent it, under a 'Stopped, so nothing more
+    was sent' note."""
+    src = _harness(_CHAIN + f"endTurn(); await _settleQueuedTurn(2, {'Promise.resolve([])' if mode == 'stopped' else 'null'}, '{mode}');\n")
+    out = eval_js(src, _CHAIN_OUT)
+    assert out["first"] == ["A"] and out["sent"] == ["A"] and out["left"] == []
+    assert out["tray"] == ["B", "C"]
+    note = "Stopped, so nothing more was sent." if mode == "stopped" else "The turn did not end with a reply, so nothing more was sent."
+    assert any(n.startswith(note) for n in out["notes"])
+
+
+def test_a_slow_stop_of_a_chain_turn_leaves_the_next_turns_held_message_alone():
+    """r4: the pull-back reaches EARLIER generations (the chain), never a
+    later one — D, held in turn 3 while turn 2's stop settles, is sent."""
+    src = _harness(_CHAIN + "let undo; const und = new Promise(r => { undo = r; });\n"
+                   "endTurn(); const s = _settleQueuedTurn(2, und, 'stopped');\n"
+                   "nextTurn();\n" + _QUEUE + "await send('D');\n"
+                   "undo([]); await s;\n"
+                   "const mid = { held: _sendAfterTurn.map(i => i.text), tray: tray() };\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done');\n")
+    out = eval_js(src, "{mid, sent}")
+    assert out == {"mid": {"held": ["D"], "tray": ["B", "C"]}, "sent": ["A", "D"]}
+
+
+def test_a_hold_word_queued_during_the_chain_holds_the_rest_of_it():
+    """r4 MAJOR 2: "wait" typed while A (turn 2) runs, agent answered queue →
+    B and C must not out-run it; everything back in typing order."""
+    src = _harness(_CHAIN + _QUEUE + "await send('wait');\n"
+                   "const trayAfterWait = tray();\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n")
+    out = eval_js(src, "{trayAfterWait, out: " + _CHAIN_OUT + "}")
+    assert out["trayAfterWait"] == ["B", "C", "wait"]
+    assert out["out"]["sent"] == ["A"] and out["out"]["left"] == [] and out["out"]["tray"] == ["B", "C", "wait"]
+    assert any(n.startswith("Typed before 'wait' and still waiting") for n in out["out"]["notes"])
+
+
+def test_a_hold_word_read_during_the_chain_holds_the_rest_of_it():
+    """r4 MAJOR 2 (inject variant): the turn READ the "wait"; its clean end
+    pulls the conversation's waiting chain back."""
+    src = _harness(_CHAIN + _INJECT + "await send('wait');\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'A'}},{{role:'user',content:'wait'}},{{role:'assistant',content:'a2'}}] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a2' });\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n")
+    out = eval_js(src, _CHAIN_OUT)
+    assert out["sent"] == ["A"] and out["left"] == [] and out["tray"] == ["B", "C"]
+    assert any("'wait' was typed during the turn" in n for n in out["notes"])
+
+
+def test_the_chain_goes_on_when_its_turns_end_cleanly():
+    """Control for the two above: no stop, no hold → B and C follow."""
+    src = _harness(_CHAIN + "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "nextTurn(); endTurn(); await _settleQueuedTurn(3, null, 'done');\n")
+    out = eval_js(src, _CHAIN_OUT)
+    assert out["sent"] == ["A", "B", "C"] and out["left"] == [] and out["tray"] == []
+
+
+# ── §4SB r5 (client review r4) ─────────────────────────────────────────────
+
+_RELOAD_NAV = "globalThis.performance = { getEntriesByType: (k) => k === 'navigation' ? [{ type: 'reload' }] : [] };\n"
+
+
+def test_a_reload_mid_chain_trays_what_was_waiting_to_be_sent():
+    """r5 MAJOR (pre-existing): B and C lived in memory only; the agent had
+    handed its copy out → gone."""
+    out = _reload(_CHAIN, _RELOAD_NAV + "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{tray: tray(), typed: sstore['ghost.queued.typed'] || null, notes}")
+    assert out["tray"] == ["B", "C"] and out["typed"] is None
+    assert any(n.startswith("A reload or a duplicated tab was left with these unsent.") for n in out["notes"])   # r7 wording
+
+
+def test_a_reload_with_a_held_message_trays_it():
+    out = _reload(_QUEUE + "await send('H');\n", _RELOAD_NAV + "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{tray: tray(), typed: sstore['ghost.queued.typed'] || null}")
+    assert out == {"tray": ["H"], "typed": None}
+
+
+def test_a_waiting_item_leaves_storage_once_sent_or_trayed():
+    src = _harness(_CHAIN + "const waiting = JSON.parse(sstore['ghost.queued.typed']).map(x => [x.kind, x.text]);\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "nextTurn(); endTurn(); await _settleQueuedTurn(3, null, 'done');\n")
+    out = eval_js(src, "{waiting, sent, after: sstore['ghost.queued.typed'] || null}")
+    assert out == {"waiting": [["held", "B"], ["held", "C"]], "sent": ["A", "B", "C"], "after": None}
+    src = _harness(_CHAIN + "endTurn(); await _settleQueuedTurn(2, Promise.resolve([]), 'stopped');\n")
+    assert eval_js(src, "{tray: tray(), after: sstore['ghost.queued.typed'] || null}") == {"tray": ["B", "C"], "after": None}
+
+
+def test_a_lost_chain_turn_settled_by_a_new_message_ends_the_chain():
+    """r5 MINOR 2: `_settleLostTurns(true)` pulled only the lost turn's own
+    items; C (gen 1) stayed and went out after the next clean turn."""
+    src = _harness(_CHAIN + "isProcessingRequest = false; currentChatController = null;\n"
+                   "nextTurn();\n"
+                   "const mid = { tray: tray(), left: _sendAfterTurn.map(q => q.text) };\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done');\n")
+    out = eval_js(src, "{mid, sent, tray: tray()}")
+    assert out == {"mid": {"tray": ["B", "C"], "left": []}, "sent": ["A"], "tray": ["B", "C"]}
+
+
+def test_a_late_inject_answer_for_a_hold_word_holds_the_chain_turn_running_now():
+    """r5 MINOR 1: "wait" answered `inject` after its turn settled, while B
+    already runs as turn 3 → turn 3's clean end used to send C."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "nextTurn(); await release('/api/turn/inbox'); await wp;\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a3' });\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done');\n"
+                   "const afterThree = { sent: [...sent], tray: tray() };\n"
+                   "nextTurn(); endTurn(); await _settleQueuedTurn(4, null, 'done');\n")
+    out = eval_js(src, "{afterThree, sent, left: _sendAfterTurn.map(q => q.text)}")
+    assert out["afterThree"] == {"sent": ["A", "B"], "tray": ["wait", "C"]}
+    assert out["sent"] == ["A", "B"] and out["left"] == []
+
+
+def test_a_failed_leftovers_fetch_on_a_chain_turn_trays_the_chain_with_its_own_note():
+    """r5 MINOR 3: the note said 'did not end with a reply' — it did."""
+    src = _harness(_CHAIN + _QUEUE + "await send('D');\n" + _INJECT + "await send('E');\n"
+                   f"routes['{L}'] = [500, {{}}];\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done'); await tick();\n")
+    out = eval_js(src, "{sent, tray: tray(), notes, owed: Object.keys(_owedMap())}")
+    assert out["sent"] == ["A"] and out["tray"] == ["B", "C", "D", "E"] and out["owed"] == ["web-s1"]
+    assert any(n.startswith("The messages the agent did not read could not be fetched, so nothing more was sent.") for n in out["notes"])
+
+
+def test_a_leftover_typed_twice_takes_the_unread_occurrences_slot():
+    """r4 MINOR 5: inject "yes" (read), queue H, inject "yes" (left over) —
+    the leftover used to take the READ occurrence's seq and go before H."""
+    src = _harness(_INJECT + "await send('yes');\n" + _QUEUE + "await send('H');\n" + _INJECT + "await send('yes');\n"
+                   f"routes['{S}'] = [200, {{ messages: [{{role:'user',content:'u1'}},{{role:'user',content:'yes'}},{{role:'assistant',content:'a'}}] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['yes'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, "{sent, next: _sendAfterTurn.map(q => q.text)}")
+    assert out == {"sent": ["H"], "next": ["yes"]}
+
+
+def test_a_re_sent_leftover_still_needs_the_same_conversation():
+    """The re-send rides the held-message path: a /clear in between trays it."""
+    src = _harness(_INJECT + "await send('A');\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: ['A'] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' });\n"
+                   "endTurn(); _convEpoch += 1; await _settleQueuedTurn(1, null, 'done');\n")
+    out = eval_js(src, _OUT)
+    assert out["sent"] == [] and out["composer"] == "A"
+    assert any("The conversation changed" in n for n in out["notes"])
+
+
+# ── §4SB r6 (client review r5) ─────────────────────────────────────────────
+
+def test_a_late_inject_answer_landing_while_the_chain_turns_settle_awaits_holds_the_chain():
+    """r6 MAJOR (review r5 probe D1): the late-`inject` branch set the hold word
+    on the turn running now only while `!cur.ended`. A settle sets `ended` at
+    once and then AWAITS the leftovers fetch before `_turnHoldWord` is read;
+    an inbox answer landing in that await saw `ended`, set nothing, and the
+    chain went on past the "wait" (C was sent). Fails without the fix with
+    hw null, sent [A, B, C], tray [wait]."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   f"nextTurn(); _markOwed('web-s1'); hold('{L}');\n"          # B runs as turn 3 with an owed mark
+                   f"routes['{S}'] = [200, {{ messages: [] }}]; chatHistory.push({{ role: 'assistant', content: 'a3' }});\n"
+                   "endTurn(); const sp = _settleQueuedTurn(3, null, 'done'); await tick();\n"
+                   "const mid = { ended: _turnInfo.get(3).ended, settled: _turnInfo.get(3).settled };\n"
+                   "await release('/api/turn/inbox'); await wp;\n"            # the late answer lands mid-await
+                   "const hw = _turnInfo.get(3).holdWord || null;\n"
+                   f"await release('{L}'); await sp; await tick();\n")
+    out = eval_js(src, "{mid, hw, sent, tray: tray(), left: _sendAfterTurn.map(q => q.text)}")
+    assert out["mid"] == {"ended": True, "settled": False}          # the world: ended, settle still awaiting
+    assert out["hw"] == "wait"
+    assert out == {"mid": out["mid"], "hw": "wait", "sent": ["A", "B"], "tray": ["wait", "C"], "left": []}
+
+
+def test_a_late_hold_word_never_lands_on_a_turn_already_settled():
+    """r6 control: with no newer turn the late answer's `cur` IS the settled
+    turn; nothing is set on it (the text is trayed by the late branch)."""
+    src = _harness(_INJECT + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done'); await release('/api/turn/inbox'); await wp;\n")
+    assert eval_js(src, "{hw: _turnInfo.get(1).holdWord || null, tray: tray(), sent}") == {"hw": None, "tray": ["wait"], "sent": []}
+
+
+def test_a_reload_trays_what_was_waiting_in_typing_order():
+    """r6 MINOR (review r5 probe A1c): the held D (typed LAST, during the
+    turn) was remembered before the resends B and C (remembered at the
+    settle); the storage order is remembering order, so the reload trayed
+    [D, B, C]. Fails without the fix (no `seq` stored, no sort)."""
+    out = _reload(_INJECT + "await send('A'); await send('B'); await send('C');\n" + _QUEUE + "await send('D');\n"
+                  f"routes['{S}'] = [200, {{ messages: [] }}]; routes['{L}'] = [200, {{ messages: ['A', 'B', 'C'] }}];\n"
+                  "chatHistory.push({ role: 'assistant', content: 'a' }); endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                  "const waiting = _sendAfterTurn.map(q => q.text);\n"
+                  "if (JSON.stringify(waiting) !== '[\"B\",\"C\",\"D\"]') throw new Error('waiting ' + waiting);\n",
+                  _RELOAD_NAV + "_onSessionShown(); await _settleChain; await tick();\n", "{tray: tray()}")
+    assert out == {"tray": ["B", "C", "D"]}
+
+
+def test_a_late_hold_word_on_an_ordinary_turn_says_where_it_came_from():
+    """r6 MINOR (review r5 probe D2): turn 1's "wait" is answered `inject`
+    while an ORDINARY turn 2 runs with "yes please" held; the clean end of
+    turn 2 holds "yes please" back (right) under "'wait' was typed during the
+    turn" (wrong: it was not). Fails without the fix on the note."""
+    src = _harness(_INJECT + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "nextTurn();\n"
+                   "_holdForAfterTurn({ text: 'yes please', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s1', epoch: _convEpoch });\n"
+                   "await release('/api/turn/inbox'); await wp;\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}]; chatHistory.push({{ role: 'assistant', content: 'a2' }});\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n")
+    out = eval_js(src, "{sent, tray: tray(), notes, hw: _turnInfo.get(2).holdWord || null, late: _turnInfo.get(2).holdLate || null}")
+    assert out["sent"] == [] and out["tray"] == ["wait", "yes please"] and out["hw"] == "wait" and out["late"] == "wait"
+    assert any(n.startswith("'wait' from an earlier turn arrived while this one ran, so nothing of it is sent on its own.") for n in out["notes"])
+    assert not any("'wait' was typed during the turn" in n for n in out["notes"])
+
+
+def test_a_chain_of_ten_leftovers_is_sent_to_the_end():
+    """r6 MINOR (review r5 probe A3): `_beginQueuedTurn` pruned `_turnInfo`
+    below `_turnGen - 8` while gen 1's L10 still waited; the drain found no
+    info for it and trayed it under "did not end with a reply". Fails
+    without the fix with sent L1..L9, tray [L10]."""
+    src = _harness(_INJECT + "".join(f"await send('L{i}'); " for i in range(1, 11)) + "\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   f"routes['{L}'] = [200, {{ messages: [{', '.join(repr('L%d' % i) for i in range(1, 11))}] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a' }); endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   f"routes['{L}'] = [200, {{ messages: [] }}];\n"
+                   "for (let g = 2; g <= 11; g++) { nextTurn(); endTurn(); await _settleQueuedTurn(g, null, 'done'); }\n")
+    out = eval_js(src, "{sent, tray: tray(), left: _sendAfterTurn.map(q => q.text), gen1: _turnInfo.has(1)}")
+    assert out == {"sent": [f"L{i}" for i in range(1, 11)], "tray": [], "left": [], "gen1": False}   # pruned once nothing of it waits
+
+
+def test_a_duplicated_tab_trays_what_was_waiting_but_not_the_injects():
+    """r6 MINOR (review r5 probe B2): a duplicated tab ('navigate') recovered
+    nothing — right for an inject (the original tab owns it, the agent has
+    the copy) but a WAITING item has no other copy on the agent's side: a
+    duplicate is acceptable, a loss is not. Fails without the fix with
+    tray [] for H."""
+    nav = "globalThis.performance = { getEntriesByType: (k) => k === 'navigation' ? [{ type: 'navigate' }] : [] };\n"
+    out = _reload(_QUEUE + "await send('H');\n", nav + "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{tray: tray(), kept: JSON.parse(sstore['ghost.queued.typed'] || '[]').map(x => x.text), notes}")
+    assert out["tray"] == ["H"] and out["kept"] == []
+    assert any(n.startswith("A reload or a duplicated tab was left with these unsent.") for n in out["notes"])   # r7 wording
+    out = _reload(_INJECT + "await send('A');\n", nav + "_onSessionShown(); await _settleChain; await tick();\n",
+                  "{tray: tray(), kept: JSON.parse(sstore['ghost.queued.typed'] || '[]').map(x => x.text)}")
+    assert out == {"tray": [], "kept": []}
+    out = _reload(_CHAIN, nav + "_onSessionShown(); await _settleChain; await tick();\n", "{tray: tray()}")
+    assert out == {"tray": ["B", "C"]}
+
+
+# ── §4SB r7 (client review r6) ─────────────────────────────────────────────
+
+_BY_SID = "Object.fromEntries(Object.entries(stored()).map(([k, v]) => [k, v.map(x => [x.text, x.why])]))"
+_LATE_NOTE = "'wait' from an earlier turn arrived while this one ran, so nothing of it is sent on its own."
+_AFTER_NOTE = "'wait' arrived after its turn ended, so nothing of that conversation is sent on its own."   # r9: no turn runs
+
+
+def test_a_late_hold_word_of_another_session_never_holds_the_running_turn():
+    """r7 MAJOR (review r6 probe b1): s1's "wait" answered `inject` late while
+    an s2 turn runs (the user switched sessions mid-turn; a switch never
+    bumps the epoch): the late branch held the s2 turn — its own leftover Y
+    was trayed under the late note and s1's waiting C was left for a later
+    s1 turn to drain. Fails without the fix with hw3 'wait', sent [A, B],
+    Y in s2's tray."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"              # sent [A, B]; C waits (gen 1, s1)
+                   "window.__ghostSessionId = 'web-s2'; nextTurn();\n"                     # gen 3 is an s2 turn
+                   "_turnInfo.get(3).typed.push('Y'); _turnInfo.get(3).typedSeq.push(77); _markOwed('web-s2');\n"
+                   "await release('/api/turn/inbox'); await wp;\n"                         # the late answer: cur = gen 3 (s2)
+                   "const mid = { hw3: _turnInfo.get(3).holdWord || null, sid3: _turnInfo.get(3).sid, left: _sendAfterTurn.map(q => q.text) };\n"
+                   f"routes['{L}'] = [200, {{ messages: ['Y'] }}]; routes['/api/sessions/web-s2'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a3' });\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done'); await tick();\n")
+    out = eval_js(src, "{mid, sent, bySid: " + _BY_SID + ", left: _sendAfterTurn.map(q => q.text)}")
+    assert out["mid"] == {"hw3": None, "sid3": "web-s2", "left": []}       # s2's turn untouched; s1's chain swept at once
+    assert out["sent"] == ["A", "B", "Y"] and out["left"] == []
+    assert out["bySid"] == {"web-s1": [["wait", "The turn ended as this was sent; the agent may or may not have read it."],
+                                       ["C", _LATE_NOTE]]}                   # nothing in s2's tray
+
+
+def test_a_message_held_in_another_sessions_turn_after_a_late_hold_word_is_sent():
+    """r7 MAJOR (review r6 probe b2): the s2 turn's own queue-held "Y please",
+    typed after s1's late "wait" landed, was trayed under "Typed after
+    'wait' in the same turn". Fails without the fix with sent [A, B]."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "window.__ghostSessionId = 'web-s2'; nextTurn();\n"
+                   "await release('/api/turn/inbox'); await wp;\n"
+                   "_holdForAfterTurn({ text: 'Y please', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s2', epoch: _convEpoch });\n"
+                   "routes['/api/sessions/web-s2'] = [200, { messages: [] }]; chatHistory.push({ role: 'assistant', content: 'a3' });\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done'); await tick();\n")
+    out = eval_js(src, "{sent, bySid: " + _BY_SID + ", left: _sendAfterTurn.map(q => q.text)}")
+    assert out["sent"] == ["A", "B", "Y please"] and out["left"] == []
+    assert out["bySid"] == {"web-s1": [["wait", "The turn ended as this was sent; the agent may or may not have read it."], ["C", _LATE_NOTE]]}
+
+
+def test_a_late_hold_word_with_no_turn_of_its_session_running_sweeps_its_waiting_chain():
+    """r7 (review r6 probe a2, the same-session control of the MAJOR): the
+    late answer lands after the chain turn settled and before the next chain
+    turn began — no turn to hold, so the session's waiting C is trayed now,
+    not sent by the next clean turn. Fails without the fix with sent
+    [A, B, C]."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "await release('/api/turn/inbox'); await wp;\n"                 # lands on settled gen 2, C still waiting
+                   "const mid = { tray: tray(), left: _sendAfterTurn.map(q => q.text) };\n"
+                   "nextTurn();\n"
+                   f"routes['{S}'] = [200, {{ messages: [] }}]; chatHistory.push({{ role: 'assistant', content: 'a3' }});\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done'); await tick();\n")
+    out = eval_js(src, "{mid, sent, tray: tray(), left: _sendAfterTurn.map(q => q.text), notes}")
+    assert out["mid"] == {"tray": ["wait", "C"], "left": []}
+    assert out["sent"] == ["A", "B"] and out["tray"] == ["wait", "C"] and out["left"] == []
+    assert any(n.startswith(_AFTER_NOTE) for n in out["notes"])          # r9 wording: no turn was running
+    assert not any(n.startswith(_LATE_NOTE) for n in out["notes"])
+
+
+def test_a_late_inject_answer_for_a_pruned_turn_is_trayed_not_queued():
+    """r7 MINOR (review r6 probe c1): with its turn's record pruned (`info`
+    null) the late answer took the LIVE-inject branch: pushed to
+    `_queuedInjects` under a "read at the next step" bubble that no settle
+    ever clears. Fails without the fix with injects [[Z, 1]], tray []."""
+    src = _harness(_INJECT + "hold('/api/turn/inbox'); const p = send('Z');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "for (let g = 2; g <= 12; g++) { nextTurn(); endTurn(); await _settleQueuedTurn(g, null, 'done'); }\n"
+                   "nextTurn();\n"                                                   # gen 13 runs; gen 1 long pruned
+                   "await release('/api/turn/inbox'); await p;\n")
+    out = eval_js(src, "{gen1: _turnInfo.has(1), injects: _queuedInjects.map(q => [q.text, q.gen]), tray: tray(), owed: Object.keys(_owedMap()),"
+                  " bubbles: chatLog.children.filter(c => c.classList.contains('queued')).length}")
+    assert out == {"gen1": False, "injects": [], "tray": ["Z"], "owed": ["web-s1"], "bubbles": 0}
+
+
+def test_a_message_held_after_a_late_hold_word_says_the_word_was_another_turns():
+    """r7 NIT (review r6): "yes please" held AFTER turn 1's late "wait" landed
+    on turn 2 was trayed under "Typed after 'wait' in the same turn" — it was
+    not typed in this turn. Fails without the fix on the note."""
+    src = _harness(_INJECT + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "nextTurn(); await release('/api/turn/inbox'); await wp;\n"      # the late answer holds turn 2
+                   "_holdForAfterTurn({ text: 'yes please', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s1', epoch: _convEpoch });\n")
+    out = eval_js(src, "{tray: tray(), notes, left: _sendAfterTurn.map(q => q.text)}")
+    assert out["tray"] == ["wait", "yes please"] and out["left"] == []
+    assert any(n.startswith("Typed while 'wait' from an earlier turn held this one, so not sent on its own.") for n in out["notes"])
+    assert not any("Typed after 'wait' in the same turn" in n for n in out["notes"])
+
+
+def test_a_turns_own_hold_word_is_named_over_a_later_late_one():
+    """r7 NIT (review r6 mutant M1c survived): turn 2 holds its own "stop"
+    (queue path), then turn 1's "wait" lands late — the settle note must
+    name "stop" (the turn's own word, typed during it), not "wait" from an
+    earlier turn. Fails with `cur.holdWord = w` (the late word overwrote)."""
+    src = _harness(_INJECT + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "nextTurn();\n"
+                   "_holdForAfterTurn({ text: 'stop', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s1', epoch: _convEpoch });\n"
+                   "_turnInfo.get(2).typed.push('Y'); _turnInfo.get(2).typedSeq.push(77); _markOwed('web-s1');\n"
+                   "await release('/api/turn/inbox'); await wp;\n"                 # the late 'wait' on a turn that holds 'stop'
+                   f"routes['{L}'] = [200, {{ messages: ['Y'] }}]; routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a2' });\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done'); await tick();\n")
+    out = eval_js(src, "{sent, tray: tray(), notes, hw: _turnInfo.get(2).holdWord, late: _turnInfo.get(2).holdLate}")
+    assert out["sent"] == [] and out["tray"] == ["stop", "wait", "Y"]
+    assert out["hw"] == "stop" and out["late"] == "wait"
+    assert any(n.startswith("'stop' was typed during the turn, so nothing of it is sent on its own.") for n in out["notes"])
+    assert not any("from an earlier turn arrived" in n for n in out["notes"])
+
+
+@pytest.mark.parametrize("l2_at, expect", [(2000, ["one", "one-b", "two"]), (500, ["two", "one", "one-b"])])
+def test_recovered_entries_of_two_earlier_loads_never_interleave(l2_at, expect):
+    """r7 NIT (review r6 probe d1): sorted by `seq` alone, a second earlier
+    load's low seq cut into the first load's order ([two, one, one-b]).
+    Loads order by their first remembered time, then seq within a load.
+    Fails without the fix for the first case."""
+    seed = ("sstore['ghost.queued.typed'] = JSON.stringify(["
+            "{load:'L1', gen:1, sid:'web-s1', text:'one', at:1000, kind:'held', hid:1, seq:3},"
+            " {load:'L1', gen:1, sid:'web-s1', text:'one-b', at:1001, kind:'held', hid:2, seq:4},"
+            f" {{load:'L2', gen:1, sid:'web-s1', text:'two', at:{l2_at}, kind:'held', hid:1, seq:1}}]);\n")
+    out = eval_js(_harness(seed + _RELOAD_NAV + "_onSessionShown(); await _settleChain; await tick();\n"), "{tray: tray()}")
+    assert out == {"tray": expect}
+
+
+# ── §4SB r8 (client review r7) ─────────────────────────────────────────────
+
+_OWN_NOTE = "'wait' was typed during the turn, so nothing of it is sent on its own."
+_LATE_NOTE_FROM = "'wait' from an earlier turn arrived while this one ran, so nothing of it is sent on its own."
+
+
+def test_a_late_hold_word_marks_its_own_turn_while_that_turn_still_settles():
+    """r8 MAJOR (review r7 probe r1): s1's turn 2 has an inject Y and a late-
+    answered "wait"; during its leftovers await the user switches to s2 and
+    sends (gen 3, s2). The answer lands: the sweep trays B and C, but turn
+    2's own record stayed unmarked, so its settle re-sent Y into s1 once the
+    user came back. Fails without the fix with hw2 null, Y waiting after
+    settle 2 and sent [A, Y]."""
+    src = _harness(_CHAIN + "await send('Y');\n"                                         # inject into gen 2 (s1)
+                   "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   f"hold('{L}'); routes['{L}'] = [200, {{ messages: ['Y'] }}]; routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a2' });\n"
+                   "endTurn(); const sp = _settleQueuedTurn(2, null, 'done'); await tick();\n"   # settle 2 awaits the fetch
+                   "window.__ghostSessionId = 'web-s2'; nextTurn();\n"                     # the user switched to s2 and sent
+                   "await release('/api/turn/inbox'); await wp; await tick();\n"           # the late 'wait': cur = gen 3 (s2)
+                   "const afterLate = { left: _sendAfterTurn.map(q => q.text), hw2: _turnInfo.get(2).holdWord || null, hw3: _turnInfo.get(3).holdWord || null };\n"
+                   f"await release('{L}'); await sp; await tick();\n"
+                   "const afterSettle2 = { left: _sendAfterTurn.map(q => [q.text, q.gen, q.sid]), sent: [...sent] };\n"
+                   "await send('M');\n"                                                     # inject into gen 3 so its settle awaits
+                   f"hold('{L}'); routes['{L}'] = [200, {{ messages: [] }}]; routes['/api/sessions/web-s2'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a3' });\n"
+                   "endTurn(); const sp3 = _settleQueuedTurn(3, null, 'done'); await tick();\n"
+                   "window.__ghostSessionId = 'web-s1';\n"                                 # back to s1 during settle 3's await
+                   f"await release('{L}'); await sp3; await tick();\n")
+    out = eval_js(src, "{afterLate, afterSettle2, sent, bySid: " + _BY_SID + ", left: _sendAfterTurn.map(q => q.text)}")
+    assert out["afterLate"] == {"left": [], "hw2": "wait", "hw3": None}
+    assert out["afterSettle2"] == {"left": [], "sent": ["A"]}
+    assert out["sent"] == ["A"] and out["left"] == []
+    assert out["bySid"] == {"web-s1": [["wait", "The turn ended as this was sent; the agent may or may not have read it."],
+                                       ["B", _LATE_NOTE_FROM], ["C", _LATE_NOTE_FROM], ["Y", _OWN_NOTE]]}
+
+
+def test_a_late_hold_word_landing_in_its_own_turns_settle_is_that_turns_word():
+    """r8 NIT (review r7 probe p1): the late answer lands during gen 1's OWN
+    settle await (no newer turn): `cur === info`, so the note must be
+    "'wait' was typed during the turn", not "from an earlier turn". Fails
+    without the fix with holdLate 'wait' and the earlier-turn note."""
+    src = _harness(_INJECT + "await send('A');\n"
+                   "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   f"hold('{L}'); routes['{L}'] = [200, {{ messages: ['A'] }}]; routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a1' });\n"
+                   "endTurn(); const sp = _settleQueuedTurn(1, null, 'done'); await tick();\n"
+                   "await release('/api/turn/inbox'); await wp;\n"
+                   f"await release('{L}'); await sp; await tick();\n")
+    out = eval_js(src, "{sent, tray: tray(), notes, hw: _turnInfo.get(1).holdWord, late: _turnInfo.get(1).holdLate || null}")
+    assert out["sent"] == [] and out["tray"] == ["wait", "A"] and out["hw"] == "wait" and out["late"] is None
+    assert any(n.startswith(_OWN_NOTE) for n in out["notes"]) and not any("from an earlier turn" in n for n in out["notes"])
+
+
+def test_the_late_sweep_never_crosses_into_another_sessions_waiting_items():
+    """r8 pin gap (review r7 probe a3): s2's "Y please", queue-held for its
+    running turn BEFORE s1's late "wait" lands, survives the sweep of s1's
+    chain and is sent. Fails when `_unholdTurn(null, …)` ignores the sid."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "window.__ghostSessionId = 'web-s2'; nextTurn();\n"
+                   "_holdForAfterTurn({ text: 'Y please', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s2', epoch: _convEpoch });\n"
+                   "await release('/api/turn/inbox'); await wp;\n"
+                   "const mid = { left: _sendAfterTurn.map(q => [q.text, q.sid]) };\n"
+                   "routes['/api/sessions/web-s2'] = [200, { messages: [] }]; chatHistory.push({ role: 'assistant', content: 'a3' });\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done'); await tick();\n")
+    out = eval_js(src, "{mid, sent, bySid: " + _BY_SID + ", left: _sendAfterTurn.map(q => q.text)}")
+    assert out["mid"] == {"left": [["Y please", "web-s2"]]}
+    assert out["sent"] == ["A", "B", "Y please"] and out["left"] == []
+    assert out["bySid"] == {"web-s1": [["wait", "The turn ended as this was sent; the agent may or may not have read it."], ["C", _LATE_NOTE_FROM]]}
+
+
+def test_a_late_hold_word_of_an_earlier_epoch_never_holds_the_new_conversation():
+    """r8 pin gap (review r7 probe b2, the epoch term): the epoch bumped with
+    the sid kept; the epoch-0 "wait" lands on an epoch-1 turn → not held (its
+    leftover N is re-sent), and the epoch-0 chain (C) is swept to the tray.
+    Fails without the epoch term with hw3 'wait' and N trayed."""
+    src = _harness(_CHAIN + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(2, null, 'done');\n"
+                   "_convEpoch += 1; nextTurn();\n"
+                   "_turnInfo.get(3).typed.push('N'); _turnInfo.get(3).typedSeq.push(77); _markOwed('web-s1');\n"
+                   "await release('/api/turn/inbox'); await wp;\n"
+                   "const mid = { hw3: _turnInfo.get(3).holdWord || null, left: _sendAfterTurn.map(q => q.text), tray: tray() };\n"
+                   f"routes['{L}'] = [200, {{ messages: ['N'] }}]; routes['{S}'] = [200, {{ messages: [] }}]; chatHistory.push({{ role: 'assistant', content: 'a3' }});\n"
+                   "endTurn(); await _settleQueuedTurn(3, null, 'done'); await tick();\n")
+    out = eval_js(src, "{mid, sent, tray: tray(), left: _sendAfterTurn.map(q => q.text)}")
+    assert out["mid"] == {"hw3": None, "left": [], "tray": ["wait", "C"]}
+    assert out["sent"] == ["A", "B", "N"] and out["tray"] == ["wait", "C"] and out["left"] == []
+
+
+def test_a_message_held_after_the_turns_own_word_and_a_late_one_names_the_own_word():
+    """r8 pin gap (review r7 probe p2): own "stop" held, then a late "wait"
+    lands, then "more" is held → `earlier` is 'stop' (the turn's own word) and
+    the note must be "Typed after 'stop' in the same turn", not the
+    earlier-turn wording. Fails when the note checks `holdLate` for truth
+    rather than equality with the word."""
+    src = _harness(_INJECT + "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "nextTurn();\n"
+                   "_holdForAfterTurn({ text: 'stop', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s1', epoch: _convEpoch });\n"
+                   "await release('/api/turn/inbox'); await wp;\n"
+                   "_holdForAfterTurn({ text: 'more', div: new El(), seq: ++_queuedSeq, gen: _turnGen, sid: 'web-s1', epoch: _convEpoch });\n")
+    out = eval_js(src, "{tray: tray(), notes, hw: _turnInfo.get(2).holdWord, late: _turnInfo.get(2).holdLate}")
+    assert out["tray"] == ["stop", "wait", "more"] and out["hw"] == "stop" and out["late"] == "wait"
+    assert any(n.startswith("Typed after 'stop' in the same turn, so not sent on its own.") for n in out["notes"])
+    assert not any("from an earlier turn held this one" in n for n in out["notes"])
+
+
+def test_a_recovered_entry_without_a_time_sorts_as_the_oldest_load():
+    """r8 pin gap (review r7 probe e1): an old entry with no `at` (older
+    storage) counts as time 0, so its load comes first; a NaN there would
+    make the sort order undefined. Fails with `x.at` unguarded."""
+    seed = ("sstore['ghost.queued.typed'] = JSON.stringify([{load:'L1', gen:1, sid:'web-s1', text:'one', kind:'held', hid:1, seq:3},"
+            " {load:'L2', gen:1, sid:'web-s1', text:'two', at:500, kind:'held', hid:1, seq:1}]);\n")
+    out = eval_js(_harness(seed + _RELOAD_NAV + "_onSessionShown(); await _settleChain; await tick();\n"), "{tray: tray()}")
+    assert out == {"tray": ["one", "two"]}
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_a_queue_answer_for_a_pruned_turn_is_trayed_with_the_reason(running):
+    """r8 MINOR (review r7 probe d1/d1b): a `queue` answer for a turn whose
+    record was pruned went into the chain; the drain trayed it under "The
+    turn did not end with a reply" (false — the page just no longer knows).
+    Fails without the fix on the note."""
+    src = _harness(_QUEUE + "hold('/api/turn/inbox'); const p = send('Z');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "for (let g = 2; g <= 12; g++) { nextTurn(); endTurn(); await _settleQueuedTurn(g, null, 'done'); }\n"
+                   + ("nextTurn();\n" if running else "")
+                   + "await release('/api/turn/inbox'); await p; await tick();\n")
+    out = eval_js(src, "{gen1: _turnInfo.has(1), sent, tray: tray(), notes, left: _sendAfterTurn.map(q => q.text),"
+                  " bubbles: chatLog.children.filter(c => c.classList.contains('queued')).length, held: JSON.parse(sstore['ghost.queued.typed'] || '[]').length}")
+    assert out["gen1"] is False and out["sent"] == [] and out["tray"] == ["Z"] and out["left"] == []
+    assert out["bubbles"] == 0 and out["held"] == 0
+    assert any(n.startswith("This page no longer has that turn's record, so it was not sent.") for n in out["notes"])
+    assert not any("did not end with a reply" in n for n in out["notes"])
+
+
+# ── §4SB r9 (client review r8: NITs) ───────────────────────────────────────
+
+def test_a_pruned_queue_answer_for_a_hold_word_keeps_the_hold_word_note():
+    """r9 NIT 1 (review r8 probe d3): the r8 pruned-turn branch said "This page
+    no longer has that turn's record" for a bare "wait" too; a hold word is
+    named as one. Fails without the fix on the note."""
+    src = _harness(_QUEUE + "hold('/api/turn/inbox'); const p = send('wait');\n"
+                   "endTurn(); await _settleQueuedTurn(1, null, 'done');\n"
+                   "for (let g = 2; g <= 12; g++) { nextTurn(); endTurn(); await _settleQueuedTurn(g, null, 'done'); }\n"
+                   "await release('/api/turn/inbox'); await p; await tick();\n")
+    out = eval_js(src, "{gen1: _turnInfo.has(1), sent, tray: tray(), notes, left: _sendAfterTurn.map(q => q.text)}")
+    assert out["gen1"] is False and out["sent"] == [] and out["tray"] == ["wait"] and out["left"] == []
+    assert any(n.startswith("'wait' is a hold word") for n in out["notes"])
+    assert not any("no longer has that turn's record" in n for n in out["notes"])
+
+
+def test_a_turns_own_word_is_named_over_a_late_one_landing_in_its_own_settle():
+    """r9 NIT 2 (review r8 probe x1; world X1 `info.holdWord = w` survived):
+    own "stop" queue-held in gen 1, then the late inject "wait" lands while
+    gen 1 settles → the record keeps 'stop' and the settle names it. Fails
+    in X1 with hw 'wait' and "'wait' was typed during the turn"."""
+    src = _harness(_INJECT + "await send('Y');\n"
+                   "_holdForAfterTurn({ text: 'stop', div: new El(), seq: ++_queuedSeq, gen: 1, sid: 'web-s1', epoch: _convEpoch });\n"
+                   "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   f"hold('{L}'); routes['{L}'] = [200, {{ messages: ['Y'] }}]; routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a1' });\n"
+                   "endTurn(); const sp = _settleQueuedTurn(1, null, 'done'); await tick();\n"
+                   "await release('/api/turn/inbox'); await wp; await tick();\n"
+                   f"await release('{L}'); await sp; await tick();\n")
+    out = eval_js(src, "{hw: _turnInfo.get(1).holdWord, sent, tray: tray(), notes}")
+    assert out["hw"] == "stop" and out["sent"] == [] and out["tray"] == ["stop", "wait", "Y"]
+    assert any(n.startswith("'stop' was typed during the turn, so nothing of it is sent on its own.") for n in out["notes"])
+    assert not any("'wait' was typed during the turn" in n for n in out["notes"])
+
+
+def test_a_late_hold_word_with_nothing_running_says_its_turn_ended():
+    """r9 NIT 4 (review r8 probe a2): the sweep note said "arrived while this
+    one ran" with NO turn running (own settle done, another settle pending
+    kept Y waiting). Fails without the fix on the note."""
+    src = _harness(_INJECT + "await send('Y');\n"
+                   "hold('/api/turn/inbox'); const wp = send('wait');\n"
+                   f"routes['{L}'] = [200, {{ messages: ['Y'] }}]; routes['{S}'] = [200, {{ messages: [] }}];\n"
+                   "chatHistory.push({ role: 'assistant', content: 'a1' });\n"
+                   "endTurn(); const sp = _settleQueuedTurn(1, null, 'done'); let unblock; const blk = _settleQueuedTurn(0, new Promise(r => { unblock = r; }), 'stopped');\n"
+                   "await sp; await tick();\n"
+                   "const mid = { settled1: _turnInfo.get(1).settled, pending: _settlesPending, left: _sendAfterTurn.map(q => q.text) };\n"
+                   "await release('/api/turn/inbox'); await wp; await tick();\n"
+                   "unblock([]); await blk; await tick();\n")
+    out = eval_js(src, "{mid, sent, tray: tray(), notes, left: _sendAfterTurn.map(q => q.text)}")
+    assert out["mid"] == {"settled1": True, "pending": 1, "left": ["Y"]}
+    assert out["sent"] == [] and out["tray"] == ["wait", "Y"] and out["left"] == []
+    assert any(n.startswith(_AFTER_NOTE) for n in out["notes"]) and not any("while this one ran" in n for n in out["notes"])

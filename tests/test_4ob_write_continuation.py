@@ -18,7 +18,7 @@ class FakeLLM:
     def __init__(self, replies):
         self.replies, self.payloads = list(replies), []
 
-    async def chat_completion(self, payload, timeout=None, task_label=""):
+    async def chat_completion(self, payload, timeout=None, task_label="", side_main=False):
         self.payloads.append(payload)
         if not self.replies:
             return {"choices": [{"message": {"content": W.END_MARKER}, "finish_reason": "stop"}]}

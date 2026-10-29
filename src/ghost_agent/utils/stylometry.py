@@ -117,6 +117,22 @@ _NEUTRALIZE_PROMPT = (
 )
 
 
+# §4SC-c: the POST bound is `route()`'s (one truth). The import CAN fail: this
+# module is imported by the search tools, which `core.llm` imports in turn at
+# start-up, and the lexical scrub must work without the client at all — so one
+# fallback, the same number `route()` uses, named only here.
+try:
+    from ..core.llm import _ROUTE_TIMEOUT_S as _NEUTRALIZE_TIMEOUT_S
+except Exception:  # noqa: BLE001
+    _NEUTRALIZE_TIMEOUT_S = 12.0
+#: §4SC-d: the call's WHOLE budget (permit gate + POST). A saturated Nova is
+#: not a breaker fault, so `require_healthy` lets the call through to its
+#: permit gate, which `_do_chat_completion` sizes from the budget: at 12 s the
+#: gate alone cost 9 s and every anonymous search up to 21 s; at 6 s the gate
+#: is ≤ 3 s and the POST ≤ 6 s — a scrub is not worth more.
+_NEUTRALIZE_BUDGET_S = 6.0
+
+
 async def neutralize_query(
     text: Optional[str],
     *,
@@ -134,6 +150,14 @@ async def neutralize_query(
     lexical = scrub_query(text)
     if not text or llm_client is None:
         return lexical
+    _pool = getattr(llm_client, "worker_clients", None)
+    if _pool is not None and not _pool:
+        # §4SC-c: no worker pool configured → the client's "requested but
+        # unconfigured pool" arm would run this on MAIN with no save hook.
+        # Not `if not _pool`: a real LLMClient always has the attribute (a
+        # list, empty without --worker-nodes); a duck-typed client without
+        # it (the tests' stubs) is not a main server and keeps the call.
+        return lexical
     try:
         payload = {
             "model": model or "default",
@@ -142,7 +166,17 @@ async def neutralize_query(
             "max_tokens": int(max_tokens),
             "stream": False,
         }
-        res = await llm_client.chat_completion(payload)
+        # §4SC-b: OFF the main slot. This runs inline on every anonymous
+        # deep_research/darkweb_search; a plain main call that does not open
+        # with the head displaces the owner's conversation (req 72c2f05d:
+        # 41,742 tokens re-prefilled, 282 s). `off_main_only`: every worker
+        # node failed → the client raises → the lexical scrub below, never
+        # the main model. §4SC-c: bounded like `route()` (12 s; the worker
+        # client's default is 1200 s — a hung Nova stalled every anonymous
+        # search 20 min) and healthy nodes only (an open breaker = no call).
+        res = await llm_client.chat_completion(
+            payload, use_worker=True, off_main_only=True, require_healthy=True,
+            timeout=_NEUTRALIZE_TIMEOUT_S, total_budget=_NEUTRALIZE_BUDGET_S)
         out = (
             (res or {}).get("choices", [{}])[0]
             .get("message", {}).get("content", "") or ""

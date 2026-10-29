@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=17.0';
+import * as matrixGraphFace from './matrix_graph.js?v=17.4';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.0';   // what the status line under the reply shows
@@ -22,6 +22,7 @@ const chatInput = document.getElementById('chat-input');
 const sendBtn = document.getElementById('send-btn');
 const interruptBtn = document.getElementById('interrupt-btn');   // §4RZ: stop the running tool only
 const restoreTray = document.getElementById('restore-tray');      // §4RZ r6a7: texts handed back
+const restoreStatus = document.getElementById('restore-status');  // §4SB: the tray's one-line live status
 const effortSelect = initEffortSelector(document, window);   // §4RB: hidden unless the agent says it is on
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const statusText = document.getElementById('status-text');
@@ -375,6 +376,7 @@ let currentTurnStartedAt = 0;
 // §4RZ step 6a — messages sent while a turn runs (see `_sendWhileBusy`).
 let _queuedInjects = [];        // [{text, div, seq, gen, sid, epoch}] accepted by a turn's inbox
 let _sendAfterTurn = [];        // [{text, div, seq, gen, sid, epoch}] sent normally once that turn ends
+let _heldId = 0;                // §4SB r5: ids of the waiting items remembered in sessionStorage
 let _queuedSeq = 0;
 let _inboxStopUndelivered = null;   // the inbox's stop word cancelled the turn: what it never read
 let _queuedFeatureOn = null;        // null until the agent answers; the tool button shows only on true
@@ -386,6 +388,9 @@ let _settlesPending = 0;            // no held message is sent while a settle is
 let _restoreUnsaved = null;         // [items] whose own localStorage key could not be written (sessionStorage; lazy)
 let _restoreSeq = 0;
 const _trayNoted = new Set();       // tray batches whose reason this page has said (once a session is bound)
+const _PAGE_LOAD = `${Date.now()}-${Math.random().toString(36).slice(2)}`;   // §4SB: this page load; a typed inject of another load was lost to a reload
+let _trayCount = -1;                // §4SB: items last announced (the status line speaks only on a change)
+let _owedMarks = 0;                 // §4SB r2: every _markOwed bumps it; a settle clears no debt marked during its await
 let _leftoversOwed = null;          // {sid: markedAt ms} a lost/failed turn still owes (localStorage; loaded lazily)
 
 const SEND_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
@@ -3114,9 +3119,12 @@ function _beginQueuedTurn() {
     _queueOwedLeftovers(false);
     _turnGen += 1;
     _turnInfo.set(_turnGen, { sid: _queuedSid(), epoch: _convEpoch, startedAt: Date.now(),
-                              typed: [], ended: false, settled: false, outcome: null });
+                              typed: [], typedSeq: [], ended: false, settled: false, outcome: null });   // §4SB r3: typedSeq = typing order
     for (const g of Array.from(_turnInfo.keys())) {
-        if (g < _turnGen - 8) _turnInfo.delete(g);
+        // §4SB r6: never while something of it still waits to be sent — a
+        // chain of ≥10 leftovers lost its turn's record and the drain trayed
+        // the tail under "did not end with a reply"
+        if (g < _turnGen - 8 && !_sendAfterTurn.some(q => q.gen === g)) _turnInfo.delete(g);
     }
     return _turnGen;
 }
@@ -3134,12 +3142,14 @@ function _settleLostTurns(newTurn = false) {
         if (!newTurn) { _settleQueuedTurn(g, null, 'unknown'); continue; }
         Object.assign(info, { ended: true, settled: true, outcome: 'unknown' });
         if (info.sid && info.typed.length) _markOwed(info.sid);
-        const held = _sendAfterTurn.filter(it => it.gen === g);
-        _sendAfterTurn = _sendAfterTurn.filter(it => it.gen !== g);
+        // §4SB r5 (review MINOR): the chain of earlier turns feeding this one
+        // ends with it too — 'unknown' puts everything back
+        const held = _unholdTurn(g, info.sid, info.epoch);
         for (const it of [..._queuedInjects.filter(q => q.gen === g), ...held]) if (it.div) it.div.remove();
         _queuedInjects = _queuedInjects.filter(q => q.gen !== g);
         const back = [...info.typed, ...held.map(it => it.text)];
         _restoreToComposer(back, 'An earlier turn was lost; the agent may or may not have read these.', info.sid);
+        _forgetTyped(g);                      // §4SB
     }
 }
 
@@ -3338,6 +3348,7 @@ function _trayInsert(id) {
 
 // A session is on screen (load, switch): its tray, and its owed leftovers.
 function _onSessionShown() {
+    try { _recoverTypedAfterReload(); } catch (e) { /* storage */ }    // §4SB
     try { _renderTray(); _queueOwedLeftovers(false); } catch (e) { /* storage */ }
 }
 
@@ -3351,11 +3362,13 @@ function _renderTray() {
     const elsewhere = unsaved.some(it => !here.has(it.sid || ''));
     restoreTray.innerHTML = '';
     restoreTray.classList.toggle('hidden', !items.length && !elsewhere);
+    const whys = [];                                                   // §4SB r2: said on the status line
     const warn = (text) => {
         const w = document.createElement('div');
         w.className = 'restore-warn';
         w.textContent = text;
         restoreTray.appendChild(w);
+        if (!_trayNoted.has('warn:' + text)) { _trayNoted.add('warn:' + text); whys.push(text); }
     };
     if (unsaved.some(it => here.has(it.sid || ''))) {           // still not saved (also after a reload)
         warn('Browser storage is full: these are kept only until this tab closes.');
@@ -3371,10 +3384,12 @@ function _renderTray() {
         const ins = document.createElement('button');
         ins.className = 'restore-insert';
         ins.textContent = 'Insert';
+        ins.setAttribute('aria-label', `Insert: ${_shortText(it.text)}`);     // §4SB: each button names its text
         ins.onclick = () => _trayInsert(it.id);
         const dis = document.createElement('button');
         dis.className = 'restore-dismiss';
         dis.textContent = 'Dismiss';
+        dis.setAttribute('aria-label', `Dismiss: ${_shortText(it.text)}`);
         dis.onclick = () => _trayRemove(it.id);
         row.appendChild(text); row.appendChild(ins); row.appendChild(dis);
         restoreTray.appendChild(row);
@@ -3383,7 +3398,9 @@ function _renderTray() {
     for (const [batch, { why, n }] of fresh) {
         _trayNoted.add(batch);
         addMessage('system', `${why} ${n === 1 ? 'Your message is' : `${n} messages are`} in the tray above the composer.`);
+        if (!whys.includes(why)) whys.push(why);
     }
+    _trayStatus(items.length, whys);                                   // §4SB
 }
 // Owed leftovers: {sid: markedAt}, kept across reloads (the page works
 // without storage). Cleared only when a fetch returns texts, when the old
@@ -3391,6 +3408,13 @@ function _renderTray() {
 // that session ended), or after the agent's own TTL.
 const LEFTOVER_TTL_MS = 30 * 60 * 1000;          // the agent's LEFTOVER_TTL_S
 const _OWED_KEY = 'ghost.queued.leftoversOwed';
+// §4SB: the agent's own stop and hold words, COPIED (core/queued_messages
+// `_STOP_RE`, tools/memory `_DENY_RE`; bin/ghost `_is_hold_word` is the CLI
+// twin). Matched on folded text (lower-case, accents stripped, like
+// memory/profile._fold); `\w` here is Unicode, as in Python.
+const _STOP_WORD_RE = /^(?:stop|cancel|abort|σταματα|σταματησε|ακυρο|ακυρωσε)[\s.!]*$/u;
+const _HOLD_WORD_RE = /(?<![\p{L}\p{N}_])(?:no|nope|cancel|stop|wait|hold\s+on|abort|οχι|μην|μη|ακυρο|ακυρωσε|σταματα|περιμενε)(?![\p{L}\p{N}_])/u;
+const _TYPED_KEY = 'ghost.queued.typed';          // §4SB: sessionStorage — this tab's injects whose turn has not settled
 function _owedMap() {
     if (_leftoversOwed === null) {
         _leftoversOwed = {};
@@ -3404,7 +3428,7 @@ function _owedMap() {
 function _saveOwed() {
     try { localStorage.setItem(_OWED_KEY, JSON.stringify(_owedMap())); } catch (e) { /* no storage */ }
 }
-function _markOwed(sid) { if (sid) { _owedMap()[sid] = Date.now(); _saveOwed(); } }
+function _markOwed(sid) { if (sid) { _owedMap()[sid] = Date.now(); _owedMarks += 1; _saveOwed(); } }
 function _clearOwed(sid) { if (sid in _owedMap()) { delete _owedMap()[sid]; _saveOwed(); } }
 
 // The agent's leftovers for `sid`: texts, or null when the call failed.
@@ -3491,10 +3515,208 @@ function _requestSessionResync() {
     } catch (e) { /* workspace modules not loaded */ }
 }
 
+function _foldText(text) {
+    return String(text || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/ς/g, 'σ');
+}
+// A stop or a hold ("stop", "wait, no", "σταμάτησε"): sent later as a new
+// request it would mean something else, so it is never held for sending.
+// §4SB r2: the stop regex matches the WHOLE message; the hold regex only a
+// message made of nothing but hold words and punctuation ("wait, no",
+// "no.", "hold on", r3: "no, no, no, no" too — no word cap) — "no sugar",
+// "stop the backup job", "cancel that" are instructions and are held and
+// sent as before. Returns the word that held (single-spaced), or null.
+function _holdWordIn(text) {
+    const f = _foldText(text).trim();
+    const stop = f.match(_STOP_WORD_RE);
+    if (stop) return f.replace(/[\s.!]+$/, '');
+    const words = f.match(new RegExp(_HOLD_WORD_RE.source, 'gu')) || [];
+    if (!words.length) return null;
+    const rest = f.replace(new RegExp(_HOLD_WORD_RE.source, 'gu'), '').replace(/[^\p{L}\p{N}]+/gu, '');
+    return rest ? null : words[0].replace(/\s+/g, ' ');
+}
+// §4SB r3 (the CLI's r8): the hold word of a turn — one the inbox queued
+// (`info.holdWord`), one the turn READ (an inject), one still held, or one
+// among `extra` (the leftovers). Null when the turn has none.
+function _turnHoldWord(info, gen, extra = []) {
+    if (info && info.holdWord) return info.holdWord;
+    const texts = [...(info ? info.typed : []), ..._sendAfterTurn.filter(q => q.gen === gen).map(q => q.text), ...extra];
+    for (const t of texts) { const w = _holdWordIn(t); if (w !== null) return w; }
+    return null;
+}
+// This turn's held items leave the queue for the tray (a hold word holds
+// what was typed BEFORE it too). §4SB r4: with `sid`+`epoch`, everything
+// an EARLIER turn of this conversation left waiting goes too, in typing
+// order — the leftover re-send chain (A sent, B and C waiting) must not
+// out-run a "wait" typed during A's turn, nor go on after a Stop. A LATER
+// turn's held items stay: typed after this turn, they are its successor's
+// (a slow stop never sweeps the next turn's messages). §4SB r7: `gen` null
+// = every turn of the conversation (a late hold word whose session has no
+// turn running).
+function _unholdTurn(gen, sid, epoch) {
+    const mine = (q) => q.gen === gen
+        || (sid !== undefined && (gen === null || q.gen < gen) && (q.sid || '') === (sid || '') && q.epoch === epoch);
+    const out = _sendAfterTurn.filter(mine).sort((a, b) => a.seq - b.seq);
+    _sendAfterTurn = _sendAfterTurn.filter(q => !mine(q));
+    for (const q of out) if (q.div) q.div.remove();
+    _forgetHeld(out);                                // r5: trayed by the caller — no longer a reload's orphan
+    return out;
+}
+// §4SB r3 (the CLI's _in_typing_order): each leftover takes the seq of its
+// LAST unmatched typed occurrence (r4: the agent reads in order, so of a
+// text typed twice the earlier one is the read one; identical texts are
+// order-indifferent among themselves); one this tab never typed (another
+// client's) comes first.
+function _leftoverSeqs(info, texts) {
+    const slots = new Map();
+    if (info) info.typed.forEach((t, i) => slots.set(t, [...(slots.get(t) || []), info.typedSeq[i]]));
+    return texts.map(t => { const s = slots.get(t); return s && s.length ? s.pop() : -1; });
+}
+function _isHoldWord(text) { return _holdWordIn(text) !== null; }
+function _holdNote(text, word) {
+    return `'${word}' is a ${_STOP_WORD_RE.test(_foldText(text).trim()) ? 'stop' : 'hold'} word — never sent on its own.`;
+}
+
+// §4SB: what this tab injected into a turn that has not settled, in
+// sessionStorage: a reload mid-turn loses `_turnInfo`, and with it the
+// "may or may not have read" hand-back. Each entry carries the page load
+// that wrote it; entries of another load are that reload's orphans.
+function _typedList() {
+    try {
+        const v = JSON.parse(sessionStorage.getItem(_TYPED_KEY) || '[]');
+        return Array.isArray(v) ? v.filter(x => x && typeof x.text === 'string' && typeof x.load === 'string') : [];
+    } catch (e) { return []; }
+}
+function _saveTyped(list) {
+    try {
+        if (list.length) sessionStorage.setItem(_TYPED_KEY, JSON.stringify(list));
+        else sessionStorage.removeItem(_TYPED_KEY);
+    } catch (e) { /* no storage */ }
+}
+function _rememberTyped(gen, sid, text) {
+    _saveTyped([..._typedList(), { load: _PAGE_LOAD, gen, sid: sid || '', text, at: Date.now() }]);
+}
+function _forgetTyped(gen) {
+    _saveTyped(_typedList().filter(x => !(x.load === _PAGE_LOAD && x.gen === gen && x.kind !== 'held')));
+}
+// §4SB r5 (review MAJOR, pre-existing): what waits to be SENT after a turn
+// (a held message, a leftover re-send) lived in memory only — a reload
+// mid-chain lost it, and the agent had already handed its copy out. Each
+// such item is remembered while it waits (`kind: 'held'`) and forgotten the
+// moment it is sent or trayed; a reload trays the orphans.
+function _rememberHeld(it) {
+    if (!it.hid) it.hid = ++_heldId;
+    const rest = _typedList().filter(x => !(x.load === _PAGE_LOAD && x.kind === 'held' && x.hid === it.hid));
+    _saveTyped([...rest, { load: _PAGE_LOAD, gen: it.gen, sid: it.sid || '', text: it.text, at: Date.now(), kind: 'held', hid: it.hid,
+                           seq: it.seq }]);                                   // §4SB r6: the reload trays in typing order
+}
+function _forgetHeld(items) {
+    const ids = new Set(items.map(it => it.hid).filter(Boolean));
+    if (ids.size) _saveTyped(_typedList().filter(x => !(x.load === _PAGE_LOAD && x.kind === 'held' && ids.has(x.hid))));
+}
+// Orphans of an earlier page load go to their session's tray (the debt for
+// the agent's own leftover was marked when the inject was accepted).
+// §4SB r2: a DUPLICATED tab copies sessionStorage too, with a new
+// _PAGE_LOAD; its navigation is 'navigate', so it recovers no INJECT — the
+// original tab still owns those (the agent has the copy). A reload or a
+// reopened closed tab ('back_forward') recovers; so does a browser without
+// the API. §4SB r6: what WAITED to be sent (`kind: 'held'`) is trayed by a
+// duplicate too — the agent has no copy of it; a duplicate is acceptable, a
+// loss is not.
+function _navigationType() {
+    try {
+        const perf = globalThis.performance;
+        if (!perf || typeof perf.getEntriesByType !== 'function') return null;
+        const e = perf.getEntriesByType('navigation')[0];
+        return e && typeof e.type === 'string' ? e.type : null;
+    } catch (e) { return null; }
+}
+function _recoverTypedAfterReload() {
+    const all = _typedList();
+    const foreign = all.filter(x => x.load !== _PAGE_LOAD);
+    if (!foreign.length) return;
+    _saveTyped(all.filter(x => x.load === _PAGE_LOAD));   // r3: dropped either way (a duplicate would tray them at ITS next reload)
+    const nav = _navigationType();
+    const duplicate = nav !== null && nav !== 'reload' && nav !== 'back_forward';   // §4SB r6: held items still tray
+    // r4: trayed however old — past the agent's leftover TTL this orphan is
+    // the ONLY copy left, which is the reason for the tray (it has its own
+    // RESTORE_TTL_MS); a duplicate is acceptable, a loss is not
+    const groups = new Map();                        // r5: per session AND kind (typed vs waiting to be sent)
+    // r6: in typing order (`seq` on held entries; one without comes first);
+    // r7: by load first (its earliest `at`) — two earlier loads never interleave
+    const firstAt = new Map();
+    for (const x of foreign) firstAt.set(x.load, Math.min(firstAt.get(x.load) ?? Infinity, x.at || 0));
+    for (const x of [...foreign].sort((a, b) => (firstAt.get(a.load) - firstAt.get(b.load)) || ((a.seq ?? -1) - (b.seq ?? -1)))) {
+        if (duplicate && x.kind !== 'held') continue;
+        const k = `${x.sid}\u0000${x.kind === 'held' ? 'held' : 'typed'}`;
+        groups.set(k, [...(groups.get(k) || []), x.text]);
+    }
+    for (const [k, texts] of groups) {
+        const [sid, kind] = k.split('\u0000');
+        _restoreToComposer(texts, kind === 'held' ? 'A reload or a duplicated tab was left with these unsent.'   // r7 wording
+            : 'The page reloaded during the turn; the agent may or may not have read these.', sid || _queuedSid());
+    }
+}
+
+// §4SB: the tray is `aria-live="off"`; one short line in #restore-status
+// says what changed instead of the whole tray being read out again.
+function _shortText(text) {
+    const t = String(text).replace(/\s+/g, ' ').trim();
+    return t.length > 60 ? t.slice(0, 57) + '…' : t;
+}
+// §4SB r2: `whys` are the reasons of the batches first shown by this render
+// (and any storage warning): the WHY is said too, not only the count.
+function _trayStatus(n, whys = []) {
+    if (typeof restoreStatus === 'undefined' || !restoreStatus) return;
+    const changed = n !== _trayCount && !(_trayCount < 0 && n === 0);    // an empty tray at load says nothing
+    if (!changed && !whys.length) return;
+    _trayCount = n;
+    const count = n === 0 ? 'The tray is empty.'
+        : `${n === 1 ? 'One message' : `${n} messages`} in the tray above the composer.`;
+    restoreStatus.textContent = [...whys, count].join(' ');
+}
+
 function _holdForAfterTurn(it) {
+    const info = _turnInfo.get(it.gen) || null;
+    if (!info) {
+        // §4SB r8 (review MINOR): a `queue` answer for a PRUNED turn went into
+        // the chain and the drain trayed it as "did not end with a reply"
+        // (false — the page just no longer knows)
+        if (it.div) it.div.remove();
+        const w0 = _holdWordIn(it.text);                     // r9: a hold word is still named as one
+        _restoreToComposer([it.text], w0 !== null ? _holdNote(it.text, w0)
+            : "This page no longer has that turn's record, so it was not sent.", it.sid);
+        return;
+    }
+    const word = _holdWordIn(it.text);
+    if (word !== null) {
+        // §4SB: a stop or hold typed while the turn was not yet running (the
+        // agent answered `queue`, or this tab has no session id) is never
+        // auto-sent as a fresh request: the model would have to answer it.
+        if (it.div) it.div.remove();
+        if (info) info.holdWord = word;
+        // §4SB r3 (CLI r8): what was held BEFORE the hold goes back too —
+        // first, in typing order (r4), the conversation's whole waiting
+        // re-send chain with it (r4)
+        const before = _unholdTurn(it.gen, it.sid, it.epoch).map(q => q.text);
+        _restoreToComposer(before, `Typed before '${word}' and still waiting, so not sent on its own.`, it.sid);
+        _restoreToComposer([it.text], _holdNote(it.text, word), it.sid);
+        return;
+    }
+    // §4SB r2 (as the CLI's _hold, r6): once a hold word was typed in this
+    // turn, nothing typed after it is sent on its own either — "wait" then
+    // "and delete the rest" must not reach the model without the wait.
+    const earlier = _turnHoldWord(info, it.gen);
+    if (earlier !== null) {
+        if (it.div) it.div.remove();
+        _restoreToComposer([it.text], info && info.holdLate === earlier                    // §4SB r7
+            ? `Typed while '${earlier}' from an earlier turn held this one, so not sent on its own.`
+            : `Typed after '${earlier}' in the same turn, so not sent on its own.`, it.sid);
+        return;
+    }
     _setQueuedLabel(it.div, 'sends after this turn');
     chatLog.appendChild(it.div);
     _sendAfterTurn.push(it);
+    _rememberHeld(it);                               // r5: survives a reload (trayed there)
     _drainSendAfterTurn();
 }
 
@@ -3556,20 +3778,66 @@ async function _sendWhileBusy() {
         return;
     }
     if (path === 'inject') {
-        if (info && info.settled) {
+        if (!info || info.settled || info.ended) {     // §4SB r7: a PRUNED turn's answer is late too (never a live inject)
             // Accepted after this page settled the turn: whether it is read
             // or left over shows on the agent's side — the session copy, or
             // the tray once the leftovers are taken. Never history here.
-            // r6a8: to the tray too (a duplicate is fine), never only a debt
+            // r6a8: to the tray too (a duplicate is fine), never only a debt.
+            // §4SB r2: the same once the turn has ENDED here (the settle may
+            // be mid-await): pushing to `typed` then would re-mark the debt
+            // the settle is about to clear and the text would be wiped.
             _markOwed(sid);
             div.remove();
             _restoreToComposer([text], 'The turn ended as this was sent; the agent may or may not have read it.', sid);
+            // §4SB r5 (review MINOR): a late "wait" still holds the chain turn
+            // running NOW — its clean end must not send the rest of the chain.
+            // §4SB r6: until SETTLED, not until ended — a settle sets `ended`
+            // at once, then awaits the leftovers fetch before it reads
+            // `_turnHoldWord`; an answer landing in that await saw `ended`,
+            // set nothing, and the chain went on past the "wait". `holdLate`
+            // names the note (the word is another turn's, not this one's).
+            // §4SB r7 (review MAJOR): only a turn of the SAME conversation —
+            // a late answer for session A's "wait" held session B's running
+            // turn (the user switched sessions mid-turn; a switch never
+            // bumps the epoch). Otherwise (another session's turn runs, or
+            // none) the word's own session's whole waiting chain goes to the
+            // tray now, so a later turn of that session never drains it.
+            const w = _holdWordIn(text), cur = _turnInfo.get(_turnGen);
+            if (w !== null) {
+                // §4SB r8 (review MAJOR): the word's OWN turn, ended but still
+                // settling (its leftovers fetch in flight), is marked too —
+                // else its settle re-sent its leftover Y into the session
+                // later, after the sweep below had trayed the chain
+                // (the sid the word was POSTed under is not compared here on
+                // purpose: marking its own turn trays, the safer reading)
+                if (info && !info.settled) info.holdWord = info.holdWord || w;
+                if (cur && !cur.settled && (cur.sid || '') === (sid || '') && cur.epoch === epoch) {
+                    cur.holdWord = cur.holdWord || w;    // r7: the turn's OWN word stays first — the note names it
+                    if (cur !== info) cur.holdLate = w;  // r8: "from an earlier turn" only when it IS another turn's
+                } else {
+                    _restoreToComposer(_unholdTurn(null, sid, epoch).map(q => q.text), !cur || cur.settled   // r9: no turn runs
+                        ? `'${w}' arrived after its turn ended, so nothing of that conversation is sent on its own.`
+                        : `'${w}' from an earlier turn arrived while this one ran, so nothing of it is sent on its own.`, sid);
+                }
+            }
             _requestSessionResync();
             return;
         }
         _setQueuedLabel(div, 'queued — read at the next step');
         _queuedInjects.push(item);
-        if (info) info.typed.push(text);
+        // §4SB: owed from now (a reload before the settle found nothing owed
+        // and the agent's leftover was pruned); this turn's clean end clears
+        // it. A mark already later than now is left alone: it is not ours.
+        const have = _owedMap()[sid];
+        if (have === undefined || have <= Date.now()) {
+            _markOwed(sid);
+            if (info) info.markedAt = _owedMap()[sid];
+        }
+        if (info) {
+            info.typed.push(text);
+            info.typedSeq.push(seq);              // §4SB r3: the resend keeps typing order
+            _rememberTyped(gen, sid, text);
+        }
         return;
     }
     _holdForAfterTurn(item);                     // queue: never reached the agent
@@ -3621,6 +3889,7 @@ async function _settleQueuedTurnNow(info, gen, undeliveredP, mode) {
     let leftovers = [];
     let failed = false;
     const owedAt = sid ? _owedMap()[sid] : undefined;
+    const markedAt0 = info ? info.markedAt : undefined, marks0 = _owedMarks;   // §4SB r2: snapshots before the await
     if (sid && (typed.length || (clean && owedAt !== undefined))) {
         if (mode === 'unknown') {
             if (typed.length) _markOwed(sid);
@@ -3628,8 +3897,12 @@ async function _settleQueuedTurnNow(info, gen, undeliveredP, mode) {
             const got = await _fetchLeftovers(sid);
             if (got === null) { _markOwed(sid); failed = true; } else {
                 leftovers = got;
-                // a clean end closes every older turn of this session
-                if (got.length || (clean && owedAt !== undefined && owedAt < ((info && info.startedAt) || Infinity))) _clearOwed(sid);
+                // a clean end closes every older turn of this session, and
+                // (§4SB) this turn's own mark unless something marked after it;
+                // r2: a debt marked DURING the fetch (a late inject) stays
+                if (_owedMarks === marks0 && (got.length || (clean && owedAt !== undefined
+                    && (owedAt < ((info && info.startedAt) || Infinity)
+                        || (markedAt0 !== undefined && owedAt <= markedAt0))))) _clearOwed(sid);
             }
         }
     }
@@ -3641,13 +3914,51 @@ async function _settleQueuedTurnNow(info, gen, undeliveredP, mode) {
     // A clean turn's injects are trusted to the session copy. Any other
     // ending: every text accepted during it comes back (r6a7: no "visibly
     // held" check — a duplicate is acceptable, a loss is not).
-    _restoreToComposer([...undelivered, ...leftovers],
-        mode === 'stopped' ? 'Stopped: not read by the agent.' : 'Not read by the agent.', sid);
+    // §4SB r2 (operator): after a CLEAN reply the agent's leftovers are SENT,
+    // in order and before anything held later in this turn, as normal
+    // requests through the held-message path (the server backdates each to
+    // its accept time, `note_handed_back`, so a "yes" cannot confirm past a
+    // later "wait"), in TYPING order with what the turn held (r3). A stop or
+    // hold word anywhere in the turn — typed, read, held or left over —
+    // keeps EVERY line of the turn back, before it as well as after it
+    // (r3, the CLI's r8 decision), named. Any other ending: all to the tray.
+    if (clean && !failed) {
+        const word = _turnHoldWord(info, gen, leftovers);
+        if (word !== null) {
+            const seqs = _leftoverSeqs(info, leftovers);
+            const back = [...leftovers.map((text, i) => ({ text, seq: seqs[i] })), ..._unholdTurn(gen, sid, info ? info.epoch : _convEpoch)]
+                .sort((a, b) => a.seq - b.seq).map(x => x.text);
+            _restoreToComposer(back, info && info.holdLate === word                       // §4SB r6
+                ? `'${word}' from an earlier turn arrived while this one ran, so nothing of it is sent on its own.`
+                : `'${word}' was typed during the turn, so nothing of it is sent on its own.`, sid);
+        } else {
+            const seqs = _leftoverSeqs(info, leftovers);
+            const resend = leftovers.map((text, i) => ({ text, div: null, seq: seqs[i], gen, sid, epoch: info ? info.epoch : _convEpoch }));
+            const at = _sendAfterTurn.findIndex(q => q.gen === gen);
+            const mine = [..._sendAfterTurn.filter(q => q.gen === gen), ...resend].sort((a, b) => a.seq - b.seq);
+            _sendAfterTurn = _sendAfterTurn.filter(q => q.gen !== gen);
+            _sendAfterTurn.splice(at < 0 ? _sendAfterTurn.length : at, 0, ...mine);
+            for (const r of resend) _rememberHeld(r);    // r5: the agent handed its copy out — this is the only one
+        }
+        _restoreToComposer(undelivered, 'Not read by the agent.', sid);
+    } else {
+        // §4SB r4: a Stop, a lost or a failed turn ends the re-send chain
+        // too — nothing still waiting for this conversation is sent (the
+        // drain would have sent an EARLIER turn's items: their turn did end
+        // with a reply)
+        const chain = _unholdTurn(gen, sid, info ? info.epoch : _convEpoch).map(q => q.text);
+        _restoreToComposer(chain, mode === 'stopped' ? 'Stopped, so nothing more was sent.'
+            : failed ? 'The messages the agent did not read could not be fetched, so nothing more was sent.'
+            : 'The turn did not end with a reply, so nothing more was sent.', sid);
+        _restoreToComposer([...undelivered, ...leftovers],
+            mode === 'stopped' ? 'Stopped: not read by the agent.' : 'Not read by the agent.', sid);
+    }
     if (!clean || failed) _restoreToComposer(typed, 'The agent may or may not have read these.', sid);
     if (failed) {
         addMessage('system', 'Could not fetch the messages the agent did not read; '
             + 'they come back when the next turn starts.');
     }
+    _forgetTyped(gen);                       // §4SB: handed back or adopted; no longer a reload's orphan
     if (info) info.settled = true;
 }
 
@@ -3666,6 +3977,7 @@ function _drainSendAfterTurn() {
         if (i < 0) return;
         const it = _sendAfterTurn.splice(i, 1)[0];
         if (it.div) it.div.remove();
+        _forgetHeld([it]);                           // r5: sent or trayed below
         const info = _turnInfo.get(it.gen) || null;
         if (!info || info.outcome !== 'done') {
             _restoreToComposer([it.text], info && info.outcome === 'stopped'
@@ -3677,6 +3989,10 @@ function _drainSendAfterTurn() {
             _restoreToComposer([it.text], 'The conversation changed before this was sent.', it.sid);
             continue;
         }
+        // §4SB r7: sendMessage calls _beginQueuedTurn synchronously, so no
+        // late inbox answer can land between this settle and the next turn's
+        // record — an `await` added before it would reopen that window (the
+        // late branch then finds no turn of the session and trays the chain).
         sendMessage(false, it.text);
         return;
     }

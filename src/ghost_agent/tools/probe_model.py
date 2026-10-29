@@ -248,6 +248,9 @@ async def tool_probe_model(context, prompts: Any = None, chain: bool = False,
                 # its own request (§4QA); the worker leg never touches main
                 use_worker=(node == "worker"), off_main_only=(node == "worker"),
                 is_background=_bg, task_label="probe-model",
+                # §4SC-b: a foreground probe on main does not open with the
+                # head — a side call (the conversation is saved first)
+                side_main=(not _bg and node == "main"),
                 timeout=min(_PER_CALL_TIMEOUT_S, int(left)), total_budget=left), left)
             served = served_leg(data).get("served_by") or ""
             if node == "worker" and served and served != "worker":

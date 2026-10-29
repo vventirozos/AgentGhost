@@ -68,6 +68,12 @@ RESTORE_TIMEOUT_S = 30.0
 #: §4RW review: seconds allowed per GB of a saved state (10-26: 1.7 GB took 5-9 s under memory pressure)
 RESTORE_S_PER_GB = 10.0
 SAVE_TIMEOUT_S = 60.0
+#: §4SA: a save's bound grows with the state like the restore's — a flat 60 s
+#: can time a multi-GB write out under memory pressure, and the .part llama
+#: goes on writing is never kept. ~35 KB of KV per token (§4RL) plus the
+#: checkpoints (--ctx-checkpoints 12 × ~150 MiB)
+STATE_BYTES_PER_TOKEN = 35_000
+CHECKPOINTS_BYTES = 12 * 150 * 1024 * 1024
 #: a .part file older than this is a save that never finished
 STALE_PART_S = 3600.0
 #: r3: a prompt that shares no token with the slot: llama selects the slot by LRU
@@ -156,9 +162,14 @@ def head_key(identity: str, rendered: str) -> str:
     return hashlib.sha1(blob.encode("utf-8", "ignore")).hexdigest()[:16]
 
 
-def conv_key(identity: str, session: str) -> str:
-    """§4RV: one file per conversation (its slot-session key) per server."""
-    blob = identity + "\nconversation\n" + str(session or "")
+def conv_key(identity: str, session: str, level: Optional[str] = None) -> str:
+    """§4RV: one file per conversation (its slot-session key) per server.
+    §4SA review: and per effort LEVEL when known — the effort sentence is in
+    the head, so a state built at one level cannot serve a prompt at another;
+    one file per conversation made every level flip overwrite the other
+    level's state (A→B→A re-read the whole conversation). A level-less key is
+    the plain one (files saved before §4SA, an unknown server level)."""
+    blob = identity + "\nconversation\n" + str(session or "") + (f"\n@{level}" if level else "")
     return "c" + hashlib.sha1(blob.encode("utf-8", "ignore")).hexdigest()[:15]
 
 
@@ -321,6 +332,17 @@ def restore_timeout_s(d: Path, key: str) -> float:
     return max(RESTORE_TIMEOUT_S, RESTORE_S_PER_GB * gb)
 
 
+def save_timeout_s(n_tokens: int) -> float:
+    """§4SA: seconds a save of a slot holding ``n_tokens`` may take —
+    max(SAVE_TIMEOUT_S, RESTORE_S_PER_GB per estimated GB)."""
+    try:
+        n = max(0, int(n_tokens or 0))
+    except (TypeError, ValueError):
+        n = 0
+    gb = (n * STATE_BYTES_PER_TOKEN + CHECKPOINTS_BYTES) / 1e9
+    return max(SAVE_TIMEOUT_S, RESTORE_S_PER_GB * gb)
+
+
 def restore(base: str, d: Path, key: str) -> Tuple[bool, str, float]:
     """(restored, detail, seconds). A restore whose token count is not the
     saved one is discarded with its file."""
@@ -451,6 +473,7 @@ def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
                          if not p.name.endswith(".part.bin")),
                         key=lambda t: t[0], reverse=True)
         kept: dict = {}
+        conv_seen: set = set()  # §4SA r2: conversations (the meta's `conv`), not their per-level files
         conv_bytes = 0          # of the conversations kept so far, newest first
         for used_at, p in ranked:
             if _last_use(p) != used_at:
@@ -471,13 +494,24 @@ def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
             except OSError:
                 continue
             n = kept.get(kind, 0)
-            if (n >= (KEEP_CONV if kind == CONV else keep)
+            # §4SA review r2: conversation files are per conversation AND effort
+            # level — the count is of conversations (the meta's `conv`, the
+            # plain key; a pre-§4SA file's key IS that plain key, so it groups
+            # with the conversation's level files), else an effort-switching
+            # owner's rotation shrank to two conversations
+            cid = (str(meta_field(d, key, "conv") or key)) if kind == CONV else None
+            same_conv = kind == CONV and cid in conv_seen
+            if ((n >= (KEEP_CONV if kind == CONV else keep) and not same_conv)
                     or (kind == CONV and n >= 1 and conv_bytes + size > CONV_BYTES_MAX)):
                 discard(d, key, keep_part=True)   # a dropped big one leaves room for an older, smaller one
                 continue
-            kept[kind] = n + 1
             if kind == CONV:
+                if not same_conv:
+                    conv_seen.add(cid)
+                    kept[kind] = n + 1
                 conv_bytes += size
+            else:
+                kept[kind] = n + 1
         for p in d.glob("head-*.part.bin"):
             try:
                 if now - p.stat().st_mtime > STALE_PART_S:

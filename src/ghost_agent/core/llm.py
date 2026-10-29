@@ -7,6 +7,7 @@ import os
 import re
 import contextlib
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from functools import partial
 from typing import List, Dict, Any, Optional
 import httpx
@@ -748,6 +749,18 @@ def _h(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:16]
 
 
+#: §4SC-b: what a `side_main` call is, for the agent's side hook's log line —
+#: a ContextVar, not a client attribute: the hook awaits, and two requests'
+#: side calls on one client would read each other's name
+_side_call_what_ctx: ContextVar[str] = ContextVar("side_call_what", default="")
+
+
+def side_call_what() -> str:
+    """The current task's `side_main` call, named for the side hook ('' when
+    the call is not one — the picture look on the vision pool)."""
+    return _side_call_what_ctx.get()
+
+
 def head_shape(payload) -> Optional[tuple]:
     """``(system length, system hash, tool count, tools hash)`` of a head
     payload — the WHOLE warmed system text and tool list (r1: the profile
@@ -814,6 +827,16 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
     """A call just ran (or started streaming) on the MAIN slot: mark whether
     the slot still opens with the head. No reference yet → no mark."""
     try:
+        if not background and opened_at is not None:
+            changed_at = getattr(llm, "_slot_changed_at", None)
+            if isinstance(changed_at, (int, float)) and changed_at > opened_at:
+                # §4SA review r2: a stream that opened before the slot changed
+                # hands (its conversation saved and released, another one
+                # restored or taken) says nothing about what the slot holds now
+                # — no mark, no owner. (r1 refused only the ownership and still
+                # wrote the marks from the stale payload: the new owner's next
+                # save then read "a call ran since" and skipped.)
+                return
         if not str(label or "").startswith(OUTSIDE_CALL_LABEL):
             # §4RQ: the agent's own call holds the slot now, not the outside one
             llm._outside_slot_dirty = False
@@ -824,6 +847,16 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
         llm._head_displaced_early = bool(llm._head_displaced and background)
         llm._head_displaced_by = str(label or "unlabelled")
         llm._last_main_call_end = time.monotonic()
+        # §4SA: did the slot move on from the owner's conversation? A call
+        # that opens with the head, or shares its tools (the owner on Slack:
+        # a public system text over the same tool block), is that
+        # conversation's own; a background call, a member's turn, a game move
+        # or an outside call is not. `_head_displaced` keeps saying whether
+        # the HEAD is in the slot (the re-warm's question); this says whose
+        # state it holds (the save's and the switch's question).
+        from ..utils.logging import requester_is_member
+        llm._slot_moved_on = bool(background or requester_is_member()
+                                  or (llm._head_displaced and not shares_head_tools(payload, ref)))
         if not background:
             # §4RP: a request's own call that opens with the head — its
             # conversation owns the slot now. A call without the head (a
@@ -837,16 +870,28 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
             from ..utils.logging import slot_session_context
             key = slot_session_context.get()
             owner = getattr(llm, "_slot_session", None)
-            used = getattr(llm, "_slot_session_used", None)
-            taken_since = bool(owner and opened_at is not None and isinstance(used, (int, float))
-                               and used > opened_at)
-            if key and (key == owner or (not llm._head_displaced and not taken_since)):
+            # §4SA: a call that shares the head's tools (the owner on Slack)
+            # takes the slot too — before, that conversation never owned it,
+            # was never saved, and re-read its thread on every message. A
+            # channel member's never does: `_slot_moved_on` is True for a
+            # member's call whatever its tools (the battery showed a second
+            # role check here dead). A stream that opened before the slot
+            # changed hands returned above.
+            if key and (key == owner or not llm._slot_moved_on):
+                if key != owner:
+                    llm._slot_changed_at = time.monotonic()        # §4SA review: a change of hands
                 llm._slot_session = key
                 llm._slot_session_used = time.monotonic()
                 # §4RP-b: and which request of it — its next request re-reads
                 # from just past the head (the first message's label changes)
                 from ..utils.logging import request_id_context
-                llm._slot_request = str(request_id_context.get() or "")
+                rid = str(request_id_context.get() or "")
+                # §4SA: how many main calls this request has made on the slot —
+                # llama keeps 12 checkpoints and erases the oldest first, so a
+                # long request can push out the one its follow-up resumes from
+                llm._slot_request_calls = (int(getattr(llm, "_slot_request_calls", 0) or 0) + 1
+                                           if rid and rid == getattr(llm, "_slot_request", None) else 1)
+                llm._slot_request = rid
     except Exception:  # noqa: BLE001
         pass
 
@@ -935,11 +980,41 @@ def outside_slot_dirty(llm) -> bool:
     return getattr(llm, "_outside_slot_dirty", False) is True
 
 
-def release_slot_session(llm) -> None:
-    """§4RP: the head is back in the slot — no conversation owns it."""
+def slot_moved_on(llm) -> bool:
+    """§4SA: the slot's last call was not the owner conversation's own (see
+    `note_main_slot_prompt`) — its record, if any, has outlived its state."""
+    return getattr(llm, "_slot_moved_on", False) is True
+
+
+#: §4SA: a same-conversation follow-up restores the head first when the
+#: previous request made at least this many main calls (0 = never). llama
+#: keeps --ctx-checkpoints (12) and erases the oldest first, so a request of
+#: many tool turns can lose the checkpoint at its message; the follow-up then
+#: re-reads from token 0 (head included, ~166 s) unless the head comes back
+#: first and only the conversation is re-read. Off until measured.
+CONV_HEAD_FIRST_CALLS_ENV = "GHOST_CONV_HEAD_FIRST_CALLS"
+
+
+def conv_head_first_calls() -> int:
+    raw = (os.getenv(CONV_HEAD_FIRST_CALLS_ENV) or "").strip()
+    try:
+        return max(0, int(raw)) if raw else 0
+    except ValueError:
+        return 0
+
+
+def release_slot_session(llm, stamp: bool = True) -> None:
+    """§4RP: the head is back in the slot — no conversation owns it. §4SA
+    review: ``stamp`` marks the change of hands, so a stream that opened before
+    it never takes the slot back; the re-warm's release passes False — it runs
+    with nothing live, and a request whose stream opened during the re-warm's
+    own call must still take the slot (review r2)."""
     try:
         llm._slot_session = None
         llm._slot_request = None
+        llm._slot_request_calls = 0           # §4SA review: a count never outlives its request
+        if stamp:
+            llm._slot_changed_at = time.monotonic()
     except Exception:  # noqa: BLE001
         pass
 
@@ -3755,7 +3830,13 @@ class LLMClient:
         except Exception as e:  # noqa: BLE001
             logger.info("before-main-dispatch hook skipped: %s: %s", type(e).__name__, e)
 
-    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None, before_dispatch=None) -> Dict[str, Any]:
+    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None, before_dispatch=None, side_main: bool = False) -> Dict[str, Any]:
+        # ``side_main`` (§4SC): a foreground call of the request's own that does
+        # NOT open with the head (the §4OB cut-write continuation) displaces the
+        # conversation in the slot exactly as a picture look does — llama cannot
+        # park a >31k-token state (prompt state 3.4 GB > --cache-ram 2 GB; req
+        # 72c2f05d re-prefilled 41,742 tokens, 282 s). It takes the side path:
+        # the conversation is saved first, the request's next head call restores.
         if is_background:
             # The foreground wait protects exactly one resource: the MAIN
             # inference slot. A call that will be served by an off-main
@@ -3885,10 +3966,26 @@ class LLMClient:
                 self.foreground_tasks += 1
             try:
                 _side = False
-                if not (use_swarm or use_worker or use_vision or use_coding or use_critic or off_main_only):
+                if side_main and not off_main_only and not (use_swarm or use_worker or use_vision
+                                                            or use_coding or use_critic):
+                    _side = True                                   # §4SC: the cut-write continuation
+                    # §4SC-b: named by its label (fact-check verify, probe,
+                    # research summary); the unlabelled one is the continuation
+                    _what_tok = _side_call_what_ctx.set(
+                        "this request's cut-write continuation"
+                        if str(task_label or "") in ("", "write-continuation")
+                        else f"this request's {task_label} call")
+                    try:
+                        await self._before_side_main_dispatch(payload)
+                    finally:
+                        _side_call_what_ctx.reset(_what_tok)
+                elif not (use_swarm or use_worker or use_vision or use_coding or use_critic or off_main_only):
                     await self._before_main_dispatch(payload)
-                elif not off_main_only and self._pool_is_main_box(use_swarm, use_worker, use_vision,
-                                                                  use_coding, use_critic):
+                elif self._pool_is_main_box(use_swarm, use_worker, use_vision, use_coding, use_critic):
+                    # §4SC-d: `off_main_only` governs the FALLBACK, not where the
+                    # pool lives — a pool that IS the main box displaces the
+                    # conversation either way; `_side` so a failed prefill is
+                    # counted as displaced too
                     _side = True
                     await self._before_side_main_dispatch(payload)
                 try:

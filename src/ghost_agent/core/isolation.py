@@ -375,6 +375,7 @@ ISOLATION_NULLED_ATTRS: Tuple[str, ...] = (
     "workspace_model",
     "profile_memory",
     "scheduler",
+    "_rewarm_task",        # §4SA: the live head re-warm task (main.py cancels it at shutdown) — no isolated turn's
     "journal",
     "trajectory_collector",
     "episodic_memory",

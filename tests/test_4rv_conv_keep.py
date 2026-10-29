@@ -152,7 +152,7 @@ async def test_another_conversation_saves_the_kept_one_first(cwarm, monkeypatch)
     await agent._slot_switch_before(_turn(st))
     assert st["order"] == [f"save:{H.CONV}", "restore"]
     key, n, at_least = st["conv_saves"][0]
-    assert key == H.conv_key("id", "sess-a") and n >= 28213 + A.CONV_MIN_PAST_TOKENS and at_least
+    assert key == H.conv_key("id", "sess-a") and n >= 28213 + A.conv_min_past_tokens() and at_least
     assert llm._slot_session is None
     assert any("saved to disk before" in m for m in st["lines"])
     # §4RW: one icon per event — the conversation's save, then the head's restore
@@ -224,9 +224,9 @@ async def test_no_save_when_the_slot_is_not_that_conversation(cwarm, monkeypatch
     await _warm_with_file(agent, st, quiet=True)
     _switch_env(agent, llm, st, monkeypatch, slot=40000)
     _conv_env(agent, llm, st, monkeypatch, used_after_end=(case != "other_call_since"),
-              slot=28213 + A.CONV_MIN_PAST_TOKENS - 1 if case == "too_short" else 40000)
+              slot=28213 + A.conv_min_past_tokens() - 1 if case == "too_short" else 40000)
     if case == "displaced":
-        llm._head_displaced = True
+        llm._head_displaced = llm._slot_moved_on = True
     if case == "no_owner":
         llm._slot_session = None
     if case == "off":
@@ -951,7 +951,7 @@ async def test_a_replaced_slot_does_not_count_as_the_owners_conversation(cwarm, 
         return (True, "41000 tokens", 0.8)
     monkeypatch.setattr(H, "restore", restore)
     _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=9500)
-    llm._head_displaced = True                             # a member's call ran since
+    llm._head_displaced = llm._slot_moved_on = True        # a member's call ran since
     tok = request_id_context.set("req-next")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -1166,7 +1166,8 @@ async def test_a_conversation_is_saved_with_the_level_it_was_built_at(cwarm, mon
     _conv_env(agent, llm, st, monkeypatch)
     agent._slot_level = slot_level
     assert await agent._conv_save(llm, "x") is True
-    assert st["extras"][-1] == extra
+    assert st["extras"][-1].get("effort") == (extra or {}).get("effort")
+    assert st["extras"][-1]["head_in_slot"] is True              # §4SA: the state opens with the head
 
 
 @pytest.mark.parametrize("kw,default,want", [

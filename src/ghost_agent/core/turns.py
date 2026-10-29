@@ -273,20 +273,56 @@ class TurnRegistry:
             return
         turn.accepting = False
         if turn.inbox and turn.session_id and not turn._cancel:
-            from .queued_messages import MAX_PENDING, LEFTOVER_MAX_SESSIONS
-            self._prune_leftovers_locked()
-            kept = self._leftovers.pop(turn.session_id, [])     # re-inserted: newest last
-            kept.extend(dict(m, kind=turn.kind) for m in turn.inbox)
-            self._leftovers[turn.session_id] = kept[-MAX_PENDING:]
-            while len(self._leftovers) > LEFTOVER_MAX_SESSIONS:
-                self._leftovers.pop(next(iter(self._leftovers)))
+            self._add_leftovers_locked(turn.session_id, turn.kind, turn.inbox, tag=turn.req_id)
         turn.inbox.clear()
+
+    def add_leftovers(self, session_id: str, kind: str, items: List[dict]) -> int:
+        """§4SB: messages a turn DRAINED but never read (cancelled, or an
+        upstream error after the drain) go to the conversation's leftovers
+        like unread inbox rows do — ``items`` are ``{"text", "ts"}`` dicts;
+        no cancel check (a cancelled turn's drained rows are exactly the
+        case). Returns how many were kept."""
+        items = [m for m in (items or []) if isinstance(m, dict) and str(m.get("text") or "").strip()]
+        if not session_id or not items:
+            return 0
+        with self._lock:
+            return self._add_leftovers_locked(str(session_id), str(kind or ""), items, tag="")
+
+    def _add_leftovers_locked(self, session_id: str, kind: str, items, *, tag: str) -> int:
+        """Append ``items`` to the session's leftovers: TTL-pruned, tagged
+        with ``kind``, newest MAX_PENDING kept per session, LEFTOVER_MAX_SESSIONS
+        bound. Logs what moved and what was dropped (§4SB: the cap dropped the
+        oldest silently — two turns ending with unread rows lost the first's)."""
+        from .queued_messages import MAX_PENDING, LEFTOVER_MAX_SESSIONS
+        self._prune_leftovers_locked()
+        kept = self._leftovers.pop(session_id, [])     # re-inserted: newest last
+        # §4SB r2: the TTL counts from NOW (`kept_at`); the accept `ts` stays as it
+        # was — a re-sent row's start is backdated to it (a hold typed after the
+        # row still withdraws it), so it must never be refreshed
+        now = time.time()
+        kept.extend(dict(m, kind=kind, kept_at=now) for m in items)
+        dropped = max(0, len(kept) - MAX_PENDING)
+        self._leftovers[session_id] = kept[-MAX_PENDING:]
+        while len(self._leftovers) > LEFTOVER_MAX_SESSIONS:
+            self._leftovers.pop(next(iter(self._leftovers)))
+        n = len(items)
+        try:                              # a log line never raises into the registry
+            from ..utils.logging import Icons, pretty_log
+            head = f"[{(tag or session_id)[:8]}]"
+            pretty_log("Queued Message", f"{head} {n} unread → leftovers", icon=Icons.QUEUED_MSG)
+            if dropped:
+                pretty_log("Queued Message",
+                           f"{head} {dropped} older unread message(s) dropped (leftovers full)",
+                           icon=Icons.QUEUED_MSG)
+        except Exception:  # noqa: BLE001
+            pass
+        return min(n, MAX_PENDING)        # the cap drops the OLDEST: earlier rows first
 
     def _prune_leftovers_locked(self) -> None:
         from .queued_messages import LEFTOVER_TTL_S
         cutoff = time.time() - LEFTOVER_TTL_S
         for sid in list(self._leftovers):
-            fresh = [m for m in self._leftovers[sid] if m.get("ts", 0) >= cutoff]
+            fresh = [m for m in self._leftovers[sid] if m.get("kept_at", m.get("ts", 0)) >= cutoff]
             if fresh:
                 self._leftovers[sid] = fresh
             else:
@@ -313,12 +349,20 @@ class TurnRegistry:
         session, never by `current()`. It may no longer accept messages (its
         streamed final is draining): a stop word or a status question still
         reaches it, and the router refuses an inject."""
+        hits = self.find_running_all(session_id, kind)
+        return hits[-1] if hits else None
+
+    def find_running_all(self, session_id: str, kind: str) -> List[ActiveTurn]:
+        """§4SB: EVERY running turn of this sender, oldest first — a draining
+        streamed tail and a newer turn of the same conversation can both be
+        running, and a "stop" must reach both (find_running alone hit the
+        newest)."""
         if not session_id:
-            return None
+            return []
         with self._lock:
             hits = [t for t in self._turns.values()
                     if t.running and t.session_id == str(session_id) and t.kind == kind]
-        return max(hits, key=lambda t: t.started_at) if hits else None
+        return sorted(hits, key=lambda t: t.started_at)
 
 
 def get_turn_registry(agent) -> TurnRegistry:

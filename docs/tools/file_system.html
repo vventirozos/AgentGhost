@@ -978,7 +978,17 @@ arguments - Unterminated string", so it regenerated the same full-size write. Th
   <code>&lt;&lt;&lt;END OF FILE&gt;&gt;&gt;</code>; a round that restarts the file, repeats its tail or is prose is
   dropped (two abort); bounded by 6 rounds of 8k tokens and the request's time budget (§4RK: 480 s per round and 1,500 s in all — the 27B generates ~23 tok/s, so a full round is ~356 s before its prefill; the old 300 s could not finish one). The model sees one result: "Wrote N
   bytes in K parts — continued automatically". If the rounds run out the file stays in progress with the usual note.
-  Log line: <code>write continued</code>. Pins: <code>tests/test_4ob_write_continuation.py</code>.</p>
+  Log line: <code>write continued</code>. Pins: <code>tests/test_4ob_write_continuation.py</code>.
+  <strong>§4SC (2026-10-29):</strong> each continuation round is a call of the request's own that does not open with the head, so it
+  replaced the request's conversation in the main slot unsaved (request 72c2f05d: a 51,604-token state destroyed, the next turn
+  re-prefilled 41,742 tokens in 282&nbsp;s — llama cannot park a state larger than <code>--cache-ram</code>). The round now goes through
+  <code>chat_completion(..., side_main=True)</code>: the conversation is saved to disk first (📼 "saved to disk before this request's
+  cut-write continuation") and the request's next head call restores it, as after a picture look —
+  <a href="../core/head_saves.html#cut-write">head_saves</a>. Pins: <code>tests/test_4sc_cut_write_slot.py</code>.
+  <strong>§4SC-b:</strong> the same side path now covers the other foreground calls that run on main without the head (the
+  fact-check verify, a <code>probe_model</code> on main, the research summary), the anonymous query rewrite left main, the
+  §4MD truncation continuation keeps its tool list (<code>tool_choice: "none"</code>) so it opens with the head, and the
+  side call's name in the 📼 line comes from its <code>task_label</code> — <a href="../core/llm.html#4sc-b">llm §4SC-b</a>.</p>
   <p><strong>Two guards from the first live probe.</strong> A 300-fact page was cut with ~1,000 facts already saved; six
   no-think rounds then added 170 KB more and degenerated into one fact repeated thousands of times. <em>Close mode:</em>
   when the file already holds at least as many list items (quoted strings, bullets, numbered lines, <code>&lt;li&gt;</code>

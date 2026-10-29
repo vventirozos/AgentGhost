@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=7.8">
+    <link rel="stylesheet" href="/static/style.css?v=7.9">
 </head>
 
 <body>
@@ -223,8 +223,11 @@
                 <span id="turn-status-desc"></span>
                 <span id="turn-status-icon"></span>
             </div>
-            <!-- §4RZ: messages handed back (not read, or maybe not read); Insert / Dismiss each -->
-            <div id="restore-tray" class="hidden" role="region" aria-live="polite" aria-label="Messages handed back"></div>
+            <!-- §4RZ: messages handed back (not read, or maybe not read); Insert / Dismiss each.
+                 §4SB: the tray itself is not live (a re-render read the whole tray out again);
+                 #restore-status says what changed in one line. -->
+            <div id="restore-tray" class="hidden" role="region" aria-live="off" aria-label="Messages handed back"></div>
+            <div id="restore-status" role="status" aria-live="polite"></div>
             <div id="input-area">
                 <textarea id="chat-input" placeholder="Enter message" rows="1"
                           aria-label="Message" enterkeyhint="send"></textarea>
@@ -372,7 +375,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=17.0"></script>
+    <script type="module" src="/static/app.js?v=17.4"></script>
 </body>
 
 </html>

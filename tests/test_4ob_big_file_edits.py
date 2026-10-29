@@ -134,7 +134,7 @@ class _Slow:
     def __init__(self):
         self.calls = 0
 
-    async def chat_completion(self, payload, timeout=None, task_label=""):
+    async def chat_completion(self, payload, timeout=None, task_label="", side_main=False):
         self.calls += 1
         await asyncio.sleep(30)
         return {"choices": [{"message": {"content": "]\n" + W.END_MARKER}, "finish_reason": "stop"}]}
@@ -168,7 +168,7 @@ def test_the_completion_result_carries_the_cap_note(tmp_path):
     """Fails where the model finished a continued file and never learned that
     it was cut, from the cut note (review C MAJOR; the 8k cap it named is gone, §4RF)."""
     class Done:
-        async def chat_completion(self, payload, timeout=None, task_label=""):
+        async def chat_completion(self, payload, timeout=None, task_label="", side_main=False):
             return {"choices": [{"message": {"content": "]\n" + W.END_MARKER}, "finish_reason": "stop"}]}
     ctx = _Ctx(tmp_path)
     ctx.llm_client = Done()

@@ -298,7 +298,10 @@ async def test_the_taps_lead_stays_at_the_head_of_a_stopped_reply():
 
 async def test_a_stop_before_anything_showed_keeps_the_question_in_the_session():
     """r2 m3: a Stop the turn never reached a check for (a prefill), then the
-    proxy's hang-up: the session still gets the turn, marked cancelled."""
+    proxy's hang-up: the session still gets the turn — the request row alone
+    (§4SB: a reply that is ONLY the "_(Turn cancelled…)" stub is no reply;
+    one was consolidated into smart memory on 10-29). Until §4SB this pinned
+    the stub itself as the stored reply."""
     from ghost_agent.api.routes import chat_proxy
     from ghost_agent.core.turns import get_turn_registry
     a, _ = _scripted_agent([_prefill_forever])
@@ -328,7 +331,8 @@ async def test_a_stop_before_anything_showed_keeps_the_question_in_the_session()
                 break
             await asyncio.sleep(0.02)
     assert store.append_turn.called
-    assert store.append_turn.call_args.args[2].startswith("_(Turn cancelled")
+    assert [m["content"] for m in store.append_turn.call_args.args[1]] == ["explain"]   # the request row
+    assert store.append_turn.call_args.args[2] == ""                                  # no stub stored (§4SB)
 
 
 async def test_a_plain_stop_commits_without_a_retract_when_the_shown_text_ends_in_a_space():

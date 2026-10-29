@@ -69,13 +69,13 @@ class _StubLLM:
         self.content = content
         self.calls = 0
 
-    async def chat_completion(self, payload):
+    async def chat_completion(self, payload, **kw):   # §4SC-b: off-main kwargs
         self.calls += 1
         return {"choices": [{"message": {"content": self.content}}]}
 
 
 class _BoomLLM:
-    async def chat_completion(self, payload):
+    async def chat_completion(self, payload, **kw):   # §4SC-b: off-main kwargs
         raise RuntimeError("upstream down")
 
 

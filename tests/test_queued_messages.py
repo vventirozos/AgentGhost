@@ -716,7 +716,9 @@ async def test_switch_off_leaves_the_message_in_the_inbox_unread(monkeypatch, tm
     assert reg.take_leftovers("s2", kind="owner") == ["also check reuters"]
 
 
-async def test_a_message_posted_during_the_last_generation_is_a_leftover(monkeypatch, tmp_path):
+async def test_a_message_posted_during_the_last_generation_is_read_in_one_more_step(monkeypatch, tmp_path):
+    """§4SB: before, it was a leftover (live 2026-10-29 05:38: never read) —
+    now the loop takes ONE extra step and the model goes on from it."""
     monkeypatch.setenv("GHOST_QUEUED_MESSAGES", "1")
     agent, ctx, _ = _loop_agent(monkeypatch, tmp_path)
     reg = get_turn_registry(agent)
@@ -726,12 +728,14 @@ async def test_a_message_posted_during_the_last_generation_is_a_leftover(monkeyp
         calls["n"] += 1
         if calls["n"] == 1:
             assert reg.post("web-q3", "one more thing")
-        return _resp("The answer is 4.")
+            return _resp("The answer is 4.")
+        return _resp("And the one more thing: five.")
     ctx.llm_client.chat_completion = AsyncMock(side_effect=_complete)
     body = {"session_id": "s3", "messages": [{"role": "user", "content": "what is 2+2?"}]}
-    await agent.handle_chat(body, FakeBgTasks(), request_id="web-q3", requester_role="owner")
-    assert reg.take_leftovers("s3", kind="owner") == ["one more thing"]
-    assert body.get("_queued_delivered") == []
+    final, _, _ = await agent.handle_chat(body, FakeBgTasks(), request_id="web-q3", requester_role="owner")
+    assert reg.take_leftovers("s3", kind="owner") == []
+    assert body.get("_queued_delivered") == [{"role": "user", "content": "one more thing"}]
+    assert "The answer is 4." in final and "five" in final
 
 
 async def test_a_streamed_final_stops_accepting_before_it_drains(monkeypatch, tmp_path):

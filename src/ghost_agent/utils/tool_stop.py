@@ -258,12 +258,15 @@ def interrupted_text(tool: str, *, started: bool, killed: bool) -> str:
     if not started:
         return (f"NOT RUN: the user interrupted the tool batch before this {tool} call started."
                 + tail)
+    # §4SB: a call cut mid-write (a script writing report.csv, a download)
+    # leaves half-written files; the model is told to check, not trust them
+    files = " Files it was writing may be incomplete — check them before relying on them."
     if killed:
         return (f"INTERRUPTED BY THE USER: the user stopped this {tool} call while it was "
-                "running, and it was stopped. Its output is not available." + tail)
+                "running, and it was stopped. Its output is not available." + files + tail)
     return (f"INTERRUPTED BY THE USER: the user stopped this {tool} call while it was "
             "running. Its output was discarded; work it started may still finish in the "
-            "background." + tail)
+            "background." + files + tail)
 
 
 def uncut_note(tool: str) -> str:

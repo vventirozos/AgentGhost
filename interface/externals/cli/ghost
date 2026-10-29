@@ -757,13 +757,30 @@ def _fold(text: Any) -> str:
     return "".join(ch for ch in t if not unicodedata.combining(ch))
 
 
+def _hold_word(text: str) -> str:
+    """The stop or hold word a typed line IS ("stop", "wait, no", "hold on",
+    "σταμάτα"…), else "". Sent later as a new request such a line would
+    mean something else — it is never held for sending (review r5: typed
+    before the turn registered, it came back as a fresh turn).
+
+    §4SB r2/r3: a whole-line stop word always; otherwise only a line that
+    is nothing but deny words and punctuation ("wait, no", "no no no no").
+    "no sugar", "cancel that", "stop the backup job", "ok no problem" are
+    ordinary text and are held, then sent after the turn (r5 kept them;
+    r3 dropped a word-count cap that let "no no no no" through)."""
+    f = _fold(text).strip()
+    if not f:
+        return ""
+    if _STOP_RE.fullmatch(f):
+        return f.rstrip(" .!")
+    hits = _DENY_RE.findall(f)
+    if not hits or re.search(r"\w", _DENY_RE.sub("", f)):
+        return ""                           # other words too: ordinary text
+    return " ".join(hits[0].split())
+
+
 def _is_hold_word(text: str) -> bool:
-    """A stop or a hold ("stop", "wait", "no", "σταμάτα"…): sent later as
-    a new request it would mean something else — it is never held for
-    sending (review r5: typed before the turn registered, it came back as a
-    fresh turn)."""
-    f = _fold(text)
-    return bool(_STOP_RE.fullmatch(f.strip()) or _DENY_RE.search(f))
+    return bool(_hold_word(text))
 
 
 class _Ended:
@@ -1266,7 +1283,7 @@ class GhostCLI:
         self._sending: tuple[str, dict, bool] | None = None
         # The busy turn's ONE deferring SIGINT handler box (review r12).
         self._sig: dict | None = None
-        self._streamed = {"any": False, "refused": False}
+        self._streamed = {"any": False, "refused": False, "inbox_cancel": False}
         self._turn_clean = False
         self._turn_stopped = False
         self._busy_session: PromptSession | None = None
@@ -1689,12 +1706,18 @@ class GhostCLI:
 
     def _in_typing_order(self, items: list[str]) -> list[str]:
         """This turn's items sorted by when they were typed; a text typed
-        twice gets each occurrence's own index (review r4). Items not typed
-        this turn (another client's, an earlier turn's) come first."""
+        twice gets each occurrence's own index (review r4) — the LAST
+        unmatched one (§4SB r4: the agent reads in order, so the earlier
+        occurrence is the read one; identical texts are order-indifferent
+        among themselves). Items not typed this turn (another client's, an
+        earlier turn's) come first. Known limit (r5 review): ``_typed`` mixes
+        held, injected and restored lines, so a text typed as held, then
+        again as an inject the turn read, hands the held one the inject's
+        later slot — identical texts, order only."""
         slots: dict[str, list[int]] = {}
         for i, t in enumerate(self._typed):
             slots.setdefault(t, []).append(i)
-        keyed = [(slots[t].pop(0) if slots.get(t) else -1, n, t)
+        keyed = [(slots[t].pop() if slots.get(t) else -1, n, t)
                  for n, t in enumerate(items)]
         return [t for _, _, t in sorted(keyed)]
 
@@ -1763,13 +1786,26 @@ class GhostCLI:
     def _hold(self, text: str, why: str = "") -> None:
         # A stop/hold word typed this turn (``_typed`` includes this line)
         # also holds back every line typed after it: sent ahead of it, they
-        # would undo the "wait" (review r6).
-        if any(_is_hold_word(t) for t in self._typed) or _is_hold_word(text):
+        # would undo the "wait" (review r6). Named (§4SB r2).
+        word = next((w for w in map(_hold_word, self._typed) if w), "") or _hold_word(text)
+        if word:
+            # §4SB r4: the re-send chain still waiting in the outbox (an
+            # earlier turn's leftovers / held lines) stops here too — sent
+            # on, it would out-run the «wait» (the line sending now is
+            # already in _sending, not in the outbox)
+            chain = list(self._outbox)
+            self._outbox.clear()
+            # APPEND, never prepend (r5 review MAJOR): the busy prompt commits
+            # `_restored[shown:]` by POSITION — a prepend puts the chain into
+            # the slots the prompt already shows and drops it at the commit
+            self._restored.extend(chain)
             self._restore_to_prompt([text])
             self.notice(f"not sent: {_trim(text, 60)} — the turn did not take it"
-                        + (f" ({why})" if why else "") + ", and after a stop or "
-                        "a hold nothing is sent on its own; it is back in the "
-                        "prompt after the reply", "dim")
+                        + (f" ({why})" if why else "") + f", and after «{word}» "
+                        "nothing typed this turn is sent on its own; it is back "
+                        "in the prompt after the reply"
+                        + (f", with the {len(chain)} still waiting to be sent" if chain else ""),
+                        "dim")
             return
         self._held.append(text)
         self.notice(f"held: {_trim(text, 60)} — sent after this reply"
@@ -1899,8 +1935,13 @@ class GhostCLI:
             return "", None
         path = data.get("path")
         other = str(data.get("request_id") or "")
-        own = re.sub(r"#\d+\Z", "", other)    # register() renames a reused id
-        if rid and other and not own.endswith(rid) and path in ("inject", "status", "cancel"):
+        # §4SB r2: a cancel names every turn it stopped — `request_id` (the
+        # newest) and `request_ids` (all, oldest first: a draining tail and
+        # this turn can fall to one "stop"). Any of them being THIS turn
+        # makes the answer ours. register() renames a reused id ("#2").
+        named = [n for n in [other] + [str(x) for x in data.get("request_ids") or []] if n]
+        mine = any(re.sub(r"#\d+\Z", "", n).endswith(rid) for n in named) if rid else True
+        if named and not mine and path in ("inject", "status", "cancel"):
             # The agent routes by conversation to its latest RUNNING turn: an
             # earlier turn still finishing while this one waits on the lock
             # (review r6). The answer is not about this turn.
@@ -1948,6 +1989,8 @@ class GhostCLI:
                 (" " * GUTTER + PROMPT_GLYPH, "you"), (_trim(line, 200), "")))
             self.notice(f"↳ {_safe(data.get('reply') or '(no status)')}", "mute")
         elif path == "cancel":                # echoed after the partial reply
+            if rid and named:                 # §4SB: it named this turn (gate above)
+                self._streamed["inbox_cancel"] = True
             return "cancel", (line, list(data.get("undelivered") or []))
         else:                               # "queue", or a path we don't know
             self._hold(line, _safe(data.get("reason") or ""))
@@ -2101,8 +2144,9 @@ class GhostCLI:
 
     def _after_busy_turn(self, escaped: bool = False, asked: bool = True) -> None:
         """Leftovers (accepted, never read) and held messages: sent as
-        normal messages after a finished reply; after a stopped one they go
-        back into the prompt instead — the operator said stop.
+        normal messages after a CLEAN reply (§4SB r2, operator: "both are
+        correct depending on the case"); after a stop, an unclean end or a
+        lost answer they go back into the prompt instead.
 
         ``escaped``: the turn's own code was left by an exception (a Ctrl-C
         right as the reply ended): an unclean end (review r11). ``asked``
@@ -2131,10 +2175,11 @@ class GhostCLI:
             sig["esc"] = None               # the answer is in: book it whole
             if status == 200 and isinstance(data, dict):
                 answered = True             # only this counts (review r6)
-                # RULE (r4): a leftover — accepted by the agent but read by
-                # no turn — is NEVER sent on its own; it goes back into the
-                # prompt, named. Kept on self at once; matched FIRST, so the
-                # accepted typing it is does not come back twice.
+                # RULE (r4 → §4SB r2): a leftover — accepted by the agent but
+                # read by no turn — is sent after a clean reply, back in the
+                # prompt otherwise (see _settle). Kept on self at once;
+                # matched FIRST, so the accepted typing it is is not offered
+                # twice.
                 self._fresh = [str(m) for m in (data.get("messages") or [])
                                if str(m).strip()]
                 self._claim(self._fresh)
@@ -2183,20 +2228,40 @@ class GhostCLI:
         # After a clean end only those an EARLIER turn accepted (r10): its
         # end is not seen from here.
         self._restore_unknown(earlier_only=clean)
+        # §4SB r2 (operator: "both are correct depending on the case"): after
+        # a CLEAN reply a leftover — accepted by the agent, read by no turn —
+        # is SENT as a normal message, in typing order with the held ones
+        # (the server backdates it to its accept time: a "yes" cannot
+        # confirm past a later "wait"); after a stop, an unclean end or a
+        # lost answer it goes back into the prompt (rule r4 until now).
+        # DECISION (r8, operator: "a stop or hold sent later means something
+        # else"): a stop/hold typed this turn — or handed back as a leftover
+        # — keeps EVERY line of the turn back, before it as well as after
+        # it. Named.
+        word = (next((w for w in map(_hold_word, self._typed + fresh) if w), "")
+                if clean and (held or fresh or self._outbox) else "")   # r4: a waiting chain too
+        if word:
+            # §4SB r4: the re-send chain waiting in the outbox stops too —
+            # it would out-run the «wait» (ordered first below: -1 slots)
+            chain = list(self._outbox)
+            self._outbox.clear()
+            keep = self._in_typing_order(fresh + held)
+            names = "; ".join(f"«{_trim(t, 50)}»" for t in chain + keep)
+            self.notice(f"not sent — «{word}» was typed during the turn; "
+                        f"back in the prompt: {names}", "notice")
+            self._restored += chain + keep  # ordered with the rest below
+            self._held, self._fresh = [], []    # consumed: in the prompt
+            held = fresh = []
+        clean = clean and not sig["hit"]    # a Ctrl-C while settling: a stop
         if fresh:
             names = "; ".join(f"«{_trim(t, 50)}»" for t in fresh)
-            self.notice(f"not read by the agent — back in the prompt: {names}",
+            self.notice(f"not read by the agent — "
+                        f"{'sent now' if clean else 'back in the prompt'}: {names}",
                         "notice")
-        if clean and held and any(_is_hold_word(t) for t in self._typed):
-            # DECISION (r8, operator: "a stop or hold sent later means
-            # something else"): a stop/hold typed this turn keeps EVERY held
-            # line of the turn, before it as well as after it.
-            names = "; ".join(f"«{_trim(t, 50)}»" for t in held)
-            self.notice(f"not sent — a stop or hold was typed during the turn; "
-                        f"back in the prompt: {names}", "notice")
-            self._restored += held          # ordered with the rest below
-            self._held = held = []          # consumed: in the prompt
-        clean = clean and not sig["hit"]    # a Ctrl-C while settling: a stop
+        if clean and sig["hit"]:            # ...even one landing on that line (r11)
+            clean = False
+            if fresh:
+                self.notice("⛔ stopped — back in the prompt instead", "mute")
         if not clean:
             # Everything comes back into the prompt, in typing order: held
             # messages still waiting from earlier turns, then this turn's.
@@ -2204,8 +2269,8 @@ class GhostCLI:
                 self._restored + fresh + held)
             self._outbox.clear()
         else:
-            self._restored = self._in_typing_order(self._restored + fresh)
-            self._outbox.extend(held)
+            self._restored = self._in_typing_order(self._restored)
+            self._outbox.extend(self._in_typing_order(fresh + held))
         # Committed above (a gap here costs a duplicate, never a line).
         self._held, self._fresh, self._open = [], [], []
 
@@ -2218,8 +2283,10 @@ class GhostCLI:
         # Shared with the stream worker (copy.copy keeps the dict): "any"
         # once the stream delivered ANY content — text, reasoning, retract,
         # tool status (r16: the one source of truth for "started");
-        # "refused" when the agent answered the chat POST with an error status.
-        self._streamed = {"any": False, "refused": False}
+        # "refused" when the agent answered the chat POST with an error status;
+        # "inbox_cancel" (§4SB) when the inbox answered a typed stop with
+        # `path: cancel` naming THIS turn — the agent received it for sure.
+        self._streamed = {"any": False, "refused": False, "inbox_cancel": False}
 
     def _unsend(self) -> None:
         """The line chat_turn was sending never left (an escape before the
@@ -2305,13 +2372,19 @@ class GhostCLI:
                     if not reply and (self._turn_interrupted or self._turn_stopped):
                         # A stop before any reply text: _finish_turn drops the
                         # line from history, so it comes back here, named — it
-                        # may or may not have reached the agent (review r15).
+                        # may or may not have reached the agent (review r15),
+                        # unless the inbox cancel named this turn (§4SB): then
+                        # the agent received the stop and cancelled it.
                         self._restored.insert(0, line)
-                        self.notice(
-                            f"back in the prompt — the agent did not take it: "
-                            f"«{_trim(line, 60)}»" if self._streamed["refused"] else
-                            f"back in the prompt — the agent may or may not have "
-                            f"received it: «{_trim(line, 60)}»", "mute")
+                        if self._streamed["refused"]:
+                            said = "the agent did not take it"
+                        elif self._streamed["inbox_cancel"]:
+                            said = ("the agent received the stop and cancelled "
+                                    "the turn before replying")
+                        else:
+                            said = "the agent may or may not have received it"
+                        self.notice(f"back in the prompt — {said}: "
+                                    f"«{_trim(line, 60)}»", "mute")
                     self._finish_turn(line, request_id, reply)
                     escaped = False
                 finally:

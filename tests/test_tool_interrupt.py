@@ -62,6 +62,13 @@ def test_the_wording_says_only_what_is_certain():
     assert t.startswith("NOT RUN") and "before this vision_analysis call started" in t
     for t in (TS.interrupted_text("x", started=a, killed=b) for a in (0, 1) for b in (0, 1)):
         assert "Do not run it again unless the user asks" in t
+    # §4SB: a call that RAN may have left half-written files; one that never
+    # began wrote nothing, so it is not told to check
+    for killed in (True, False):
+        t = TS.interrupted_text("execute", started=True, killed=killed)
+        assert "Files it was writing may be incomplete" in t and t.index("incomplete") < t.index("Do not run")
+        assert TS.is_user_interrupted(t)
+    assert "Files it was writing" not in TS.interrupted_text("execute", started=False, killed=False)
 
 
 def test_nothing_is_bound_by_default():
@@ -134,6 +141,35 @@ async def test_the_turn_being_cancelled_still_cancels_every_call():
         await task
     await asyncio.sleep(0)
     assert cancelled == [1, 1]
+
+
+async def test_the_turn_being_cancelled_runs_the_killers():
+    """§4SB: a hard cancel (or the proxy's hang-up cancelling the task) while
+    a batch runs must REQUEST the stop — cancelling the asyncio tasks never
+    reaches a worker thread's subprocess; only the killers do. Pinned on a
+    registered killer and on the real yt-dlp killer in a worker thread."""
+    from ghost_agent.core.agent import _gather_stoppable, _stoppable_call
+    from ghost_agent.memory import youtube_ingest as Y
+    stop, registered = TS.ToolStop(), threading.Event()
+
+    async def ytdlp_in_a_worker():
+        stop.on_stop(registered.set)
+        # to_thread copies the context: the worker sees the bound stop
+        return await asyncio.to_thread(
+            Y._run_subprocess, [sys.executable, "-c", "import time; time.sleep(30)"], 60, None)
+    task = asyncio.ensure_future(
+        _gather_stoppable([(0, _stoppable_call(0, "knowledge_base", ytdlp_in_a_worker(), stop))], stop))
+    await asyncio.sleep(0.5)
+    t0 = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stop.requested()
+    assert registered.wait(TS.KILL_CONFIRM_S)
+    while not stop.killed(0) and time.monotonic() - t0 < TS.KILL_CONFIRM_S:
+        await asyncio.sleep(0.05)
+    assert stop.killed(0), "the yt-dlp subprocess outlived the cancelled turn"
+    assert time.monotonic() - t0 < TS.KILL_CONFIRM_S
 
 
 # ── the turn, end to end ────────────────────────────────────────────────────

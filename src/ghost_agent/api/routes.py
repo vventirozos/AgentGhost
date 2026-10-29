@@ -1379,6 +1379,14 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         # later replay repeated the same turn (R2 lens C).
         if _sess_store is None or not _session_id:
             return
+        # §4SB: a reply that is ONLY the cancel note is no reply — store the
+        # request alone (the store takes a turn ending in a user row), so no
+        # later history or smart-memory arc carries a "_(Turn cancelled" stub
+        # (live 10-29 05:36: one was consolidated into smart memory)
+        if re.fullmatch(r"_\(Turn cancelled:[^\n]*?\.\)_"
+                        r"(?:\s*No output was produced before the cancellation\.)?",
+                        str(assistant_text or "").strip()):
+            assistant_text, prefix_len = "", 0
         # queued messages the turn READ belong before its reply: [u1, q1, a]
         # (the route pops a client's value; only the agent writes this list)
         _turn_msgs = list(_new_msgs) + list(body.get("_queued_delivered") or [])
@@ -1478,6 +1486,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     finally:
                         _rtc.reset(_tok)
                     _get = None
+                    _taken = False          # r9: the turn's result was read below
                     try:
                         while not _turn.done():
                             _get = asyncio.ensure_future(_tap.queue.get())
@@ -1503,6 +1512,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                             yield b"data: [DONE]\n\n"
                             return
                         (content, created_time, req_id), _turn_ctx = _turn.result()
+                        _taken = True
                     finally:
                         if _get is not None and not _get.done():
                             _get.cancel()      # r2: a disconnect inside the wait left it pending
@@ -1527,6 +1537,34 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                                 except Exception:  # noqa: BLE001 — never break the close
                                     pass
                             _turn.cancel()     # the client went away mid-turn (parity: the await was cancelled)
+                        elif not _taken and not _turn.cancelled() and _turn.exception() is None:
+                            # r9: the client hung up at a tap frame and the turn FINISHED before
+                            # this close ran (the hook closes a dropped generator later) — its
+                            # result was never taken: close the streamed final's unstarted drain
+                            # here (its tail hands the drained rows back and unregisters the
+                            # turn; nothing else can ever reach it), then keep the shown text
+                            _c = None
+                            try:
+                                _c = _turn.result()[0][0]
+                                if hasattr(_c, "aclose"):
+                                    _cl = _c.aclose()
+                                    try:
+                                        _cl.send(None)
+                                    except (StopIteration, StopAsyncIteration, RuntimeError):
+                                        pass
+                            except Exception:  # noqa: BLE001 — never break the close
+                                pass
+                            try:
+                                from ..utils.logging import spawn_bg as _spawn_cut2
+                                if isinstance(_c, str) and _c.strip():
+                                    # r10: a finished NON-stream reply is whole — stored as it is
+                                    # (not the tap's partial under a cut note, not nothing)
+                                    _spawn_cut2(_persist_session(_c), name="session-cut")
+                                elif _tap.sent.strip():
+                                    _spawn_cut2(_persist_session((_tap.sent.rstrip() + "\n\n" + STREAM_CUT_NOTE).lstrip()),
+                                                name="session-cut")
+                            except Exception:  # noqa: BLE001
+                                pass
                     # r2 M1: awaited in place, the turn's context variables
                     # (trajectory id, event project, conversation key…) stayed
                     # visible to the streamed drain below; a task runs on a
@@ -1539,15 +1577,6 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                             _var.set(_val)
 
                 if hasattr(content, '__aiter__'):
-                    if _tap is not None:
-                        for _rf in _tap.retract_before_stream():
-                            yield _rf
-                        if _tap.released_generations:
-                            # §4MR: the instrument must see the forced finals too
-                            pretty_log("Reply Stream",
-                                       f"{req_id} retracted for a streamed final"
-                                       + (f" · retracted: {', '.join(_tap.retracts)}" if _tap.retracts else ""),
-                                       icon=Icons.WARN)
                     # Streamed final generation: accumulate the deltas so the
                     # session records what the user actually saw (this path
                     # bypasses the finalize tail, so nothing else knows the
@@ -1559,6 +1588,18 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     from ..core.sessions import utf16_len
                     _stream_ended = False
                     try:
+                        # §4SB r7: the tap's retract frames yield INSIDE the guarded
+                        # region — a hang-up at one of them closes `content` below
+                        # (unstarted: its tail hands the drained rows back)
+                        if _tap is not None:
+                            for _rf in _tap.retract_before_stream():
+                                yield _rf
+                            if _tap.released_generations:
+                                # §4MR: the instrument must see the forced finals too
+                                pretty_log("Reply Stream",
+                                           f"{req_id} retracted for a streamed final"
+                                           + (f" · retracted: {', '.join(_tap.retracts)}" if _tap.retracts else ""),
+                                           icon=Icons.WARN)
                         async for chunk in content:
                             content_started = True
                             (_pre if _sse_is_stream_prefix(chunk) else _acc).append(_sse_delta_text(chunk))
@@ -1570,6 +1611,26 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                         _stream_ended = True    # an upstream error, not a hang-up: the handler below reports it (r1)
                         raise
                     finally:
+                        if not _stream_ended:
+                            # §4SB r6 (review MAJOR): the final's drain hands back the
+                            # drained rows it never answered in ITS finally — await-free,
+                            # so one synchronous step runs it NOW, before the cut-persist
+                            # below copies the rows (a hang-up closes this generator
+                            # first; the inner one only when the GC gets to it). A close
+                            # that does wait is finished off this frame.
+                            try:
+                                _cl = content.aclose()
+                                try:
+                                    _cl.send(None)
+                                except (StopIteration, StopAsyncIteration, RuntimeError):
+                                    pass
+                                else:
+                                    # r7: the drain's finally awaits nothing (pinned by
+                                    # AST); a close that suspends anyway is left to the
+                                    # generator hook — resuming it here would corrupt it
+                                    logger.warning("final close suspended on %s — left to the hook", req_id)
+                            except Exception:  # noqa: BLE001 — never break the close
+                                pass
                         if not _stream_ended and "".join(_acc + _pre).strip():   # r1: text, not empty deltas
                             # §4RD: the client went away mid-reply (closed at the
                             # yield: GeneratorExit/OSError, or cancelled) — the
@@ -2838,13 +2899,25 @@ async def turn_cancel(request: Request):
     _reg = get_turn_registry(agent)
     _rid = body.get("request_id") or None
     _turn = _reg.get(_rid) if _rid else _reg.current()
+    from ..core import queued_messages as qm
+    _interrupted = []
+    if _turn is not None and _turn.running and _turn.kind in qm.OPEN_KINDS:
+        # §4SB: BEFORE cancel — a cooperative flag is never read by a running
+        # tool batch, and interrupt_tools refuses a turn already cancelled
+        _interrupted = _reg.interrupt_tools(_turn.req_id)
     result = _reg.cancel(_rid, hard=bool(body.get("hard", False)))
-    if _turn is not None and result.get("cancelled"):
+    if _turn is not None and result.get("cancelled") and qm.enabled():
         # r8: pressing Stop holds like typing "stop" — a yes registered
         # before it (handed back, or waiting on the turn lock) cannot
         # confirm. Only ever removes authority; owner turns only.
+        # §4SB: off = the pre-§4RZ behaviour (no hold), like the inbox.
         from ..tools.memory import note_queued_withdrawal
         note_queued_withdrawal(_turn.session_id, _turn.kind, "stop")
+    if _turn is not None and result.get("cancelled"):
+        result["interrupted"] = _interrupted
+        if _interrupted:
+            pretty_log("Tool Interrupt", f"[{_turn.req_id[:8]}] stop button: "
+                       + ", ".join(_interrupted), icon=Icons.STOP)
     _note_handed_back(_turn, result)
     return JSONResponse(result, status_code=200 if result.get("cancelled")
                         else 404)
@@ -2859,6 +2932,9 @@ def _note_handed_back(turn, result: dict) -> None:
     if turn is not None and items:
         from ..tools.memory import note_handed_back
         note_handed_back(turn.session_id, turn.kind, items)
+        # §4SB: hand-backs were invisible in the agent log
+        pretty_log("Queued Message", f"[{turn.req_id[:8]}] {len(items)} undelivered handed back "
+                   "to the client (cancel)", icon=Icons.QUEUED_MSG)
 
 
 def _inbox_sender(request) -> str:
@@ -2880,8 +2956,9 @@ async def turn_inbox(request: Request):
 
     Body: ``{"session_id": "...", "text": "..."}``. The reply names the path
     (core/queued_messages.py): ``inject`` (read at the turn's next step),
-    ``cancel`` (the turn was stopped; ``undelivered`` = messages it never
-    read), ``status`` (``reply`` = the system's answer) or ``queue`` (send
+    ``cancel`` (every running turn of this sender was stopped; ``undelivered``
+    = messages they never read, ``interrupted`` = the tool calls stopped,
+    §4SB), ``status`` (``reply`` = the system's answer) or ``queue`` (send
     it as a normal message — ``reason`` says why)."""
     agent = get_agent(request)
     try:
@@ -2898,11 +2975,12 @@ async def turn_inbox(request: Request):
     session_id = str(body.get("session_id") or "")
     if is_conversation_key_only(session_id):
         session_id = ""                 # Slack conversations have no inbox (Slack stays as it is)
-    text = str(body.get("text") or "").strip()
+    text = str(body.get("text") or "").replace("\r", "").strip()   # §4SB: as /api/chat strips it
     kind = _inbox_sender(request)
     turn = reg.find_running(session_id, kind)
     path, reason = qm.route(text, turn, session_id=session_id, kind=kind)
     out = {"path": path}
+    interrupted = []
     if session_id:
         # a hold ("wait", "stop", "no") withdraws the yes of EVERY request of
         # this conversation that registered before it — running, finishing,
@@ -2913,9 +2991,29 @@ async def turn_inbox(request: Request):
         from ..tools.memory import note_queued_withdrawal
         note_queued_withdrawal(session_id, kind, text)
     if path == qm.PATH_CANCEL:
-        res = reg.cancel(turn.req_id)
-        _note_handed_back(turn, res)
-        out.update(request_id=turn.req_id, undelivered=res.get("undelivered", []))
+        # §4SB: EVERY running turn of this sender (a draining tail and a newer
+        # turn can both run), oldest first; the oldest cancelled is reported
+        stopped, undelivered = [], []
+        for t in reg.find_running_all(session_id, kind) or [turn]:
+            # §4SB: BEFORE cancel — a running tool batch never reads the
+            # cooperative flag, and interrupt_tools refuses a cancelled turn
+            interrupted += reg.interrupt_tools(t.req_id)
+            res = reg.cancel(t.req_id)
+            if not res.get("cancelled"):
+                continue                 # unregistered between find and cancel
+            stopped.append(t)
+            _note_handed_back(t, res)
+            undelivered += res.get("undelivered", [])
+        if stopped:
+            # §4SB r2: the NEWEST is the sender's live turn (the CLI keys its
+            # "own turn" branch on it); every cancelled id rides `request_ids`
+            out.update(request_id=stopped[-1].req_id, request_ids=[t.req_id for t in stopped],
+                       undelivered=undelivered, interrupted=interrupted)
+        else:
+            path, reason = qm.PATH_QUEUE, "the turn is finishing"   # §4SB: not "cancel"
+            out = {"path": path}
+            if interrupted:
+                out["interrupted"] = interrupted     # r2: the tools WERE stopped — the client must know
     elif path == qm.PATH_STATUS:
         out.update(request_id=turn.req_id, reply=qm.status_reply(turn))
     elif path == qm.PATH_INJECT:
@@ -2927,8 +3025,10 @@ async def turn_inbox(request: Request):
     if reason:
         out["reason"] = reason
     pretty_log("Queued Message",
-               f"[{str(getattr(turn, 'req_id', '') or '-')[:8]}] {path}"
-               + (f" ({reason})" if reason else ""), icon=Icons.QUEUED_MSG)
+               f"[{str(out.get('request_id') or getattr(turn, 'req_id', '') or '-')[:8]}] {path}"
+               + (f" ({reason})" if reason else "")
+               + (f" — interrupted: {', '.join(interrupted)}" if interrupted else ""),
+               icon=Icons.QUEUED_MSG)
     return JSONResponse(out)
 
 
@@ -2961,7 +3061,9 @@ async def turn_interrupt(request: Request):
     if not qm.same_sender(turn, session_id=session_id, kind=kind):
         return JSONResponse({"interrupted": [], "reason": "no running turn for this sender"},
                             status_code=404)
-    names = reg.interrupt_tools(turn.req_id)
+    names = []
+    for t in reg.find_running_all(session_id, kind) or [turn]:
+        names += reg.interrupt_tools(t.req_id)      # §4SB: a draining tail may run a tool too
     pretty_log("Tool Interrupt", f"[{turn.req_id[:8]}] "
                + (", ".join(names) if names else "no tool running"), icon=Icons.STOP)
     if not names:
@@ -2988,6 +3090,9 @@ async def turn_inbox_leftovers(request: Request):
         sid, kind=kind)
     from ..tools.memory import note_handed_back
     note_handed_back(sid, kind, items)       # re-sent, they start when accepted (§4RZ r7)
+    if items:                                # §4SB: hand-backs were invisible in the agent log
+        pretty_log("Queued Message", f"handed back {len(items)} to the client (session {sid[:8]})",
+                   icon=Icons.QUEUED_MSG)
     return JSONResponse({"messages": [m["text"] for m in items]})
 
 

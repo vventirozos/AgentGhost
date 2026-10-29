@@ -538,19 +538,23 @@ footer#input-area-wrapper {
 }
 
 /* §4RZ step 6a: a message sent while a turn runs. Dim until the turn ends
-   (then it is an ordinary bubble); the label says what happens to it. */
+   (then it is an ordinary bubble); the label says what happens to it.
+   §4SB: the bubble was 0.55 opaque with a 0.5-alpha label (~2.5:1 on the
+   black page); dashed border + a lighter text colour do the dimming now and
+   the label reads at 4.5:1 or better. */
 .message.user.queued {
-    opacity: 0.55;
+    opacity: 0.85;
+    color: #c8cdd8;
     border-style: dashed;
     font-size: 0.78rem;
 }
 .message.user .queued-label {
     display: block;
     margin-top: 4px;
-    font-size: 0.62rem;
+    font-size: 0.7rem;
     letter-spacing: 1px;
     text-transform: uppercase;
-    color: rgba(255, 255, 255, 0.5);
+    color: rgba(255, 255, 255, 0.9);
 }
 /* the system's progress answer reads as a sentence, not a status chip */
 .message.system.queued-status {
@@ -2925,3 +2929,6 @@ body.restoring .message { animation: none !important; }
 #restore-tray button { background: none; border: 1px solid currentColor; border-radius: 6px;
     color: inherit; padding: 2px 8px; cursor: pointer; font: inherit; }
 #restore-tray .restore-warn { font-size: 0.85em; opacity: 0.8; }
+/* §4SB: the tray's live status line — read by screen readers, not seen */
+#restore-status { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }

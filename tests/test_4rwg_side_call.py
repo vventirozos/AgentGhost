@@ -47,7 +47,7 @@ async def _held(agent, llm, st, monkeypatch, slot=40000):
 
 def _look_ran(llm):
     """What `note_main_slot_prompt` leaves after the look (no head)."""
-    llm._head_displaced = True
+    llm._head_displaced = llm._slot_moved_on = True
     llm._last_main_call_end = llm._slot_session_used = time.monotonic()
 
 
@@ -104,7 +104,7 @@ async def test_the_look_saves_nothing_when_it_is_not_this_requests_slot(cwarm, m
     if case == "other_owner":
         llm._slot_session = "sess-z"
     elif case == "displaced":
-        llm._head_displaced = True
+        llm._head_displaced = llm._slot_moved_on = True
     elif case == "head_call":
         payload = _turn(st)
     else:
@@ -145,7 +145,9 @@ def _client(vision_url):
     ("http://127.0.0.1:8088/v1/", {"use_vision": True}, ["side"]),
     ("http://10.0.0.9:8088", {"use_vision": True}, []),                 # a vision node of its own
     ("http://127.0.0.1:8088", {"use_critic": True}, []),                # critic on another box
-    ("http://127.0.0.1:8088", {"use_vision": True, "off_main_only": True}, []),
+    # §4SC-d: off_main_only governs the FALLBACK, not where the pool lives — a
+    # pool that IS the main box still displaces the conversation; it saves
+    ("http://127.0.0.1:8088", {"use_vision": True, "off_main_only": True}, ["side"]),
     ("http://127.0.0.1:8088", {}, ["main"]),
 ])
 async def test_the_client_runs_the_side_hook_for_a_pool_on_the_main_server(url, kw, want):
@@ -291,7 +293,7 @@ async def test_a_keyless_marker_from_another_request_is_ignored(cwarm, monkeypat
 async def test_a_keyless_look_on_a_displaced_slot_sets_no_marker(cwarm, monkeypatch, rid):
     agent, llm, st = cwarm
     await _keyless(agent, llm, st, monkeypatch)
-    llm._head_displaced = True
+    llm._head_displaced = llm._slot_moved_on = True
     await agent._side_call_before(LOOK)
     assert getattr(agent, "_side_call_rid", None) is None
 

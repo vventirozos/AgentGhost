@@ -834,8 +834,8 @@ _BOOT_MONO = None
 #: watchdog before abandoning it. The healthy case takes milliseconds.
 _BIO_SHUTDOWN_GRACE_S = 5.0
 
-#: §4LD: the whole stop must fit launchd's kill — the plist sets no
-#: ExitTimeOut, so SIGKILL lands 20 s after SIGTERM. uvicorn waited for every
+#: §4LD: the whole stop must fit launchd's kill — SIGKILL lands ExitTimeOut
+#: after SIGTERM (20 s then; 60 s since §4LJ). uvicorn waited for every
 #: open request with NO limit before the app's shutdown ran at all: 45 of 49
 #: stops were killed before the drains, the abort record of an interrupted
 #: turn, `sched.shutdown` and `sandbox_mgr.close` ever ran. Budget: open
@@ -2051,7 +2051,7 @@ async def lifespan(app):
         from .utils.logging import spawn_bg as _spawn_bg_main
         _warmup_task = _spawn_bg_main(agent.warm_up_main_prefix(),
                                       name="main-prefix-warmup")
-        _spawn_main_prefix_rewarm(agent, _spawn_bg_main)
+        context._rewarm_task = _spawn_main_prefix_rewarm(agent, _spawn_bg_main)   # §4SA r2: cancelled before the shutdown save
 
     # Metacognition bundle: the validator-block counter (§4PT). None unless
     # --enable-metacog; the shutdown below emits its summary line.
@@ -2214,6 +2214,17 @@ async def lifespan(app):
         # cause is fixed at the reader; this is the rail: wait a bounded
         # time, then name where the straggler is parked and go on.
         await _stop_biological_watchdog(context.biological_task)
+        # §4SA: the conversation that owns the main slot goes to disk before the
+        # process goes (the boot warm-up restores the head over the slot). After
+        # the idle loop and the re-warm tick are stopped (review: a tick must not
+        # post between the idle check and the save), before the LLM client closes.
+        _rw = getattr(context, "_rewarm_task", None)
+        if _rw is not None and not _rw.done():
+            _rw.cancel()
+        try:
+            await agent.save_slot_conversation_at_shutdown()
+        except Exception as _csx:  # noqa: BLE001 — shutdown must proceed
+            logger.debug("shutdown conversation save skipped: %s", _csx)
 
         # Drain fire-and-forget background writes (e.g. the episodic-archive
         # memory.add). These are short disk writes wrapped in to_thread, so

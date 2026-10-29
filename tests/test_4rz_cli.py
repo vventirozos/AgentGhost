@@ -301,7 +301,7 @@ class _Harness:
 
 
 class TestBusyTurn:
-    def test_held_go_to_the_outbox_and_leftovers_to_the_prompt(
+    def test_held_and_leftovers_go_to_the_outbox_after_a_clean_reply(
             self, monkeypatch, out):
         h = _Harness(monkeypatch, lines=["use metric", "after this"],
                      inbox={"after this": {"path": "queue", "reason": "the turn is finishing"}},
@@ -311,12 +311,13 @@ class TestBusyTurn:
         assert h.g.history[-1] == {"role": "assistant",
                                    "content": "first block\n\nopen tail done"}
         assert h.g.turns[-1]["interrupted"] == ""
-        # RULE (r4): a leftover is never sent on its own — named, back in the
-        # prompt; only the held line (it never reached the agent) is sent
-        assert list(h.g._outbox) == ["after this"]
-        assert h.g._take_draft().split("\n") == ["accepted but unread", "half"]
+        # RULE (r4 → §4SB r2): after a CLEAN reply the leftover is sent, named,
+        # in typing order with the held line (a server text not typed here
+        # comes first); only the draft stays in the prompt
+        assert list(h.g._outbox) == ["accepted but unread", "after this"]
+        assert h.g._take_draft() == "half"
         text = " ".join(_plain(out).split())
-        assert "not read by the agent — back in the prompt: «accepted but unread»" in text
+        assert "not read by the agent — sent now: «accepted but unread»" in text
         assert "first block" in text and "open tail done" in text
         assert "queued: use metric" in text
 
@@ -1141,23 +1142,26 @@ class TestRound3Small:
         assert defaults == ["a\nb"]
 
 
-# --- review round 4: leftovers are never auto-sent --------------------------------
+# --- review round 4: leftovers after an unclean end are never auto-sent ----------
+# (§4SB r2: after a CLEAN reply they are sent — see Test4SBR2Leftovers)
 
 class TestLeftoverRule:
-    def test_timeout_restore_plus_its_own_leftover_is_not_sent(
+    def test_timeout_restore_plus_its_own_leftover_is_sent_once(
             self, monkeypatch, out):
-        """MAJOR 1 (r4 p1): put back after an inbox read timeout, then the
-        same text handed back as a leftover — never sent. r10: a timed-out
-        typing is not matched, so it shows twice (a duplicate, not a loss)."""
+        """MAJOR 1 (r4 p1), §4SB r2: put back after an inbox read timeout
+        ("may have received"), then the same text handed back as a leftover
+        after a clean reply — it WAS delivered and unread, so it is sent.
+        r10: a timed-out typing is not matched, so the hedged copy stays in
+        the prompt (a duplicate, not a loss)."""
         h = _Harness(monkeypatch, lines=["use metric"], leftovers=["use metric"])
         monkeypatch.setattr(h.api, "turn_inbox", lambda sid, t: (_ for _ in ()).throw(
             cli.requests.exceptions.ReadTimeout("slow")))
         h.g.chat_turn("q")
-        assert list(h.g._outbox) == []
-        assert h.g._take_draft() == "use metric\nuse metric"
+        assert list(h.g._outbox) == ["use metric"]
+        assert h.g._take_draft() == "use metric"
 
     def test_a_leftover_from_a_later_fetch_is_never_sent(self, monkeypatch, out):
-        """MAJOR 2: whenever it arrives, a leftover goes to the prompt."""
+        """MAJOR 2: with no clean reply behind it, a leftover goes to the prompt."""
         g = cli.GhostCLI(cli.GhostAPI("http://localhost:9", "k"), session_id="s")
         monkeypatch.setattr(g.api, "inbox_leftovers",
                             lambda sid: (200, {"messages": ["late one"]}))
@@ -1170,8 +1174,8 @@ class TestLeftoverRule:
         monkeypatch.setattr(h.api, "turn_inbox", lambda sid, t: (_ for _ in ()).throw(
             cli.requests.exceptions.ConnectTimeout("down")))
         h.g.chat_turn("q")
-        assert list(h.g._outbox) == ["offline"]
-        assert h.g._take_draft() == "unread"
+        assert list(h.g._outbox) == ["unread", "offline"]     # §4SB r2: sent, in order
+        assert h.g._take_draft() == ""
 
     def test_duplicate_typed_lines_keep_their_own_order(self, monkeypatch, out):
         """NIT 5: a text typed twice — each occurrence its own index."""
@@ -1652,7 +1656,9 @@ class TestRound10:
         "ok": leftovers ["ok","ok"] are two messages; both come back."""
         h = _Harness(monkeypatch, lines=["ok"], leftovers=["ok", "ok"])
         h.g.chat_turn("q")
-        assert h.g._take_draft().split("\n").count("ok") == 2
+        # §4SB r2: after the clean reply both are sent (a duplicate, not a loss)
+        assert list(h.g._outbox).count("ok") == 2
+        assert h.g._take_draft() == ""
 
     def test_another_clients_identical_undelivered_is_kept(self, monkeypatch, out):
         h = _Harness(monkeypatch, lines=["ok"], abort=True, finish_on_gate=False)
@@ -1693,7 +1699,10 @@ class TestRound10:
         h = _Harness(monkeypatch, lines=["use metric"], leftovers=["use metric"],
                      inbox={"use metric": {"path": "inject", "request_id": "OTHERTURN"}})
         h.g.chat_turn("q")
-        assert h.g._take_draft() == "use metric"
+        # §4SB r2: the leftover is sent after the clean reply; the accepted
+        # typing it matched is not ALSO put back
+        assert list(h.g._outbox) == ["use metric"]
+        assert h.g._take_draft() == ""
 
     def test_an_earlier_turns_line_in_its_undelivered_shows_once(self, monkeypatch, out):
         h = _Harness(monkeypatch, lines=["use metric", "stop"], finish_on_gate=False,
@@ -2398,3 +2407,281 @@ class TestRound16:
         h.g._streamed["any"] = True             # the previous turn's verdict
         h.g.chat_turn("second")
         assert "may not have registered it yet" in " ".join(_plain(out).split())
+
+
+# --- §4SB: a typed stop the inbox answered for THIS turn is not "may or may not" -----
+
+class Test4SBStopWording:
+    """Fresh-eye review (live 2026-10-29 05:33): a bare stop word at the
+    busy prompt, answered `path: cancel` with this turn's request_id before
+    any token streamed, was reported as "may or may not have received it".
+    The CLI knows better there; the hedge stays for the unknown cases."""
+
+    def _quiet_stream(self, monkeypatch, h):
+        """Nothing streams until the gate opens, then [DONE]."""
+        def gen(*a, **k):
+            assert h.gate.wait(5)
+            yield b"data: [DONE]"
+        monkeypatch.setattr(h, "_sse", gen)
+
+    def test_inbox_cancel_naming_this_turn_is_said_truthfully(self, monkeypatch, out):
+        h = _Harness(monkeypatch, lines=["use metric", "stop"], finish_on_gate=False,
+                     inbox={"stop": {"path": "cancel", "request_id": "r",
+                                     "undelivered": ["use metric"]}})
+        self._quiet_stream(monkeypatch, h)
+        fake = h.api.turn_inbox
+
+        def inbox(sid, text):
+            ans = fake(sid, text)
+            if ans[1].get("path") == "cancel":
+                h.gate.set()                # the agent stopped the turn
+            return ans
+
+        monkeypatch.setattr(h.api, "turn_inbox", inbox)
+        h.g.chat_turn("my question")
+        assert h.cancel_calls == []         # the inbox already stopped it
+        assert h.g.history == []            # dropped: no reply
+        # restore unchanged (r4): the request line first, then the unread one
+        assert h.g._take_draft().split("\n") == ["my question", "use metric"]
+        txt = " ".join(_plain(out).split())
+        assert "stopped — agent turn cancelled" in txt
+        assert ("the agent received the stop and cancelled the turn before "
+                "replying: «my question»") in txt
+        assert "may or may not" not in txt
+
+    def test_a_lost_cancel_answer_keeps_the_hedge(self, monkeypatch, out):
+        h = _Harness(monkeypatch, abort=True, finish_on_gate=False)
+        self._quiet_stream(monkeypatch, h)
+
+        def cancel(**k):
+            h.gate.set()
+            raise _RT("slow")
+
+        monkeypatch.setattr(h.api, "cancel_turn", cancel)
+        h.g.chat_turn("my question")
+        assert h.g._take_draft().split("\n")[0] == "my question"
+        txt = " ".join(_plain(out).split())
+        assert "did not answer the cancel" in txt
+        assert "may or may not have received it: «my question»" in txt
+        assert "received the stop" not in txt
+
+    def test_a_cancel_naming_another_turn_keeps_the_hedge(self, monkeypatch, out):
+        """The inbox answer was about an earlier turn: this one is cancelled
+        by its own id, and even an answered cancel keeps the r15 hedge."""
+        h = _Harness(monkeypatch, lines=["stop"], finish_on_gate=False,
+                     inbox=_other_stop([]))
+        self._quiet_stream(monkeypatch, h)
+        monkeypatch.setattr(h.api, "cancel_turn", lambda **k: (
+            h.cancel_calls.append(k), h.gate.set(),
+            (200, {"cancelled": True, "undelivered": []}))[2])
+        h.g.chat_turn("my question")
+        assert h.cancel_calls and h.cancel_calls[0]["request_id"] == h.rid
+        assert h.g._take_draft().split("\n")[0] == "my question"
+        txt = " ".join(_plain(out).split())
+        assert "earlier turn" in txt
+        assert "may or may not have received it: «my question»" in txt
+        assert "received the stop" not in txt
+
+
+# --- §4SB r2: cancel answers name every stopped turn; hold words narrowed ----------
+
+class Test4SBR2CancelIds:
+    def _run(self, monkeypatch, out, answer):
+        """A quiet stream; the inbox answers "stop" with ``answer`` (its ids
+        rendered with this turn's rid as "r") and opens the gate."""
+        h = _Harness(monkeypatch, lines=["stop"], finish_on_gate=False)
+
+        def gen(*a, **k):
+            assert h.gate.wait(5)
+            yield b"data: [DONE]"
+
+        monkeypatch.setattr(h, "_sse", gen)
+
+        def inbox(sid, text):
+            h.inbox_calls.append((sid, text))
+            ans = {k: (h.rid if v == "r" else [h.rid if x == "r" else x for x in v]
+                       if isinstance(v, list) else v) for k, v in answer.items()}
+            h.gate.set()
+            return 200, ans
+
+        monkeypatch.setattr(h.api, "turn_inbox", inbox)
+        monkeypatch.setattr(h.api, "cancel_turn", lambda **k: (
+            h.cancel_calls.append(k), (200, {"cancelled": True, "undelivered": []}))[1])
+        h.g.chat_turn("my question")
+        return h, " ".join(_plain(out).split())
+
+    @pytest.mark.parametrize("newest,ids", [("r", ["TAIL", "r"]), ("TAIL", ["r", "TAIL"])])
+    def test_this_turn_among_the_cancelled_ids_is_said_truthfully(
+            self, monkeypatch, out, newest, ids):
+        h, txt = self._run(monkeypatch, out, {"path": "cancel", "request_id": newest,
+                                              "request_ids": ids, "undelivered": []})
+        assert h.cancel_calls == []                 # the inbox stopped it
+        assert "earlier turn" not in txt
+        assert ("the agent received the stop and cancelled the turn before "
+                "replying: «my question»") in txt
+        assert "may or may not" not in txt
+        assert h.g._take_draft() == "my question"
+
+    def test_a_cancel_naming_only_other_turns_keeps_the_hedge(self, monkeypatch, out):
+        h, txt = self._run(monkeypatch, out, {"path": "cancel", "request_id": "OTHER",
+                                              "request_ids": ["TAIL", "OTHER"],
+                                              "undelivered": []})
+        assert h.cancel_calls and h.cancel_calls[0]["request_id"] == h.rid
+        assert "earlier turn" in txt
+        assert "may or may not have received it: «my question»" in txt
+        assert "received the stop" not in txt
+
+
+class Test4SBR2HoldWords:
+    """r5's rule applied the server's whole _DENY_RE to any line: "no
+    sugar" was never sent. Only a bare stop word, or a short line that is
+    nothing but hold words, is one."""
+
+    @pytest.mark.parametrize("line", ["no sugar", "stop the backup job",
+                                      "cancel that", "ok no problem"])
+    def test_an_ordinary_line_with_a_deny_word_is_sent_after_the_turn(
+            self, monkeypatch, out, line):
+        h = _Harness(monkeypatch, lines=[line], inbox={line: _QUEUE})
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == [line]
+        assert h.g._take_draft() == ""
+        assert "not sent" not in _plain(out)
+
+    @pytest.mark.parametrize("line,word", [("wait, no", "wait"), ("no.", "no"),
+                                           ("stop", "stop"), ("hold on", "hold on")])
+    def test_a_bare_hold_word_is_kept_back_and_named(self, monkeypatch, out, line, word):
+        h = _Harness(monkeypatch, lines=[line], inbox={line: _QUEUE})
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft() == line
+        txt = _plain(out)
+        assert "not sent" in txt and f"«{word}»" in txt
+
+    def test_a_long_line_after_a_hold_word_is_kept_back_too(self, monkeypatch, out):
+        """r6 kept: after "wait" nothing typed in the turn is sent on its own."""
+        h = _Harness(monkeypatch, lines=["wait", "stop the backup job"],
+                     inbox={"wait": _QUEUE, "stop the backup job": _QUEUE})
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft().split("\n") == ["wait", "stop the backup job"]
+        assert "«wait»" in _plain(out)
+
+    @pytest.mark.parametrize("line,word", [("Stop!", "stop"), ("σταμάτα", "σταματα"),
+                                           ("όχι, περίμενε", "οχι"), ("no no no", "no"),
+                                           ("no no no no", "no"), ("wait... hold on!", "wait"),
+                                           ("ok no problem", ""), ("stop the backup job", ""),
+                                           ("cancel that", ""),
+                                           ("no sugar", ""), ("wait for the backup", ""),
+                                           ("", "")])
+    def test_hold_word_unit(self, line, word):
+        assert cli._hold_word(line) == word
+        assert cli._is_hold_word(line) is bool(word)
+
+
+class Test4SBR2Leftovers:
+    """Operator: "both are correct depending on the case" — leftovers are
+    sent after a clean reply, back in the prompt otherwise."""
+
+    def test_clean_reply_sends_leftovers_in_typing_order(self, monkeypatch, out):
+        h = _Harness(monkeypatch, lines=["use metric", "then celsius", "and round"],
+                     inbox={"then celsius": _QUEUE},
+                     leftovers=["use metric", "and round"], draft_at_end="half")
+        h.g.chat_turn("q")
+        assert h.g.turns[-1]["interrupted"] == ""
+        assert list(h.g._outbox) == ["use metric", "then celsius", "and round"]
+        assert h.g._take_draft() == "half"
+        txt = " ".join(_plain(out).split())
+        assert "not read by the agent — sent now: «use metric»; «and round»" in txt
+        assert "back in the prompt" not in txt
+
+    def test_a_stopped_turn_puts_leftovers_back(self, monkeypatch, out):
+        h = _Harness(monkeypatch, lines=["use metric"], abort=True, finish_on_gate=False,
+                     leftovers=["use metric"])
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft().split("\n") == ["unread one", "use metric", "half typed"]
+        assert "back in the prompt" in _plain(out)
+
+    def test_a_lost_leftovers_answer_puts_nothing_in_the_outbox(self, monkeypatch, out):
+        h = _Harness(monkeypatch, lines=["use metric", "then celsius"],
+                     inbox={"then celsius": _QUEUE})
+        monkeypatch.setattr(h.api, "inbox_leftovers", lambda sid: (_ for _ in ()).throw(
+            _RT("slow")))
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft().split("\n") == ["use metric", "then celsius"]
+
+    @pytest.mark.parametrize("left,word", [("wait", "wait"), ("no.", "no"),
+                                           ("Stop!", "stop")])
+    def test_a_hold_word_leftover_keeps_everything_back_named(
+            self, monkeypatch, out, left, word):
+        h = _Harness(monkeypatch, lines=["use metric", left, "then celsius"],
+                     inbox={"then celsius": _QUEUE}, leftovers=[left])
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == []
+        # "then celsius" was put back as it was typed (r6: after a hold word)
+        assert h.g._take_draft().split("\n") == [left, "then celsius"]
+        txt = " ".join(_plain(out).split())
+        assert f"not sent — «{word}» was typed during the turn; back in the prompt: «{left}»" in txt
+        assert "sent now" not in txt
+
+    def test_an_ordinary_leftover_with_a_deny_word_is_sent(self, monkeypatch, out):
+        h = _Harness(monkeypatch, lines=["no sugar"], leftovers=["no sugar"])
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == ["no sugar"]
+        assert h.g._take_draft() == ""
+
+    # -- §4SB r4: the re-send chain in the outbox is stoppable by a hold word
+
+    def test_a_hold_word_queued_during_a_chain_turn_pulls_the_outbox_back(
+            self, monkeypatch, out):
+        """r4 MAJOR 2: outbox [A, B, C]; "wait" typed while A runs (agent
+        answered queue) → B and C used to be sent by the REPL loop."""
+        h = _Harness(monkeypatch, lines=["wait"], inbox={"wait": _QUEUE})
+        h.g._outbox.extend(["A", "B", "C"])
+        h.g._send_outbox()
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft().split("\n") == ["B", "C", "wait"]
+        txt = " ".join(_plain(out).split())
+        assert "with the 2 still waiting to be sent" in txt
+
+    def test_the_chain_pull_back_keeps_every_line_when_the_prompt_already_showed_text(
+            self, monkeypatch, out):
+        """r5 MAJOR (inside the r4 fix): the chain was PREPENDED to _restored,
+        but the busy prompt commits `_restored[shown:]` by position — with X
+        already shown, B was dropped and X kept."""
+        h = _Harness(monkeypatch, lines=["wait"], inbox={"wait": _QUEUE})
+        h.g._restored = ["X"]
+        h.g._outbox.extend(["A", "B", "C"])
+        h.g._send_outbox()
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft().split("\n") == ["B", "C", "wait"]
+
+    def test_a_hold_word_read_during_a_chain_turn_pulls_the_outbox_back(
+            self, monkeypatch, out):
+        """r4 MAJOR 2 (inject variant): the turn READ the "wait"; its clean
+        settle stops the chain, named."""
+        h = _Harness(monkeypatch, lines=["wait"])
+        h.g._outbox.extend(["A", "B", "C"])
+        h.g._send_outbox()
+        assert list(h.g._outbox) == []
+        assert h.g._take_draft().split("\n") == ["B", "C"]
+        txt = " ".join(_plain(out).split())
+        assert "not sent — «wait» was typed during the turn; back in the prompt: «B»; «C»" in txt
+
+    def test_a_chain_turn_without_a_hold_word_keeps_the_outbox(self, monkeypatch, out):
+        """Control: an ordinary inject during A leaves B and C to be sent."""
+        h = _Harness(monkeypatch, lines=["use metric"])
+        h.g._outbox.extend(["A", "B", "C"])
+        h.g._send_outbox()
+        assert list(h.g._outbox) == ["B", "C"]
+        assert h.g._take_draft() == ""
+
+    def test_a_text_typed_twice_gives_the_leftover_the_unread_slot(self, monkeypatch, out):
+        """r4 MINOR 5: "yes" (read), "H" (held), "yes" (left over) — the
+        leftover took the first "yes"'s index and went out before H."""
+        h = _Harness(monkeypatch, lines=["yes", "H", "yes"], inbox={"H": _QUEUE},
+                     leftovers=["yes"])
+        h.g.chat_turn("q")
+        assert list(h.g._outbox) == ["H", "yes"]
+        assert h.g._take_draft() == ""

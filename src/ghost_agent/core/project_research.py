@@ -796,7 +796,10 @@ async def _llm_complete(context, prompt: str, *, max_tokens: int,
             "max_tokens": max_tokens,
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
-        }, timeout=timeout, is_background=is_background)
+        }, timeout=timeout, is_background=is_background,
+           # §4SC-b: inline on the user's turn it is a main call without the
+           # head — a side call, so the conversation is saved first
+           side_main=not is_background, task_label="research-summary")
         return _message_text(r)
     except Exception as e:
         logger.debug("research LLM call failed: %s", e)

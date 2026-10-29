@@ -626,6 +626,41 @@ _CREATIVE_KEYWORDS = {"design", "architect", "brainstorm", "creative", "alternat
 _PRECISE_KEYWORDS = {"sql", "query", "select", "insert", "update", "delete", "migrate", "schema", "exact", "precise", "security", "auth", "encrypt", "regex"}
 
 
+class _FinalStream:
+    """§4SB r6: the streamed final's drain with a close that works BEFORE its
+    first step. An async generator closed before it ever ran executes no
+    `finally`: a client that hung up between handle_chat's return and the
+    route's first pull left the turn registered and the drained rows booked
+    read with nothing answering them. `aclose()` on an unstarted stream runs
+    the tail (the §4SB hand-back + the unregister); a started one closes as
+    before. Iterates like the generator it wraps."""
+    __slots__ = ("_gen", "_tail", "_started")
+
+    def __init__(self, gen, tail):
+        self._gen, self._tail, self._started = gen, tail, False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self._started = True
+        return await self._gen.__anext__()
+
+    async def aclose(self):
+        if not self._started:
+            self._started = True
+            try:
+                self._tail()
+            except Exception:  # noqa: BLE001
+                pass
+        await self._gen.aclose()
+    # (r8: no __del__ — on the route an unstarted wrapper stays reachable through
+    #  registry → turn.task → result until the route's own close ran its tail, and
+    #  a finalizer taking the registry lock from a GC thread could block it; the
+    #  route closes `content` explicitly: its streaming `finally` on every ending
+    #  it reaches, and (r9) its tap `finally` when the turn finished untaken)
+
+
 async def _stream_or_abort_frames(it):
     """Drain an SSE stream; convert a RAISE into the abort frames it should
     have been.
@@ -1267,6 +1302,71 @@ def _po_carry(context, req_id):
     carried answer, or None."""
     d = getattr(context, "_po_carries", None)
     return d.get(str(req_id or "")) if isinstance(d, dict) else None
+
+
+def _with_carry(context, req_id, text: str) -> str:
+    """§4SB r2 (review MAJOR): an error exit's text, with the answer a
+    previous round carried (§4PO, the §4SB extra step) in FRONT of it — the
+    error exits assigned `final_ai_content` whole, and the extra step had
+    made a complete answer a hostage of one more model call."""
+    try:
+        pc = _po_carry(context, req_id)
+        kept = str(pc[1] or "").strip() if pc else ""
+        text = str(text or "")
+        if kept and kept not in text:
+            return kept + "\n\n" + text
+    except Exception:  # noqa: BLE001
+        pass
+    return str(text or "")
+
+
+def _q_mark_read(turn) -> None:
+    """§4SB r3: a reply that answered (text or a tool call) read EVERY drained
+    message in its prompt — the marker moves to the end and the overflow's
+    "left-out" set is cleared (an overflow's retry rebuilds the prompt with
+    every row, so what a later round reads is all of them; r3 review: rows a
+    completed reply had read were handed back after an overflow)."""
+    try:
+        turn._q_read = len(getattr(turn, "_q_items", ()) or ())
+        turn._q_skipped = ()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _q_note_overflow(turn, rows, sent_rows) -> None:
+    """§4SB r3: an overflow retry sent only ``sent_rows`` (the NEWEST within
+    its budget) of the queued ``rows`` in the prompt: the others are unread
+    unless a completed reply had read them before — their drained positions
+    (`_q_i`, stamped at the drain) go to `_q_skipped`; the marker moves to the
+    end so the hand-back reads both."""
+    try:
+        read = int(getattr(turn, "_q_read", 0) or 0)
+        items = list(getattr(turn, "_q_items", ()) or ())
+        left_out = max(0, len(rows) - len(sent_rows))
+        skipped = set(getattr(turn, "_q_skipped", ()) or ())
+        unidentified = False
+        for r in rows[:left_out]:
+            i = r.get("_q_i") if isinstance(r, dict) else None
+            if not isinstance(i, int):
+                # r4: a row copied without its stamp — find it by text among the
+                # unread items (the hand-back matches by text too; r5: a loop row
+                # carries the QUEUED_LABEL line first — stripped before matching)
+                from .queued_messages import QUEUED_LABEL as _ql
+                text = str(r.get("content") or "") if isinstance(r, dict) else ""
+                if text.startswith(_ql + "\n"):
+                    text = text[len(_ql) + 1:]
+                i = next((k for k in range(read, len(items))
+                          if k not in skipped and str((items[k] or {}).get("text") or "") == text), None)
+            if isinstance(i, int) and i >= read:
+                skipped.add(i)
+            elif i is None:
+                unidentified = True
+        turn._q_skipped = tuple(sorted(skipped))
+        # r4: a left-out row nobody could place keeps the marker where it is
+        # (it comes back as a duplicate, never booked read = lost)
+        turn._q_read = read if unidentified else len(items)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _po_note_carry(context, req_id, start: int, kept: str) -> None:
@@ -3867,6 +3967,28 @@ _WORK_TOOLS = frozenset({"execute", "browser", "web_search", "deep_research", "d
                          "delegate", "delegate_to_swarm", "create_skill", "probe_model"})
 
 
+def status_only_refusal_text() -> str:
+    """§4SB: the status-only gate's refusal. The gate is set from the FIRST
+    ask; a message sent mid-turn ("also restart it") never grants (§4RZ s4:
+    deny→allow is forbidden) — but the text must not claim the user asked
+    only for status once they added an instruction: name it, and ask for it
+    as a new message."""
+    try:
+        from .queued_messages import delivered as _qd
+        added = _qd()
+    except Exception:  # noqa: BLE001
+        added = ()
+    if not added:
+        return ("Not run: the user asked for a STATUS / progress report. Answer from "
+                "what is already known — the project's tasks and work log, the jobs' "
+                "state, files already written. Start no new work; offer to continue "
+                "if they want.")
+    newest = " ".join(str(added[-1] or "").split())[:80]
+    return (f"Not run: this request began as a STATUS question, so no new work starts in it, "
+            f"even though the user added '{newest}' while it ran. Answer from what is known "
+            f"and ask the user to send that instruction as a new message.")
+
+
 def is_status_question(text: str) -> bool:
     t = str(text or "").strip()
     return (len(t) <= 80 and bool(_STATUS_QUESTION_RE.search(t))
@@ -6338,6 +6460,25 @@ DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
 # "length" on every continuation (mis-reported finish_reason, runaway) can't
 # loop forever — each continuation is a full upstream round-trip.
 MAX_TRUNCATION_CONTINUATIONS = 3
+#: §4SC-e: a stream cut INSIDE a call tag the template opens on its own line
+#: (`<tool_call>` / `<function=`): the tail is a line-anchored PREFIX of one of
+#: the two tag names — "…\n<tool_ca", "<tool_ca", "…\n<func", "…\n<" — and
+#: never a `<` inside a line ("std::vector<int", "x<y", "if a <", "#include
+#: <stdio") or another tag ("\n<br"), which §4SC-d's `<[a-z_]{0,9}$` also
+#: caught: legitimate cut answers were not continued and lost their tail.
+#: Case-sensitive on purpose: the template's tags are lowercase; the sibling
+#: substring gates lower-case the text because a model may echo a tag freely.
+_CALL_TAG_TAIL = re.compile(
+    r"(?:^|\n)<(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l(?:l)?)?)?)?)?)?)?)?"
+    r"|f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?$")
+
+
+def _in_open_fence(text: str) -> bool:
+    """§4SC-g: the text ends inside an open code fence — LINE-START fences
+    only, on think-stripped text: a mid-line ``` mention ("a block with ```
+    and") or a fence quoted inside <think> is not a fence, and a raw count
+    of them skipped the tag rule and appended a spurious closing fence."""
+    return len(re.findall(r"(?m)^\s{0,3}```", _strip_think_blocks(text))) % 2 == 1
 #: one continuation call's budget (§4MD M2). §4RK: 180 → 480 s — at the 27B's
 #: ~23 tok/s a continuation of a few thousand tokens plus its prefill did not
 #: fit 180 s, so the cut answer shipped with the "could not finish" note.
@@ -9226,6 +9367,9 @@ async def _gather_stoppable(items, stop) -> list:
             for t in late:                   # abandoned: still unwinding (a held lock)
                 t.add_done_callback(lambda f: f.cancelled() or f.exception())
     except asyncio.CancelledError:           # the turn itself was cancelled: gather parity
+        # §4SB: the stop first — cancelling the tasks never reaches a worker
+        # thread's docker exec / yt-dlp / browser runner; only the killers do
+        stop.request()
         for t in tasks:
             t.cancel()
         raise
@@ -11439,9 +11583,22 @@ MEMBER_HEAD_RECENT_S = 14 * 86400.0
 MEMBER_HEAD_RECHECK_S = 1800.0
 #: §4RU-r: unanswered /slots reads in a row after which the switch gives up
 SWITCH_UNREAD_LIMIT = 3
-#: §4RV: a conversation is saved only this far past the head (fewer tokens
-#: re-read faster than a save plus a restore, ~2 s)
-CONV_MIN_PAST_TOKENS = 1024
+#: §4RV: a conversation is saved only this far past the head. §4SA (review
+#: 10-29): 1024 saved a 2 GB file for a 1.4k-token tail that re-reads in ~8 s
+#: — twelve one-shot conversations wrote ~25 GB in half an hour; 3072 tokens
+#: (~20 s of re-read at the 27B's ~170 tok/s) is the floor now, GHOST_CONV_MIN_PAST_TOKENS overrides
+CONV_MIN_PAST_TOKENS = 3072
+#: §4SA: how long the shutdown waits for the slot's conversation to reach disk
+#: (inside launchd's 60 s exit window with the other drains; a 3 GB save is 1–11 s live)
+SHUTDOWN_CONV_SAVE_S = 25.0   # §4SA review: uvicorn's 6 s + the four 5 s drains leave ~34 s of the 60
+
+
+def conv_min_past_tokens() -> int:
+    raw = (os.getenv("GHOST_CONV_MIN_PAST_TOKENS") or "").strip()
+    try:
+        return max(0, int(raw)) if raw else CONV_MIN_PAST_TOKENS
+    except ValueError:
+        return CONV_MIN_PAST_TOKENS
 #: §4RV: how long a background call's save waits for the slot to go idle
 CONV_SAVE_WAIT_S = 60.0
 #: §4RW review: a conversation save needs this much of its deadline, or it is not posted
@@ -14859,8 +15016,7 @@ class GhostAgent:
                     if mode == "park" and slot_kept(llm):
                         # §4RP rule 4: the conversation that used the slot keeps
                         # it until it has been idle GHOST_SLOT_KEEP_S (600 s)
-                        self._head_defer(_hs, "a conversation keeps the slot inside its idle window",
-                                         loud=False, count=False)
+                        self._head_defer(_hs, self._kept_why(), loud=False, count=False)
                         return
                     if not mode:
                         return
@@ -14908,8 +15064,7 @@ class GhostAgent:
                         await self._conv_displace(llm, "the head's prefill (no file for it yet)",
                                                   stop=self._request_live_check(llm))
                     if slot_kept(llm):
-                        self._head_defer(_hs, "a conversation keeps the slot inside its idle window",
-                                         loud=False, count=False)
+                        self._head_defer(_hs, self._kept_why(), loud=False, count=False)
                     if _near is not None:
                         await _restore_head()
                         for _f in ("restore", "restored", "detail", "restore_s", "parked"):
@@ -15068,8 +15223,22 @@ class GhostAgent:
             pretty_log("Head Disk", f"head restore deferred — {why}{_n}; the next re-warm tick retries",
                        icon=Icons.HEAD_DEFER)
         else:
-            logger.info("head restore deferred: %s", why)
+            # §4SA: the same reason tick after tick (a conversation holding the
+            # slot for hours) is one INFO line, then debug — 150 lines in two days
+            if why == getattr(self, "_head_defer_last_why", None):
+                logger.debug("head restore deferred again: %s", why)
+            else:
+                logger.info("head restore deferred: %s", why)
+        self._head_defer_last_why = why
         raise BackgroundDeferred(f"background call deferred: head restore ({why})")
+
+    @staticmethod
+    def _kept_why() -> str:
+        """§4SA: why a tick leaves the slot alone — the words were the keep
+        window's even under GHOST_CONV_KEEP, where there is no window."""
+        from .llm import conv_keep_enabled
+        return ("a conversation holds the slot (it goes to disk before anything replaces it)"
+                if conv_keep_enabled() else "a conversation keeps the slot inside its idle window")
 
     async def _slot_switch_before(self, payload) -> None:
         """§4RP rule 3: before a foreground main call of a conversation other
@@ -15092,7 +15261,7 @@ class GhostAgent:
         (`_restore_when_idle`). Nothing for the request that holds the slot,
         a call outside the running turn, no file, or the bare head."""
         from ..utils.logging import slot_session_context
-        from .llm import BEFORE_MAIN_DISPATCH_S, release_slot_session
+        from .llm import BEFORE_MAIN_DISPATCH_S, release_slot_session, slot_moved_on
         # review r2: the deadline counts from the hook's entry, as the client's bound does
         _late = time.monotonic() + BEFORE_MAIN_DISPATCH_S - _head_saves.RESTORE_TIMEOUT_S - 2.0
         llm = getattr(getattr(self, "context", None), "llm_client", None)
@@ -15125,7 +15294,7 @@ class GhostAgent:
         # look that never reached it, or by an earlier run of the same sched- id,
         # must not restore over the request's own conversation)
         if ((not key and not (getattr(self, "_side_call_rid", None) == str(request_id_context.get() or "")
-                              and getattr(llm, "_head_displaced", False) is True))
+                              and slot_moved_on(llm)))
                 or not isinstance(hs, dict) or not _head_saves.enabled()):
             return
         # §4RW-f (operator item 5): the effort sentence closes the system block,
@@ -15140,8 +15309,9 @@ class GhostAgent:
         # the slot since its last call — its conversation comes back, though
         # the request already decided its restore (live: 30k tokens re-read
         # from token 0, 179 s, after a render look)
-        _after_side = (getattr(self, "_side_call_rid", None) == rid and bool(rid)
-                       and getattr(llm, "_head_displaced", False) is True)
+        # (§4SA review: "moved on", not "no head" — the owner on Slack's state never
+        # has the head, so the head mark would read every marker as a look that ran)
+        _after_side = (getattr(self, "_side_call_rid", None) == rid and bool(rid) and slot_moved_on(llm))
         cur_level = self._call_level(payload)
         if cur_level is not None and hs.get("effort") not in (None, cur_level):
             new_hs = await self._head_plan_for_level(llm, cur_level, rid)
@@ -15149,18 +15319,38 @@ class GhostAgent:
                 hs = self._head_plan_last = new_hs
         slot_level = getattr(self, "_slot_level", None)
         level_moved = slot_level is not None and cur_level is not None and slot_level != cur_level
+        held_by = getattr(llm, "_slot_request", None)
+        if (_conv and level_moved and owner and owner == key and isinstance(held_by, str) and held_by
+                and held_by != rid and self._turn_holder_ok()):
+            # §4SA: a NEW request of this conversation at another level — the slot
+            # holds the conversation at the OLD level: to disk first, with that
+            # level (live 10-28: the head went over it unsaved, and when the level
+            # came back the file was three requests old). Not inside a request
+            # (the thinking-off turn flips the level and back): one file per
+            # conversation, and two multi-GB saves per flip would cost more than
+            # the re-read they could spare.
+            await self._conv_save(llm, f"this conversation's change to {cur_level} effort", _late)
         if cur_level is not None:
             self._slot_level = cur_level             # what this call leaves in the slot
-        held_by = getattr(llm, "_slot_request", None)
+        from .llm import conv_head_first_calls
+        _calls = int(getattr(llm, "_slot_request_calls", 0) or 0)
+        _head_first = conv_head_first_calls()
+        _long_followup = (_conv and owner == key and isinstance(held_by, str) and bool(held_by)
+                          and held_by != rid and 0 < _head_first <= _calls)
         # §4RV: under GHOST_CONV_KEEP the next request's first message is the
         # previous one's, so it resumes from llama's checkpoint — no head restore
-        next_request = (not _conv and owner == key and isinstance(held_by, str) and bool(held_by)
-                        and held_by != rid)
+        # (§4SA: unless the previous request made so many calls that llama may
+        # have erased that checkpoint — then the head first, so that only the
+        # conversation is re-read and not the head with it)
+        next_request = ((not _conv and owner == key and isinstance(held_by, str) and bool(held_by)
+                         and held_by != rid) or _long_followup)
         if owner and owner == key and not next_request and not level_moved and not (
-                _conv and getattr(llm, "_head_displaced", False) is True):
+                _conv and slot_moved_on(llm)):
             # (§4RW review MAJOR: under GHOST_CONV_KEEP the owner record can
             # outlive its state — a member's turn after the owner's reply ended
-            # — and the request then skipped every restore: from token 0)
+            # — and the request then skipped every restore: from token 0.
+            # §4SA: "moved on", not "no head": the owner on Slack holds the slot
+            # without the head and resumes from it)
             return
         from .llm import opens_with_head, shares_head_tools
         ref = getattr(llm, "_head_ref", None)
@@ -15190,14 +15380,19 @@ class GhostAgent:
         # §4RW-f (round 2 MAJOR): a moved level is never "already decided" — the
         # conversation in the slot cannot resume across the sentence, so the
         # request's earlier decision (A → B → back to A) does not hold
-        if kind in done.get(rid, ()) and not level_moved and not (_after_side and kind == "head"):
+        # (§4SA review: the owner on Slack's calls are "tools" — its look must get
+        # its thread back too)
+        if kind in done.get(rid, ()) and not level_moved and not _after_side:
             return
-        if kind == "head":
+        if _after_side:
             self._side_call_rid = None
         done.setdefault(rid, set()).add(kind)
         while len(done) > 16:
             done.pop(next(iter(done)))
-        if _conv and key and kind == "head" and await self._conv_restore(llm, hs, key, rid, _late, level=cur_level):
+        # §4SA: a "tools" call (the owner on Slack) has a conversation file too; a
+        # long request's follow-up skips its (older) file — the slot IS the conversation
+        if (_conv and key and kind in ("head", "tools") and not _long_followup
+                and await self._conv_restore(llm, hs, key, rid, _late, level=cur_level)):
             return
         n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
         if not n_head:
@@ -15218,8 +15413,14 @@ class GhostAgent:
             return
         ok, detail, dt, n = res
         _same = bool((level_moved or _after_side) and owner and owner == key)   # §4RW-f, §4RW-g
-        _whose = ("this request after its own picture look" if _after_side and not level_moved else
+        # §4SC-c: the side call by name (the look, the cut-write continuation,
+        # a fact-check-verify call) — what `_side_call_before` saved before
+        _side_what = str(getattr(self, "_side_call_what_last", "") or "this request's picture look")
+        _side_what = _side_what.replace("this request's ", "", 1)
+        _whose = (f"this request after its own {_side_what}" if _after_side and not level_moved else
                   f"this conversation at {cur_level or 'the default'} effort" if _same else
+                  f"this conversation's next request (its last made {_calls} calls, past llama's "
+                  f"{_head_first}-call checkpoint span)" if _long_followup else
                   "this conversation's next request" if next_request else
                   "another conversation's first call" if owner else "this request")
         if ok:
@@ -15245,13 +15446,19 @@ class GhostAgent:
         pool = 127.0.0.1:8088) replaces the conversation it holds. Saved to
         disk first; the request's next call that opens with the head restores
         it (`_slot_switch_before`). Owner requests that hold the slot only.
+        §4SC: the cut-write continuation too (`chat_completion(side_main=True)`;
+        §4SC-b: also the fact-check verify, a foreground probe_model and the
+        research summary — the client names it in `llm.side_call_what()`).
         §4RW-g b: a request without a conversation key (a probe, a scheduled
         task) has nothing to save — its next head call gets the head back."""
-        from .llm import BEFORE_MAIN_DISPATCH_S, conv_keep_enabled, opens_with_head, shares_head_tools
+        from .llm import (BEFORE_MAIN_DISPATCH_S, conv_keep_enabled, opens_with_head, shares_head_tools,
+                          side_call_what, slot_moved_on)
         from ..utils.logging import request_id_context, slot_session_context
         llm = getattr(getattr(self, "context", None), "llm_client", None)
         if llm is None or not conv_keep_enabled():
             return
+        what = side_call_what()                                                      # §4SC (§4SC-b: a ContextVar)
+        what = what if isinstance(what, str) and what else "this request's picture look"
         key, rid = slot_session_context.get(), str(request_id_context.get() or "")
         if requester_is_member():
             # §4RW-g c: a member's look replaces the members' head and the
@@ -15264,7 +15471,7 @@ class GhostAgent:
         owner = getattr(llm, "_slot_session", None)
         why = ("no request id" if not rid else
                "another conversation owns the slot" if key and owner != key else
-               "the slot was already displaced" if getattr(llm, "_head_displaced", False) is True else
+               "the slot was already displaced" if slot_moved_on(llm) else
                "another turn holds the lock" if not self._turn_holder_ok() else "")
         if why:
             logger.info("conversation not saved before a side call on the main server: %s", why)
@@ -15273,11 +15480,16 @@ class GhostAgent:
         if opens_with_head(payload, ref) or shares_head_tools(payload, ref):
             return
         self._side_call_rid = rid                # (saved or not: its next head call restores)
+        self._side_call_what_last = what         # §4SC-c: for the restore line
+        _late = time.monotonic() + BEFORE_MAIN_DISPATCH_S - _head_saves.RESTORE_TIMEOUT_S - 2.0
         if not key:
+            if owner:
+                # §4SA review r2: a probe's look over an owned slot — the owner's
+                # conversation to disk first, as before any other displacement
+                await self._conv_displace(llm, what.replace("this request's", "a request's", 1), _late)
             logger.info("side call on the main server: no conversation key — the head comes back after it")
             return
-        _late = time.monotonic() + BEFORE_MAIN_DISPATCH_S - _head_saves.RESTORE_TIMEOUT_S - 2.0
-        await self._conv_save(llm, "this request's picture look", _late)
+        await self._conv_save(llm, what, _late)
 
     @staticmethod
     def _call_level(payload) -> Optional[str]:
@@ -15317,9 +15529,15 @@ class GhostAgent:
         return hs
 
     def _idle_s(self) -> float:
-        """Seconds since the last request (0 when unknown)."""
+        """Seconds since the last request that was not a probe (0 when
+        unknown) — the slot's gap clock (§4SA: `last_real_activity_time`,
+        else the idle scheduler's `last_activity_time`)."""
         try:
-            return (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
+            ctx = self.context
+            last = getattr(ctx, "last_real_activity_time", None)
+            if not isinstance(last, datetime.datetime):
+                last = ctx.last_activity_time
+            return (datetime.datetime.now() - last).total_seconds()
         except Exception:  # noqa: BLE001
             return 0.0
 
@@ -15385,10 +15603,13 @@ class GhostAgent:
                 # owner, or a call since its last one, means the slot moved on)
                 last = getattr(llm, "_last_main_call_end", None)
                 cur = getattr(llm, "_slot_session_used", None)
+                from .llm import slot_moved_on
+                # §4SA: "moved on" (a call that was not this conversation's), not
+                # "no head" — the owner on Slack's state has no head and is saved
                 return (getattr(llm, "_slot_session", None) == owner
                         and isinstance(cur, (int, float))
                         and not (isinstance(last, (int, float)) and last > cur)
-                        and getattr(llm, "_head_displaced", False) is not True)
+                        and not slot_moved_on(llm))
             lock = getattr(self, "_conv_lock", None)
             if lock is None:
                 lock = self._conv_lock = asyncio.Lock()
@@ -15400,6 +15621,7 @@ class GhostAgent:
 
     async def _conv_save_locked(self, llm, why, late, hs, owner, used, still_it, stop=None) -> bool:
         """`_conv_save`'s body, under the conversation lock."""
+        from .llm import BEFORE_MAIN_DISPATCH_S
         try:
             if getattr(llm, "_conv_saved", None) == (owner, used):
                 return True
@@ -15411,27 +15633,58 @@ class GhostAgent:
             if not n_head:
                 _prev = _head_saves.newest_head_for(hs["dir"], hs.get("identity", ""))
                 n_head = (_head_saves.stored_tokens(hs["dir"], _prev) if _prev else None) or 0
+            late_given = late is not None
             late = time.monotonic() + CONV_SAVE_WAIT_S if late is None else late
             if not await self._slot_idle(hs["base"], late, stop):
-                logger.info("conversation not saved before %s: the main slot stayed busy", why)
+                pretty_log("Conversation", f"not saved before {why} — the main slot stayed busy; its next "
+                           f"request re-reads it", icon=Icons.HEAD_FAIL)
                 return False
             n = await asyncio.to_thread(_head_saves.slot_tokens, hs["base"])
-            if n is None or n < n_head + CONV_MIN_PAST_TOKENS or not still_it():
+            if n is not None and n < n_head + conv_min_past_tokens() and still_it():
+                logger.info("conversation not saved before %s: %d tokens past the head, under the %d floor",
+                            why, n - n_head, conv_min_past_tokens())
                 return False
-            key = _head_saves.conv_key(hs.get("identity", ""), owner)
-            save_s = min(_head_saves.SAVE_TIMEOUT_S, late - time.monotonic())
+            if n is None or not still_it():
+                return False
+            # §4SA review: one file per conversation AND level — a flip between
+            # levels must not overwrite the other level's state
+            key = _head_saves.conv_key(hs.get("identity", ""), owner, getattr(self, "_slot_level", None))
+            # §4SA: the bound grows with the state, as the restore's does. A caller
+            # without a deadline (a background call's hook) gets the state's own
+            # bound — review: the 60 s wait cap had capped an 80 s save, and the
+            # file llama went on writing was never kept
+            if late_given:
+                # §4SC-b: the caller sized its window (the side hook: the dispatch
+                # bound less the restore's) — the save gets all of it, not the
+                # state's estimate, which the window was already built from
+                save_s = late - time.monotonic()
+            else:
+                late = max(late, time.monotonic() + min(_head_saves.save_timeout_s(n),
+                                                        BEFORE_MAIN_DISPATCH_S - CONV_SAVE_WAIT_S - 15.0))
+                save_s = min(_head_saves.save_timeout_s(n), late - time.monotonic())
             if save_s < CONV_SAVE_MIN_S:
                 # §4RW review: a 5 s bound on a multi-GB save timed out while llama
                 # kept writing (a .part file left for an hour, the slot released)
-                logger.info("conversation not saved before %s: %.0fs left of the deadline", why, save_s)
+                pretty_log("Conversation", f"not saved before {why} — {save_s:.0f}s left of the deadline; its "
+                           f"next request re-reads it", icon=Icons.HEAD_FAIL)
                 return False
             t0 = time.monotonic()
+            # §4SA: whether the state opens with the head (the owner on Slack's
+            # does not) — the restore sets the head mark from it
+            _extra = {"head_in_slot": getattr(llm, "_head_displaced", False) is not True,
+                      "calls": int(getattr(llm, "_slot_request_calls", 0) or 0),   # §4SA: for the head-first gate
+                      "rid": str(getattr(llm, "_slot_request", "") or ""),       # (r2: the gate exempts this request)
+                      "conv": _head_saves.conv_key(hs.get("identity", ""), owner)}  # (r2: prune counts conversations)
+            if getattr(self, "_slot_level", None):
+                _extra["effort"] = self._slot_level                                  # §4RW-f
             ok, detail = await asyncio.to_thread(
                 _head_saves.save, hs["base"], hs["dir"], key, n, hs.get("identity", ""),
-                _head_saves.CONV, save_s, True,
-                ({"effort": self._slot_level} if getattr(self, "_slot_level", None) else None))   # §4RW-f
+                _head_saves.CONV, save_s, True, _extra)
             if not ok:
-                logger.info("conversation not saved before %s: %s", why, detail)
+                # §4SA review: on screen — a timed-out or refused save is the
+                # conversation lost, and it was a durable-only line
+                pretty_log("Conversation", f"not saved before {why} ({detail}) — its next request "
+                           f"re-reads it", icon=Icons.HEAD_FAIL)
                 return False
             # (llama runs the save before any call posted after it, so the
             # file is this conversation; the "on disk" mark only while it is
@@ -15441,7 +15694,7 @@ class GhostAgent:
                 # review r2: what a later claim may trust — this conversation,
                 # this many tokens, last on the slot
                 llm._conv_last_saved = (owner, _head_saves.stored_tokens(hs["dir"], key),
-                                        time.monotonic())
+                                        time.monotonic(), key)          # (§4SA r2: which file)
             pretty_log("Conversation", f"saved to disk before {why} in {time.monotonic() - t0:.1f}s "
                        f"({detail}) — its next request restores it",
                        icon=Icons.CONV_SAVE)
@@ -15502,7 +15755,11 @@ class GhostAgent:
         from disk (it holds the head too, and llama's checkpoint at its last
         message). True when it is in the slot. §4RW-f: ``level`` is the
         call's effort level (None: unknown)."""
-        ckey = _head_saves.conv_key(hs.get("identity", ""), session)
+        # §4SA review: this level's own file first; the plain key is a file saved
+        # before §4SA or at an unknown level (the level check below judges it)
+        ckey = _head_saves.conv_key(hs.get("identity", ""), session, level) if level else None
+        if not (ckey and _head_saves.stored_tokens(hs["dir"], ckey)):
+            ckey = _head_saves.conv_key(hs.get("identity", ""), session)
         if not _head_saves.stored_tokens(hs["dir"], ckey):
             return False
         lock = getattr(self, "_conv_lock", None)
@@ -15515,6 +15772,22 @@ class GhostAgent:
             if not n_conv:
                 return False
             saved_level = _head_saves.meta_field(hs["dir"], ckey, "effort")
+            # §4SA review: the file holds the previous request's last 12
+            # checkpoints exactly as the slot did — past the gate, the head is
+            # the better start for it too (else llama re-reads from token 0)
+            from .llm import conv_head_first_calls
+            _gate, _calls_saved = conv_head_first_calls(), _head_saves.meta_field(hs["dir"], ckey, "calls")
+            try:
+                _calls_saved = int(_calls_saved or 0)
+            except (TypeError, ValueError):
+                _calls_saved = 0
+            _saved_rid = str(_head_saves.meta_field(hs["dir"], ckey, "rid") or "")
+            if 0 < _gate <= _calls_saved and _saved_rid != rid:
+                # (r2: a file this request saved before its own look extends
+                # into its next prompt whole — no checkpoint needed; not gated)
+                pretty_log("Conversation", f"not restored — its last request made {_calls_saved} calls, past "
+                           f"llama's {_gate}-call checkpoint span; the head instead", icon=Icons.CONV_LEFT)
+                return False
             if saved_level and level and str(saved_level) != level:
                 # §4RW-f: saved at another effort level — it parts from this request
                 # at the effort sentence, before any of its checkpoints: llama would
@@ -15525,6 +15798,7 @@ class GhostAgent:
             _ls = getattr(llm, "_conv_last_saved", None)
             _end = getattr(llm, "_last_main_call_end", None)
             if (isinstance(_ls, tuple) and _ls[:2] == (session, n_conv)
+                    and (len(_ls) < 4 or _ls[3] == ckey)         # §4SA r2: this level's file
                     # round-3 review: and no call ran on the slot since that save
                     and not (isinstance(_end, (int, float)) and _end > _ls[2])
                     and await asyncio.to_thread(_head_saves.slot_tokens, hs["base"]) == n_conv):
@@ -15541,10 +15815,12 @@ class GhostAgent:
                 if not ok and any(w in str(detail).lower() for w in ("timeout", "timed out")):
                     # §4RW review MAJOR: llama finishes a restore the client gave
                     # up on (a 6 GB file under swap) — the head restored after it
-                    # threw the conversation away. §4RW-e (review): /slots counts
-                    # the last completion's prompt, not what a restore loaded, so
-                    # the landing is checked by posting it once more — the file is
-                    # in the page cache now, and the reply carries n_restored
+                    # threw the conversation away. §4RW-e (review) posted the
+                    # restore once more to see it land (the file is in the page
+                    # cache then, and the reply carries n_restored). §4SA: the
+                    # b11960 source shows a restore DOES replace the slot's prompt
+                    # tokens, so /slots would have told too; the re-post stays —
+                    # it is what the pins exercise, and it costs ~0.5 s once
                     # Round 2: a second timeout means llama is reading the file
                     # from an idle slot — it lands; the head is not put over it.
                     # Only posted when the request's deadline allows its bound.
@@ -15565,9 +15841,16 @@ class GhostAgent:
             return False
         _head_saves.touch(hs["dir"], ckey)
         now = time.monotonic()
+        llm._slot_changed_at = now                  # §4SA review: a change of hands
         llm._slot_session, llm._slot_session_used, llm._slot_request = session, now, rid
+        llm._slot_request_calls = 0                 # §4SA review: this request's calls, not the last one's
         llm._conv_saved = (session, now)            # the slot is what the file holds
-        llm._head_displaced = False
+        # §4SA: the file says whether its state opens with the head (the owner on
+        # Slack's does not); either way the slot holds this conversation's own state
+        llm._head_displaced = _head_saves.meta_field(hs["dir"], ckey, "head_in_slot") is False
+        llm._head_displaced_early = False           # (review: a background call's marks must not outlive it)
+        llm._head_displaced_by = "conversation restore"
+        llm._slot_moved_on = False
         pretty_log("Conversation", f"restored from disk in {dt:.1f}s ({detail}) — it resumes at "
                    f"its last message", icon=Icons.CONV_RESTORE)
         return True
@@ -15897,7 +16180,7 @@ class GhostAgent:
                     _head_saves.restore, owner_hs["base"], owner_hs["dir"], owner_hs["key"])
                 if ok:
                     llm._head_displaced = False
-                    release_slot_session(llm)
+                    release_slot_session(llm, stamp=False)
                     logger.info("owner's head restored after the members' head save (%s, %.1fs)", detail, rdt)
             return True
         except Exception as e:  # noqa: BLE001 — best-effort, like the warm-up
@@ -16041,6 +16324,7 @@ class GhostAgent:
         prefill it or no file exists yet — only while nothing else is on the
         main slot (`head_saves.save` also refuses a slot that moved on)."""
         self._head_defer_streak = 0          # the call went out: not deferred
+        self._head_defer_last_why = None
         try:
             base, d, key = hs["base"], hs["dir"], hs["key"]
             verdict, cached, prompt = rewarm_verdict(resp, dt_s)
@@ -16048,7 +16332,7 @@ class GhostAgent:
                 hs["prompt_n"] = prompt          # §4RW: what this head is, file or not
             if hs.get("restored"):
                 from .llm import release_slot_session
-                release_slot_session(llm)         # §4RP: the head owns the slot again
+                release_slot_session(llm, stamp=False)   # §4RP: the head owns the slot again (§4SA r2: no stamp)
                 llm._outside_slot_dirty = False   # §4RQ
                 _after = f" after a '{displaced_by}' call" if displaced_by else ""
                 _parked = "; the conversation parked in llama's RAM cache first" if hs.get("parked") else ""
@@ -16124,6 +16408,46 @@ class GhostAgent:
         if isinstance(seen, int) and total < seen:
             self._forget_slot_owner("llama restarted")
 
+    @staticmethod
+    def _hand_back_unread(turn_reg, turn, delivered_rows) -> int:
+        """§4SB: messages the loop drained for a model call that never
+        completed (a cancel or an upstream error landed between the drain and
+        the reply) go to the conversation's leftovers and leave the rows the
+        route persists — before, they were stored as read and the client had
+        nothing to hand back (review 2026-10-29). ``_q_read`` is the count a
+        completed reply had read; ``_q_items`` what was drained. Never raises;
+        returns how many went back."""
+        try:
+            if turn is None or turn_reg is None:
+                return 0
+            items = list(getattr(turn, "_q_items", ()) or ())
+            read = int(getattr(turn, "_q_read", 0) or 0)
+            # (r2: rows an overflow retry's budget left out of its prompt — the
+            # oldest — are unread too, whatever the marker says)
+            skipped = sorted(i for i in (getattr(turn, "_q_skipped", ()) or ()) if 0 <= i < read)
+            unread = [items[i] for i in skipped] + items[read:]
+            if not unread:
+                return 0
+            texts = [str(m.get("text") or "") for m in unread]
+            if isinstance(delivered_rows, list):
+                # the persisted rows: drop the unread ones from the END, by text
+                for t in reversed(texts):
+                    for i in range(len(delivered_rows) - 1, -1, -1):
+                        if str(delivered_rows[i].get("content") or "") == t:
+                            del delivered_rows[i]
+                            break
+            # (r2 review: the accept `ts` is KEPT — a re-sent row's start is
+            # backdated to it so a later hold still withdraws it; the leftovers'
+            # TTL counts from the registry's own `kept_at`)
+            kept = int(turn_reg.add_leftovers(turn.session_id, turn.kind, [dict(m) for m in unread]) or 0)
+            pretty_log("Queued Message", f"[{str(turn.req_id)[:8]}] {len(unread)} message(s) drained but never "
+                       f"read — handed back" + ("" if kept == len(unread) else f" ({kept} kept)"),
+                       icon=Icons.QUEUED_MSG)
+            return kept
+        except Exception as e:  # noqa: BLE001 — a hand-back must never fail the turn
+            logger.info("queued hand-back skipped: %s: %s", type(e).__name__, e)
+            return 0
+
     def _forget_slot_owner(self, why: str) -> None:
         """The slot holds no conversation and no head: say so to the record."""
         from .llm import release_slot_session
@@ -16134,7 +16458,47 @@ class GhostAgent:
             logger.info("head disk: %s — the slot record names no conversation now", why)
             release_slot_session(llm)
         llm._head_displaced = True
+        llm._slot_moved_on = True                      # §4SA
         llm._head_displaced_by = why
+
+    async def save_slot_conversation_at_shutdown(self) -> bool:
+        """§4SA: the conversation that owns the main slot goes to disk before
+        the process exits. The record dies with the process, and the boot
+        warm-up restores the head over whatever the slot holds (live 10-29
+        06:11: a 2.3 GB state displaced unsaved; 8–20 restarts on a day of
+        fixes). Nothing while a turn runs (the slot holds that turn's state,
+        stamped aborted). Bounded by SHUTDOWN_CONV_SAVE_S, inside launchd's
+        60 s exit window with the other drains. True when a file was written."""
+        from .llm import conv_keep_enabled
+        try:
+            llm = getattr(getattr(self, "context", None), "llm_client", None)
+            if llm is None or not conv_keep_enabled() or not getattr(llm, "_slot_session", None):
+                return False
+            from .llm import slot_moved_on
+            if (int(getattr(llm, "foreground_requests", 0) or 0) > 0
+                    or getattr(self, "_turn_lock_rid", None)):
+                logger.info("conversation not saved at shutdown: a turn is running")
+                return False
+            if int(getattr(llm, "_main_streams_open", 0) or 0) > 0 or slot_moved_on(llm):
+                # review: a background stream still on the slot, or a call that
+                # was not the conversation's — the wait would end in a refusal
+                logger.info("conversation not saved at shutdown: the slot holds another call's state")
+                return False
+            from ..utils.aio import wait_for as _wait_for
+            late = time.monotonic() + SHUTDOWN_CONV_SAVE_S
+            try:
+                # review r2: the conversation lock can be held by a background
+                # call's save for a minute or more — the wait is bounded too, or
+                # launchd's SIGKILL lands before the drains
+                return bool(await _wait_for(self._conv_save(llm, "the agent's shutdown", late),
+                                            SHUTDOWN_CONV_SAVE_S + 1.0))
+            except asyncio.TimeoutError:
+                logger.info("conversation not saved at shutdown: it did not finish inside the shutdown budget "
+                            "(the lock held by another save, or a slow slot)")
+                return False
+        except Exception as e:  # noqa: BLE001 — shutdown must proceed
+            logger.info("conversation save at shutdown skipped: %s: %s", type(e).__name__, e)
+            return False
 
     async def _main_slot_metrics(self) -> Tuple[Optional[int], Optional[int]]:
         """(requests_processing, prompt_tokens_total) from the main node's
@@ -16267,21 +16631,27 @@ class GhostAgent:
         Returns the displacing call's label, or "" for a periodic tick. A
         client that keeps no mark (no head reference yet, a stub) sleeps the
         whole period in one call, as before."""
-        from .llm import head_rewarm_due
+        from .llm import conv_keep_enabled, head_rewarm_due, slot_kept
         llm = getattr(getattr(self, "context", None), "llm_client", None)
+
+        def _kept() -> bool:
+            # §4SA review: under conversation keep a conversation without the
+            # head (the owner on Slack) owns the slot for hours — not a
+            # displacement to re-plan for every period
+            return conv_keep_enabled() and slot_kept(llm)
         if not isinstance(getattr(llm, "_head_ref", None), tuple):
             await sleep(period_s)
             # the boot warm-up registers the head while this first sleep runs
             # (live: the first tick named nothing and logged "churn")
             if (isinstance(getattr(llm, "_head_ref", None), tuple)
-                    and getattr(llm, "_head_displaced", False) is True):
+                    and getattr(llm, "_head_displaced", False) is True and not _kept()):
                 return str(getattr(llm, "_head_displaced_by", "") or "unlabelled")
             return ""
         if not early:
             # the last displacement re-warm did not land: the period, then
             # say so again if the mark still stands
             await sleep(period_s)
-            if getattr(llm, "_head_displaced", False) is True:
+            if getattr(llm, "_head_displaced", False) is True and not _kept():
                 return str(getattr(llm, "_head_displaced_by", "") or "unlabelled")
             return ""
         left = period_s
@@ -16294,7 +16664,7 @@ class GhostAgent:
             if left <= 0:
                 # the periodic tick: name a known displacement (r2: it logged
                 # "evicted by main-slot churn" for one the client had seen)
-                if getattr(llm, "_head_displaced", False) is True:
+                if getattr(llm, "_head_displaced", False) is True and not _kept():
                     return str(getattr(llm, "_head_displaced_by", "") or "unlabelled")
                 return ""
 
@@ -22263,11 +22633,9 @@ class GhostAgent:
                 _so = getattr(self.context, "_status_only_req", None)
                 if _cname in _WORK_TOOLS and _so and _so == str(request_id_context.get() or ""):
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
-                               "content": _TO.rejected(
-                                   "Not run: the user asked for a STATUS / progress report. Answer from "
-                                   "what is already known — the project's tasks and work log, the jobs' "
-                                   "state, files already written. Start no new work; offer to continue "
-                                   "if they want.", world_changed=False, reason_code="status_only")}
+                               "content": _TO.rejected(      # §4SB: names a mid-turn instruction
+                                   status_only_refusal_text(),
+                                   world_changed=False, reason_code="status_only")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     continue
@@ -27820,12 +28188,38 @@ class GhostAgent:
                 # Skip when a tool call is in flight (those turns are
                 # handled by the parse/retry path, not user-facing
                 # prose) or when the model emitted no visible content.
+                _full_low = full_content.lower()           # §4SC-e: one lowering for the sibling gates
+                _stripped = full_content.rstrip()
+                # §4SC-f: a cut inside an OPEN code fence is code, whatever the
+                # line starts with (§4IY: fenced call markup is documentation)
+                _in_fence = _in_open_fence(full_content)
+                # §4SC-d: a cut INSIDE an opening tag ("…\n<tool_ca") is a call
+                # turn, not prose — continued, the seam shipped raw (§4SC-e: the
+                # tag's own line, not any `<` — see _CALL_TAG_TAIL)
+                _tail_m = None if _in_fence else _CALL_TAG_TAIL.search(_stripped)
+                # §4SC-f: the substring exclusions below read the text WITHOUT
+                # that tail — a cut at exactly "…\n<tool_call" (the full name, no
+                # `>`) excluded itself, and the fragment shipped raw with no note
+                _rest_low = _stripped[:_tail_m.start()].lower() if _tail_m else _full_low
                 _truncated_text_turn = (
                     (stream_finish_reason == "length" or stream_errored)
                     and bool(full_content.strip())
                     and not msg.get("tool_calls")
-                    and "<tool_call" not in full_content.lower()
-                    and "<function" not in full_content.lower()
+                    and "<tool_call" not in _full_low
+                    and "<function" not in _full_low
+                    and _tail_m is None
+                )
+                # §4SC-d follow-up: that cut, with no complete call markup
+                # anywhere and no tool_calls, has nothing the parser can find —
+                # the fragment is stripped below and the cut is said, as for
+                # any other cut answer ("Let me look that up.\n<tool_ca" shipped)
+                _tag_tail_cut = (
+                    (stream_finish_reason == "length" or stream_errored)
+                    and bool(full_content.strip())
+                    and not msg.get("tool_calls")
+                    and "<tool_call" not in _rest_low
+                    and "<function" not in _rest_low
+                    and _tail_m is not None
                 )
                 _continue_tries = 0
                 _cut_unrecovered = False     # §4MD M1: a cut answer left cut
@@ -27857,16 +28251,28 @@ class GhostAgent:
                         "messages": cont_messages,
                         "stream": False,
                     }
-                    # Plain-text continuation: never invite a tool call.
-                    cont_payload.pop("tools", None)
-                    cont_payload.pop("tool_choice", None)
-                    cont_payload.pop("parallel_tool_calls", None)
+                    # Plain-text continuation: never invite a tool call — but
+                    # KEEP the tools (§4SC-b). `opens_with_head` hashes the tool
+                    # list, so a continuation without them was a non-head call
+                    # that displaced the conversation AND re-prefilled the whole
+                    # prompt itself (the template renders tools first).
+                    # `tool_choice:"none"` renders byte-identical to "auto" and
+                    # suppresses the call, as the forced-final retry relies on.
+                    if cont_payload.get("tools"):
+                        cont_payload["tool_choice"] = "none"
+                    else:
+                        cont_payload.pop("tool_choice", None)
+                        cont_payload.pop("parallel_tool_calls", None)
                     stream_finish_reason = None
                     try:
                         # bounded (§4MD M2): this call holds the turn lock and
                         # the main-node lock; the client default is 1200 s
+                        # §4SC-c: with tools it opens with the head (the main
+                        # path); without them it is a non-head call of this
+                        # request — a side call, so the conversation is saved
                         cont_result = await self.context.llm_client.chat_completion(
-                            cont_payload, timeout=TRUNCATION_CONTINUATION_TIMEOUT_S)
+                            cont_payload, timeout=TRUNCATION_CONTINUATION_TIMEOUT_S,
+                            side_main=not cont_payload.get("tools"))
                         cont_choice = (cont_result or {}).get("choices", [{}])[0]
                         cont_text = (cont_choice.get("message", {}) or {}).get("content", "") or ""
                         stream_finish_reason = cont_choice.get("finish_reason")
@@ -27880,13 +28286,42 @@ class GhostAgent:
                         if not cont_text.strip():
                             _cut_unrecovered = True
                             break
+                        # §4SC-c: the schemas are in view now — a continuation
+                        # that answers with a call is not prose; appended, the
+                        # cut answer became a tool turn. The pre-loop gate,
+                        # on the continuation: the cut stays cut, with its note.
+                        _cont_low = cont_text.lower()
+                        if ((cont_choice.get("message", {}) or {}).get("tool_calls")
+                                or "<tool_call" in _cont_low or "<function" in _cont_low
+                                # §4SC-d: the closing forms too — a cut inside
+                                # the opening tag continues as "ll>\n{…}</tool_call>"
+                                or "tool_call>" in _cont_low or "</function" in _cont_low):
+                            _cut_unrecovered = True
+                            break
                         # Bridge with a space only when the seam would
                         # otherwise weld two words together; mid-token
                         # cuts are continued without a gap.
                         if full_content and not full_content[-1].isspace() and not cont_text[:1].isspace():
-                            full_content += cont_text if cont_text[:1] in ",.;:!?)]}\"'" else " " + cont_text
+                            # §4SC-e/f: a leading `>` is glued only when the tail's last
+                            # line has an unmatched `<` ("std::vector<int" + "> v") or
+                            # ends in -/=/> ("a -" + "> b"); "x" + "> 5" gets its space
+                            _last = full_content.rsplit("\n", 1)[-1]
+                            _glue_gt = cont_text[:1] == ">" and (_last.count("<") > _last.count(">")
+                                                                  or _last.endswith(("-", "=", ">")))
+                            full_content += (cont_text if (cont_text[:1] in ",.;:!?)]}\"'" or _glue_gt)
+                                             else " " + cont_text)
                         else:
                             full_content += cont_text
+                        # §4SC-g: a continuation round ITSELF cut inside a tag
+                        # ("… and part two.\n<tool_ca", length) — the tail rule
+                        # ran only pre-loop, and the next round completed the
+                        # markup ("ll>\nignored" shipped). The same rule here:
+                        # strip the tail, say the cut, stop.
+                        if stream_finish_reason == "length" and not _in_open_fence(full_content):
+                            if _CALL_TAG_TAIL.search(full_content.rstrip()) is not None:
+                                full_content = _CALL_TAG_TAIL.sub("", full_content.rstrip())
+                                _cut_unrecovered = True
+                                break
                     except Exception as exc:
                         logger.warning("Truncation continuation failed: %s", exc)
                         _cut_unrecovered = True
@@ -27894,12 +28329,23 @@ class GhostAgent:
                     _truncated_text_turn = stream_finish_reason == "length"
                 if _truncated_text_turn and _continue_tries >= MAX_TRUNCATION_CONTINUATIONS:
                     _cut_unrecovered = True
+                if _tag_tail_cut:
+                    full_content = _CALL_TAG_TAIL.sub("", full_content.rstrip())   # the `\n<…` tail
+                    _cut_unrecovered = True
+                elif _tail_m is not None:
+                    # §4SC-g: the rest holds a complete call block (or tool_calls)
+                    # — the parser's turn, but not with the dangling fragment in
+                    # the text: it reached the pre-tool narration
+                    full_content = _CALL_TAG_TAIL.sub("", _stripped)
                 if _cut_unrecovered:
                     # The partial answer reached the user as COMPLETE ("The
                     # capital of Peru is") and the turn booked ok (§4MD M1).
                     # Say it, and mark the turn failed — the marker is the
                     # outcome rules' strongest signal.
-                    full_content = (full_content.rstrip() + "\n\n" + TRUNCATED_ANSWER_NOTE
+                    # §4SC-e: a cut inside a code fence — close it first, or
+                    # the note renders as code
+                    _fence = "\n```" if _in_open_fence(full_content) else ""
+                    full_content = (full_content.rstrip() + _fence + "\n\n" + TRUNCATED_ANSWER_NOTE
                                     + " " + UPSTREAM_ABORT_MARKER)
 
                 merged_content = full_content
@@ -28028,6 +28474,9 @@ class GhostAgent:
                 # stall), nothing at all is the server
                 _raw_reply_empty = (not str(merged_content or "")
                                     and not msg.get("tool_calls"))
+                _q_t = _turn_reg.get(req_id) if _turn_reg is not None else None   # §4SB: this reply read every
+                if _q_t is not None and (_strip_think_blocks(str(full_content or "")).strip() or msg.get("tool_calls")):   # drained message
+                    _q_mark_read(_q_t)       # (r2/r3/r4: an empty 200 or a thinking-only reply — split or inline — answered nothing)
                 clean_msg_content = _strip_think_blocks(merged_content).strip()
                 msg["content"] = clean_msg_content
 
@@ -28164,8 +28613,9 @@ class GhostAgent:
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 # the marker books the turn FAILED (§4MD M3: an outage was
                 # "turn outcome ok" and credited every lesson shown in it)
-                final_ai_content = ("CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again. "
-                                    + UPSTREAM_ABORT_MARKER)
+                final_ai_content = _with_carry(self.context, request_id_context.get(),
+                                               "CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again. "
+                                               + UPSTREAM_ABORT_MARKER)      # §4SB r2: the carried answer first
                 pretty_log("System Fault", "Upstream server unreachable", level="ERROR", icon=Icons.FAIL)
                 force_stop = True
                 return "break"
@@ -28300,6 +28750,10 @@ class GhostAgent:
                             _raw_reply_empty = (not str(msg.get("content") or "")
                                                 and not msg.get("reasoning_content")
                                                 and not msg.get("tool_calls"))
+                            _q_t = _turn_reg.get(req_id) if _turn_reg is not None else None   # §4SB
+                            if _q_t is not None and not _raw_reply_empty:
+                                _q_note_overflow(_q_t, _q_rows, _q_sent)    # (r2/r3: the OLDEST rows left out are unread;
+                                #  r4: an empty 200 answered nothing — the rows stay in `messages` for the next reply)
                     except Exception as retry_e:
                         # Surface a calm, actionable message instead of a
                         # raw CRITICAL/traceback. The task state is intact;
@@ -28312,21 +28766,24 @@ class GhostAgent:
                             "are preserved. Ask me to retry the step and I'll process the large "
                             "files with a script (summarising them) instead of reading them whole."
                         )
+                        final_ai_content = _with_carry(self.context, request_id_context.get(), final_ai_content)  # §4SB r2
                         force_stop = True
                         return "break"
                 else:
                     # the raw upstream body (model paths, server internals)
                     # stays in the log, not the reply (§4MD MINOR 8)
                     logger.error("upstream HTTP %s: %s", e.response.status_code, e.response.text[:2000])
-                    final_ai_content = (f"CRITICAL: Upstream error {e.response.status_code} — the model server could "
-                                        f"not answer this time. Please try again in a moment. " + UPSTREAM_ABORT_MARKER)
+                    final_ai_content = _with_carry(self.context, request_id_context.get(),
+                                                   f"CRITICAL: Upstream error {e.response.status_code} — the model server could "
+                                                   f"not answer this time. Please try again in a moment. " + UPSTREAM_ABORT_MARKER)   # §4SB r2
                     pretty_log("System Fault", f"HTTP {e.response.status_code}", level="ERROR", icon=Icons.FAIL)
                     force_stop = True
                     return "break"
             except Exception as e:
                 logger.error("LLM communication failed: %s: %s", type(e).__name__, e)
-                final_ai_content = (f"CRITICAL: An unexpected error occurred while communicating with the LLM "
-                                    f"({type(e).__name__}). Please try again in a moment. " + UPSTREAM_ABORT_MARKER)
+                final_ai_content = _with_carry(self.context, request_id_context.get(),
+                                               f"CRITICAL: An unexpected error occurred while communicating with the LLM "
+                                               f"({type(e).__name__}). Please try again in a moment. " + UPSTREAM_ABORT_MARKER)   # §4SB r2
                 pretty_log("System Fault", str(e), level="ERROR", icon=Icons.FAIL)
                 force_stop = True
                 return "break"
@@ -28535,6 +28992,34 @@ class GhostAgent:
 
             if not tool_calls:
                 clean_ui = ui_content.strip("` \n\r")
+                # §4SB: the user sent something while THIS answer was being
+                # generated — the inbox accepted it "for the next step", and this
+                # exit would leave it unread (live 2026-10-29 05:38: a message at
+                # +24 s of a 28 s turn ended in the tray). ONE extra step, when
+                # nothing of this answer has been shown yet: the answer so far is
+                # carried (§4PO), the model's row goes into history, and the
+                # rebuild drains the message — the model goes on from it.
+                from .queued_messages import enabled as _q_on
+                _q_turn = _turn_reg.get(req_id) if (_turn_reg is not None and _q_on()) else None
+                _q_pending = bool(getattr(_q_turn, "inbox", None)) if _q_turn is not None else False
+                if (_q_pending and clean_ui and not getattr(_q_turn, "_q_extra_used", False)   # (r2: an empty 200 is not an answer)
+                        and not getattr(_q_turn, "cancelled", False)
+                        and not is_final_generation and not force_final_response and not force_stop
+                        and turn < effective_max_turns - 1
+                        and not str(getattr(locals().get("_tap"), "sent", "") or "")):
+                    _q_turn._q_extra_used = True
+                    messages.append(msg)
+                    _q_kept = (ui_content or "").replace("\r", "").strip()
+                    if _q_kept:
+                        if final_ai_content and not final_ai_content.endswith("\n\n"):
+                            final_ai_content += "\n\n"
+                        _po_note_carry(self.context, request_id_context.get(),
+                                       len(final_ai_content or ""), _q_kept)
+                        final_ai_content += _q_kept
+                    pretty_log("Queued Message",
+                               f"[{str(req_id)[:8]}] the reply was ready when {len(_q_turn.inbox)} message(s) "
+                               "arrived — one more step reads them", icon=Icons.QUEUED_MSG)
+                    return "continue"
                 # §4GH: a forced-final turn (tools off — the breaker,
                 # the one-task latch, the planner) whose own text is
                 # empty or narration would ship the accumulated
@@ -28878,9 +29363,10 @@ class GhostAgent:
                     pretty_log("Upstream Empty", f"the model server returned an empty reply "
                                f"({_ue[req_id]})", level="WARNING", icon=Icons.WARN)
                     if _ue[req_id] >= 2:
-                        final_ai_content = ("CRITICAL: Upstream error — the model server returned empty replies "
-                                            "(it may be out of memory or restarting). Please try again in a moment. "
-                                            + UPSTREAM_ABORT_MARKER)
+                        final_ai_content = _with_carry(self.context, request_id_context.get(),
+                                                       "CRITICAL: Upstream error — the model server returned empty replies "
+                                                       "(it may be out of memory or restarting). Please try again in a moment. "
+                                                       + UPSTREAM_ABORT_MARKER)      # §4SB r2
                         force_stop = True
                         return "break"
                     return "continue"
@@ -29430,6 +29916,10 @@ class GhostAgent:
                             # reply, so the repair turn restates
                             # whatever still matters.
                             final_ai_content = ""
+                            try:        # §4SB r2: a refuted carry must not come back on an error exit
+                                getattr(self.context, "_po_carries", {}).pop(str(request_id_context.get() or ""), None)
+                            except Exception:  # noqa: BLE001
+                                pass
                         else:
                             # UNVERIFIED: prior narration isn't
                             # wrong, just untested — discard exactly
@@ -29502,8 +29992,19 @@ class GhostAgent:
         the agent "busy" and silently starved every idle phase — those turns
         mark foreground, which already holds the idle tick off mid-turn."""
         from .autonomous_activity import is_internal_request
-        if not is_internal_request(request_id_context.get()):
+        from ..utils.logging import is_probe_request_id
+        _rid = request_id_context.get()
+        if not is_internal_request(_rid):
             self.context.last_activity_time = datetime.datetime.now()
+            # §4SA: a diagnostic probe (probe-…) is the operator's test traffic,
+            # not the owner at the keyboard — bursts every ~3 min kept the slot's
+            # gap clock (`_idle_s`) under 600 s, so a new level's head file or
+            # the members' head was never made and the tick deferred for hours.
+            # (Review: the idle scheduler keeps its own clock above — probes
+            # must go on holding its phases off, or self-play and the failure
+            # replays start between the operator's probes and queue them.)
+            if not is_probe_request_id(_rid):
+                self.context.last_real_activity_time = datetime.datetime.now()
             # §4MI: the quiet-hours hold asks "was the OWNER here?" — the
             # window clock above is also written by self-play's finally,
             # so a 03:41 self-play run counted as the owner being present;
@@ -29908,6 +30409,10 @@ class GhostAgent:
                 # (a behavioural failure for the corpus), and how many repeated-
                 # opening answers the cross-turn breaker has let through.
                 loop_breaker_for(self.context, req_id, pop=True)   # a reused id starts clean
+                try:                                               # §4SB r2: and no stale §4PO carry (sched-/probe ids)
+                    getattr(self.context, "_po_carries", {}).pop(str(req_id or ""), None)
+                except Exception:  # noqa: BLE001
+                    pass
                 self.context._cross_turn_answers_waved = 0
                 # Context-pressure lockdown: set after the SECOND overflow in
                 # one request (read budget drops to zero for its remainder).
@@ -31215,7 +31720,11 @@ class GhostAgent:
                     # drained message is one the model reads.
                     if _queued_on:
                         for _q in _turn_reg.drain(req_id):
-                            messages.append(_queued_row(_q))
+                            _q_row = _queued_row(_q)
+                            if _active_turn is not None:            # §4SB: what was drained, for the hand-back
+                                _active_turn._q_items = list(getattr(_active_turn, "_q_items", ()) or ()) + [dict(_q)]
+                                _q_row["_q_i"] = len(_active_turn._q_items) - 1   # (r3: its drained position; req_messages drops the key)
+                            messages.append(_q_row)
                             _queued_note_delivered(_q["text"])      # step 2: every alert names it
                             self._on_queued_delivery(_q["text"], req_id)  # step 4: the owner's own words
                             _delivered_rows.append({"role": "user", "content": _q["text"]})
@@ -31748,6 +32257,13 @@ class GhostAgent:
                         # in handle_chat's frame; the identical assignment inside
                         # _stream_final_generation only sets a dead method local.
                         _stream_owns_unregister = True
+                        if _active_turn is not None:       # §4SB r2 (review MAJOR): the streamed final's prompt
+                            # r5: the marker as it stands, for the drain's finally — a final
+                            # that emits nothing visible answered no drained row (hand-back there)
+                            _active_turn._q_pre_final = (int(getattr(_active_turn, "_q_read", 0) or 0),
+                                                         tuple(getattr(_active_turn, "_q_skipped", ()) or ()))
+                            _active_turn._q_delivered_rows = locals().get("_delivered_rows")
+                            _q_mark_read(_active_turn)     # carries every drained row (r4: the overflow's left-out set too)
                         return self._stream_final_generation(ss)
 
                     # §4GS step 4b: the internal consumer of this turn.
@@ -32053,6 +32569,10 @@ class GhostAgent:
         finally:
             # Queued messages: the loop is over — nothing more is read, even
             # while a streamed final still drains. Pending ones → leftovers.
+            # §4SB: and the ones drained for a model call that never completed
+            # (a cancel, an upstream error) — they were booked as read and
+            # persisted as history, the client could never hand them back
+            self._hand_back_unread(_turn_reg, _active_turn, locals().get("_delivered_rows"))
             _turn_reg.close_inbox(req_id, _active_turn)
             _note_request_end(req_id)            # §4RZ: no tool confirms after this
             _queued_end_request(_queued_scope)
@@ -33187,10 +33707,12 @@ class GhostAgent:
 
         async def stream_wrapper():
             full_content = ""
+            _model_text = ""              # §4SB r5: the model's OWN deltas (no prefix, no fallback, no notes)
             # §4RD: the drain's finally reads the text so far through this — a
             # stream closed at a yield (Stop: the proxy hangs up first) never
             # reaches the tail that records the turn
             _drain_flags["partial"] = lambda: full_content
+            _drain_flags["model"] = lambda: _model_text
             _um_failed_stream = False     # §4LK: set before [DONE]; read by the record
             # §4O B-MAJOR-1: the internal drain sets stream_errored on an
             # upstream abort frame and recovers; this USER-FACING final
@@ -33352,6 +33874,7 @@ class GhostAgent:
                                     if not _saw_reasoning and not thinking_disabled(payload):
                                         yield reasoning_unparsed_frame(req_id, created_time, stream_model)
                                 full_content += _new_text
+                                _model_text += _new_text
                 except Exception as e:
                     logger.debug(f"Stream chunk decode error: {type(e).__name__}")
 
@@ -33874,6 +34397,7 @@ class GhostAgent:
                         _ff_candidate, call_turn=_ff_candidate != _ff_unscrubbed.strip()).strip()
                     if _ff_candidate and not _ff_narr(_ff_candidate):
                         _ff_retry_text = _ff_candidate
+                        _model_text += _ff_candidate      # §4SB r6: the retry ANSWERED — model text, not the system's
                     else:
                         pretty_log(
                             "Turn Budget",
@@ -34722,6 +35246,45 @@ class GhostAgent:
         except Exception:  # noqa: BLE001
             _req_deadline = 0.0
 
+        def _q_handback_if_unanswered() -> None:
+            # §4SB r5 (review MAJOR): the handoff booked every drained row read
+            # before the stream ran; a final that emitted nothing visible (raise,
+            # empty stream, a Stop before the first token) answered none of them —
+            # the marker goes back to where the handoff found it and the rows are
+            # handed back (and leave the persisted rows) as on every other death.
+            # r6: shared with the close of a final the client hung up on before
+            # its first step (no `finally` runs then); the retry's answer counts
+            # as model text; a leaked raw reasoning prefix does not (§4KO, as
+            # the record); the marker advances after the hand-back (idempotent).
+            try:
+                _q_pre = getattr(_active_turn, "_q_pre_final", None)
+                if _q_pre is None:
+                    return
+                # (the MODEL's text: the no-answer fallback and the system notes
+                #  are the system's words, not a reply that read the rows; r7: nor
+                #  is call markup the stream scrubbed and never ran — an executed
+                #  call marks the rows read in the loop, a scrubbed one answered
+                #  nothing and its retry's answer counts on its own)
+                _q_vis = _MODULE_SCRUB_RE.sub("", strip_raw_orphan_reasoning(_strip_think_blocks(
+                    str((_drain_flags.get("model") or (lambda: ""))() or "")))).strip()
+                _active_turn._q_pre_final = None             # (r7: after the compute — nothing left to raise)
+                if not _q_vis:
+                    _active_turn._q_read, _active_turn._q_skipped = _q_pre
+                    self._hand_back_unread(_turn_reg, _active_turn,
+                                           getattr(_active_turn, "_q_delivered_rows", None))
+                    _q_mark_read(_active_turn)
+            except Exception:  # noqa: BLE001 — never break a drain
+                pass
+
+        def _unstarted_tail() -> None:
+            # §4SB r6: the client hung up before the route pulled the first
+            # chunk — the drain's `finally` never runs: hand back + unregister
+            _q_handback_if_unanswered()
+            try:
+                _turn_reg.unregister(req_id, _active_turn)
+            except Exception:  # noqa: BLE001
+                pass
+
         async def _stream_then_unregister(_gen):
             _drain_t0 = time.monotonic()
             _chunks = 0
@@ -34741,6 +35304,7 @@ class GhostAgent:
                     _stop_seen = bool(getattr(_active_turn, "cancelled", False))   # identity, not the id (r1)
                 except Exception:  # noqa: BLE001
                     _stop_seen = False
+                _q_handback_if_unanswered()                              # §4SB r5/r6
                 _turn_reg.unregister(req_id, _active_turn)
                 try:                                                     # §4OG-1 (h): the drain's report write is done
                     from ..tools.file_system import forget_request_receipts as _ffr2
@@ -34871,7 +35435,7 @@ class GhostAgent:
                 # r3 m2: the append (and a rotation) runs off the event loop
                 on_result=lambda st, _rid=str(req_id or ""): _spawn_bg_q(
                     asyncio.to_thread(_fc_s.record_quote, _rid, st, path="stream_filter"), name="census-quote"))
-        return (_stream_then_unregister(_frames),
+        return (_FinalStream(_stream_then_unregister(_frames), _unstarted_tail),   # §4SB r6
                 created_time, req_id)
 
     async def _census_fast(self, req_id, reply, kind: str = "fast") -> None:
