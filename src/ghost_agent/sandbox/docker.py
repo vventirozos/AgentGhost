@@ -113,6 +113,17 @@ SAFE_RM_INSTALL_CMD = "sh -c " + shlex.quote(
 SANDBOX_TOOL_PACKAGES = tuple("netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish".split())
 SANDBOX_TOOL_BINARIES = tuple("nc socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois 7z pdftotext ffmpeg convert stockfish".split())
 
+#: Provisioning marker v11 (2026-10-30, operator: "upgrade the sandbox psql"):
+#: the PostgreSQL 18 client tools from apt.postgresql.org, matching the host
+#: server (18.6) — Debian bookworm's own client is 15, which lacks the 16–18
+#: catalog columns and refuses newer pg_dump formats. The repo key comes from
+#: Debian's signed `postgresql-common` (embedded in its apt.postgresql.org.sh),
+#: so nothing unsigned is downloaded. Binaries are probed by their versioned
+#: path: `psql` alone would also answer for the old 15.
+SANDBOX_PG_PACKAGES = ("postgresql-common", "postgresql-client-18")
+SANDBOX_PG_BINARIES = ("/usr/lib/postgresql/18/bin/psql", "/usr/lib/postgresql/18/bin/pg_dump",
+                       "/usr/lib/postgresql/18/bin/pg_basebackup")
+
 # Client-side deadline (seconds) for a container exec when the caller gives no
 # explicit one. docker-py's exec socket read blocks in poll() with NO timeout
 # (verified in 7.1.0), so a wedged daemon would otherwise hang the calling
@@ -1190,18 +1201,26 @@ class DockerSandbox:
         #                ping/traceroute: they need NET_RAW, which §4KF
         #                dropped. v9 images upgrade in place; older ones
         #                take the full provision.
-        marker_path = "/root/.supercharged.v10"
+        #   v11 (now):   .supercharged.v11 — the PostgreSQL 18 client
+        #                (SANDBOX_PG_PACKAGES): `postgresql-common` from Debian,
+        #                whose signed apt.postgresql.org.sh adds the PGDG repo
+        #                with the key it carries, then `postgresql-client-18`
+        #                (psql/pg_dump/pg_basebackup 18.6, = the host server).
+        #                pg_wrapper runs the newest installed major, so bare
+        #                `psql` is 18; the Debian 15 client stays installed.
+        #                v10 images upgrade in place (over Tor once egress is
+        #                enforced; measured on a throwaway container first).
+        marker_path = "/root/.supercharged.v11"
         # The marker this version supersedes, and the delta that lifts an
         # image from it to this one. Keep the three in step with the history
-        # above when bumping again — and with SANDBOX_TOOL_PACKAGES /
-        # SANDBOX_TOOL_BINARIES (pinned equal by tests/test_4kg_sandbox_tools).
-        # Debian installs stockfish under /usr/games, which the exec PATH
-        # (the python image's) does not include: it was "missing" on the
-        # live container while the package was there. The symlink puts it on
-        # PATH for the model and for the verify chain alike (measured 2026-09-24).
-        prev_marker_path = "/root/.supercharged.v9"
-        upgrade_delta_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /etc/apt/apt.conf.d && echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
-        upgrade_delta_verify = "sh -c 'command -v nc && command -v socat && command -v jq && command -v unzip && command -v zip && command -v tree && command -v nano && command -v bc && command -v gawk && command -v rsync && command -v pkg-config && command -v telnet && command -v whois && command -v 7z && command -v pdftotext && command -v ffmpeg && command -v convert && command -v stockfish'"
+        # above when bumping again — and with SANDBOX_PG_PACKAGES /
+        # SANDBOX_PG_BINARIES (pinned by tests/test_sandbox_marker_upgrade).
+        # The v10 CLI set (SANDBOX_TOOL_*) stays in the full provision and
+        # the Dockerfile (tests/test_4kg_sandbox_tools); its stockfish symlink
+        # (/usr/games is off the exec PATH) lives there too.
+        prev_marker_path = "/root/.supercharged.v10"
+        upgrade_delta_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /etc/apt/apt.conf.d && echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop && apt-get update && apt-get install -y --no-install-recommends postgresql-common && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y && apt-get install -y --no-install-recommends postgresql-client-18'"
+        upgrade_delta_verify = "sh -c 'command -v psql && test -x /usr/lib/postgresql/18/bin/psql && test -x /usr/lib/postgresql/18/bin/pg_dump && test -x /usr/lib/postgresql/18/bin/pg_basebackup'"
 
         # The marker/chromium probes are two docker execs; running them
         # before EVERY command added latency for nothing. Verify once per
@@ -1236,7 +1255,7 @@ class DockerSandbox:
                     "Sandbox Provision",
                     f"Upgrading {prev_marker_path.rsplit('.', 1)[-1]} → "
                     f"{marker_path.rsplit('.', 1)[-1]} in place (adds: "
-                    f"{' '.join(SANDBOX_TOOL_BINARIES)})…",
+                    f"{' '.join(SANDBOX_PG_PACKAGES)})…",
                     icon=Icons.SANDBOX_BOX,
                 )
                 _verified = False
@@ -1312,7 +1331,7 @@ class DockerSandbox:
             # unbounded mirror/CDN stall would wedge every concurrent tool
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
-            apt_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /etc/apt/apt.conf.d && echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop && apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish --no-install-recommends && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
+            apt_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /etc/apt/apt.conf.d && echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop && apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client postgresql-common libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish --no-install-recommends && ln -sf /usr/games/stockfish /usr/local/bin/stockfish && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y && apt-get install -y --no-install-recommends postgresql-client-18'"
             code, out = self._provision_exec(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"

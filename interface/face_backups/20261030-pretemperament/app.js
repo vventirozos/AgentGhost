@@ -1,0 +1,7059 @@
+import * as matrixGraphFace from './matrix_graph.js?v=17.4';
+import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
+import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
+import { turnCaption } from './turn_caption.js?v=1.0';   // what the status line under the reply shows
+
+// --- Voice Globals ---
+let isTTSActive = false;
+let ttsTextQueue = [];
+let ttsAudioQueue = [];
+let isFetchingTTS = false;
+let isPlayingTTS = false;
+let audioCtx = null;
+let currentAudioSource = null;
+let ttsBuffer = "";
+let mediaRecorder;
+let audioChunks = [];
+
+let activeFace = matrixGraphFace;
+
+const chatLog = document.getElementById('chat-log');
+const chatInput = document.getElementById('chat-input');
+const sendBtn = document.getElementById('send-btn');
+const interruptBtn = document.getElementById('interrupt-btn');   // §4RZ: stop the running tool only
+const restoreTray = document.getElementById('restore-tray');      // §4RZ r6a7: texts handed back
+const restoreStatus = document.getElementById('restore-status');  // §4SB: the tray's one-line live status
+const effortSelect = initEffortSelector(document, window);   // §4RB: hidden unless the agent says it is on
+const fullscreenBtn = document.getElementById('fullscreen-btn');
+const statusText = document.getElementById('status-text');
+const connectionDot = document.getElementById('connection-dot');
+const plannerMonologue = document.getElementById('planner-monologue');
+
+let ws;
+let monologueTimeout;
+let chatHistory = [];
+const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+// The /ws log stream is auth-gated server-side. Browsers can't set custom
+// headers on a WebSocket, so pass the injected key as a query param.
+const wsUrl = `${wsProtocol}//${window.location.host}/ws?key=${encodeURIComponent(window.GHOST_API_KEY || '')}`;
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
+// §4ML CRIT: "is this OUR api?" is decided on the PARSED url — origin and
+// path — never by substring. `url.includes(location.host + '/api/')` sent
+// the key to `https://attacker/c.png?x=<our host>/api/download/x` (a
+// markdown image in a reply fetches with no click). Returns the url when it
+// is same-origin and its PATH starts with `prefix`, else null.
+function _ownApiUrl(u, prefix = '/api/') {
+    try {
+        const p = new URL(String(u || ''), window.location.href);
+        if (p.origin !== window.location.origin) return null;
+        return p.pathname.startsWith(prefix) ? p : null;
+    } catch (e) { return null; }
+}
+
+// Wrap window.fetch so every request to our own /api/* automatically
+// includes the X-Ghost-Key header injected into the page by the server.
+(function installAuthFetch() {
+    const apiKey = window.GHOST_API_KEY;
+    if (!apiKey) return;
+    const origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        try {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const isApi = _ownApiUrl(url) !== null;
+            if (isApi) {
+                init = init || {};
+                const headers = new Headers(init.headers || (typeof input !== 'string' ? input.headers : undefined) || {});
+                if (!headers.has('X-Ghost-Key')) headers.set('X-Ghost-Key', apiKey);
+                init.headers = headers;
+            }
+        } catch (e) { /* fall through */ }
+        return origFetch(input, init);
+    };
+})();
+
+// Safe localStorage wrapper (iOS private mode throws QuotaExceededError).
+// `set` REPORTS failure (true/false + `lastError`) since 2026-09-11: every
+// failure used to be logged as "private mode?" and dropped, so a full
+// quota on a long session silently stopped persisting history AND the
+// in-flight handle — the recovery this client is built around — on
+// exactly the heaviest conversations. saveChatState reacts to the name.
+const safeStorage = {
+    lastError: null,
+    get(key) {
+        try { return localStorage.getItem(key); } catch (e) { return null; }
+    },
+    set(key, value) {
+        try {
+            localStorage.setItem(key, value);
+            this.lastError = null;
+            return true;
+        } catch (e) {
+            this.lastError = (e && e.name) || 'Error';
+            console.warn('localStorage write failed', this.lastError);
+            return false;
+        }
+    },
+    remove(key) {
+        try { localStorage.removeItem(key); } catch (e) {}
+    },
+    keys(prefix) {
+        const out = [];
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && (!prefix || k.startsWith(prefix))) out.push(k);
+            }
+        } catch (e) { /* private mode — no enumeration */ }
+        return out;
+    }
+};
+
+// ── Session identity + per-session history keys (2026-09-11) ──────────
+// This tab's session lives in sessionStorage; localStorage keeps the
+// last-used id so a NEW tab opens where you left off. Before this, one
+// flat key was shared by every tab, so two tabs on two conversations
+// overwrote each other's identity and a reload reconciled one
+// conversation's local history against the other's.
+const SESSION_ID_KEY = 'ghost_session_id';
+const HISTORY_KEY = 'ghost_chat_history';
+function storedSessionId() {
+    try {
+        const own = sessionStorage.getItem(SESSION_ID_KEY);
+        if (own) return own;
+    } catch (e) { /* fall through */ }
+    return safeStorage.get(SESSION_ID_KEY) || null;
+}
+function persistSessionId(id) {
+    try {
+        if (id) sessionStorage.setItem(SESSION_ID_KEY, id);
+        else sessionStorage.removeItem(SESSION_ID_KEY);
+    } catch (e) { /* private mode */ }
+    if (id) safeStorage.set(SESSION_ID_KEY, id);
+    else safeStorage.remove(SESSION_ID_KEY);
+    // §4RZ r6a6: texts handed back for this session wait for it to be on screen
+    if (typeof _onSessionShown === 'function') setTimeout(_onSessionShown, 0);
+}
+// Local history is keyed by the session it belongs to; the bare legacy
+// key is read once (migration) and then removed.
+function _historyKey(sid) {
+    const id = sid === undefined ? (window.__ghostSessionId || storedSessionId()) : sid;
+    return id ? `${HISTORY_KEY}:${id}` : HISTORY_KEY;
+}
+function localHistoryKeys() {
+    return safeStorage.keys(HISTORY_KEY + ':');
+}
+// The token counter under the composer's buttons (tokens.js). Built here, after
+// safeStorage: a call above its `const` is a TDZ ReferenceError.
+const tokenCounter = createTokenCounter(document.getElementById('token-count'), safeStorage,
+    () => window.__ghostSessionId || storedSessionId());
+
+// ═══════════════════════════════════════════════════════════════
+//  Icon vocabulary — aligned 1:1 with src/ghost_agent/utils/logging.py
+//  `class Icons` so every log line from the agent maps to a known
+//  category, color, and dwell-time. Without this the UI sees
+//  `<icon> <+delta> <title> <content>` but only the handful of icons
+//  in the old WORKING_ICONS Set got any special treatment — the rest
+//  (🐍 🐚 🌐 🔬 💭 🧭 🎯 🗣️ 🤖 📖 👀 ⬇️ 📝 🔎 📍 📚 🧬 🗒️ 🎨 etc.) were
+//  treated as generic "non-working" emoji and faded out after 2s,
+//  letting the ubiquitous post-LLM 🧠 summary log dominate.
+// ═══════════════════════════════════════════════════════════════
+
+// Priority classes. Higher numbers override lower when a log arrives.
+//   accent  — one-off lifecycle / status flashes, always visible briefly
+//   tool    — external action: code, shell, search, web, image gen
+//   memory  — filesystem + memory stores
+//   plan    — planning, routing, context assembly
+//   think   — raw LLM thinking / replies (the floor; easily overwritten)
+//   idle    — system-idle states
+// Keys mirror utils/logging.py's Icons class. The Python glyphs were
+// migrated to wide-base (non-VS16) forms — WARN ⚠️→🔶, SHIELD 🛡️→🔒,
+// CUT ✂️→🔻, etc. This map was regenerated to match (2026-07-15); the old
+// two-codepoint VS16 keys ('⚠️','🛡️',…) were unreachable anyway because
+// extractIcon's \p{Extended_Pictographic} match strips the trailing U+FE0F.
+const ICON_CLASS = {
+    // --- lifecycle / status (accent) ---
+    '⚡': 'accent',   // SYSTEM_BOOT
+    '🚀': 'accent',   // SYSTEM_READY
+    '🌅': 'accent',   // BOOT_AWAKE
+    '💽': 'accent',   // HEAD_SAVE (§4RO)
+    '📀': 'accent',   // HEAD_RESTORE
+    '🕒': 'accent',   // HEAD_DEFER
+    '📛': 'accent',   // HEAD_FAIL
+    '📼': 'accent',   // CONV_SAVE (§4RV)
+    '🔙': 'accent',   // CONV_RESTORE (§4RV)
+    '🧳': 'think',    // CONV_LEFT (§4RW-f)
+    '💤': 'idle',     // SYSTEM_SHUT
+    '😴': 'idle',
+    '🎬': 'accent',   // REQ_START
+    '🏁': 'accent',   // REQ_DONE
+    '⏳': 'accent',   // REQ_WAIT
+    '✅': 'accent',   // OK
+    '❌': 'accent',   // FAIL
+    '🔶': 'accent',   // WARN
+    '🛑': 'accent',   // STOP
+    '🔄': 'accent',   // RETRY
+    '💡': 'accent',   // IDEA
+    '🐛': 'accent',   // BUG
+    '🔒': 'accent',   // SHIELD
+    '📣': 'accent',   // NOTIFY_OUT
+    '🪞': 'accent',   // SELF_STATE
+    '🎓': 'accent',   // SKILL_GRADUATE
+    '👍': 'accent',   // FEEDBACK_POS — human outcome label (/api/feedback)
+    '👎': 'accent',   // FEEDBACK_NEG
+
+    // --- tools (external action) ---
+    '🌐': 'tool',     // TOOL_SEARCH
+    '🌎': 'tool',     // TOOL_BROWSER
+    '🧅': 'tool',     // TOOL_DARKWEB
+    '🔬': 'tool',     // TOOL_DEEP
+    '🐍': 'tool',     // TOOL_CODE
+    '🐚': 'tool',     // TOOL_SHELL
+    '🧰': 'tool',     // TOOL_DISPATCH
+    '📥': 'tool',     // TOOL_DOWN / Docker pull
+    '📨': 'accent',   // QUEUED_MSG — a message the user sent while the turn runs (§4RZ)
+    '🎨': 'tool',     // IMAGE_GEN
+    '📄': 'tool',     // REPORT_PDF
+    '🎮': 'tool',     // GAME_MOVE
+    '🧱': 'tool',     // OUTSIDE_LOOK (§4RQ Eva's World look)
+    '🎲': 'tool',     // UNCERTAINTY_DIE
+    '🧪': 'tool',     // VERIFIER_LAB
+    '📌': 'tool',     // VERDICT_NOTE — §4OK: a verdict is information, not an error
+    '📦': 'tool',     // SANDBOX_BOX
+    '🏃': 'tool',     // JOB_PROMOTE — long sandbox command detached as a job
+    '🔧': 'tool',     // NODE_WORKER
+    '🛸': 'tool',     // NODE_EDGE
+
+    // --- memory / filesystem ---
+    '💾': 'memory',   // TOOL_FILE_W
+    '📖': 'memory',   // TOOL_FILE_R
+    '📙': 'memory',   // TOOL_FILE_M — multi-path batch read
+    '🔖': 'memory',   // TOOL_FILE_O — code outline / symbol map (§4KB)
+
+    '🌿': 'memory',   // VCS_GIT — local git over the workspace (§4KB)
+    '🔍': 'memory',   // TOOL_FILE_S
+    '👀': 'memory',   // TOOL_FILE_I
+    '📝': 'memory',   // MEM_SAVE
+    '🔎': 'memory',   // MEM_READ
+    '📍': 'memory',   // MEM_MATCH
+    '📚': 'memory',   // MEM_INGEST
+    '📑': 'memory',   // MEM_SPLIT
+    '🔻': 'memory',   // CUT
+    '🧬': 'memory',   // MEM_EMBED
+    '🧮': 'memory',   // VECTOR_EMBED (de-collided from 🧬 2026-07-24)
+    '🧹': 'memory',   // MEM_WIPE
+    '🚮': 'memory',   // CLEANUP — the agent moved its own check files out of the workspace (§4NY)
+    '📔': 'memory',   // MEM_SCRATCH
+    '💪': 'memory',   // MEM_REINFORCE
+    '📇': 'memory',   // MEM_INDEX
+    '📓': 'memory',   // MEM_LIBRARY
+    '🪢': 'memory',   // GRAPH_WEB
+    '🧾': 'memory',   // BELIEF_SCALES
+    '📶': 'memory',   // THRESHOLD_TUNE
+    '🎥': 'memory',   // EPISODE_REEL
+    '📡': 'memory',   // ACTIVITY
+    '🔀': 'memory',   // EVENT_BUS (de-collided from 📡 2026-07-24)
+    '👤': 'memory',   // USER_ID
+    '🐘': 'memory',   // POSTGRES
+
+    // --- planning / routing ---
+    '📋': 'plan',     // BRAIN_PLAN
+    '🧩': 'plan',     // BRAIN_CTX
+    '🧭': 'plan',     // BRAIN_ROUTE
+    '🎯': 'plan',     // BRAIN_AIM
+    '🌳': 'plan',     // MCTS_TREE
+    '🔮': 'plan',     // FORESIGHT — shadow world model
+    '🪄': 'plan',     // IMAGINE — pre-flight steer / candidate ranking
+    '🌀': 'plan',     // DREAM_REPLAY — counterfactual episode replay
+    '🦋': 'plan',     // EVOLVE — scaffold self-evolution
+    '🚜': 'plan',     // GEPA_AUTONOMY — §4DC supply watch / live judge
+    '🔗': 'plan',     // CONSTRAINT
+
+    // --- raw thinking (the floor) ---
+    '🧠': 'think',    // BRAIN_SUM — the one that was drowning everything
+    '🪫': 'think',    // EFFORT_LOW (§4RB)
+    '🔋': 'think',    // EFFORT_MEDIUM
+    '🔥': 'think',    // EFFORT_XHIGH
+    '💭': 'think',    // BRAIN_THINK
+    '💬': 'think',    // LLM_ASK
+    '🤖': 'think',    // LLM_REPLY
+
+    // --- idle / skipped ---
+    '⏩': 'idle',     // SKIP
+    '🌙': 'plan',     // DREAM
+    '🫀': 'idle',     // HEARTBEAT — idle scheduler, routine
+
+    // --- metacognition (§LOG-7 — registered in Icons; were literal
+    // glyphs in metacog_log.py that fell through to the 'think' floor) ---
+    '🫧': 'plan',     // METACOG (generic uplift)
+    '🌱': 'plan',     // METACOG_BOOT
+    '📊': 'plan',     // METACOG_SUMMARY
+    '📈': 'plan',     // METACOG_CONF
+    '📐': 'plan',     // METACOG_CALIB
+    '🥇': 'plan',     // METACOG_ARBITER
+    '🚧': 'plan',     // METACOG_VALID
+    '💻': 'plan',     // METACOG_HOST
+    '🚦': 'plan',     // METACOG_REPLAN
+    '🚪': 'plan',     // METACOG_GATE
+
+    // --- misc ---
+    '🫥': 'accent',   // MODE_GHOST
+};
+
+// (The dwell/priority tables that arbitrated the center-stage
+// #activity-icon left with it, 2026-07-29 — the turn status line shows
+// the CURRENT corridor step verbatim, no arbitration needed.)
+
+function _iconClass(icon) { return ICON_CLASS[icon] || 'think'; }
+
+// Used elsewhere (setWorkingState gating). "Working" = the agent is
+// actively doing something a user cares to watch; true for everything
+// except idle / SYSTEM_SHUT — and except the human-feedback receipts
+// (👍/👎), which are terminal bookkeeping: labeling yesterday's reply
+// must not spin the face into a 60s "working" animation on an idle agent.
+const _NON_WORKING_ICONS = new Set(['👍', '👎']);
+const WORKING_ICONS = new Set(Object.keys(ICON_CLASS).filter(i =>
+    ICON_CLASS[i] !== 'idle' && !_NON_WORKING_ICONS.has(i)
+));
+const IDLE_ICONS = new Set(Object.keys(ICON_CLASS).filter(i =>
+    ICON_CLASS[i] === 'idle' || i === '✅' || i === '❌' || i === '🛑'
+));
+
+let isProcessingRequest = false;
+// True only while we're rebuilding the chat log from saved/loaded history.
+// Auto-opening the visualizer (for renderable code blocks and images) is
+// desirable for a fresh live reply, but jarring when restoring history —
+// it would pop the floating window open on every page load. The image
+// auto-open runs from an async MutationObserver microtask, so a plain
+// flag cleared on a macrotask (setTimeout 0) reliably stays set through
+// the observer pass that processes the restored nodes.
+let _restoringHistory = false;
+function _withHistoryRestore(fn) {
+    _restoringHistory = true;
+    try { fn(); }
+    finally { setTimeout(() => { _restoringHistory = false; }, 0); }
+}
+let currentChatController = null;
+let currentTaskId = null;
+// §4PR: declared at the top, before any boot code can reach the functions
+// that read them (a `let`/`const` read before its line is a TDZ error)
+let _renderSeq = 0;   // a newer Visualize click supersedes an awaiting one
+const _authedBlobInflight = new Map();
+const _autoOpenedImgSrcs = new Set();
+let currentChunkIndex = 0;
+let currentAgentMessageDiv = null;
+let currentAccumulatedContent = "";
+// The AGENT's request id for the in-flight turn (from the SSE frames'
+// "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
+// Distinct from currentTaskId, which is the interface proxy's stream handle.
+let currentReqId = null;
+// Set when the reply's frames say `ghost.labelable: false` — the system
+// answered without a model turn (an owner command, §4PY), which writes NO
+// trajectory, so a thumb
+// could never land (§4EX). The bubble then gets no thumbs at all instead
+// of an error on every tap. Reset wherever currentReqId is.
+let currentTurnUnlabelable = false;
+// §4KO R3: length of the stream prefix (prior text, a correction banner) the
+// agent marks `ghost.stream_prefix` — not this generation's text, so the
+// leaked-reasoning cuts start after it. Reset wherever the accumulator is.
+let currentStreamPrefixLen = 0;
+// §4KP: the server's `ghost.reasoning_unparsed` — this reply's reasoning did not
+// arrive on the reasoning channel, so its opening may be reasoning the display
+// strips once the orphan </think> arrives. Speech waits for the whole reply
+// and speaks what the display shows. Reset wherever the accumulator is.
+let currentSpeechHold = false;
+// The text of the turn this tab most recently sent — the only identifier
+// available when durable sessions are off. See `_resolveOwnTurnId`.
+let _lastSentUserText = '';
+let currentThinkingInterval = null;
+let currentTTSMutedLength = 0;
+// When this turn was SENT (ms). The clock under the bubble counts from it, and
+// the in-flight handle carries it, so a reattach after the phone suspended the
+// page (or iOS reloaded it) keeps counting instead of restarting at 0:00.
+let currentTurnStartedAt = 0;
+// §4RZ step 6a — messages sent while a turn runs (see `_sendWhileBusy`).
+let _queuedInjects = [];        // [{text, div, seq, gen, sid, epoch}] accepted by a turn's inbox
+let _sendAfterTurn = [];        // [{text, div, seq, gen, sid, epoch}] sent normally once that turn ends
+let _heldId = 0;                // §4SB r5: ids of the waiting items remembered in sessionStorage
+let _queuedSeq = 0;
+let _inboxStopUndelivered = null;   // the inbox's stop word cancelled the turn: what it never read
+let _queuedFeatureOn = null;        // null until the agent answers; the tool button shows only on true
+let _turnGen = 0;                   // this page's turn generation
+const _turnInfo = new Map();        // gen -> {sid, epoch, startedAt, typed, ended, settled, outcome}
+let _convEpoch = 0;                 // moves on /clear (a new conversation with no session id)
+let _settleChain = Promise.resolve();   // settles run one at a time (leftovers are per SESSION)
+let _settlesPending = 0;            // no held message is sent while a settle is pending
+let _restoreUnsaved = null;         // [items] whose own localStorage key could not be written (sessionStorage; lazy)
+let _restoreSeq = 0;
+const _trayNoted = new Set();       // tray batches whose reason this page has said (once a session is bound)
+const _PAGE_LOAD = `${Date.now()}-${Math.random().toString(36).slice(2)}`;   // §4SB: this page load; a typed inject of another load was lost to a reload
+let _trayCount = -1;                // §4SB: items last announced (the status line speaks only on a change)
+let _owedMarks = 0;                 // §4SB r2: every _markOwed bumps it; a settle clears no debt marked during its await
+let _leftoversOwed = null;          // {sid: markedAt ms} a lost/failed turn still owes (localStorage; loaded lazily)
+
+const SEND_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
+const CANCEL_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`;
+
+function toggleSendButtonUI(isProcessing, stoppable = true) {
+    // Every request path (chat, voice, resume) ends through here with
+    // false — one idempotent hook covers all ticker teardown.
+    if (!isProcessing) stopTurnTicker();
+    if (sendBtn) {
+        if (isProcessing) {
+            // ⚠ `stoppable` distinguishes a turn Stop can abort from an
+            // upload/workspace operation that merely holds the turn flag.
+            // Making those visible (F14) gave them a live-looking Stop
+            // button wired to nothing, because the handler needs
+            // `currentChatController` (R3 lens B). Show BUSY, not STOP.
+            sendBtn.innerHTML = stoppable ? CANCEL_SVG : SEND_SVG;
+            sendBtn.classList.toggle('send-btn-cancel', !!stoppable);
+            sendBtn.disabled = !stoppable;
+            // The accessible name has to move with the state. This button
+            // is icon-only in all three of them, so a static label would
+            // announce "Send message" while the control is a Stop — worse
+            // than the no-name-at-all it replaced, because it is confidently
+            // wrong. The markup's aria-label is the idle value.
+            sendBtn.setAttribute('aria-label',
+                stoppable ? 'Stop the current turn' : 'Working — please wait');
+            // §4RZ: Enter sends to the running turn while a chat turn streams
+            if (stoppable && typeof chatInput !== 'undefined' && chatInput) {
+                chatInput.placeholder = 'Message the running turn';
+            }
+        } else {
+            if (typeof chatInput !== 'undefined' && chatInput) chatInput.placeholder = 'Enter message';
+            sendBtn.innerHTML = SEND_SVG;
+            sendBtn.classList.remove('send-btn-cancel');
+            sendBtn.disabled = false;
+            sendBtn.setAttribute('aria-label', 'Send message');
+        }
+    }
+    // §4RZ: the tool interrupt shows while a chat turn runs (not for an
+    // upload holding the flag), once the agent has answered as ON
+    if (typeof interruptBtn !== 'undefined' && interruptBtn) {
+        interruptBtn.classList.toggle('hidden', !(isProcessing && stoppable) || _queuedFeatureOn !== true);
+    }
+}
+
+// --- Notification & Service Worker Setup ---
+// iOS Safari: Notification API and Web Push are only available for installed PWAs.
+// Skip on iOS unless running in standalone (home-screen) mode.
+const isStandalonePWA = window.matchMedia('(display-mode: standalone)').matches ||
+    window.navigator.standalone === true;
+const notificationsSupported = ('Notification' in window) && (!isIOS || isStandalonePWA);
+
+// iOS standalone (installed PWA) MUST register the SW too — it is the
+// only iOS context that can hold a push subscription. The old blanket
+// `!isIOS` skip kept even installed PWAs pushless.
+if ('serviceWorker' in navigator && (!isIOS || isStandalonePWA)) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js')
+            .then((reg) => { _watchServiceWorkerUpdates(reg); })
+            .catch(err => console.error('Service Worker registration failed:', err));
+    });
+    navigator.serviceWorker.addEventListener('message', (e) => _onServiceWorkerMessage(e && e.data));
+}
+
+// ── Service worker update flow (2026-09-11) ───────────────────────────
+// sw.js used to skipWaiting() on install, swapping the worker under a page
+// mid-turn. Now a new worker waits until the operator picks "Reload" on a
+// system bubble; the swap then reloads the page — after the current turn
+// if one is running.
+let _swReloadPending = false;
+function _watchServiceWorkerUpdates(reg) {
+    if (!reg) return;
+    if (reg.waiting && navigator.serviceWorker.controller) _offerServiceWorkerUpdate(reg);
+    reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+            if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+                _offerServiceWorkerUpdate(reg);
+            }
+        });
+    });
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!_swReloadPending) return;      // first install, not an update
+        if (isProcessingRequest) {
+            window.GhostCore?.events?.addEventListener(
+                'turn-complete', () => location.reload(), { once: true });
+            return;
+        }
+        location.reload();
+    });
+}
+function _offerServiceWorkerUpdate(reg) {
+    const div = addMessage('system', 'A new version of the console is ready.');
+    if (!div) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-retry-btn';
+    btn.textContent = 'Reload';
+    btn.setAttribute('aria-label', 'Reload to the new version');
+    btn.addEventListener('click', () => {
+        _swReloadPending = true;
+        const w = reg && reg.waiting;
+        if (w) w.postMessage({ type: 'SKIP_WAITING' });
+        else location.reload();
+    });
+    div.appendChild(document.createTextNode(' '));
+    div.appendChild(btn);
+    return div;
+}
+// Messages FROM the worker: a rotated push subscription needs the API key
+// this page holds to register its new endpoint; a notification click on an
+// already-visible window fires no visibilitychange, so the resume/resync
+// chain is kicked explicitly.
+function _onServiceWorkerMessage(data) {
+    if (!data || typeof data.type !== 'string') return false;
+    if (data.type === 'push-resubscribed') {
+        ensurePushSubscription();
+        return true;
+    }
+    if (data.type === 'push-click') {
+        try { resumeOrReconcileInflightTurn(); } catch (e) { /* not booted yet */ }
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('push-click', { detail: data }));
+        } catch (e) { /* ignore */ }
+        return true;
+    }
+    return false;
+}
+
+// The error's KIND shapes the face's flinch (2026-09-11): network
+// flickers, refusal freezes, timeout fades; the generic recoil otherwise.
+function _faceError(message, type) {
+    const kind = typeof activeFace.errorKindFor === 'function'
+        ? activeFace.errorKindFor(message, type) : 'generic';
+    if (typeof activeFace.noteError === 'function') activeFace.noteError(kind);
+    else activeFace.triggerSpike();
+    return kind;
+}
+
+// Offline is a state, not a mystery: say so in the chip. The WebSocket's
+// own reconnect timer brings ONLINE back.
+window.addEventListener('offline', () => setConnectionState('error', 'OFFLINE'));
+window.addEventListener('online', () => setConnectionState('pending', 'RECONNECTING'));
+
+// ── Web push subscription (2026-08-01) ─────────────────────────────
+// Subscribes this device for locked-phone delivery: reply-ready pushes
+// (the ack-grace contract in server.py) + agent notify events. Runs
+// after permission lands; re-runs each boot (subscribe is idempotent —
+// the server upserts by endpoint).
+function _b64urlToUint8(base64url) {
+    const pad = '='.repeat((4 - (base64url.length % 4)) % 4);
+    const b64 = (base64url + pad).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(b64);
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function ensurePushSubscription() {
+    try {
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+        if (isIOS && !isStandalonePWA) return;   // Safari tab: no push context
+        if (Notification.permission !== 'granted') return;
+        const res = await fetch('/api/push/vapid');
+        if (!res.ok) return;
+        const { enabled, key } = await res.json();
+        if (!enabled || !key) return;
+        const registration = await navigator.serviceWorker.ready;
+        let sub = await registration.pushManager.getSubscription();
+        // VAPID rotation: a subscription bound to a RETIRED server key
+        // looks alive on both ends (server upserts it forever, pushes
+        // fail 401/403) and never delivers again. Compare and re-bind.
+        if (sub && sub.options && sub.options.applicationServerKey) {
+            const cur = new Uint8Array(sub.options.applicationServerKey);
+            const want = _b64urlToUint8(key);
+            const same = cur.length === want.length
+                && cur.every((v, i) => v === want[i]);
+            if (!same) {
+                try { await sub.unsubscribe(); } catch (e) { /* re-bind anyway */ }
+                sub = null;
+            }
+        }
+        if (!sub) {
+            sub = await registration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: _b64urlToUint8(key),
+            });
+        }
+        await fetch('/api/push/subscribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subscription: sub.toJSON() }),
+        });
+    } catch (e) {
+        console.warn('Push subscription unavailable:', e);
+    }
+}
+
+// Permission is asked from an EXPLICIT control (the bell panel's
+// lock-screen-alerts row, notifications.js), not from the first click
+// anywhere on the page (2026-09-11). A stray tap on the composer used to
+// throw the OS dialog with no context; on iOS a denial is permanent for
+// that install, and this permission is what the whole locked-phone push
+// feature depends on.
+//
+// What the control should show. `needsInstall` = iOS Safari tab: push is
+// only available to a Home-Screen install, so the honest action there is
+// "install", not "enable".
+function pushPermissionState() {
+    const hasApi = typeof Notification !== 'undefined' && Notification !== null;
+    const needsInstall = !!(isIOS && !isStandalonePWA);
+    const supported = !!(hasApi && !needsInstall);
+    return {
+        supported,
+        needsInstall,
+        permission: hasApi ? Notification.permission : 'unsupported',
+    };
+}
+
+// The user gesture that unlocks the OS prompt; resolves to the resulting
+// permission. Subscribes for push on a grant.
+async function requestNotificationPermission() {
+    const st = pushPermissionState();
+    if (!st.supported) return st.permission;
+    if (st.permission !== 'default') {
+        if (st.permission === 'granted') ensurePushSubscription();
+        return st.permission;
+    }
+    let result = 'default';
+    try {
+        const r = Notification.requestPermission();
+        result = (r && typeof r.then === 'function') ? await r : r;
+    } catch (e) {
+        console.error('Notification permission error:', e);
+    }
+    if (result === 'granted') ensurePushSubscription();
+    return result || Notification.permission;
+}
+
+// Already-granted permission (returning visitor): subscribe on boot.
+window.addEventListener('load', () => { ensurePushSubscription(); });
+
+async function notifyUser(message) {
+    if (!notificationsSupported) return;
+    if (Notification.permission !== "granted" || !document.hidden) return;
+
+    try {
+        if ('serviceWorker' in navigator) {
+            const registration = await navigator.serviceWorker.ready;
+            registration.showNotification("Ghost System", {
+                body: message,
+                icon: "/static/icons/icon-192.png?v=2",
+                // Keyed URL: the SW click handler opens data.url; a bare
+                // '/' would land a fresh window on the 401 page.
+                data: { url: location.pathname + location.search }
+            });
+        } else {
+            new Notification("Ghost System", {
+                body: message, icon: "/static/icons/icon-192.png?v=2" });
+        }
+    } catch (e) {
+        console.error("Notification failed:", e);
+    }
+}
+// ------------------------------------
+
+function setConnectionState(state, label) {
+    // state: 'online' | 'pending' | 'busy' | 'error'
+    // Clearing inline styles so the CSS class wins — the old onopen/onclose
+    // handlers set inline background-color, which would override classes.
+    if (connectionDot) {
+        connectionDot.style.backgroundColor = '';
+        connectionDot.style.boxShadow = '';
+        connectionDot.classList.remove('state-online', 'state-pending', 'state-busy', 'state-error');
+        connectionDot.classList.add(`state-${state}`);
+    }
+    if (statusText && label) statusText.textContent = label;
+}
+
+let _wsReconnectTimer = null;
+function connectWebSocket() {
+    // Coalesce overlapping triggers (the 3s onclose timer races the
+    // visibilitychange/pageshow handlers). Without this, a second call
+    // overwrote `ws` while the first socket stayed open and un-torn-down —
+    // an orphan that kept firing onmessage (every log line processed twice)
+    // and spawned its own onclose reconnect chain, multiplying sockets.
+    if (ws && (ws.readyState === WebSocket.CONNECTING
+               || ws.readyState === WebSocket.OPEN)) {
+        return;
+    }
+    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+    // Detach the old socket's handlers before replacing it so a late
+    // onclose from the previous socket can't schedule a duplicate reconnect.
+    if (ws) { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; }
+    setConnectionState('pending', 'CONNECTING…');
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+        setConnectionState('online', 'ONLINE');
+    };
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'log') {
+                const icon = extractIcon(data.content);
+                const flashColor = getIconColor(icon);
+
+                // Feed the live log console's ring buffer (renders only
+                // while the drawer is open; collects regardless).
+                pushLogEntry(data.content, data.is_error);
+                // …and the in-turn activity ticker (no-op unless a turn
+                // is showing its typing indicator right now).
+                noteTickerLine(data.content);
+
+                // Log lines feed the face's activity ENVELOPE — a small
+                // energy contribution each, smoothed inside matrix_graph —
+                // instead of firing a full pulse per line, which strobed
+                // the scene several times a second on a busy agent.
+                const isMonologue = data.content.includes("PLANNER MONOLOGUE");
+                if (activeFace.noteActivity) {
+                    activeFace.noteActivity(isMonologue ? 0.08 : 0.16, flashColor);
+                } else if (isMonologue) {
+                    activeFace.triggerSmallPulse();
+                } else {
+                    activeFace.triggerPulse(flashColor);
+                }
+
+                if (icon) {
+                    updateStateFromIcon(icon);
+                    // Genuine failures only: ⚠️ warnings are routine (node
+                    // fallbacks, heals) and kept tinting the face on
+                    // ordinary healthy turns.
+                    if (['❌', '🛑'].includes(icon)) activeFace.triggerSpike();
+                }
+                if (data.is_error) activeFace.triggerSpike();
+
+                // Check for Planner Monologue
+                const plannerMatch = data.content.match(/PLANNER MONOLOGUE\s*:\s*(.*)/);
+                if (plannerMatch && plannerMatch[1]) {
+                    showPlannerMonologue(plannerMatch[1]);
+                }
+            }
+        } catch (e) { console.error("WebSocket Error:", e); }
+    };
+    ws.onclose = () => {
+        setConnectionState('error', 'DISCONNECTED');
+        if (_wsReconnectTimer) clearTimeout(_wsReconnectTimer);
+        _wsReconnectTimer = setTimeout(connectWebSocket, 3000);
+    };
+}
+
+// iOS Safari suspends background timers; force reconnect when the tab comes back.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connectWebSocket();
+    }
+});
+window.addEventListener('pageshow', (e) => {
+    if (e.persisted && (!ws || ws.readyState !== WebSocket.OPEN)) {
+        connectWebSocket();
+    }
+    // Re-arm the artifact observer on a bfcache restore. It is only
+    // observed once at module init, so any teardown left it dead for the
+    // life of the restored page (see the pagehide handler).
+    if (e.persisted) {
+        try {
+            const el = document.getElementById('chat-log');
+            if (el) chatObserver.observe(el, { childList: true, subtree: true });
+        } catch (err) { /* ignore */ }
+    }
+});
+
+// VisualViewport: track virtual keyboard height so the input area stays visible on iOS.
+//
+// "Is a keyboard open?" can NOT be derived from innerHeight vs vv.height:
+// in standalone-PWA contexts innerHeight SHRINKS with the keyboard (unlike
+// Safari-browser, where it stays at layout height) — that comparison read
+// keyboard-open as no-keyboard, cleared the body pin, and the user typed
+// blind behind the keyboard (operator repro 2026-08-01). The reliable
+// baseline is the MAXIMUM vv height seen in this orientation: a focused
+// editable + a vv meaningfully below that maximum = keyboard.
+let _vvMaxH = 0;
+function _vvEditing() {
+    const ae = document.activeElement;
+    return !!ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT'
+        || ae.isContentEditable);
+}
+function _vvNoteHeight() {
+    const vv = window.visualViewport;
+    if (vv && Math.abs(window.innerWidth - vv.width) <= 2
+            && vv.height > _vvMaxH) {
+        _vvMaxH = vv.height;
+    }
+}
+function _vvKeyboardOpen() {
+    const vv = window.visualViewport;
+    return !!vv && _vvEditing() && (_vvMaxH - vv.height) > 80;
+}
+function _vvResetMax() { _vvMaxH = 0; }   // rotation: re-learn the baseline
+
+if ('visualViewport' in window) {
+    let kbSettleTimer = null;
+    let kbGuardRetries = 0;
+    let lastWinWidth = window.innerWidth;
+
+    const setKb = (px) => document.documentElement.style.setProperty(
+        '--keyboard-height', `${px}px`);
+    const isEditing = _vvEditing;
+
+    const updateKeyboardOffset = () => {
+        const vv = window.visualViewport;
+        _vvNoteHeight();
+        let kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        // Mid-rotation, innerHeight and vv.height describe DIFFERENT
+        // orientations (bogus half-screen "keyboard"). Defer while the
+        // widths disagree — but only a few times: real iOS Safari can
+        // report slightly incoherent widths indefinitely, and an
+        // ever-deferring guard would freeze keyboard tracking entirely.
+        if (Math.abs(window.innerWidth - vv.width) > 2 && kbGuardRetries < 8) {
+            kbGuardRetries += 1;
+            clearTimeout(kbSettleTimer);
+            kbSettleTimer = setTimeout(updateKeyboardOffset, 250);
+            return;
+        }
+        kbGuardRetries = 0;
+        // No focused editable = no keyboard; anything left over is stale.
+        if (!isEditing()) kb = 0;
+        // ── ONE MECHANISM AT A TIME ────────────────────────────────
+        // `syncBodyHeight` pins document.body to the visual viewport
+        // whenever _vvKeyboardOpen(), which ALREADY lifts the footer to
+        // sit just above the keyboard. Translating #ui-layer on top of
+        // that applies the same correction twice and drives the composer
+        // clean off the TOP of the screen, overlapping the status bar
+        // (operator screenshot, iOS, after a long reply).
+        //
+        // The transform stays for the window the body pin does not
+        // cover: _vvKeyboardOpen() additionally requires this
+        // orientation's max height to be learned and the drop to exceed
+        // 80px, so a just-focused input or an unlearned baseline still
+        // needs it. Whichever is active, exactly one of them is.
+        if (_vvKeyboardOpen()) kb = 0;
+        // A real mobile keyboard never exceeds ~55% of the screen.
+        kb = Math.min(kb, Math.round(window.innerHeight * 0.55));
+        setKb(kb);
+    };
+    window.visualViewport.addEventListener('resize', updateKeyboardOffset);
+    window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+
+    const scheduleSettle = (delay) => {
+        clearTimeout(kbSettleTimer);
+        kbSettleTimer = setTimeout(updateKeyboardOffset, delay);
+    };
+
+    // Rotation is the state we can never trust on iOS Safari: it dismisses
+    // the keyboard but can KEEP the element focused, and visualViewport
+    // may report stale geometry until the next user interaction — every
+    // derived value is suspect (the "input box at the top of the screen"
+    // repro: focus → rotate → rotate back). Don't repair the lie — make
+    // the state deterministic: blur (the keyboard is gone anyway), zero
+    // the translate NOW, re-measure once settled.
+    const onRotate = () => {
+        if (isEditing()) { try { document.activeElement.blur(); } catch (e) {} }
+        setKb(0);
+        _vvResetMax();   // the old orientation's max height is meaningless now
+        scheduleSettle(400);
+    };
+    window.addEventListener('orientationchange', onRotate);
+    window.addEventListener('resize', () => {
+        if (window.innerWidth !== lastWinWidth) {
+            // Width change == rotation (mobile viewports don't resize
+            // horizontally otherwise; desktop windows don't run this UI
+            // with a virtual keyboard).
+            lastWinWidth = window.innerWidth;
+            onRotate();
+            return;
+        }
+        scheduleSettle(250);
+    });
+
+    // Keyboard closed via blur: zero the translate immediately — the vv
+    // resize event can arrive late or (WebKit quirk) with stale numbers.
+    // Small delay so focus hopping between two editables doesn't flicker.
+    document.addEventListener('focusout', () => {
+        setTimeout(() => { if (!isEditing()) setKb(0); }, 50);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Live log console (2026-07-13)
+//
+//  The pretty-log stream already arrives over the WebSocket (it drives
+//  the face's activity envelope + the planner monologue) — this just
+//  makes it READABLE: a bottom-drawer console toggled from the header.
+//  A ring buffer collects even while the drawer is closed, so opening
+//  shows recent history instead of starting blind. Lines carry the same
+//  icon→jewel-tone accent mapping as the face (left border), with plain
+//  dim text for readability on the dark theme.
+// ═══════════════════════════════════════════════════════════════
+
+const LOG_BUFFER_CAP = 500;
+const logBuffer = [];
+// The ONLINE chip in the header toggles the console (2026-09-05, operator:
+// the separate terminal button is gone; "when I click or tap the status
+// indicator the log window should open").
+const logToggleBtn = document.getElementById('status-indicator');
+const logConsole = document.getElementById('log-console');
+const logConsoleBody = document.getElementById('log-console-body');
+const logClearBtn = document.getElementById('log-clear');
+const logCloseBtn = document.getElementById('log-close');
+const logResumeBtn = document.getElementById('log-resume');
+const logNewCount = document.getElementById('log-new-count');
+let logPinned = true;    // auto-scroll follows the tail until the user scrolls up
+let logUnseen = 0;
+
+// CSI colour/cursor sequences from the agent's pretty stream.
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+function cleanLogLine(raw) {
+    return String(raw || '').replace(ANSI_ESCAPE_RE, '').replace(/\s+$/, '');
+}
+
+function pushLogEntry(rawContent, isError) {
+    const text = cleanLogLine(rawContent);
+    if (!text.trim()) return;
+    const icon = extractIcon(text);
+    const entry = {
+        text,
+        accent: icon ? getIconColor(icon) : '',
+        isError: !!isError,
+    };
+    logBuffer.push(entry);
+    if (logBuffer.length > LOG_BUFFER_CAP) logBuffer.shift();
+    if (logConsole && !logConsole.classList.contains('hidden')) {
+        logConsoleBody.appendChild(buildLogLine(entry));
+        while (logConsoleBody.childElementCount > LOG_BUFFER_CAP) {
+            logConsoleBody.removeChild(logConsoleBody.firstChild);
+        }
+        if (logPinned) {
+            logConsoleBody.scrollTop = logConsoleBody.scrollHeight;
+        } else {
+            logUnseen++;
+            if (logNewCount) logNewCount.textContent = String(logUnseen);
+            if (logResumeBtn) logResumeBtn.classList.remove('hidden');
+        }
+    }
+}
+
+function buildLogLine(entry) {
+    const div = document.createElement('div');
+    div.className = 'log-line' + (entry.isError ? ' log-line-error' : '');
+    if (entry.accent) div.style.borderLeftColor = entry.accent;
+    div.textContent = entry.text;
+    return div;
+}
+
+function openLogConsole() {
+    if (!logConsole) return;
+    const frag = document.createDocumentFragment();
+    for (const entry of logBuffer) frag.appendChild(buildLogLine(entry));
+    logConsoleBody.innerHTML = '';
+    logConsoleBody.appendChild(frag);
+    logConsole.classList.remove('hidden');
+    if (logToggleBtn) logToggleBtn.classList.add('active');
+    logPinned = true;
+    logUnseen = 0;
+    if (logResumeBtn) logResumeBtn.classList.add('hidden');
+    logConsoleBody.scrollTop = logConsoleBody.scrollHeight;
+}
+
+function closeLogConsole() {
+    if (!logConsole) return;
+    logConsole.classList.add('hidden');
+    if (logToggleBtn) logToggleBtn.classList.remove('active');
+}
+
+if (logToggleBtn) {
+    logToggleBtn.addEventListener('click', () => {
+        if (logConsole.classList.contains('hidden')) openLogConsole();
+        else closeLogConsole();
+    });
+}
+if (logCloseBtn) logCloseBtn.addEventListener('click', closeLogConsole);
+if (logClearBtn) {
+    logClearBtn.addEventListener('click', () => {
+        logBuffer.length = 0;
+        logConsoleBody.innerHTML = '';
+        logUnseen = 0;
+        if (logResumeBtn) logResumeBtn.classList.add('hidden');
+    });
+}
+if (logConsoleBody) {
+    logConsoleBody.addEventListener('scroll', () => {
+        const nearBottom = logConsoleBody.scrollTop + logConsoleBody.clientHeight
+            >= logConsoleBody.scrollHeight - 40;
+        if (nearBottom) {
+            logPinned = true;
+            logUnseen = 0;
+            if (logResumeBtn) logResumeBtn.classList.add('hidden');
+        } else {
+            logPinned = false;
+        }
+    }, { passive: true });
+}
+if (logResumeBtn) {
+    logResumeBtn.addEventListener('click', () => {
+        logPinned = true;
+        logUnseen = 0;
+        logResumeBtn.classList.add('hidden');
+        logConsoleBody.scrollTop = logConsoleBody.scrollHeight;
+    });
+}
+
+function showPlannerMonologue(text) {
+    if (!plannerMonologue) return;
+    plannerMonologue.textContent = text.trim();
+    plannerMonologue.classList.add('visible');
+
+    // Clear any existing hide timer so it stays visible while updating
+    clearTimeout(monologueTimeout);
+
+    // If we are NOT currently processing a request (e.g. late logs after reply),
+    // ensure we still auto-hide after a short delay so it doesn't get stuck open.
+    if (!isProcessingRequest) {
+        monologueTimeout = setTimeout(hidePlannerMonologue, 2000);
+    }
+}
+
+function hidePlannerMonologue() {
+    if (!plannerMonologue) return;
+    plannerMonologue.classList.remove('visible');
+}
+
+function extractIcon(logLine) {
+    const match = logLine.match(/(\p{Extended_Pictographic})/u);
+    return match ? match[0] : null;
+}
+
+// Map each class to a distinct accent color for the face's slow mood
+// tint. THERMAL family (2026-07-28, matching matrix_graph's blue↔red
+// two-pole scheme): cold blues for memory/planning/success, hot reds
+// for external action and failure, violet for raw thought — the bridge
+// hue between the poles. These BLEND into the sphere's accent, so a
+// full neon here would drag the whole theme bright again.
+const _ICON_CLASS_COLOR = {
+    accent_ok:   '#16418c',  // ✅ settled blue — success = cooled
+    accent_err:  '#a3123a',  // ❌ 🛑 hot crimson (WARN 🔶 is routine, stays accent)
+    accent:      '#1f3fa8',  // ⚡ 🚀 🎬 🏁 electric blue (dark)
+    tool:        '#6e1530',  // dark arterial red — external action = heat
+    memory:      '#14297a',  // deep indigo — stored, cold
+    plan:        '#2a2470',  // blue-violet
+    think:       '#3a1a5e',  // violet — the bridge between the poles
+    idle:        '#10131f',  // blue-black slate
+};
+
+function getIconColor(icon) {
+    // Error/success get special sub-colors — they're visually the
+    // most meaningful accent events the user can see flash by.
+    if (icon === '✅') return _ICON_CLASS_COLOR.accent_ok;
+    if (icon === '❌' || icon === '🛑') {
+        return _ICON_CLASS_COLOR.accent_err;
+    }
+    return _ICON_CLASS_COLOR[_iconClass(icon)] || _ICON_CLASS_COLOR.think;
+}
+
+// The center-stage #activity-icon was REMOVED 2026-07-29 (operator:
+// "remove the icon from the middle") — the turn status line under the
+// waiting reply bubble carries the per-turn icon now, and ambient
+// activity still animates the face itself. updateStateFromIcon stays:
+// it drives the FACE's working state from the log stream, icon element
+// or not.
+
+let workTimer;
+function updateStateFromIcon(icon) {
+    if (isProcessingRequest) return; // Prevent logs from turning off the active state during a request
+
+    if (WORKING_ICONS.has(icon)) {
+        activeFace.setWorkingState(true);
+        clearTimeout(workTimer);
+        workTimer = setTimeout(() => {
+            if (!isProcessingRequest) {
+                activeFace.setWorkingState(false);
+            }
+        }, 60000);
+    } else if (IDLE_ICONS.has(icon)) {
+        activeFace.setWorkingState(false);
+        clearTimeout(workTimer);
+    }
+}
+
+// Languages that get a "Visualize" button instead of inline display.
+// Declared here (not next to attachRenderButtons further down) because
+// decorateCodeBlocks references it, and loadChatState() — which calls
+// decorateCodeBlocks — runs at module top-level *before* the render
+// section below would otherwise initialize this const (TDZ).
+const RENDERABLE_LANGS = new Set([
+    'language-html', 'language-css', 'language-javascript', 'language-js',
+    'language-mermaid', 'language-csv'
+]);
+
+// Wrap rendered markdown tables in a horizontal scroller (2026-09-04).
+//
+// A table wider than the bubble used to be SQUEEZED into it: the browser
+// shrinks columns until the text wraps, and a four-column comparison came
+// out as ragged prose whose columns could not be told apart. `.table-scroll`
+// + `width: max-content` on the table (style.css) lets it keep its natural
+// column widths and scroll instead.
+//
+// Called from decorateCodeBlocks rather than from decorateCodeBlocks' three
+// callers: every path that renders agent markdown already reaches that one
+// function, and a second call to remember at each site is a call the next
+// site forgets.
+//
+// Idempotence (streaming reassigns innerHTML on every chunk, so this runs
+// per token) comes from the DOM itself — "is my parent already a wrapper?"
+// — not from a `data-` marker. The first version carried both; mutation
+// testing showed deleting the marker changed no behaviour, because the
+// derived check already covered every case. A marker can also go STALE in
+// a way the derived check cannot: move a wrapped table out of its wrapper
+// and the marker still claims it is wrapped, so the table silently loses
+// its scroller forever.
+function decorateTables(root) {
+    if (!root) return;
+    root.querySelectorAll('table').forEach(table => {
+        if (table.parentElement
+            && table.parentElement.classList.contains('table-scroll')) {
+            return;
+        }
+        const wrap = document.createElement('div');
+        wrap.className = 'table-scroll';
+        // A scrollable region must be reachable by keyboard, or a table
+        // wider than the bubble is unreadable without a pointer.
+        wrap.tabIndex = 0;
+        wrap.setAttribute('role', 'region');
+        wrap.setAttribute('aria-label', 'Table');
+        table.parentNode.insertBefore(wrap, table);
+        wrap.appendChild(table);
+    });
+}
+
+// Decorate <pre><code> blocks inside a rendered message with a small
+// language pill + copy button. Runs on each marked.parse() reassignment;
+// the `data-decorated` marker makes it idempotent so repeated streaming
+// updates don't stack buttons. Also the single entry point for the other
+// per-message markdown decorations (see decorateTables).
+function decorateCodeBlocks(root) {
+    if (!root) return;
+    decorateTables(root);
+    const pres = root.querySelectorAll('pre');
+    pres.forEach(pre => {
+        if (pre.dataset.decorated === '1') return;
+        const code = pre.querySelector('code');
+        if (!code) return;
+        // Skip renderable blocks — `attachRenderButtons` owns those; we
+        // don't want two buttons stacking in the same corner.
+        if (pre.classList.contains('renderable-hidden')) return;
+        // During streaming a renderable block (html/css/js/mermaid/csv)
+        // isn't `.renderable-hidden` yet, so also skip by language. Else
+        // we'd decorate it with a lang badge + Copy header that ends up
+        // orphaned above the hidden code once the Visualize button lands.
+        const langClass = [...code.classList].find(c => c.startsWith('language-'));
+        if (langClass && RENDERABLE_LANGS.has(langClass)) return;
+
+        pre.dataset.decorated = '1';
+        pre.classList.add('decorated-code');
+
+        const lang = langClass ? langClass.replace('language-', '') : 'text';
+
+        // Header carries only the language badge; the ACTION buttons
+        // (copy, expand) live in a footer bar at the BOTTOM of the block
+        // (operator request) — which also keeps them reachable while the
+        // collapsed window is scrolled.
+        const header = document.createElement('div');
+        header.className = 'code-header';
+
+        const badge = document.createElement('span');
+        badge.className = 'code-lang';
+        badge.textContent = lang;
+        header.appendChild(badge);
+
+        const footer = document.createElement('div');
+        footer.className = 'code-footer';
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'code-copy';
+        copyBtn.type = 'button';
+        copyBtn.textContent = 'Copy';
+        copyBtn.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(code.textContent || '');
+                copyBtn.textContent = 'Copied';
+                copyBtn.classList.add('copied');
+                setTimeout(() => {
+                    copyBtn.textContent = 'Copy';
+                    copyBtn.classList.remove('copied');
+                }, 1400);
+            } catch (e) {
+                copyBtn.textContent = 'Failed';
+                setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1400);
+            }
+        });
+        footer.appendChild(copyBtn);
+
+        // Long outputs render as a fixed-height window that SCROLLS
+        // internally (right-hand scrollbar) — the old version clipped the
+        // overflow entirely until expanded. The expander still toggles to
+        // full inline height. Threshold is generous so ordinary snippets
+        // never shrink. (Streaming rebuilds reset to collapsed; the final
+        // decorate pass after the stream settles it.)
+        const lineCount = (code.textContent.match(/\n/g) || []).length + 1;
+        if (lineCount > 34) {
+            pre.classList.add('code-collapsed');
+            const expand = document.createElement('button');
+            expand.className = 'code-expand';
+            expand.type = 'button';
+            expand.textContent = `Expand · ${lineCount} lines`;
+            expand.addEventListener('click', () => {
+                const collapsed = pre.classList.toggle('code-collapsed');
+                expand.textContent = collapsed ? `Expand · ${lineCount} lines` : 'Collapse';
+            });
+            footer.appendChild(expand);
+        }
+
+        pre.insertBefore(header, pre.firstChild);
+        pre.appendChild(footer);
+    });
+}
+
+// Empty-state hero. Operator direction 2026-08-16: the suggestion chips
+// ("What are you capable of?" …) are GONE, and the wordmark is quiet.
+//
+// The reasoning: this sits on top of a live animated constellation that is
+// the most striking thing on the screen. A heavy 700-weight, 10px-tracked,
+// double-glow title plus three buttons competed with it and won — which is
+// why the result read as cluttered. An empty state is a threshold, not a
+// billboard: a hairline wordmark, a rule, and one line of orientation.
+function renderEmptyStateHero() {
+    if (!chatLog) return;
+    // Don't stack heroes if one's already there.
+    if (chatLog.querySelector('.empty-hero')) return;
+
+    const hero = document.createElement('div');
+    hero.className = 'empty-hero';
+
+    const title = document.createElement('div');
+    title.className = 'empty-hero-title';
+    // Per-letter spans so the reveal can cascade; the trailing letter's
+    // tracking is trimmed in CSS so the word stays optically centred.
+    for (const ch of 'GHOST') {
+        const span = document.createElement('span');
+        span.textContent = ch;
+        title.appendChild(span);
+    }
+
+    const rule = document.createElement('div');
+    rule.className = 'empty-hero-rule';
+
+    const sub = document.createElement('div');
+    sub.className = 'empty-hero-sub';
+    sub.textContent = window.matchMedia('(pointer: coarse)').matches
+        ? 'Ask anything'
+        : 'Ask anything · ⌘K for commands';
+
+    hero.appendChild(title);
+    hero.appendChild(rule);
+    hero.appendChild(sub);
+    chatLog.appendChild(hero);
+}
+function dismissEmptyStateHero() {
+    if (!chatLog) return;
+    const hero = chatLog.querySelector('.empty-hero');
+    if (hero) hero.remove();
+}
+
+// Render untrusted markdown safely.
+//
+// marked.parse() passes raw HTML through by default (GFM spec). Agent
+// responses are untrusted — a tool output containing <script>…</script>
+// or `<img onerror=…>` outside a code fence would execute in-page.
+// DOMPurify strips dangerous nodes/attributes without mangling the rest
+// of the markdown. If either library failed to load (CDN down, offline
+// deploy), fall back to plain text rather than silently leaking unsafe
+// HTML into the DOM.
+// §4ML: a reply may not draw a form (a fake "re-enter your key" box) or load
+// a remote image (it fetches from the owner's IP the moment it renders). An
+// image is kept only when it is ours (/api/download/…) or inline data; a
+// remote one becomes a plain link the owner can choose to open.
+// Every element/attribute that FETCHES on render is forbidden too — <img src>
+// is handled below, but srcset, a style background, <video poster>, <table
+// background>, SVG <image>/<use>, <picture>/<source>, <audio>/<video> each
+// fetched from a foreign host with no click (fresh-reader R2, Chromium).
+// marked emits `align`, never `style`, so no table loses its alignment.
+const _PURIFY_CONFIG = {
+    FORBID_TAGS: ['form', 'button', 'select', 'textarea', 'option',
+                  'picture', 'source', 'video', 'audio', 'track',
+                  'image', 'use', 'feimage', 'object', 'embed', 'iframe',
+                  'link', 'meta', 'base'],
+    FORBID_ATTR: ['action', 'formaction', 'srcset', 'poster', 'background',
+                  'style', 'ping', 'xlink:href'],
+};
+function _neutraliseRemoteImages(html) {
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    // a GFM task list is the only input a reply may carry (a checkbox,
+    // disabled); `type=image` fetches, a text box is a phishing form
+    t.content.querySelectorAll('input').forEach((el) => {
+        if ((el.getAttribute('type') || '').toLowerCase() !== 'checkbox') el.remove();
+        else el.setAttribute('disabled', '');
+    });
+    t.content.querySelectorAll('img').forEach((img) => {
+        const src = img.getAttribute('src') || '';
+        if (_ownApiUrl(src, '/api/download/')
+                && !/\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(src.split(/[?#]/)[0])) {
+            // §4OJ: a reply that wrote a NON-image file as `![x](/api/download/notes.md)`
+            // drew a broken-image badge; it is a file link
+            const link = document.createElement('a');
+            link.setAttribute('href', src);
+            link.textContent = img.getAttribute('alt') || decodeURIComponent(src.split('/').pop().split(/[?#]/)[0]);
+            img.replaceWith(link);
+            return;
+        }
+        if (/^data:image\//i.test(src) || _ownApiUrl(src, '/api/download/')) return;
+        const a = document.createElement('a');
+        a.setAttribute('href', src);
+        a.setAttribute('rel', 'noopener noreferrer');
+        a.setAttribute('target', '_blank');
+        a.textContent = `🖼 ${img.getAttribute('alt') || 'remote image'} (not loaded)`;
+        img.replaceWith(a);
+    });
+    return t.innerHTML;
+}
+function renderMarkdown(text) {
+    const raw = String(text ?? "");
+    if (window.marked && window.DOMPurify) {
+        try {
+            return _neutraliseRemoteImages(
+                window.DOMPurify.sanitize(window.marked.parse(raw), _PURIFY_CONFIG));
+        } catch (e) {
+            console.warn('markdown render failed, falling back to text', e);
+        }
+    }
+    // Fallback: HTML-escape, then keep the line structure — the comment
+    // above promised <p>/<br> for two months while the code returned the
+    // bare escaped text, so a sanitizer load failure collapsed every reply
+    // into one paragraph (2026-09-11).
+    const escaped = raw
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    return '<p>' + escaped.replace(/\r?\n/g, '<br>') + '</p>';
+}
+
+// Strip the agent's internal-only markup before display: <tool_call>
+// blocks AND <think> reasoning blocks (including an unclosed trailing
+// one mid-stream). This keeps the visible transcript consistent with
+// what the TTS engine speaks — previously the display stripped only
+// <tool_call>, so raw reasoning leaked into the chat bubble while being
+// suppressed in audio.
+// `keepLen` (§4KO R3): the stream prefix — the orphan-close cut starts after it.
+function _stripInternalTags(text, keepLen = 0) {
+    const tags = (t) => t
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')   // closed reasoning
+        .replace(/<think>[\s\S]*$/i, '')             // unclosed (still streaming)
+        .replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '');
+    const s = String(text ?? "");
+    const n = Math.min(Math.max(0, Number(keepLen) || 0), s.length);
+    return (tags(s.slice(0, n)) + _stripOrphanThinkClose(tags(s.slice(n)))).trim();
+}
+
+// §4KO: the mirror of agent.strip_raw_orphan_reasoning, for RAW text (history
+// sent back to the server keeps inline <think> blocks): cut only a pure-prose
+// prefix — no call opener, think opener or fence before the orphan close — that
+// ends in a close followed by a blank line or directly by a call opener.
+function _stripRawOrphanReasoning(text) {
+    const s = String(text ?? "");
+    if (!/<\/think/i.test(s)) return s;
+    const m = s.match(/^([\s\S]*?)(?:^|\n)<\/think(?:ing)?[ \t]*>[ \t]*(?:\r?\n[ \t]*\r?\n|\r?\n(?=[ \t]*<(?:tool_call\b|tool\b|function\b)))/i);
+    if (!m || /<(?:tool_call|tool|function|think)\b|```|~~~/i.test(m[1])) return s;
+    return s.slice(m[0].length);
+}
+
+// §4KP: display text → the sentences speech queues, cleaned like the live
+// voice path (markup, emphasis, brackets and links dropped).
+function _speechSentences(text) {
+    const clean = String(text ?? "").replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
+    return clean.split(/(?<=[.?!;])\s+/).map(t => t.trim()).filter(t => /[\p{L}\p{N}]/u.test(t));
+}
+
+// §4KP: what a held reply speaks at its clean end — the prefix's unspoken
+// remainder (the live voice path spoke it up to its last full sentence), then
+// the generation as the display shows it.
+function _heldSpeech(buffer, text, prefixLen) {
+    const s = String(text ?? "");
+    const n = Math.min(Math.max(0, Number(prefixLen) || 0), s.length);
+    return [..._speechSentences(buffer), ..._speechSentences(_stripInternalTags(s.slice(n)))];
+}
+
+// §4KO: the streamed reply as history sent back to the server — a leaked
+// reasoning prefix cut by the raw rule, the stream prefix (R3: prior text, a
+// correction banner) kept whole.
+function _historyContent(text, prefixLen) {
+    const s = String(text ?? "");
+    const n = Math.min(Math.max(0, Number(prefixLen) || 0), s.length);
+    return s.slice(0, n) + _stripRawOrphanReasoning(s.slice(n));
+}
+
+// §4KO: reasoning that leaked into the reply CONTENT and ends in an orphan
+// </think> (the chat template opens the block in the prompt, so there is no
+// opener). The mirror of agent._strip_orphan_think_close: everything before the
+// FIRST </think> that starts its own line and is followed by a blank line is
+// reasoning; ``` and ~~~ fences are shielded; a raw-JSON body is left alone.
+// Streamed bytes cannot be recalled, so the display does it: the whole reply is
+// re-rendered from the accumulated text every frame, and the leaked prefix
+// disappears as soon as the tag and its blank line arrive.
+function _stripOrphanThinkClose(text) {
+    const s = String(text ?? "");
+    // a raw-JSON body (it opens with a left brace) is a tool call, not prose
+    if (!/<\/think/i.test(s) || s.trimStart().charAt(0) === "\u007B") return s;
+    const fences = [];
+    const shield = (m) => { fences.push(m); return `\u0000FENCE${fences.length - 1}\u0000`; };
+    const shielded = s.replace(/```[\s\S]*?```/g, shield).replace(/~~~[\s\S]*?~~~/g, shield);
+    let out = shielded.replace(/^[\s\S]*?(?:^|\n)<\/think(?:ing)?[ \t]*>[ \t]*\r?\n[ \t]*\r?\n/i, '');
+    for (let i = fences.length - 1; i >= 0; i--) out = out.split(`\u0000FENCE${i}\u0000`).join(fences[i]);
+    return out;
+}
+
+// Day separators: a live conversation spanning midnight gets a quiet
+// mono date rule between the two days. Live messages only — restored
+// history renders without them (no reliable per-message timestamps).
+function _maybeInsertDaySeparator(ts) {
+    if (_restoringHistory || !chatLog) return;
+    const prior = chatLog.querySelectorAll('.message[data-ts]');
+    const last = prior.length ? prior[prior.length - 1] : null;
+    const lastTs = last ? Number(last.dataset.ts || 0) : 0;
+    if (!lastTs) return;
+    if (new Date(lastTs).toDateString() !== new Date(ts).toDateString()) {
+        const sep = document.createElement('div');
+        sep.className = 'day-separator';
+        sep.textContent = new Date(ts).toLocaleDateString(undefined,
+            { weekday: 'short', month: 'short', day: 'numeric' });
+        chatLog.appendChild(sep);
+    }
+}
+
+function addMessage(role, text) {
+    dismissEmptyStateHero();
+    const ts = Date.now();
+    _maybeInsertDaySeparator(ts);
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+    div.dataset.ts = String(ts);
+    // System messages are ours (connection notices, upload progress,
+    // error strings), not agent output — render them as plain text so a
+    // crafted upstream error message cannot inject markup.
+    if (role === 'system') {
+        div.textContent = text;
+    } else {
+        div.innerHTML = renderMarkdown(text);
+        if (role === 'agent') decorateCodeBlocks(div);
+    }
+    chatLog.appendChild(div);
+    if (role !== 'system') decorateMessageActions();
+    // Your own message always scrolls (you just sent it); anything else
+    // only follows while the log is pinned near the bottom.
+    if (role === 'user') scrollToBottom();
+    else scrollToBottomIfPinned();
+    return div;
+}
+
+// ── Retry / regenerate / edit-and-resend (2026-09-11) ─────────────────
+// Every bubble that has a chatHistory entry carries its index, so the
+// ⋯ menu (workspace.js) and the Retry button on error bubbles can cut the
+// conversation at a known point instead of guessing by DOM position.
+function _stampHistoryIndex(div, idx) {
+    if (div && div.dataset && Number.isInteger(idx) && idx >= 0) {
+        div.dataset.hidx = String(idx);
+    }
+}
+
+// Plain text of a history entry, or null when it carries parts that a
+// composer cannot hold (an attached image): editing that would silently
+// drop the attachment, so the caller refuses instead.
+function _historyEntryText(entry) {
+    if (!entry) return null;
+    if (typeof entry.content === 'string') return entry.content;
+    if (Array.isArray(entry.content)) {
+        if (entry.content.some(c => c && c.type !== 'text')) return null;
+        return entry.content.map(c => (c && c.text) || '').join(' ');
+    }
+    return null;
+}
+
+// Index of the user turn that a bubble belongs to: the entry itself for a
+// user bubble, the nearest preceding user entry for an agent bubble.
+function _userTurnIndexFor(history, idx) {
+    if (!Array.isArray(history) || !Number.isInteger(idx)) return -1;
+    for (let i = Math.min(idx, history.length - 1); i >= 0; i--) {
+        if (history[i] && history[i].role === 'user') return i;
+    }
+    return -1;
+}
+
+// Cut chatHistory (and the transcript) just BEFORE the user turn that
+// `idx` belongs to and put that turn's text back in the composer. Returns
+// the text, or null with a reason when nothing was cut. `send` re-submits
+// immediately (Retry / Regenerate); without it the user edits first.
+function _truncateToUserTurn(idx, send) {
+    if (isProcessingRequest) return { ok: false, reason: 'A turn is still running — stop it first.' };
+    const at = _userTurnIndexFor(chatHistory, idx);
+    if (at < 0) return { ok: false, reason: 'No message to resend.' };
+    const text = _historyEntryText(chatHistory[at]);
+    if (text === null) return { ok: false, reason: 'That message carries an attachment and cannot be edited here.' };
+    // §4PR r4: an edit/retry cuts the turn a recovery may be waiting for —
+    // its next poll recreated the placeholder and the adopted reply put
+    // the cut message back
+    _endRecoveryForNewTurn(true);
+    // Drop the bubbles from that turn on (system notices included — they
+    // belong to the turn being redone). `hidx` marks the boundary.
+    if (chatLog) {
+        let cutting = false;
+        for (const node of Array.from(chatLog.children)) {
+            if (!cutting && node.dataset && Number(node.dataset.hidx) >= at) cutting = true;
+            if (cutting) node.remove();
+        }
+    }
+    chatHistory = chatHistory.slice(0, at);
+    saveChatState();
+    // §4RZ r6a8: a draft (say, text inserted from the tray) is not overwritten unseen
+    if (typeof _restoreToComposer === 'function' && String(chatInput.value).trim()) {
+        _restoreToComposer([chatInput.value], 'Your draft before Retry/Edit.');
+    }
+    chatInput.value = text;
+    chatInput.style.height = '';
+    chatInput.dispatchEvent(new Event('input'));
+    if (send) {
+        sendTypedMessage();
+    } else {
+        chatInput.focus();
+        try { chatInput.setSelectionRange(text.length, text.length); } catch (e) { /* non-text input */ }
+    }
+    return { ok: true, text };
+}
+
+function retryLastTurn() {
+    return _truncateToUserTurn(chatHistory.length - 1, true);
+}
+
+// A system bubble with a Retry button — for the turn outcomes that leave
+// the user with nothing to do but retype: Stop, a network error, an error
+// frame from the agent. `retryLastTurn` re-checks isProcessing at click.
+function addRetryableSystemMessage(text) {
+    const div = addMessage('system', text);
+    if (!div) return div;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-retry-btn';
+    btn.textContent = 'Retry';
+    btn.setAttribute('aria-label', 'Retry the last message');
+    btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const r = retryLastTurn();
+        if (!r.ok && typeof window.__ghostWorkspace?.toast === 'function') {
+            window.__ghostWorkspace.toast(r.reason, 'error');
+        }
+    });
+    div.appendChild(document.createTextNode(' '));
+    div.appendChild(btn);
+    return div;
+}
+
+// ── Adopting a server history without losing the user's own turns ─────
+// Moved here from sessions.js on 2026-09-11 so there is ONE authority:
+// the locked-phone recovery below (`reconcileFromSession`) had its own raw
+// length compare and adopted the server copy wholesale — the F2 loss the
+// sessions module had already fixed twice in its own two paths.
+//
+// Stable message key. Mirrors the server's `_msg_key`: the ROLE plus a
+// stringified content, so a multimodal payload compares by value rather
+// than by object identity; objects serialise with sorted keys.
+function _msgKey(m) {
+    const c = m && m.content;
+    let text;
+    if (c === null || c === undefined) text = '';
+    else if (typeof c === 'string') text = c;
+    else text = JSON.stringify(c, (_k, v) =>
+        (v && typeof v === 'object' && !Array.isArray(v))
+            ? Object.keys(v).sort().reduce((o, kk) => (o[kk] = v[kk], o), {})
+            : v);
+    return (m && m.role) + '\u0000' + text;
+}
+
+// Alignment PAIRS, the same LCS traceback the server runs.
+function _lcsPairs(serverMsgs, localMsgs) {
+    const n = serverMsgs.length, m = localMsgs.length;
+    if (!n || !m) return [];
+    const sk = serverMsgs.map(_msgKey), lk = localMsgs.map(_msgKey);
+    const table = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            table[i][j] = sk[i] === lk[j]
+                ? table[i + 1][j + 1] + 1
+                : Math.max(table[i + 1][j], table[i][j + 1]);
+        }
+    }
+    const pairs = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+        if (sk[i] === lk[j]) { pairs.push([i, j]); i++; j++; }
+        else if (table[i + 1][j] >= table[i][j + 1]) i++;
+        else j++;
+    }
+    return pairs;
+}
+
+// Adopt the server copy WITHOUT deleting or REORDERING anything: align
+// local against the server with the server's own LCS; before the first
+// aligned position keep the client's copy whole (history the store's
+// 400-message cap evicted); after it, keep a local-only USER message (a
+// turn the agent never stored) and drop local-only assistant entries
+// (aborted-stream stubs).
+function _reconcileWithLocal(serverMsgs, localMsgs) {
+    const raw = localMsgs || [];
+    if (!raw.length) return serverMsgs;
+    const local = raw.map((m) => (m && typeof toWireMessage === 'function') ? toWireMessage(m) : m);
+    const pairs = _lcsPairs(serverMsgs, local);
+    const out = [];
+    let i = 0, j = 0;
+    const firstAligned = pairs.length ? pairs[0][1] : local.length;
+    const takeLocal = (k) => {
+        const m = raw[k];
+        if (!m) return;
+        if (k < firstAligned || m.role === 'user') out.push(m);
+    };
+    for (const [pi, pj] of pairs) {
+        while (i < pi) out.push(serverMsgs[i++]);   // server-only
+        while (j < pj) takeLocal(j++);              // local-only, in place
+        out.push(serverMsgs[pi]);
+        i = pi + 1;
+        j = pj + 1;
+    }
+    while (i < serverMsgs.length) out.push(serverMsgs[i++]);
+    while (j < local.length) takeLocal(j++);
+    return out;
+}
+
+// Has adopting `serverMsgs` changed anything the tab shows? Compared on
+// the RECONCILED array, not the raw server copy: once one local turn is
+// legitimately unaccounted, local is permanently `server + k`, and a raw
+// length compare read "nothing new" (or "drifted") forever.
+function _adoptionChanges(adopted, local) {
+    const wire = (m) => (m && typeof toWireMessage === 'function') ? toWireMessage(m) : (m || null);
+    return adopted.length !== local.length
+        || JSON.stringify(wire(adopted[adopted.length - 1] || null))
+            !== JSON.stringify(wire(local[local.length - 1] || null));
+}
+
+// Per-message affordance: a small overlay row (timestamp + ⋯ menu) on
+// finished user/agent bubbles. The menu itself (copy / quote / memory
+// correction) is owned by the workspace module via GhostCore. Guarded by
+// the presence of the row, not a dataset flag — streaming rebuilds a
+// bubble's innerHTML, which wipes children while element attributes
+// survive, so a dataset guard would leave completed replies bare.
+function decorateMessageActions() {
+    if (!chatLog) return;
+    chatLog.querySelectorAll('.message.agent, .message.user').forEach(div => {
+        if (div.classList.contains('thinking') || div.classList.contains('streaming')) return;
+        if (div.classList.contains('queued')) return;   // §4RZ: no history entry yet
+        _ensureFeedbackRow(div);
+        if (div.querySelector(':scope > .msg-actions')) return;
+        const row = document.createElement('div');
+        row.className = 'msg-actions';
+        const time = document.createElement('span');
+        time.className = 'msg-time';
+        if (div.dataset.ts) {
+            time.textContent = new Date(Number(div.dataset.ts))
+                .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+        row.appendChild(time);
+        const menuBtn = document.createElement('button');
+        menuBtn.className = 'msg-menu-btn';
+        menuBtn.type = 'button';
+        menuBtn.textContent = '⋯';
+        menuBtn.title = 'Message actions';
+        menuBtn.setAttribute('aria-label', 'Message actions');
+        menuBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (window.GhostCore && window.GhostCore.openMessageMenu) {
+                window.GhostCore.openMessageMenu(div, menuBtn);
+            }
+        });
+        row.appendChild(menuBtn);
+        div.appendChild(row);
+    });
+}
+
+// Inline SVG thumbs (Material outlines rendered as currentColor fills) so
+// the feedback controls take the theme's color system — emoji glyphs can't.
+// Built via DOM APIs to keep the file free of innerHTML='<...>' patterns.
+const _THUMB_PATHS = {
+    up: 'M1 21h4V9H1v12zM23 10c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.58 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z',
+    down: 'M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z'
+};
+
+function _thumbSvg(kind) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('fill', 'currentColor');
+    p.setAttribute('d', _THUMB_PATHS[kind]);
+    svg.appendChild(p);
+    return svg;
+}
+
+// Outcome-label footer for agent bubbles with a known request id: a quiet
+// right-aligned row INSIDE the bubble (hover-revealed on desktop, dim-always
+// on touch, latched visible once a verdict is chosen). Lives in normal flow
+// — the old placement inside the floating .msg-actions overlay crowded the
+// timestamp/menu and could overlap the reply text (operator: "really bad").
+function _ensureFeedbackRow(div) {
+    if (!div.classList.contains('agent') || !div.dataset.reqId) return;
+    // No trajectory behind this reply (a system answer, §4EX): a thumb
+    // could only ever fail, so offer none.
+    if (div.dataset.unlabelable) return;
+    if (div.querySelector(':scope > .msg-feedback')) return;
+    const fbRow = document.createElement('div');
+    fbRow.className = 'msg-feedback';
+    if (div.dataset.feedback) fbRow.classList.add('fb-decided');
+    for (const sig of ['positive', 'negative']) {
+        const fb = document.createElement('button');
+        fb.className = `msg-fb-btn msg-fb-${sig}`;
+        fb.type = 'button';
+        fb.title = sig === 'positive'
+            ? 'Good answer (labels this turn passed)'
+            : 'Bad answer (labels this turn failed)';
+        fb.setAttribute('aria-label', fb.title);
+        fb.appendChild(_thumbSvg(sig === 'positive' ? 'up' : 'down'));
+        if (div.dataset.feedback === sig) fb.classList.add('fb-active');
+        fb.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            sendFeedback(div, sig);
+        });
+        fbRow.appendChild(fb);
+    }
+    div.appendChild(fbRow);
+}
+
+// ── Client-only history keys (reqId/feedback — the 👍/👎 label plumbing) ──
+// Stripped from EVERY wire payload; preserved across server-history
+// adoption. One canonical mapper so a new chatHistory sender can't forget
+// the strip (R1 review: the sessions resync compared fat-local vs
+// clean-server JSON and read "drifted" on every focus, wiping the labels).
+function toWireMessage(m) {
+    if (!m || typeof m !== 'object') return m;
+    const { reqId, feedback, unlabelable, prefixLen, ...rest } = m;
+    return rest;
+}
+
+// Carry the client-only label keys forward onto a server-fetched history.
+// Server messages are canonical for role/content but never carry reqId, so
+// adopting them verbatim silently stripped every label (and persisted the
+// loss via saveChatState). Index-aligned and gated on role+content
+// equality, so adopting a genuinely different conversation is a no-op.
+function mergeClientLabelKeys(serverMsgs) {
+    const out = Array.isArray(serverMsgs)
+        ? serverMsgs.map(m => (m && typeof m === 'object' ? { ...m } : m))
+        : [];
+    for (let i = 0; i < out.length && i < chatHistory.length; i++) {
+        const loc = chatHistory[i];
+        if (!loc || !loc.reqId || !out[i] || out[i].role !== loc.role) continue;
+        // Content gate, with ONE relaxation: an aborted reply's local copy
+        // is the server's full reply truncated + "*[Aborted]*" — exact
+        // equality would drop the label from precisely the reply most
+        // likely to be 👎'd (the sessions resync re-adopts ~2s after every
+        // abort, deterministically). Scoped tight (R3 review): only at the
+        // LOCAL TAIL, where the abort stub always lives, and only with a
+        // substantial prefix — a short generic stub ("Sure") prefix-matching
+        // an index-shifted different reply would graft the wrong reqId.
+        let same = out[i].content === loc.content;
+        if (!same && i === chatHistory.length - 1
+                && typeof out[i].content === 'string'
+                && typeof loc.content === 'string') {
+            const abortIdx = loc.content.lastIndexOf('\n\n*[Aborted]*');
+            if (abortIdx >= 32) {
+                same = out[i].content.startsWith(loc.content.slice(0, abortIdx));
+            }
+        }
+        if (same) {
+            out[i].reqId = loc.reqId;
+            if (loc.feedback) out[i].feedback = loc.feedback;
+            if (loc.unlabelable) out[i].unlabelable = true;
+            if (loc.prefixLen) out[i].prefixLen = loc.prefixLen;   // §4KO R4
+        }
+    }
+    return out;
+}
+
+// Stamp a bubble with its agent request id. A REUSED bubble (resume path)
+// keeps its dataset across innerHTML rewrites, so a changed id must clear
+// the stale feedback latch + row or the new reply renders a verdict nobody
+// gave — and the same-signal no-op guard would then make that thumb
+// permanently untappable.
+function _stampReqId(div, id, unlabelable) {
+    if (!div) return;
+    // Follows the id: a reused bubble must not inherit the previous
+    // turn's "no thumbs" (or its thumbs) — see the reqId stale-clear below.
+    if (unlabelable) div.dataset.unlabelable = '1';
+    else delete div.dataset.unlabelable;
+    // Stale-clear runs even when the NEW id is unknown (R3: a reused
+    // bubble whose new turn captured no id — the "No response" path —
+    // kept the previous turn's reqId, latch, and thumbs, so a tap there
+    // labeled the wrong trajectory).
+    if (div.dataset.reqId && div.dataset.reqId !== (id || '')) {
+        delete div.dataset.reqId;
+        delete div.dataset.feedback;
+        // The retry latch and any armed retry belong to the OLD turn — a
+        // reused bubble must not fire the old label at the new id, nor
+        // start the new turn with its one 404 retry already burned.
+        delete div.dataset.fbRetried;
+        if (div._fbTimer) { clearTimeout(div._fbTimer); div._fbTimer = null; }
+        const old = div.querySelector(':scope > .msg-feedback');
+        if (old) old.remove();
+    }
+    if (id) div.dataset.reqId = id;
+}
+
+// POST a human outcome label for an agent reply (Track-1a, 2026-08-13).
+// The agent resolves request_id → trajectory and writes its corrections
+// sidecar, turning this turn's outcome=unknown into a real label for the
+// learning stack. Fire-and-forget with a visual latch on the tapped thumb.
+async function sendFeedback(div, signal, retryReqId) {
+    const reqId = div.dataset.reqId;
+    // Same-signal repeats are a no-op CLIENT-side too (the server also
+    // dedupes — first live test: three 👍 in 2s appended three sidecar
+    // rows). Switching to the opposite thumb re-labels.
+    if (!reqId || div.dataset.feedback === signal) return;
+    // An ARMED RETRY fires blind 4s later — it must stand down if the
+    // operator labeled in the meantime (either thumb: a 👎 landed after
+    // the pending 👍 would otherwise be silently overwritten server-side)
+    // or if the bubble was re-stamped with a different turn's id.
+    if (retryReqId && (div.dataset.feedback || reqId !== retryReqId)) return;
+    // A fresh tap supersedes any armed retry from a previous tap — and
+    // returns the un-consumed retry budget (R3: a superseding tap during
+    // the flush window burned the latch without a retry ever running, so
+    // the tap that would have succeeded at t+4s turned into an error).
+    if (!retryReqId && div._fbTimer) {
+        clearTimeout(div._fbTimer);
+        div._fbTimer = null;
+        delete div.dataset.fbRetried;
+    }
+    const btns = div.querySelectorAll('.msg-fb-btn');
+    btns.forEach(b => { b.disabled = true; });
+    try {
+        const r = await fetch('/api/feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request_id: reqId, signal: signal, source: 'web' })
+        });
+        if (!r.ok) {
+            // 404 = the trajectory can flush moments AFTER the stream ends
+            // (the agent records it post-semaphore) — one delayed retry
+            // recovers exactly the tap-the-instant-it-lands case.
+            //
+            // 429/5xx too (review C3): a 503 is the agent RESTARTING, i.e.
+            // the exact window a deploy creates, and this path produced
+            // one transient chat bubble and nothing durable — while this
+            // client is the source of HALF the live labels. Slack already
+            // retries these; the web UI silently did not.
+            const _retryable = (r.status === 404 || r.status === 429
+                                || r.status >= 500);
+            if (_retryable && !div.dataset.fbRetried) {
+                div.dataset.fbRetried = '1';
+                div._fbTimer = setTimeout(() => {
+                    div._fbTimer = null;
+                    sendFeedback(div, signal, reqId);
+                }, 4000);
+                return;
+            }
+            const err = await r.json().catch(() => ({}));
+            _noteFeedbackFailure(div, `Feedback not recorded: ${err.error || err.detail || ('HTTP ' + r.status)}`);
+            return;
+        }
+        delete div.dataset.fbRetried;
+        delete div.dataset.fbFailure;   // a later failure may speak again
+        // Latch on the LIVE bubble: a drift re-render can detach `div`
+        // between the tap (or an armed retry) and this response — latching
+        // the detached node showed no verdict and invited a duplicate tap
+        // (R3 review). The history loop below is the durable half either way.
+        let target = div;
+        if (!target.isConnected) {
+            // CSS.escape: reqIds are server hex today, but X-Request-ID is
+            // client-controlled on other surfaces — an unescaped quote
+            // would throw here AFTER the POST succeeded and misreport a
+            // recorded label as a network error.
+            target = chatLog.querySelector(
+                `.message.agent[data-req-id="${CSS.escape(reqId)}"]`) || div;
+        }
+        target.dataset.feedback = signal;
+        const fbRow = target.querySelector(':scope > .msg-feedback');
+        if (fbRow) fbRow.classList.add('fb-decided');
+        target.querySelectorAll('.msg-fb-btn').forEach(b => {
+            b.classList.toggle('fb-active',
+                b.classList.contains(`msg-fb-${signal}`));
+        });
+        // Persist the latch so a reload re-renders the chosen thumb.
+        for (let i = chatHistory.length - 1; i >= 0; i--) {
+            if (chatHistory[i].reqId === reqId) {
+                chatHistory[i].feedback = signal;
+                break;
+            }
+        }
+        if (typeof saveChatState === 'function') saveChatState();
+    } catch (e) {
+        console.warn('feedback failed:', e);
+        _noteFeedbackFailure(div, 'Feedback not recorded: network error — tap again.');
+    } finally {
+        btns.forEach(b => { b.disabled = false; });
+    }
+}
+
+// One system line per failure per bubble (2026-09-05, operator: the same
+// "FEEDBACK NOT RECORDED" line stacked up once per tap). The FIRST failure
+// is worth a line — the operator must know the label was lost; the same
+// failure again on the next tap is not. A DIFFERENT message (a 404 that
+// became a network error) still speaks; a success clears the latch so a
+// later failure speaks again. Pure DOM state, so it can be executed under
+// node with a stub bubble.
+function _noteFeedbackFailure(div, message) {
+    if (div && div.dataset && div.dataset.fbFailure === message) return false;
+    if (div && div.dataset) div.dataset.fbFailure = message;
+    addMessage('system', message);
+    return true;
+}
+
+function scrollToBottom() {
+    requestAnimationFrame(() => { chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'smooth' }); });
+    _hideNewContentPill();
+}
+
+// Reading position (2026-09-11). Every append used to yank the reader to
+// the bottom — scroll up to re-read while a turn finishes, or tap the
+// composer on a phone (a viewport resize), and you were thrown down.
+// Only the user's own send and a fresh render may scroll unconditionally;
+// everything else follows the log only while it is already pinned near
+// the bottom, and otherwise lights the "new messages" pill (the log
+// console has had exactly this affordance since 07-13).
+function _isNearBottom(threshold = 150) {
+    if (!chatLog) return true;
+    return (chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= threshold;
+}
+function scrollToBottomIfPinned() {
+    if (_isNearBottom()) scrollToBottom();
+    else _noteNewContentBelow();
+}
+const chatResumeBtn = document.getElementById('chat-resume');
+function _noteNewContentBelow() {
+    if (chatResumeBtn) chatResumeBtn.classList.remove('hidden');
+}
+function _hideNewContentPill() {
+    if (chatResumeBtn) chatResumeBtn.classList.add('hidden');
+}
+if (chatResumeBtn) {
+    chatResumeBtn.addEventListener('click', () => {
+        _hideNewContentPill();
+        chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'smooth' });
+    });
+}
+
+// During streaming we get 50+ chunks/sec. Smooth-scrolling each one
+// stutters and animates the scrollbar through every partial frame.
+// Use an rAF-throttled `auto` scroll: feels instant, burns one frame.
+let _streamScrollScheduled = false;
+function scrollToBottomDuringStream() {
+    if (_streamScrollScheduled) return;
+    _streamScrollScheduled = true;
+    requestAnimationFrame(() => {
+        _streamScrollScheduled = false;
+        // 'instant', not 'auto': #chat-log has `scroll-behavior: smooth`, and
+        // 'auto' means "use the CSS value" — so every frame started a fresh
+        // smooth animation that trailed the growing reply (the jitter).
+        chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'instant' });
+    });
+}
+
+// Re-render the in-flight agent message from the accumulated content.
+// Re-parsing the full markdown + re-sanitizing on every network read is
+// O(n²) over a long reply; coalescing renders to one-per-animation-frame
+// (scheduleStreamRender) keeps it smooth. _renderStreamingContent does
+// the actual work and is also called once synchronously after the stream
+// ends to flush the final tokens.
+// Swap the waiting bubble from typing dots to a reply. Returns true the
+// first time (the bubble was still `.thinking`), false after. Pure DOM,
+// so it runs under node with a stub element.
+function _revealAgentBubble(div) {
+    if (!div || !div.classList || !div.classList.contains('thinking')) return false;
+    div.classList.remove('thinking');
+    div.textContent = "";
+    return true;
+}
+
+// §4MP: the agent retracted the reply text it had streamed (a tool call
+// followed it, or the finished reply was rewritten). Drop the text, the
+// bubble's render and any speech of it; the frames that follow replace it.
+// Returns whether anything was dropped.
+function _applyStreamRetract() {
+    if (currentAccumulatedContent === "") return false;
+    stopTTS();
+    currentAccumulatedContent = "";
+    currentStreamPrefixLen = 0;
+    currentSpeechHold = false;
+    currentTTSMutedLength = 0;
+    _cancelScheduledStreamRender();
+    if (currentAgentMessageDiv) currentAgentMessageDiv.innerHTML = "";
+    return true;
+}
+
+// Re-render the streaming bubble without rebuilding its images (2026-10-24).
+// A plain innerHTML swap made a fresh <img> every frame: a fresh authed
+// fetch, a raw 401 frame, then the 🖼️ button arriving async — the image
+// area flickered and the reply hopped. Images _processChatLogArtifacts has
+// already taken (and their broken-image badges) are carried across, keyed by
+// their original src. The new markup is parsed in an inert <template> and a
+// matched <img> is swapped for a comment there, so the duplicate never
+// starts a load; the kept node goes back in after, button before it.
+function _replaceStreamBubble(div, html) {
+    const kept = new Map();
+    div.querySelectorAll('img.placeholder-added, .broken-image-badge').forEach(el => {
+        const src = el.dataset.ghostSrc;
+        if (!src) return;
+        if (!kept.has(src)) kept.set(src, []);
+        kept.get(src).push(el);
+    });
+    if (!kept.size) { div.innerHTML = html; return; }
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    const swaps = [];
+    t.content.querySelectorAll('img').forEach(img => {
+        const old = (kept.get(img.getAttribute('src') || '') || []).shift();
+        if (!old) return;
+        const mark = document.createComment('');
+        img.replaceWith(mark);
+        swaps.push([mark, old]);
+    });
+    div.replaceChildren(t.content);
+    for (const [mark, old] of swaps) {
+        const btn = old._ghostPlaceholderBtn;
+        mark.replaceWith(old);
+        if (btn) old.before(btn);
+    }
+}
+
+function _renderStreamingContent() {
+    if (!currentAgentMessageDiv || currentAccumulatedContent === "") return;
+    const displayContent = _stripInternalTags(currentAccumulatedContent, currentStreamPrefixLen);
+    // Reasoning only so far (an open <think> block): keep the typing dots.
+    // Rendering the empty string here is what blanked the bubble for the
+    // whole thinking phase.
+    if (!displayContent) return;
+    if (_revealAgentBubble(currentAgentMessageDiv)) {
+        // From here the reply itself is the story — the caption says so
+        // until turn end.
+        setTurnStatusDesc('writing the reply…', '💬');
+        if (typeof activeFace.setPhase === 'function') activeFace.setPhase('write');
+    }
+    // Pinned is read BEFORE the re-render: measured after it, one frame that
+    // adds a paragraph or a code block (>50 px) read as "the reader scrolled
+    // up", following stopped, and the next frame caught up — the hop.
+    const wasPinned = _isNearBottom();
+    _replaceStreamBubble(currentAgentMessageDiv, renderMarkdown(displayContent));
+    // Streaming-cursor glyph; removed in sendMessage's finally.
+    currentAgentMessageDiv.classList.add('streaming');
+    if (wasPinned) scrollToBottomDuringStream();
+    else _noteNewContentBelow();
+    decorateCodeBlocks(currentAgentMessageDiv);
+}
+let _streamRenderRafId = null;
+function scheduleStreamRender() {
+    if (_streamRenderRafId !== null) return;
+    _streamRenderRafId = requestAnimationFrame(() => {
+        _streamRenderRafId = null;
+        _renderStreamingContent();
+    });
+}
+// Cancel a pending throttled render. Without this, a frame scheduled
+// during streaming can fire AFTER sendMessage's finally removed the
+// `streaming` class and re-add it — leaving the blinking cursor glyph
+// stuck on a completed reply.
+function _cancelScheduledStreamRender() {
+    if (_streamRenderRafId !== null) {
+        cancelAnimationFrame(_streamRenderRafId);
+        _streamRenderRafId = null;
+    }
+}
+
+// Is-reading dim: when the user has scrolled up to review earlier
+// history, fade the background sphere back so the text takes focus.
+// When they return to the bottom, the sphere returns. Debounced via
+// a simple "near-bottom" threshold so it doesn't flicker with
+// rubber-banding on iOS Safari.
+(function installReadingDimListener() {
+    if (!chatLog) return;
+    let scheduled = false;
+    const update = () => {
+        scheduled = false;
+        const dist = chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight;
+        // 150px: bigger than iOS rubber-band overscroll, smaller than a
+        // single message — reliably detects intentional scrollback.
+        const isReading = dist > 150;
+        document.body.classList.toggle('is-reading', isReading);
+        if (!isReading) _hideNewContentPill();
+    };
+    chatLog.addEventListener('scroll', () => {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(update);
+    }, { passive: true });
+})();
+
+// Storage copy of a history that would not fit: inline images (data:
+// URIs) become a placeholder and only the newest 200 entries are kept.
+// The DURABLE copy is the server's; this is the reload cache.
+const LOCAL_HISTORY_MAX = 200;
+function _slimHistoryForStorage(history) {
+    const slim = (history || []).map((m) => {
+        if (!m || !Array.isArray(m.content)) return m;
+        return { ...m, content: m.content.map((part) => {
+            const url = part && part.image_url && part.image_url.url;
+            if (typeof url === 'string' && url.startsWith('data:')) {
+                return { type: 'text', text: '[image omitted from local history]' };
+            }
+            return part;
+        }) };
+    });
+    return slim.slice(-LOCAL_HISTORY_MAX);
+}
+function _isQuotaError(name) {
+    return name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED';
+}
+let _quotaWarned = false;
+function saveChatState() {
+    const key = _historyKey();
+    if (safeStorage.set(key, JSON.stringify(chatHistory))) return true;
+    if (!_isQuotaError(safeStorage.lastError)) return false;   // private mode etc.
+    const ok = safeStorage.set(key, JSON.stringify(_slimHistoryForStorage(chatHistory)));
+    if (!_quotaWarned) {
+        _quotaWarned = true;
+        const msg = ok
+            ? 'Browser storage is full: older messages and inline images are kept only on the server now.'
+            : 'Browser storage is full: this conversation is not being saved locally (the server copy is unaffected).';
+        if (typeof window.__ghostWorkspace?.toast === 'function') window.__ghostWorkspace.toast(msg, 'error');
+        else console.warn('[Ghost] ' + msg);
+    }
+    return ok;
+}
+
+// Render a full message history into the (cleared) chat log. Shared by
+// the localStorage restore, workspace load, and the sessions rail
+// (server-side conversations). body.restoring suppresses the entrance
+// animations so a re-render doesn't replay every slide-in.
+function renderHistoryToLog(history) {
+    chatLog.innerHTML = '';
+    document.body.classList.add('restoring');
+    _withHistoryRestore(() => {
+        for (let hidx = 0; hidx < history.length; hidx++) {
+            const msg = history[hidx];
+            // Only conversational roles get bubbles — a stored session can
+            // carry tool/function messages (other clients), which would
+            // otherwise masquerade as USER bubbles.
+            if (!['user', 'assistant', 'system'].includes(msg.role)) continue;
+            const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
+            let displayContent = msg.content;
+
+            if (Array.isArray(displayContent)) {
+                const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
+                displayContent = texts.join(" ") + " \n*[Image Attached]*";
+            }
+            if (typeof displayContent === 'string') {
+                let cleanContent = _stripInternalTags(displayContent, msg.prefixLen);   // §4KO R4: the stream prefix
+                if (cleanContent) {
+                    const div = document.createElement('div');
+                    div.className = `message ${roleClass}`;
+                    if (roleClass === 'system') {
+                        div.textContent = cleanContent;
+                    } else {
+                        div.innerHTML = renderMarkdown(cleanContent);
+                        if (roleClass === 'agent') decorateCodeBlocks(div);
+                    }
+                    // Restore the feedback handle + chosen thumb so the
+                    // 👍/👎 buttons survive a reload (local history only —
+                    // server-side sessions don't carry reqId).
+                    if (roleClass === 'agent' && msg.reqId) {
+                        div.dataset.reqId = msg.reqId;
+                        if (msg.feedback) div.dataset.feedback = msg.feedback;
+                        if (msg.unlabelable) div.dataset.unlabelable = '1';
+                    }
+                    if (roleClass !== 'system') _stampHistoryIndex(div, hidx);
+                    chatLog.appendChild(div);
+                }
+            }
+        }
+        decorateMessageActions();
+        scrollToBottom();
+        if (typeof attachRenderButtons === 'function') attachRenderButtons();
+    });
+    setTimeout(() => document.body.classList.remove('restoring'), 60);
+}
+
+function loadChatState() {
+    let saved = safeStorage.get(_historyKey());
+    if (!saved) {
+        // Legacy flat key (pre 2026-09-11): adopt once, then remove it so
+        // no later tab can pick up a stale conversation from it.
+        const legacy = safeStorage.get(HISTORY_KEY);
+        if (legacy) {
+            saved = legacy;
+            safeStorage.remove(HISTORY_KEY);
+            safeStorage.set(_historyKey(), legacy);
+        }
+    }
+    if (saved) {
+        try {
+            // Shape-validate: JSON.parse happily yields a string, a number
+            // or an object, and `chatHistory.push` then throws BEFORE
+            // sendMessage's try block — the composer dies with a
+            // console-only error and no visible cause (R2 lens B). The
+            // bridge setter has always guarded this; the two direct
+            // assignments did not.
+            const _parsed = JSON.parse(saved);
+            chatHistory = Array.isArray(_parsed) ? _parsed : [];
+            renderHistoryToLog(chatHistory);
+        } catch (e) {
+            console.error("Failed to load chat history", e);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  In-flight turn survival (2026-08-01) — the Claude-app model.
+//
+//  The proxy buffers every chat stream server-side (task lives while
+//  running + 10 min after completion), and the AGENT persists the
+//  finished reply into the durable session store. What used to be lost
+//  when iOS killed the page mid-request was only the HANDLE — the task
+//  id lived in a module `let`. Persist it, and on return:
+//    1. proxy replay buffer still there  → reattach the live stream
+//    2. buffer gone, turn still running  → placeholder + poll sessions
+//    3. buffer gone, turn finished       → adopt the session's history
+//  (3) goes through wholesale adoption (server canonical), never an
+//  append — appending a diverged fat replay is the merge_history
+//  doubling case.
+// ═══════════════════════════════════════════════════════════════
+const INFLIGHT_KEY = 'ghost_inflight_turn';
+let reconcilePollTimer = null;
+let resumeLatch = false;        // synchronous re-entry guard (see below)
+// Bounded attempts for the NETWORK-error resume path (the fourth resume
+// trigger, which used to bypass the latch and could retry forever silently).
+let _netResumeTries = 0;
+let inflightHeartbeat = null;   // owner-tab liveness while streaming
+
+// Tab identity: sessionStorage survives same-tab reloads but NOT an iOS
+// PWA kill — which is exactly right: the reopened app gets a fresh id
+// and may adopt the orphaned handle, while a SECOND live tab (whose
+// heartbeat is fresh) must keep its hands off another tab's turn.
+const TAB_ID = (() => {
+    try {
+        let id = sessionStorage.getItem('ghost_tab_id');
+        if (!id) {
+            id = (crypto.randomUUID ? crypto.randomUUID()
+                : `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            sessionStorage.setItem('ghost_tab_id', id);
+        }
+        return id;
+    } catch (e) { return `tab-${Math.random().toString(36).slice(2)}`; }
+})();
+
+// ⚠ ONE KEY PER TAB. A single shared `ghost_inflight_turn` meant every
+// tab wrote over every other tab's handle and `clearInflightHandle()`
+// deleted it outright — on turn completion, abort, /clear, the resume
+// mismatch drop, the reconcile give-up. Tab 1's heartbeat then correctly
+// stood down, so nothing noticed; if tab 1 was killed mid-turn its reply
+// was unrecoverable, which is the exact recovery this subsystem exists for
+// (R3 lens B). Namespacing is the fix — a tabId GUARD would only move the
+// loss into saveInflightHandle, where tab 2's own turn becomes the casualty.
+function _inflightKey(tabId) {
+    return `${INFLIGHT_KEY}:${tabId || TAB_ID}`;
+}
+
+function _inflightKeys() {
+    const out = [];
+    try {
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(INFLIGHT_KEY + ':')) out.push(k);
+        }
+    } catch (e) { /* private mode — no enumeration */ }
+    return out;
+}
+
+function saveInflightHandle() {
+    if (!currentTaskId) return;
+    safeStorage.set(_inflightKey(), JSON.stringify({
+        taskId: currentTaskId,
+        sessionId: window.__ghostSessionId || storedSessionId(),
+        tabId: TAB_ID,
+        ts: Date.now(),
+        beat: Date.now(),
+        startedAt: currentTurnStartedAt || Date.now(),
+    }));
+    // Heartbeat while the owning tab streams: lets other tabs tell a
+    // LIVE owner from a killed one.
+    if (inflightHeartbeat) clearInterval(inflightHeartbeat);
+    inflightHeartbeat = setInterval(() => {
+        try {
+            const raw = safeStorage.get(_inflightKey());
+            if (!raw) return;
+            const h = JSON.parse(raw);
+            if (h.tabId !== TAB_ID) return;  // paranoia: not ours to beat
+            h.beat = Date.now();
+            safeStorage.set(_inflightKey(), JSON.stringify(h));
+        } catch (e) { /* storage gone — nothing to keep alive */ }
+    }, 5000);
+}
+
+// `handle` names WHOSE key to drop. Adopting an orphan and then calling the
+// bare form would clear our own (empty) slot and leave the orphan on disk to
+// be re-adopted on every visibility change — a loop, not a cleanup.
+function clearInflightHandle(handle) {
+    safeStorage.remove(_inflightKey(handle && handle.tabId));
+    safeStorage.remove(INFLIGHT_KEY);            // legacy single-key handle
+    if (reconcilePollTimer) { clearTimeout(reconcilePollTimer); reconcilePollTimer = null; }
+    if (inflightHeartbeat) { clearInterval(inflightHeartbeat); inflightHeartbeat = null; }
+}
+
+function readInflightHandle() {
+    const parse = (raw) => {
+        try {
+            const h = JSON.parse(raw);
+            return (h && typeof h.taskId === 'string' && h.taskId) ? h : null;
+        } catch (e) { return null; }
+    };
+    // Ours first — a tab always owns its own turn.
+    const mine = safeStorage.get(_inflightKey());
+    const ours = mine ? parse(mine) : null;
+    if (ours) return ours;
+    // Otherwise adopt an ORPHAN: another tab's handle whose heartbeat has
+    // gone stale (that tab was killed). A live tab's handle is left alone.
+    const STALE_MS = 15000;
+    const GC_MS = 10 * 60 * 1000;   // the proxy's replay buffer TTL
+    let best = null;
+    for (const k of _inflightKeys()) {
+        const h = parse(safeStorage.get(k) || '');
+        if (!h) { safeStorage.remove(k); continue; }
+        const age = Date.now() - (h.beat || h.ts || 0);
+        if (age > GC_MS) { safeStorage.remove(k); continue; }
+        if (age > STALE_MS && (!best || (h.ts || 0) > (best.ts || 0))) best = h;
+    }
+    // Legacy single-key handle written before this tab upgraded.
+    if (!best) {
+        const legacy = safeStorage.get(INFLIGHT_KEY);
+        if (legacy) best = parse(legacy);
+    }
+    return best;
+}
+
+// Recreate the thinking bubble + ticker for a resume that outlived the
+// page (after a reload nothing of the original turn's DOM exists). No-op
+// when the original bubble is still attached (same-page Safari resume).
+function ensureAgentBubbleForResume() {
+    // Reuse the bubble only for ITS turn (stamped with the send time). After
+    // a finished turn the pointer still names that reply; adopting another
+    // tab's turn reused it, and §4RN would have put a running clock under it.
+    if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected
+            && currentAgentMessageDiv.dataset.turnStart === String(currentTurnStartedAt)) {
+        // Same page: the bubble survived, but the dropped stream's teardown
+        // stopped its clock — give it back, counting from the send, not now.
+        if (!tickerTimer) startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt);
+        return;
+    }
+    dismissEmptyStateHero();
+    currentAgentMessageDiv = document.createElement('div');
+    currentAgentMessageDiv.className = 'message agent thinking';
+    currentAgentMessageDiv.dataset.ts = String(Date.now());
+    currentAgentMessageDiv.dataset.turnStart = String(currentTurnStartedAt);
+    const ind = document.createElement('span');
+    ind.className = 'typing-indicator';
+    ind.setAttribute('aria-label', 'Thinking');
+    ind.appendChild(document.createElement('span'));
+    ind.appendChild(document.createElement('span'));
+    ind.appendChild(document.createElement('span'));
+    currentAgentMessageDiv.appendChild(ind);
+    chatLog.appendChild(currentAgentMessageDiv);
+    startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt);
+    scrollToBottom();
+}
+
+// True while `sid` is still the conversation this tab is showing. The
+// reconcile poll can outlive a rail switch/new-chat by many seconds —
+// adopting session A's history after the user moved to session B would
+// bind A's transcript to B and replay it into B's durable store on the
+// next turn (R6 review; same corruption class as the sessions resync).
+function _sessionStillCurrent(sid) {
+    const cur = window.__ghostSessionId;
+    // undefined = the sessions module hasn't booted/bound yet → allow.
+    // null = EXPLICITLY unbound (/clear with sessions unreachable,
+    // setCurrent(null)) → adopting anything would resurrect the cleared
+    // conversation (R7 review). Anything else: exact match only.
+    if (cur === undefined) return true;
+    return cur === sid;
+}
+
+// One announcement per recovery, and a poll chain that cannot silently die.
+let _reconcileAnnounced = false;
+let _reconcileTries = 0;
+const _RECONCILE_MAX_TRIES = 120;   // ~10 minutes at 5s (up to ~40 when each poll's fetch times out)
+
+let _reconcileHandle = null;   // §4PR r2: the handle the recovery is FOR
+// §4PR r3: a recovery is ACTIVE while its timer waits OR a poll is running
+// (awaiting /api/turns or the session). A send bumps the generation: every
+// running poll sees it after its next await and stands down.
+let _reconcileGen = 0;
+let _reconcileRunning = 0;
+let _reconcileSid = null;
+const _RECONCILE_FETCH_MS = 15000;
+// r6: AbortSignal.timeout is Safari 16+; without it the TypeError fired
+// before fetch and every recovery poll failed silently for ~10 minutes
+function _timeoutSignal(ms) {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        return AbortSignal.timeout(ms);
+    }
+    const c = new AbortController();
+    setTimeout(() => c.abort(), ms);
+    return c.signal;
+}
+function _scheduleReconcilePoll(sid, handle) {
+    if (reconcilePollTimer) return;
+    // never arm during a live turn: the give-up path below would stop the
+    // live turn's clock and delete its handle (r2 M1 / r3)
+    if (isProcessingRequest) return;
+    _reconcileHandle = handle || null;
+    if (_reconcileTries++ >= _RECONCILE_MAX_TRIES) {
+        addMessage('system', 'Gave up waiting for this turn. If it finished, '
+            + 'switching sessions and back will show the reply.');
+        stopTurnTicker();
+        clearInflightHandle(handle);
+        _reconcileAnnounced = false;
+        _reconcileTries = 0;
+        return;
+    }
+    reconcilePollTimer = setTimeout(() => {
+        reconcilePollTimer = null;
+        reconcileFromSession(sid, handle);
+    }, 5000);
+}
+
+// §4PR: why the recovery stands down. A NEWER session identity ends it (and
+// its ticker — it kept counting after a rail switch — unless a live turn
+// now owns the ticker). A live turn also ends it: a send ends a pending
+// recovery explicitly (_endRecoveryForNewTurn); r2 M1 — deferring it
+// through the turn spent the try budget, and the give-up path then killed
+// the LIVE turn's clock and deleted its resume handle.
+function _reconcileBlocked(sid, handle, gen) {
+    if (gen !== undefined && gen !== _reconcileGen) return true;   // ended by a send
+    if (!_sessionStillCurrent(sid)) {
+        if (!isProcessingRequest) stopTurnTicker();
+        // the recovery ends here: the next one starts with a full budget
+        _reconcileAnnounced = false;
+        _reconcileTries = 0;
+        return true;
+    }
+    return !!isProcessingRequest;
+}
+
+// A send while a recovery waits for an OLDER turn: end the recovery cleanly
+// and say so (before this, its placeholder dangled with dots forever) —
+// BEFORE the new turn writes its own handle, so only the old one goes.
+function _endRecoveryForNewTurn(silent = false) {
+    if (!reconcilePollTimer && !_reconcileRunning) return;
+    _reconcileGen += 1;
+    const elsewhere = _reconcileSid && !_sessionStillCurrent(_reconcileSid);
+    clearInflightHandle(_reconcileHandle);
+    _reconcileHandle = null;
+    _reconcileAnnounced = false;
+    _reconcileTries = 0;
+    if (currentAgentMessageDiv && currentAgentMessageDiv.classList.contains('thinking')) {
+        stopTurnTicker();
+        currentAgentMessageDiv.remove();
+        currentAgentMessageDiv = null;
+    }
+    if (!silent) addMessage('system', 'Stopped waiting for the earlier reply — if it finished, it '
+        + (elsewhere ? 'appears when you switch back to that session.'
+                     : 'appears when you switch to this session again.'));
+}
+
+async function reconcileFromSession(sid, handle) {
+    // `handle` is the inflight record this recovery is FOR — which may belong
+    // to another (dead) tab we adopted. Terminal cleanups must name it: a
+    // bare clear drops our own empty slot and leaves the orphan on disk, to
+    // be re-adopted on every visibility change (R4 lens B).
+    if (!sid) { clearInflightHandle(handle); return; }
+    // §4PR r4: one run at a time — a visibilitychange run beside a
+    // timer-fired one posted "Recovered…" then "could not be recovered"
+    if (_reconcileRunning) return;
+    const gen = _reconcileGen;
+    _reconcileHandle = handle || null;
+    _reconcileSid = sid;
+    _reconcileRunning += 1;
+    try {
+        // A LIVE turn owns the log, and so does a NEWER session identity.
+        // Bail at entry AND after every await — adoption calls
+        // renderHistoryToLog, which would detach the bubble a new turn is
+        // streaming into and drop its user message.
+        if (_reconcileBlocked(sid, handle, gen)) return;
+        let stillRunning = false;
+        try {
+            // §4PR r5: bounded — one hung request held _reconcileRunning
+            // forever, and every later recovery stood down behind it
+            const tr = await fetch('/api/turns', { signal: _timeoutSignal(_RECONCILE_FETCH_MS) });
+            if (_reconcileBlocked(sid, handle, gen)) return;
+            if (tr.ok) {
+                const td = await tr.json();
+                if (_reconcileBlocked(sid, handle, gen)) return;
+                stillRunning = (td.turns || []).some(
+                    (t) => t.session_id === sid && (t.running || t.queued));
+            }
+        } catch (e) {
+            // A hiccup on /api/turns used to return here with NO poll
+            // rescheduled, so the recovery chain died permanently — a thinking
+            // bubble and a running clock, forever, on a visible tab (R2 lens B).
+            if (!_reconcileBlocked(sid, handle, gen)) _scheduleReconcilePoll(sid, handle);
+            return;
+        }
+        if (stillRunning) {
+            // The proxy's replay buffer is gone (restart) but the agent is
+            // still computing. The reply will land in the session store when
+            // it finishes — keep a placeholder and poll. Its clock counts
+            // from the send the handle recorded (a reload lost the old one).
+            if (handle) currentTurnStartedAt = _turnStartFromHandle(handle);
+            ensureAgentBubbleForResume();
+            // Announce ONCE per recovery, not once per poll. The old guard
+            // (`if (!reconcilePollTimer)`) conflated "first time" with "no poll
+            // pending", and the timeout body nulls the timer BEFORE recursing —
+            // so a 3-minute turn printed ~36 identical "Ghost is still working"
+            // bubbles (measured under node: 6 in 30s).
+            if (!_reconcileAnnounced) {
+                _reconcileAnnounced = true;
+                addMessage('system', 'Ghost is still working on your request…');
+            }
+            if (!_reconcileBlocked(sid, handle, gen)) _scheduleReconcilePoll(sid, handle);
+            return;
+        }
+        _reconcileAnnounced = false;
+        try {
+            const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`,
+                { signal: _timeoutSignal(_RECONCILE_FETCH_MS) });
+            if (_reconcileBlocked(sid, handle, gen)) return;
+            if (res.ok) {
+                const data = await res.json();
+                if (_reconcileBlocked(sid, handle, gen)) return;
+                const msgs = Array.isArray(data.messages) ? data.messages : [];
+                // Reconcile, never adopt wholesale (2026-09-11): this path
+                // compared raw lengths and replaced the local transcript with
+                // the server copy — deleting the operator's own typed message
+                // when the agent never persisted the turn, and reading "nothing
+                // new" whenever local was legitimately `server + k`. Same LCS
+                // the sessions module's two paths use; same drift test.
+                const adopted = msgs.length ? _reconcileWithLocal(msgs, chatHistory) : chatHistory;
+                if (msgs.length && _adoptionChanges(adopted, chatHistory)) {
+                    // Carry the client-only label keys forward (they exist ONLY
+                    // here; verbatim adoption stripped every 👍/👎).
+                    chatHistory = mergeClientLabelKeys(adopted);
+                    renderHistoryToLog(chatHistory);
+                    saveChatState();
+                    addMessage('system', 'Recovered the reply that finished while you were away.');
+                    _reconcileAnnounced = false;
+                    _reconcileTries = 0;
+                } else {
+                    addMessage('system', 'The previous request could not be recovered.');
+                    // Reset the budget on EVERY terminal exit, not only the
+                    // successful one: a later recovery in the same page
+                    // otherwise started with whatever was left and gave up
+                    // early — or immediately (R3 lens B).
+                    _reconcileAnnounced = false;
+                    _reconcileTries = 0;
+                }
+            } else if (res.status === 404) {
+                addMessage('system', 'The previous request could not be recovered.');
+                _reconcileAnnounced = false;
+                _reconcileTries = 0;
+            } else {
+                // sessions store hiccup (503 while the agent restarts): keep
+                // polling — a bare return left the placeholder ticking forever
+                if (!_reconcileBlocked(sid, handle, gen)) _scheduleReconcilePoll(sid, handle);
+                return;
+            }
+        } catch (e) { if (!_reconcileBlocked(sid, handle, gen)) _scheduleReconcilePoll(sid, handle); return; }
+        // Settled (recovered / not recovered / 404): no turn runs, so no clock.
+        // §4RN: the resume bubble may hold a PARTIAL reply (no `thinking`
+        // class) and still carry the clock the recovery gave it.
+        stopTurnTicker();
+        // A placeholder bubble that never streamed has nothing to show.
+        if (currentAgentMessageDiv && currentAgentMessageDiv.classList.contains('thinking')) {
+            currentAgentMessageDiv.remove();
+            currentAgentMessageDiv = null;
+        }
+        clearInflightHandle(handle);
+        // §4RZ r6a2: the recovery ended this page's lost turn (guarded: the
+        // recovery is also run on its own, extracted, by older suites)
+        if (typeof _settleLostTurns === 'function') {
+            _settleLostTurns();
+            _queueOwedLeftovers(true);    // the turn is over: close_inbox has run
+        }
+        // r5: the turn is settled — a stale id let the network resume run
+        // afterwards, 404 and post "could not be recovered" under "Recovered…"
+        if (handle && handle.taskId && handle.taskId === currentTaskId) currentTaskId = null;
+    } finally {
+        _reconcileRunning -= 1;
+    }
+}
+
+async function resumeOrReconcileInflightTurn() {
+    // Synchronous latch: boot + visibilitychange + pageshow can all fire
+    // in one tick (bfcache restore), and the isProcessingRequest guard
+    // alone has an async gap before sendMessage(true) claims the turn —
+    // two concurrent resumes each replayed the stream from chunk 0 into
+    // one bubble and pushed TWO assistant messages (review CRITICAL).
+    if (resumeLatch || isProcessingRequest) return;
+    resumeLatch = true;
+    try {
+        const h = readInflightHandle();
+        if (!h) return;
+        // Another LIVE tab owns this turn: fresh heartbeat → hands off.
+        // A dead owner (killed PWA) stops beating and may be adopted.
+        if (h.tabId && h.tabId !== TAB_ID
+                && Date.now() - (h.beat || h.ts || 0) < 15000) {
+            return;
+        }
+        // The handle belongs to a conversation this client no longer
+        // shows (/clear minted a new session while the turn hung):
+        // resurrecting the old transcript into the new session would
+        // duplicate it server-side. Drop it.
+        const currentSid = window.__ghostSessionId || storedSessionId();
+        if (h.sessionId && currentSid && h.sessionId !== currentSid) {
+            clearInflightHandle(h);
+            return;
+        }
+        let state = null;
+        try {
+            const r = await fetch(`/api/chat/task/${encodeURIComponent(h.taskId)}/state`);
+            if (r.ok) state = await r.json();
+        } catch (e) { /* proxy down — nothing to do until it returns */ return; }
+        if (isProcessingRequest) return;
+        if (state && state.cancelled) {
+            // The user stopped this turn; reattaching would replay the
+            // stream they ended (R2 lens A).
+            clearInflightHandle(h);
+            return;
+        }
+        if (state && state.exists) {
+            // Replay buffer alive: reattach the stream exactly like the
+            // same-page Safari resume, with a fresh bubble. sendMessage
+            // sets isProcessingRequest synchronously before its first
+            // await, so the latch can release right after this call.
+            //
+            // ⚠ RE-HOME THE HANDLE FIRST. `clearInflightHandle`'s own
+            // docstring says adopting an orphan and then clearing the bare
+            // form "would leave the orphan on disk to be re-adopted on every
+            // visibility change — a loop, not a cleanup" — and this branch,
+            // the ADOPT branch, did exactly that: the resume path never
+            // calls saveInflightHandle(), so all four terminal cleanups
+            // dropped OUR empty slot while the dead tab's key survived. Every
+            // visibility return re-adopted it and replayed the whole buffer:
+            // reply re-rendered, TTS re-spoken, a duplicate assistant pushed
+            // into chatHistory, for up to the proxy's 10-minute TTL (R5 lens
+            // B, reproduced). Dropping the orphan and re-saving under THIS
+            // tab makes the heartbeat and all four terminal paths work.
+            clearInflightHandle(h);
+            currentTaskId = h.taskId;
+            currentTurnStartedAt = _turnStartFromHandle(h);
+            currentChunkIndex = 0;
+            currentAccumulatedContent = "";
+            currentStreamPrefixLen = 0;
+            currentSpeechHold = false;
+            saveInflightHandle();
+            ensureAgentBubbleForResume();
+            sendMessage(true);
+            return;
+        }
+        await reconcileFromSession(h.sessionId, h);
+    } finally {
+        resumeLatch = false;
+    }
+}
+
+// Auto-expand textarea height organically. When the field empties,
+// CLEAR the inline height so the `rows="1"` attribute regains control
+// — `height: auto` on an already-styled textarea computes from content
+// and doesn't reliably snap back to the one-row default.
+// §4RZ r6a7: the hand-back tray is shown at load and refreshed when another tab changes it
+setTimeout(_onSessionShown, 0);
+window.addEventListener('storage', (e) => {
+    if (e.key === null || e.key === _RESTORE_KEY || String(e.key).startsWith(_RESTORE_ITEM_PREFIX)) { try { _renderTray(); } catch (x) { /* storage */ } }
+});
+// Pre-turn posture (2026-09-11): the body leans toward the composer
+// while there is something typed in it.
+chatInput.addEventListener('blur', () => {
+    if (typeof activeFace.setComposerGaze === 'function') activeFace.setComposerGaze(false);
+});
+chatInput.addEventListener('input', function () {
+    if (typeof activeFace.setComposerGaze === 'function') {
+        activeFace.setComposerGaze(this.value.trim().length > 0);
+    }
+});
+chatInput.addEventListener('input', function () {
+    if (this.value === '') {
+        this.style.height = '';
+        return;
+    }
+    this.style.height = 'auto';
+    this.style.height = this.scrollHeight + 'px';
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  Turn status HUD (2026-07-29, v2 — operator direction)
+//
+//  The agent's turns routinely run 30-60s+ of tools + thinking before
+//  the first content token. Placement iterated twice with the
+//  operator: v1 breadcrumb inside the bubble (rejected), v2 next to
+//  the center-stage activity icon (rejected — the 2.2rem icon dwarfed
+//  the caption), v3 FINAL: a caption line re-parented directly UNDER
+//  the waiting reply bubble, format `timer : description - icon` with
+//  a text-sized icon of its own. (The big center-stage #activity-icon
+//  was removed entirely right after — same operator session.)
+//
+//  Corridor filtering: background work (self-play, dreams) streams
+//  over the same socket with its own request ids. On send we adopt the
+//  id of the FIRST "request started" corridor that opens (ours — the
+//  POST fires it within ~a second; a corridor already open when we
+//  sent can never be adopted) and only lines carrying that id update
+//  the description; until adoption only the clock runs.
+// ═══════════════════════════════════════════════════════════════
+
+// Titles that narrate plumbing, not progress — never shown.
+const TICKER_NOISE = new Set([
+    'prefill cache', 'memory bus', 'llm request',
+    'constraint check', 'metacog conf', 'turn outcome', 'agent parser',
+]);
+// Friendly phrasings for the most common step titles; anything not
+// listed falls back to the raw title (already short and readable).
+// The device client's caption tables (mirrored in clockwork turnstatus.py,
+// pinned equal there). The web caption reads turn_caption.js instead; the
+// noise set still drops plumbing titles before the face is fed.
+const TICKER_VERBS = {
+    'worker compute': 'delegating to the worker node',
+    'sandbox tree': 'scanning the workspace',
+    'sandbox exec': 'running a command',
+    'execution task': 'executing code',
+    'file read': 'reading a file',
+    'file write': 'writing a file',
+    'web search': 'searching the web',
+    'browser': 'driving the browser',
+    'verifier': 'verifying the answer',
+    'memory recall': 'recalling memories',
+    'memory save': 'saving a memory',
+    'graph updated': 'updating the knowledge graph',
+    'system weather': 'checking the weather',
+    'vision': 'looking at an image',
+    'delegate': 'delegating a subtask',
+};
+// What the turn status line SHOWS lives in turn_caption.js (2026-10-27).
+// What a ticker line means to the FACE (2026-09-11): a gait for the
+// step class, whether it is a tool call (a discrete kick), a memory
+// recall (a comet) or the verifier's verdict. Pure; executed under node.
+const _FACE_PHASE_BY_TITLE = {
+    'web search': 'search', 'browser': 'search',
+    'memory recall': 'search', 'file read': 'read',
+    'sandbox tree': 'read', 'vision': 'read', 'sandbox exec': 'tool',
+    'execution task': 'tool', 'file write': 'tool', 'worker compute': 'tool',
+    'delegate': 'tool', 'memory save': 'tool', 'graph updated': 'tool',
+    'verifier': 'verify', 'tool call': 'tool',
+};
+function faceSignalsForTicker(title, icon, detail) {
+    const out = { phase: null, tool: false, recall: false, verdict: null };
+    const t = String(title || '').toLowerCase();
+    const d = String(detail || '');
+    if (_FACE_PHASE_BY_TITLE[t]) out.phase = _FACE_PHASE_BY_TITLE[t];
+    if (t === 'tool call' || icon === '🧰') { out.phase = 'tool'; out.tool = true; }
+    if (icon === '🔎' || icon === '📍' || t === 'memory recall') out.recall = true;
+    if (icon === '🧪' || t.startsWith('verif')) {   // §4NV: verdict lines now wear ✅/❌/🔶
+        out.phase = 'verify';
+        if (/^\s*CONFIRMED/i.test(d)) out.verdict = 'pass';
+        else if (/^\s*REFUTED/i.test(d)) out.verdict = 'refute';
+    }
+    return out;
+}
+let _turnVerdict = null;
+let _lastRecallAt = 0;
+function _feedFaceFromTicker(title, icon, detail) {
+    const f = faceSignalsForTicker(title, icon, detail);
+    if (f.phase && typeof activeFace.setPhase === 'function') activeFace.setPhase(f.phase);
+    if (f.tool && typeof activeFace.noteToolCall === 'function') activeFace.noteToolCall();
+    if (f.recall && typeof activeFace.noteRecall === 'function') {
+        const now = Date.now();
+        if (now - _lastRecallAt > 1500) { _lastRecallAt = now; activeFace.noteRecall(); }
+    }
+    if (f.verdict) _turnVerdict = f.verdict;
+    return f;
+}
+
+const turnStatusEl = document.getElementById('turn-status');
+const turnStatusDescEl = document.getElementById('turn-status-desc');
+const turnStatusClockEl = document.getElementById('turn-status-clock');
+const turnStatusIconEl = document.getElementById('turn-status-icon');
+let tickerTimer = null, tickerStart = 0, tickerReqId = null;
+// The corridor the last stopped clock had adopted, and its turn's send time: a
+// reattach restarting the SAME turn's clock keeps captioning from its log lines
+// (its "request started" line streamed long ago and never repeats).
+let tickerLastStart = 0, tickerLastReqId = null;
+// §4ML: the corridor headers seen since send ({tag, rid8}) and this turn's
+// own request id once the proxy reports it. Adoption needs BOTH to agree:
+// "the first corridor after send" adopted a member's, a probe's or
+// self-play's turn whenever ours queued behind it (and showed its file
+// names). The header's third field is the request id's first 8 chars.
+let tickerSeen = [], tickerOwnRid = null;
+
+function _tickerHeaderIsOurs(rid8, own) {
+    own = String(own || '');
+    return !!own && (rid8 === own.slice(0, 8) || rid8 === ('probe-' + own).slice(0, 8));
+}
+
+function _tryAdoptTicker() {
+    if (tickerReqId !== null || !tickerOwnRid) return;
+    const hit = tickerSeen.find(h => _tickerHeaderIsOurs(h.rid8, tickerOwnRid));
+    if (hit) tickerReqId = hit.tag;
+}
+
+function noteTickerOwnRid(rid) {
+    tickerOwnRid = rid || null;
+    _tryAdoptTicker();
+}
+
+// The send time an in-flight handle recorded (older handles: when it was
+// saved, which is within a second or two of the send). Kept RAW even when
+// the device clock has since moved back: it is also the stamp that matches
+// the turn's bubble; startTurnTicker clamps what the clock counts from.
+function _turnStartFromHandle(h) {
+    const t = Number((h && (h.startedAt || h.ts)) || 0);
+    return t > 0 ? t : Date.now();
+}
+
+function _tickerClockText(startedAt, now) {
+    const s = Math.max(0, Math.floor((now - startedAt) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// `startedAt`: when the turn was sent — a reattach passes the original send
+// time so the clock continues; a new turn passes nothing (now).
+function startTurnTicker(afterEl, startedAt) {
+    stopTurnTicker();
+    if (!turnStatusEl) return;
+    tickerStart = startedAt > 0 && startedAt <= Date.now() ? startedAt : Date.now();
+    const sameTurn = startedAt > 0 && startedAt === tickerLastStart && tickerLastReqId !== null;
+    tickerReqId = sameTurn ? tickerLastReqId : null;
+    tickerSeen = [];
+    tickerOwnRid = null;
+    // Nothing to show yet (operator 10-27): say it is thinking.
+    turnStatusDescEl.textContent = 'thinking…';
+    turnStatusClockEl.textContent = _tickerClockText(tickerStart, Date.now());
+    turnStatusIconEl.textContent = '💭';
+    // Re-parent under the waiting reply bubble (the element survives
+    // detachment by /clear or history repaints — appendChild re-adopts
+    // the same node wherever the current bubble lives).
+    if (afterEl && afterEl.insertAdjacentElement) {
+        afterEl.insertAdjacentElement('afterend', turnStatusEl);
+    }
+    turnStatusEl.classList.remove('hidden');
+    tickerTimer = setInterval(() => {
+        turnStatusClockEl.textContent = _tickerClockText(tickerStart, Date.now());
+    }, 1000);
+}
+
+function stopTurnTicker() {
+    if (tickerTimer) { tickerLastStart = tickerStart; tickerLastReqId = tickerReqId; }
+    clearInterval(tickerTimer);
+    tickerTimer = null;
+    tickerReqId = null;
+    tickerSeen = [];
+    tickerOwnRid = null;
+    if (turnStatusEl) turnStatusEl.classList.add('hidden');
+}
+
+function setTurnStatusDesc(text, icon) {
+    if (!tickerTimer) return;
+    if (turnStatusDescEl) turnStatusDescEl.textContent = text;
+    if (icon && turnStatusIconEl) turnStatusIconEl.textContent = icon;
+}
+
+function noteTickerLine(raw) {
+    if (!tickerTimer) return;                       // no turn in flight
+    const clean = cleanLogLine(raw);
+    // Corridor adoption: the corridor that OPENS after our send AND carries
+    // our request id (a corridor already open when we sent is never seen).
+    if (tickerReqId === null) {
+        if (/request started/.test(clean)) {
+            const m = clean.match(/^\S+\s+(\S+)\s+(\S+)\s/);
+            if (m) {
+                tickerSeen.push({ tag: m[1], rid8: m[2] });
+                if (tickerSeen.length > 32) tickerSeen.shift();
+                _tryAdoptTicker();
+            }
+        }
+        return;
+    }
+    // Body lines: │  <id>  <icon>  <+delta>  <title>  <content…>
+    const parts = clean.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
+    if (parts.length < 3 || parts[1] !== tickerReqId) return;
+    const icon = extractIcon(clean);
+    if (!icon) return;
+    const cls = _iconClass(icon);
+    if (cls === 'think') {
+        // Long reasoning stretches between tools: say so instead of
+        // leaving the last tool's caption to go stale.
+        setTurnStatusDesc('thinking…', '💭');
+        return;
+    }
+    if (cls !== 'tool' && cls !== 'memory' && cls !== 'plan' && cls !== 'accent') return;
+    // Feedback receipts are terminal bookkeeping, not turn activity — an
+    // in-flight turn's status line must not read out a 👍 someone left on
+    // yesterday's reply.
+    if (_NON_WORKING_ICONS.has(icon)) return;
+    const iconIdx = parts.findIndex(p => p.includes(icon));
+    if (iconIdx < 0) return;
+    let ti = iconIdx + 1;
+    if (/^\+[\d.\s]*m?s$/.test(parts[ti] || '')) ti++;
+    const title = (parts[ti] || '').toLowerCase().slice(0, 22).trim();
+    if (!title || TICKER_NOISE.has(title)) return;
+    const detail = parts.slice(ti + 1).join(' ').trim();
+    // Only what the user is meant to see (TURN_CAPTIONS); the face still
+    // reads every step it read before.
+    const cap = turnCaption(title, icon, detail);
+    if (cap) setTurnStatusDesc(cap.text, cap.icon);
+    _feedFaceFromTicker(title, icon, detail);
+}
+
+// Turn a failed Response into an Error that still says something.
+//
+// Two ways the previous one-liner destroyed the diagnosis (review R1 M14/M15):
+//   * `await response.json()` on a NON-JSON error body throws, and the
+//     SyntaxError replaced the status entirely — a front-door 502 with an
+//     HTML body read as "Unexpected token <", which names no subsystem.
+//   * only `.error` was read, but FastAPI's own HTTPException renders
+//     `{"detail": …}` — so a 401 from the key check and a 400 "Invalid
+//     session id" both arrived as a bare "HTTP 4xx".
+// `detail` can also be an array (validation errors), which stringifies to
+// "[object Object]"; carry the status so callers can classify regardless.
+async function _httpError(response, prefix) {
+    let body = null;
+    try { body = await response.json(); } catch (e) { body = null; }
+    let msg = '';
+    if (body && typeof body === 'object') {
+        const d = body.error || body.detail;
+        msg = typeof d === 'string' ? d : (d ? JSON.stringify(d) : '');
+    }
+    if (!msg) msg = `HTTP ${response.status}`;
+    const err = new Error(prefix ? `${prefix}: ${msg}` : msg);
+    err.status = response.status;
+    return err;
+}
+
+// Stop means stop. `/api/chat/cancel/<task>` is a PROXY-side teardown (it
+// kills the buffered relay task); the agent's own turn only stops via
+// `/api/turn/cancel`. Without this, "Stopped by user." was a lie: the turn
+// ran to completion, held the global turn lock, and its reply landed in the
+// durable session with no client showing it (review R1 M8).
+// ⚠ RESOLVE THE TARGET FIRST. A bare `{}` body means "cancel the turn
+// holding the semaphore" (core/turns.py::current) — NOT "cancel mine". And
+// `currentReqId` is null until the first SSE frame carrying an id, which for
+// a tool-heavy turn is the whole 30-60s thinking phase, i.e. exactly when
+// Stop gets pressed. So the R1 version of this fix could kill a background
+// dream/self-play turn while the user's own queued turn ran on to completion
+// and the tab reported "Stopped by user." — the same dishonesty one layer
+// deeper (R2 lens B). `/api/turns` carries `session_id` per turn, so the
+// client can identify its own turn; if it cannot, it must NOT guess.
+async function _resolveOwnTurnId(sentText) {
+    const sid = window.__ghostSessionId || storedSessionId();
+    let data;
+    try {
+        // BOUNDED. Stop exists for the case where the agent is wedged, and
+        // /api/turns queues behind the same lock — an unbounded fetch here
+        // meant the "could not identify your turn" warning never printed at
+        // all, and every Stop leaked a pending request (R3 lens B).
+        const res = await fetch('/api/turns', {
+            signal: AbortSignal.timeout(4000),
+        });
+        if (!res.ok) return null;
+        data = await res.json();
+    } catch (e) {
+        return null;
+    }
+    const turns = (data && data.turns) || [];
+    const pick = (list) => list.length
+        ? ((list.find(t => t.running) || list[0]).request_id || null) : null;
+    if (sid) {
+        const mine = turns.filter(t => t && t.session_id === sid);
+        if (mine.length) return pick(mine);
+    }
+    // SESSIONS DISABLED (or not yet bound): there is no session id to match
+    // on — `routes.py` reports `enabled:false` whenever the store is off, and
+    // sessions.js then never publishes an id at all. Identify by the turn
+    // PREVIEW instead, which the registry derives from the user message
+    // (turns.py trims it to 120 chars). Without this the composer's Stop
+    // could cancel nothing at all in a supported deployment mode — a
+    // regression the tests missed because they all stub a session id.
+    const probe = String(sentText || '').split(/\s+/).join(' ').slice(0, 40);
+    if (probe) {
+        const byText = turns.filter(
+            t => t && typeof t.preview === 'string' && t.preview.startsWith(probe));
+        if (byText.length === 1) return byText[0].request_id || null;
+    }
+    return null;
+}
+
+// §4RZ: the agent's last answer is kept on the function (`lastAnswer`) for
+// its `undelivered` — the messages the turn never read.
+function _lastCancelUndelivered() {
+    const d = _cancelAgentTurn.lastAnswer;
+    _cancelAgentTurn.lastAnswer = null;
+    return (d && Array.isArray(d.undelivered)) ? d.undelivered : [];
+}
+
+async function _cancelAgentTurn(reqId, sentText, hard) {
+    _cancelAgentTurn.lastAnswer = null;
+    const target = reqId || await _resolveOwnTurnId(sentText);
+    if (!target) {
+        // No bare-body fallback: cancelling "whatever is running" can hit an
+        // unrelated background turn.
+        addMessage('system', '⚠ Stopped listening, but this tab could not '
+            + 'identify its turn on the agent, so nothing was cancelled — it '
+            + 'may still be running. The turn panel (status strip) lists '
+            + 'in-flight turns and can cancel by id.');
+        return false;
+    }
+    const body = hard ? { request_id: target, hard: true }
+                      : { request_id: target };
+    return fetch('/api/turn/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        // bounded (§4RZ r6a3): an unanswered cancel stalled the queued-message settle
+        signal: AbortSignal.timeout(15000),
+    }).then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        _cancelAgentTurn.lastAnswer = data;
+        if (res.ok && data.cancelled) return true;
+        // 404 = nothing to cancel, which is the benign case (the turn had
+        // already finished). Anything else means the agent IS still working:
+        // actionable, so say it.
+        if (res.status !== 404) {
+            addMessage('system', '⚠ Stop reached this tab but NOT the agent — '
+                + 'the turn is still running (' + (data.detail || data.error
+                || ('HTTP ' + res.status)) + '). Its reply will appear in this '
+                + 'session when it finishes; the turn panel can hard-cancel.');
+        }
+        return false;
+    }).catch((e) => {
+        addMessage('system', '⚠ Stop reached this tab but the cancel call '
+            + 'failed (' + (e && e.message || e) + ') — the agent may still '
+            + 'be running this turn.');
+        return false;
+    });
+}
+
+// ── Messages sent while a turn runs (§4RZ step 6a) ─────────────────────
+// Enter while this tab's chat turn streams posts the text to
+// /api/turn/inbox instead of /api/chat. The agent answers the path:
+//   inject — the turn reads it at its next step: a dim "queued" bubble;
+//   status — the system's progress answer, shown as a note, not a reply;
+//   cancel — a bare stop word stopped the turn: handled like Stop;
+//   queue  — the text never reached the agent: held, and sent after the
+//            turn only when it ended with a reply (a tab with no session id
+//            holds its text the same way).
+// The page does NOT attribute (review r6a4): it never decides which queued
+// messages the turn read. After a turn that had any, it adopts the agent's
+// session copy — the chat route stores exactly what was read, [u1, q1,
+// reply] — and the queued bubbles go. What the agent accepted but no turn
+// read (leftovers, a Stop's `undelivered`) is fetched only once the turn is
+// over and always goes back into the composer: never sent, never history.
+// Everything is keyed by the TURN it was sent into (`gen`): an inbox answer
+// can land after that turn ended, and a slow Stop can settle after the
+// next turn started.
+// (state: `_queuedInjects` … `_leftoversOwed`, declared with the turn state above)
+const INBOX_TIMEOUT_MS = 35000;     // the interface's own proxy gives up at 30 s
+// A Stop's cancel answer (`undelivered`) is waited for this long; then the
+// turn settles as 'unknown' (r6a3: a cancel that never answered stalled
+// every later settle).
+const STOP_SETTLE_TIMEOUT_MS = 20000;
+
+function _queuedSid() {
+    return window.__ghostSessionId || storedSessionId();
+}
+
+// Known on/off. The tool button shows only once the agent has answered as
+// ON (an inbox answer without the "off" reason, an interrupt answer), and
+// hides again when it says off — no reload needed either way.
+function _setQueuedFeature(on) {
+    _queuedFeatureOn = !!on;
+    if (typeof interruptBtn !== 'undefined' && interruptBtn) {
+        interruptBtn.classList.toggle('hidden',
+            !(_queuedFeatureOn && isProcessingRequest && currentChatController));
+    }
+}
+
+// A reply that is (or ends with) the agent's cancel note is not a clean end
+// (agent.py / routes.py: "_(Turn cancelled: <reason>.)_").
+const _CANCEL_NOTE_RE = /_\(Turn cancelled: [^\n]*\.\)_(?: No output was produced before the cancellation\.)?\s*$/;
+function _isCleanReply(text) {
+    return typeof text === 'string' && !!text.trim() && !_CANCEL_NOTE_RE.test(text);
+}
+
+function _isOffReason(reason) {
+    return /queued messages are off/i.test(String(reason || ''));
+}
+
+// A new turn (or a resume this page holds no live record of) gets a
+// generation. Leftovers still owed from an earlier turn are taken now: the
+// new turn has accepted nothing yet, so none of them can be its own.
+function _beginQueuedTurn() {
+    _settleLostTurns(true);    // r6a2: an older turn this page lost never blocks the new one
+    _queueOwedLeftovers(false);
+    _turnGen += 1;
+    _turnInfo.set(_turnGen, { sid: _queuedSid(), epoch: _convEpoch, startedAt: Date.now(),
+                              typed: [], typedSeq: [], ended: false, settled: false, outcome: null });   // §4SB r3: typedSeq = typing order
+    for (const g of Array.from(_turnInfo.keys())) {
+        // §4SB r6: never while something of it still waits to be sent — a
+        // chain of ≥10 leftovers lost its turn's record and the drain trayed
+        // the tail under "did not end with a reply"
+        if (g < _turnGen - 8 && !_sendAfterTurn.some(q => q.gen === g)) _turnInfo.delete(g);
+    }
+    return _turnGen;
+}
+
+// Every turn that never ended on this page (its stream was lost and a
+// recovery took over, or nothing did) settles as 'unknown' — except the one
+// streaming right now. A new turn starting does not settle them (a
+// recovery may still own the log, r6a5): their leftovers are owed, and
+// what was typed during them goes to the hand-back tray (never lost; a
+// duplicate there is acceptable, an auto-send is not).
+function _settleLostTurns(newTurn = false) {
+    for (const [g, info] of Array.from(_turnInfo.entries())) {
+        if (info.ended) continue;
+        if (!newTurn && g === _turnGen && isProcessingRequest) continue;
+        if (!newTurn) { _settleQueuedTurn(g, null, 'unknown'); continue; }
+        Object.assign(info, { ended: true, settled: true, outcome: 'unknown' });
+        if (info.sid && info.typed.length) _markOwed(info.sid);
+        // §4SB r5 (review MINOR): the chain of earlier turns feeding this one
+        // ends with it too — 'unknown' puts everything back
+        const held = _unholdTurn(g, info.sid, info.epoch);
+        for (const it of [..._queuedInjects.filter(q => q.gen === g), ...held]) if (it.div) it.div.remove();
+        _queuedInjects = _queuedInjects.filter(q => q.gen !== g);
+        const back = [...info.typed, ...held.map(it => it.text)];
+        _restoreToComposer(back, 'An earlier turn was lost; the agent may or may not have read these.', info.sid);
+        _forgetTyped(g);                      // §4SB
+    }
+}
+
+function _setQueuedLabel(div, label) {
+    let tag = div.querySelector(':scope > .queued-label');
+    if (!tag) {
+        tag = document.createElement('span');
+        tag.className = 'queued-label';
+        div.appendChild(tag);
+    }
+    tag.textContent = label;
+}
+
+// A user bubble for a message sent mid-turn, above the reply being streamed.
+function _queuedBubble(text, label) {
+    dismissEmptyStateHero();
+    const div = document.createElement('div');
+    div.className = 'message user queued';
+    div.dataset.ts = String(Date.now());
+    div.innerHTML = renderMarkdown(text);
+    _setQueuedLabel(div, label);
+    if (currentAgentMessageDiv && currentAgentMessageDiv.parentNode === chatLog) {
+        chatLog.insertBefore(div, currentAgentMessageDiv);
+    } else {
+        chatLog.appendChild(div);
+    }
+    scrollToBottomIfPinned();
+    return div;
+}
+
+// Hand texts back (r6a7): never into the composer by itself. They go into
+// a tray above the composer, per session, kept in localStorage for
+// RESTORE_TTL_MS; the tray shows the on-screen session's items only, each
+// with Insert (into the composer at the caret: the owner's own action) and
+// Dismiss. No dedup and no implicit pruning: a duplicate is acceptable, a
+// loss is not. Every write re-reads storage first, so tabs never overwrite
+// each other's items.
+const RESTORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// r6a10: ONE localStorage key per item. An add writes only its own key and
+// a removal removes only its own key, so no write ever rewrites another
+// tab's item (Chrome serves each renderer a cached copy of localStorage).
+const _RESTORE_ITEM_PREFIX = 'ghost.queued.restore.item.';
+const _RESTORE_KEY = 'ghost.queued.restore';                       // the pre-r6a10 single map (migrated)
+const _RESTORE_UNSAVED_KEY = 'ghost.queued.restore.unsaved';       // sessionStorage
+const _RESTORE_CONFIRMED_KEY = 'ghost.queued.restore.confirmed';   // ids localStorage has held (last 500)
+function _restoreId() {
+    try { if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID(); } catch (e) { /* old browser */ }
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}-${++_restoreSeq}`;
+}
+function _restoreValid(it) {
+    return !!it && typeof it.text === 'string' && typeof it.id === 'string'
+        && typeof it.at === 'number' && Date.now() - it.at < RESTORE_TTL_MS;
+}
+function _confirmedIds() {
+    try { const v = JSON.parse(localStorage.getItem(_RESTORE_CONFIRMED_KEY) || '[]'); return Array.isArray(v) ? v : []; }
+    catch (e) { return []; }
+}
+// A duplicated tab copies sessionStorage: a copied unsaved item that
+// localStorage has held since (and may have lost to an Insert/Dismiss) is
+// dropped. Losing an entry to a racing write costs at most one duplicate.
+function _confirm(id) {
+    try {
+        const conf = [..._confirmedIds().filter(x => x !== id), id].slice(-500);
+        localStorage.setItem(_RESTORE_CONFIRMED_KEY, JSON.stringify(conf));
+    } catch (e) { /* a duplicated tab may show one item twice */ }
+}
+function _storedItems() {
+    const out = [];
+    try {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(_RESTORE_ITEM_PREFIX)) keys.push(k);
+        }
+        for (const k of keys) {
+            let it = null;
+            try { it = JSON.parse(localStorage.getItem(k)); } catch (e) { /* unreadable */ }
+            if (_restoreValid(it)) out.push(it);
+            else localStorage.removeItem(k);                     // expired or broken
+        }
+    } catch (e) { /* no storage */ }
+    return out.sort((x, y) => x.at - y.at);
+}
+function _unsavedList() {
+    if (_restoreUnsaved === null) {
+        let v = [];
+        try { v = JSON.parse(sessionStorage.getItem(_RESTORE_UNSAVED_KEY) || '[]'); } catch (e) { /* none */ }
+        _restoreUnsaved = (Array.isArray(v) ? v : []).filter(it => _restoreValid(it));
+    }
+    return _restoreUnsaved;
+}
+function _saveUnsaved() {             // true when sessionStorage holds the list
+    try {
+        if (_restoreUnsaved && _restoreUnsaved.length) sessionStorage.setItem(_RESTORE_UNSAVED_KEY, JSON.stringify(_restoreUnsaved));
+        else sessionStorage.removeItem(_RESTORE_UNSAVED_KEY);
+        return true;
+    } catch (e) { return false; }        // memory only
+}
+// Write one item under its own key; when localStorage refuses, it stays
+// with this tab (sessionStorage, so a reload keeps it) and is retried.
+// True when the item is kept durably (its own key, or sessionStorage).
+function _storeItem(it) {
+    try {
+        localStorage.setItem(_RESTORE_ITEM_PREFIX + it.id, JSON.stringify(it));
+    } catch (e) {
+        if (!_unsavedList().some(x => x.id === it.id)) _unsavedList().push(it);
+        return _saveUnsaved();
+    }
+    _restoreUnsaved = _unsavedList().filter(x => x.id !== it.id);
+    _saveUnsaved();
+    _confirm(it.id);
+    return true;
+}
+// r6a12: an old item without an id gets one derived from it (FNV-1a over
+// session, text, batch and its place in the old map), the same on every
+// run, so a migration that must be retried never copies it again. A
+// missing time is the migration time (r6a13): a re-run skips the item by
+// its id, so it is never copied, and its copy expires 7 days later.
+function _legacyId(sid, it, i) {
+    let h = 0x811c9dc5;
+    const src = JSON.stringify([sid, it.text, it.batch || '', i]);
+    for (let k = 0; k < src.length; k++) { h ^= src.charCodeAt(k); h = Math.imul(h, 0x01000193) >>> 0; }
+    return `legacy-${h.toString(16)}`;
+}
+function _migrateRestores() {
+    let old = null;
+    try { old = localStorage.getItem(_RESTORE_KEY); } catch (e) { return; }
+    if (old === null) return;
+    let v = {};
+    try { v = JSON.parse(old) || {}; } catch (e) { /* unreadable */ }
+    // r6a11: an id localStorage has held is migrated already, or was
+    // dismissed (an old-code tab may rewrite the map); an item with text is
+    // never dropped for its shape; the old key goes only once all are kept.
+    const seen = new Set(_confirmedIds());
+    let kept = true;
+    for (const k of Object.keys(v || {})) {
+        (Array.isArray(v[k]) ? v[k] : []).forEach((raw, i) => {
+            if (!raw || typeof raw.text !== 'string' || !raw.text.trim()) return;
+            const it = { ...raw, sid: k,
+                         id: typeof raw.id === 'string' && raw.id ? raw.id : _legacyId(k, raw, i),
+                         at: typeof raw.at === 'number' ? raw.at : Date.now() };
+            if (!it.batch) it.batch = it.id;
+            if (seen.has(it.id) || !_restoreValid(it)) return;
+            if (!_storeItem(it)) kept = false;
+        });
+    }
+    if (kept) { try { localStorage.removeItem(_RESTORE_KEY); } catch (e) { /* no storage */ } }
+}
+// {sid: [items]}: the stored items, plus this tab's unsaved ones.
+function _restoreMap() {
+    _migrateRestores();
+    // retry (storage may have room now); one localStorage held since was
+    // saved, and maybe dismissed, by another tab: not ours to bring back
+    const seen = new Set(_confirmedIds());
+    _restoreUnsaved = _unsavedList().filter(it => !seen.has(it.id));
+    _saveUnsaved();
+    for (const it of _unsavedList().slice()) _storeItem(it);
+    const out = {};
+    for (const it of [..._storedItems(), ..._unsavedList()]) {
+        (out[it.sid || ''] = out[it.sid || ''] || []).push(it);
+    }
+    return out;
+}
+
+function _restoreToComposer(texts, why, sid = _queuedSid()) {
+    const list = texts.filter(t => typeof t === 'string' && t.trim());
+    if (!list.length) return;
+    const batch = _restoreId();
+    for (const text of list) _storeItem({ id: _restoreId(), batch, sid: sid || '', text, why, at: Date.now() });
+    _renderTray();
+}
+
+function _trayRemove(id) {
+    const m = _restoreMap();
+    const it = [...(m[_queuedSid() || ''] || []), ...(m[''] || [])].find(x => x.id === id) || null;
+    try { localStorage.removeItem(_RESTORE_ITEM_PREFIX + id); } catch (e) { /* no storage */ }
+    _restoreUnsaved = _unsavedList().filter(x => x.id !== id);
+    _saveUnsaved();
+    _renderTray();
+    return it;
+}
+
+// Insert: the text goes into the composer at the caret, then leaves the tray.
+function _trayInsert(id) {
+    const it = _trayRemove(id);
+    if (!it) return;
+    const v = String(chatInput.value);
+    const a = typeof chatInput.selectionStart === 'number' ? chatInput.selectionStart : v.length;
+    const b = typeof chatInput.selectionEnd === 'number' ? chatInput.selectionEnd : a;
+    chatInput.value = v.slice(0, a) + it.text + v.slice(b);
+    if (typeof chatInput.setSelectionRange === 'function') {
+        try { chatInput.setSelectionRange(a + it.text.length, a + it.text.length); } catch (e) { /* not focusable */ }
+    }
+    try { chatInput.dispatchEvent(new Event('input')); chatInput.focus(); } catch (e) { /* stub */ }
+}
+
+// A session is on screen (load, switch): its tray, and its owed leftovers.
+function _onSessionShown() {
+    try { _recoverTypedAfterReload(); } catch (e) { /* storage */ }    // §4SB
+    try { _renderTray(); _queueOwedLeftovers(false); } catch (e) { /* storage */ }
+}
+
+function _renderTray() {
+    if (typeof restoreTray === 'undefined' || !restoreTray) return;
+    const sid = _queuedSid() || '', m = _restoreMap();
+    // items kept before this tab had a session id show with every session (r6a8)
+    const items = [...(m[sid] || []), ...(sid ? (m[''] || []) : [])];
+    const unsaved = _unsavedList();
+    const here = new Set([sid, ...(sid ? [''] : [])]);
+    const elsewhere = unsaved.some(it => !here.has(it.sid || ''));
+    restoreTray.innerHTML = '';
+    restoreTray.classList.toggle('hidden', !items.length && !elsewhere);
+    const whys = [];                                                   // §4SB r2: said on the status line
+    const warn = (text) => {
+        const w = document.createElement('div');
+        w.className = 'restore-warn';
+        w.textContent = text;
+        restoreTray.appendChild(w);
+        if (!_trayNoted.has('warn:' + text)) { _trayNoted.add('warn:' + text); whys.push(text); }
+    };
+    if (unsaved.some(it => here.has(it.sid || ''))) {           // still not saved (also after a reload)
+        warn('Browser storage is full: these are kept only until this tab closes.');
+    }
+    if (elsewhere) warn('Other conversations have unsaved items: open them before closing this tab.');
+    const fresh = new Map();
+    for (const it of items) {
+        const row = document.createElement('div');
+        row.className = 'restore-item';
+        const text = document.createElement('span');
+        text.className = 'restore-text';
+        text.textContent = it.text;
+        const ins = document.createElement('button');
+        ins.className = 'restore-insert';
+        ins.textContent = 'Insert';
+        ins.setAttribute('aria-label', `Insert: ${_shortText(it.text)}`);     // §4SB: each button names its text
+        ins.onclick = () => _trayInsert(it.id);
+        const dis = document.createElement('button');
+        dis.className = 'restore-dismiss';
+        dis.textContent = 'Dismiss';
+        dis.setAttribute('aria-label', `Dismiss: ${_shortText(it.text)}`);
+        dis.onclick = () => _trayRemove(it.id);
+        row.appendChild(text); row.appendChild(ins); row.appendChild(dis);
+        restoreTray.appendChild(row);
+        if (sid && !_trayNoted.has(it.batch)) fresh.set(it.batch, { why: it.why, n: (fresh.get(it.batch) || { n: 0 }).n + 1 });
+    }
+    for (const [batch, { why, n }] of fresh) {
+        _trayNoted.add(batch);
+        addMessage('system', `${why} ${n === 1 ? 'Your message is' : `${n} messages are`} in the tray above the composer.`);
+        if (!whys.includes(why)) whys.push(why);
+    }
+    _trayStatus(items.length, whys);                                   // §4SB
+}
+// Owed leftovers: {sid: markedAt}, kept across reloads (the page works
+// without storage). Cleared only when a fetch returns texts, when the old
+// turn is known closed (a recovery confirmed it, or a later clean turn on
+// that session ended), or after the agent's own TTL.
+const LEFTOVER_TTL_MS = 30 * 60 * 1000;          // the agent's LEFTOVER_TTL_S
+const _OWED_KEY = 'ghost.queued.leftoversOwed';
+// §4SB: the agent's own stop and hold words, COPIED (core/queued_messages
+// `_STOP_RE`, tools/memory `_DENY_RE`; bin/ghost `_is_hold_word` is the CLI
+// twin). Matched on folded text (lower-case, accents stripped, like
+// memory/profile._fold); `\w` here is Unicode, as in Python.
+const _STOP_WORD_RE = /^(?:stop|cancel|abort|σταματα|σταματησε|ακυρο|ακυρωσε)[\s.!]*$/u;
+const _HOLD_WORD_RE = /(?<![\p{L}\p{N}_])(?:no|nope|cancel|stop|wait|hold\s+on|abort|οχι|μην|μη|ακυρο|ακυρωσε|σταματα|περιμενε)(?![\p{L}\p{N}_])/u;
+const _TYPED_KEY = 'ghost.queued.typed';          // §4SB: sessionStorage — this tab's injects whose turn has not settled
+function _owedMap() {
+    if (_leftoversOwed === null) {
+        _leftoversOwed = {};
+        try {
+            const v = JSON.parse(localStorage.getItem(_OWED_KEY) || '{}');
+            if (v && typeof v === 'object') for (const k of Object.keys(v)) if (typeof v[k] === 'number') _leftoversOwed[k] = v[k];
+        } catch (e) { /* no storage */ }
+    }
+    return _leftoversOwed;
+}
+function _saveOwed() {
+    try { localStorage.setItem(_OWED_KEY, JSON.stringify(_owedMap())); } catch (e) { /* no storage */ }
+}
+function _markOwed(sid) { if (sid) { _owedMap()[sid] = Date.now(); _owedMarks += 1; _saveOwed(); } }
+function _clearOwed(sid) { if (sid in _owedMap()) { delete _owedMap()[sid]; _saveOwed(); } }
+
+// The agent's leftovers for `sid`: texts, or null when the call failed.
+async function _fetchLeftovers(sid) {
+    try {
+        const res = await fetch('/api/turn/inbox/leftovers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid }),
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return null;
+        const d = await res.json().catch(() => null);
+        if (!d || !Array.isArray(d.messages)) return null;
+        return d.messages.filter(t => typeof t === 'string' && t.trim());
+    } catch (e) {
+        return null;
+    }
+}
+
+// Leftovers a lost (or failed) turn still owes — after any settle in
+// progress (they pop the same per-session store). `closed`: the old turn
+// is known to be over, so an empty answer settles the debt.
+function _queueOwedLeftovers(closed) {
+    _settleChain = _settleChain.then(() => _collectOwedLeftovers(closed)).catch(() => {});
+    return _settleChain;
+}
+
+async function _collectOwedLeftovers(closed, before = Infinity) {
+    const sid = _queuedSid();
+    const at = sid ? _owedMap()[sid] : undefined;
+    if (at === undefined) return;          // another session's debt waits for that session
+    const got = await _fetchLeftovers(sid);
+    if (got === null) return;              // still owed
+    _restoreToComposer(got, 'Not read by the agent in an earlier turn.', sid);
+    if (got.length || (closed && at < before) || Date.now() - at > LEFTOVER_TTL_MS) _clearOwed(sid);
+}
+
+// Adopt the agent's session copy (what the turn read is stored there), so
+// the next request is built from it. False when a turn owns the log now,
+// the conversation changed, or the copy could not be read.
+async function _resyncFromSession(sid) {
+    try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`,
+            { signal: AbortSignal.timeout(8000) });
+        if (!res.ok) return false;
+        const data = await res.json();
+        if (isProcessingRequest || _queuedSid() !== sid) return false;
+        const msgs = Array.isArray(data && data.messages) ? data.messages : [];
+        const adopted = msgs.length ? _reconcileWithLocal(msgs, chatHistory) : chatHistory;
+        if (msgs.length && _adoptionChanges(adopted, chatHistory)) {
+            chatHistory = _reattachLabelKeys(mergeClientLabelKeys(adopted), chatHistory);
+            renderHistoryToLog(chatHistory);
+            saveChatState();
+        }
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// The inject rows shift the reply's index, so the index-based merge drops
+// its reqId: carry each lost one over by role + content (the last match).
+function _reattachLabelKeys(rows, local) {
+    const have = new Set(rows.map(r => r && r.reqId).filter(Boolean));
+    for (const loc of local) {
+        if (!loc || !loc.reqId || have.has(loc.reqId)) continue;
+        for (let i = rows.length - 1; i >= 0; i--) {
+            const r = rows[i];
+            if (!r || r.reqId || r.role !== loc.role || r.content !== loc.content) continue;
+            rows[i] = { ...r, reqId: loc.reqId };
+            for (const k of ['feedback', 'unlabelable', 'prefixLen']) if (loc[k]) rows[i][k] = loc[k];
+            have.add(loc.reqId);
+            break;
+        }
+    }
+    return rows;
+}
+
+// Re-align later from the agent's session copy (sessions.js retries while a turn runs).
+function _requestSessionResync() {
+    try {
+        window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-aborted'));
+    } catch (e) { /* workspace modules not loaded */ }
+}
+
+function _foldText(text) {
+    return String(text || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/ς/g, 'σ');
+}
+// A stop or a hold ("stop", "wait, no", "σταμάτησε"): sent later as a new
+// request it would mean something else, so it is never held for sending.
+// §4SB r2: the stop regex matches the WHOLE message; the hold regex only a
+// message made of nothing but hold words and punctuation ("wait, no",
+// "no.", "hold on", r3: "no, no, no, no" too — no word cap) — "no sugar",
+// "stop the backup job", "cancel that" are instructions and are held and
+// sent as before. Returns the word that held (single-spaced), or null.
+function _holdWordIn(text) {
+    const f = _foldText(text).trim();
+    const stop = f.match(_STOP_WORD_RE);
+    if (stop) return f.replace(/[\s.!]+$/, '');
+    const words = f.match(new RegExp(_HOLD_WORD_RE.source, 'gu')) || [];
+    if (!words.length) return null;
+    const rest = f.replace(new RegExp(_HOLD_WORD_RE.source, 'gu'), '').replace(/[^\p{L}\p{N}]+/gu, '');
+    return rest ? null : words[0].replace(/\s+/g, ' ');
+}
+// §4SB r3 (the CLI's r8): the hold word of a turn — one the inbox queued
+// (`info.holdWord`), one the turn READ (an inject), one still held, or one
+// among `extra` (the leftovers). Null when the turn has none.
+function _turnHoldWord(info, gen, extra = []) {
+    if (info && info.holdWord) return info.holdWord;
+    const texts = [...(info ? info.typed : []), ..._sendAfterTurn.filter(q => q.gen === gen).map(q => q.text), ...extra];
+    for (const t of texts) { const w = _holdWordIn(t); if (w !== null) return w; }
+    return null;
+}
+// This turn's held items leave the queue for the tray (a hold word holds
+// what was typed BEFORE it too). §4SB r4: with `sid`+`epoch`, everything
+// an EARLIER turn of this conversation left waiting goes too, in typing
+// order — the leftover re-send chain (A sent, B and C waiting) must not
+// out-run a "wait" typed during A's turn, nor go on after a Stop. A LATER
+// turn's held items stay: typed after this turn, they are its successor's
+// (a slow stop never sweeps the next turn's messages). §4SB r7: `gen` null
+// = every turn of the conversation (a late hold word whose session has no
+// turn running).
+function _unholdTurn(gen, sid, epoch) {
+    const mine = (q) => q.gen === gen
+        || (sid !== undefined && (gen === null || q.gen < gen) && (q.sid || '') === (sid || '') && q.epoch === epoch);
+    const out = _sendAfterTurn.filter(mine).sort((a, b) => a.seq - b.seq);
+    _sendAfterTurn = _sendAfterTurn.filter(q => !mine(q));
+    for (const q of out) if (q.div) q.div.remove();
+    _forgetHeld(out);                                // r5: trayed by the caller — no longer a reload's orphan
+    return out;
+}
+// §4SB r3 (the CLI's _in_typing_order): each leftover takes the seq of its
+// LAST unmatched typed occurrence (r4: the agent reads in order, so of a
+// text typed twice the earlier one is the read one; identical texts are
+// order-indifferent among themselves); one this tab never typed (another
+// client's) comes first.
+function _leftoverSeqs(info, texts) {
+    const slots = new Map();
+    if (info) info.typed.forEach((t, i) => slots.set(t, [...(slots.get(t) || []), info.typedSeq[i]]));
+    return texts.map(t => { const s = slots.get(t); return s && s.length ? s.pop() : -1; });
+}
+function _isHoldWord(text) { return _holdWordIn(text) !== null; }
+function _holdNote(text, word) {
+    return `'${word}' is a ${_STOP_WORD_RE.test(_foldText(text).trim()) ? 'stop' : 'hold'} word — never sent on its own.`;
+}
+
+// §4SB: what this tab injected into a turn that has not settled, in
+// sessionStorage: a reload mid-turn loses `_turnInfo`, and with it the
+// "may or may not have read" hand-back. Each entry carries the page load
+// that wrote it; entries of another load are that reload's orphans.
+function _typedList() {
+    try {
+        const v = JSON.parse(sessionStorage.getItem(_TYPED_KEY) || '[]');
+        return Array.isArray(v) ? v.filter(x => x && typeof x.text === 'string' && typeof x.load === 'string') : [];
+    } catch (e) { return []; }
+}
+function _saveTyped(list) {
+    try {
+        if (list.length) sessionStorage.setItem(_TYPED_KEY, JSON.stringify(list));
+        else sessionStorage.removeItem(_TYPED_KEY);
+    } catch (e) { /* no storage */ }
+}
+function _rememberTyped(gen, sid, text) {
+    _saveTyped([..._typedList(), { load: _PAGE_LOAD, gen, sid: sid || '', text, at: Date.now() }]);
+}
+function _forgetTyped(gen) {
+    _saveTyped(_typedList().filter(x => !(x.load === _PAGE_LOAD && x.gen === gen && x.kind !== 'held')));
+}
+// §4SB r5 (review MAJOR, pre-existing): what waits to be SENT after a turn
+// (a held message, a leftover re-send) lived in memory only — a reload
+// mid-chain lost it, and the agent had already handed its copy out. Each
+// such item is remembered while it waits (`kind: 'held'`) and forgotten the
+// moment it is sent or trayed; a reload trays the orphans.
+function _rememberHeld(it) {
+    if (!it.hid) it.hid = ++_heldId;
+    const rest = _typedList().filter(x => !(x.load === _PAGE_LOAD && x.kind === 'held' && x.hid === it.hid));
+    _saveTyped([...rest, { load: _PAGE_LOAD, gen: it.gen, sid: it.sid || '', text: it.text, at: Date.now(), kind: 'held', hid: it.hid,
+                           seq: it.seq }]);                                   // §4SB r6: the reload trays in typing order
+}
+function _forgetHeld(items) {
+    const ids = new Set(items.map(it => it.hid).filter(Boolean));
+    if (ids.size) _saveTyped(_typedList().filter(x => !(x.load === _PAGE_LOAD && x.kind === 'held' && ids.has(x.hid))));
+}
+// Orphans of an earlier page load go to their session's tray (the debt for
+// the agent's own leftover was marked when the inject was accepted).
+// §4SB r2: a DUPLICATED tab copies sessionStorage too, with a new
+// _PAGE_LOAD; its navigation is 'navigate', so it recovers no INJECT — the
+// original tab still owns those (the agent has the copy). A reload or a
+// reopened closed tab ('back_forward') recovers; so does a browser without
+// the API. §4SB r6: what WAITED to be sent (`kind: 'held'`) is trayed by a
+// duplicate too — the agent has no copy of it; a duplicate is acceptable, a
+// loss is not.
+function _navigationType() {
+    try {
+        const perf = globalThis.performance;
+        if (!perf || typeof perf.getEntriesByType !== 'function') return null;
+        const e = perf.getEntriesByType('navigation')[0];
+        return e && typeof e.type === 'string' ? e.type : null;
+    } catch (e) { return null; }
+}
+function _recoverTypedAfterReload() {
+    const all = _typedList();
+    const foreign = all.filter(x => x.load !== _PAGE_LOAD);
+    if (!foreign.length) return;
+    _saveTyped(all.filter(x => x.load === _PAGE_LOAD));   // r3: dropped either way (a duplicate would tray them at ITS next reload)
+    const nav = _navigationType();
+    const duplicate = nav !== null && nav !== 'reload' && nav !== 'back_forward';   // §4SB r6: held items still tray
+    // r4: trayed however old — past the agent's leftover TTL this orphan is
+    // the ONLY copy left, which is the reason for the tray (it has its own
+    // RESTORE_TTL_MS); a duplicate is acceptable, a loss is not
+    const groups = new Map();                        // r5: per session AND kind (typed vs waiting to be sent)
+    // r6: in typing order (`seq` on held entries; one without comes first);
+    // r7: by load first (its earliest `at`) — two earlier loads never interleave
+    const firstAt = new Map();
+    for (const x of foreign) firstAt.set(x.load, Math.min(firstAt.get(x.load) ?? Infinity, x.at || 0));
+    for (const x of [...foreign].sort((a, b) => (firstAt.get(a.load) - firstAt.get(b.load)) || ((a.seq ?? -1) - (b.seq ?? -1)))) {
+        if (duplicate && x.kind !== 'held') continue;
+        const k = `${x.sid}\u0000${x.kind === 'held' ? 'held' : 'typed'}`;
+        groups.set(k, [...(groups.get(k) || []), x.text]);
+    }
+    for (const [k, texts] of groups) {
+        const [sid, kind] = k.split('\u0000');
+        _restoreToComposer(texts, kind === 'held' ? 'A reload or a duplicated tab was left with these unsent.'   // r7 wording
+            : 'The page reloaded during the turn; the agent may or may not have read these.', sid || _queuedSid());
+    }
+}
+
+// §4SB: the tray is `aria-live="off"`; one short line in #restore-status
+// says what changed instead of the whole tray being read out again.
+function _shortText(text) {
+    const t = String(text).replace(/\s+/g, ' ').trim();
+    return t.length > 60 ? t.slice(0, 57) + '…' : t;
+}
+// §4SB r2: `whys` are the reasons of the batches first shown by this render
+// (and any storage warning): the WHY is said too, not only the count.
+function _trayStatus(n, whys = []) {
+    if (typeof restoreStatus === 'undefined' || !restoreStatus) return;
+    const changed = n !== _trayCount && !(_trayCount < 0 && n === 0);    // an empty tray at load says nothing
+    if (!changed && !whys.length) return;
+    _trayCount = n;
+    const count = n === 0 ? 'The tray is empty.'
+        : `${n === 1 ? 'One message' : `${n} messages`} in the tray above the composer.`;
+    restoreStatus.textContent = [...whys, count].join(' ');
+}
+
+function _holdForAfterTurn(it) {
+    const info = _turnInfo.get(it.gen) || null;
+    if (!info) {
+        // §4SB r8 (review MINOR): a `queue` answer for a PRUNED turn went into
+        // the chain and the drain trayed it as "did not end with a reply"
+        // (false — the page just no longer knows)
+        if (it.div) it.div.remove();
+        const w0 = _holdWordIn(it.text);                     // r9: a hold word is still named as one
+        _restoreToComposer([it.text], w0 !== null ? _holdNote(it.text, w0)
+            : "This page no longer has that turn's record, so it was not sent.", it.sid);
+        return;
+    }
+    const word = _holdWordIn(it.text);
+    if (word !== null) {
+        // §4SB: a stop or hold typed while the turn was not yet running (the
+        // agent answered `queue`, or this tab has no session id) is never
+        // auto-sent as a fresh request: the model would have to answer it.
+        if (it.div) it.div.remove();
+        if (info) info.holdWord = word;
+        // §4SB r3 (CLI r8): what was held BEFORE the hold goes back too —
+        // first, in typing order (r4), the conversation's whole waiting
+        // re-send chain with it (r4)
+        const before = _unholdTurn(it.gen, it.sid, it.epoch).map(q => q.text);
+        _restoreToComposer(before, `Typed before '${word}' and still waiting, so not sent on its own.`, it.sid);
+        _restoreToComposer([it.text], _holdNote(it.text, word), it.sid);
+        return;
+    }
+    // §4SB r2 (as the CLI's _hold, r6): once a hold word was typed in this
+    // turn, nothing typed after it is sent on its own either — "wait" then
+    // "and delete the rest" must not reach the model without the wait.
+    const earlier = _turnHoldWord(info, it.gen);
+    if (earlier !== null) {
+        if (it.div) it.div.remove();
+        _restoreToComposer([it.text], info && info.holdLate === earlier                    // §4SB r7
+            ? `Typed while '${earlier}' from an earlier turn held this one, so not sent on its own.`
+            : `Typed after '${earlier}' in the same turn, so not sent on its own.`, it.sid);
+        return;
+    }
+    _setQueuedLabel(it.div, 'sends after this turn');
+    chatLog.appendChild(it.div);
+    _sendAfterTurn.push(it);
+    _rememberHeld(it);                               // r5: survives a reload (trayed there)
+    _drainSendAfterTurn();
+}
+
+async function _sendWhileBusy() {
+    const text = chatInput.value.trim();
+    if (!text || text === '/clear') return;     // /clear needs an idle composer
+    chatInput.value = '';
+    chatInput.style.height = '';
+    const seq = ++_queuedSeq, gen = _turnGen, sid = _queuedSid(), epoch = _convEpoch;
+    const div = _queuedBubble(text, 'sending…');
+    const item = { text, div, seq, gen, sid, epoch };
+    if (!sid) { _holdForAfterTurn(item); return; }   // no inbox without a session id
+    let data = null;
+    try {
+        const res = await fetch('/api/turn/inbox', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid, text }),
+            signal: AbortSignal.timeout(INBOX_TIMEOUT_MS),
+        });
+        if (res.ok) data = await res.json().catch(() => null);
+    } catch (e) { data = null; }
+    const path = data && typeof data.path === 'string' ? data.path : null;
+    if (path) _setQueuedFeature(!_isOffReason(data.reason));
+    const info = _turnInfo.get(gen) || null;
+    if (path === 'queue' && _isOffReason(data.reason)) {
+        // OFF (the production default): the old page — nothing is sent on
+        // its own while a turn runs; the text waits in the composer.
+        div.remove();
+        _restoreToComposer([text], 'Messages to a running turn are off on this agent; send it when the turn ends.', sid);
+        return;
+    }
+    if (!path) {
+        // No answer: the agent may have accepted it — never sent on its own.
+        div.remove();
+        _restoreToComposer([text], 'Could not reach the running turn (it may have the message).', sid);
+        return;
+    }
+    if (path === 'status') {
+        div.remove();
+        const note = addMessage('system', String(data.reply || 'The turn is still running.'));
+        if (note) note.classList.add('queued-status');
+        return;
+    }
+    if (path === 'cancel') {
+        div.remove();
+        const undelivered = Array.isArray(data.undelivered) ? data.undelivered : [];
+        if (gen === _turnGen && info && !info.ended && isProcessingRequest && currentChatController) {
+            _inboxStopUndelivered = undelivered;      // read by the Stop path
+            currentChatController.abort();
+            toggleSendButtonUI(false);
+        } else if (info && !info.settled) {
+            // the page lost this turn's stream, or it is settling: settle it
+            // as stopped (r6a2)
+            _settleQueuedTurn(gen, Promise.resolve(undelivered), 'stopped');
+        } else {
+            _restoreToComposer(undelivered, 'The turn stopped before reading them.', sid);
+        }
+        return;
+    }
+    if (path === 'inject') {
+        if (!info || info.settled || info.ended) {     // §4SB r7: a PRUNED turn's answer is late too (never a live inject)
+            // Accepted after this page settled the turn: whether it is read
+            // or left over shows on the agent's side — the session copy, or
+            // the tray once the leftovers are taken. Never history here.
+            // r6a8: to the tray too (a duplicate is fine), never only a debt.
+            // §4SB r2: the same once the turn has ENDED here (the settle may
+            // be mid-await): pushing to `typed` then would re-mark the debt
+            // the settle is about to clear and the text would be wiped.
+            _markOwed(sid);
+            div.remove();
+            _restoreToComposer([text], 'The turn ended as this was sent; the agent may or may not have read it.', sid);
+            // §4SB r5 (review MINOR): a late "wait" still holds the chain turn
+            // running NOW — its clean end must not send the rest of the chain.
+            // §4SB r6: until SETTLED, not until ended — a settle sets `ended`
+            // at once, then awaits the leftovers fetch before it reads
+            // `_turnHoldWord`; an answer landing in that await saw `ended`,
+            // set nothing, and the chain went on past the "wait". `holdLate`
+            // names the note (the word is another turn's, not this one's).
+            // §4SB r7 (review MAJOR): only a turn of the SAME conversation —
+            // a late answer for session A's "wait" held session B's running
+            // turn (the user switched sessions mid-turn; a switch never
+            // bumps the epoch). Otherwise (another session's turn runs, or
+            // none) the word's own session's whole waiting chain goes to the
+            // tray now, so a later turn of that session never drains it.
+            const w = _holdWordIn(text), cur = _turnInfo.get(_turnGen);
+            if (w !== null) {
+                // §4SB r8 (review MAJOR): the word's OWN turn, ended but still
+                // settling (its leftovers fetch in flight), is marked too —
+                // else its settle re-sent its leftover Y into the session
+                // later, after the sweep below had trayed the chain
+                // (the sid the word was POSTed under is not compared here on
+                // purpose: marking its own turn trays, the safer reading)
+                if (info && !info.settled) info.holdWord = info.holdWord || w;
+                if (cur && !cur.settled && (cur.sid || '') === (sid || '') && cur.epoch === epoch) {
+                    cur.holdWord = cur.holdWord || w;    // r7: the turn's OWN word stays first — the note names it
+                    if (cur !== info) cur.holdLate = w;  // r8: "from an earlier turn" only when it IS another turn's
+                } else {
+                    _restoreToComposer(_unholdTurn(null, sid, epoch).map(q => q.text), !cur || cur.settled   // r9: no turn runs
+                        ? `'${w}' arrived after its turn ended, so nothing of that conversation is sent on its own.`
+                        : `'${w}' from an earlier turn arrived while this one ran, so nothing of it is sent on its own.`, sid);
+                }
+            }
+            _requestSessionResync();
+            return;
+        }
+        _setQueuedLabel(div, 'queued — read at the next step');
+        _queuedInjects.push(item);
+        // §4SB: owed from now (a reload before the settle found nothing owed
+        // and the agent's leftover was pruned); this turn's clean end clears
+        // it. A mark already later than now is left alone: it is not ours.
+        const have = _owedMap()[sid];
+        if (have === undefined || have <= Date.now()) {
+            _markOwed(sid);
+            if (info) info.markedAt = _owedMap()[sid];
+        }
+        if (info) {
+            info.typed.push(text);
+            info.typedSeq.push(seq);              // §4SB r3: the resend keeps typing order
+            _rememberTyped(gen, sid, text);
+        }
+        return;
+    }
+    _holdForAfterTurn(item);                     // queue: never reached the agent
+}
+
+// After a turn. `mode`: 'done' (it ended with a reply), 'ended' (it ended
+// without one), 'stopped', or 'unknown' (this page lost it). Marked at once;
+// the work runs after any earlier settle (leftovers are per SESSION).
+function _settleQueuedTurn(gen, undeliveredP, mode) {
+    const info = _turnInfo.get(gen) || null;
+    // a turn settled 'unknown' stays unknown (r6a3)
+    if (info && info.outcome === 'unknown' && (mode === 'done' || mode === 'ended')) mode = 'unknown';
+    if (info) {
+        info.ended = true;
+        info.settled = false;
+        info.outcome = mode;
+    }
+    _settlesPending += 1;
+    const p = _settleChain
+        .then(() => _settleQueuedTurnNow(info, gen, undeliveredP, mode))
+        .catch((e) => { console.warn('queued messages: settle failed', e); if (info) info.settled = true; })
+        .then(() => { _settlesPending -= 1; _drainSendAfterTurn(); });
+    _settleChain = p;
+    return p;
+}
+
+async function _settleQueuedTurnNow(info, gen, undeliveredP, mode) {
+    let undelivered = [];
+    if (undeliveredP) {
+        const TIMED_OUT = {};
+        let timer = null;
+        const late = new Promise((r) => { timer = setTimeout(() => r(TIMED_OUT), STOP_SETTLE_TIMEOUT_MS); });
+        let got;
+        try { got = await Promise.race([undeliveredP, late]); } catch (e) { got = []; }
+        clearTimeout(timer);
+        if (got === TIMED_OUT) {
+            mode = 'unknown';                 // no answer from the cancel
+            if (info) info.outcome = 'unknown';
+        } else {
+            undelivered = Array.isArray(got) ? got : [];
+        }
+    }
+    const sid = info ? info.sid : _queuedSid();
+    const mine = (it) => it.gen === gen;
+    const typed = info ? info.typed : _queuedInjects.filter(mine).map(it => it.text);
+    const clean = mode === 'done';
+    // Leftovers only once the turn is over, into that session's tray; a
+    // lost turn owes them.
+    let leftovers = [];
+    let failed = false;
+    const owedAt = sid ? _owedMap()[sid] : undefined;
+    const markedAt0 = info ? info.markedAt : undefined, marks0 = _owedMarks;   // §4SB r2: snapshots before the await
+    if (sid && (typed.length || (clean && owedAt !== undefined))) {
+        if (mode === 'unknown') {
+            if (typed.length) _markOwed(sid);
+        } else {
+            const got = await _fetchLeftovers(sid);
+            if (got === null) { _markOwed(sid); failed = true; } else {
+                leftovers = got;
+                // a clean end closes every older turn of this session, and
+                // (§4SB) this turn's own mark unless something marked after it;
+                // r2: a debt marked DURING the fetch (a late inject) stays
+                if (_owedMarks === marks0 && (got.length || (clean && owedAt !== undefined
+                    && (owedAt < ((info && info.startedAt) || Infinity)
+                        || (markedAt0 !== undefined && owedAt <= markedAt0))))) _clearOwed(sid);
+            }
+        }
+    }
+    // History is the agent's session copy; this page never writes queued
+    // rows. Adopted after a clean turn; otherwise the rail realigns later.
+    if (sid && typed.length && !(clean && await _resyncFromSession(sid))) _requestSessionResync();
+    for (const it of _queuedInjects.filter(mine)) if (it.div) it.div.remove();
+    _queuedInjects = _queuedInjects.filter(it => !mine(it));
+    // A clean turn's injects are trusted to the session copy. Any other
+    // ending: every text accepted during it comes back (r6a7: no "visibly
+    // held" check — a duplicate is acceptable, a loss is not).
+    // §4SB r2 (operator): after a CLEAN reply the agent's leftovers are SENT,
+    // in order and before anything held later in this turn, as normal
+    // requests through the held-message path (the server backdates each to
+    // its accept time, `note_handed_back`, so a "yes" cannot confirm past a
+    // later "wait"), in TYPING order with what the turn held (r3). A stop or
+    // hold word anywhere in the turn — typed, read, held or left over —
+    // keeps EVERY line of the turn back, before it as well as after it
+    // (r3, the CLI's r8 decision), named. Any other ending: all to the tray.
+    if (clean && !failed) {
+        const word = _turnHoldWord(info, gen, leftovers);
+        if (word !== null) {
+            const seqs = _leftoverSeqs(info, leftovers);
+            const back = [...leftovers.map((text, i) => ({ text, seq: seqs[i] })), ..._unholdTurn(gen, sid, info ? info.epoch : _convEpoch)]
+                .sort((a, b) => a.seq - b.seq).map(x => x.text);
+            _restoreToComposer(back, info && info.holdLate === word                       // §4SB r6
+                ? `'${word}' from an earlier turn arrived while this one ran, so nothing of it is sent on its own.`
+                : `'${word}' was typed during the turn, so nothing of it is sent on its own.`, sid);
+        } else {
+            const seqs = _leftoverSeqs(info, leftovers);
+            const resend = leftovers.map((text, i) => ({ text, div: null, seq: seqs[i], gen, sid, epoch: info ? info.epoch : _convEpoch }));
+            const at = _sendAfterTurn.findIndex(q => q.gen === gen);
+            const mine = [..._sendAfterTurn.filter(q => q.gen === gen), ...resend].sort((a, b) => a.seq - b.seq);
+            _sendAfterTurn = _sendAfterTurn.filter(q => q.gen !== gen);
+            _sendAfterTurn.splice(at < 0 ? _sendAfterTurn.length : at, 0, ...mine);
+            for (const r of resend) _rememberHeld(r);    // r5: the agent handed its copy out — this is the only one
+        }
+        _restoreToComposer(undelivered, 'Not read by the agent.', sid);
+    } else {
+        // §4SB r4: a Stop, a lost or a failed turn ends the re-send chain
+        // too — nothing still waiting for this conversation is sent (the
+        // drain would have sent an EARLIER turn's items: their turn did end
+        // with a reply)
+        const chain = _unholdTurn(gen, sid, info ? info.epoch : _convEpoch).map(q => q.text);
+        _restoreToComposer(chain, mode === 'stopped' ? 'Stopped, so nothing more was sent.'
+            : failed ? 'The messages the agent did not read could not be fetched, so nothing more was sent.'
+            : 'The turn did not end with a reply, so nothing more was sent.', sid);
+        _restoreToComposer([...undelivered, ...leftovers],
+            mode === 'stopped' ? 'Stopped: not read by the agent.' : 'Not read by the agent.', sid);
+    }
+    if (!clean || failed) _restoreToComposer(typed, 'The agent may or may not have read these.', sid);
+    if (failed) {
+        addMessage('system', 'Could not fetch the messages the agent did not read; '
+            + 'they come back when the next turn starts.');
+    }
+    _forgetTyped(gen);                       // §4SB: handed back or adopted; no longer a reload's orphan
+    if (info) info.settled = true;
+}
+
+// One held text at a time, as a normal turn; its own end drains the next.
+// Sent only with positive evidence: the turn it was typed in ended with a
+// reply, and the conversation is the same. Otherwise to the tray.
+function _drainSendAfterTurn() {
+    if (_settlesPending > 0) return;              // the settle drains when it is done
+    for (;;) {
+        // the first whose turn has settled: one stuck turn never blocks the rest.
+        // Restoring to the composer is safe mid-turn; sending is not.
+        const i = _sendAfterTurn.findIndex((q) => {
+            const qi = _turnInfo.get(q.gen);
+            return (!qi || qi.settled) && (!isProcessingRequest || !qi || qi.outcome !== 'done');
+        });
+        if (i < 0) return;
+        const it = _sendAfterTurn.splice(i, 1)[0];
+        if (it.div) it.div.remove();
+        _forgetHeld([it]);                           // r5: sent or trayed below
+        const info = _turnInfo.get(it.gen) || null;
+        if (!info || info.outcome !== 'done') {
+            _restoreToComposer([it.text], info && info.outcome === 'stopped'
+                ? 'Stopped, so nothing more was sent.'
+                : 'The turn did not end with a reply, so nothing more was sent.', it.sid);
+            continue;
+        }
+        if (it.epoch !== _convEpoch || (it.sid || null) !== (_queuedSid() || null)) {
+            _restoreToComposer([it.text], 'The conversation changed before this was sent.', it.sid);
+            continue;
+        }
+        // §4SB r7: sendMessage calls _beginQueuedTurn synchronously, so no
+        // late inbox answer can land between this settle and the next turn's
+        // record — an `await` added before it would reopen that window (the
+        // late branch then finds no turn of the session and trays the chain).
+        sendMessage(false, it.text);
+        return;
+    }
+}
+
+// Stop the running tool call(s) only; the turn goes on.
+async function interruptRunningTool() {
+    const sid = _queuedSid();
+    if (!sid) {
+        addMessage('system', 'This tab has no session id, so it cannot name its turn.');
+        return;
+    }
+    if (interruptBtn) interruptBtn.disabled = true;     // one request at a time
+    try {
+        const res = await fetch('/api/turn/interrupt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid }),
+            signal: AbortSignal.timeout(INBOX_TIMEOUT_MS),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            _setQueuedFeature(true);
+            const names = Array.isArray(data.interrupted) ? data.interrupted : [];
+            addMessage('system', `Stopped ${names.join(', ') || 'the running tool'}; the turn goes on.`);
+        } else if (res.status === 409) {
+            _setQueuedFeature(true);
+            addMessage('system', 'Nothing running: no tool call to stop.');
+        } else if (res.status === 404) {
+            const off = _isOffReason(data.reason);
+            if (off) _setQueuedFeature(false);
+            addMessage('system', off
+                ? 'Stopping a tool is off on this agent.'
+                : 'No running turn of this conversation.');
+        } else {
+            addMessage('system', `Could not stop the tool (${data.detail || data.error
+                || ('HTTP ' + res.status)}).`);
+        }
+    } catch (e) {
+        addMessage('system', `Could not reach the agent to stop the tool (${(e && e.message) || e}).`);
+    } finally {
+        if (interruptBtn) interruptBtn.disabled = false;
+    }
+}
+
+async function sendMessage(isResume = false, queuedText = null) {
+    const resuming = isResume === true;
+    // §4RZ: a message held for after the turn (or handed back unread) is
+    // sent as itself; the composer keeps whatever is being typed.
+    const fromQueue = typeof queuedText === 'string';
+    const text = (fromQueue ? queuedText : chatInput.value).trim();
+    if (!resuming && (!text || isProcessingRequest)) return;
+    // A resume must not stack on a turn either: the legacy same-page
+    // auto-resume (resumeOnVisible) and the persisted-handle path can
+    // both fire on the same visibilitychange — the second replay wiped
+    // the first's accumulator and double-pushed the assistant message.
+    if (resuming && isProcessingRequest) return;
+
+    if (text === '/clear' && !resuming) {
+        _convEpoch += 1;                 // §4RZ: nothing held is sent into the new conversation
+        chatInput.value = '';
+        chatInput.style.height = '';
+        _endRecoveryForNewTurn(true);   // §4PR r4: a running poll would rebuild a placeholder
+        chatLog.innerHTML = '';
+        chatHistory = [];
+        safeStorage.remove(_historyKey());
+        tokenCounter.forget();           // before the sessions rail mints the new id below
+        // A surviving in-flight handle points at the OLD conversation —
+        // left alone, the next reconcile would resurrect the cleared
+        // transcript into the freshly minted session.
+        clearInflightHandle();
+        // Close the visualizer BEFORE revoking: it may be displaying one
+        // of these blobs right now (blank preview + dead Download button
+        // otherwise).
+        if (typeof closeRenderWindow === 'function') closeRenderWindow();
+        // Flush the authed-image blob cache too — the thumbnails those
+        // URLs pointed at are gone from the DOM, so holding on to the
+        // blobs is pure leak.
+        for (const url of _authedBlobCache.values()) {
+            try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+        }
+        _authedBlobCache.clear();
+        if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
+        // Let the sessions rail mint a fresh session id — /clear means
+        // "new conversation", not "amnesia inside the same session".
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('conversation-cleared'));
+        } catch (e) { /* workspace modules not loaded */ }
+        const msg = addMessage('system', 'Context cleared');
+        // Hero AFTER the confirmation removes itself (addMessage dismisses
+        // any hero, so rendering it first left a blank log 2s later) — and
+        // only if the log is still empty by then.
+        setTimeout(() => {
+            msg.remove();
+            if (!chatLog.querySelector('.message')) renderEmptyStateHero();
+        }, 2000);
+        return;
+    }
+
+    if (!resuming) {
+        // §4PR: a recovery still waiting for an OLDER turn ends here, said
+        // in one line (its placeholder dangled with dots forever).
+        _autoOpenedImgSrcs.clear();   // a new turn may auto-open its images
+        _endRecoveryForNewTurn();
+        if (!fromQueue) {
+            chatInput.value = '';
+            chatInput.style.height = ''; // Clear inline height → rows="1" takes over
+        }
+        const _userDiv = addMessage('user', text);
+        
+        currentTaskId = null;
+        currentTurnStartedAt = Date.now();
+        currentChunkIndex = 0;
+        currentAccumulatedContent = "";
+        currentStreamPrefixLen = 0;
+        currentSpeechHold = false;
+        currentReqId = null;
+        currentTurnUnlabelable = false;
+        tokenCounter.startTurn();        // the last turn's numbers are not this one's
+        _turnVerdict = null;
+        if (typeof activeFace.setPhase === 'function') activeFace.setPhase(null);
+        if (typeof activeFace.setComposerGaze === 'function') activeFace.setComposerGaze(false);
+
+        chatHistory.push({ role: "user", content: text });
+        _stampHistoryIndex(_userDiv, chatHistory.length - 1);
+        _beginQueuedTurn();              // §4RZ: this turn's generation
+        // Remembered for Stop: with sessions disabled there is no session id
+        // to match a turn on, and the turn registry's `preview` is derived
+        // from exactly this text (R3 lens B).
+        _lastSentUserText = text;
+        if (typeof saveChatState === 'function') saveChatState();
+        if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
+        
+        // Render a CSS-driven typing indicator (three staggered dots) so
+        // the waiting state reads as deliberate UX rather than text poke.
+        // The setInterval-based "Thinking.".repeat() version flickered on
+        // fast responses because the first real chunk could race a tick
+        // that overwrote the fresh content with "Thinking..".
+        dismissEmptyStateHero();
+        currentAgentMessageDiv = document.createElement('div');
+        currentAgentMessageDiv.className = 'message agent thinking';
+        currentAgentMessageDiv.dataset.ts = String(Date.now());
+        currentAgentMessageDiv.dataset.turnStart = String(currentTurnStartedAt);
+        // Build indicator via DOM APIs (no user-supplied content, but
+        // keeps the file free of innerHTML = '<...>' patterns).
+        const _ind = document.createElement('span');
+        _ind.className = 'typing-indicator';
+        _ind.setAttribute('aria-label', 'Thinking');
+        _ind.appendChild(document.createElement('span'));
+        _ind.appendChild(document.createElement('span'));
+        _ind.appendChild(document.createElement('span'));
+        currentAgentMessageDiv.appendChild(_ind);
+        chatLog.appendChild(currentAgentMessageDiv);
+        // Turn status line under the waiting bubble (`timer :
+        // description - icon`) — see the Turn status block above.
+        startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt);
+        scrollToBottom();
+        currentThinkingInterval = null;
+    } else {
+        // Cross-reload resumes have no surviving bubble; same-page resumes
+        // keep theirs (this is a no-op then). Reconnects are silent — the
+        // stream resuming is the only signal the user needs.
+        ensureAgentBubbleForResume();
+        setTimeout(scrollToBottomIfPinned, 100);
+    }
+
+    // Explicitly lock the blob into an active state
+    isProcessingRequest = true;
+    toggleSendButtonUI(true);
+    activeFace.setWorkingState(true);
+    // The immersion dive is gated on USER turns only — ambient log
+    // activity keeps driving speed/glow via setWorkingState, but only
+    // this lifecycle swallows the camera.
+    if (typeof activeFace.setUserTurn === 'function') activeFace.setUserTurn(true);
+    // Only flip the dot to 'busy' if the WS is actually up — otherwise
+    // the 'error' state should stay so the user sees the real problem.
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        setConnectionState('busy', 'PROCESSING…');
+    }
+    // §4RZ: set on a Stop — resolves to the messages the turn never read
+    let _stopUndeliveredP = null;
+    // §4RZ: the turn may still run on the agent (a resume or a session
+    // recovery takes it over): its queued messages are settled when it ends
+    let _turnStillLive = false;
+    // §4RZ: how the turn ended, for what was held until after it ('done' =
+    // a reply arrived; 'unknown' = this page cannot tell)
+    let _turnOutcome = 'ended';
+    // a resume this page holds no live record of (a reload) gets a fresh one
+    if (resuming && !(_turnInfo.get(_turnGen) && !_turnInfo.get(_turnGen).ended)) _beginQueuedTurn();
+    const _myGen = _turnGen;
+    try {
+        // Deliberately omit `model`: the agent validates a supplied model
+        // name against its single configured model and returns 404
+        // ModelNotFound on any mismatch (see api/routes.py). Pinning a
+        // name here means every model rename on the agent silently breaks
+        // chat with a 404. With no `model`, the agent uses its configured
+        // model (`requested_model or configured_model`), so the client
+        // always tracks whatever the agent is running.
+        // Strip client-only bookkeeping (reqId/feedback — the 👍/👎 label
+        // plumbing) so the wire payload stays clean OpenAI message shapes.
+        const payload = {
+            messages: chatHistory.map(toWireMessage),
+            stream: true
+        };
+        // §4RB: the effort selector, when shown and not the default (the interface
+        // turns it into the X-Ghost-Effort header)
+        const _effort = effortForPayload(effortSelect);
+        if (_effort) payload.reasoning_effort = _effort;
+        // Durable sessions: when the workspace module holds an active
+        // session id, bind the turn to it. The AGENT is the source of
+        // truth for session history and merges tolerantly, so replaying
+        // the full local history here can never double it.
+        // ⚠ Fall back to the STORED id. `window.__ghostSessionId` is only
+        // published by sessions.js, which runs after the dynamic
+        // import('./workspace.js') chain plus three agent round trips — and
+        // the composer is live throughout. A turn sent in that window
+        // carried no session_id, was never persisted, and the next resync
+        // (which protects user messages but not assistant ones) then deleted
+        // the reply the user was reading. `saveInflightHandle` has had this
+        // exact fallback all along (R3 lens B).
+        const _sid = window.__ghostSessionId || storedSessionId();
+        if (_sid) payload.session_id = _sid;
+        currentChatController = new AbortController();
+
+        let response;
+        if (resuming && currentTaskId) {
+            currentTTSMutedLength = currentAccumulatedContent.length;
+            currentAccumulatedContent = "";
+            currentStreamPrefixLen = 0;
+            currentSpeechHold = false;
+            currentChunkIndex = 0;
+            response = await fetch(`/api/chat/resume/${currentTaskId}?offset=0`, {
+                signal: currentChatController.signal
+            });
+            setTimeout(scrollToBottom, 50);
+        } else {
+            // A genuinely NEW upstream turn (also reachable on a resume
+            // whose task handle was lost) — any captured id belongs to an
+            // abandoned turn and must not stamp this one's reply.
+            currentReqId = null;
+            currentTurnUnlabelable = false;
+            response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: currentChatController.signal
+            });
+            if (response.headers.has('X-Task-ID')) {
+                currentTaskId = response.headers.get('X-Task-ID');
+                // Survive a page kill: the handle is all a reload needs to
+                // reattach this stream (see resumeOrReconcileInflightTurn).
+                saveInflightHandle();
+            }
+            // The proxy mints the agent's request id and sends it up front
+            // (2026-09-11), so Stop and the thumbs know the turn from t=0
+            // instead of after the first content frame. The frames carry
+            // the same id (restamped agent-side), so nothing disagrees.
+            if (response.headers.has('X-Request-ID')) {
+                const _rid = String(response.headers.get('X-Request-ID') || '').trim();
+                if (_rid) currentReqId = _rid.replace(/^chatcmpl-/, '');
+                noteTickerOwnRid(currentReqId);
+            }
+        }
+
+        if (!response.ok) {
+            throw await _httpError(response);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let streamBuffer = "";
+        // Set when an error frame renders; suppresses the phantom
+        // "No response" assistant reply that would otherwise be pushed into
+        // chatHistory and persisted (see the finalize branch below).
+        let streamHadError = false;
+        // §4KP: the stream's own terminal frame arrived — a cancel or a relay
+        // teardown ends the read with no error and no [DONE].
+        let streamSawDone = false;
+        // Reset per turn: the network-resume attempts below are bounded so a
+        // down proxy cannot spin a silent retry loop forever.
+        _netResumeTries = 0;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            currentChunkIndex++;
+
+            streamBuffer += decoder.decode(value, { stream: true });
+            let lines = streamBuffer.split('\n');
+
+            // Keep the last partial line in the buffer
+            streamBuffer = lines.pop();
+
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (!trimmedLine || !trimmedLine.startsWith("data: ")) continue;
+
+                const dataStr = trimmedLine.substring(6).trim();
+                if (dataStr === "[DONE]") { streamSawDone = true; continue; }
+
+                try {
+                    const data = JSON.parse(dataStr);
+                    let chunkContent = "";
+
+                    // Every frame carries the agent's request id as
+                    // "chatcmpl-<id>" — capture once for feedback labels.
+                    if (!currentReqId && typeof data.id === 'string' && data.id) {
+                        currentReqId = data.id.replace(/^chatcmpl-/, '');
+                    }
+                    // The route marks a reply that has no trajectory behind
+                    // it (a system answer): no thumbs for this bubble.
+                    if (data.ghost && data.ghost.labelable === false) currentTurnUnlabelable = true;
+                    if (data.ghost && data.ghost.reasoning_unparsed === true) currentSpeechHold = true;   // §4KP
+                    // §4MP: the agent streams its reply as it is generated; when a
+                    // tool call follows the text, or the finished reply was
+                    // rewritten, it RETRACTS what it sent — drop it (and any speech
+                    // of it); what follows replaces it.
+                    if (data.ghost && data.ghost.retract === true) {
+                        _applyStreamRetract();
+                        continue;
+                    }
+                    // The turn's token totals (one frame before [DONE]): the
+                    // counter only — never reply text, speech or history.
+                    if (data.ghost && data.ghost.usage) {
+                        tokenCounter.note(data.ghost.usage);
+                        continue;
+                    }
+
+                    if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
+                        chunkContent = data.choices[0].delta.content;
+                    } else if (data.message && data.message.content) {
+                        // Fallback for non-streaming formats that might be wrapped
+                        chunkContent = data.message.content;
+                    } else if (data.error) {
+                        // The agent and the proxy both send STRUCTURED errors
+                        // ({message, type, error_id}); a bare template turned
+                        // every one of them into "Error: [object Object]".
+                        // That is the string the operator saw for the agent
+                        // being down (UpstreamError), a evicted task
+                        // (TaskEvicted), a blown buffer (BufferCapExceeded)
+                        // and an agent InternalError alike — destroying the
+                        // error_id that correlates to the log. Objects only
+                        // ever reached this branch, so the bug was total.
+                        const _e = data.error;
+                        let _msg = (_e && typeof _e === 'object')
+                            ? (_e.message || _e.detail || _e.error || JSON.stringify(_e))
+                            : String(_e);
+                        const _type = (_e && typeof _e === 'object' && _e.type) ? ` [${_e.type}]` : '';
+                        const _eid = (_e && typeof _e === 'object' && _e.error_id) ? ` (error_id ${_e.error_id})` : '';
+                        addRetryableSystemMessage(`Error${_type}: ${_msg}${_eid}`);
+                        streamHadError = true;
+                        _faceError(_msg, _type);
+                        continue;
+                    }
+                    // §4ML: after an error frame the agent echoes the error as a
+                    // content chunk (for clients that only read content). It is
+                    // not a reply: shown already as the system message above,
+                    // and pushed to history it became the "assistant's" turn in
+                    // the durable session and context for the next request.
+                    if (streamHadError) continue;
+                    if (chunkContent) {
+                        if (currentAccumulatedContent === "") {
+                            if (currentThinkingInterval) {
+                                clearInterval(currentThinkingInterval);
+                                currentThinkingInterval = null;
+                            }
+                            // The typing dots are NOT torn down here. The
+                            // first chunk of most replies opens a <think>
+                            // block, which the renderer strips — so tearing
+                            // the indicator down on the first CHUNK left an
+                            // EMPTY bubble for the whole reasoning phase.
+                            // _renderStreamingContent reveals the bubble on
+                            // the first VISIBLE character instead.
+                        }
+
+                        currentAccumulatedContent += chunkContent;
+                        if (data.ghost && data.ghost.stream_prefix === true) {
+                            currentStreamPrefixLen = currentAccumulatedContent.length;
+                        }
+
+                        // --- Voice Intercept Logic ---
+                        if (isTTSActive && !currentSpeechHold && currentAccumulatedContent.length > currentTTSMutedLength) {
+                            ttsBuffer += chunkContent;
+                            
+                            let openThink = ttsBuffer.lastIndexOf('<think>') > ttsBuffer.lastIndexOf('</think>');
+                            let openTool = ttsBuffer.lastIndexOf('<tool_call') > ttsBuffer.lastIndexOf('</tool_call>');
+                            
+                            if (!openThink && !openTool) {
+                                // Strip markdown, XML tags, and reasoning blocks
+                                let cleanBuffer = ttsBuffer.replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
+                                
+                                // Find natural sentence boundaries
+                                let boundaryMatch = cleanBuffer.match(/([.?!;]+[\s]+)/);
+                                if (boundaryMatch) {
+                                    let splitIndex = boundaryMatch.index + boundaryMatch[0].length;
+                                    let sentence = cleanBuffer.substring(0, splitIndex).trim();
+                                    
+                                    // Only queue if it contains actual words or numbers
+                                    if (/[\p{L}\p{N}]/u.test(sentence)) {
+                                        queueTTS(sentence);
+                                    }
+                                    
+                                    ttsBuffer = cleanBuffer.substring(splitIndex); // Keep remainder
+                                }
+                            }
+                        }
+                        // -----------------------------
+                    }
+                } catch (e) {
+                    console.warn("Failed to parse SSE chunk:", dataStr, e);
+                }
+            }
+
+            // Coalesce re-renders to one per animation frame (see
+            // _renderStreamingContent) instead of re-parsing the whole
+            // markdown on every network read.
+            if (currentAccumulatedContent !== "" && currentAgentMessageDiv) {
+                scheduleStreamRender();
+            }
+        }
+
+        // Flush a final synchronous render so the last tokens are shown
+        // even if an rAF was still pending when the stream ended.
+        _renderStreamingContent();
+
+        if (isTTSActive && currentSpeechHold && streamSawDone && !streamHadError) {
+            // §4KP: a CLEAN end only (an abort, a drop or an error frame never
+            // reaches here with the reply complete). The prefix was spoken live
+            // up to its last full sentence; speak its remainder, then the
+            // generation as the display shows it (leaked reasoning stripped).
+            const _held = _heldSpeech(ttsBuffer, currentAccumulatedContent, currentStreamPrefixLen);
+            ttsBuffer = "";
+            for (const sentence of _held) queueTTS(sentence);
+        }
+
+        // Push the final concatenated message to chat history. On the
+        // resume path the partial assistant turn was never pushed when it
+        // dropped, so a plain push is correct in both cases. `reqId` is
+        // client-only bookkeeping (stripped from wire payloads) that lets
+        // the 👍/👎 label buttons survive a reload.
+        if (currentAccumulatedContent) {
+            chatHistory.push({ role: "assistant", content: _historyContent(currentAccumulatedContent, currentStreamPrefixLen),
+                               prefixLen: currentStreamPrefixLen || undefined,   // §4KO R4: client-only, for re-renders
+                               reqId: currentReqId || undefined,
+                               unlabelable: currentTurnUnlabelable || undefined });
+            _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
+            // A reply that was ALL reasoning (<think> with no text after
+            // it) never revealed the bubble: say so instead of leaving the
+            // dots animating on a finished turn.
+            const _onlyReasoned = _revealAgentBubble(currentAgentMessageDiv);
+            if (_onlyReasoned) {
+                currentAgentMessageDiv.textContent = "No reply text (the model only reasoned).";
+            }
+            // §4RZ r6a5/r6a6: positive evidence for sending held texts — a
+            // clean end with reply text (reasoning alone is not a reply)
+            if (!_onlyReasoned && streamSawDone && !streamHadError && typeof _isCleanReply === 'function'
+                    && _isCleanReply(chatHistory[chatHistory.length - 1].content)) _turnOutcome = 'done';
+            // Stamp only alongside a history entry that carries the id —
+            // a "No response" bubble with live thumbs would take labels
+            // that can never persist (no matching entry to latch onto).
+            _stampReqId(currentAgentMessageDiv, currentReqId, currentTurnUnlabelable);
+        } else if (streamHadError) {
+            // An error frame already rendered a system message saying what
+            // went wrong. Pushing a phantom assistant reply on top of it put
+            // "No response" into chatHistory — and from there into the
+            // DURABLE session store, where it is indistinguishable from a
+            // real (bad) reply and becomes context for later turns. The
+            // error is the outcome; there is no assistant turn to record.
+            currentAgentMessageDiv.remove();
+        } else {
+            currentAgentMessageDiv.textContent = "No response";
+            chatHistory.push({ role: "assistant", content: "No response" });
+            _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
+            // Clear any stale stamp from a previous turn on a reused
+            // bubble — an unlabeled "No response" must carry no thumbs.
+            _stampReqId(currentAgentMessageDiv, null);
+        }
+        if (typeof saveChatState === 'function') saveChatState();
+        if (typeof notifyUser === 'function') notifyUser("Response complete.");
+        // Delivery ack: proof that live JS rendered the reply. Without it
+        // the server assumes the phone is locked and sends the reply-ready
+        // push after the grace window.
+        if (currentTaskId) {
+            fetch(`/api/chat/ack/${encodeURIComponent(currentTaskId)}`,
+                { method: 'POST' }).catch(() => {});
+        }
+        currentTaskId = null; // Clear task id
+        clearInflightHandle();
+
+        if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
+    } catch (e) {
+        if (e.name === 'AbortError') {
+            if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
+            // Stop is ONE call now (2026-09-11): /api/chat/cancel tears
+            // down the proxy relay AND cancels the agent's turn by the id
+            // the proxy minted, answering {agent: {cancelled}}. Only when
+            // the proxy could not (legacy task shape, transport failure,
+            // or a refusal) does this tab fall back to resolving its own
+            // turn via /api/turns — never a blind "whatever is running"
+            // cancel (review R1 M8 / R2 lens B). The ids are captured
+            // NOW: the fields below are reset before the promise settles.
+            // §4RZ: what the turn never read comes back with the cancel
+            // (`undelivered`); a stop word sent to the inbox already has it,
+            // and that turn is already cancelled — only the relay is left to
+            // tear down (a second agent cancel could 404 and warn that
+            // nothing was cancelled).
+            const _byInbox = _inboxStopUndelivered !== null;
+            const _inboxUnd = _inboxStopUndelivered || [];
+            _inboxStopUndelivered = null;
+            const _und = (v) => (v && Array.isArray(v.undelivered) ? v.undelivered : []);
+            const _rid = currentReqId, _txt = _lastSentUserText;
+            if (currentTaskId && !_byInbox) {
+                _stopUndeliveredP = fetch(`/api/chat/cancel/${currentTaskId}`,
+                                          { method: 'POST', signal: AbortSignal.timeout(15000) })
+                    .then(r => r.json().catch(() => ({})))
+                    .then(d => {
+                        if (d && d.agent && d.agent.cancelled === true) return _und(d.agent);
+                        return _cancelAgentTurn(_rid, _txt).then(_lastCancelUndelivered);
+                    })
+                    .catch(() => _cancelAgentTurn(_rid, _txt).then(_lastCancelUndelivered));
+            } else if (!_byInbox) {
+                _stopUndeliveredP = _cancelAgentTurn(_rid, _txt).then(_lastCancelUndelivered);
+            } else {
+                if (currentTaskId) {
+                    fetch(`/api/chat/cancel/${currentTaskId}`, { method: 'POST' }).catch(() => {});
+                }
+                _stopUndeliveredP = Promise.resolve(_inboxUnd);
+            }
+            if (!resuming && currentAccumulatedContent === "" && currentAgentMessageDiv) currentAgentMessageDiv.remove();
+            if (currentAccumulatedContent !== "") {
+                // Keep the reqId: a reply aborted BECAUSE it was going
+                // wrong is a prime 👎 target, and the trajectory exists.
+                chatHistory.push({ role: "assistant",
+                                   content: _historyContent(currentAccumulatedContent, currentStreamPrefixLen) + "\n\n*[Aborted]*",
+                                   prefixLen: currentStreamPrefixLen || undefined,
+                                   reqId: currentReqId || undefined,
+                                   unlabelable: currentTurnUnlabelable || undefined });
+                if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) {
+                    _stampReqId(currentAgentMessageDiv, currentReqId, currentTurnUnlabelable);
+                    _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
+                }
+                addRetryableSystemMessage('Stopped by user.');
+            } else {
+                addRetryableSystemMessage('Stopped by user.');
+            }
+            currentTaskId = null;
+            clearInflightHandle();
+            if (typeof saveChatState === 'function') saveChatState();
+            // The agent may have persisted the FULL reply while this client
+            // kept the aborted stub — let the sessions module re-align from
+            // the server so the next replay can't diverge.
+            try {
+                window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-aborted'));
+            } catch (err) { /* workspace modules not loaded */ }
+        } else {
+            _turnOutcome = 'unknown';    // §4RZ: a failed request — the page cannot tell how the turn ended
+            if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
+            
+            const errMsg = e.message.toLowerCase();
+            // §4PR: only a turn that EXISTS can be resumed. A POST that never
+            // reached the server (proxy down, Wi-Fi off) has no task id, and
+            // the silent branch dropped it with no message and no Retry.
+            if (currentTaskId && (errMsg.includes('load failed') || errMsg.includes('networkerror') || errMsg.includes('fetch'))) {
+                // Safari killed the fetch by suspending the tab. Resume
+                // silently — no system bubble; the reply continuing is the
+                // only signal.
+                // ⚠ GUARDED RESUME. These two callbacks are the FOURTH
+                // resume trigger and they bypassed `resumeLatch` entirely.
+                // On an iOS unlock the latched path (boot /
+                // visibilitychange / pageshow) replays an already-complete
+                // buffer in milliseconds and NULLS currentTaskId — so this
+                // 1s callback then found no task, fell through the
+                // `resuming && currentTaskId` test, and took the POST
+                // branch: a whole NEW turn whose last message is an
+                // assistant reply. There is also no attempt cap, so a down
+                // proxy produced an endless silent 1s retry loop behind a
+                // permanent thinking bubble.
+                const _resumeAttempt = () => {
+                    if (!currentTaskId) { _settleLostTurns(); return; }   // resumed, or a recovery took it (§4RZ r6a2)
+                    if (isProcessingRequest) return;     // the latch's job
+                    // §4PR r4: a recovery already owns this turn (the
+                    // visibility path found its stream gone); a resume here
+                    // 404'd, cleared the recovery and offered a Retry that
+                    // re-ran a turn the agent had finished
+                    if (reconcilePollTimer || _reconcileRunning) return;
+                    if (_netResumeTries >= 3) {
+                        // §4RZ: this page lost the turn — its queued messages
+                        // are settled as unknown (the session copy shows
+                        // them), never swept into the next turn
+                        _settleQueuedTurn(_myGen, null, 'unknown');
+                        addMessage('system',
+                            '⚠ Lost the connection to this turn and could ' +
+                            'not reattach after 3 tries. The turn may still ' +
+                            'be running — reload to pick it up.');
+                        _netResumeTries = 0;
+                        // ⚠ RELEASE THE HANDLE. The 5s inflight heartbeat
+                        // kept writing `beat`, so `Date.now() - h.beat <
+                        // 15000` stayed true forever and no other tab (or
+                        // reopened PWA) could ever adopt this orphaned turn
+                        // — the exact recovery this subsystem exists for
+                        // (R2 lens B).
+                        clearInflightHandle();
+                        return;
+                    }
+                    _netResumeTries += 1;
+                    sendMessage(true);
+                };
+                _turnStillLive = true;
+                if (document.visibilityState === 'visible') {
+                    setTimeout(_resumeAttempt, 1000);
+                } else {
+                    document.addEventListener('visibilitychange', function resumeOnVisible() {
+                        if (document.visibilityState === 'visible') {
+                            document.removeEventListener('visibilitychange', resumeOnVisible);
+                            setTimeout(_resumeAttempt, 1000);
+                        }
+                    });
+                }
+            } else {
+                // Not every failure here is a NETWORK failure. The 500-message
+                // interface cap surfaces as `Too many messages (501 > 500
+                // cap)` — a lock-out that needs /clear or a session switch,
+                // not a retry — and labelling it "Network Error" pointed the
+                // operator at the wrong problem (review R1 M11).
+                const _m = String(e && e.message || e);
+                if (/Too many messages/i.test(_m)) {
+                    addMessage('system',
+                        `This conversation is too long for one request (${_m}). `
+                        + 'Start a new chat, or switch sessions and back — the '
+                        + 'server keeps the durable copy, so nothing is lost.');
+                } else if (resuming) {
+                    // §4PR r4: the proxy no longer holds this turn's stream
+                    // (404 after a long lock). The agent may still finish or
+                    // have finished it: hand over to the session recovery —
+                    // a Retry here re-ran a completed turn.
+                    const _rsid = window.__ghostSessionId || storedSessionId();
+                    const _rh = readInflightHandle();
+                    currentTaskId = null;
+                    if (_rsid) {
+                        _turnStillLive = true;
+                        _settleQueuedTurn(_myGen, null, 'unknown');   // §4RZ: the recovery owns the turn now
+                        setTimeout(() => reconcileFromSession(_rsid, _rh), 0);   // after `finally`
+                    } else {
+                        addRetryableSystemMessage(`Network Error: ${_m}`);
+                        clearInflightHandle();
+                    }
+                } else {
+                    addRetryableSystemMessage(`Network Error: ${_m}`);
+                }
+                _faceError(_m, 'network');
+                // The turn is abandoned client-side. If the agent finishes
+                // anyway, the sessions resync (visibilitychange) adopts it.
+                if (!resuming) clearInflightHandle();
+            }
+        }
+    } finally {
+        if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
+        // Cancel any throttled render still queued for a future frame —
+        // otherwise it fires after this point and re-adds `streaming`.
+        _cancelScheduledStreamRender();
+        // Drop the streaming cursor glyph and any stale "thinking" class
+        // so the message renders as a completed reply.
+        //
+        // ⚠ THE CLASS IS NOT THE ANIMATION. `.thinking` is styled in no CSS
+        // file at all; the bouncing dots belong to `.typing-indicator span`,
+        // a CHILD element that only ever disappears when the bubble's
+        // content is replaced. So on every zero-content end — a 500, a 401
+        // after key rotation, the 413 message cap, an abort during a resume,
+        // the resume give-up — this teardown removed a class that styles
+        // nothing and left dots animating forever, with a timestamp and a ⋯
+        // menu decorating the corpse (R2 lens B).
+        if (currentAgentMessageDiv) {
+            currentAgentMessageDiv.classList.remove('streaming', 'thinking');
+            const _ind = currentAgentMessageDiv.querySelector('.typing-indicator');
+            if (_ind) {
+                if (currentAccumulatedContent) {
+                    _ind.remove();          // real content arrived; the
+                                            // renderer normally does this
+                } else {
+                    // Nothing ever streamed: this bubble has no content to
+                    // become. `decorateMessageActions()` below would give it
+                    // a timestamp and a ⋯ menu, making an animating stub read
+                    // as a finished empty reply.
+                    currentAgentMessageDiv.remove();
+                    currentAgentMessageDiv = null;
+                }
+            }
+        }
+
+        if (isTTSActive && ttsBuffer.trim().length > 0) {
+            let finalClean = ttsBuffer.replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "").trim();
+            if (/[\p{L}\p{N}]/u.test(finalClean)) queueTTS(finalClean);
+            ttsBuffer = "";
+        }
+
+        isProcessingRequest = false;
+        currentChatController = null;
+        toggleSendButtonUI(false);
+        activeFace.setWorkingState(false);
+        if (typeof activeFace.setUserTurn === 'function') activeFace.setUserTurn(false);
+        // The release (2026-09-11): the verifier's verdict, when one was
+        // logged for this turn, shapes how the face lets go — a pass
+        // crystallises and holds, a refute shudders, anything else
+        // exhales. Then the gait clears.
+        if (typeof activeFace.noteVerdict === 'function') {
+            activeFace.noteVerdict(_turnVerdict || 'stop');
+        }
+        _turnVerdict = null;
+        if (typeof activeFace.setPhase === 'function') activeFace.setPhase(null);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            setConnectionState('online', 'ONLINE');
+        }
+        setTimeout(scrollToBottomIfPinned, 100);
+
+        // Auto-hide planner monologue 2 seconds after reply
+        monologueTimeout = setTimeout(hidePlannerMonologue, 2000);
+
+        // Attach "Visualize" buttons to any renderable code blocks
+        attachRenderButtons();
+        // Timestamp + actions row for the completed reply, and let the
+        // sessions rail refresh (the agent may have just created the
+        // session / derived its title).
+        decorateMessageActions();
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-complete'));
+        } catch (e) { /* workspace modules not loaded */ }
+        // §4RZ: the messages sent while it ran — read ones become history,
+        // unread ones are sent next (after a Stop: to the tray)
+        if (_inboxStopUndelivered !== null && _stopUndeliveredP === null) {
+            // the stop word landed after the stream had already ended
+            _stopUndeliveredP = Promise.resolve(_inboxStopUndelivered);
+        }
+        _inboxStopUndelivered = null;
+        if (!_turnStillLive) {
+            _settleQueuedTurn(_myGen, _stopUndeliveredP, _stopUndeliveredP !== null ? 'stopped' : _turnOutcome);
+        }
+    }
+}
+
+// A TYPED message leaves voice mode: if you're at a keyboard you're reading,
+// not listening. The mic path (which sets isTTSActive) deliberately calls
+// sendMessage() directly so a spoken turn still gets a spoken reply.
+function sendTypedMessage() {
+    isTTSActive = false;
+    sendMessage();
+}
+
+if (interruptBtn) interruptBtn.addEventListener('click', () => { interruptRunningTool(); });
+
+sendBtn.addEventListener('click', () => {
+    if (isProcessingRequest && currentChatController) {
+        currentChatController.abort();
+        toggleSendButtonUI(false);
+    } else if (!isProcessingRequest) {
+        sendTypedMessage();
+    }
+});
+
+chatInput.addEventListener('keydown', (e) => {
+    // An IME (CJK, Vietnamese) and most mobile predictive-text paths
+    // confirm a candidate with Enter — that keydown carries isComposing
+    // (legacy engines: keyCode 229) and must NOT send a half-composed
+    // message.
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (!isProcessingRequest) {
+            sendTypedMessage();
+        } else if (currentChatController) {
+            _sendWhileBusy();       // §4RZ: to the running turn's inbox
+        }
+        return;
+    }
+    // ArrowUp in an EMPTY composer recalls the last thing you sent — the
+    // shell habit, and the cheapest "fix a typo and resend" there is.
+    if (e.key === 'ArrowUp' && chatInput.value === '' && !isProcessingRequest) {
+        const at = _userTurnIndexFor(chatHistory, chatHistory.length - 1);
+        const text = at >= 0 ? _historyEntryText(chatHistory[at]) : null;
+        if (text) {
+            e.preventDefault();
+            chatInput.value = text;
+            chatInput.dispatchEvent(new Event('input'));
+            try { chatInput.setSelectionRange(text.length, text.length); } catch (err) { /* ignore */ }
+        }
+    }
+});
+
+if (fullscreenBtn) {
+    fullscreenBtn.addEventListener('click', () => { document.body.classList.toggle('zen-mode'); });
+}
+
+// Face-form picker (2026-07-29 — replaced the blind cycle: at 9 forms,
+// reaching the one you wanted took up to 8 clicks × 1.4s reorganization
+// blends, each through a form you didn't ask for). The button now opens
+// a menu built from matrix_graph's own roster (getForms — a form added
+// there appears here with no edit), current form highlighted, one click
+// jumps straight to it. Falls back to the old cycle if the face module
+// predates getForms/setForm (stale cache).
+const FACE_FORM_HINTS = {
+    cube: 'weight tensor',
+    tesseract: 'infinite corridor',
+    vortex: 'black hole',
+    descent: 'loss landscape',
+    empty: 'no face',
+};
+const faceFormBtn = document.getElementById('face-form-btn');
+let faceFormMenu = null;
+
+// Persist a pick SERVER-side (2026-09-05). setForm() writes localStorage,
+// which is per-origin / per-browser / per-device — so the form picked
+// here never became the default on the phone PWA or in a LAN-IP tab, and
+// Safari's storage purge reset it. server.py stores it and injects it
+// into the next page load as <meta name="ghost-face-form">
+// (matrix_graph.js resolveInitialForm); the authed fetch wrapper adds the
+// key header. Fire-and-forget on purpose: the face has already switched
+// locally; a failed save (offline, key rotated) leaves localStorage as
+// the fallback and says so once in the console. Resolves to whether the
+// server took it — pure enough to EXECUTE under node with a fake fetch.
+function rememberFaceForm(name) {
+    return fetch('/api/ui/prefs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ face_form: name }),
+        signal: AbortSignal.timeout(8000),
+    }).then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return true;
+    }).catch((e) => {
+        console.warn('[Ghost] face form kept locally only — server save failed:',
+            (e && e.message) || e);
+        return false;
+    });
+}
+
+function closeFaceFormMenu() {
+    if (faceFormMenu) faceFormMenu.classList.add('hidden');
+}
+
+function buildFaceFormMenu() {
+    if (faceFormMenu) return faceFormMenu;
+    faceFormMenu = document.createElement('div');
+    faceFormMenu.id = 'face-form-menu';
+    faceFormMenu.className = 'hidden';
+    faceFormMenu.setAttribute('role', 'menu');
+    faceFormMenu.setAttribute('aria-label', 'Face form');
+    for (const name of activeFace.getForms()) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'face-form-item';
+        item.dataset.form = name;
+        item.setAttribute('role', 'menuitemradio');
+        const label = document.createElement('span');
+        label.className = 'face-form-name';
+        label.textContent = name;
+        item.appendChild(label);
+        const hint = document.createElement('span');
+        hint.className = 'face-form-hint';
+        hint.textContent = FACE_FORM_HINTS[name] || '';
+        item.appendChild(hint);
+        item.addEventListener('click', () => {
+            const picked = activeFace.setForm(name);
+            rememberFaceForm(picked);
+            markActiveFaceForm();
+            closeFaceFormMenu();
+            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+            if (toast) toast(`Face form: ${picked}`);
+        });
+        faceFormMenu.appendChild(item);
+    }
+    document.body.appendChild(faceFormMenu);
+    // Outside click / Escape closes — standard menu manners.
+    document.addEventListener('click', (ev) => {
+        if (!faceFormMenu.classList.contains('hidden')
+            && !faceFormMenu.contains(ev.target)
+            && ev.target !== faceFormBtn && !faceFormBtn.contains(ev.target)) {
+            closeFaceFormMenu();
+        }
+    });
+    document.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') closeFaceFormMenu();
+    });
+    return faceFormMenu;
+}
+
+function markActiveFaceForm() {
+    if (!faceFormMenu) return;
+    const current = typeof activeFace.getForm === 'function' ? activeFace.getForm() : '';
+    for (const item of faceFormMenu.querySelectorAll('.face-form-item')) {
+        item.classList.toggle('active', item.dataset.form === current);
+        item.setAttribute('aria-checked', item.dataset.form === current ? 'true' : 'false');
+    }
+}
+
+if (faceFormBtn) {
+    faceFormBtn.addEventListener('click', () => {
+        if (typeof activeFace.getForms !== 'function'
+            || typeof activeFace.setForm !== 'function') {
+            // Stale-cache fallback: the old blind cycle still works.
+            if (typeof activeFace.cycleForm !== 'function') return;
+            const name = activeFace.cycleForm();
+            rememberFaceForm(name);
+            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+            if (toast) toast(`Face form: ${name}`);
+            return;
+        }
+        const menu = buildFaceFormMenu();
+        if (!menu.classList.contains('hidden')) {
+            closeFaceFormMenu();
+            return;
+        }
+        markActiveFaceForm();
+        // Anchor under the button, right-aligned to it, clamped on-screen
+        // on BOTH axes (the #msg-menu manners — workspace.js). The old code
+        // clamped only the right offset: on a phone the centered header
+        // puts this button near the LEFT edge, so a right-anchored 230px+
+        // menu hung ~half off the left of the screen. Must be visible
+        // before measuring (hidden = display:none).
+        const rect = faceFormBtn.getBoundingClientRect();
+        menu.classList.remove('hidden');
+        const mw = menu.offsetWidth;
+        const mh = menu.offsetHeight;
+        const rightMax = Math.max(8, window.innerWidth - mw - 8);
+        menu.style.right = `${Math.min(
+            Math.max(8, Math.round(window.innerWidth - rect.right)), rightMax)}px`;
+        let top = Math.round(rect.bottom + 8);
+        if (top + mh > window.innerHeight - 8) {
+            top = Math.max(8, window.innerHeight - mh - 8);
+        }
+        menu.style.top = `${top}px`;
+    });
+}
+
+// Global toggle for Zen Mode (Persistent Key)
+document.addEventListener('keydown', (e) => {
+    // Toggle with 'Z' unless the user is typing in ANY text field (chat
+    // input, session search, palette, memory modal…) — the original
+    // check excluded only #chat-input, so typing "z" in a newer field
+    // would flip zen mode mid-word.
+    const el = document.activeElement;
+    const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+        || el.isContentEditable);
+    if (e.key.toLowerCase() === 'z' && !typing && !e.metaKey && !e.ctrlKey) {
+        document.body.classList.toggle('zen-mode');
+    }
+});
+
+// Workspace Save/Load Logic — two explicit buttons in the sessions rail
+// (2026-09-05, operator: "next to +"). The header's single glyph used to
+// FLIP: Load with an empty chat, Save otherwise — an action you had to
+// know. Now Save is simply disabled with nothing to save, and Load is
+// always available: loading mints a FRESH session (see the change
+// handler), so an open chat is never overwritten — it only asks first.
+const workspaceSaveBtn = document.getElementById('workspace-save-btn');
+const workspaceLoadBtn = document.getElementById('workspace-load-btn');
+const workspaceUploadInput = document.getElementById('workspace-upload-input');
+
+function updateWorkspaceBtnState() {
+    if (!workspaceSaveBtn) return;
+    const empty = chatHistory.length === 0;
+    workspaceSaveBtn.disabled = empty;
+    // Title and accessible name move TOGETHER (the old flip changed one
+    // and not the other — a11y review).
+    workspaceSaveBtn.title = empty ? 'Save workspace (nothing to save yet)' : 'Save workspace as a zip';
+    workspaceSaveBtn.setAttribute('aria-label', workspaceSaveBtn.title);
+}
+
+if (workspaceLoadBtn && workspaceUploadInput) {
+    workspaceLoadBtn.addEventListener('click', () => {
+        if (isProcessingRequest) return;
+        if (chatHistory.length > 0 && !confirm(
+            'Load a workspace into a NEW session? The current chat stays in the sessions list.')) {
+            return;
+        }
+        workspaceUploadInput.click();
+    });
+}
+
+if (workspaceSaveBtn) {
+    updateWorkspaceBtnState();
+
+    workspaceSaveBtn.addEventListener('click', async () => {
+        if (isProcessingRequest || chatHistory.length === 0) return;
+        isProcessingRequest = true;
+        activeFace.setWorkingState(true);
+        // The composer must SHOW the busy state: without this the
+        // button still reads SEND, and a click hits neither branch of
+        // the handler while Enter tests !isProcessingRequest — the user
+        // is silently ignored (R2 lens B).
+        toggleSendButtonUI(true, false);   // no AbortController here
+
+        try {
+            const response = await fetch('/api/workspace/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                // Same wire-shape strip as /api/chat: a workspace
+                // restored weeks later would otherwise present live
+                // thumbs whose reqIds are past the agent's 8-day
+                // trajectory scan — guaranteed 404s.
+                body: JSON.stringify({ chat_history: chatHistory.map(toWireMessage) })
+            });
+            
+            if (!response.ok) throw await _httpError(response, 'Save failed');
+            
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            
+            let filename = `workspace_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`;
+            const disposition = response.headers.get('content-disposition');
+            if (disposition && disposition.indexOf('filename=') !== -1) {
+                filename = disposition.split('filename=')[1].replace(/["']/g, '');
+            }
+            
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.URL.revokeObjectURL(url);
+            
+            // An INCOMPLETE archive must not read as a clean save (§4GK
+            // round 5). The agent sets X-Ghost-Archive-Omitted: N when N
+            // files could not be read and are therefore NOT in the zip;
+            // this branch used to say "saved successfully" for any
+            // response.ok, so the only surviving evidence was omitted.json
+            // inside an archive nobody had a reason to open — until the
+            // restore wiped the sandbox and wrote back the readable subset.
+            const omittedCount = parseInt(response.headers.get('X-Ghost-Archive-Omitted'), 10);
+            if (omittedCount > 0) {
+                addMessage('system', `Workspace saved, but ${omittedCount} file(s) could NOT be read and are MISSING from the archive — see omitted.json inside the zip before restoring from it.`);
+            } else {
+                addMessage('system', 'Workspace saved successfully.');
+            }
+        } catch (err) {
+            addMessage('system', `Save Workspace Error: ${err.message}`);
+            activeFace.triggerSpike();
+        } finally {
+            isProcessingRequest = false;
+            activeFace.setWorkingState(false);
+            toggleSendButtonUI(false);
+        }
+    });
+}
+
+if (workspaceUploadInput) {
+    workspaceUploadInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        workspaceUploadInput.value = '';
+        
+        isProcessingRequest = true;
+        activeFace.setWorkingState(true);
+        // The composer must SHOW the busy state: without this the
+        // button still reads SEND, and a click hits neither branch of
+        // the handler while Enter tests !isProcessingRequest — the user
+        // is silently ignored (R2 lens B).
+        toggleSendButtonUI(true, false);   // no AbortController here
+        addMessage('system', `Loading workspace from ${file.name}...`);
+        
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        try {
+            const response = await fetch('/api/workspace/load', {
+                method: 'POST',
+                body: formData
+            });
+            
+            if (!response.ok) throw await _httpError(response, 'Load failed');
+            
+            const result = await response.json();
+            if (result.error) throw new Error(result.error);
+            
+            // Shape-validate like the bridge setter does: a non-array here
+            // makes the next `chatHistory.push` throw BEFORE sendMessage's
+            // try block, killing the composer with a console-only error.
+            chatHistory = Array.isArray(result.chat_history)
+                ? result.chat_history : [];
+            renderHistoryToLog(chatHistory);
+            // PERSIST, and take a FRESH session identity. Without the save,
+            // a reload silently restored the old localStorage history over
+            // the loaded workspace; without the rebind, the next turn
+            // appended the workspace's messages into whatever durable
+            // session was current — contaminating a conversation the
+            // operator never opened (R2 lens B).
+            // §4PR: rebind FIRST, then save — saved before the rebind, the
+            // workspace landed under the OLD session's key (lost on reload,
+            // merged into the old session by another tab).
+            try {
+                window.GhostCore?.events?.dispatchEvent(
+                    new CustomEvent('conversation-cleared'));
+            } catch (err) { /* workspace modules not loaded */ }
+            saveChatState();
+
+            // §4GK round 6: a restore can be INCOMPLETE and still be a 200.
+            // `not_cleared` names what the wipe could not remove (a directory
+            // the archive froze read-only, whose stale contents are now mixed
+            // into the "restored" workspace) and `unrestored` names members
+            // that could not be written. Reporting a clean load over either is
+            // the same defect the save side fixed for `omitted`.
+            const _nc = Array.isArray(result.not_cleared) ? result.not_cleared : [];
+            const _ur = Array.isArray(result.unrestored) ? result.unrestored : [];
+            if (_nc.length || _ur.length) {
+                const _bits = [];
+                if (_ur.length) _bits.push(`${_ur.length} file(s) could NOT be written`);
+                if (_nc.length) _bits.push(`${_nc.length} path(s) survived the wipe and may hold stale content`);
+                // §4GK round 7: `unrestored` entries are OBJECTS ({path, reason}),
+                // so joining them rendered "[object Object]" — the operator was
+                // told the restore was incomplete and shown nothing usable.
+                const _name = (x) => (x && typeof x === 'object')
+                    ? (x.path ?? JSON.stringify(x)) : String(x);
+                const _names = [..._ur, ..._nc].map(_name).slice(0, 3).join(', ');
+                addMessage('system',
+                    `Workspace loaded, but it is INCOMPLETE — ${_bits.join('; ')}. `
+                    + `First few: ${_names}.`);
+            } else {
+                addMessage('system', 'Workspace loaded successfully.');
+            }
+            updateWorkspaceBtnState();
+
+        } catch (error) {
+            addMessage('system', `Workspace Load Error: ${error.message}`);
+            activeFace.triggerSpike();
+        } finally {
+            isProcessingRequest = false;
+            activeFace.setWorkingState(false);
+            toggleSendButtonUI(false);
+            scrollToBottom();
+        }
+    });
+}
+
+// File Transfer Logic
+const uploadBtn = document.getElementById('upload-btn');
+const downloadBtn = document.getElementById('download-btn');
+const fileUploadInput = document.getElementById('file-upload-input');
+
+if (uploadBtn && fileUploadInput) {
+    uploadBtn.addEventListener('click', () => {
+        if (isProcessingRequest) return;
+        fileUploadInput.click();
+    });
+
+    // Choosing a file opens the ask sheet (2026-09-05, operator) instead
+    // of uploading blind — see openUploadAsk below.
+    fileUploadInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        // Reset input immediately so the same file can be uploaded again if needed
+        fileUploadInput.value = '';
+        if (!file) return;
+        openUploadAsk(file);
+    });
+}
+
+// The name the file is stored under in the sandbox. iOS names EVERY camera
+// capture `image.jpg`, so a second photo silently overwrote the first and a
+// later "what kind of car is that?" pointed at whichever came last. Generic
+// camera names get a timestamp; anything else keeps its name. Pure — the
+// clock is a parameter so it can be executed under node.
+// `IMG_0042` / `IMG42` are Photos-library names — unique per photo — and
+// stay; only the literal camera-capture names are generic.
+const _GENERIC_CAPTURE_NAMES = /^(image|photo|capture)\d*\.(jpe?g|png|heic|heif|webp)$/i;
+function uploadNameFor(file, now) {
+    const name = String((file && file.name) || 'upload');
+    if (!_GENERIC_CAPTURE_NAMES.test(name)) return name;
+    const d = now instanceof Date ? now : new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-`
+        + `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    return `photo-${stamp}.${name.split('.').pop().toLowerCase()}`;
+}
+
+// The chat message "Upload & ask" sends: the question, then the file it is
+// about, named the way the agent's tools find it (by sandbox filename —
+// which is what the operator used to type by hand). Pure; executed under
+// node. An empty question means "upload only" and composes nothing.
+function composeUploadRequest(question, storedName) {
+    const q = String(question || '').trim();
+    if (!q) return '';
+    return `${q}\n\n(File just uploaded to the sandbox: ${storedName})`;
+}
+
+// Upload one file to the sandbox. Resolves to the stored filename, or null
+// after reporting the failure in the chat (the operator sees why: the server
+// explains type/size/name rejections, and the message carries it).
+async function uploadToSandbox(file, storedName) {
+    isProcessingRequest = true;
+    activeFace.setWorkingState(true);
+    toggleSendButtonUI(true, false);   // no AbortController here
+    addMessage('system', `Uploading ${storedName} to sandbox...`);
+    const formData = new FormData();
+    formData.append('file', file, storedName);
+    try {
+        const response = await fetch('/api/upload', { method: 'POST', body: formData });
+        if (!response.ok) {
+            // The server explains WHY (type not allowed, too large, no
+            // filename); pasting only the status threw that away.
+            throw await _httpError(response, 'Upload failed');
+        }
+        const result = await response.json();
+        if (result.error) {
+            addMessage('system', `Upload Failed: ${result.error}`);
+            activeFace.triggerSpike();
+            return null;
+        }
+        // NOTE: an `updateActivityIcon('✅')` call sat here until
+        // 2026-08-02. The function was deleted with the center-stage
+        // #activity-icon on 2026-07-29 but two call sites survived, so
+        // this threw a ReferenceError on every SUCCESSFUL upload — the
+        // enclosing catch then reported "Upload Error" for an upload
+        // that had just worked. The success message above is the
+        // status signal; the turn-status line owns icons now.
+        const stored = (result && typeof result.filename === 'string' && result.filename) || storedName;
+        addMessage('system', `Successfully uploaded ${stored}.`);
+        return stored;
+    } catch (error) {
+        addMessage('system', `Upload Error: ${error.message}`);
+        activeFace.triggerSpike();
+        return null;
+    } finally {
+        isProcessingRequest = false;
+        activeFace.setWorkingState(false);
+        toggleSendButtonUI(false);
+        scrollToBottom();
+    }
+}
+
+// ── Ask-about-this-file sheet ───────────────────────────────────────
+// A photo from the phone camera used to need TWO steps: upload, then a
+// typed message naming image.jpg. The sheet shows the file (thumbnail
+// when it is an image), takes an optional question, and ONE button
+// uploads — with a question it also sends question + stored filename as
+// one chat message the moment the upload lands; an empty box is "upload
+// only" by definition (operator: no second button).
+const uploadAskModal = document.getElementById('upload-ask-modal');
+const uploadAskInput = document.getElementById('upload-ask-input');
+const uploadAskPreview = document.getElementById('upload-ask-preview');
+const uploadAskPreviewWrap = document.getElementById('upload-ask-preview-wrap');
+const uploadAskFile = document.getElementById('upload-ask-file');
+const uploadAskSend = document.getElementById('upload-ask-send');
+let pendingUpload = null;          // { file, storedName, previewUrl }
+
+// The button says what it will do: "Upload" for an empty box, "Upload &
+// ask" once there is a question. Pure on the text; executed under node.
+function uploadAskLabel(question) {
+    return String(question || '').trim() ? 'Upload & ask' : 'Upload';
+}
+function _syncUploadAskLabel() {
+    if (uploadAskSend && uploadAskInput) uploadAskSend.textContent = uploadAskLabel(uploadAskInput.value);
+}
+
+// Default question (operator): a photo — taken or picked — opens with
+// "Describe this image:" already in the box, so Upload alone asks for a
+// description. Other files open empty. Pure; executed under node.
+const UPLOAD_ASK_IMAGE_DEFAULT = 'Describe this image:';
+function uploadAskDefaultFor(file) {
+    const type = String((file && file.type) || '');
+    return type.startsWith('image/') ? UPLOAD_ASK_IMAGE_DEFAULT : '';
+}
+
+// The default behaves like a suggestion, not like text the operator
+// wrote: while the box is PRISTINE (still showing the default), the
+// first keystroke REPLACES it — a typed character starts a fresh
+// question, Backspace/Delete clears the whole box. `keydown` handles
+// the physical/virtual keys; `resolvePristineInput` is the fallback for
+// edits that arrive without a keydown (dictation, paste, predictive
+// text): given the default and what the box holds after such an edit,
+// it returns what the operator meant — the text they added (typed after
+// the default), nothing (they deleted into it), or their replacement.
+// Pure; executed under node.
+function resolvePristineInput(defaultText, value) {
+    const d = String(defaultText || ''); const v = String(value || '');
+    if (v === d) return d;                              // nothing happened
+    if (d && v.startsWith(d)) return v.slice(d.length).replace(/^\s+/, '');
+    if (d && d.startsWith(v)) return '';                // a deletion into the default
+    return v;                                           // replaced outright
+}
+let uploadAskPristine = false;
+function _setUploadAskPristine(on) {
+    uploadAskPristine = !!on;
+    uploadAskInput?.classList.toggle('pristine', uploadAskPristine);
+}
+
+function openUploadAsk(file) {
+    if (!uploadAskModal) {
+        // Stale-cached markup without the sheet: keep uploads working.
+        uploadToSandbox(file, uploadNameFor(file));
+        return;
+    }
+    closeUploadAsk();
+    const storedName = uploadNameFor(file);
+    let previewUrl = null;
+    if (file.type && file.type.startsWith('image/') && uploadAskPreview) {
+        try { previewUrl = URL.createObjectURL(file); } catch (e) { previewUrl = null; }
+    }
+    pendingUpload = { file, storedName, previewUrl };
+    if (uploadAskPreviewWrap) uploadAskPreviewWrap.hidden = !previewUrl;
+    if (uploadAskPreview) uploadAskPreview.src = previewUrl || '';
+    if (uploadAskFile) {
+        uploadAskFile.textContent = storedName === file.name
+            ? `${file.name} · ${_fmtBytes(file.size)}`
+            : `${file.name} → ${storedName} · ${_fmtBytes(file.size)}`;
+    }
+    if (uploadAskInput) {
+        uploadAskInput.value = uploadAskDefaultFor(file);
+        _setUploadAskPristine(uploadAskInput.value !== '');
+    }
+    _syncUploadAskLabel();
+    uploadAskModal.classList.remove('hidden');
+    if (uploadAskInput) {
+        uploadAskInput.focus();
+        // The box, not the thumbnail, is what the sheet is about: keep it
+        // in view even if a tall sheet scrolled (phone + keyboard).
+        try { uploadAskInput.scrollIntoView({ block: 'nearest' }); } catch (e) { /* older WebKit */ }
+    }
+}
+
+function closeUploadAsk() {
+    if (pendingUpload && pendingUpload.previewUrl) {
+        try { URL.revokeObjectURL(pendingUpload.previewUrl); } catch (e) { /* ignore */ }
+    }
+    pendingUpload = null;
+    if (uploadAskPreview) uploadAskPreview.src = '';
+    uploadAskModal?.classList.add('hidden');
+}
+
+function _fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// §4PR: send a message the CLIENT composed (upload, voice) without
+// clobbering what the user is typing. sendMessage takes the composer text
+// and clears it synchronously, so the draft is put back right after; while
+// a turn runs nothing can be sent, so the text joins the draft instead of
+// replacing it.
+function _sendComposed(text) {
+    const draft = chatInput.value;
+    if (isProcessingRequest) {
+        chatInput.value = draft.trim() ? `${draft.replace(/\s+$/, '')} ${text}` : text;
+        try { chatInput.dispatchEvent(new Event('input')); } catch (e) { /* stub */ }
+        addMessage('system', 'A turn is still running — the text is in the composer; '
+            + 'send it when the turn finishes.');
+        return Promise.resolve();
+    }
+    chatInput.value = text;
+    const p = sendMessage();
+    if (draft.trim()) {
+        chatInput.value = draft;
+        // sendMessage reset the inline height; let the auto-grow re-measure
+        try { chatInput.dispatchEvent(new Event('input')); } catch (e) { /* stub */ }
+    }
+    return p;
+}
+
+async function confirmUploadAsk() {
+    if (!pendingUpload || isProcessingRequest) return;
+    const { file, storedName } = pendingUpload;
+    const question = uploadAskInput ? uploadAskInput.value : '';
+    closeUploadAsk();
+    const stored = await uploadToSandbox(file, storedName);
+    if (!stored) return;
+    const message = composeUploadRequest(question, stored);
+    if (!message) return;
+    // Ride the ordinary send path so the turn gets the same streaming,
+    // resume, history and thumbs handling as a typed message.
+    await _sendComposed(message);
+}
+
+if (uploadAskModal) {
+    uploadAskSend?.addEventListener('click', () => confirmUploadAsk());
+    uploadAskInput?.addEventListener('input', () => {
+        if (uploadAskPristine) {
+            const resolved = resolvePristineInput(UPLOAD_ASK_IMAGE_DEFAULT, uploadAskInput.value);
+            if (resolved !== UPLOAD_ASK_IMAGE_DEFAULT) {
+                uploadAskInput.value = resolved;
+                _setUploadAskPristine(false);
+            }
+        }
+        _syncUploadAskLabel();
+    });
+    // First key on a pristine default: a character starts a fresh question,
+    // Backspace/Delete clears the box. Enter still sends the default.
+    uploadAskInput?.addEventListener('keydown', (e) => {
+        if (!uploadAskPristine || e.metaKey || e.ctrlKey || e.altKey) return;
+        if (e.key === 'Backspace' || e.key === 'Delete') {
+            e.preventDefault();
+            uploadAskInput.value = '';
+            _setUploadAskPristine(false);
+            _syncUploadAskLabel();
+        } else if (e.key.length === 1) {
+            uploadAskInput.value = '';          // the key then inserts itself
+            _setUploadAskPristine(false);
+        }
+    });
+    document.getElementById('upload-ask-close')?.addEventListener('click', closeUploadAsk);
+    uploadAskModal.addEventListener('click', (e) => { if (e.target === uploadAskModal) closeUploadAsk(); });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !uploadAskModal.classList.contains('hidden')) closeUploadAsk();
+    });
+    // Enter sends (the phone keyboard's "send" key too); Shift+Enter for a newline.
+    uploadAskInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); confirmUploadAsk(); }
+    });
+}
+
+if (downloadBtn) {
+    downloadBtn.addEventListener('click', () => {
+        if (isProcessingRequest) return;
+        const filename = prompt("Enter the exact filename to download from the sandbox:");
+        if (filename && filename.trim() !== '') {
+            addMessage('system', `Starting download for ${filename}...`);
+            // Trigger download by creating a hidden anchor tag
+            const url = `/api/download/${encodeURIComponent(filename.trim())}`;
+            // Must go through fetch (not a plain <a> navigation) so the
+            // authed wrapper attaches X-Ghost-Key. A plain-anchor fallback
+            // can't carry the header, so it would just 401 — and skipping
+            // the res.ok check would "download" the error JSON as the file.
+            fetch(url)
+                .then(async (res) => {
+                    // `await` needs an async callback — and the server's
+                    // reason ("no such file: report.pdf") is what the
+                    // operator needs, not a bare status (R3 lens B).
+                    if (!res.ok) throw await _httpError(res, 'Download failed');
+                    return res.blob();
+                })
+                .then(blob => {
+                    const objectUrl = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = objectUrl;
+                    a.download = filename.trim();
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
+                })
+                .catch(err => {
+                    addMessage('system', `Download failed for ${filename.trim()}: ${err.message}`);
+                    activeFace.triggerSpike();
+                });
+        }
+    });
+}
+
+if (window.visualViewport) {
+    let bodySettleTimer = null;
+    const syncBodyHeight = () => {
+        scrollToBottomIfPinned();
+        _vvNoteHeight();
+        // Pin the body ONLY while a keyboard is genuinely open (focused
+        // editable + vv meaningfully below this orientation's max — see
+        // _vvKeyboardOpen; innerHeight comparisons are unusable because
+        // standalone PWAs shrink innerHeight WITH the keyboard). Clearing
+        // to the CSS 100dvh steady state otherwise keeps one stale WebKit
+        // reading (likelier the longer a reply streams) from freezing the
+        // body short — footer floating mid-screen (operator repro).
+        if (_vvKeyboardOpen()) {
+            document.body.style.height = window.visualViewport.height + 'px';
+        } else {
+            document.body.style.height = '';
+        }
+        window.scrollTo(0, 0);
+    };
+    window.visualViewport.addEventListener('resize', syncBodyHeight);
+    // Same rotation-transient hazard as the keyboard offset above: if the
+    // LAST vv resize fired mid-rotate, body height stuck at the wrong
+    // orientation's value. Re-sync once the window geometry settles.
+    window.addEventListener('resize', () => {
+        clearTimeout(bodySettleTimer);
+        bodySettleTimer = setTimeout(syncBodyHeight, 300);
+    });
+
+    // ── Geometry watchdog ──────────────────────────────────────────
+    // Events cannot be trusted to arrive, arrive in order, or carry
+    // fresh numbers on iOS (rotation, scroll-dismiss, WebKit staleness —
+    // three distinct producers of the same stuck-layout symptom so far).
+    // Instead of chasing each producer, verify the applied geometry
+    // against FRESH measurements on a slow tick and correct drift. Only
+    // acts when something is measurably wrong (>32px), so the steady
+    // state costs two computed-style reads per tick.
+    setInterval(() => {
+        try {
+            const vv = window.visualViewport;
+            if (Math.abs(window.innerWidth - vv.width) > 2) return; // mid-rotate
+            _vvNoteHeight();
+            // 1. Body pin: BOTH directions. A stale pin with no keyboard
+            // floats the input mid-screen; a MISSING pin with the keyboard
+            // open hides the input behind it (typing blind) — heal each.
+            const pinned = document.body.style.height;
+            if (_vvKeyboardOpen()) {
+                const want = vv.height;
+                if (!pinned || Math.abs(parseFloat(pinned) - want) > 32) {
+                    document.body.style.height = want + 'px';
+                    window.scrollTo(0, 0);
+                }
+            } else if (pinned) {
+                document.body.style.height = '';
+                window.scrollTo(0, 0);
+            }
+            // 2. Keyboard-translate drift.
+            const applied = parseFloat(getComputedStyle(document.documentElement)
+                .getPropertyValue('--keyboard-height')) || 0;
+            if (applied > 0) {
+                const ae = document.activeElement;
+                const editing = !!ae && (ae.tagName === 'TEXTAREA'
+                    || ae.tagName === 'INPUT' || ae.isContentEditable);
+                let want = editing
+                    ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+                    : 0;
+                want = Math.min(want, Math.round(window.innerHeight * 0.55));
+                if (Math.abs(applied - want) > 32) {
+                    document.documentElement.style.setProperty(
+                        '--keyboard-height', `${want}px`);
+                }
+            }
+        } catch (e) { /* never let the watchdog take the page down */ }
+    }, 800);
+}
+
+// The document-wide `dblclick` preventDefault that lived here (an iOS
+// double-tap-zoom guard) is GONE (2026-09-11): the viewport is already
+// user-scalable=no and buttons carry touch-action: manipulation, so all it
+// did on a desktop was break double-click word selection in the transcript
+// and in every text box.
+
+setTimeout(() => {
+    const sysMsg = document.getElementById('init-msg');
+    if (sysMsg) {
+        sysMsg.style.transition = 'opacity 1s ease';
+        sysMsg.style.opacity = '0';
+        setTimeout(() => sysMsg.remove(), 1000);
+    }
+}, 2000);
+
+// Warn once at boot if either markdown dependency didn't load — renderMarkdown
+// quietly falls back to escaped text, but silent markdown breakage is a bad
+// debugging experience.
+if (!window.marked || !window.DOMPurify) {
+    console.warn(
+        '[Ghost] Markdown/sanitizer CDN did not load. Falling back to plain text.',
+        { marked: !!window.marked, DOMPurify: !!window.DOMPurify }
+    );
+}
+
+// Restore the previously chosen face (default = first) and start it.
+activeFace.init();
+// Dev/verification hook: lets headless checks (Playwright) drive the
+// face's working state and read its debug state. Harmless in prod —
+// the page is key-gated and the hook mutates nothing the WS handlers
+// don't already mutate.
+window.__ghostFace = activeFace;
+loadChatState();
+// Reattach or reconcile a turn that outlived the page. Ordering vs the
+// sessions boot (dynamic import below) is TIMING, not structure: the
+// local /state probe normally resolves well before sessions.js finishes
+// its two module fetches + agent round trips, so sendMessage(true) has
+// already claimed isProcessingRequest (checked by the sessions boot)
+// by the time it could reload history. If the probe loses the race the
+// cost is a redundant render, not corruption — reconcileFromSession
+// re-checks isProcessingRequest after every await.
+resumeOrReconcileInflightTurn();
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resumeOrReconcileInflightTurn();
+});
+window.addEventListener('pageshow', (e) => {
+    if (e.persisted) resumeOrReconcileInflightTurn();
+});
+connectWebSocket();
+if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
+// If the chat log is empty after loading history, show an onboarding hero.
+if (!chatHistory || chatHistory.length === 0) renderEmptyStateHero();
+
+// (Reconnect-on-visible is handled by the single visibilitychange
+// listener defined earlier — see connectWebSocket wiring above.)
+
+// ═══════════════════════════════════════════════════════════════
+//  Render Window – Visualizer Logic
+// ═══════════════════════════════════════════════════════════════
+
+// --- Mermaid init ---
+// Guarded: if the mermaid CDN failed to load, `mermaid` is undefined.
+// This runs at module top-level *before* the render-window element refs
+// and listeners below, so an unguarded throw here would leave those
+// consts in the TDZ and make `attachRenderButtons()` (called from
+// sendMessage's finally) throw on every completed message. Mirrors the
+// defensive marked/DOMPurify handling.
+// mermaid / chart.js / papaparse are loaded ON FIRST USE (2026-09-11).
+// They were five render-blocking <script> tags in <head>, 3.6 MB of which
+// mermaid alone was 3.3 MB — parsed on every cold load for features most
+// turns never touch. `_ensureVendor` injects the vendored file once and
+// resolves when its global exists; mermaid is initialised right after.
+const _VENDORS = {
+    // §4PR: mermaid is NOT loaded into this document any more — it runs in
+    // the opaque-origin sandboxed frame (renderMermaid). 10.9.1's
+    // sequence-label XSS (CVE-2025-54881) fired here under 'strict'.
+    chart:   { src: '/static/vendor/chart.umd.min.js', global: 'Chart' },
+    papaparse: { src: '/static/vendor/papaparse.min.js', global: 'Papa' },
+};
+const _vendorLoads = new Map();
+function _ensureVendor(name) {
+    const spec = _VENDORS[name];
+    if (!spec) return Promise.reject(new Error(`unknown vendor ${name}`));
+    if (window[spec.global]) return Promise.resolve(window[spec.global]);
+    if (_vendorLoads.has(name)) return _vendorLoads.get(name);
+    const p = new Promise((resolve, reject) => {
+        const el = document.createElement('script');
+        el.src = spec.src;
+        el.async = true;
+        el.onload = () => {
+            const g = window[spec.global];
+            if (!g) { reject(new Error(`${name} loaded but defined no ${spec.global}`)); return; }
+            resolve(g);
+        };
+        el.onerror = () => reject(new Error(`${name} failed to load`));
+        document.head.appendChild(el);
+    });
+    // A failed load must not poison every later attempt.
+    p.catch(() => _vendorLoads.delete(name));
+    _vendorLoads.set(name, p);
+    return p;
+}
+
+// --- Element references ---
+const renderWindow = document.getElementById('render-window');
+const renderHeader = document.getElementById('render-header');
+const renderIframe = document.getElementById('render-iframe');
+// Opaque-origin iframe for untrusted agent HTML/JS (see index.html).
+const renderIframeSandboxed = document.getElementById('render-iframe-sandboxed');
+const mermaidContainer = document.getElementById('mermaid-container');
+const chartContainer = document.getElementById('chart-container');
+const renderChart = document.getElementById('render-chart');
+const renderCloseBtn = document.getElementById('render-close');
+const renderZoomIn = document.getElementById('render-zoom-in');
+const renderZoomOut = document.getElementById('render-zoom-out');
+const renderDownloadBtn = document.getElementById('render-download');
+
+let currentChart = null;
+let currentZoom = 1.0;
+let currentRenderState = null;
+let _pdfBlobUrl = null;   // PDFs bypass the image LRU (multi-MB); one live URL
+
+// HTML-attribute escaper for srcdoc interpolation. The old code used
+// contentDocument.write + setAttribute to dodge attribute breakout —
+// correct, but document.write races the close handler's about:blank
+// navigation and cannot follow a PDF src (contentDocument inaccessible).
+// srcdoc with PROPERLY ESCAPED values is equally breakout-proof and
+// deterministic from any prior frame state.
+const _escAttr = (s) => String(s).replace(/[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;',
+              '"': '&quot;', "'": '&#39;' }[c]));
+
+// Every open path goes through this FIRST. Hiding a surface is not enough:
+// agent code in the sandboxed frame keeps running (audio, timers) while
+// display:none, a destroyed chart leaves its canvas, the previous mermaid
+// SVG masquerades as the new diagram, and a stale zoom magnifies a blank
+// margin. Tear down, then let the caller show its own surface.
+function resetRenderSurfaces() {
+    // §4PR: every open path supersedes an awaiting render (a late chart or
+    // vendor load painted over a newer image/HTML preview)
+    _renderSeq += 1;
+    renderIframe.style.display = 'none';
+    renderIframeSandboxed.style.display = 'none';
+    mermaidContainer.style.display = 'none';
+    chartContainer.style.display = 'none';
+    renderIframeSandboxed.removeAttribute('srcdoc');   // stops agent code
+    renderIframe.removeAttribute('srcdoc');
+    if (renderIframe.getAttribute('src')) renderIframe.src = 'about:blank';
+    mermaidContainer.replaceChildren();
+    if (currentChart) {
+        currentChart.destroy();
+        currentChart = null;
+    }
+    currentZoom = 1.0;
+    applyZoom();
+}
+
+// Wrapper-document helper for our OWN markup (never agent content).
+function _setMainFrameHTML(html) {
+    renderIframe.removeAttribute('src');
+    renderIframe.srcdoc = html;   // srcdoc wins over any queued navigation
+    renderIframe.style.display = 'block';
+}
+
+// Friendly in-window failure panel — a visualizer that pops open and shows
+// NOTHING is the defect class this file kept reproducing.
+function _showRenderError(text) {
+    currentRenderState = null;
+    _setMainFrameHTML(
+        '<!DOCTYPE html><html><head><style>'
+        + 'body{margin:0;height:100vh;display:flex;align-items:center;'
+        + 'justify-content:center;background:#0f0505;color:#ff8888;'
+        + 'font-family:monospace;font-size:14px;padding:24px;'
+        + 'box-sizing:border-box;text-align:center;}'
+        + '</style></head><body>' + _escAttr(text) + '</body></html>');
+}
+
+function closeRenderWindow() {
+    renderWindow.classList.add('hidden');
+    resetRenderSurfaces();
+    if (_pdfBlobUrl) {
+        try { URL.revokeObjectURL(_pdfBlobUrl); } catch (e) { /* ignore */ }
+        _pdfBlobUrl = null;
+    }
+    currentRenderState = null;
+}
+
+// --- Close button ---
+renderCloseBtn.addEventListener('click', closeRenderWindow);
+
+// --- Download helper ---
+if (renderDownloadBtn) {
+    renderDownloadBtn.addEventListener('click', () => {
+        if (!currentRenderState) return;
+
+        const triggerDownload = async (url, filename) => {
+            if (url.startsWith('blob:')) {
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            } else {
+                try {
+                    const response = await fetch(url);
+                    const blob = await response.blob();
+                    const objectUrl = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = objectUrl;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
+                } catch (e) {
+                    console.error("Download fallback", e);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                }
+            }
+        };
+
+        if (currentRenderState.type === 'image') {
+            const url = currentRenderState.src;
+            // The src is a blob: URL by the time we get here — the real
+            // filename was stashed at open time from the /api/download
+            // path (the old startsWith('http') branch never matched, so
+            // every image saved as image.png).
+            let filename = currentRenderState.name || 'image.png';
+            if (!currentRenderState.name && url.startsWith('http') && url.includes('/')) {
+                const parts = url.split('/');
+                filename = parts[parts.length - 1].split('?')[0] || 'image.png';
+            }
+            triggerDownload(url, filename);
+        } else if (currentRenderState.type === 'pdf') {
+            // Was a silent no-op: type 'pdf' matched no branch.
+            triggerDownload(currentRenderState.src,
+                currentRenderState.name || 'report.pdf');
+        } else if (currentRenderState.type === 'mermaid') {
+            // §4PR: the SVG came from the sandboxed frame (postMessage); it is
+            // saved as bytes and never parsed or shown in this document
+            let source = String(currentRenderState.svg || '');
+            if (!source) addMessage('system', 'The diagram has not finished rendering yet.');
+            if (source) {
+                if (!source.match(/^<svg[^>]+xmlns="http\:\/\/www\.w3\.org\/2000\/svg"/)) {
+                    source = source.replace(/^<svg/, '<svg xmlns="http://www.w3.org/2000/svg"');
+                }
+                const blob = new Blob([source], { type: "application/octet-stream" });
+                const url = URL.createObjectURL(blob);
+                triggerDownload(url, 'diagram.svg');
+                setTimeout(() => URL.revokeObjectURL(url), 100);
+            }
+        } else if (currentRenderState.type === 'chart') {
+            const canvas = document.getElementById('render-chart');
+            if (canvas) {
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = canvas.width;
+                tempCanvas.height = canvas.height;
+                const ctx = tempCanvas.getContext('2d');
+                ctx.fillStyle = '#0f0505';
+                ctx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+                ctx.drawImage(canvas, 0, 0);
+                triggerDownload(tempCanvas.toDataURL("image/png"), 'chart.png');
+            }
+        } else if (currentRenderState.type === 'html') {
+            const ext = currentRenderState.lang.replace('language-', '');
+            const filename = `code.${(ext === 'javascript' || ext === 'js') ? 'js' : ext}`;
+            let mimeType = 'text/plain;charset=utf-8';
+            if (ext === 'html') mimeType = 'text/html;charset=utf-8';
+            else if (ext === 'css') mimeType = 'text/css;charset=utf-8';
+            else if (ext === 'javascript' || ext === 'js') mimeType = 'application/javascript;charset=utf-8';
+            
+            const blob = new Blob([currentRenderState.content], { type: mimeType });
+            const url = URL.createObjectURL(blob);
+            triggerDownload(url, filename);
+            setTimeout(() => URL.revokeObjectURL(url), 100);
+        }
+    });
+}
+
+// --- Zoom helpers ---
+function applyZoom() {
+    const t = `scale(${currentZoom})`;
+    renderIframe.style.transform = t;
+    renderIframeSandboxed.style.transform = t;
+    mermaidContainer.style.transform = t;
+    chartContainer.style.transform = t;
+    renderIframe.style.transformOrigin = 'center center';
+    renderIframeSandboxed.style.transformOrigin = 'center center';
+    mermaidContainer.style.transformOrigin = 'center center';
+    chartContainer.style.transformOrigin = 'center center';
+}
+
+renderZoomIn.addEventListener('click', () => {
+    currentZoom = Math.min(currentZoom + 0.1, 3.0);
+    applyZoom();
+});
+
+renderZoomOut.addEventListener('click', () => {
+    currentZoom = Math.max(currentZoom - 0.1, 0.3);
+    applyZoom();
+});
+
+// --- Drag and Resize logic ---
+(function initDragAndResize() {
+    let isDragging = false;
+    let startX, startY, origLeft, origTop;
+
+    // --- DRAG ---
+    renderHeader.addEventListener('mousedown', onDragStart);
+    renderHeader.addEventListener('touchstart', onDragStart, { passive: false });
+
+    function onDragStart(e) {
+        // Ignore clicks on buttons inside the header
+        if (e.target.closest('.render-btn')) return;
+        isDragging = true;
+        
+        const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
+        const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
+
+        startX = clientX;
+        startY = clientY;
+        origLeft = renderWindow.offsetLeft;
+        origTop = renderWindow.offsetTop;
+        renderHeader.style.cursor = 'grabbing';
+        // Prevent either iframe from swallowing the drag's pointer events.
+        renderIframe.style.pointerEvents = 'none';
+        renderIframeSandboxed.style.pointerEvents = 'none';
+
+        if (e.cancelable) e.preventDefault();
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        document.addEventListener('touchmove', onMouseMove, { passive: false });
+        document.addEventListener('touchend', onMouseUp);
+    }
+
+    function onMouseMove(e) {
+        if (!isDragging) return;
+        const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
+        const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
+        const dx = clientX - startX;
+        const dy = clientY - startY;
+        // Clamp so at least a grabbable sliver of the header stays
+        // on-screen — a window dragged fully off-viewport had no recovery
+        // path (no reset control, position not persisted).
+        const w = renderWindow.offsetWidth;
+        const newLeft = Math.min(Math.max(origLeft + dx, -(w - 60)),
+            window.innerWidth - 60);
+        const newTop = Math.min(Math.max(origTop + dy, 0),
+            window.innerHeight - 44);
+        renderWindow.style.left = newLeft + 'px';
+        renderWindow.style.top = newTop + 'px';
+        if (e.cancelable) e.preventDefault();
+    }
+
+    function onMouseUp() {
+        if (isDragging) {
+            isDragging = false;
+            renderHeader.style.cursor = 'grab';
+            renderIframe.style.pointerEvents = 'auto'; // Restore iframe interactions
+            renderIframeSandboxed.style.pointerEvents = 'auto';
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            document.removeEventListener('touchmove', onMouseMove);
+            document.removeEventListener('touchend', onMouseUp);
+        }
+    }
+
+    // --- RESIZE ---
+    const resizer = document.createElement('div');
+    resizer.style.position = 'absolute';
+    resizer.style.bottom = '0';
+    resizer.style.right = '0';
+    resizer.style.width = '16px';
+    resizer.style.height = '16px';
+    resizer.style.cursor = 'nwse-resize';
+    resizer.style.zIndex = '1000';
+    // Match visual handle
+    resizer.style.background = 'linear-gradient(135deg, transparent 50%, rgba(139, 0, 0, 0.4) 50%)';
+    resizer.style.borderRadius = '0 0 12px 0';
+    renderWindow.appendChild(resizer);
+
+    let isResizing = false;
+    let startW, startH, startResX, startResY;
+
+    resizer.addEventListener('mousedown', onResizeStart);
+    resizer.addEventListener('touchstart', onResizeStart, { passive: false });
+
+    function onResizeStart(e) {
+        isResizing = true;
+        
+        const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
+        const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
+
+        startResX = clientX;
+        startResY = clientY;
+        const style = window.getComputedStyle(renderWindow);
+        startW = parseInt(style.width, 10);
+        startH = parseInt(style.height, 10);
+        renderIframe.style.pointerEvents = 'none'; // Prevent iframe event swallowing
+        renderIframeSandboxed.style.pointerEvents = 'none';
+
+        if (e.cancelable) e.preventDefault();
+        e.stopPropagation();
+
+        document.addEventListener('mousemove', onResizeMove);
+        document.addEventListener('mouseup', onResizeUp);
+        document.addEventListener('touchmove', onResizeMove, { passive: false });
+        document.addEventListener('touchend', onResizeUp);
+    }
+
+    function onResizeMove(e) {
+        if (!isResizing) return;
+        const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
+        const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
+        const newWidth = startW + clientX - startResX;
+        const newHeight = startH + clientY - startResY;
+        renderWindow.style.width = Math.max(200, newWidth) + 'px';
+        renderWindow.style.height = Math.max(150, newHeight) + 'px';
+        if (e.cancelable) e.preventDefault();
+    }
+
+    function onResizeUp() {
+        if (isResizing) {
+            isResizing = false;
+            renderIframe.style.pointerEvents = 'auto'; // Restore iframe interactions
+            renderIframeSandboxed.style.pointerEvents = 'auto';
+            document.removeEventListener('mousemove', onResizeMove);
+            document.removeEventListener('mouseup', onResizeUp);
+            document.removeEventListener('touchmove', onResizeMove);
+            document.removeEventListener('touchend', onResizeUp);
+        }
+    }
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  Render Buttons – "Visualize" on code blocks
+// ═══════════════════════════════════════════════════════════════
+
+function attachRenderButtons() {
+    const pres = chatLog.querySelectorAll('pre');
+    pres.forEach(pre => {
+        // Skip if already processed
+        if (pre.querySelector('.render-code-btn')) return;
+
+        const code = pre.querySelector('code');
+        if (!code) return;
+
+        // Check if the code block has a renderable language class
+        const lang = [...code.classList].find(c => RENDERABLE_LANGS.has(c));
+        if (!lang) return;
+
+        // Make the <pre> a positioning context
+        pre.style.position = 'relative';
+        pre.classList.add('renderable-hidden');
+
+        const btn = document.createElement('button');
+        btn.className = 'render-code-btn';
+        btn.textContent = 'Visualize';
+        pre.appendChild(btn);
+
+        btn.addEventListener('click', () => {
+            const codeText = code.textContent;
+
+            resetRenderSurfaces();
+            renderWindow.classList.remove('hidden');
+
+            if (lang === 'language-mermaid') {
+                renderMermaid(codeText);
+            } else if (lang === 'language-csv') {
+                renderCSV(codeText);
+            } else {
+                renderHTMLContent(codeText, lang);
+            }
+        });
+
+        // Auto-open the visualizer for freshly-arrived blocks, but not
+        // when we're rebuilding the log from history (that would spring
+        // the window open on every page/workspace load).
+        if (!_restoringHistory) btn.click();
+    });
+}
+
+// --- Mermaid renderer --- (caller ran resetRenderSurfaces)
+// §4PR (CRIT): the diagram source is model output, and mermaid 10.9.1 runs
+// script from a sequence-diagram label (CVE-2025-54881) even under
+// securityLevel 'strict' — in the document that holds GHOST_API_KEY, with
+// no click (fresh blocks auto-open). The library and the source now go
+// into the SANDBOXED frame (allow-scripts only, opaque origin), like agent
+// HTML: an exploit there cannot reach window.parent or the key. The frame
+// posts the SVG back only so Download can save it (never inserted here).
+let _mermaidNonce = '';
+function _mermaidSrcdoc(codeText, nonce) {
+    // JSON with '<' escaped: the source cannot close the <script> element
+    const src = JSON.stringify(String(codeText)).replace(/</g, '\\u003c');
+    const lib = new URL('/static/vendor/mermaid.min.js', location.href).href;
+    return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>'
+        + 'html,body{margin:0;background:#0f0505;color:rgba(158,170,192,0.6);font:13px monospace;}'
+        + 'body{display:flex;justify-content:center;align-items:center;min-height:100vh;}'
+        + '#d{max-width:100%;padding:8px;box-sizing:border-box;}#d svg{max-width:100%;height:auto;}'
+        + 'pre{white-space:pre-wrap;}.err{color:#ff4444;}'
+        + '</style></head><body><div id="d"><pre>Rendering diagram…</pre></div>'
+        + `<script src="${_escAttr(lib)}"><\/script><script>(function(){`
+        + 'var d=document.getElementById("d");'
+        + `var src=${src};var nonce=${JSON.stringify(nonce)};`
+        + 'function fail(m){d.textContent="";var p=document.createElement("pre");p.className="err";p.textContent=m;d.appendChild(p);}'
+        + 'if(!window.mermaid){fail("Diagram rendering unavailable (mermaid failed to load).");return;}'
+        + 'try{mermaid.initialize({startOnLoad:false,theme:"dark",securityLevel:"strict"});}catch(e){}'
+        + 'mermaid.render("g",src).then(function(r){d.innerHTML=r.svg;'
+        + 'try{parent.postMessage({ghostMermaid:nonce,svg:r.svg},"*");}catch(e){}})'
+        + '.catch(function(e){fail(String(e&&e.message||e));});'
+        + '})();<\/script></body></html>';
+}
+window.addEventListener('message', (ev) => {
+    const d = ev && ev.data;
+    if (!d || typeof d !== 'object' || !_mermaidNonce || d.ghostMermaid !== _mermaidNonce) return;
+    if (ev.source !== renderIframeSandboxed.contentWindow) return;
+    if (currentRenderState && currentRenderState.type === 'mermaid'
+            && currentRenderState.nonce === d.ghostMermaid) {
+        currentRenderState.svg = String(d.svg || '');
+    }
+});
+function renderMermaid(codeText) {
+    ++_renderSeq;
+    const nonce = (crypto.randomUUID ? crypto.randomUUID()
+        : String(Math.random()).slice(2) + Date.now());
+    _mermaidNonce = nonce;
+    currentRenderState = { type: 'mermaid', nonce, svg: '' };
+    renderIframeSandboxed.style.display = 'block';
+    renderIframeSandboxed.srcdoc = _mermaidSrcdoc(codeText, nonce);
+}
+
+// --- HTML / CSS / JS renderer --- (caller ran resetRenderSurfaces)
+function renderHTMLContent(codeText, lang) {
+    currentRenderState = { type: 'html', content: codeText, lang: lang };
+    // Agent code goes into the SANDBOXED frame only.
+    renderIframeSandboxed.style.display = 'block';
+
+    let html = codeText;
+    if (lang === 'language-css') {
+        html = `<!DOCTYPE html><html><head><style>${codeText}</style></head><body></body></html>`;
+    } else if (lang === 'language-javascript' || lang === 'language-js') {
+        html = `<!DOCTYPE html><html><head></head><body><script>${codeText}<\/script></body></html>`;
+    }
+
+    // srcdoc + sandbox="allow-scripts" (no allow-same-origin) runs the
+    // agent code in an opaque origin: it can't reach window.parent, so it
+    // can't read the injected GHOST_API_KEY or drive our /api/* calls.
+    // Using srcdoc (not contentDocument.write) is what lets us drop
+    // allow-same-origin — the parent never needs to touch the doc.
+    renderIframeSandboxed.srcdoc = html;
+}
+
+// --- CSV / Chart renderer --- (caller ran resetRenderSurfaces)
+async function renderCSV(codeText) {
+    const seq = ++_renderSeq;
+    // Both libraries load on first use; a failed load previously threw a
+    // raw ReferenceError out of the click handler with the window already
+    // open on stale content.
+    try {
+        await Promise.all([_ensureVendor('papaparse'), _ensureVendor('chart')]);
+    } catch (e) {
+        if (seq !== _renderSeq) return;
+        _showRenderError('Chart rendering unavailable (vendor library failed to load).');
+        return;
+    }
+    if (seq !== _renderSeq) return;
+    currentRenderState = { type: 'chart' };
+    chartContainer.style.display = 'block';
+
+    const parsed = Papa.parse(codeText.trim(), {
+        header: true,
+        dynamicTyping: true,
+        skipEmptyLines: true
+    });
+
+    const fields = parsed.meta.fields;
+    if (!fields || fields.length < 2) {
+        // Was a silent `return`: empty black panel, and Download handed
+        // out a black PNG of the destroyed chart.
+        chartContainer.style.display = 'none';
+        _showRenderError('This CSV needs a header row and at least two columns to chart.');
+        return;
+    }
+
+    const labelKey = fields[0];
+    const labelsArray = parsed.data.map(row => row[labelKey]);
+
+    // Palette for multiple datasets
+    const palette = [
+        'rgba(139, 0, 0, 0.8)',
+        'rgba(0, 243, 255, 0.8)',
+        'rgba(0, 255, 157, 0.8)',
+        'rgba(189, 0, 255, 0.8)',
+        'rgba(255, 170, 0, 0.8)',
+        'rgba(255, 51, 102, 0.8)'
+    ];
+
+    const datasetsArray = fields.slice(1).map((key, i) => ({
+        label: key,
+        data: parsed.data.map(row => row[key]),
+        backgroundColor: palette[i % palette.length],
+        borderColor: palette[i % palette.length].replace('0.8', '1'),
+        borderWidth: 1
+    }));
+
+    currentChart = new Chart(document.getElementById('render-chart'), {
+        type: 'bar',
+        data: { labels: labelsArray, datasets: datasetsArray },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            color: '#fff',
+            plugins: {
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: { ticks: { color: '#fff' }, grid: { color: 'rgba(255,255,255,0.08)' } },
+                y: { ticks: { color: '#fff' }, grid: { color: 'rgba(255,255,255,0.08)' } }
+            }
+        }
+    });
+}
+
+// Zoomed-image viewer via srcdoc. The src is interpolated through
+// _escAttr, which closes the `" onload="alert(1)` attribute-breakout the
+// old document.write/setAttribute approach existed to prevent — while
+// being deterministic from ANY prior frame state (document.write can't
+// follow a PDF src and raced the close handler's navigation).
+function writeImageIntoIframe(iframe, imgSrc) {
+    if (!iframe) return;
+    _setMainFrameHTML(
+        '<!DOCTYPE html><html><head><style>'
+        + 'body{margin:0;display:flex;justify-content:center;align-items:center;'
+        + 'height:100vh;background:#0f0505;}'
+        + 'img{max-width:100%;max-height:100%;object-fit:contain;'
+        + 'border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,0.5);}'
+        + '</style></head><body>'
+        + `<img src="${_escAttr(imgSrc)}">`
+        + '</body></html>'
+    );
+}
+
+function openImageInVisualizer(imgEl) {
+    resetRenderSurfaces();
+    currentRenderState = {
+        type: 'image', src: imgEl.src,
+        name: imgEl.dataset.ghostName || null,
+    };
+    writeImageIntoIframe(renderIframe, imgEl.src);
+    renderWindow.classList.remove('hidden');
+}
+
+chatLog.addEventListener('click', (e) => {
+    if (e.target.tagName === 'IMG' && e.target.closest('.message')) {
+        openImageInVisualizer(e.target);
+    }
+});
+
+
+// Auto-open images in Visualizer (Robust against streaming DOM destruction).
+//
+// The agent emits images as markdown pointing at `/api/download/<file>`,
+// which is gated by `X-Ghost-Key`. Browsers don't attach custom headers to
+// plain <img> loads, so the image 401s — both the chat thumbnail and the
+// visualizer iframe render empty. Route the load through the authed fetch
+// wrapper and swap to a blob URL before handing it to the iframe.
+//
+// Map is used as a simple LRU: re-setting a key moves it to the end of
+// insertion order, and we evict from the front when we exceed the cap.
+// Without eviction the cache leaks blob URLs indefinitely (long chats
+// with many images exhaust browser memory).
+const AUTHED_BLOB_CACHE_MAX = 100;
+const _authedBlobCache = new Map();  // raw URL → blob object URL
+
+function _evictAuthedBlobCache() {
+    let guard = _authedBlobCache.size;
+    while (_authedBlobCache.size > AUTHED_BLOB_CACHE_MAX && guard-- > 0) {
+        const oldestKey = _authedBlobCache.keys().next().value;
+        const oldestUrl = _authedBlobCache.get(oldestKey);
+        _authedBlobCache.delete(oldestKey);
+        // Never revoke the URL the visualizer is showing RIGHT NOW —
+        // that blanked the open preview and killed its Download button.
+        // Re-insert as most-recent and evict the next-oldest instead.
+        if (currentRenderState && currentRenderState.src === oldestUrl) {
+            _authedBlobCache.set(oldestKey, oldestUrl);
+            continue;
+        }
+        try { URL.revokeObjectURL(oldestUrl); } catch (e) { /* ignore */ }
+    }
+}
+
+// §4MR: the blob types an authed image may keep — raster only (SVG and
+// anything else become inert octet-streams, which an <img> cannot show and
+// a new tab downloads instead of running).
+const _RASTER_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp',
+                                     'image/avif', 'image/bmp']);
+function _safeImageBlobType(type) {
+    const t = String(type || '').split(';')[0].trim().toLowerCase();
+    return _RASTER_IMAGE_TYPES.has(t) ? t : 'application/octet-stream';
+}
+
+// §4PR: streaming rebuilds the bubble every frame, so the same image src
+// arrives many times — one fetch in flight per src, and the visualizer
+// auto-opens an image once per turn (it re-opened every frame, resetting a
+// newer preview and undoing the user's close).
+function _toAuthedBlobUrl(rawSrc) {
+    if (!rawSrc || !_ownApiUrl(rawSrc, '/api/download/')) return Promise.resolve(rawSrc);
+    if (_authedBlobCache.has(rawSrc)) return _fetchAuthedBlobUrl(rawSrc);
+    if (_authedBlobInflight.has(rawSrc)) return _authedBlobInflight.get(rawSrc);
+    const p = _fetchAuthedBlobUrl(rawSrc);
+    _authedBlobInflight.set(rawSrc, p);
+    const done = () => { _authedBlobInflight.delete(rawSrc); };
+    p.then(done, done);
+    return p;
+}
+
+async function _fetchAuthedBlobUrl(rawSrc) {
+    if (_authedBlobCache.has(rawSrc)) {
+        // Touch: delete + re-set to mark as most recently used.
+        const cached = _authedBlobCache.get(rawSrc);
+        _authedBlobCache.delete(rawSrc);
+        _authedBlobCache.set(rawSrc, cached);
+        return cached;
+    }
+    const res = await fetch(rawSrc);
+    if (!res.ok) throw new Error(`image fetch ${res.status}`);
+    const raw = await res.blob();
+    // §4MR: a blob keeps the server's type, and a blob: URL opened in a new
+    // tab runs in THIS origin — an agent-linked SVG could then script the
+    // page and read the key. Only raster types stay images.
+    const safeType = _safeImageBlobType(raw.type);
+    const blob = safeType === raw.type ? raw : new Blob([raw], { type: safeType });
+    const blobUrl = URL.createObjectURL(blob);
+    _authedBlobCache.set(rawSrc, blobUrl);
+    _evictAuthedBlobCache();
+    return blobUrl;
+}
+
+async function _handleChatImage(img) {
+    // Capture the restore state synchronously, BEFORE any await. The
+    // auto-open decision below happens after an async blob fetch, by
+    // which point _restoringHistory's macrotask reset may already have
+    // fired — so we can't read the live flag there.
+    const restoringAtStart = _restoringHistory;
+    let swappedToBlob = false;
+    const rawSrc = img.getAttribute('src') || '';
+    try {
+        if (_ownApiUrl(rawSrc, '/api/download/')) {
+            // The original <img src="/api/download/..."> load starts the
+            // moment marked inserts it into the DOM; the browser can't
+            // attach the X-Ghost-Key header to a plain <img>, so that
+            // initial load 401s. We rewrite src to an authed blob URL
+            // that succeeds.
+            //
+            // Deliberately DO NOT attach an error listener for authed
+            // images. Safari delivers the original 401 "error" event
+            // asynchronously (sometimes after we've swapped src), and
+            // blob URLs load from memory — they don't meaningfully
+            // fail. Genuine fetch failures are already caught below
+            // and surface via _showBrokenImagePlaceholder.
+            const blobUrl = await _toAuthedBlobUrl(rawSrc);
+            if (blobUrl !== rawSrc) {
+                img.src = blobUrl;
+                swappedToBlob = true;
+                // Real filename for the visualizer's Download button — by
+                // open time the src is an anonymous blob: URL.
+                img.dataset.ghostName =
+                    rawSrc.split('/').pop().split('?')[0] || '';
+            }
+        } else {
+            // Non-API URL: browser loads it natively, no rewrite, so
+            // surface genuine load failures up front.
+            img.addEventListener('error', () => { _showBrokenImagePlaceholder(img); }, { once: true });
+        }
+    } catch (e) {
+        // Authed fetch itself failed (401/404/network) — render the
+        // broken badge directly instead of leaving the unresolved <img>.
+        console.warn('Authed image fetch failed', e);
+        _showBrokenImagePlaceholder(img);
+        return;
+    }
+
+    // The img may have been destroyed mid-stream when the agent's
+    // streaming content kept rebuilding innerHTML. If so, bail quietly
+    // — the NEXT img the observer sees will get its own processing.
+    if (!img.parentNode) return;
+
+    const renderWindow = document.getElementById('render-window');
+    const renderIframe = document.getElementById('render-iframe');
+    const mermaidContainer = document.getElementById('mermaid-container');
+    const chartContainer = document.getElementById('chart-container');
+
+    // Only auto-open the visualizer for live images. When restoring
+    // history we still swap to the blob URL and add the reopen button
+    // below, but we don't pop the floating window open on page load.
+    if (!restoringAtStart && !_autoOpenedImgSrcs.has(rawSrc)) {
+        _autoOpenedImgSrcs.add(rawSrc);
+        openImageInVisualizer(img);
+    }
+
+    const placeholder = document.createElement('button');
+    placeholder.className = 'icon-btn';
+    placeholder.textContent = '🖼️';
+    placeholder.title = 'Open Image';
+    placeholder.style.width = '100%';
+    placeholder.style.borderRadius = '8px';
+    placeholder.style.marginTop = '10px';
+    placeholder.style.height = '40px';
+    placeholder.onclick = () => { openImageInVisualizer(img); };
+    // Insert BEFORE hiding the img so a concurrent error event (rare,
+    // blob-decode failure) can't run `img.replaceWith(badge)` while
+    // the placeholder button is still un-inserted — that would leave
+    // the chat with only the badge and no way to reopen the image.
+    img.parentNode.insertBefore(placeholder, img);
+    img.classList.add('renderable-hidden-img');
+    // Stash the button on the img so `_showBrokenImagePlaceholder` can
+    // detect "this image was already successfully processed, don't
+    // replace it" even if Safari dispatches a late spurious error.
+    img._ghostPlaceholderBtn = placeholder;
+}
+
+// PDF report support.
+//
+// The agent's `report_pdf` tool returns markdown of the form
+//   [📄 Title (PDF)](/api/download/report_xxx.pdf)
+// which marked renders as a plain <a href="/api/download/...">. A plain
+// navigation 401s (no X-Ghost-Key header), so we intercept the click and
+// fetch the blob ourselves. History of this feature (2026-08-01 review):
+// the first version nested an iframe inside a sandbox'd iframe — the
+// plugins-sandbox flag is unclearable and inherited, so the PDF viewer
+// was blocked in EVERY engine and the window opened onto nothing.
+// Now: desktop gets the blob straight into the (unsandboxed, same-origin)
+// #render-iframe — browsers render application/pdf blobs natively. iOS
+// cannot render PDFs in ANY subframe (platform limit, not fixable with
+// attributes), so it gets an in-window panel whose "Open PDF" link
+// targets a new top-level tab, where Safari's native viewer works.
+function _showPdfPanel(pdfBlobUrl, filename) {
+    _setMainFrameHTML(
+        '<!DOCTYPE html><html><head><style>'
+        + 'body{margin:0;height:100vh;display:flex;flex-direction:column;gap:18px;'
+        + 'align-items:center;justify-content:center;background:#0f0505;'
+        + 'font-family:-apple-system,sans-serif;}'
+        + 'a{color:#0ff;font-size:18px;text-decoration:none;border:1px solid #0aa;'
+        + 'border-radius:10px;padding:14px 26px;}'
+        + 'p{color:#9eaac0;font-size:13px;margin:0;}'
+        + '</style></head><body>'
+        + `<a href="${_escAttr(pdfBlobUrl)}" target="_blank" rel="noopener">📄 Open ${_escAttr(filename)}</a>`
+        + '<p>PDF preview opens in a new tab on this device.</p>'
+        + '</body></html>');
+}
+
+async function _handleChatPdfLink(link) {
+    // Decorate the anchor with a clear PDF affordance so users know it's
+    // a document deliverable, not a generic link. The label is built once
+    // on first sight; reopens reuse the same DOM.
+    const labelText = link.textContent && link.textContent.trim()
+        ? link.textContent.trim()
+        : 'Open PDF';
+    if (!link.dataset.pdfDecorated) {
+        link.dataset.pdfDecorated = '1';
+        link.classList.add('pdf-link');
+        link.title = 'Open PDF in visualizer (and download)';
+    }
+
+    link.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        const rawHref = link.getAttribute('href') || '';
+        const filename = rawHref.split('/').pop().split('?')[0] || 'report.pdf';
+        try {
+            // Dedicated blob, NOT the image LRU: PDFs are multi-MB and a
+            // 100-entry cache of them is a phone tab-kill. One live URL,
+            // revoked on replace and on window close.
+            const res = await fetch(rawHref || link.href);
+            if (!res.ok) throw new Error(`PDF fetch ${res.status}`);
+            const fetched = await res.blob();
+            // §4ML CRIT: the native-viewer frame is NOT sandboxed and a blob
+            // URL inherits this page's origin — only real PDF bytes may load
+            // there, typed as a PDF whatever the server said.
+            const head = new Uint8Array(await fetched.slice(0, 5).arrayBuffer());
+            if (String.fromCharCode(...head) !== '%PDF-') throw new Error('not a PDF file');
+            const blob = new Blob([fetched], { type: 'application/pdf' });
+            if (_pdfBlobUrl) {
+                try { URL.revokeObjectURL(_pdfBlobUrl); } catch (e) { /* ignore */ }
+            }
+            _pdfBlobUrl = URL.createObjectURL(blob);
+
+            resetRenderSurfaces();
+            currentRenderState = { type: 'pdf', src: _pdfBlobUrl, name: filename };
+            if (isIOS) {
+                _showPdfPanel(_pdfBlobUrl, filename);
+            } else {
+                renderIframe.removeAttribute('srcdoc');
+                renderIframe.src = _pdfBlobUrl;   // native viewer
+                renderIframe.style.display = 'block';
+            }
+            renderWindow.classList.remove('hidden');
+            // No auto-download anymore: it prompted on every click (iOS)
+            // and could fall outside the user-activation window. The
+            // window's Download button covers keeping a copy.
+        } catch (e) {
+            console.warn('PDF fetch failed', e);
+            resetRenderSurfaces();
+            renderWindow.classList.remove('hidden');
+            _showRenderError(`Could not load ${filename}: ${e.message || e}`);
+        }
+    });
+
+    // If the link was rendered without visible text (rare — agent style
+    // is `[📄 Title (PDF)](...)`, which always has text), set a sensible
+    // label so it's still clickable.
+    if (!link.textContent || !link.textContent.trim()) {
+        link.textContent = `📄 ${labelText}`;
+    }
+}
+
+function _processChatLogArtifacts() {
+    document.querySelectorAll('#chat-log img').forEach(img => {
+        if (img.classList.contains('placeholder-added')) return;
+        img.classList.add('placeholder-added');
+        img.dataset.ghostSrc = img.getAttribute('src') || '';   // _replaceStreamBubble's key
+        // _handleChatImage owns the error-listener lifecycle — it has
+        // to wait until AFTER the authed blob-URL swap to attach it,
+        // so the expected 401 on the initial unauthed load doesn't
+        // spuriously trigger the broken-image badge.
+        _handleChatImage(img);
+    });
+
+    // Capture PDF download links emitted by tools/report_pdf.py.
+    // Matches `/api/download/*.pdf` (case-insensitive) anywhere in the
+    // href so we still hit nested or proxied URLs. Other file types
+    // continue to use the browser's default <a> behaviour.
+    document.querySelectorAll('#chat-log a[href*="/api/download/"]').forEach(link => {
+        if (link.dataset.pdfHandled) return;
+        const href = link.getAttribute('href') || '';
+        // §4ML CRIT: the PATH must end in .pdf (`x.html?.pdf` matched the
+        // old regex and loaded agent HTML into the same-origin frame)
+        const own = _ownApiUrl(href, '/api/download/');
+        if (!own || !/\.pdf$/i.test(own.pathname)) return;
+        link.dataset.pdfHandled = '1';
+        _handleChatPdfLink(link);
+    });
+}
+
+const chatObserver = new MutationObserver(_processChatLogArtifacts);
+const chatLogElement = document.getElementById('chat-log');
+if (chatLogElement) {
+    chatObserver.observe(chatLogElement, { childList: true, subtree: true });
+    // A MutationObserver only reports FUTURE mutations, so chat history
+    // restored by loadChatState() (which ran earlier, before this point)
+    // was never processed — its images would 401 and show broken. Do one
+    // initial pass over the already-present nodes. _restoringHistory is
+    // still true here (its reset is a macrotask that runs after this
+    // synchronous script), so restored images get the authed-blob swap
+    // without auto-opening the visualizer.
+    _processChatLogArtifacts();
+}
+
+function _showBrokenImagePlaceholder(img) {
+    // Replace a failed <img> with a visible badge so users aren't staring
+    // at a silent blank. Surfaces auth / 404 / network failures.
+    if (img.dataset.brokenHandled) return;
+    // Guard 1: blob URLs load synchronously from memory and don't fail
+    // in practice. A spurious error on a blob src is almost always
+    // Safari dispatching the original unauthed 401 late, after we've
+    // already swapped — ignore it.
+    if (img.src && img.src.startsWith('blob:')) return;
+    // Guard 2: if the image was already decorated with a placeholder
+    // button (meaning the authed flow completed successfully), the
+    // user has a working way to reopen the visualizer — don't clobber.
+    if (img._ghostPlaceholderBtn) return;
+    img.dataset.brokenHandled = '1';
+    const badge = document.createElement('div');
+    badge.className = 'broken-image-badge';
+    const name = (img.getAttribute('alt') || img.getAttribute('src') || 'image')
+        .split('/').pop().split('?')[0].slice(0, 64);
+    badge.textContent = `🖼️ image unavailable — ${name}`;
+    badge.dataset.ghostSrc = img.dataset.ghostSrc || '';   // a streaming re-render keeps the badge
+    img.replaceWith(badge);
+}
+
+// Release resources on page unload so zombies don't pile up across
+// reloads. Closing the WebSocket lets the server drop the socket from
+// `connected_websockets` immediately instead of waiting for the TCP RST.
+// Disconnecting the MutationObserver is harmless during unload but helps
+// in tests / reused windows.
+// ⚠ `pagehide`, guarded on `!persisted` — NOT `beforeunload`.
+//
+// `beforeunload` does not block bfcache in Safari or Chrome, and this
+// handler performs teardown that NOTHING restores: `chatObserver.observe()`
+// runs exactly once, at module init, and neither pageshow handler
+// re-observes. So opening a PDF and hitting Back left a page where every
+// existing <img> pointed at a REVOKED blob (and could not be reprocessed,
+// because `_processChatLogArtifacts` bails on the surviving
+// `placeholder-added` class) and every FUTURE image or PDF link went
+// unprocessed — a plain /api/download/ load that 401s with no broken-image
+// badge (R2 lens B). The code's own `e.persisted` handling proves bfcache
+// is expected here.
+window.addEventListener('pagehide', (e) => {
+    if (e.persisted) return;   // going into bfcache — the page comes BACK
+    try { chatObserver.disconnect(); } catch (err) { /* ignore */ }
+    try { if (ws) ws.close(); } catch (err) { /* ignore */ }
+    // Revoke every cached blob URL so the browser releases the memory
+    // promptly instead of waiting for GC on a navigated-away document.
+    for (const url of _authedBlobCache.values()) {
+        try { URL.revokeObjectURL(url); } catch (err) { /* ignore */ }
+    }
+    _authedBlobCache.clear();
+});
+
+
+// --- TTS Engine ---
+const ttsToggleBtn = document.getElementById('tts-toggle-btn');
+if (ttsToggleBtn) {
+    ttsToggleBtn.addEventListener('click', () => {
+        isTTSActive = !isTTSActive;
+        ttsToggleBtn.classList.toggle('active', isTTSActive);
+        
+        if (isTTSActive) {
+            // UNLOCK BROWSER AUTOPLAY via Web Audio API
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+            // Play a silent buffer to explicitly register user interaction with Apple WebKit
+            const silentBuffer = audioCtx.createBuffer(1, 1, 22050);
+            const silentSource = audioCtx.createBufferSource();
+            silentSource.buffer = silentBuffer;
+            silentSource.connect(audioCtx.destination);
+            silentSource.start(0);
+        } else {
+            stopTTS();
+        }
+    });
+}
+
+function stopTTS() {
+    // ⚠ BUMP THE GENERATION FIRST. `processTTSFetch` shifts its text before
+    // awaiting /api/tts, then pushes the blob and calls playNextAudio() —
+    // against state this function just cleared. So an interrupted clip
+    // played ANYWAY: the mic path's "full duplex interruption" is exactly
+    // this, the agent talking over the user's recording (R3 lens B).
+    _ttsGeneration += 1;
+    // Revoke what we drop, or every interruption leaks a blob URL.
+    for (const url of ttsAudioQueue) {
+        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    }
+    ttsTextQueue = [];
+    ttsAudioQueue = [];
+    ttsBuffer = "";
+    if (currentAudioSource) {
+        try { currentAudioSource.stop(); } catch(e) {}
+        try { currentAudioSource.disconnect(); } catch(e) {}
+        try { currentAudioSource.pause(); } catch(e) {}
+        currentAudioSource = null;
+    }
+    isPlayingTTS = false;
+    isFetchingTTS = false;
+    // Kill the analyser rAF loop and reset the sphere's audio level so
+    // it decays immediately instead of drifting after a stop.
+    if (typeof _stopTTSAudioPump === 'function') _stopTTSAudioPump();
+}
+
+// Bumped by stopTTS. Every await inside the TTS pipeline re-checks it, so
+// an interrupted clip cannot resurrect itself after the queue was cleared.
+let _ttsGeneration = 0;
+
+function queueTTS(text) {
+    ttsTextQueue.push(text);
+    processTTSFetch();
+}
+
+async function processTTSFetch() {
+    if (isFetchingTTS || ttsTextQueue.length === 0) return;
+    isFetchingTTS = true;
+
+    let text = ttsTextQueue.shift();
+    const gen = _ttsGeneration;
+
+    try {
+        let res = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: text })
+        });
+        if (gen !== _ttsGeneration) {
+            // stopTTS ran while this was in flight. Anything we do now
+            // speaks over whatever replaced it.
+            isFetchingTTS = false;
+            return;
+        }
+        if (res.ok) {
+            let blob = await res.blob();
+            if (gen !== _ttsGeneration) { isFetchingTTS = false; return; }
+            let audioUrl = URL.createObjectURL(blob);
+            ttsAudioQueue.push(audioUrl);
+            if (!isPlayingTTS) playNextAudio();
+        } else {
+            // Same as STT: /api/tts carries the reason (voice unavailable,
+            // text too long, `say` timed out) and the user saw NOTHING at
+            // all — console-only (R3 lens A).
+            const _e = await _httpError(res, '🔊 Voice error');
+            console.error("TTS Fetch Error:", _e.message);
+            addMessage('system', _e.message);
+        }
+    } catch (e) {
+        console.error("TTS Fetch Error:", e);
+    }
+    
+    isFetchingTTS = false;
+    // Recursively fetch the next chunk while audio is playing
+    if (gen === _ttsGeneration && ttsTextQueue.length > 0) {
+        processTTSFetch();
+    }
+}
+
+// Route a freshly-created <audio> through the shared AudioContext with
+// an AnalyserNode so the sphere visualizer can react to the voice.
+// Fails safe: if any step throws (iOS Safari has been fussy about
+// createMediaElementSource in the past), we silently fall back to
+// plain element playback so TTS is never broken by the visualizer.
+//
+// Notes on Safari quirks:
+//   * createMediaElementSource can only be called once per element.
+//     We always pass a freshly-constructed Audio, so that's fine.
+//   * Once an element is routed through AudioContext, its audio only
+//     comes out via the context's destination — remember to connect
+//     the analyser to audioCtx.destination.
+//   * iOS requires the context to be resumed after a user gesture.
+//     stopTTS/start paths already handle resume(); we defend again
+//     here in case playback starts via a different code path.
+let _ttsAnalyser = null;
+let _ttsAudioDataArr = null;
+let _ttsAudioRafId = null;
+
+function _ensureTTSAnalyser() {
+    if (_ttsAnalyser || !audioCtx) return _ttsAnalyser;
+    try {
+        _ttsAnalyser = audioCtx.createAnalyser();
+        _ttsAnalyser.fftSize = 128;
+        _ttsAudioDataArr = new Uint8Array(_ttsAnalyser.frequencyBinCount);
+        _ttsAnalyser.connect(audioCtx.destination);
+    } catch (e) {
+        console.warn('AnalyserNode unavailable — audio-reactive sphere disabled', e);
+        _ttsAnalyser = null;
+    }
+    return _ttsAnalyser;
+}
+
+function _pumpTTSAudioLevel() {
+    if (!_ttsAnalyser || !_ttsAudioDataArr) return;
+    _ttsAnalyser.getByteFrequencyData(_ttsAudioDataArr);
+    let sum = 0;
+    for (let i = 0; i < _ttsAudioDataArr.length; i++) sum += _ttsAudioDataArr[i];
+    const avg = sum / (_ttsAudioDataArr.length * 255);  // 0..1
+    if (activeFace && typeof activeFace.setAudioLevel === 'function') {
+        activeFace.setAudioLevel(avg);
+    }
+    _ttsAudioRafId = requestAnimationFrame(_pumpTTSAudioLevel);
+}
+
+function _startTTSAudioPump() {
+    if (_ttsAudioRafId !== null) return;
+    _ttsAudioRafId = requestAnimationFrame(_pumpTTSAudioLevel);
+}
+function _stopTTSAudioPump() {
+    if (_ttsAudioRafId !== null) {
+        cancelAnimationFrame(_ttsAudioRafId);
+        _ttsAudioRafId = null;
+    }
+    if (activeFace && typeof activeFace.setAudioLevel === 'function') {
+        activeFace.setAudioLevel(0);
+    }
+}
+
+// Microphone level → the face while you hold to talk (2026-09-11). The
+// input is analysed only (never routed to the speakers); the pump stops
+// with the recorder.
+let _micAnalyser = null, _micSource = null, _micData = null, _micRafId = null;
+function _startMicAudioPump(stream) {
+    try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        _micSource = audioCtx.createMediaStreamSource(stream);
+        _micAnalyser = audioCtx.createAnalyser();
+        _micAnalyser.fftSize = 128;
+        _micData = new Uint8Array(_micAnalyser.frequencyBinCount);
+        _micSource.connect(_micAnalyser);
+        const pump = () => {
+            if (!_micAnalyser) return;
+            _micAnalyser.getByteFrequencyData(_micData);
+            let sum = 0;
+            for (let i = 0; i < _micData.length; i++) sum += _micData[i];
+            if (typeof activeFace.setAudioLevel === 'function') {
+                activeFace.setAudioLevel(Math.min(1, (sum / (_micData.length * 255)) * 2.2));
+            }
+            _micRafId = requestAnimationFrame(pump);
+        };
+        _micRafId = requestAnimationFrame(pump);
+    } catch (e) {
+        console.warn('mic analyser unavailable — face will not react to the voice', e);
+    }
+}
+function _stopMicAudioPump() {
+    if (_micRafId !== null) { cancelAnimationFrame(_micRafId); _micRafId = null; }
+    try { if (_micSource) _micSource.disconnect(); } catch (e) { /* ignore */ }
+    _micSource = null; _micAnalyser = null; _micData = null;
+    if (typeof activeFace.setAudioLevel === 'function') activeFace.setAudioLevel(0);
+}
+
+function playNextAudio() {
+    if (isPlayingTTS || ttsAudioQueue.length === 0) return;
+    isPlayingTTS = true;
+
+    let audioUrl = ttsAudioQueue.shift();
+
+    currentAudioSource = new Audio(audioUrl);
+
+    const cleanupAndNext = () => {
+        URL.revokeObjectURL(audioUrl);
+        isPlayingTTS = false;
+        // Only halt the pump when the queue is fully drained — back-to-back
+        // clips should keep the visualizer hot without resetting to 0.
+        if (ttsAudioQueue.length === 0) _stopTTSAudioPump();
+        playNextAudio();
+    };
+
+    currentAudioSource.onended = cleanupAndNext;
+    currentAudioSource.onerror = cleanupAndNext;
+
+    // Best-effort analyser wiring. Any failure here must not block
+    // playback — the sphere visualizer is purely cosmetic.
+    let wiredAnalyser = false;
+    try {
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        const analyser = _ensureTTSAnalyser();
+        if (analyser) {
+            const src = audioCtx.createMediaElementSource(currentAudioSource);
+            src.connect(analyser);
+            wiredAnalyser = true;
+            _startTTSAudioPump();
+        }
+    } catch (e) {
+        // iOS Safari occasionally rejects createMediaElementSource for
+        // cross-origin-ish blob URLs; swallow and play the element
+        // natively. Next clip will try again fresh.
+        console.warn('TTS analyser wiring skipped:', e && e.message);
+    }
+
+    currentAudioSource.play().catch(e => {
+        console.error("Audio playback rejected:", e);
+        cleanupAndNext();
+    });
+}
+
+// --- Push-To-Talk Audio Engine (Mic) ---
+const micBtn = document.getElementById('mic-btn');
+let isRecording = false;
+// §4PR: push-to-talk = the press is HELD. A release during the
+// getUserMedia wait (a quick tap, the first permission prompt) found
+// isRecording still false and stopped nothing — the recorder then started
+// with no press held and auto-sent on the NEXT tap's release.
+let _micPressHeld = false;
+let _micStarting = false;
+
+if (micBtn) {
+    const startRecording = async (e) => {
+        if (e.cancelable) e.preventDefault();
+        _micPressHeld = true;
+        if (isRecording || _micStarting) return;
+        _micStarting = true;
+        try { await _startRecordingHeld(e); } finally { _micStarting = false; }
+    };
+    const _startRecordingHeld = async (e) => {
+
+        stopTTS(); // Full Duplex Interruption
+
+        // Voice in → voice out. Holding the mic is both the intent signal
+        // ("I'm hands-free") and the user gesture browsers require before
+        // they will play audio, so we unlock autoplay HERE rather than
+        // behind a separate TTS button (the header has no room for one —
+        // see index.html). Typing a message switches speech back off.
+        isTTSActive = true;
+        try {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            // A silent buffer is what actually registers the interaction
+            // with Apple WebKit; resume() alone is not enough on iOS.
+            const silentBuffer = audioCtx.createBuffer(1, 1, 22050);
+            const silentSource = audioCtx.createBufferSource();
+            silentSource.buffer = silentBuffer;
+            silentSource.connect(audioCtx.destination);
+            silentSource.start(0);
+        } catch (_) { /* autoplay unlock is best-effort; STT still works */ }
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            addMessage('system', '🎙️ Error: Microphone access requires HTTPS or localhost context.');
+            return;
+        }
+
+        // iOS Safari can silently hang on getUserMedia — give it a 5s ceiling.
+        let permTimeout;
+        try {
+            const permPromise = navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    sampleRate: 16000,
+                    channelCount: 1
+                }
+            });
+            const timeoutPromise = new Promise((_, reject) => {
+                permTimeout = setTimeout(() => reject(new Error('Permission timeout')), 5000);
+            });
+            const stream = await Promise.race([permPromise, timeoutPromise]);
+            clearTimeout(permTimeout);
+            if (!_micPressHeld) {
+                // released while the permission/stream was pending: no
+                // recording, and the microphone goes off again
+                stream.getTracks().forEach(track => track.stop());
+                return;
+            }
+
+            // iOS Safari does not encode audio/webm — pick a supported MIME type.
+            const candidates = [
+                'audio/mp4',
+                'audio/mp4;codecs=mp4a.40.2',
+                'audio/aac',
+                'audio/webm;codecs=opus',
+                'audio/webm',
+                'audio/wav'
+            ];
+            let chosenMime = '';
+            if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
+                chosenMime = candidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
+            }
+            mediaRecorder = chosenMime
+                ? new MediaRecorder(stream, { mimeType: chosenMime })
+                : new MediaRecorder(stream);
+            audioChunks = [];
+            _startMicAudioPump(stream);
+
+            mediaRecorder.ondataavailable = event => {
+                if (event.data.size > 0) audioChunks.push(event.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                _stopMicAudioPump();
+                const blobType = mediaRecorder.mimeType || chosenMime || 'audio/webm';
+                const audioBlob = new Blob(audioChunks, { type: blobType });
+                const ext = blobType.includes('mp4') || blobType.includes('aac') ? 'm4a'
+                    : blobType.includes('wav') ? 'wav' : 'webm';
+                addMessage('system', '🎙️ Uploading audio for STT...');
+                const formData = new FormData();
+                formData.append('file', audioBlob, `voice_record.${ext}`);
+                
+                try {
+                    // (Second orphaned updateActivityIcon call removed
+                    // 2026-08-02 — see the upload path. This one was invisible
+                    // while the mic button was deleted; restoring the button
+                    // revived it and it broke STT with "can't find variable".)
+                    activeFace.setWorkingState(true);
+
+                    const res = await fetch('/api/stt', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.text) {
+                            _sendComposed(data.text);
+                        } else {
+                            addMessage('system', '🎙️ STT transcribed nothing.');
+                        }
+                    } else {
+                        // voice.py raises real diagnoses ("'ffmpeg' not
+                        // found on PATH… set GHOST_FFMPEG_BIN", "Audio is
+                        // 22.3 min; the limit is 15 min", "thinking tokens
+                        // consumed the entire budget — raise
+                        // GHOST_STT_MAX_TOKENS") and stt_proxy returns each
+                        // verbatim. Printing only the status made "the mic
+                        // does nothing" indistinguishable from "the audio
+                        // node is down" (R3 lens A).
+                        const _e = await _httpError(res, '🎙️ STT Error');
+                        addMessage('system', _e.message);
+                    }
+                } catch (err) {
+                    addMessage('system', '🎙️ STT Upload Failed: ' + err.message);
+                } finally {
+                    activeFace.setWorkingState(false);
+                }
+                
+                stream.getTracks().forEach(track => track.stop());
+            };
+            
+            mediaRecorder.start();
+            isRecording = true;
+            micBtn.classList.add('recording');
+            addMessage('system', '🎙️ Recording started...');
+        } catch (err) {
+            clearTimeout(permTimeout);
+            let msg = err.message || String(err);
+            if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+                msg = 'Microphone access denied. On iOS check Settings > Safari > Microphone.';
+            } else if (err.name === 'NotFoundError') {
+                msg = 'No microphone found on this device.';
+            } else if (msg === 'Permission timeout') {
+                msg = 'Microphone permission timed out. Try again.';
+            }
+            addMessage('system', '🎙️ ' + msg);
+        }
+    };
+
+    const stopRecording = (e) => {
+        if (e && e.cancelable) e.preventDefault();
+        _micPressHeld = false;
+        if (!isRecording || !mediaRecorder) return;
+        
+        mediaRecorder.stop();
+        isRecording = false;
+        micBtn.classList.remove('recording');
+    };
+
+    micBtn.addEventListener('mousedown', startRecording);
+    micBtn.addEventListener('mouseup', stopRecording);
+    micBtn.addEventListener('mouseleave', stopRecording);
+
+    // For mobile
+    micBtn.addEventListener('touchstart', startRecording, {passive: false});
+    micBtn.addEventListener('touchend', stopRecording, {passive: false});
+    micBtn.addEventListener('touchcancel', stopRecording, {passive: false});
+    // iOS dispatches a context menu on long-press — suppress it for the mic button.
+    micBtn.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Workspace bridge (2026-07-28)
+//
+//  app.js predates ES-module exports; the operator-console features
+//  (sessions rail, notifications, status panel, command palette) live
+//  in separate modules that talk to this core through window.GhostCore.
+//  New functionality belongs in modules — this bridge is the seam, not
+//  a dumping ground.
+// ═══════════════════════════════════════════════════════════════
+window.GhostCore = {
+    events: new EventTarget(),
+    addMessage,
+    renderMarkdown,
+    renderHistoryToLog,
+    decorateCodeBlocks,
+    decorateTables,
+    decorateMessageActions,
+    attachRenderButtons,
+    stripInternalTags: _stripInternalTags,
+    safeStorage,
+    scrollToBottom,
+    renderEmptyStateHero,
+    dismissEmptyStateHero,
+    activeFace,
+    stopTTS,
+    sendMessage,
+    // Cancel THIS TAB's turn (resolving its request id first). Exposed so
+    // the palette can stop a turn without the blind "whatever holds the
+    // semaphore" cancel it used to issue (R3 lens B).
+    cancelOwnTurn: (hard) => {
+        if (currentChatController) { try { currentChatController.abort(); } catch (e) {} }
+        return _cancelAgentTurn(currentReqId, _lastSentUserText, hard);
+    },
+    getChatHistory: () => chatHistory,
+    // A session load sets the identity first, then the history: the token
+    // counter re-reads the (now current) session's totals here.
+    setChatHistory: (h) => { chatHistory = Array.isArray(h) ? h : []; saveChatState(); tokenCounter.render(); },
+    // Wire-shape helpers for modules that fetch/compare server histories
+    // (sessions.js): strip client-only label keys for comparison, and
+    // preserve them across adoption. See toWireMessage/mergeClientLabelKeys.
+    toWireMessage,
+    mergeClientLabelKeys,
+    // Reset the visible conversation WITHOUT touching the session store —
+    // the sessions module decides what happens next (new id, load, …).
+    clearConversation: () => {
+        chatLog.innerHTML = '';
+        chatHistory = [];
+        safeStorage.remove(_historyKey());
+        tokenCounter.hide();             // a new chat: the next id has no count yet
+        // Close the visualizer BEFORE revoking — it may be displaying one
+        // of these blobs (session switches used to blank the open preview).
+        closeRenderWindow();
+        for (const url of _authedBlobCache.values()) {
+            try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+        }
+        _authedBlobCache.clear();
+        updateWorkspaceBtnState();
+        renderEmptyStateHero();
+    },
+    isProcessing: () => isProcessingRequest,
+    // Retry / regenerate / edit (2026-09-11): cut the conversation at the
+    // user turn a bubble belongs to (its data-hidx) and resend or refill.
+    // ONE reconcile authority for every server-history adoption
+    // (sessions.js load/resync + the recovery path here).
+    reconcileWithLocal: _reconcileWithLocal,
+    // Per-tab session identity + per-session local history keys.
+    storedSessionId,
+    persistSessionId,
+    localHistoryKeys,
+    resendFromIndex: (idx) => _truncateToUserTurn(idx, true),
+    editFromIndex: (idx) => _truncateToUserTurn(idx, false),
+    retryLastTurn,
+    // Lock-screen alerts row in the bell panel.
+    pushPermissionState,
+    requestNotificationPermission,
+    elements: { chatLog, chatInput, logToggleBtn },
+    toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
+};
+
+import('./workspace.js?v=9.2').catch(e => {
+    // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
+    // with it `window.__ghostSessionId` — so when it fails to load, every
+    // turn silently reverts to CLIENT-CARRIED history: no durable session,
+    // no rail, no bell, no status strip, and nothing on screen saying so.
+    // A stale `?v=` in a cached index.html is enough to cause it, and the
+    // operator's only clue was an empty sidebar. Durable sessions are the
+    // thing this console exists for; losing them cannot be a console.warn.
+    console.warn('[Ghost] workspace modules failed to load:', e);
+    try {
+        addMessage('system',
+            '⚠ Console modules failed to load — this tab has NO durable ' +
+            'session (history is client-carried only), no sessions rail and ' +
+            'no notifications. Hard-reload to retry; if it persists the ' +
+            'static assets are stale or unreachable.');
+    } catch (_) { /* addMessage unavailable — the warn above is all we have */ }
+});
+

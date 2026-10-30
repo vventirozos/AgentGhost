@@ -1,15 +1,15 @@
 {
   "app.js": {
-    "sha": "d8a3bfc7d61d9645",
-    "version": "17.0"
+    "sha": "b47296ed92fe2fb7",
+    "version": "17.8"
   },
   "effort.js": {
     "sha": "40ad7b946907c142",
     "version": "1.2"
   },
   "matrix_graph.js": {
-    "sha": "87535fb54d0a42a6",
-    "version": "17.0"
+    "sha": "0f96168531db65ad",
+    "version": "17.8"
   },
   "notifications.js": {
     "sha": "487030a97676874f",
@@ -28,8 +28,12 @@
     "version": "7.6"
   },
   "style.css": {
-    "sha": "3681accc75f558da",
-    "version": "7.8"
+    "sha": "153c6fea1c84b876",
+    "version": "7.9"
+  },
+  "temperament.js": {
+    "sha": "9e168479edf81026",
+    "version": "1.3"
   },
   "tokens.js": {
     "sha": "0aa668ae8d23cb93",

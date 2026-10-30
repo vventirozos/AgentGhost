@@ -94,12 +94,13 @@ class TestFacePureHelpers:
         assert out == ["network", "network", "timeout", "refusal", "generic"]
 
     def test_verdict_mapping_and_refute_flinch(self, graph_js):
-        out = eval_js("let verdict = null, verdictEnv = 0, flinch = 0;\n" + _fn(graph_js, "noteVerdict"),
+        out = eval_js("let verdict = null, verdictEnv = 0, flinch = 0; const temper = { event: () => 1 };\n" + _fn(graph_js, "noteVerdict"),
                       "[noteVerdict('pass'), verdictEnv, flinch, noteVerdict('refute'), flinch, noteVerdict('whatever')]")
         assert out == ["pass", 1.0, 0, "refute", 0.5, "stop"]
 
     def test_tool_call_is_a_saturating_kick(self, graph_js):
-        out = eval_js("let toolPulse = 0;\n" + _fn(graph_js, "noteToolCall"),
+        # the temperament's gain (2026-10-30) is 1 here: this pins the kick itself
+        out = eval_js("let toolPulse = 0; const temper = { event: () => 1 };\n" + _fn(graph_js, "noteToolCall"),
                       "[noteToolCall(), noteToolCall(), toolPulse]")
         assert out == [0.6, 1.0, 1.0], "the kick must saturate at 1"
 
@@ -126,9 +127,9 @@ class TestFaceRenderWiring:
 
     def test_stillness_slows_time_and_the_pulse_clock(self, graph_nc):
         # dt-scaled since 2026-09-20 (tStep = the clock advance this frame).
-        assert "const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF;" in graph_nc   # camDive since 2026-09-21
+        assert "const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF * _tsSpeed();" in graph_nc   # camDive since 2026-09-21; temperament speed since 2026-10-30
         assert "time += tStep;" in graph_nc
-        assert "* (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul;" in graph_nc
+        assert "* (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul * _tsSpeed();" in graph_nc
         i = graph_nc.index("const still = Math.min(1.0, Math.max(")
         body = graph_nc[i:i + 300]
         assert "verdict === 'pass'" in body and "errorKind === 'refusal'" in body and "gait.verify" in body
@@ -342,6 +343,6 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=17.4" in index and "style.css?v=7.9" in index
-    assert "matrix_graph.js?v=17.4" in app and "workspace.js?v=9.2" in app
+    assert "app.js?v=17.8" in index and "style.css?v=7.9" in index
+    assert "matrix_graph.js?v=17.8" in app and "workspace.js?v=9.2" in app
     assert "status.js?v=7.6" in ws and "palette.js?v=7.5" in ws

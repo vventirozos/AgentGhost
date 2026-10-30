@@ -315,7 +315,7 @@ def test_the_image_carries_iptables():
     later marker's full-provision line and recipe must keep it."""
     import inspect, re
     src = inspect.getsource(DockerSandbox._ensure_running_impl)
-    assert 'marker_path = "/root/.supercharged.v10"' in src
+    assert 'marker_path = "/root/.supercharged.v11"' in src
     apt_line = re.search(r'apt_cmd = "(.+?)"\n', src).group(1)
     assert " iptables " in apt_line or " iptables'" in apt_line
     assert "iptables" in (Path(__file__).resolve().parents[1] / "sandbox" / "Dockerfile").read_text()

@@ -88,7 +88,7 @@ emit({ rest, idleP95: p95Of(idle), turnP95: p95Of(turn), turnMax: maxOf(turn),
        twMaxTurn: Math.max(...twAbs), twNonZero: twAbs.filter(t => t > 0.05).length,
        seedsTurnMax: Math.max(...dT.tesseract.seeds), edgePhaseBases: bases.size,
        flashTool: dTool.gaitFlash, cornerSizesTool, wobPass, twPassDecay: twB / Math.max(1e-9, twA), shudder,
-       sweepOn, nan, wraps: turn.reduce((m, s) => m + s.wraps, 0), lines: lines.geometry.drawRange.count / 2,
+       sweepOn, nan, wraps: turn.reduce((m, s) => m + s.wraps, 0), lines: lines.geometry.drawRange.count / 2, linesNow: { ...face.getDebugState().tesseract.lines },
        kernelBase: d0.tesseract.kernelBase, shells: d0.tesseract.shells, kernelN: d0.tesseract.kernelN,
        stream: d0.tesseract.stream, rollIdleRate: (face.getDebugState().tesseract.roll - d0.tesseract.roll) / ((1200 + 900 + 3 + 400 + 5 + 60 + 400 + 12 + 400 + 120 + 600) / 60),
        centerDim: lines.material.uniforms.uCenterDim.value,
@@ -165,7 +165,11 @@ def test_one_corridor_edges_rulings_ties_and_a_lattice_kernel(mech):
     assert L["kernel"] == 3 * 3 * 3 * 2, L                    # 54 lattice edges
     assert mech["kernelBase"] == 12 * 8                       # corners on every other shell
     assert mech["stream"] == 250 - 12 * 8 - 27
-    assert mech["lines"] == L["shells"] + L["rulings"] + L["ties"] + L["kernel"]
+    # the drawn count and the per-kind stats of the SAME frame (2026-10-30: the
+    # temperament varies the clock, so how many shells are faded at the END
+    # no longer equals the count at rest by coincidence)
+    N = mech["linesNow"]
+    assert mech["lines"] == N["shells"] + N["rulings"] + N["ties"] + N["kernel"], (mech["lines"], N)
 
 
 def test_the_stream_rides_the_expansion_at_spread_speeds(lab):

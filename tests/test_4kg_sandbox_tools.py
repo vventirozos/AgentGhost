@@ -72,14 +72,14 @@ def test_the_measured_needs_are_in_the_set():
         assert gone not in PK, f"{gone} needs NET_RAW, which §4KF dropped"
 
 
-def test_the_v10_delta_installs_every_package_and_proves_every_binary():
-    delta, verify = _assigned("upgrade_delta_cmd"), _assigned("upgrade_delta_verify")
-    assert _assigned("marker_path") == "/root/.supercharged.v10" and _assigned("prev_marker_path") == "/root/.supercharged.v9"
-    for pkg in PK:
-        assert re.search(rf"(^|\s){re.escape(pkg)}(\s|'|$)", delta), f"delta does not install {pkg}"
-    assert "apt-get update" in delta and "--no-install-recommends" in delta
-    for b in BI:
-        assert f"command -v {b}" in verify, f"the marker could be written without {b}"
+def test_the_v10_set_outlives_its_delta():
+    """v11 (the PostgreSQL 18 client) replaced the v10 delta, so a v9 image now
+    takes the full provision — which must still install and link the v10 set,
+    and the v10 delta must not linger anywhere a v10 image could re-run it."""
+    delta = _assigned("upgrade_delta_cmd")
+    assert _assigned("prev_marker_path") == "/root/.supercharged.v10"
+    for pkg in ("netcat-openbsd", "ffmpeg", "stockfish"):
+        assert not re.search(rf"(^|\s){re.escape(pkg)}(\s|'|$)", delta), f"the v11 delta re-installs v10's {pkg}"
 
 
 def test_the_full_provision_and_the_recipe_carry_the_same_packages():
@@ -89,8 +89,8 @@ def test_the_full_provision_and_the_recipe_carry_the_same_packages():
     for pkg in PK:
         assert re.search(rf"(^|\s){re.escape(pkg)}(\s|'|\\|$)", apt_line), f"full provision lacks {pkg}"
         assert re.search(rf"(^|\s){re.escape(pkg)}(\s|\\|$)", active), f"Dockerfile lacks {pkg}"
-    assert "RUN touch /root/.supercharged.v10" in active, "the recipe must stamp the CURRENT marker"
-    assert ".supercharged.v9" not in active
+    assert "RUN touch /root/.supercharged.v11" in active, "the recipe must stamp the CURRENT marker"
+    assert ".supercharged.v10" not in active
 
 
 def test_stockfish_is_put_on_the_exec_path_in_all_three_copies():
@@ -99,20 +99,22 @@ def test_stockfish_is_put_on_the_exec_path_in_all_three_copies():
     PATH lacks — `command -v stockfish` failed, the model's `stockfish`
     calls failed, and a v10 verify chain would never have passed."""
     link = "ln -sf /usr/games/stockfish /usr/local/bin/stockfish"
-    delta, apt_line = _assigned("upgrade_delta_cmd"), _assigned("apt_cmd")
+    apt_line = _assigned("apt_cmd")
     recipe = (_ROOT / "sandbox" / "Dockerfile").read_text(encoding="utf-8")
-    assert link in delta and link in apt_line
+    assert link in apt_line
     assert f"RUN {link}" in recipe
-    assert delta.index("stockfish &&") < delta.index(link), "the link follows the install inside the same command"
+    assert apt_line.index("stockfish --no-install-recommends &&") < apt_line.index(link), "the link follows the install inside the same command"
 
 
 def test_the_upgrade_log_names_what_it_adds():
     """The log line used to say "(adds iptables)" — a v9 literal that would
-    have lied on v10. It must derive from the tuple (PARSED: the f-string of
-    the 'Upgrading … in place' call references SANDBOX_TOOL_BINARIES)."""
+    have lied on v10. It must derive from the CURRENT delta's tuple (PARSED:
+    the f-string of the 'Upgrading … in place' call references
+    SANDBOX_PG_PACKAGES since v11)."""
     names, text = _upgrade_log_fstring_names()
     assert text, "the in-place upgrade log call was not found"
-    assert "SANDBOX_TOOL_BINARIES" in names, names
+    assert "SANDBOX_PG_PACKAGES" in names, names
+    assert "SANDBOX_TOOL_BINARIES" not in names, "v10's set would be announced on a v11 upgrade"
     assert "iptables" not in text
 
 
@@ -147,3 +149,17 @@ def test_the_full_provision_runs_unattended_without_recommends():
     "three copies agree" was true of names, not results."""
     apt_line = _assigned("apt_cmd")
     assert "--no-install-recommends" in apt_line and "DEBIAN_FRONTEND=noninteractive" in apt_line
+
+
+def test_the_full_provision_installs_the_pg18_client_after_the_repo_setup():
+    """v11: a fresh image (no marker) gets psql 18 too — the PGDG setup runs
+    AFTER the main install (which brings postgresql-common) and BEFORE the
+    client install from the repo it adds."""
+    common, client = dmod.SANDBOX_PG_PACKAGES
+    apt_line = _assigned("apt_cmd")
+    setup = "/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y"
+    assert apt_line.index(f" {common} ") < apt_line.index(setup) \
+        < apt_line.index(f"install -y --no-install-recommends {client}"), apt_line
+    recipe = (_ROOT / "sandbox" / "Dockerfile").read_text(encoding="utf-8")
+    active = "\n".join(ln for ln in recipe.splitlines() if not ln.lstrip().startswith("#"))
+    assert active.index(setup) < active.index(client) < active.index("RUN touch /root/.supercharged.v11")

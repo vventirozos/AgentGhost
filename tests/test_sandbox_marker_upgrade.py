@@ -239,15 +239,21 @@ def test_this_versions_delta_is_what_the_evidence_asked_for():
     one line that states the expectation from outside: v9 exists to add
     iptables for the Tor-only egress rules. Update it with the next bump,
     deliberately."""
-    assert _CUR_MARKER.endswith(".v10")   # §4KG: the everyday CLI set (nc for the leak probe, unzip, stockfish, ffmpeg, …)
-    # §4KG (marker v10): the everyday CLI set. The delta's package list and
-    # the verify chain are held to the module tuples, so the three copies
-    # (delta, full provision, Dockerfile) cannot drift apart.
-    from ghost_agent.sandbox.docker import SANDBOX_TOOL_BINARIES, SANDBOX_TOOL_PACKAGES
-    assert set(_DELTA_PKGS.split()) == set(SANDBOX_TOOL_PACKAGES), _DELTA_PKGS
-    for b in SANDBOX_TOOL_BINARIES:
-        assert f"command -v {b}" in _VERIFY, f"verify does not prove {b} landed"
-    assert _VERIFY_TOOL == SANDBOX_TOOL_BINARIES[0], _VERIFY
+    assert _CUR_MARKER.endswith(".v11")   # 2026-10-30: the PostgreSQL 18 client (host server is 18.6; bookworm ships 15)
+    # The delta installs Debian's signed postgresql-common FIRST (its
+    # apt.postgresql.org.sh carries the PGDG key), runs that script, and
+    # only then installs postgresql-client-18 from the repo it added.
+    from ghost_agent.sandbox.docker import SANDBOX_PG_BINARIES, SANDBOX_PG_PACKAGES
+    common, client = SANDBOX_PG_PACKAGES
+    assert _DELTA_PKGS.split() == [common], _DELTA_PKGS
+    setup = "/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y"
+    assert _DELTA.index(f"install -y --no-install-recommends {common}") < _DELTA.index(setup) \
+        < _DELTA.index(f"install -y --no-install-recommends {client}"), _DELTA
+    assert "curl" not in _DELTA and "wget" not in _DELTA, "no unsigned key download"
+    # versioned paths: bare `psql` also answers for the Debian 15 client
+    for b in SANDBOX_PG_BINARIES:
+        assert f"test -x {b}" in _VERIFY, f"verify does not prove {b} landed"
+    # the full provision's copy is pinned PARSED in test_4kg_sandbox_tools
 
 
 # --- the delta obeys the provisioning backoff (review, 2026-09-09) ---------

@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Ghost">
+    <!-- The manifest link is injected by server.py (its URL carries the
+         access key); the touch icon is safe as static markup. -->
+    <!-- No ?v= cache-buster: Safari has been observed skipping
+         query-string touch icons when snapshotting for Add to Home
+         Screen. Root-path /apple-touch-icon.png aliases the same
+         file for the probe Safari makes when this link is unusable. -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/icon-180.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
+    <title>Ghost Interface</title>
+    <!-- §4ML: no Google Fonts — every page load reached Google from the
+         owner's address (the no-identity-egress rule); style.css falls back
+         to the system UI and monospace fonts. -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "/static/vendor/three/three.module.js",
+                "three/addons/": "/static/vendor/three/jsm/"
+            }
+        }
+    </script>
+    <!-- Vendored locally (no CDN) so the XSS-critical sanitizer chain
+         (marked + DOMPurify) can't be swapped via a CDN compromise / MITM,
+         and versions are pinned. Refresh with: see docs/interfaces.
+         `defer`: classic deferred scripts run before the deferred module
+         (app.js) in document order, so the sanitizer is ready when the
+         module evaluates and the parser no longer blocks on them.
+         mermaid (3.3 MB), papaparse and chart.js are NOT loaded here any
+         more (2026-09-11): app.js fetches them on the first diagram /
+         chart render (_ensureVendor) — a cold phone load used to parse
+         3.6 MB of render-blocking script for features most turns never
+         touch. -->
+    <script defer src="/static/vendor/marked.min.js"></script>
+    <script defer src="/static/vendor/purify.min.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v=7.9">
+</head>
+
+<body>
+    <div id="background-layer">
+        <div id="sphere-container"></div>
+    </div>
+
+    <!-- Sessions rail: the agent's episodic-memory strata. Docked on wide
+         screens, off-canvas drawer on phones/portrait tablets. Rows are
+         built by sessions.js from GET /api/sessions. -->
+    <aside id="session-rail" aria-label="Sessions">
+        <div id="rail-header">
+            <span id="rail-title">SESSIONS</span>
+            <!-- Workspace load / save live HERE since 2026-09-05 (operator:
+                 "next to +"), as two explicit buttons — the header's one
+                 glyph used to flip between Load (empty chat) and Save
+                 (non-empty), which you had to know to use. -->
+            <div id="rail-actions">
+                <input type="file" id="workspace-upload-input" style="display: none;" accept=".zip" />
+                <button id="workspace-load-btn" class="icon-btn" type="button" title="Load workspace" aria-label="Load workspace from a zip">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                </button>
+                <button id="workspace-save-btn" class="icon-btn" type="button" title="Save workspace" aria-label="Save workspace as a zip">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
+                </button>
+                <button id="new-chat-btn" class="icon-btn" title="New chat" aria-label="New chat">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                </button>
+            </div>
+        </div>
+        <input id="session-search" type="search" placeholder="Filter sessions" autocomplete="off"
+               aria-label="Filter sessions" />
+        <div id="session-list" role="list"></div>
+        <div id="rail-note" class="hidden"></div>
+        <!-- Destructive footer: two-step armed confirm (first click arms,
+             second click within 4s executes) — no browser dialog, and a
+             stray click can never wipe the strata. Hidden while sessions
+             are disabled or the list is empty. -->
+        <div id="rail-footer" class="hidden">
+            <button id="delete-all-sessions-btn" type="button"
+                    aria-label="Delete all sessions">Delete all sessions</button>
+        </div>
+    </aside>
+    <div id="rail-scrim" class="hidden" aria-hidden="true"></div>
+
+    <div id="ui-layer">
+        <div id="render-window" class="hidden">
+            <div id="render-header">
+                <span id="render-title">VISUALIZER</span>
+                <div id="render-controls">
+                    <button id="render-download" class="render-btn" title="Download" aria-label="Download rendered output">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                    </button>
+                    <button id="render-zoom-out" class="render-btn" aria-label="Zoom out">-</button>
+                    <button id="render-zoom-in" class="render-btn" aria-label="Zoom in">+</button>
+                    <button id="render-close" class="render-btn" aria-label="Close visualizer">✕</button>
+                </div>
+            </div>
+            <div id="render-content-wrapper">
+                <!-- Same-origin iframe: ONLY our own generated wrappers and
+                     blob previews (images / PDFs). Never receives agent code.
+                     Deliberately NOT sandboxed: `sandbox` on a same-origin
+                     frame with allow-scripts+allow-same-origin is a security
+                     no-op, but its plugins-sandbox flag is unclearable and
+                     blocked the PDF viewer in every engine (2026-08-01). -->
+                <iframe id="render-iframe"></iframe>
+                <!-- Sandboxed iframe: renders untrusted agent-authored
+                     HTML/CSS/JS via srcdoc. NO allow-same-origin, so it gets
+                     an opaque origin and cannot reach window.parent (and thus
+                     cannot read the injected GHOST_API_KEY). -->
+                <iframe id="render-iframe-sandboxed" sandbox="allow-scripts"></iframe>
+                <div id="mermaid-container"></div>
+                <div id="chart-container"><canvas id="render-chart"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Live log console: renders the same pretty-log stream that already
+             feeds the face/monologue over the WebSocket. Toggled by #logs-btn;
+             fed from a ring buffer that collects even while closed. -->
+        <div id="log-console" class="hidden">
+            <div id="log-console-header">
+                <span id="log-console-title">LIVE LOG</span>
+                <div id="log-console-controls">
+                    <button id="log-clear" class="render-btn" title="Clear" aria-label="Clear the live log">⌫</button>
+                    <button id="log-close" class="render-btn" title="Close" aria-label="Close the live log">✕</button>
+                </div>
+            </div>
+            <div id="log-console-body"></div>
+            <button id="log-resume" class="hidden">▼ paused — <span id="log-new-count">0</span> new</button>
+        </div>
+
+        <header>
+            <div id="header-left">
+                <button id="rail-toggle" class="icon-btn" title="Sessions" aria-label="Toggle sessions rail">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="15" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+                </button>
+                <div id="status-wrapper">
+                    <!-- The ONLINE chip (2026-09-05, operator): an .icon-btn
+                         pill that OPENS THE LIVE LOG — the separate terminal
+                         button is gone. The model pill and the agent-status
+                         panel it used to open are gone too (same day).
+                         status.js still turns it DEGRADED, with the reason in
+                         its title; data-title is the resting tooltip. -->
+                    <button id="status-indicator" class="icon-btn" type="button" title="Live log"
+                            data-title="Live log" aria-label="Live log">
+                        <span id="connection-dot"></span>
+                        <span id="status-text">ONLINE</span>
+                    </button>
+                    <div id="planner-monologue"></div>
+                </div>
+            </div>
+            <!-- Icon order (2026-09-05, operator: "make the sorting make
+                 sense"): left cluster = navigation (sessions rail) then the
+                 status light (opens the live log); right cluster = alerts
+                 (bell), the two sandbox FILE transfers (upload, download),
+                 then appearance (face, zen) last. Workspace load/save moved
+                 to the sessions rail; the terminal button was folded into
+                 the status light. Five controls here + two on the left fit
+                 ONE row on a 375px phone (style.css ≤480 block). -->
+            <div id="header-controls">
+                <button id="notif-btn" class="icon-btn" title="Notifications" aria-label="Notifications">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+                    <span id="notif-badge" class="hidden">0</span>
+                </button>
+                <input type="file" id="file-upload-input" style="display: none;" />
+                <button id="upload-btn" class="icon-btn" title="Upload to Sandbox" aria-label="Upload a file to the sandbox">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                </button>
+                <button id="download-btn" class="icon-btn" title="Download from Sandbox" aria-label="Download a file from the sandbox">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                </button>
+                <!-- TTS voice toggle removed 2026-07-28 (voice unused; frees
+                     the mobile header to a single row). The TTS engine in
+                     app.js is guarded by `if (ttsToggleBtn)` and stays
+                     dormant; restore by re-adding #tts-toggle-btn here. -->
+                <button id="face-form-btn" class="icon-btn" title="Cycle face form"
+                        aria-label="Cycle face form">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="9" r="5.5"></circle><path d="M14 10.5a5.5 5.5 0 1 1-3.5 9.9"></path><path d="M12 3.5 13.2 6l2.6.4-1.9 1.9.5 2.6-2.4-1.3"></path></svg>
+                </button>
+                <button id="fullscreen-btn" class="icon-btn" title="Toggle Zen Mode" aria-label="Toggle zen mode">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path
+                            d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <main id="chat-container">
+            <div id="chat-log">
+                <!-- Chat messages -->
+                <div id="init-msg" class="message system">Initializing Ghost Interface v2.0...</div>
+            </div>
+            <!-- Reading position (2026-09-11): shown when content lands
+                 below a reader who has scrolled up; nothing scrolls them
+                 down any more without asking. Same shape as #log-resume. -->
+            <button id="chat-resume" class="hidden" type="button"
+                    aria-label="Scroll to the newest messages">▼ new messages</button>
+        </main>
+
+        <footer id="input-area-wrapper">
+            <!-- Turn status line (2026-07-29 v3): re-parented under the
+                 waiting reply bubble while a user turn runs — timer chip,
+                 description, text-sized icon (visual grouping does the
+                 separating; the literal `:`/`-` punctuation read as soup).
+                 Parked here hidden between turns. -->
+            <div id="turn-status" class="hidden">
+                <span id="turn-status-clock">0:00</span>
+                <span id="turn-status-desc"></span>
+                <span id="turn-status-icon"></span>
+            </div>
+            <!-- §4RZ: messages handed back (not read, or maybe not read); Insert / Dismiss each.
+                 §4SB: the tray itself is not live (a re-render read the whole tray out again);
+                 #restore-status says what changed in one line. -->
+            <div id="restore-tray" class="hidden" role="region" aria-live="off" aria-label="Messages handed back"></div>
+            <div id="restore-status" role="status" aria-live="polite"></div>
+            <div id="input-area">
+                <textarea id="chat-input" placeholder="Enter message" rows="1"
+                          aria-label="Message" enterkeyhint="send"></textarea>
+                <!-- Hold-to-talk mic. RESTORED 2026-08-02. It was removed
+                     2026-08-01 as "unused" — but the reason nobody used it is
+                     that BOTH voice endpoints proxied to a Raspberry-Pi voice
+                     server that no longer exists (`raspberrypi.local` doesn't
+                     resolve; the launcher's `disorder` override listens on
+                     nothing), so the button was a no-op against a dead host.
+                     STT now runs locally on nova's Gemma 4 audio node and TTS
+                     on the macOS synthesiser — see interface/voice.py.
+                     Holding the mic also enables spoken replies for that turn
+                     (the press is the user gesture that unlocks autoplay);
+                     typing a message turns speech back off. That keeps the
+                     header at six controls, preserving the single-row mobile
+                     layout the TTS toggle was removed to protect. -->
+                <button id="mic-btn" title="Hold to talk" aria-label="Hold to talk">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
+                <!-- §4RB: reasoning effort for the messages you send (Default = nothing is
+                     sent: the model server's own level). Shown only while the agent reports
+                     the switch on (GHOST_REASONING_EFFORT=1, the 27B); status.js toggles it. -->
+                <!-- 2026-10-24 (operator): a grey bars icon — hollow = Default, 1/2/3 filled =
+                     Low/Med/X-high — with the native select laid invisibly over it, so a
+                     tap still opens the system picker. The icon follows the select by CSS
+                     (:has(option:checked)); the wrap hides with it. -->
+                <span id="effort-wrap">
+                <svg id="effort-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                    <rect class="b1" x="1.5" y="10.5" width="3" height="4" rx="0.5"></rect>
+                    <rect class="b2" x="6.5" y="7.5" width="3" height="7" rx="0.5"></rect>
+                    <rect class="b3" x="11.5" y="3.5" width="3" height="11" rx="0.5"></rect>
+                </svg>
+                <select id="effort-select" class="hidden"
+                        title="Reasoning effort for your messages. Default is the model server's own level. A change of level re-processes this conversation once on the next message (seconds; longer for a long conversation)"
+                        aria-label="Reasoning effort">
+                    <option value="">Default</option>
+                    <option value="xhigh">X-high</option>
+                    <option value="medium">Med</option>
+                    <option value="low">Low</option>
+                </select>
+                </span>
+                <!-- Token counter (2026-10-27, operator: discreet, right, under the buttons): the last
+                     reply's context ↑ and generation ↓ tokens, from the agent's usage frame
+                     (tokens.js). Hidden until a turn reports one. -->
+                <span id="token-count" class="hidden" aria-live="off"></span>
+                <!-- §4RZ step 6a: stop the tool call the running turn is waiting on (the turn
+                     goes on). Shown while a chat turn runs; app.js toggles it. -->
+                <button id="interrupt-btn" class="hidden" type="button"
+                        title="Stop the running tool (the turn goes on)"
+                        aria-label="Stop the running tool">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="5 4 15 12 5 20 5 4"></polygon>
+                        <line x1="19" y1="5" x2="19" y2="19"></line>
+                    </svg>
+                </button>
+                <button id="send-btn" aria-label="Send message">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="22" y1="2" x2="11" y2="13"></line>
+                        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                    </svg>
+                </button>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Workspace overlays (content built by the workspace modules). -->
+    <div id="notif-panel" class="hidden" aria-label="Notifications">
+        <div class="panel-header">
+            <span class="panel-title">NOTIFICATIONS</span>
+            <button id="notif-clear" class="render-btn" title="Clear all" aria-label="Clear all notifications">⌫</button>
+            <button id="notif-close" class="render-btn" title="Close" aria-label="Close notifications">✕</button>
+        </div>
+        <div id="notif-list"></div>
+    </div>
+
+    <div id="cmd-palette" class="hidden" role="dialog" aria-modal="true" aria-label="Command palette">
+        <div id="palette-box">
+            <input id="palette-input" type="text" placeholder="Type a command or session name…"
+                   autocomplete="off" spellcheck="false" />
+            <div id="palette-results" role="listbox"></div>
+        </div>
+    </div>
+
+    <div id="msg-menu" class="hidden" role="menu"></div>
+
+    <!-- Ask-about-this-file (2026-09-05, operator): choosing a file no
+         longer uploads it blind. A sheet shows a preview + the name and
+         takes an optional question; "Upload & ask" sends the question
+         and the uploaded filename as ONE chat message, so a photo from
+         the phone camera goes straight to "what kind of car is that?"
+         instead of a second message naming image.jpg by hand. -->
+    <div id="upload-ask-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="upload-ask-title">
+        <div id="upload-ask-box" class="modal-box">
+            <div class="panel-header">
+                <span class="panel-title" id="upload-ask-title">ASK ABOUT THIS FILE</span>
+                <button id="upload-ask-close" class="render-btn" type="button" title="Cancel" aria-label="Cancel the upload">✕</button>
+            </div>
+            <!-- Question FIRST, picture as a thumbnail (operator, same day):
+                 a full-width preview put the typing box below the fold and
+                 under the phone keyboard — the sheet is about the question. -->
+            <label class="modal-label" for="upload-ask-input">Your question (optional)</label>
+            <textarea id="upload-ask-input" class="modal-textarea" rows="3" enterkeyhint="send"
+                      autocapitalize="sentences"></textarea>
+            <div id="upload-ask-meta">
+                <div id="upload-ask-preview-wrap" hidden>
+                    <img id="upload-ask-preview" alt="Thumbnail of the file about to be uploaded">
+                </div>
+                <p id="upload-ask-file" class="modal-hint"></p>
+            </div>
+            <!-- ONE button (operator): an empty question IS "upload only".
+                 The label follows the box: "Upload" / "Upload & ask". -->
+            <div class="modal-actions">
+                <button id="upload-ask-send" class="modal-btn primary" type="button">Upload</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="memory-modal" class="hidden" role="dialog" aria-modal="true">
+        <div id="memory-modal-box">
+            <div class="panel-header">
+                <span class="panel-title" id="memory-modal-title">CORRECT MEMORY</span>
+                <button id="memory-modal-close" class="render-btn" title="Close" aria-label="Close memory correction">✕</button>
+            </div>
+            <p id="memory-modal-hint">Finds one stored memory fragment containing this exact text and rewrites
+                it. Trim the match down to the false part before applying.</p>
+            <label class="modal-label" for="memory-match">Stored text to find</label>
+            <textarea id="memory-match" rows="3" spellcheck="false"></textarea>
+            <label class="modal-label" for="memory-replacement" id="memory-replacement-label">Corrected text</label>
+            <textarea id="memory-replacement" rows="3" spellcheck="false"></textarea>
+            <div id="memory-modal-actions">
+                <button id="memory-modal-cancel" type="button">Cancel</button>
+                <button id="memory-modal-apply" type="button">Apply correction</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-stack" aria-live="polite"></div>
+
+    <script type="module" src="/static/app.js?v=17.4"></script>
+</body>
+
+</html>

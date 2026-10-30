@@ -311,6 +311,9 @@ def _write_harness(root: Path, graph: Path) -> None:
     for name, src in _SCENARIOS.items():
         (root / f"{name}.mjs").write_text(src)
     shutil.copyfile(graph, root / "matrix_graph.js")
+    # the face's inner state (2026-10-30) — a sibling module matrix_graph imports;
+    # older backups used as negative controls simply never import it
+    shutil.copyfile(_STATIC / "temperament.js", root / "temperament.js")
 
 
 @pytest.fixture(scope="module")

@@ -198,7 +198,10 @@ for (let f = 0; f < 240; f++) { tick(1); if ((to === 'vortex' || to === 'tessera
 function camera_z() { return view().cz; }
 const st = face.getDebugState(), v = view();
 emit({ maxD, firstD, camHeld, camZ: v.cz, rz: v.rz, rx: v.rx,
-       vortexRz: st.vortexSpin * 0.22, vortexRx: 0.06 * Math.sin(st.clock * 0.050) });
+       // the temperament's body (2026-10-30) rides on top by design: the law
+       // holds once it is taken off (st.body: 0 on a face without it)
+       vortexRz: st.vortexSpin * 0.22 + ((st.body || {}).rz || 0),
+       vortexRx: 0.06 * Math.sin(st.clock * 0.050) + ((st.body || {}).rx || 0) });
 """,
     # 2 / 3 — backing-store sizes at init and after DPR changes.
     "dpr": r"""
@@ -302,6 +305,7 @@ def lab(tmp_path_factory):
     for name, src in _SCENARIOS.items():
         (root / f"{name}.mjs").write_text(src)
     shutil.copyfile(_GRAPH, root / "matrix_graph.js")
+    shutil.copyfile(_GRAPH.parent / "temperament.js", root / "temperament.js")
     return root
 
 
@@ -351,7 +355,7 @@ def test_camera_static_forms_hold_the_camera_exactly_after_the_blend(lab, a, b, 
     assert r["camHeld"] and r["camZ"] == 5.0, r
     if b == "vortex":
         # The roll is the form's own law, bit for bit — no 2π residue.
-        assert r["rz"] == r["vortexRz"] and r["rx"] == r["vortexRx"], r
+        assert abs(r["rz"] - r["vortexRz"]) < 1e-9 and abs(r["rx"] - r["vortexRx"]) < 1e-9, r
 
 
 # ═══ 2 / 3 — backing-store resolution and DPR changes ═══════════════════

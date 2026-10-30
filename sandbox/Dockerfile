@@ -63,7 +63,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         sudo coreutils nodejs npm g++ curl wget git procps \
-        postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables \
+        postgresql-client postgresql-common libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables \
         netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish \
  && rm -rf /var/lib/apt/lists/*
 
@@ -111,7 +111,12 @@ RUN python3 -m playwright install --with-deps chromium
 # can't be trusted to match.
 # stockfish installs to /usr/games, off the exec PATH — expose it (§4KG).
 RUN ln -sf /usr/games/stockfish /usr/local/bin/stockfish
-RUN touch /root/.supercharged.v10
+# v11 (2026-10-30): the PostgreSQL 18 client from apt.postgresql.org; the repo key
+# is the one Debian's signed postgresql-common carries (SANDBOX_PG_PACKAGES).
+RUN /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y \
+ && apt-get install -y --no-install-recommends postgresql-client-18 \
+ && rm -rf /var/lib/apt/lists/*
+RUN touch /root/.supercharged.v11
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

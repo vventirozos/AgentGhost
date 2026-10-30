@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=17.4';
+import * as matrixGraphFace from './matrix_graph.js?v=17.8';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.0';   // what the status line under the reply shows
@@ -702,6 +702,9 @@ function connectWebSocket() {
                 // …and the in-turn activity ticker (no-op unless a turn
                 // is showing its typing indicator right now).
                 noteTickerLine(data.content);
+                // …and the face's temperament: the line's icons say what
+                // kind of work ran and how it came out (2026-10-30).
+                if (typeof activeFace.noteLogLine === 'function') activeFace.noteLogLine(data.content, data.is_error);
 
                 // Log lines feed the face's activity ENVELOPE — a small
                 // energy contribution each, smoothed inside matrix_graph —
@@ -4323,6 +4326,8 @@ async function sendMessage(isResume = false, queuedText = null) {
 
                     if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
                         chunkContent = data.choices[0].delta.content;
+                        // token rate + <think> state → the face (2026-10-30)
+                        if (typeof activeFace.noteStreamChunk === 'function') activeFace.noteStreamChunk(chunkContent);
                     } else if (data.message && data.message.content) {
                         // Fallback for non-streaming formats that might be wrapped
                         chunkContent = data.message.content;
