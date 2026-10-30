@@ -102,7 +102,6 @@ def agent():
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     a = GhostAgent(context)
-    a.max_thinking_chars_override = 500
     return a
 
 
@@ -111,6 +110,9 @@ class FakeBgTasks:
         pass
 
 
+# §4SD: the 500-char thinking cap override is gone with the caps; the turn
+# is cut by the n-gram loop probe instead — the stream ends INSIDE the open
+# inline <think>, on the repeated text (the adapter sends one chunk)
 RUNAWAY = ("The validator expects 0 lines but split returns "
            "a list with one empty string. ") * 20
 XML = ('<tool_call>\n<function name="noop">\n'
@@ -127,7 +129,7 @@ async def test_two_caps_then_a_no_think_report_turn_ships_the_report(agent):
     async def capture(payload, **kwargs):
         payloads.append(payload)
         if len(payloads) <= 2:
-            return {"choices": [{"message": {"content": f"<think>{RUNAWAY}</think>\n{XML}",
+            return {"choices": [{"message": {"content": f"<think>{RUNAWAY}",
                                              "tool_calls": []}}]}
         return {"choices": [{"message": {"content": REPORT, "tool_calls": []}}]}
 
@@ -167,7 +169,7 @@ async def test_two_caps_then_a_report_turn_that_goes_back_to_work_ships_the_hone
         if payload.get("chat_template_kwargs", {}).get("enable_thinking") is False:
             return {"choices": [{"message": {"content": f"Let me fix that.\n{XML}",
                                              "tool_calls": []}}]}
-        return {"choices": [{"message": {"content": f"<think>{RUNAWAY}</think>\n{XML}",
+        return {"choices": [{"message": {"content": f"<think>{RUNAWAY}",
                                          "tool_calls": []}}]}
 
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=capture)
@@ -197,7 +199,7 @@ async def test_second_cap_on_the_last_turn_ships_the_fallback_at_once(agent):
 
     async def capture(payload, **kwargs):
         calls["n"] += 1
-        return {"choices": [{"message": {"content": f"<think>{RUNAWAY}</think>\n{XML}",
+        return {"choices": [{"message": {"content": f"<think>{RUNAWAY}",
                                          "tool_calls": []}}]}
 
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=capture)

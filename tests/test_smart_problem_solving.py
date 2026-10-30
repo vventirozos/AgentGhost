@@ -36,14 +36,11 @@ class TestDifferentiatedStrikes:
 # ============================================================
 
 class TestProgressiveThinking:
-    def test_base_and_extended_caps_defined(self):
-        from ghost_agent.core.agent import MAX_THINKING_CHARS, MAX_THINKING_CHARS_EXTENDED
-        # 32K = where loop-checking begins; 200K = the hard backstop (raised
-        # from 64K so a strong model's long-but-legitimate reasoning isn't
-        # guillotined on raw length — only a DETECTED loop aborts in between).
-        assert MAX_THINKING_CHARS == 32000
-        assert MAX_THINKING_CHARS_EXTENDED == 200000
-        assert MAX_THINKING_CHARS_EXTENDED > MAX_THINKING_CHARS
+    def test_the_char_caps_are_gone(self):
+        # §4SD: world — the 200K abort comes back and discards a 64k-token draft
+        import ghost_agent.core.agent as A
+        assert not hasattr(A, "MAX_THINKING_CHARS_EXTENDED")
+        assert not hasattr(A, "MAX_THINKING_CHARS")
 
     def test_loop_detection_kills_repetitive_content(self):
         from ghost_agent.core.agent import _detect_thinking_loop

@@ -40,7 +40,6 @@ import pytest
 
 from ghost_agent.core import coding_executor as ce
 from ghost_agent.core.coding_executor import (
-    SPEC_REASONING_ABORT_CHARS,
     _apply_file,
     _generate_build_spec,
     build_coding_task,
@@ -72,8 +71,10 @@ def _diverse_chunks(total_chars):
 
 
 def _ceiling_chunks():
-    """Loop-free reasoning that just keeps going — the budget-burn shape."""
-    return _diverse_chunks(SPEC_REASONING_ABORT_CHARS + 15_000)
+    """Loop-free reasoning that eats the whole budget with no content — the
+    budget-burn shape (§4SD: no length ceiling cuts it now; it runs to the
+    stream's end and the caller's no-content branch takes over)."""
+    return _diverse_chunks(45_000)
 
 
 def _clean_chunks():

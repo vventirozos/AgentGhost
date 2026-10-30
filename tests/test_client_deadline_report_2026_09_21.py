@@ -200,7 +200,8 @@ class _Req:
     async def body(self): return b""
 
 
-@pytest.mark.parametrize("header, want", [("1800", 1800.0), ("abc", 0.0), ("", 0.0), (None, 0.0), ("-5", 0.0)])
+@pytest.mark.parametrize("header, want", [("1800", 1800.0), ("abc", 0.0), ("", 0.0), (None, 0.0), ("-5", 0.0),
+                                          ("inf", float("inf")), ("nan", 0.0)])   # §4SD: web stream + CLI send inf
 async def test_the_route_stores_the_client_timeout_in_the_contextvar(header, want):
     """Executed through the REAL chat route (`chat_proxy`) with the agent
     stubbed: the deadline the stub sees during `handle_chat` is the header's

@@ -218,6 +218,7 @@ def read_bytes_nofollow(path: Path, *, max_bytes: int = 0, from_start: bool = Fa
         if not _stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(
                 f"Security Error: refusing to read '{path}' — not a regular file.")
+        _block_if_regular(fd)                                   # §4SD
         if max_bytes > 0 and not from_start:
             size = os.fstat(fd).st_size
             if size > max_bytes:
@@ -324,6 +325,11 @@ def write_text_nofollow(path: Path, text: str, *, encoding: str = "utf-8") -> No
         raise ValueError(
             f"Security Error: refusing to write '{path}' — it is not a "
             "regular file (FIFO, socket or device node).")
+    try:
+        _block_if_regular(fd)                                   # §4SD
+    except OSError:
+        _close_quietly(fd)                                      # review: not yet owned by fdopen
+        raise
     with os.fdopen(fd, "w", encoding=encoding) as fh:
         fh.write(text)
         fh.flush()
@@ -381,6 +387,11 @@ def write_text_nofollow_in_dir(dir_path: Path, name: str, text: str, *,
         raise ValueError(
             f"Security Error: refusing to write '{dir_path / name}' — it is not a "
             "regular file (FIFO, socket or device node).")
+    try:
+        _block_if_regular(fd)                                   # §4SD
+    except OSError:
+        _close_quietly(fd)                                      # review: not yet owned by fdopen
+        raise
     with os.fdopen(fd, "w", encoding=encoding) as fh:
         fh.write(text)
 
@@ -461,6 +472,7 @@ def read_text_nofollow(name, *, dir_fd=None, encoding: str = "utf-8",
         if not _stat.S_ISREG(st.st_mode):
             raise ValueError(
                 f"Security Error: refusing to read '{name}' — not a regular file.")
+        _block_if_regular(fd, st)                               # §4SD
         # ⚠ HEAD, NOT TAIL (§4GK round 4). This used to `lseek` to
         # `st.st_size - max_bytes` and return the END of the file. Its only
         # capped caller — the workspace tidy's referenced-media scan — uses
@@ -517,6 +529,7 @@ def read_bytes_nofollow_fd(name, *, dir_fd=None, max_bytes: int = 0) -> bytes:
         st = os.fstat(fd)
         if not _stat.S_ISREG(st.st_mode):
             raise ValueError(f"{name}: not a regular file")
+        _block_if_regular(fd, st)                               # §4SD
         fh = os.fdopen(fd, "rb", closefd=True)
     except BaseException:
         _close_quietly(fd)
@@ -881,6 +894,7 @@ def copytree_nofollow(src: Path, dest: Path, root: Path, *, ignore=None,
                 if not _stat.S_ISREG(fst.st_mode):
                     skipped.append(f"{dirpath / name}: not a regular file when opened")
                     continue
+                _block_if_regular(fd, fst)                      # §4SD
                 # ⚠ ONE BAD DESTINATION ENTRY MUST NOT ABORT THE TREE
                 # (§4GK round 4). The destination-side `open`/`chmod` sat
                 # outside any per-entry guard, unlike the source-side opens,
@@ -2578,11 +2592,12 @@ def _read_regular_nofollow(real: Path, *, filename: str = "",
     """
     flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
              | getattr(os, "O_NONBLOCK", 0))
-    fd = os.open(str(real), flags)
+    fd = _retry_transient(os.open, str(real), flags)            # §4SD review: reads too
     try:
         st = os.fstat(fd)
         if not stat_mod.S_ISREG(st.st_mode):
             raise _NotRegular()
+        _block_if_regular(fd, st)                               # §4SD
         if st.st_size > _EDIT_MAX_BYTES:
             raise _TooLarge(st.st_size)
         _deny = _inode_write_refusal(fd, filename, sandbox_dir, project_store)
@@ -2590,7 +2605,7 @@ def _read_regular_nofollow(real: Path, *, filename: str = "",
             raise _InodeDenied(_deny)
         chunks, remaining = [], st.st_size
         while remaining > 0:
-            chunk = os.read(fd, min(remaining, 1 << 20))
+            chunk = _retry_transient(os.read, fd, min(remaining, 1 << 20))
             if not chunk:
                 break
             chunks.append(chunk)
@@ -2618,16 +2633,17 @@ def _read_text_guarded(real: Path, expect: os.stat_result, *,
     non-regular file so `replace`'s existing read-error arms report it."""
     flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
              | getattr(os, "O_NONBLOCK", 0))
-    fd = os.open(str(real), flags)
+    fd = _retry_transient(os.open, str(real), flags)            # §4SD review: reads too
     try:
         st = os.fstat(fd)
         if not stat_mod.S_ISREG(st.st_mode):
             raise OSError(_errno.EINVAL, "not a regular file")
         if (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino):
             raise _FileChangedUnderneath()
+        _block_if_regular(fd, st)                               # §4SD
         chunks, remaining = [], st.st_size
         while remaining > 0:
-            chunk = os.read(fd, min(remaining, 1 << 20))
+            chunk = _retry_transient(os.read, fd, min(remaining, 1 << 20))
             if not chunk:
                 break
             chunks.append(chunk)
@@ -2636,6 +2652,93 @@ def _read_text_guarded(real: Path, expect: os.stat_result, *,
         os.close(fd)
     return io.TextIOWrapper(io.BytesIO(b"".join(chunks)), encoding=encoding,
                             errors=errors, newline=newline).read()
+
+
+#: §4SD: errnos the macOS /workspace bind mount (virtiofs) returns for a
+#: moment while the host still holds a file it just wrote — req d886d047's
+#: edit of index.html failed EAGAIN and the model spent a whole turn retrying
+#: it by hand; the same edit landed 24 s later. EWOULDBLOCK == EAGAIN here.
+_TRANSIENT_IO_ERRNOS = frozenset({_errno.EAGAIN, _errno.EBUSY})
+#: sleeps between attempts (~3.9 s in all): the window has been seconds long
+#: (§4NW: a PNG re-written a few seconds after it was created)
+_TRANSIENT_IO_BACKOFF_S = (0.1, 0.25, 0.5, 1.0, 2.0)
+
+
+def _block_if_regular(fd: int, st: Optional[os.stat_result] = None) -> os.stat_result:
+    """§4SD: clear O_NONBLOCK once ``fd`` is known to be a REGULAR file. The
+    flag is there only so a FIFO swapped in cannot wedge the open; on the
+    macOS virtiofs mount it also makes a regular file's read or write fail
+    EAGAIN — and a BUFFERED read (fdopen/TextIOWrapper) takes that EAGAIN for
+    end-of-file (review: the streaming replace committed a truncated file
+    with SUCCESS). Every O_NONBLOCK open calls this after its regular-file
+    check (`tests/test_4sd_transient_write_retry.py` enumerates them).
+    Returns the stat."""
+    st = st if st is not None else os.fstat(fd)
+    if stat_mod.S_ISREG(st.st_mode):
+        os.set_blocking(fd, True)
+    return st
+
+
+def _retry_transient(fn, *args, **kwargs):
+    """Call ``fn`` and retry it while it raises EAGAIN/EBUSY, then re-raise.
+    Synchronous — callers run it in a worker thread. ``fn`` must be safe to
+    repeat: a single syscall that did nothing when it failed, or a
+    tmp-then-rename writer that removes its tmp on the way out. An error a
+    nested retry already exhausted (`_commit_replace`) is not retried again:
+    six outer runs of six inner retries were ~27 s and six tmp files (review)."""
+    for _pause in _TRANSIENT_IO_BACKOFF_S:
+        try:
+            return fn(*args, **kwargs)
+        except OSError as e:
+            if e.errno not in _TRANSIENT_IO_ERRNOS or getattr(e, "_ghost_retried", False):
+                raise
+        time.sleep(_pause)
+    return fn(*args, **kwargs)
+
+
+def _commit_replace(tmp, dst) -> None:
+    """§4SD: ``os.replace(tmp, dst)`` retried on EAGAIN/EBUSY. A rename the
+    mount reported as failed but performed is DONE — a retry would fail
+    ENOENT on an applied change, and a caller that re-ran its whole write
+    would append the part twice. "Performed" is proved, not assumed: the
+    tmp's inode now stands at ``dst`` (review: `lexists` is False on ANY
+    lstat error, so a rename that did not happen plus a failed lstat
+    reported SUCCESS with the target unchanged and the tmp leaked)."""
+    try:
+        tmp_id = _retry_transient(os.lstat, tmp)                 # review: a transient lstat of its own tmp
+    except OSError as e:
+        e._ghost_retried = True              # the caller's whole-step retry must not nest it (round 4)
+        raise
+    tmp_id = (tmp_id.st_dev, tmp_id.st_ino)
+
+    def _landed() -> bool:
+        try:
+            os.lstat(tmp)
+            return False                     # still there: not renamed
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False                     # cannot tell: not proved
+        try:
+            st = os.lstat(dst)
+        except OSError:
+            return False
+        return (st.st_dev, st.st_ino) == tmp_id
+
+    def _once():
+        try:
+            os.replace(tmp, dst)
+        except OSError as e:
+            # transient, or ENOENT on a retry whose earlier attempt landed
+            # while the mount still showed the tmp
+            if e.errno in _TRANSIENT_IO_ERRNOS | {_errno.ENOENT} and _landed():
+                return
+            raise
+    try:
+        _retry_transient(_once)
+    except OSError as e:
+        e._ghost_retried = True              # the caller's retry must not re-run the write
+        raise
 
 
 def _write_edit_nofollow(real: Path, data: bytes, expect: os.stat_result) -> None:
@@ -2654,7 +2757,7 @@ def _write_edit_nofollow(real: Path, data: bytes, expect: os.stat_result) -> Non
     flags = (os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
              | getattr(os, "O_NONBLOCK", 0))
     try:
-        fd = os.open(str(real), flags)
+        fd = _retry_transient(os.open, str(real), flags)
     except OSError as _oe:
         # ELOOP = the final component is now a symlink: swapped in after
         # the check. Nothing was opened, nothing written — same verdict as
@@ -2672,10 +2775,14 @@ def _write_edit_nofollow(real: Path, data: bytes, expect: os.stat_result) -> Non
                 != (expect.st_dev, expect.st_ino, expect.st_size,
                     expect.st_mtime_ns, expect.st_ctime_ns)):
             raise _FileChangedUnderneath()
-        os.ftruncate(fd, 0)
+        _block_if_regular(fd, st)                               # §4SD
+        # each step retried on its own (§4SD): a failed ftruncate/write did
+        # nothing, while re-running the whole function after the truncate
+        # would fail the stamp check above against its own truncate
+        _retry_transient(os.ftruncate, fd, 0)
         view = memoryview(data)
         while view:
-            n = os.write(fd, view)
+            n = _retry_transient(os.write, fd, view)
             view = view[n:]
     finally:
         os.close(fd)
@@ -3301,11 +3408,12 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
         # checks cannot see. A short-lived O_NOFOLLOW fd; the streaming
         # branch below re-opens its own.
         def _inode_check():
-            _fd = os.open(str(_real), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                          | getattr(os, "O_NONBLOCK", 0))
+            _fd = _retry_transient(os.open, str(_real), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                   | getattr(os, "O_NONBLOCK", 0))
             try:
+                _ist = _block_if_regular(_fd)                   # §4SD
                 return (_inode_write_refusal(_fd, filename, sandbox_dir, project_store),
-                        os.fstat(_fd), os.read(_fd, 8192))
+                        _ist, _retry_transient(os.read, _fd, 8192))
             finally:
                 os.close(_fd)
         _deny, _st_checked, _head = await asyncio.to_thread(_inode_check)
@@ -3382,13 +3490,22 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
                         _sfd = os.open(str(_real), os.O_RDWR
                                        | getattr(os, "O_NOFOLLOW", 0)
                                        | getattr(os, "O_NONBLOCK", 0))
-                        _sst = os.fstat(_sfd)
+                        try:                                     # §4SD review: no leak per retry
+                            _sst = os.fstat(_sfd)
+                        except BaseException:
+                            os.close(_sfd)
+                            raise
                         if not stat_mod.S_ISREG(_sst.st_mode):
                             os.close(_sfd)
                             raise OSError(_errno.EINVAL, "not a regular file")
                         if (_sst.st_dev, _sst.st_ino) != (_st.st_dev, _st.st_ino):
                             os.close(_sfd)
                             raise _FileChangedUnderneath()
+                        try:
+                            _block_if_regular(_sfd, _sst)       # §4SD: a buffered EAGAIN read = EOF
+                        except BaseException:
+                            os.close(_sfd)
+                            raise
                         with open(_sfd, 'r', encoding='utf-8', errors='surrogateescape',
                                   newline='') as f_in:                      # endings KEPT (review B)
                             with tempfile.NamedTemporaryFile(mode='w', dir=path.parent,
@@ -3418,7 +3535,8 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
                             except Exception:
                                 pass
                         raise
-                replaced, _tmp, _chg_old, _chg_new = await asyncio.to_thread(_streaming_replace)
+                replaced, _tmp, _chg_old, _chg_new = await asyncio.to_thread(
+                    _retry_transient, _streaming_replace)                          # §4SD
                 if replaced > 0 and _tmp is not None:
                     _committed = False
                     try:
@@ -3476,7 +3594,7 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
                             os.chmod(_tmp, stat_mod.S_IMODE(_st.st_mode) & 0o777)
                         except OSError:
                             pass
-                        await asyncio.to_thread(os.replace, _tmp, path)
+                        await asyncio.to_thread(_commit_replace, _tmp, path)   # §4SD
                         _committed = True
                     finally:
                         if not _committed:
@@ -5335,7 +5453,7 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path, more_p
                 if _swap1:
                     os.unlink(_tmp)
                     return _swap1
-                os.replace(_tmp, path)
+                _commit_replace(_tmp, path)                     # §4SD
             except BaseException:
                 try:
                     os.unlink(_tmp)
@@ -5346,7 +5464,7 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path, more_p
             _prev_bytes = path.stat().st_size if path.exists() else -1
         except OSError:
             _prev_bytes = -1
-        _swapped = await asyncio.to_thread(_atomic_write)      # §4PF r4 (F15): a refusal string when the dir was swapped
+        _swapped = await asyncio.to_thread(_retry_transient, _atomic_write)      # §4SD; §4PF r4 (F15): a refusal string when the dir was swapped
         if _swapped:
             return _swapped
         try:
@@ -5782,8 +5900,7 @@ async def tool_append_file(filename: str, content: Any, sandbox_dir: Path, more_
                 if _swap1:
                     os.unlink(_tmp)
                     return _swap1
-                os.replace(_tmp, path)
-                _note_mutation(path)        # §4OG-1 (h): a direct append (the §4OB continuation) keeps the file this request's own
+                _commit_replace(_tmp, path)                     # §4SD: the commit point — nothing after it re-runs
             except BaseException:
                 try:
                     os.unlink(_tmp)
@@ -5791,7 +5908,12 @@ async def tool_append_file(filename: str, content: Any, sandbox_dir: Path, more_
                     pass
                 raise
             return len(_old) + len(_new)
-        total = await asyncio.to_thread(_atomic_append)
+        def _append_and_note():
+            r = _retry_transient(_atomic_append)                # §4SD: re-runs only before the commit
+            if isinstance(r, int) and not _state.get("dup"):
+                _note_mutation(path)        # §4OG-1 (h): a direct append (the §4OB continuation) keeps the file this request's own
+            return r
+        total = await asyncio.to_thread(_append_and_note)
         if isinstance(total, str):                                # §4PF r4 (F15): the dir was swapped
             return total
         if _state.get("dup"):

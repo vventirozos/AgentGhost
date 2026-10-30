@@ -31,6 +31,13 @@ from ..utils.logging import (Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREF
 
 logger = logging.getLogger("GhostAgent")
 
+#: §4SD: an SSE comment sent while a streamed turn runs without text — with no
+#: time ceiling a build can run for hours of tool calls with no byte on the
+#: wire, and a client's read timeout (the web interface: GHOST_CHAT_TIMEOUT,
+#: 4 h) would hang up and cancel it. SSE parsers ignore comment lines.
+STREAM_KEEPALIVE_S = 30.0
+STREAM_KEEPALIVE_FRAME = b": keepalive\n\n"
+
 #: §4RD: the session's copy of a streamed reply the client closed mid-way
 STREAM_CUT_NOTE = "_(Reply cut off: the stream was closed before it ended.)_"
 
@@ -1467,19 +1474,48 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 # Yield an SSE comment to send HTTP headers instantly and keep reverse proxies alive
                 yield b": processing request...\n\n"
 
+                import contextvars as _cv
+                from ..core.reply_tap import reply_tap_context as _rtc
+
+                async def _turn_capturing_context():
+                    _r = await agent.handle_chat(body, background_tasks, request_id=request_id)
+                    return _r, _cv.copy_context()
+
+                def _restore_turn_context(_turn_ctx):
+                    # r2 M1: awaited in place, the turn's context variables
+                    # (trajectory id, event project, conversation key…) stayed
+                    # visible to the streamed drain below; a task runs on a
+                    # COPY — put back every value the turn changed
+                    _here = _cv.copy_context()
+                    for _var, _val in _turn_ctx.items():
+                        if _var is _rtc:
+                            continue
+                        if _var not in _here or _here[_var] is not _val:
+                            _var.set(_val)
+
                 if _tap is None:
-                    content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
+                    # §4SD review: a keepalive while the turn runs — with no
+                    # time ceiling a build can go hours without a byte, and the
+                    # web interface's read timeout (GHOST_CHAT_TIMEOUT, 4 h)
+                    # then hangs up and cancels it. The turn runs as a task, so
+                    # its context is put back for the drain (review: the slot
+                    # key was lost and the next turn re-read the whole head).
+                    _plain = asyncio.ensure_future(_turn_capturing_context())
+                    try:
+                        while not (await asyncio.wait({_plain}, timeout=STREAM_KEEPALIVE_S))[0]:
+                            yield STREAM_KEEPALIVE_FRAME
+                        if _plain.cancelled():
+                            yield b"data: [DONE]\n\n"     # a hard stop: end the stream properly
+                            return
+                        (content, created_time, req_id), _plain_ctx = _plain.result()
+                    finally:
+                        if not _plain.done():
+                            _plain.cancel()    # the client went away mid-turn (parity: the await was cancelled)
+                    _restore_turn_context(_plain_ctx)
                 else:
                     # §4MP: run the turn as a task and forward the tap's
                     # frames while it generates (the task copies this
                     # context, so the agent finds the tap)
-                    import contextvars as _cv
-                    from ..core.reply_tap import reply_tap_context as _rtc
-
-                    async def _turn_capturing_context():
-                        _r = await agent.handle_chat(body, background_tasks, request_id=request_id)
-                        return _r, _cv.copy_context()
-
                     _tok = _rtc.set(_tap)
                     try:
                         _turn = asyncio.ensure_future(_turn_capturing_context())
@@ -1489,13 +1525,28 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     _taken = False          # r9: the turn's result was read below
                     try:
                         while not _turn.done():
-                            _get = asyncio.ensure_future(_tap.queue.get())
-                            _done, _ = await asyncio.wait({_turn, _get}, return_when=asyncio.FIRST_COMPLETED)
+                            if _get is None:
+                                _get = asyncio.ensure_future(_tap.queue.get())
+                            _done, _ = await asyncio.wait({_turn, _get}, timeout=STREAM_KEEPALIVE_S,
+                                                          return_when=asyncio.FIRST_COMPLETED)
+                            if not _done:
+                                # §4SD review: tool turns stream no text (84 %);
+                                # without a byte for 4 h the interface hangs up
+                                # and the build is cancelled. The pending get is
+                                # KEPT — a new one would race it for the next frame.
+                                yield STREAM_KEEPALIVE_FRAME
+                                continue
                             if _get in _done:
                                 content_started = True
                                 yield _get.result()
                             else:
                                 _get.cancel()
+                            _get = None
+                        if _get is not None and _get.done() and not _get.cancelled():
+                            # review: the turn ended while a keepalive was being
+                            # sent and the pending get had already taken a frame
+                            content_started = True
+                            yield _get.result()
                             _get = None
                         while not _tap.queue.empty():
                             content_started = True
@@ -1565,16 +1616,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                                                 name="session-cut")
                             except Exception:  # noqa: BLE001
                                 pass
-                    # r2 M1: awaited in place, the turn's context variables
-                    # (trajectory id, event project, conversation key…) stayed
-                    # visible to the streamed drain below; a task runs on a
-                    # COPY — put back every value the turn changed
-                    _here = _cv.copy_context()
-                    for _var, _val in _turn_ctx.items():
-                        if _var is _rtc:
-                            continue
-                        if _var not in _here or _here[_var] is not _val:
-                            _var.set(_val)
+                    _restore_turn_context(_turn_ctx)
 
                 if hasattr(content, '__aiter__'):
                     # Streamed final generation: accumulate the deltas so the
@@ -2100,6 +2142,8 @@ async def save_workspace(request: Request):
             fst = os.fstat(fd)
             if not _stat.S_ISREG(fst.st_mode):
                 raise ValueError(f"{name}: not a regular file")
+            from ..tools.file_system import _block_if_regular
+            _block_if_regular(fd, fst)                          # §4SD: virtiofs EAGAIN
             written = 0
             with zip_file.open(_member_info(arcname, st if st is not None else fst),
                                "w") as dst:

@@ -285,8 +285,10 @@ async def test_S3_tool_call_spam_aborts_the_stream():
     assert script.drained[0] is False, "tool-call spam stream drained fully"
 
 
-async def test_S4_extended_cap_aborts_a_200k_stream():
-    """S4: diverse (non-looping) thinking past the extended cap must abort."""
+async def test_S4_long_diverse_thinking_is_not_aborted():
+    """S4 (§4SD, operator: "that older guard can go"): diverse, non-looping
+    thinking past the old 200K-char cap runs to its answer. Fails where a
+    length abort comes back (it threw a 64k-token draft away as a loop)."""
     a = make_stream_agent()
     chunks = []
     for i in range(300):
@@ -296,8 +298,9 @@ async def test_S4_extended_cap_aborts_a_200k_stream():
     chunks.append(sse({"content": "CAP_RUN_COMPLETED_TEXT"}))
     script = StreamScript(chunks)
     out = await run_chat(a, script)
-    assert "CAP_RUN_COMPLETED_TEXT" not in str(out)
-    assert script.drained[0] is False
+    assert sum(len(c) for c in chunks) > 200_000
+    assert "CAP_RUN_COMPLETED_TEXT" in str(out)
+    assert script.drained[0] is True
 
 
 async def test_S5_S9_upstream_abort_triggers_continuation():

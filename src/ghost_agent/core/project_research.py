@@ -93,6 +93,8 @@ def _sha_nofollow(path: Path) -> Optional[str]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > _BRIEF_MAX_BYTES:
             return None
+        from ..tools.file_system import _block_if_regular
+        _block_if_regular(fd, st)                               # §4SD: virtiofs EAGAIN
         h = hashlib.sha256()
         while True:
             chunk = os.read(fd, 1 << 16)

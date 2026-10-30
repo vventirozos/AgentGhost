@@ -115,18 +115,29 @@ app = AsyncApp(token=os.environ.get("SLACK_BOT_TOKEN"))
 # Configuration
 # ---------------------------------------------------------------------------
 GHOST_API_URL = os.environ.get("GHOST_API_URL", "http://localhost:8000/api/chat")
-#: §4RA: how long the bot waits for one (non-streamed) agent reply. It sends no
-#: X-Ghost-Client-Timeout, so the agent uses its own budget (GHOST_MAX_REQUEST_S,
-#: 60 min in production) and never extends a Slack request. Turns run one at a
-#: time and the request clock starts when the turn STARTS, so a message can wait
-#: behind an extended coding request (up to 180 min, queueing accepted by the
-#: operator 2026-10-24): 180 min queued + 60 min of its own + 15 min margin.
+#: §4RA: how long the bot waits for one (non-streamed) agent reply. Turns run
+#: one at a time and the request clock starts when the turn STARTS, so a message
+#: can wait behind an extended coding request (queueing accepted by the operator
+#: 2026-10-24): 180 min queued + its own budget + margin. §4SD: web and CLI
+#: builds have no ceiling now, so a message queued behind one longer than
+#: ~220 min times out here and its reply is lost (operator 10-29: fine as is).
 try:
     AGENT_TIMEOUT_S = float(os.environ.get("GHOST_SLACK_AGENT_TIMEOUT", "15300") or 15300)
 except ValueError:
     AGENT_TIMEOUT_S = 15300.0
 if AGENT_TIMEOUT_S <= 0:
     AGENT_TIMEOUT_S = 15300.0
+#: §4SD (operator 10-29: "set a limit to slack for 30 mins"): a Slack request's
+#: own budget, sent as X-Ghost-Client-Timeout. The agent takes the lower of it
+#: and GHOST_MAX_REQUEST_S and never extends past a client's figure; the last
+#: minutes go to a state report. Not a hard stop: a turn already running when the
+#: report is due finishes first (16k at ~15 tok/s is up to ~18 min), then the report.
+try:
+    SLACK_REQUEST_S = float(os.environ.get("GHOST_SLACK_REQUEST_S", "1800") or 1800)
+except ValueError:
+    SLACK_REQUEST_S = 1800.0
+if not 0 < SLACK_REQUEST_S < float("inf"):
+    SLACK_REQUEST_S = 1800.0
 GHOST_API_BASE = re.sub(r"/api/chat/?$", "", GHOST_API_URL)
 # Never ship a default secret — the key must be EXPLICITLY configured. An
 # EMPTY value is allowed and means "the agent runs with auth disabled"
@@ -1281,7 +1292,9 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
                        "X-Ghost-Member": member_id_header(requester, OWNER_ID),
                        # where the reply is posted: an owner turn in a channel
                        # does not load the owner's private context (§4KY)
-                       "X-Ghost-Surface": surface}
+                       "X-Ghost-Surface": surface,
+                       # §4SD: the 30-minute Slack budget (see SLACK_REQUEST_S)
+                       "X-Ghost-Client-Timeout": str(int(SLACK_REQUEST_S))}
             response = await client.post(GHOST_API_URL, json=payload,
                                          headers=headers)
 

@@ -1499,6 +1499,10 @@ _ADVANCE_STOP_BLURB = {
                         "complete; tell the user which tasks are open and what holds them.",
     "busy": "Not run: another unattended step on this project is still running — "
             "try again when it has finished.",
+    "out_of_time": "Stopped: the build ran out of time before the task was done — the task "
+                   "is open again (READY). Any file it finished is on disk, not verified yet; "
+                   "a file it had not finished is written again from the start next time. "
+                   "Tell the user.",
     "step_crashed": "Stopped: the build step crashed before it could finish (the task "
                     "is open again, ready to retry) — tell the user what failed.",
     "autopilot_off": "Not run: autopilot is off for this project, and only the owner's "
@@ -1533,7 +1537,7 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     # manual build thrashed ~700s and broke project scoping).
     stopped_early = batch.stop_reason in (
         "failed", "repeated_failures", "budget_or_inactive", "needs_user",
-        "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed",
+        "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "out_of_time",
         "in_progress", "open_but_waiting")
     if batch.stop_reason == "model_experiment":
         _exp = next((a for a in reversed(batch.advanced) if a.get("task_id")), {})

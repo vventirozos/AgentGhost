@@ -54,7 +54,7 @@ def test_native_header_keeps_the_load_bearing_parts():
     assert "{think_budget_guidance}" in QWEN_TOOL_PROMPT_NATIVE
     # Think discipline survives (these rules are format-independent).
     assert "ANTI-PARALYSIS" in QWEN_TOOL_PROMPT_NATIVE
-    assert "DO NOT draft or write Python" in QWEN_TOOL_PROMPT_NATIVE
+    assert "DO NOT draft or write code or file content" in QWEN_TOOL_PROMPT_NATIVE   # §4SD: names HTML/CSS/JS too
     # Parallel tool use stays invited — the fix must not un-teach
     # parallelism, only the broken dialect.
     assert "PARALLEL EXECUTION" in QWEN_TOOL_PROMPT_NATIVE

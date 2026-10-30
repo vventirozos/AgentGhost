@@ -34,7 +34,6 @@
     "unused-import|src/ghost_agent/core/agent.py|Unused ToolCall imported from distill.schema": 1,
     "unused-import|src/ghost_agent/core/agent.py|Unused _STREAM_STOP_MARKERS imported from stream_guards": 1,
     "unused-import|src/ghost_agent/core/agent.py|Unused atomic_print imported from utils.logging": 1,
-    "unused-import|src/ghost_agent/core/agent.py|Unused import sys": 1,
     "unused-import|src/ghost_agent/core/agent.py|Unused tool_list_tasks imported from tools.tasks": 1,
     "unused-import|src/ghost_agent/core/autonomous_activity.py|Unused import re": 1,
     "unused-import|src/ghost_agent/core/build_gates.py|Unused import os": 1,

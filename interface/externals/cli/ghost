@@ -1085,7 +1085,9 @@ class GhostAPI:
     # -- chat --------------------------------------------------------------
     def chat_stream(self, messages: list[dict], session_id: str,
                     request_id: str, effort: str = "") -> requests.Response:
-        headers = {"X-Request-ID": request_id}
+        # §4SD: the read has no timeout, so tell the agent it may run as long as
+        # it keeps making progress (same budget as the web page)
+        headers = {"X-Request-ID": request_id, "X-Ghost-Client-Timeout": "inf"}
         if effort:                                  # §4RB: Default sends nothing
             headers["X-Ghost-Effort"] = effort
         return self.http.post(
@@ -3179,7 +3181,7 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None,
     try:
         # §4MP: piped output cannot take back streamed text — ask for the
         # finished reply only (no retracts); a terminal gets live tokens
-        _hdrs = {"X-Request-ID": request_id}
+        _hdrs = {"X-Request-ID": request_id, "X-Ghost-Client-Timeout": "inf"}   # §4SD: as chat_stream
         if effort:                                  # §4RB: --effort
             _hdrs["X-Ghost-Effort"] = effort
         if not render:

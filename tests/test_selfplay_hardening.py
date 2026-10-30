@@ -84,17 +84,8 @@ class TestAgentOverrides:
         effective = getattr(agent, "max_turns_override", None) or 40
         assert effective == 40
 
-    def test_max_thinking_chars_override_respected(self):
-        agent = GhostAgent.__new__(GhostAgent)
-        agent.max_thinking_chars_override = 12000
-        effective = getattr(agent, "max_thinking_chars_override", None) or 32000
-        assert effective == 12000
-
-    def test_max_thinking_chars_default_32000(self):
-        from ghost_agent.core.agent import MAX_THINKING_CHARS
-        agent = GhostAgent.__new__(GhostAgent)
-        effective = getattr(agent, "max_thinking_chars_override", None) or MAX_THINKING_CHARS
-        assert effective == 32000
+    # §4SD: the thinking char caps (and their override) were removed — the
+    # turn's max_tokens bounds length, the n-gram probe bounds repetition.
 
 
 # --------------------------------------------------------- brittleness scoring

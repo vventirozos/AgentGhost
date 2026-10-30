@@ -9,7 +9,6 @@ import pytest
 
 from ghost_agent.core import agent as agent_mod
 from ghost_agent.core.agent import (
-    MAX_THINKING_CHARS,
     THINKING_LOOP_PROBE_EVERY,
     THINKING_LOOP_THRESHOLD,
     THINKING_LOOP_WINDOW,
@@ -65,7 +64,6 @@ class TestDetectThinkingLoop:
         assert _detect_thinking_loop(buf) is True
 
     def test_constants_are_sane(self):
-        assert MAX_THINKING_CHARS > 0
         assert THINKING_LOOP_PROBE_EVERY > 0
         assert THINKING_LOOP_WINDOW > 0
         assert THINKING_LOOP_THRESHOLD >= 2
@@ -308,11 +306,6 @@ class TestAgentModuleWiring:
 
     def test_loop_detector_is_exported(self):
         assert callable(agent_mod._detect_thinking_loop)
-
-    def test_max_thinking_chars_reasonable(self):
-        # Should be large enough for a real chain of thought but small enough
-        # to kill the runaway-loop pathology in seconds, not minutes.
-        assert 4_000 <= MAX_THINKING_CHARS <= 200_000
 
     def test_render_helper_is_exported(self):
         assert callable(agent_mod._render_assistant_with_tool_calls)

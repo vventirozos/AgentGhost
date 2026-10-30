@@ -3898,8 +3898,9 @@ def clarify_first_reply(user_text, messages=None) -> str:
 #: §4NU: one wording for every place that tells the model how to write a big
 #: file (cut-off message, XML truncation hint; the schema says the same)
 BIG_FILE_GUIDANCE = (
-    "One reply carries at most ~16k tokens INCLUDING your thinking — about 40 KB of code, much "
-    "less for Greek text. Write a big file in PARTS, each split at a line boundary: the first "
+    "One reply carries at most ~16k–64k tokens INCLUDING your thinking (fewer the longer the "
+    "conversation; 16k is about 40 KB of code, much less for Greek text). Do not draft a whole "
+    "file in your thinking — write it. Write a big file in PARTS, each split at a line boundary: the first "
     "with file_system operation='write' and more_parts=true, each next one (~15 KB of "
     "code) with operation='write', append=true and more_parts=true, and the LAST one with "
     "append=true only (the file is checked then) — add at the END with append=true, never with "
@@ -6421,16 +6422,13 @@ def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = F
 
 
 # Streaming guards. When the upstream model enters a self-repeating thinking
-# loop (re-deriving the same paragraph hundreds of times), we kill the stream
-# instead of burning context indefinitely.
-MAX_THINKING_CHARS = 32000          # where loop-CHECKING begins (not a kill)
-# 200K (was 64K): the hard length-abort is a true backstop, not a guillotine.
-# Between 32K and 200K the stream is only aborted when `_detect_thinking_loop`
-# actually fires — so a strong model genuinely working a hard algorithm/proof/
-# debug problem (which can legitimately exceed ~16K thinking tokens) is allowed
-# to finish its derivation, while a real repetition loop is still caught at the
-# 32K check and the 200K ceiling stops any pathological runaway.
-MAX_THINKING_CHARS_EXTENDED = 200000
+# loop (re-deriving the same paragraph hundreds of times), the n-gram probe
+# below kills the stream. §4SD (operator 10-29: "that older guard can go, it's
+# from an old model family that misbehaved"): the 200K-char hard length abort
+# (MAX_THINKING_CHARS_EXTENDED) and the 32K MAX_THINKING_CHARS are gone — at
+# the 64k-token cap a whole-app draft is ~205-223K chars, and the abort threw
+# it away as "runaway loop" where §4RF keeps it. Length is bounded by the
+# turn's max_tokens; repetition by the probe.
 
 # Upstream `max_tokens` cap for a single tool-using turn. Without this, the
 # payload sends no max_tokens at all and the server default (often 1024 or
@@ -6450,6 +6448,60 @@ MAX_THINKING_CHARS_EXTENDED = 200000
 # turns 16k tokens of garbage; wire the detector and the cap is only
 # reached by healthy verbose generations.
 DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
+#: §4SD (operator 10-29: "16k tokens seems too low when it's writing big
+#: files"): a tool turn may write up to this much when the server's window has
+#: the room. Every 16k cut in the log (7 of 7,363 turns) was a whole app being
+#: drafted inside the thinking; the median turn thinks 74 tokens.
+TOOL_TURN_MAX_TOKENS_CEIL = 65536
+#: tokens left free between the prompt estimate and the window: the chat
+#: template's own tokens and tokenizer drift
+TURN_ROOM_MARGIN_TOKENS = 4096
+#: §4SD (operator 10-29: Slack requests get 30 min): a turn gets more than the
+#: 16k floor only when the time its request may still run could hold a whole
+#: room-sized turn — 64k at the 27B's ~15 tok/s is ~73 min. A Slack request
+#: (30 min, never extended) keeps 16k, so one turn cannot run past it by an hour.
+TURN_ROOM_MIN_TIME_LEFT_S = 4500.0
+
+
+def turn_room_fits_time(ceiling_s, elapsed_s) -> bool:
+    """§4SD: may this turn take more than the 16k floor? Yes with no deadline
+    (``ceiling_s`` 0) or no ceiling (inf); else only when the longest the request
+    may still run (its extension ceiling less the time spent) is at least
+    ``TURN_ROOM_MIN_TIME_LEFT_S``."""
+    try:
+        ceil, spent = float(ceiling_s or 0.0), max(0.0, float(elapsed_s or 0.0))
+    except (TypeError, ValueError):
+        return False
+    if ceil <= 0 or math.isinf(ceil):
+        return True
+    return ceil - spent >= TURN_ROOM_MIN_TIME_LEFT_S
+
+
+def turn_takes_room(payload, is_final_generation) -> bool:
+    """§4SD: the per-turn room applies to a TOOL turn carrying the default
+    cap — not a final answer or report (review: they would get up to 64k
+    too), not an operator's own --tool-turn-max-tokens, not the forced
+    report's 8k."""
+    return (not is_final_generation and isinstance(payload, dict)
+            and payload.get("max_tokens") == DEFAULT_TOOL_TURN_MAX_TOKENS)
+
+
+def output_cap_for_tool_turn(prompt_tokens, window_tokens, floor=DEFAULT_TOOL_TURN_MAX_TOKENS,
+                         ceil=TOOL_TURN_MAX_TOKENS_CEIL) -> int:
+    """§4SD: a tool turn's ``max_tokens`` — what the server's window leaves
+    after this turn's prompt (less a margin), never above ``ceil`` and never
+    below ``floor``. Below the floor the prompt was already pruned to
+    --max-context (the launcher keeps ~22k of the window for output) and a
+    turn that reaches the window's end stops like a cap cut (§4RF/§4OB
+    recover both). An unknown window → ``floor``, the pre-§4SD cap."""
+    try:
+        win, used = int(window_tokens or 0), max(0, int(prompt_tokens or 0))
+        lo, hi = int(floor), int(ceil)
+    except (TypeError, ValueError):
+        return DEFAULT_TOOL_TURN_MAX_TOKENS
+    if win <= 0:
+        return lo
+    return max(lo, min(hi, win - used - TURN_ROOM_MARGIN_TOKENS))
 
 # When the upstream stops a *text* answer at its token cap
 # (`finish_reason == "length"`), the partial reply is shipped mid-sentence
@@ -6552,6 +6604,26 @@ FUTILITY_REPORT_RUNS = 4
 REPORT_TURN_MIN_TURN = 3
 #: §4OG-1 (k): the one extension a converging build gets at the turn budget
 TURN_BUDGET_EXTENSION = 10
+#: §4SD (operator 10-29: "remove the tool turn limit"): a request with a time
+#: budget has no turn count — its deadline (extended only by coding progress)
+#: and the breakers end it. One with no deadline (scheduled, job, bench,
+#: internal) keeps this count: it is that request's only bound.
+TURN_CAP_WITHOUT_DEADLINE = 40
+
+
+def main_turn_cap(override, deadline_s, elapsed_s) -> int:
+    """§4SD: the main loop's turn count. A sub-agent's or leaf's own
+    ``max_turns_override`` wins; else no count (``sys.maxsize``) for a request
+    with a deadline AND a running clock, ``TURN_CAP_WITHOUT_DEADLINE`` for any
+    other (review: with no clock — ``elapsed_s`` None — the deadline report can
+    never fire, so the count is the only bound left)."""
+    if override:
+        return int(override)
+    try:
+        timed = float(deadline_s or 0.0) > 0 and elapsed_s is not None
+    except (TypeError, ValueError):
+        timed = False
+    return sys.maxsize if timed else TURN_CAP_WITHOUT_DEADLINE
 #: …only when this much wall time is left beyond the report reserve
 TURN_BUDGET_EXTENSION_MIN_S = 180.0
 
@@ -6647,6 +6719,8 @@ def effective_report_floor(deadline_s, req_id=None) -> float:
 
 def _span(secs: float) -> str:
     secs = max(0.0, float(secs or 0.0))
+    if math.isinf(secs):
+        return "no limit"                                  # §4SD: the ceiling may be inf
     if secs >= 600 or (secs >= 120 and round(secs) % 60 == 0):
         return f"{secs / 60:.0f} min"
     return f"{secs:.0f} s"
@@ -6659,7 +6733,9 @@ def client_deadline_line(deadline_s, ceiling_s=0.0) -> str:
     line = (f"time budget {_span(deadline_s)} (the last {_span(effective_report_floor(deadline_s))} "
             "are kept for the final report)")
     try:
-        if float(ceiling_s or 0.0) > float(deadline_s or 0.0):
+        if math.isinf(float(ceiling_s or 0.0)):
+            line += "; no time limit while code is being written (§4SD: it stops after a stall)"
+        elif float(ceiling_s or 0.0) > float(deadline_s or 0.0):
             line += f"; extendable to {_span(ceiling_s)} while code is being written"
     except (TypeError, ValueError):
         pass
@@ -8001,7 +8077,7 @@ from .stream_guards import (  # noqa: E402
     TOOL_CALL_BATCH_CEILING, NATIVE_TOOL_CALL_REPEAT,
     _STREAM_STOP_MARKERS,
     _detect_thinking_loop, _tail_has_stop_marker, _detect_tool_call_loop,
-    _detect_paragraph_loop, _detect_sentence_run_loop,
+    _detect_paragraph_loop, _detect_sentence_run_loop, _detect_block_loop,
     _detect_native_tool_call_flood,
     _native_call_identity,
 )
@@ -16247,6 +16323,46 @@ class GhostAgent:
         else:
             pretty_log("Head Disk", f"head restore over an outside call failed ({detail}) — llama "
                        f"re-processes the head", icon=Icons.HEAD_FAIL)
+
+    async def _main_window_tokens(self) -> int:
+        """§4SD: the main server's per-slot window (``/props`` n_ctx), re-read
+        every 10 min (a llama restart may change it); 0 = unknown."""
+        now = time.monotonic()
+        c = getattr(self, "_main_window_cache", None)
+        if isinstance(c, tuple) and len(c) == 2 and now < c[1]:
+            return c[0]
+        n = 0
+        try:
+            base = _head_saves.server_base(getattr(self.context.llm_client, "upstream_url", ""))
+            if base:
+                p = await asyncio.to_thread(_head_saves._http, base + "/props", None, 5.0)
+                n = int(((p or {}).get("default_generation_settings") or {}).get("n_ctx") or 0)
+        except Exception:  # noqa: BLE001 — unknown window = the 16k floor
+            n = 0
+        self._main_window_cache = (max(0, n), now + (600.0 if n > 0 else 60.0))
+        return max(0, n)
+
+    async def _tool_turn_room(self, payload) -> int:
+        """§4SD: ``output_cap_for_tool_turn`` for this payload — its messages and
+        tool schemas counted with the agent's tokenizer, off the event loop. The
+        16k floor when the request's time could not hold a room-sized turn."""
+        try:
+            rid = request_id_context.get() or ""
+            if not turn_room_fits_time(_glog.extension_ceiling_s(rid), _glog.request_elapsed_s(rid)):
+                return DEFAULT_TOOL_TURN_MAX_TOKENS
+            win = await self._main_window_tokens()
+            if win <= 0:
+                return DEFAULT_TOOL_TURN_MAX_TOKENS
+            msgs, tools = list(payload.get("messages") or []), payload.get("tools")
+
+            def _count() -> int:
+                n = _estimate_messages_tokens(msgs)
+                if tools:
+                    n += estimate_tokens(json.dumps(tools, ensure_ascii=False))
+                return n
+            return output_cap_for_tool_turn(await asyncio.to_thread(_count), win)
+        except Exception:  # noqa: BLE001
+            return DEFAULT_TOOL_TURN_MAX_TOKENS
 
     async def _head_save_plan(self, llm, payload) -> Optional[Dict[str, Any]]:
         """§4RO: None when head saves are off or the server cannot take them;
@@ -24670,6 +24786,14 @@ class GhostAgent:
                                     _rec = _si.setdefault(_bn, {"writes": 0, "runs": 0})
                                     _rec["writes"] += 1               # progress is the RUN's verdict (a reset here
                                                                       # fired the report at the 6th write, before its run)
+                                    # §4SD review: only a write not made before re-arms a run's
+                                    # earn — the same (or an A/B-alternating) write, run, error
+                                    # earned an extension every cycle with no ceiling
+                                    _wk = hashlib.sha1(str(a_hash).encode("utf-8", "replace")).hexdigest()
+                                    _seen_w = _rec.setdefault("write_keys", set())
+                                    if _wk not in _seen_w:
+                                        _seen_w.add(_wk)
+                                        _rec["new_writes"] = _rec.get("new_writes", 0) + 1
                             elif fname == "execute":
                                 # §4OE-2 (review CRITICAL): a FAILING run (pytest exit 1) is an
                                 # error result — counted here regardless, else the report tier
@@ -24774,17 +24898,20 @@ class GhostAgent:
                                 # a volatile port/pid (r3 M1) or alternating test counts (r4) read as
                                 # progress forever — a run counts once per REWRITE of its file
                                 if (isinstance(_r, dict) and _r.get("progress") is True
-                                        and _r.get("writes", 0) > _r.get("writes_at_earn", 0)):
+                                        and _r.get("new_writes", 0) > _r.get("writes_at_earn", 0)):
                                     _earned_recs.append(_r)
                         _refused = _res_unresolved or bool(getattr(_outcome, "is_rejection", False))
                         if is_code_progress(fname, ptool_op, ptarget,
                                             _refused or (_res_is_error and fname != "execute"),   # a failing run that
                                             ran_written=bool(_earned_recs)):                     # converges counts
                             for _r in _earned_recs:                       # r4: only a run that COUNTED uses it up
-                                _r["writes_at_earn"] = _r.get("writes", 0)
+                                _r["writes_at_earn"] = _r.get("new_writes", 0)
                             _glog.note_code_progress(request_id_context.get() or "",
                                                      f"wrote {ptarget}" if fname == "file_system"
-                                                     else "ran a file it wrote")
+                                                     else "ran a file it wrote",
+                                                     # §4SD review: the same write again is not progress
+                                                     key=(hashlib.sha1(str(a_hash).encode("utf-8", "replace")).hexdigest()
+                                                          if fname == "file_system" else ""))
                     except Exception:  # noqa: BLE001
                         pass
                     # §4RA end
@@ -27962,42 +28089,14 @@ class GhostAgent:
                                 # loop. Both manifest as a runaway buffer
                                 # with no tool call.
                                 guard_buf = reasoning_content if reasoning_content else full_content
-                                # Self-play can install a tighter cap via
-                                # `max_thinking_chars_override` on the
-                                # GhostAgent instance (we know the
-                                # simulation is bounded and can't afford
-                                # 32k chars of wasted introspection).
-                                # Progressive thinking budget: start at 32K, but
-                                # if the model is producing diverse content (no
-                                # n-gram repetition at the initial cap), extend
-                                # to 64K. This lets complex algorithmic reasoning
-                                # and multi-step debugging breathe while still
-                                # killing genuine loops.
-                                override_cap = getattr(self, "max_thinking_chars_override", None)
-                                # base cap (MAX_THINKING_CHARS) is now implicit:
-                                # the periodic loop probe runs at all sizes, so a
-                                # loop is caught before base regardless; only the
-                                # extended hard cap needs an explicit length gate.
-                                extended_cap = override_cap or MAX_THINKING_CHARS_EXTENDED
+                                # §4SD: no length abort — the turn's max_tokens bounds length.
 
-                                # Hard cap: past the extended budget, abort
-                                # regardless (a cheap length check).
-                                if len(guard_buf) > extended_cap:
-                                    thinking_loop_detected = True
-                                    pretty_log("Thinking Cap", f"Stream exceeded extended cap ({extended_cap} chars). Aborting turn.", level="WARNING", icon=Icons.STOP)
-                                    break
-
-                                # The n-gram repetition detector is O(buffer)
-                                # (`buf.count(tail)` over up to 64K chars). The
-                                # old code ran it PER TOKEN once thinking passed
-                                # base_cap (32K) — the dominant CPU cost of a long
-                                # thinking stream — because that boundary branch
-                                # ignored the `next_loop_probe` cadence. Run it
-                                # ONCE per THINKING_LOOP_PROBE_EVERY chars at ALL
-                                # sizes: early loops (below 32K) are still caught
-                                # within 500 chars, and in the 32-64K window a
-                                # clean probe implicitly allows the extension —
-                                # the separate per-token boundary check is gone.
+                                # The loop probes run ONCE per
+                                # THINKING_LOOP_PROBE_EVERY chars at all sizes
+                                # (an old per-token boundary check past 32K was
+                                # the dominant CPU cost of a long thinking
+                                # stream). No length cap sits beside them since
+                                # §4SD: the turn's max_tokens bounds length.
                                 if len(guard_buf) >= next_loop_probe:
                                     next_loop_probe = len(guard_buf) + THINKING_LOOP_PROBE_EVERY
                                     # § finalize/stream R1 B-3: the
@@ -28019,9 +28118,8 @@ class GhostAgent:
                                     # the fallback was built for. The
                                     # tool-call-collapse probe owns
                                     # tool degeneracies, and the
-                                    # extended hard cap + upstream
-                                    # max_tokens still bound plain-
-                                    # content runaway.
+                                    # upstream max_tokens still bounds
+                                    # plain-content runaway.
                                     _probe_ok = True
                                     if not reasoning_content:
                                         # R2 M2/M3: shared mention-
@@ -28055,7 +28153,15 @@ class GhostAgent:
                                     # probe.
                                     if reasoning_content and _detect_sentence_run_loop(reasoning_content):
                                         thinking_loop_detected = True
-                                        pretty_log("Thinking Loop", f"Detected repeated-sentence-frame loop ({SENTENCE_RUN_THRESHOLD}+ sentences with one opener) at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                        pretty_log("Thinking Loop", f"Detected repeated-sentence-frame loop ({SENTENCE_RUN_THRESHOLD}+ sentences with one or two openers) at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                        break
+                                    # §4SD: a block written out again and
+                                    # again with a period past the n-gram
+                                    # probe's 2,000 chars (a file re-drafted
+                                    # in thinking). THINKING channel only.
+                                    if reasoning_content and _detect_block_loop(reasoning_content):
+                                        thinking_loop_detected = True
+                                        pretty_log("Thinking Loop", f"Detected repeated-block loop at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
                                         break
 
                                 if "tool_calls" in delta and delta["tool_calls"]:
@@ -28138,6 +28244,7 @@ class GhostAgent:
                 try:
                     from .task_state import note_reply_seconds as _note_reply_s, note_reply_tokens as _note_reply_t   # §4OE-1
                     _note_reply_s(request_id_context.get(), thinking_duration)
+                    _glog.note_turn_seconds(request_id_context.get() or "", thinking_duration)   # §4SD: sizes the stall window
                     _gen_s = (time.monotonic() - _first_delta_at) if _first_delta_at else thinking_duration
                     _note_reply_t(request_id_context.get(),                                   # §4OG-5 (f): the GENERATION rate
                                   int(reasoning_token_count or 0) + int(content_token_count or 0)
@@ -28734,6 +28841,11 @@ class GhostAgent:
                     try:
                         payload["messages"] = recovery_msgs
                         payload["stream"] = False
+                        # §4SD review: a non-streamed call waits for the whole reply
+                        # under the client's 1,200 s read timeout — a 64k turn cap
+                        # (~70 min at ~15 tok/s) cannot land; the retry gets 16k
+                        if int(payload.get("max_tokens") or 0) > DEFAULT_TOOL_TURN_MAX_TOKENS:
+                            payload["max_tokens"] = DEFAULT_TOOL_TURN_MAX_TOKENS
                         # the loop's own list keeps the queued rows' keys (the payload stays plain)
                         messages = recovery_msgs[:_q_at] + _q_rows + recovery_msgs[_q_at + len(_q_sent):]
                         if _req_row is not None and last_user:
@@ -30987,10 +31099,13 @@ class GhostAgent:
                 # second → synthesize-now steer + whole-file-read lockdown.
                 context_pressure_steers = 0
 
-                # Self-play can cap a single attempt's turn count via
-                # `max_turns_override` on the GhostAgent instance, so a
-                # runaway simulation can't silently chew through 40 turns.
-                effective_max_turns = getattr(self, "max_turns_override", None) or 40
+                # Sub-agents and leaves cap their own count via
+                # `max_turns_override`; a request with a deadline has no count
+                # (§4SD), one without keeps TURN_CAP_WITHOUT_DEADLINE.
+                _rid_cap = request_id_context.get() or ""
+                effective_max_turns = main_turn_cap(getattr(self, "max_turns_override", None),
+                                                    _glog.request_deadline_s(_rid_cap),
+                                                    _glog.request_elapsed_s(_rid_cap))
                 _budget_extended = False                     # §4OG-1 (k): once, while the build converges
                 from .queued_messages import (enabled as _queued_enabled, queued_row as _queued_row,
                                               note_delivered as _queued_note_delivered)
@@ -32155,6 +32270,9 @@ class GhostAgent:
                         pretty_log("Turn Budget",
                                    "thinking-loop retry — thinking OFF for this turn (tools stay on)",
                                    icon=Icons.WARN, level="WARNING")
+                    if turn_takes_room(payload, is_final_generation):
+                        # §4SD: the room this turn's prompt leaves in the window, up to 64k
+                        payload["max_tokens"] = await self._tool_turn_room(payload)
                     payload = self._with_turn_effort(payload, req_id)   # §4RB
                     pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
 

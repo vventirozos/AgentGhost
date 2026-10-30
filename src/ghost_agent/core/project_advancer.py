@@ -690,6 +690,10 @@ async def _note_misquotes_if_done(store, plan, project_id, nxt) -> None:
         logger.warning("quote check note skipped for %s", nxt.id, exc_info=True)
 
 
+#: §4SD: a coding step whose leaf ran out of time (task back to READY)
+OUT_OF_TIME_PREFIX = "code build ran out of time (task back to READY)"
+
+
 def _finalize_coding(context, store, plan, project_id, nxt, cres,
                      tick_started_at, owner_requested: bool = False) -> AdvanceResult:
     """Persist the outcome of a real coding build (CodingResult) for one leaf.
@@ -793,6 +797,32 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                              (f"built: {cres.summary}; held for the owner: {_why}"
                               if _why else f"built: {cres.summary}"), None)
 
+    if getattr(cres, "out_of_time", False):
+        # §4SD review r11: the leaf's TIME ran out (an unattended step's cap,
+        # a 30-min Slack request), not the build — as a timed-out step
+        # (`_after_abort`) the task goes back to READY, with the files that
+        # completed on disk for the next step to build on; FAILED is never
+        # retried unattended
+        try:
+            store.update_task(nxt.id, status="READY", failure_reason=f"code_executor: {cres.summary}"[:300])
+        except Exception:  # noqa: BLE001
+            logger.debug("out-of-time leaf not reset", exc_info=True)
+        _increment_budget(store, project_id)
+        _tick_secs = max(0.0, time.time() - tick_started_at)
+        record_runtime(store, project_id, seconds=_tick_secs, tool_calls=1)
+        try:
+            store.update_task(nxt.id, actual_cost=_tick_secs)
+        except Exception:  # noqa: BLE001
+            logger.debug("actual_cost stamp skipped", exc_info=True)
+        store.log_event(project_id, nxt.id, "autoadvance_out_of_time",
+                        {"tool": "code_executor", "reason": (cres.summary or "")[:200],
+                         "files": list(cres.files or [])[:8]})
+        _work_log_step(store, project_id, nxt, outcome="had_failures",
+                       files=list(cres.files or []), tools={"code_executor": 1},
+                       note=f"out of time, back to READY: {(cres.summary or '')[:240]}")
+        # `advance_many` stops on this prefix (review r12: the READY task was
+        # picked again at once — 40 times in one owner batch)
+        return AdvanceResult(True, nxt.id, "coding", f"{OUT_OF_TIME_PREFIX}: {cres.summary}", None)
     plan.update_status(nxt.id, TaskStatus.FAILED,
                        failure_reason=f"code_executor: {cres.summary}")
     _increment_budget(store, project_id)
@@ -1942,6 +1972,18 @@ async def advance_unattended(context, project_id: str, **kwargs):
         _eoc.reset(_tok)
 
 
+async def _with_leaf_deadline(coro, deadline: float):
+    """§4SD: run ``coro`` with `coding_executor.leaf_deadline_context` set, so a
+    coding leaf inside it sizes each file call by the step's time left (and
+    stops as out of time rather than starting one the step's cap would cut)."""
+    from .coding_executor import leaf_deadline_context
+    tok = leaf_deadline_context.set(deadline)
+    try:
+        return await coro
+    finally:
+        leaf_deadline_context.reset(tok)
+
+
 async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: Optional[float] = None,
                              **kw) -> AdvanceResult:
     """ONE unattended step under the §4MQ gates — the only entry for the idle
@@ -2013,8 +2055,11 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
         timeout = UNATTENDED_STEP_TIMEOUT_S if step_timeout_s is None else float(step_timeout_s)
         claimed: list = []
         try:
-            res = await _wait_for(advance_once(context, project_id, owner_requested=False,
-                                               claim_sink=claimed, **kw), timeout)
+            # §4SD: the leaf sizes its calls by the time it has — a 64k file
+            # call (~73 min) must not start in a 45-min step it cannot finish in
+            res = await _wait_for(_with_leaf_deadline(
+                advance_once(context, project_id, owner_requested=False, claim_sink=claimed, **kw),
+                time.monotonic() + max(0.0, timeout - 60.0)), timeout)
         except asyncio.TimeoutError:
             res = _after_abort(store, project_id, claimed, t0,
                                "timeout", f"step passed its {int(timeout)} s cap")
@@ -2255,6 +2300,12 @@ async def advance_many(
                              "status": (store.get_task(res.task_id) or {}).get("status"),
                              "summary": res.summary})
             stop_reason = "model_experiment"      # §4QA: the turn runs it with probe_model
+            break
+        if res.task_id and res.summary.startswith(OUT_OF_TIME_PREFIX):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "out_of_time"           # §4SD r12: not re-picked in the same batch
             break
         if cls == "blocked" and res.task_id and res.summary.startswith("coding executor crashed"):
             advanced.append({"task_id": res.task_id, "classification": res.classification,

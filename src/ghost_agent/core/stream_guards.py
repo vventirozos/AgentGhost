@@ -11,6 +11,7 @@ land HERE and be referenced from the loop, not inlined into `handle_chat`.
 references (and tests) keep working unchanged.
 """
 import re
+from collections import Counter
 
 # --- thinking-loop (n-gram repetition) detector -----------------------------
 THINKING_LOOP_PROBE_EVERY = 500     # run the repetition probe every N chars
@@ -30,7 +31,52 @@ THINKING_LOOP_MAX_GAP = 3 * THINKING_LOOP_WINDOW     # 600: window + up to 400 c
 # fast at an "acceptable false-positive risk"; a strong model rarely produces
 # those, so that cost (aborting legitimate reasoning that restates a constraint
 # / loop invariant / repeated code pattern) now outweighs the benefit. The
-# tool-call-collapse probe + the 200K char ceiling remain as fast backstops.
+# tool-call-collapse probe remains a fast backstop (the 200K char ceiling is
+# gone, §4SD: the 64k output cap bounds a turn).
+
+# --- what a text line is, and when two periods are the same -----------------
+# §4SD (2026-10-29): with the 16k output cap raised to 64k and the 200K-char
+# abort removed, a 64k turn can draft a whole file in its thinking — and the
+# old line probe killed real source as a "loop": replayed through the probes
+# at the stream's cadence, 35 of 411 real files (this repo's src/ and docs/,
+# the sandbox projects, the web client) fired it — separator comments
+# (`/* ═══…`, `# ----…`), a `headers: {…}` line, a `return "Error: …"` line
+# six times in one module. Code repeats lines; prose reasoning does not. A
+# TEXT line is one written at the margin with at least four words in it — a
+# code body is indented, a separator has no words. Words are letters of any
+# script (review: an ASCII-only rule read Greek reasoning as code), and an
+# indented markdown bullet ("  - …", "  2. …") is text too — not "  * …"
+# (second review: JSDoc / C block-comment lines, ` * @param …`), and not a
+# bullet whose first word is a key ("  - name: …", a YAML list item).
+TEXT_LINE_MIN_WORDS = 4
+_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+_INDENTED_BULLET_RE = re.compile(r"[ \t]+(?:[-+•]|\d{1,3}[.)])[^\S\r\n]+(?=\S)(?![^\s:]+:(?:\s|$))")
+
+
+def _is_text_line(raw_line: str) -> bool:
+    """True for an unindented line (or an indented markdown bullet) with
+    ``TEXT_LINE_MIN_WORDS``+ words of letters — reasoning prose; False for an
+    indented code line, a separator, a blank line."""
+    if raw_line[:1] in (" ", "\t") and not _INDENTED_BULLET_RE.match(raw_line):
+        return False
+    return len(_WORD_RE.findall(raw_line)) >= TEXT_LINE_MIN_WORDS
+
+
+# Two periods of a repeat are "the same" when they are equal, or when at least
+# this share of their lines are shared (one changed line in a 20-line block
+# is 0.95). The share is counted on line MULTISETS, so it is linear in the
+# period: a line-aligned diff (difflib) went quadratic on periods of repeated
+# lines (review: 7 s for a 20K period of `}` lines, on the event loop).
+BLOCK_LOOP_SIMILAR = 0.9
+
+
+def _periods_match(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    la, lb = a.splitlines(), b.splitlines()      # a period is >= 200 chars: never empty
+    shared = sum((Counter(la) & Counter(lb)).values())
+    return 2 * shared >= BLOCK_LOOP_SIMILAR * (len(la) + len(lb))
+
 
 # --- paragraph-repeat detector (thinking channel only) ----------------------
 # The n-gram probe needs the EXACT current 200-char tail to have occurred 3×,
@@ -55,7 +101,7 @@ THINKING_LOOP_MAX_GAP = 3 * THINKING_LOOP_WINDOW     # 600: window + up to 400 c
 # 48 chars ("Let me check the file.") never count, six verbatim occurrences
 # required, and buffers under 6K chars are never judged at all — a real
 # runaway (dozens of repeats over tens of KB) still dies far earlier than
-# the n-gram/extended-cap backstops, but multi-restatement planning passes.
+# the n-gram backstop, but multi-restatement planning passes.
 PARAGRAPH_LOOP_MIN_LINE = 48       # ignore shorter lines (common phrases)
 PARAGRAPH_LOOP_THRESHOLD = 6       # same line appearing >= N times = loop
 PARAGRAPH_LOOP_SCAN_LINES = 3      # newest completed long lines checked/probe
@@ -87,7 +133,11 @@ def _detect_paragraph_loop(reasoning_buf: str) -> bool:
     # only two verbatim standalone repeats. A loop repeats the line AS a
     # line; a quote embeds it mid-sentence. One pass over the already-split
     # lines, same cost class as before.
-    _stripped = [l.strip() for l in lines[:-1]]
+    # §4SD: only TEXT lines count (see `_is_text_line`) — a drafted file's
+    # repeated code lines and separators are not a loop. A line that does not
+    # count is skipped, not a run-breaker: a loop interleaved with code still
+    # shows its text lines.
+    _stripped = [l.strip() if _is_text_line(l) else "" for l in lines[:-1]]
     _counts: dict = {}
     for _s in _stripped:
         if len(_s) >= PARAGRAPH_LOOP_MIN_LINE:
@@ -138,9 +188,10 @@ def _detect_paragraph_loop(reasoning_buf: str) -> bool:
 #     slack-12 loop escape with one year added to it);
 #   * a sentence shorter than the opener.
 # A script written without spaces yields no two-word opener and the probe
-# abstains. NOT caught, left to the other probes and the hard cap: sentences
+# abstains. NOT caught, left to the other probes and the output cap: sentences
 # that end in `."`, `.)` or `.**`; a frame with an abbreviation in it ("Dr. "
-# reads as a sentence end); two frames alternating; one stray sentence every
+# reads as a sentence end); three or more frames in rotation (two frames
+# alternating ARE caught, §4SD); one stray sentence every
 # nineteen; sentences averaging over 300 chars (twenty do not fit the window). A density rule that catches the last two fired on 3 healthy turns.
 #
 # Known cost: reasoning that legitimately writes twenty sentences in a row
@@ -154,6 +205,10 @@ def _detect_paragraph_loop(reasoning_buf: str) -> bool:
 # inside a block: real streams have MORE line structure, and every
 # line-structure rule here can only end a run.)
 SENTENCE_RUN_THRESHOLD = 20        # consecutive same-opener sentences = loop
+#: §4SD second review: two frames taking turns need twice the run — a healthy
+#: walk through cases ("Input is X. Output is Y." ×10 = 20 sentences) alternates
+#: strictly too; the healthy max over 9,103 logged turns is 5
+ALTERNATING_RUN_THRESHOLD = 40
 SENTENCE_RUN_OPENER_WORDS = 2      # the opener is the first N words
 SENTENCE_RUN_TAIL = 6_000          # only the newest N chars are examined
 
@@ -167,10 +222,10 @@ _SENTENCE_END_RE = re.compile(r"[.!?](?=\s)|\n")
 _DIGITS_RE = re.compile(r"\d+")
 
 
-def _sentence_opener_run(reasoning_buf: str) -> int:
-    """Length of the run of newest COMPLETED prose sentences that open with
-    the same ``SENTENCE_RUN_OPENER_WORDS`` words (case-folded). The trailing,
-    possibly still-streaming fragment is never counted."""
+def _newest_frames(reasoning_buf: str) -> list:
+    """The frames of the newest COMPLETED prose sentences, newest first, up to
+    the first piece that is not a prose sentence. The trailing, possibly
+    still-streaming fragment is never counted."""
     tail = reasoning_buf[-SENTENCE_RUN_TAIL:]
     pieces, start = [], 0
     for m in _SENTENCE_END_RE.finditer(tail):
@@ -179,7 +234,7 @@ def _sentence_opener_run(reasoning_buf: str) -> int:
     # (The window's first piece may be cut mid-sentence. It is read last, and
     # by then it can only end a run or lengthen one that already fills the
     # whole window — nothing to correct.)
-    run, key = 0, None
+    frames = []
     for piece in reversed(pieces):
         s = piece.strip()
         if not s:
@@ -193,23 +248,48 @@ def _sentence_opener_run(reasoning_buf: str) -> int:
             break                      # a fragment
         # The frame: its opener AND its digits. An index that moves is not
         # the same frame; a constant year or version number is.
-        frame = (" ".join(words[:SENTENCE_RUN_OPENER_WORDS]).lower(),
-                 tuple(_DIGITS_RE.findall(s)))
-        if key is None:
-            key = frame
-        elif frame != key:
+        frames.append((" ".join(words[:SENTENCE_RUN_OPENER_WORDS]).lower(),
+                       tuple(_DIGITS_RE.findall(s))))
+    return frames
+
+
+def _sentence_opener_run(reasoning_buf: str) -> int:
+    """Length of the run of newest COMPLETED prose sentences that open with
+    the same ``SENTENCE_RUN_OPENER_WORDS`` words (case-folded)."""
+    frames = _newest_frames(reasoning_buf)
+    run = 0
+    for f in frames:
+        if f != frames[0]:
             break
         run += 1
     return run
 
 
+def _alternating_frame_run(reasoning_buf: str) -> int:
+    """§4SD: length of the run of newest sentences in which TWO frames take
+    turns — "I will check the X now. Then I verify the Y again. I will check
+    …" — which ``_sentence_opener_run`` reads as runs of 1. Under three
+    sentences there is no pattern yet (0): two different sentences in a row
+    are ordinary prose. Healthy max over 9,103 logged turns, checked at every
+    sentence end: 5, the same as the one-frame run."""
+    frames = _newest_frames(reasoning_buf)
+    if len(frames) < 3 or frames[0] == frames[1]:
+        return 0
+    run = 2
+    while run < len(frames) and frames[run] == frames[run - 2]:
+        run += 1
+    return run if run >= 3 else 0
+
+
 def _detect_sentence_run_loop(reasoning_buf: str) -> bool:
     """True when the thinking stream's newest ``SENTENCE_RUN_THRESHOLD``
-    completed sentences all open with the same two words — a frame loop.
-    O(tail) per probe; runs on the n-gram probe's cadence."""
+    completed sentences all open with the same two words, or with two
+    openers taking turns — a frame loop. O(tail) per probe; runs on the
+    n-gram probe's cadence."""
     if not reasoning_buf:
         return False
-    return _sentence_opener_run(reasoning_buf) >= SENTENCE_RUN_THRESHOLD
+    return (_sentence_opener_run(reasoning_buf) >= SENTENCE_RUN_THRESHOLD
+            or _alternating_frame_run(reasoning_buf) >= ALTERNATING_RUN_THRESHOLD)
 
 
 # --- tool-call generation-collapse detector ---------------------------------
@@ -240,7 +320,72 @@ def _detect_thinking_loop(buf: str) -> bool:
     # bounded work per probe, and a passage quoted three times across the
     # whole buffer is not a loop
     recent = buf[-(THINKING_LOOP_THRESHOLD * THINKING_LOOP_MAX_GAP + THINKING_LOOP_WINDOW):]
+    # (§4SD tried a gate here — a code-shaped repeat had to be the same block
+    # — for three sibling functions drafted in thinking, core/llm.py's client
+    # builders. Review: it let short code loops with a moving counter run to
+    # the output cap. Removed; sibling blocks within 2,000 chars still fire.)
     return recent.count(tail) >= THINKING_LOOP_THRESHOLD
+
+
+# --- block-repeat detector (thinking channel only) ---------------------------
+# §4SD: the n-gram probe looks back 2,000 chars, so a loop whose period is
+# longer — a file re-drafted in thinking, a 1.5–4K code block written out
+# again and again — was left to the line probe, which only sees text lines
+# now (above). This probe follows the 200-char tail back through up to
+# BLOCK_LOOP_MAX_PERIOD chars per period: when the tail recurs and the last
+# two whole periods are the same block (equal, or ≥ 0.9 of their lines shared),
+# the stream is writing one thing over again. Measured with the probes run at
+# the stream's cadence: 0 fires on 9,103 healthy logged turns and on 411 real
+# source files drafted whole; on the 52 logged killed turns it catches 20
+# (the old probes 11), 8 that no old probe caught; synthetic code-block
+# loops die after ~2 periods (1.5K: 6.5K chars, 4K: 10.5K; the line probe
+# needed 9.5K and 19K).
+# Two drafts of a file are not a loop: three IDENTICAL occurrences are. Three
+# drafts revised a little are not either (second review: three drafts of a
+# real file revised 1–8 % a draft fired on 40/40 files) — periods that are only
+# alike (``_periods_match``) need a fourth occurrence. Four for every case lost
+# the 4 logged kills this probe added (the logged loops repeat verbatim).
+BLOCK_LOOP_MAX_PERIOD = 60_000
+BLOCK_LOOP_OCCURRENCES = 3
+BLOCK_LOOP_OCCURRENCES_ALIKE = 4
+# Review round 4: two verbatim periods are not proof for a file-sized period —
+# three drafts that each fix one line read verbatim when the newer fix lies
+# past the stream position and the older one before it (18/40 seeds on a 9K
+# file). The logged verbatim kills had periods of 1.2K, 1.9K and 3.1K chars.
+BLOCK_LOOP_VERBATIM_MAX_PERIOD = 4_000
+
+
+def _detect_block_loop(reasoning_buf: str) -> bool:
+    """True when the newest ``THINKING_LOOP_WINDOW`` chars recur, each time
+    within ``BLOCK_LOOP_MAX_PERIOD`` of the next, and the whole periods between
+    them are one block: ``BLOCK_LOOP_OCCURRENCES`` occurrences with identical
+    periods, or ``BLOCK_LOOP_OCCURRENCES_ALIKE`` with periods only alike
+    (``_periods_match``). A few ``rfind``s per probe; the line comparison runs
+    only when the tail has recurred."""
+    n = len(reasoning_buf or "")
+    if n < THINKING_LOOP_WINDOW * BLOCK_LOOP_OCCURRENCES:
+        return False
+    tail = reasoning_buf[-THINKING_LOOP_WINDOW:]
+    pos = [n - THINKING_LOOP_WINDOW]
+    while len(pos) < BLOCK_LOOP_OCCURRENCES_ALIKE:
+        lo = max(0, pos[-1] - BLOCK_LOOP_MAX_PERIOD)
+        # non-overlapping: a run of one character (`=====`, a column of
+        # spaces, `0, 0, …`) overlaps itself at every offset and fired at 202
+        # chars (review); a real loop under 200 chars a period still shows
+        # three whole windows, after ~600 chars, as the n-gram probe needs
+        p = reasoning_buf.rfind(tail, lo, pos[-1])
+        if p < 0:
+            break
+        pos.append(p)
+    if len(pos) < BLOCK_LOOP_OCCURRENCES:
+        return False
+    periods = [reasoning_buf[pos[i + 1]:pos[i]] for i in range(len(pos) - 1)]
+    if periods[0] == periods[1] and len(periods[0]) <= BLOCK_LOOP_VERBATIM_MAX_PERIOD:
+        return True                         # the newest two periods are verbatim
+    # (A period of one or two lines that varies never matches: one changed
+    # line of two is 0.5 alike — such a repeat is the n-gram probe's.)
+    return (len(pos) >= BLOCK_LOOP_OCCURRENCES_ALIKE
+            and all(_periods_match(a, b) for a, b in zip(periods, periods[1:])))
 
 
 def _tail_has_stop_marker(buf: str, new_token: str) -> bool:

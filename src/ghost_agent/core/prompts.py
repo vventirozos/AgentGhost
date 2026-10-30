@@ -724,8 +724,8 @@ Before calling a function, state your immediate next step inside <think></think>
 ADAPT YOUR THINKING DEPTH TO THE TASK:
 {think_budget_guidance}
 CRITICAL RULES FOR THINKING:
-1. DO NOT draft or write Python, SQL, or Bash code inside the <think> block! Save all code generation strictly for the `content` parameter of the <tool_call>.
-2. DO NOT perform "mental traces", step-by-step mathematical loops, or process dataset rows in your thoughts. If you need to iterate over data or calculate variables, write a Python script using the `execute` tool to do it for you. Do NOT manually compute data inside the <think> block, as you will hit your token limit and crash.
+1. DO NOT draft or write code or file content (HTML, CSS, JavaScript, Python, SQL, Bash…) inside the <think> block! Save all of it strictly for the `content` parameter of the <tool_call>.
+2. DO NOT perform "mental traces", step-by-step mathematical loops, or process dataset rows in your thoughts. If you need to iterate over data or calculate variables, write a Python script using the `execute` tool to do it for you. Do NOT manually compute data inside the <think> block: the reply is cut at the output limit before you act.
 3. ANTI-PARALYSIS: You must make a firm decision immediately. Do not debate with yourself. State your single intended action, immediately close the </think> tag, and output the <tool_call>. It is strictly forbidden to brainstorm multiple alternatives inside the think block. If you hit a paradox where outputs look identical but fail, make a decision, close the </think> tag, and write a diagnostic script to print the `repr()` of the output to find hidden characters. It is better to execute a tool and get an error than to freeze while thinking.
 4. NO CONVERSATIONAL FILLER: After closing the </think> tag, DO NOT output any conversational text or narration (e.g., "I will now use the tool..."). Output the `<tool_call>` XML block IMMEDIATELY!
 
@@ -794,8 +794,8 @@ Before calling a function, state your immediate next step inside <think></think>
 ADAPT YOUR THINKING DEPTH TO THE TASK:
 {think_budget_guidance}
 CRITICAL RULES FOR THINKING:
-1. DO NOT draft or write Python, SQL, or Bash code inside the <think> block! Save all code generation strictly for the tool call arguments.
-2. DO NOT perform "mental traces", step-by-step mathematical loops, or process dataset rows in your thoughts. If you need to iterate over data or calculate variables, write a Python script using the `execute` tool to do it for you. Do NOT manually compute data inside the <think> block, as you will hit your token limit and crash.
+1. DO NOT draft or write code or file content (HTML, CSS, JavaScript, Python, SQL, Bash…) inside the <think> block! Save all of it strictly for the tool call arguments.
+2. DO NOT perform "mental traces", step-by-step mathematical loops, or process dataset rows in your thoughts. If you need to iterate over data or calculate variables, write a Python script using the `execute` tool to do it for you. Do NOT manually compute data inside the <think> block: the reply is cut at the output limit before you act.
 3. ANTI-PARALYSIS: You must make a firm decision immediately. Do not debate with yourself. State your single intended action, immediately close the </think> tag, and call the tool. It is strictly forbidden to brainstorm multiple alternatives inside the think block. If you hit a paradox where outputs look identical but fail, make a decision, close the </think> tag, and write a diagnostic script to print the `repr()` of the output to find hidden characters. It is better to execute a tool and get an error than to freeze while thinking.
 4. NO CONVERSATIONAL FILLER: After closing the </think> tag, DO NOT output any conversational text or narration (e.g., "I will now use the tool..."). Call the tool IMMEDIATELY.
 

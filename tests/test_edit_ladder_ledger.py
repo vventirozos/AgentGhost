@@ -341,7 +341,9 @@ async def _drive(label, sandbox):
 
         def _swap_for_reader(p, flags, *a, **k):
             if (not state["done"] and str(p).endswith("t.txt")
-                    and _sys._getframe(1).f_code.co_name == "_read_text_guarded"):
+                    # §4SD: the open now runs through `_retry_transient`
+                    and "_read_text_guarded" in (_sys._getframe(1).f_code.co_name,
+                                                 _sys._getframe(2).f_code.co_name)):
                 state["done"] = True
                 _os.rename(sandbox / "d", sandbox / "tmp")
                 _os.rename(sandbox / "d2", sandbox / "d")

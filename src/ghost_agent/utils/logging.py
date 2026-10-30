@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -637,6 +638,8 @@ def request_remaining_s(req_id: str) -> Optional[float]:
 
 
 def _client_deadline() -> float:
+    """The client's timeout; ``inf`` = it waits as long as the request runs
+    (§4SD: the web interface and the CLI send ``inf``)."""
     try:
         d = float(client_deadline_context.get() or 0.0)
     except Exception:  # noqa: BLE001
@@ -653,21 +656,35 @@ def base_deadline_s(req_id: str = "") -> float:
     client, cap = _client_deadline(), server_request_cap_s(req_id)
     if client > 0 and cap > 0:
         return min(client, cap)
+    if math.isinf(client):
+        return 0.0          # §4SD: no server cap and a client that waits forever = no deadline
     return client or cap
+
+
+def _extended_ceiling_env() -> float:
+    """``GHOST_MAX_REQUEST_EXTENDED_S``: seconds, 0 = no extensions, or
+    ``inf`` = no ceiling (§4SD, operator 10-29: a dense model may build all
+    night — only a stall, or the owner's cancel, ends a request that keeps
+    writing code)."""
+    raw = str(os.environ.get("GHOST_MAX_REQUEST_EXTENDED_S", "0") or "0").strip().lower()
+    if raw in ("inf", "none", "unlimited"):
+        return math.inf
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return v if v > 0 else 0.0
 
 
 def extension_ceiling_s(req_id: str = "") -> float:
     """§4RA: the longest a request may run with extensions —
-    ``GHOST_MAX_REQUEST_EXTENDED_S`` (default 0 = no extensions), never past
+    ``GHOST_MAX_REQUEST_EXTENDED_S`` (default 0 = no extensions; ``inf`` = none), never past
     the client's own timeout, never below the base. Only a client that SENT
     its timeout is extended (review m4: a client that says nothing may hang
     up first — the CLI, scripts, the Slack bot); background kinds (no server
     cap) never are."""
     base = base_deadline_s(req_id)
-    try:
-        ceil = float(os.environ.get("GHOST_MAX_REQUEST_EXTENDED_S", "0") or 0.0)
-    except ValueError:
-        ceil = 0.0
+    ceil = _extended_ceiling_env()
     client = _client_deadline()
     if base <= 0 or ceil <= 0 or client <= 0 or server_request_cap_s(req_id) <= 0:
         return base
@@ -678,8 +695,28 @@ def extension_ceiling_s(req_id: str = "") -> float:
 #: before it takes one (the 27B spends up to ~1000 s on one write turn)
 EXTENSION_STEP_S = 900.0
 #: §4RA: progress this recent earns a step — two steps, so a write that took
-#: a whole long turn to generate still counts once it lands
+#: a whole long turn to generate still counts once it lands. §4SD: at least
+#: the request's longest turn plus one step, so a longer think never reads as
+#: a stall (review: 2× let one slow non-progress turn double the window)
 PROGRESS_WINDOW_S = 1800.0
+
+
+def note_turn_seconds(req_id: str, seconds: float) -> None:
+    """§4SD: a model turn's wall time; the longest widens the stall window."""
+    try:
+        sec = max(0.0, float(seconds or 0.0))
+    except (TypeError, ValueError):
+        return
+    with _REQ_STATE_LOCK:
+        s = _REQ_STATE.get(req_id)
+        if s is not None:
+            s["longest_turn_s"] = max(float(s.get("longest_turn_s") or 0.0), sec)
+
+
+def _progress_window_s(s: dict) -> float:
+    # one whole turn without progress, plus a step — review: 2x the longest
+    # turn let 64k turns at ~15 tok/s run ~3.6 h past the last progress
+    return max(PROGRESS_WINDOW_S, float(s.get("longest_turn_s") or 0.0) + EXTENSION_STEP_S)
 
 
 def note_report_floor(req_id: str, floor_s: float) -> None:
@@ -697,14 +734,24 @@ def note_report_floor(req_id: str, floor_s: float) -> None:
             s["floor_s"] = f
 
 
-def note_code_progress(req_id: str, what: str = "") -> None:
+def note_code_progress(req_id: str, what: str = "", key: str = "") -> bool:
     """§4RA: this request just made coding progress (the turn loop decides
-    what counts — `core.agent.is_code_progress`)."""
+    what counts — `core.agent.is_code_progress`). §4SD review: with no time
+    ceiling a loop that writes the SAME content again never stalled — a
+    ``key`` (the write's operation, target and arguments) counts once per
+    request. Returns whether it counted."""
     with _REQ_STATE_LOCK:
         s = _REQ_STATE.get(req_id)
-        if s is not None:
-            s["progress_t"] = time.monotonic()
-            s["progress_what"] = str(what or "")
+        if s is None:
+            return False
+        if key:
+            seen = s.setdefault("progress_keys", set())
+            if key in seen:
+                return False
+            seen.add(key)
+        s["progress_t"] = time.monotonic()
+        s["progress_what"] = str(what or "")
+        return True
 
 
 def request_progress_what(req_id: str) -> str:
@@ -738,17 +785,17 @@ def _earn_extension(req_id: str, base: float, ceil: float) -> float:
         if ceil <= base or pt is None:
             return have
         now = time.monotonic()
-        if now - float(pt) > PROGRESS_WINDOW_S:
+        if now - float(pt) > _progress_window_s(s):
             return have
         elapsed = now - float(s["started"])
         room = ceil - base
         window = EXTENSION_STEP_S + float(s.get("floor_s") or 0.0)
-        # bounded and exact at the ceiling (r2 M-D: `base + (ceil - base) < ceil`
-        # can hold in floating point, and the loop spun under the lock)
-        for _ in range(int(room // EXTENSION_STEP_S) + 2):
-            if have >= room or base + have - elapsed >= window:
-                break
-            have = room if room - have <= EXTENSION_STEP_S else have + EXTENSION_STEP_S
+        # whole steps until the deadline is `window` ahead, computed rather
+        # than looped (§4SD: `room` is infinite without a ceiling); exact at
+        # a finite ceiling (r2 M-D)
+        short = window - (base + have - elapsed)
+        if short > 0:
+            have = min(room, have + math.ceil(short / EXTENSION_STEP_S) * EXTENSION_STEP_S)
         s["extended_s"] = have
         return have
 

@@ -5,9 +5,9 @@ thinking loop could not be detected until the full 16384-token budget was
 burned (~4 minutes on the live box, twice in one request) — the existing
 think-hog guard then fired on the corpse. The spec call now streams via
 ``llm.stream_chat_completion`` and, while content is still empty, runs the
-exact-n-gram detector (`_detect_thinking_loop`) plus a 30K reasoning
-ceiling; an abort falls straight into the existing one-shot no-think
-retry. The paragraph-repeat detector is deliberately NOT on this path —
+exact-n-gram detector (`_detect_thinking_loop`); an abort falls straight
+into the existing one-shot no-think retry. (The 30K reasoning ceiling that
+sat beside it was removed, §4SD.) The paragraph-repeat detector is deliberately NOT on this path —
 its first deploy aborted the thinking of every live coding leaf
 (2026-07-25) because spec planning legitimately restates the task.
 
@@ -158,26 +158,27 @@ async def test_loop_probe_never_fires_once_content_started():
 
 
 @pytest.mark.asyncio
-async def test_reasoning_ceiling_aborts_non_looping_runaway():
-    # Diverse (loop-free) reasoning that just keeps going: the exact
-    # n-gram probe never fires, the 30K ceiling does — this is the
-    # budget-burn shape (40-75K chars observed live).
-    from ghost_agent.core.coding_executor import SPEC_REASONING_ABORT_CHARS
-    chunks = _diverse_chunks(SPEC_REASONING_ABORT_CHARS + 15_000)
+async def test_long_diverse_reasoning_is_not_aborted():
+    # §4SD (operator: "disable the coding executor's 30k-char abort"): a
+    # loop-free think phase of 45K chars runs to the end of the stream —
+    # the call's max_tokens bounds it, the caller's no-content branch retries
+    # it with thinking off. Fails in the world where a length ceiling is back.
+    chunks = _diverse_chunks(45_000)
     llm = StreamingFakeLLM(chunks)
     content, reasoning, aborted = await _stream_spec_completion(
         llm, {"model": "m", "messages": []}, False)
-    assert aborted == "ceiling"
+    assert aborted is None
     assert content == ""
-    assert len(reasoning) < SPEC_REASONING_ABORT_CHARS + 2_000
-    assert llm.consumed < len(chunks)
+    assert len(reasoning) >= 45_000
+    assert llm.consumed == len(chunks)
+    import ghost_agent.core.coding_executor as ce
+    assert not hasattr(ce, "SPEC_REASONING_ABORT_CHARS")
 
 
 @pytest.mark.asyncio
 async def test_normal_sized_planning_is_never_aborted():
     # ~12K of diverse planning then a clean spec — the live false-positive
     # regression shape (first deploy aborted EVERY leaf): must run clean.
-    from ghost_agent.core.coding_executor import SPEC_REASONING_ABORT_CHARS
     chunks = _diverse_chunks(12_000)[:-1]          # drop [DONE]
     chunks += [_sse({"content": SPEC_OK}), b"data: [DONE]"]
     llm = StreamingFakeLLM(chunks)

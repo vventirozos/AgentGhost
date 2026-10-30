@@ -22,17 +22,21 @@ left a 2.7KB shell with neither the File Explorer nor the Snake game in it
     batch loop) instead of being marked DONE on shallow output.
 
 Still bounded — the project task tree does the decomposition; this builds ONE
-leaf well (a spec call, N writes/edits, one verify), at most twice.
+leaf well (a spec call, one streamed call per ``generate`` file — §4SD —, N
+writes/edits, one verify), up to ``MAX_ATTEMPTS`` times within the leaf's
+time budget (``_leaf_deadline``).
 """
 
 from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import re
+import time
 import weakref
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -46,12 +50,12 @@ ToolRunner = Callable[[str, Dict[str, Any]], Awaitable[str]]
 # overflow. The task tree still does the coarse decomposition, so this only
 # bounds runaway specs, not normal multi-file work.
 MAX_FILES = 16
-# Reasoning ceiling for the streamed spec call: chain-of-thought still
-# running with ZERO content at this size is the budget-burn shape (live
-# failures ran 40-75K chars before eating the whole 16384-token budget);
-# normal spec planning lands in 3-15K. Cutting at 30K saves ~3 minutes per
-# runaway while never touching a legitimate think phase.
-SPEC_REASONING_ABORT_CHARS = 30_000
+# §4SD (2026-10-29, operator: "disable the coding executor's 30k-char
+# abort"): the 30K-char reasoning ceiling of the streamed spec call is gone,
+# like the main loop's 200K one. It was a length abort for an older model
+# family; a think phase is now bounded by the spec call's own max_tokens, and
+# a budget eaten with no content takes the same no-think retry the ceiling
+# did. The n-gram loop probe stays.
 # Upper bound on a written file. Must comfortably exceed a fully-accreted
 # single-file app: with append, the result is old+new, and old can be ~200 KB
 # (the gather cap). A tight 60 KB truncated the growing index.html mid-JS,
@@ -62,11 +66,11 @@ MAX_CONTENT_CHARS = 400_000
 # build into a batch-halting FAILURE. Each retry is fed the exact failure reason.
 MAX_ATTEMPTS = 4
 # Think policy (2026-09-03, §4EI). Live: a coding model that drafts the WHOLE
-# file inside its think block hits the ceiling above on every leaf — 6 of 6
+# file inside its think block hit the (since removed, §4SD) 30K ceiling on every leaf — 6 of 6
 # thinking attempts in request 463111ad, ~115 s each, zero content — and only
 # the no-think retry ever produced a spec. Thinking still earns its cost on a
 # model that plans in 3-15K, so the policy is adaptive rather than a switch:
-# after this many CONSECUTIVE aborted think phases (ceiling, n-gram loop, or
+# after this many CONSECUTIVE aborted think phases (n-gram loop, or
 # the whole budget eaten with no content) the spec call starts with thinking
 # disabled; one clean think phase (content produced) resets the streak. The
 # streak is kept PER LLM CLIENT (weak-keyed), so the one long-lived production
@@ -89,6 +93,97 @@ UNPARSED_SPEC_KEEP = 30
 MAX_EMPTY_RETRIES = 2
 _EMPTY_BACKOFF_S = 1.5
 _REGRESS_SHRINK_RATIO = 0.85   # a rewrite below this fraction of the old size regresses
+# §4SD (operator 2026-10-29: "given that a project could handle large files …
+# do it"): the spec call returned every file's COMPLETE text inside one JSON
+# reply — thinking plus every file in 16,384 tokens, escaped, and a reply cut
+# anywhere lost every file of the attempt. A NEW file is now named in the spec
+# with ``generate`` (what it must contain) and written by its own streamed
+# call as raw text: its output limit is the room the server's window leaves
+# (up to 64k, never under 16k — `agent.output_cap_for_tool_turn`), and a cut
+# costs only that file's tail, which is continued round by round under the
+# main loop's cut-write rules (core/write_continuation). The result goes
+# through `_apply_file` as ``content``, so every write guard still applies.
+GENERATE_ROUNDS = 6            # continuation rounds after the first call
+# A round's output limit is also what the time left can hold (review r9: a
+# 16k round — ~18 min — started 3 min before an unattended step's cut, and
+# the files of the attempt were lost): tokens ≤ (left − reserve) × a slow
+# rate; under the minimum the file fails as out of time. The reserve keeps
+# room for verify and the build gates after the last file.
+GENERATE_TOK_PER_S = 12.0      # slower than the dense main's measured 15–30
+GENERATE_RESERVE_S = 300.0
+GENERATE_MIN_TOKENS = 2048
+#: the least time a new attempt (a spec call, then the files) starts with
+GENERATE_MIN_ATTEMPT_S = GENERATE_RESERVE_S + GENERATE_MIN_TOKENS / GENERATE_TOK_PER_S
+_GENERATE_HEAD_CHARS = 1200    # what a continuation round is shown of the file
+_GENERATE_TAIL_CHARS = 1500
+_REPEAT_TAIL_LINES = 40         # r19: the cut round's tail the repetition test reads
+# A leaf's wall clock: background work has no request deadline, and a 64k
+# call is ~73 min at ~15 tok/s. `GHOST_LEAF_BUILD_MAX_S`, default 2 h; an
+# unattended step's own cap (project_advancer) lowers it via
+# `leaf_deadline_context`. A call may take the window's room only when the
+# time left could hold it (the main loop's `turn_room_fits_time` rule).
+LEAF_BUILD_MAX_S_DEFAULT = 7200.0
+#: monotonic deadline set by the caller that bounds this leaf (0 = none)
+leaf_deadline_context: contextvars.ContextVar = contextvars.ContextVar(
+    "coding_leaf_deadline", default=0.0)
+
+
+def _leaf_budget_s() -> float:
+    try:
+        v = float(os.getenv("GHOST_LEAF_BUILD_MAX_S") or LEAF_BUILD_MAX_S_DEFAULT)
+    except ValueError:
+        return LEAF_BUILD_MAX_S_DEFAULT
+    return v if 0 < v < float("inf") else LEAF_BUILD_MAX_S_DEFAULT
+
+
+def _leaf_deadline() -> float:
+    """The monotonic time this leaf must be done by: its own budget, never
+    past a caller's deadline. The request it runs inside is read live, call
+    by call (`_time_left_s`)."""
+    out = time.monotonic() + _leaf_budget_s()
+    try:
+        outer = float(leaf_deadline_context.get() or 0.0)
+    except (TypeError, ValueError):
+        outer = 0.0
+    return min(out, outer) if outer > 0 else out
+
+
+def _request_left_s() -> Optional[float]:
+    """The most time the request this leaf runs inside can still have: its
+    ceiling WITH every extension it could earn (`extension_ceiling_s`), less
+    what it has spent; None = no bound (background work; the web and the CLI
+    with no ceiling). Review r9: an owner's Slack "do the next task" — a
+    30-min request — took a 64k (~73 min) file call; r10: the remaining time
+    of the CURRENT deadline froze a web request's leaf at its base clock,
+    though each written part earns it more (`_note_round_progress`)."""
+    try:
+        from ..utils import logging as _glog
+        rid = str(_glog.request_id_context.get() or "")
+        ceil = float(_glog.extension_ceiling_s(rid) or 0.0)
+        if not (0 < ceil < float("inf")):
+            return None
+        spent = _glog.request_elapsed_s(rid)
+        return None if spent is None else ceil - float(spent)
+    except Exception:  # noqa: BLE001 — no request clock = the leaf's own
+        return None
+
+
+def _time_left_s(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    req = _request_left_s()
+    return min(left, req) if req is not None else left
+
+
+def _note_round_progress(path: str) -> None:
+    """§4RA: a generated part of a CODE file is coding progress, as a continued
+    write's part is in the main loop (`write_continuation._note_progress`) —
+    a request earns its extension while the leaf writes."""
+    try:
+        from ..utils import logging as _glog
+        from .write_continuation import _note_progress
+        _note_progress(str(_glog.request_id_context.get() or ""), path)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @dataclass
@@ -101,6 +196,9 @@ class CodingResult:
     #: §4PG (R2-1): a verify command the leaf gave RAN and exited 0 — a
     #: SUMMARY claim is not evidence; unattended, an unverified build is held
     verified: bool = False
+    #: §4SD: the leaf's time ran out (not the build) — the advancer puts the
+    #: task back to READY as for a timed-out step, not FAILED
+    out_of_time: bool = False
 
 
 def _short(text: str, n: int = 180) -> str:
@@ -578,7 +676,8 @@ def _render_existing(existing_files: Optional[Dict[str, str]], single_file: bool
         "and the system places it correctly (for HTML, inside the document "
         "before </body>). Do NOT re-send the file's existing content, and do "
         "NOT guess `edits` anchors — `append` needs no anchor and is the "
-        "reliable way to grow the app.\n"
+        "reliable way to grow the app. A NEW file of more than ~100 lines: "
+        "`generate` it.\n"
         "SCOPING (important): your appended <script> runs in an ISOLATED scope, "
         "so it CANNOT see or clobber other tasks' globals — and they can't see "
         "yours. Therefore: (1) keep helper names local (a second `function "
@@ -642,6 +741,25 @@ def _render_already_built(description: str,
         "do NOT re-send or re-implement it (a duplicate implementation "
         "appended to a working file breaks it). Only emit file entries for "
         "code that is genuinely missing, and prefer `edits` for changes.\n")
+
+
+def _render_constraints(constraints: Optional[List[str]]) -> str:
+    """User-mandated constraints from the project record. Before this block
+    the executor never saw them — the 2026-07-04 chess session's first "coded
+    AI opponent" violation was written by an autoadvance leaf whose spec
+    prompt contained no trace of "with YOU - Ghost plays directly, not a
+    generated chess AI". §4SD: a generated file's call sees them too."""
+    if not constraints:
+        return ""
+    from ..utils.constraints import (
+        PARTICIPANT_STEER, has_participant_constraint,
+        render_constraint_block,
+    )
+    out = "\n" + render_constraint_block(
+        list(constraints), header="EXPLICIT USER CONSTRAINTS (PROJECT-WIDE)") + "\n"
+    if has_participant_constraint(list(constraints)):
+        out += "\n" + PARTICIPANT_STEER + "\n"
+    return out
 
 
 def _render_research(research_context: Optional[Dict[str, str]]) -> str:
@@ -922,6 +1040,7 @@ SPEC_JSON_SCHEMA: Dict[str, Any] = {
         "files": {"type": "array", "items": {
             "type": "object",
             "properties": {"path": {"type": "string"},
+                           "generate": {"type": "string"},
                            "content": {"type": "string"},
                            "append": {"type": "string"},
                            "edits": {"type": "array",
@@ -1039,7 +1158,7 @@ def _keep_unparsed_spec_output(content: str, reasoning: str,
 # nothing else; the result must strictly json.loads to a dict.
 
 _SPEC_TOP_KEYS = frozenset({"files", "verify", "summary", "ledger"})
-_SPEC_ENTRY_KEYS = frozenset({"path", "content", "append", "edits", "find",
+_SPEC_ENTRY_KEYS = frozenset({"path", "generate", "content", "append", "edits", "find",
                               "replace", "after", "before", "insert"})
 
 
@@ -1336,7 +1455,7 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
     the full 16384-token budget was burned (~4 minutes on the live box,
     observed twice in one request, 92a968fc 2026-07-25) — the guard then
     fired on the corpse. Streaming lets the abort land while the loop is
-    still forming. Two abort conditions, both evaluated ONLY while the
+    still forming. One abort condition, evaluated ONLY while the
     content channel is still empty (once the JSON spec starts, reasoning
     is done and generated code repeats lines legitimately):
 
@@ -1347,13 +1466,13 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
         (one at just 3,019 chars) — spec planning legitimately restates
         the task and field lists, so that detector stays out of this
         path (2026-07-25 second deploy).
-      * ``SPEC_REASONING_ABORT_CHARS`` ceiling — reasoning still going
-        with zero content at 30K chars is the budget-burn shape (the
-        live failures ran 40-75K); cutting there saves ~3 minutes
-        without touching normal 3-15K planning.
+
+    The 30K-char length ceiling that sat beside it is removed (§4SD): a
+    long think runs to the call's max_tokens, and the caller's no-content
+    branch retries it with thinking off.
 
     Returns ``(content, reasoning, abort_reason)`` where ``abort_reason``
-    is ``None`` (clean), ``"loop"`` or ``"ceiling"``. Stall/mid-stream
+    is ``None`` (clean) or ``"loop"``. Stall/mid-stream
     errors surface as an SSE error event from the llm layer — the
     accumulator stops there and the caller's existing no-spec
     diagnostics handle the partial output."""
@@ -1414,9 +1533,6 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
                 if _detect_thinking_loop(buf):
                     aborted = "loop"
                     break
-                if r_len >= SPEC_REASONING_ABORT_CHARS:
-                    aborted = "ceiling"
-                    break
     finally:
         try:
             await agen.aclose()
@@ -1443,12 +1559,17 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     sys_hint = (
         "You are building ONE task inside a larger project. Output ONLY a JSON "
         "object — no prose, no markdown fences — with this shape:\n"
-        '{"files":[{"path":"name.ext", <ONE OF content|append|edits>}],'
+        '{"files":[{"path":"name.ext", <ONE OF generate|content|append|edits>}],'
         '"verify":"shell cmd that exits 0 iff it works, or \\"\\"",'
         '"summary":"one line","ledger":"one durable fact or \\"\\""}\n'
         "Per file choose EXACTLY ONE of:\n"
-        '  "content": the FULL file text — for a brand-NEW file ONLY. It must '
-        "be COMPLETE and VALID (HTML must include </body></html>); a file that "
+        '  "generate": for a brand-NEW file of more than ~100 lines — DO NOT '
+        "write its code here: describe what it must contain (purpose, "
+        "structure, the functions/ids/APIs other files rely on, how it "
+        "connects to them). The system then writes that file in a separate "
+        "call with its own output budget, showing it this plan.\n"
+        '  "content": the FULL file text — for a SHORT brand-NEW file ONLY. It must '
+        "be COMPLETE and VALID (a full HTML page must include </body></html>); a file that "
         "looks truncated is rejected.\n"
         '  "append": to ADD new code to an EXISTING file — you write ONLY the '
         "new code (a self-contained <script>/<style>/<div> or function). For "
@@ -1468,28 +1589,14 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         "pkill, kill) — if a service is involved, probe the one already "
         "running (e.g. curl its port).\n"
         "Think briefly (a short plan), then answer. Do NOT draft file contents "
-        "inside your thinking — code belongs in the JSON output only; a think "
-        "phase that outgrows the planning budget is aborted and the attempt "
-        "is lost. Never append a second copy of a section/container the file "
+        "inside your thinking — code belongs in the JSON output only; thinking "
+        "and the JSON share one output limit, and a reply cut there loses the "
+        "attempt. Never append a second copy of a section/container the file "
         "already has (same id or data-* key): fill the existing one with "
         "`edits`, or give the new one a new key."
     )
     user = f"TASK: {description}\n"
-    if constraints:
-        # User-mandated constraints from the project record. Before this
-        # block the executor never saw them — the 2026-07-04 chess session's
-        # first "coded AI opponent" violation was written by an autoadvance
-        # leaf whose spec prompt contained no trace of "with YOU - Ghost
-        # plays directly, not a generated chess AI".
-        from ..utils.constraints import (
-            PARTICIPANT_STEER, has_participant_constraint,
-            render_constraint_block,
-        )
-        user += "\n" + render_constraint_block(
-            list(constraints),
-            header="EXPLICIT USER CONSTRAINTS (PROJECT-WIDE)") + "\n"
-        if has_participant_constraint(list(constraints)):
-            user += "\n" + PARTICIPANT_STEER + "\n"
+    user += _render_constraints(constraints)
     if ledger:
         user += ("\nPROJECT LEDGER (existing files / APIs / conventions — build "
                  f"CONSISTENTLY with these):\n{ledger}\n")
@@ -1506,7 +1613,9 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     # JSON spec with a COMPLETE file embedded as `content` — a cut
     # mid-string yields invalid JSON and a truncated file, and a reasoning
     # model spends part of the budget in `reasoning_content` before the
-    # JSON even starts.
+    # JSON even starts. §4SD: a big NEW file no longer rides in this JSON —
+    # the spec names it with `generate` and `_generate_file` writes it in
+    # its own call; `content` here is for short files.
     think_off = _think_disabled_now(llm)
     if think_off:
         # Think policy (§4EI): the streak of aborted think phases has hit the
@@ -1564,6 +1673,7 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
             # attempt as "no writable files".
             if any(isinstance(f, dict) and (
                     str(f.get("content") or "").strip()
+                    or str(f.get("generate") or "").strip()
                     or str(f.get("append") or "").strip()
                     or (isinstance(f.get("edits"), list) and f.get("edits")))
                    for f in files):
@@ -1581,7 +1691,7 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     if (not _usable(spec) and not content.strip() and reasoning.strip()
             and not think_off):
         # The think phase produced no JSON: the stream guard aborted it
-        # (exact n-gram loop or the 30K reasoning ceiling — the reason is
+        # (exact n-gram loop — the reason is
         # named in the log so live tuning has data), or the think block
         # consumed the whole max_tokens budget before the JSON ever
         # started (observed live 2026-07-06: content=0, reasoning=40-62k
@@ -1596,11 +1706,6 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
                 "coding_executor: exact n-gram thinking loop aborted "
                 "mid-stream (content=0, reasoning=%d chars) — retrying "
                 "once with thinking disabled", len(reasoning.strip()))
-        elif loop_aborted == "ceiling":
-            logger.warning(
-                "coding_executor: reasoning ceiling (%d chars) hit with no "
-                "content — aborted mid-stream, retrying once with thinking "
-                "disabled", SPEC_REASONING_ABORT_CHARS)
         else:
             logger.warning(
                 "coding_executor: think block consumed the whole budget "
@@ -1633,6 +1738,599 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         # dict (path-only entries) must not leak to the caller as a spec.
         spec = {}
     return spec, was_empty
+
+
+_GENERATE_SYS = (
+    "You write ONE complete file of a software project. Reply with the file's "
+    "text ONLY, from its first line — no markdown fence, no explanation, no "
+    "JSON. The code must be complete and runnable: no TODOs, stubs, "
+    "placeholders or elided sections. When the file is complete, put the line "
+    "{marker} on its own last line."
+)
+
+
+async def _window_tokens(llm) -> int:
+    """§4SD: the main server's per-slot window (``/props`` n_ctx), cached on
+    the client for 10 min (60 s after a failure); 0 = unknown → the 16k floor."""
+    now = time.monotonic()
+    c = getattr(llm, "_ghost_window_cache", None)
+    if isinstance(c, tuple) and len(c) == 2 and isinstance(c[1], float) and now < c[1]:
+        return int(c[0])
+    n = 0
+    try:
+        from . import head_saves as _hs
+        base = _hs.server_base(str(getattr(llm, "upstream_url", "") or ""))
+        if base:
+            p = await asyncio.to_thread(_hs._http, base + "/props", None, 5.0)
+            n = int(((p or {}).get("default_generation_settings") or {}).get("n_ctx") or 0)
+    except Exception:  # noqa: BLE001 — unknown window = the floor
+        n = 0
+    try:
+        llm._ghost_window_cache = (max(0, n), now + (600.0 if n > 0 else 60.0))
+    except Exception:  # noqa: BLE001 — a client that takes no attributes re-reads
+        pass
+    return max(0, n)
+
+
+async def _file_call_cap(llm, messages, deadline: float) -> int:
+    """§4SD: a generated file's call gets the room the window leaves after its
+    prompt (`agent.output_cap_for_tool_turn`, ≤ 64k, ≥ 16k; 16k when the
+    window is unknown), never more than the leaf's time left can hold
+    (`GENERATE_TOK_PER_S`, less `GENERATE_RESERVE_S`). 0 = no time for a
+    useful round (under `GENERATE_MIN_TOKENS`)."""
+    from .agent import DEFAULT_TOOL_TURN_MAX_TOKENS, output_cap_for_tool_turn
+    by_time = int((_time_left_s(deadline) - GENERATE_RESERVE_S) * GENERATE_TOK_PER_S)
+    if by_time < GENERATE_MIN_TOKENS:
+        return 0
+    cap = DEFAULT_TOOL_TURN_MAX_TOKENS
+    if by_time > cap:
+        win = await _window_tokens(llm)
+        if win > 0:
+            from ..utils.token_counter import estimate_tokens
+            used = await asyncio.to_thread(
+                lambda: sum(estimate_tokens(str(m.get("content") or "")) + 8 for m in messages))
+            cap = output_cap_for_tool_turn(used, win)
+    return min(cap, by_time)
+
+
+#: `_stream_file_text`'s finish when a background stream gave the slot to the owner
+YIELDED = "yielded"
+_MAX_YIELDS = 12
+
+
+async def _stream_file_text(llm, payload: Dict[str, Any], is_background: bool) -> Tuple[str, Optional[str]]:
+    """One generated-file call, STREAMED (a 64k reply is over an hour; the
+    client's non-streamed read timeout is far shorter). Returns the content
+    channel and the finish reason ("length" = cut by max_tokens; None = the
+    stream broke). A client without a streamer (test doubles) gets the
+    single-shot call."""
+    import inspect as _inspect
+    streamer = getattr(llm, "stream_chat_completion", None)
+    if streamer is None or not _inspect.isasyncgenfunction(streamer):
+        resp = await llm.chat_completion({**payload, "stream": False}, is_background=is_background)
+        choice = ((resp or {}).get("choices") or [{}])[0] or {}
+        return ((choice.get("message") or {}).get("content") or "", choice.get("finish_reason"))
+    parts: List[str] = []
+    finish: Optional[str] = None
+    agen = streamer(payload, is_background=is_background)
+    # r22: a background stream holds the one main slot for up to ~an hour —
+    # it yields as soon as a USER request starts or a foreground LLM call
+    # waits (the owner waited behind it); the round ends as a cut, and the
+    # next round's call waits for the owner. r23: the baseline is read at the
+    # FIRST chunk — after the client's park admitted the stream (read before
+    # it, a round admitted after a yield, or inside an image render's idle
+    # window, never yielded again)
+    owner_base: Optional[int] = None
+    try:
+        async for raw in agen:
+            if is_background:
+                now_req = int(getattr(llm, "foreground_requests", 0) or 0)
+                if owner_base is None:
+                    owner_base = now_req
+                elif finish is None and (now_req > owner_base
+                                         or int(getattr(llm, "foreground_tasks", 0) or 0) > 0):
+                    finish = YIELDED
+                    break
+            line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("error"):
+                finish = None                 # a broken stream: not a clean end
+                break
+            ch = ((obj.get("choices") or [{}])[0]) or {}
+            cc = (ch.get("delta") or {}).get("content") or ""
+            if cc:
+                parts.append(cc)
+            if ch.get("finish_reason"):
+                finish = ch.get("finish_reason")
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:  # noqa: BLE001 — closing a broken stream
+            pass
+    return "".join(parts), finish
+
+
+def _render_reference(files: Dict[str, str]) -> str:
+    """The project's other files for a generated file's call: read-only
+    reference, without the spec's `append`/`edits` steer (review r9: a
+    raw-text writer told "USE `append`: a file entry {…}" can answer in JSON,
+    and that text would be the file)."""
+    parts = [f"--- {p} ({len(c)} bytes) ---\n{_file_excerpt(c)}" if c else f"--- {p} (exists; large) ---"
+             for p, c in files.items()]
+    if not parts:
+        return ""
+    return ("\nOTHER FILES OF THE PROJECT (read-only reference, excerpts — use "
+            "their names, ids and APIs; do not copy them into this file):\n"
+            + "\n\n".join(parts)[:40_000] + "\n")
+
+
+def _generate_prompt(path: str, brief: str, *, description: str, ledger: str, plan: list,
+                     shown_files: Dict[str, str], previous: str = "", feedback: str = "",
+                     research_context: Optional[Dict[str, str]],
+                     constraints: Optional[List[str]]) -> list:
+    from .write_continuation import END_MARKER
+    user = f"TASK: {description}\n"
+    user += _render_constraints(constraints)
+    if ledger:
+        user += ("\nPROJECT LEDGER (existing files / APIs / conventions — build "
+                 f"CONSISTENTLY with these):\n{ledger}\n")
+    user += _render_research(research_context)
+    user += _render_reference({p: c for p, c in shown_files.items() if _norm_path(p) != _norm_path(path)})
+    if previous:
+        # review r10: the leaf's own earlier version was shown as "another
+        # file, do not copy" — a retry then wrote a different file
+        # r20: only a file the failure names is told it failed
+        how = ("the attempt failed — fix in it what the failure below is about; keep what works"
+               if feedback else "keep it unless the plan changed it")
+        user += f"\nYOUR PREVIOUS VERSION OF {path} ({how}):\n{_file_excerpt(previous)}\n"
+    if feedback:
+        user += f"\nTHE PREVIOUS ATTEMPT FAILED:\n{_short(feedback, 1500)}\n"
+    lines = []
+    for f in plan:
+        if not isinstance(f, dict) or not str(f.get("path") or "").strip():
+            continue
+        what = (str(f.get("generate") or "").strip() or
+                ("edited in place" if f.get("edits") else
+                 "code appended to it" if f.get("append") else "written in full"))
+        lines.append(f"- {str(f.get('path')).strip()}: {_short(what, 600)}")
+    if lines:
+        user += "\nTHE PLAN FOR THIS TASK (every file it touches):\n" + "\n".join(lines) + "\n"
+    user += (f"\nWRITE NOW the complete file: {path}\nIt must contain: {brief}\n"
+             "Match the names, ids and APIs the other files of the plan use.\n")
+    return [{"role": "system", "content": _GENERATE_SYS.format(marker=END_MARKER)},
+            {"role": "user", "content": user}]
+
+
+class OutOfTime(str):
+    """A failure reason that means the TIME ran out, not the file or the
+    model (review r11: matched by a "out of time" prefix, so a file named
+    so read as a timeout)."""
+
+
+async def _generate_file(llm, model: str, fspec: dict, *, description: str, ledger: str,
+                         plan: list, shown_files: Dict[str, str],
+                         research_context: Optional[Dict[str, str]],
+                         constraints: Optional[List[str]], is_background: bool,
+                         deadline: float, previous: str = "",
+                         feedback: str = "") -> Tuple[Optional[str], Optional[str]]:
+    """§4SD: write one ``generate`` entry's file as raw text — the first call
+    sized by the window's room and the time left, then continuation rounds
+    while the output limit cuts it, under the main loop's cut-write rules
+    (core/write_continuation): the file is complete at the end marker, or
+    when the model ends a round that wrote text; a round that starts over,
+    repeats the file, is prose about it, or is empty is discarded; two such
+    rounds fail. Returns ``(text, None)`` or
+    ``(None, reason)`` — an `OutOfTime` reason when the time ran out."""
+    from .agent import DEFAULT_TOOL_TURN_MAX_TOKENS
+    from .llm import BackgroundDeferred, _disable_thinking
+    from .write_continuation import (continuation_messages, drop_chatter,
+                                     is_repetition, restarts_from_head, strip_tail_overlap,
+                                     to_last_complete_line)
+    from ..tools.file_system import restarts_file
+    path = str(fspec.get("path") or "").strip()
+    brief = str(fspec.get("generate") or "").strip()
+    ask = f"{description}\n{path}: {brief}"
+    text, done, bad, rounds = "", False, 0, 0
+    time_capped, err, one_line, yields = False, "", False, 0
+    while rounds <= GENERATE_ROUNDS and not done:
+        if not text:
+            messages = _generate_prompt(path, brief, description=description, ledger=ledger,
+                                        plan=plan, shown_files=shown_files, previous=previous,
+                                        feedback=feedback, research_context=research_context,
+                                        constraints=constraints)
+        else:
+            messages = continuation_messages(path, ask, text[:_GENERATE_HEAD_CHARS],
+                                             text[-_GENERATE_TAIL_CHARS:], rounds, bad)
+        cap = await _file_call_cap(llm, messages, deadline)
+        if cap <= 0:
+            return None, OutOfTime(f"out of time: the leaf's time budget could not hold another "
+                                   f"call for {path} ({len(text):,} chars written)")
+        time_capped = cap < DEFAULT_TOOL_TURN_MAX_TOKENS   # review r12: the last round's, not sticky
+        one_line = False
+        payload = {"model": model, "messages": messages, "temperature": 0.3, "max_tokens": cap}
+        _disable_thinking(payload)            # the plan was the thinking; this is the file
+        rounds += 1
+        try:
+            raw, finish = await _stream_file_text(llm, payload, is_background)
+        except (BackgroundDeferred, asyncio.CancelledError):
+            raise                             # the owner is back / the step was cut
+        except Exception as e:  # noqa: BLE001 — a broken call is a bad round (review r10: keep the text)
+            raw, finish, err = "", None, _short(str(e), 160)
+        opening = text or _THINK_HEAD_RE.sub("", raw or "", count=1)   # r19: how the FILE opened
+        cont, done = _clean_file_round(raw, wrapped=bool(_WRAP_OPEN_RE.match(opening.lstrip())))
+        yielded = finish == YIELDED
+        if yielded:
+            yields += 1
+            # r22: the owner came — a cut that costs no round (bounded: the
+            # next call waits for the owner, then defers; past
+            # `_MAX_YIELDS` a yield is an ordinary round)
+            finish, rounds = "length", rounds - (1 if yields <= _MAX_YIELDS else 0)
+            logger.info("coding_executor: generated %s — the owner is back; the round stops at %d chars",
+                        path, len(cont))
+        # The first call is never judged. r21 — one rule per file kind:
+        # CODE: a continuation round that opens with a chatter line (no code
+        # character in it) is ONLY that line → discarded, or, with the
+        # marker, the file ends there; with lines after it, the opener goes
+        # when it names the file/rest/code or ends with ":" (r16–r20: the
+        # lines after it are never judged — "    return t", "  fi\ndone" are
+        # code with no code character). PROSE/MARKDOWN: the shared rule — a
+        # short chatter round is discarded unless it ended (its last paragraph).
+        chatter = False
+        if text and _file_kind(path) == "code":
+            first, _, body = cont.lstrip("\r\n").partition("\n")
+            if _is_opener(cont, first):
+                if not body.strip():
+                    if done:
+                        cont = ""             # "Sure! It is complete.<marker>" — the file ends
+                    else:
+                        chatter = True
+                elif _strip_opener_ok(path, cont):
+                    cont = body.lstrip("\r\n")   # the rest keeps its own whitespace
+        elif text:
+            chatter = drop_chatter(cont)[1] and not done and finish != "stop"
+        if yielded and chatter:
+            cont, chatter = "", False         # r23: a cut-off opener fragment — no bad round
+        if finish != "stop" and not done:
+            kept = to_last_complete_line(cont)   # a cut (or broken) reply keeps whole lines
+            one_line = bool(cont.strip()) and not kept.strip()
+            cont = kept
+        if text:
+            cont = strip_tail_overlap(text[-_GENERATE_TAIL_CHARS:], cont)
+        if not cont.strip() and not done:
+            bad += 0 if yielded else 1        # an empty round ends nothing (review r11)
+            logger.warning("coding_executor: generated %s — round %d discarded (%s)", path, rounds,
+                           err or ("one line longer than a reply" if one_line else "empty"))
+            if bad >= 2:
+                break
+            err = ""
+            continue
+        # r19: a stuck model is still repeating when the limit cuts it — judge
+        # repetition on a CUT round's tail only (a level file's literal map,
+        # a board of equal rows, a wall row repeated per level is content)
+        stuck = (finish != "stop" and not done
+                 and is_repetition("\n".join(cont.splitlines()[-_REPEAT_TAIL_LINES:]), text))
+        restart = bool(cont.strip() and text and (restarts_file(text[:_GENERATE_HEAD_CHARS], cont)
+                                                  or restarts_from_head(text[:_GENERATE_HEAD_CHARS], cont)
+                                                  or stuck))
+        if restart or chatter:
+            bad += 1
+            done = False
+            logger.warning("coding_executor: generated %s — round %d discarded (started over / "
+                           "repeated / prose)", path, rounds)
+            if bad >= 2:
+                break
+            continue
+        text += cont
+        # §4SD review r14: the file is complete at the marker, or when the model
+        # ENDED a round that wrote text (finish "stop"); an empty round after a
+        # cut ends nothing. A confirming round (r11–r13) only invited echoes,
+        # remnants and prose into the file.
+        if finish == "stop":
+            done = True                       # (an empty "stop" round was discarded above)
+        if len(text) > MAX_CONTENT_CHARS:
+            return None, f"{path} grew past {MAX_CONTENT_CHARS:,} chars — split it into smaller files"
+        if cont.strip():
+            _note_round_progress(path)
+        logger.info("coding_executor: generated %s — round %d: +%d chars (now %d)%s",
+                    path, rounds, len(cont), len(text), " — complete" if done else "")
+    if not done:
+        if bad >= 2:
+            why = (f"the call failed: {err}" if err else
+                   "the reply was only a <think> block" if not text and _THINK_HEAD_RE.match(raw or "") else
+                   "a single line longer than one reply — write it on many lines" if one_line else
+                   "they were empty, started over, repeated the file or were prose")
+            return None, f"writing {path} failed: two continuation rounds had to be discarded ({why})"
+        if time_capped:
+            return None, OutOfTime(f"out of time: {path} was still unfinished after {GENERATE_ROUNDS} "
+                                   f"continuation rounds the time left kept short ({len(text):,} chars)")
+        return None, (f"{path} was still unfinished after {GENERATE_ROUNDS} continuation rounds "
+                      f"({len(text):,} chars) — split it into smaller files")
+    text = _unwrap_file(text, path)
+    if not text.strip():
+        return None, f"the model wrote nothing for {path}"
+    return text, None
+
+
+#: r18: the block, then whole blank lines — never the next line's indentation
+_THINK_HEAD_RE = re.compile(r"\A\s*(?:<think>(?:.*?</think>|.*\Z)|</think>)(?:[ \t]*\r?\n)*",
+                            re.DOTALL | re.IGNORECASE)   # r19: an orphan close too
+_PROSE_EXTS = frozenset({"md", "markdown", "mdx", "rmd", "qmd", "txt", "text", "rst", "adoc", "asciidoc",
+                         "tex", "log", "org"})
+#: a character prose about a file does not use (r18/r21: ' ` ( ) are prose —
+#: "Here's", "`app.py`", "(continued)")
+_CODE_CHAR_RE = re.compile(r"[={}\[\];<>\"$#|&\\]")
+#: openers the shared list lacks (r22: "Let me continue", "Okay, here is",
+#: "Below is", a curly "Here’s")
+#: (r25: at column 0 only — an indented docstring line is the file's)
+_MORE_OPENERS_RE = re.compile(r"\A[\r\n]*\(?(?:let me continue\b|ok(?:ay)?[,!.](?=\s|\Z)|below is\b|here’s\b|"
+                              r"(?:the )?(?:rest|remainder) of the (?:file|code)\b|"
+                              # r24: a "the file is done" sentence before the marker
+                              r"(?:the|this) file is (?:now |already )?complete\b|this completes\b|"
+                              r"that(?:'s|’s| is) the (?:complete|whole|full) file\b|no further (?:content|changes)\b)",
+                              re.IGNORECASE)
+#: drop_chatter's own test for a long round's opener line (write_continuation)
+_OPENER_NAMES_RE = re.compile(r"\b(?:file|rest|remaining|continu\w*|code)\b", re.IGNORECASE)
+_PROSE_NAMES = frozenset({"readme", "changelog", "license", "notes", "authors", "contributing"})
+
+
+def _file_kind(path: str) -> str:
+    """'markdown', 'prose' or 'code' — by the file's name (``README.md.j2`` is
+    markdown; an extensionless README is prose; ``notes.js``, a Makefile and
+    an .html page are code, r18)."""
+    name = str(path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    parts = name.split(".")
+    exts = set(parts[1:]) if len(parts) > 1 else set()
+    if exts & {"md", "markdown", "mdx", "rmd", "qmd"}:
+        return "markdown"
+    if exts & _PROSE_EXTS or (not exts and parts[0] in _PROSE_NAMES):
+        return "prose"
+    return "code"
+
+
+def _is_opener(cont: str, first: str) -> bool:
+    """A chatter start ("Here's", "Sure,", "I'll continue") on a line with no
+    code character — parens and quotes are prose here ("(continued)",
+    "Here's"); "continuing = False" is code (r21)."""
+    from .write_continuation import _CHATTER_RE
+    return bool(_CHATTER_RE.match(cont) or _MORE_OPENERS_RE.match(cont)) and not _CODE_CHAR_RE.search(first)
+
+
+def _strip_opener_ok(path: str, cont: str) -> bool:
+    """A continuation round's first line goes as chatter only in a CODE file,
+    only as the shared rule's opener (a chatter start that names the file /
+    the rest / the code, or ends with ":") with more lines after it, and only
+    when it reads as prose — no code character in it (r16: "continuing =
+    True" went; a GUIDE.md's "Here is the code:" is content; r18: "Here's"
+    and "`app.py`" are prose — ' and ` are not code characters here)."""
+    first, _, rest = cont.lstrip("\r\n").partition("\n")
+    if not _is_opener(cont, first) or not rest.strip():   # (called for code files only)
+        return False
+    return bool(_OPENER_NAMES_RE.search(first) or first.rstrip().endswith(":"))
+
+
+def _clean_file_round(raw: str, *, wrapped: bool = False) -> Tuple[str, bool]:
+    """(text, done) from a file call's reply — the file's own text is never
+    touched (review r15: `write_continuation.clean_round` removed a
+    ``<think>`` anywhere — code that handles LLM output lost lines — and
+    unwrapped fences round by round): only a LEADING think block goes
+    (thinking is off; a template may still emit one), and the end marker
+    ends the file at the FIRST line that ends with it — on its own or glued
+    (``};<<<END OF FILE>>>``); everything after that line goes (r17/r18:
+    "Done!", a usage example, a repeated marker), except a bare fence on the
+    very next non-blank line when the file opened with a wrapper (r19), kept
+    for `_unwrap_file`. A marker in bold, in backticks or with a full stop
+    (``**<<<END OF FILE>>>**``) is the marker (r19/r21); text glued before
+    it keeps its line verbatim (r20: ``from m import *`` lost its star). A string constant
+    that holds it (``END = "<<<END OF FILE>>>"``) is text; a marker line
+    inside a multi-line string ends the file (residue: the marker is the
+    protocol's own sentinel)."""
+    from .write_continuation import END_MARKER
+    t = _THINK_HEAD_RE.sub("", str(raw or ""), count=1)
+    lines = t.split("\n")
+    fence_re = re.compile(r"^[ \t]*`{3,}[ \t]*\r?$")
+    for i, ln in enumerate(lines):
+        alone = re.fullmatch(r"\s*([*`]*)\s*" + re.escape(END_MARKER) + r"\s*([*`.]*)\s*", ln)
+        core = ln.rstrip().rstrip("*.").rstrip()       # r21: "x = 1<marker>." too
+        if alone and alone.group(1).count("`") == alone.group(2).count("`"):
+            before = ""                       # alone: **bold**, `ticked`, with a full stop (r19/r21)
+        elif core.endswith(END_MARKER):
+            before = core[:-len(END_MARKER)]  # glued — kept verbatim (r20: "from m import *", a template's `)
+        else:
+            continue
+        head = "\n".join(lines[:i] + ([before] if before.strip() else []))
+        head += "\n" if head else ""
+        nxt = next((x for x in lines[i + 1:] if x.strip()), "")
+        if wrapped and fence_re.match(nxt):
+            head += nxt.rstrip("\r") + "\n"
+        return head, True
+    return t, False
+
+
+_WRAP_OPEN_RE = re.compile(r"\A(`{3,})([\w.+-]*)[ \t]*\r?\n")
+_ANY_FENCE_RE = re.compile(r"^[ \t]*```")
+
+
+def _unwrap_file(text: str, path: str) -> str:
+    """The prompt says no fence; a file the model wrapped anyway loses its
+    wrapper — ONE rule on the whole finished text, as the write tool's own
+    unwrap (review r9–r14: five round-by-round rules each cut real text or
+    kept a fence): a fence on the first line and a bare close of the same
+    backticks on the last line both go; a first-line fence that no line
+    closes (the file's fences are unbalanced) goes alone. A markdown file's
+    own blocks are not wrappers: there only ```markdown/```md or a
+    4+-backtick fence is. Anything else (prose around a fence, a fence
+    mid-file) is left to the write tool's syntax check and the gates."""
+    if _WRAP_OPEN_RE.match(text.lstrip(" \t\r\n")):
+        text = text.lstrip(" \t\r\n")       # r19: a blank line or space before the wrapper
+    m = _WRAP_OPEN_RE.match(text)
+    if not m:
+        return text
+    ticks, info = len(m.group(1)), m.group(2).lower()
+    kind = _file_kind(path)
+    markdown = kind == "markdown"
+    if markdown and ticks < 4 and info not in ("markdown", "md"):
+        return text
+    if kind == "prose":
+        return text                       # r15/r17: a .txt/.rst/README file's first fence is its own
+    lines = text.rstrip("\r\n").split("\n")
+    closes = len(lines) > 1 and bool(re.match(r"^[ \t]*`{%d}[ \t]*\r?$" % ticks, lines[-1]))
+    odd = sum(1 for ln in lines if _ANY_FENCE_RE.match(ln)) % 2
+    if closes and (not odd or not markdown):
+        # a code file: first + last (r15: a ``` inside a string made the count
+        # odd, the close stayed, and the write tool's own unwrap cut text)
+        return "\n".join(lines[1:-1]) + "\n"
+    if odd:
+        return text[m.end():]             # an opener no line closes (a README's own last block keeps its close)
+    return text
+
+
+def _feedback_for(path: str, feedback: str, is_own: bool) -> str:
+    """The last failure for ONE generated file's call: the leaf's own files
+    get it always (r21: a pytest trace names only the test file, the bug is
+    in the code — r20's routing by name told the code "keep it"), a new file
+    when the failure names it (r20: b.js, refused before it was written, got
+    nothing)."""
+    if not feedback:
+        return ""
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    named = bool(base) and re.search(r"(?<![\w.-])" + re.escape(base) + r"(?![\w-])", feedback) is not None
+    return feedback if is_own or named else ""
+
+
+async def _disk_text(tool_runner: ToolRunner, path: str, sent: str) -> str:
+    """The file as the write tool LEFT it (r18: it unwraps a fenced payload
+    and the read normalises CRLF — `own` held the sent text, so a retry read
+    the leaf's own file as an owner's edit and refused the regeneration).
+    Unreadable: the sent text (every guard then applies — a refusal costs a
+    retry)."""
+    live, _ = await _read_live_file(tool_runner, path)
+    return live if live is not None else sent
+
+
+def _is_generate_entry(f) -> bool:
+    return isinstance(f, dict) and bool(str(f.get("generate") or "").strip())
+
+
+def _norm_path(p: str) -> str:
+    p = str(p or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return os.path.normpath(p) if p else p
+
+
+#: the private mark `_materialize_generated` puts on a ``content`` entry it
+#: wrote from a ``generate`` one (`_apply_file`'s own-file rule reads it)
+_GENERATED_KEY = "_ghost_generated"
+
+
+async def _materialize_generated(llm, model: str, files: list, *, description: str, ledger: str,
+                                 existing: Dict[str, str], own: Dict[str, str],
+                                 pending: Dict[str, Tuple[str, str]], tool_runner: Optional[ToolRunner],
+                                 research_context: Optional[Dict[str, str]],
+                                 constraints: Optional[List[str]], is_background: bool,
+                                 deadline: float, feedback: str = "") -> Tuple[list, Optional[str]]:
+    """§4SD: every ``generate`` entry becomes a ``content`` entry, written by
+    `_generate_file`; each file's call is shown the project's files, the plan's
+    other written-in-full files and those generated before it, so they agree.
+
+    ``generate`` is for NEW files, and for ones this leaf wrote itself
+    (``own``: path → the text written; a retry regenerates them, shown its
+    previous version and the failure): an existing one changes through
+    ``edits``/``append`` (a rewrite from a description would drop what it
+    does; the snapshot may be truncated). Every entry is checked before any
+    file is generated. A file generated but not yet written waits in
+    ``pending`` (path → (brief, text)) — a later file's failure does not lose
+    it; the next attempt reuses it for the same brief (review r10/r11). On a
+    failure the generated entries that completed are returned with the reason."""
+    files = [{k: v for k, v in f.items() if k != _GENERATED_KEY} if isinstance(f, dict) else f
+             for f in files]                  # review r12: the mark is the system's, never the model's
+    gen = [f for f in files if _is_generate_entry(f)]
+    if not gen:
+        return files, None
+    known = {_norm_path(k) for k in existing}
+    others = {_norm_path(str(f.get("path") or "")) for f in files
+              if isinstance(f, dict) and not _is_generate_entry(f)}
+    seen: set = set()
+    for f in gen:
+        if not isinstance(f.get("path"), str):
+            return files, f"a `generate` entry's path is not a string ({f.get('path')!r})"
+        path = f["path"].strip()
+        np_ = _norm_path(path)
+        if not np_ or np_ in (".", "..") or np_.startswith("../"):
+            return files, f"a `generate` entry has no usable path ({path!r})"
+        if any(f.get(k) for k in ("content", "append", "edits")):
+            # review r10: {"generate": "the engine", "content": "// TODO"} wrote the stub
+            return files, (f"{path}: an entry has `generate` AND `content`/`append`/`edits` — "
+                           "use exactly one")
+        if np_ in others:
+            return files, (f"{path} is named by a `generate` entry and another entry — name each "
+                           "file once")
+        if np_ in seen:
+            # review r11: "part one"/"part two" of one file — the second was the first again
+            return files, (f"{path} is named by two `generate` entries — generate it once "
+                           "(it has its own output budget), or add to it later with `append`")
+        seen.add(np_)
+        if np_ in own:
+            # r19: the leaf's own file — unless the owner edited it since (the
+            # regeneration is shown the leaf's text and would drop the edit);
+            # unreadable (over the read cap): every write guard still judges it
+            live, _ = await _read_live_file(tool_runner, path) if tool_runner is not None else (None, "")
+            if live is None or live == own[np_]:
+                continue
+            return files, (f"{path} was changed since this task wrote it (by the owner?) — keep that "
+                           "change: fix it with `edits` or `append`, not `generate`")
+        exists = np_ in known
+        if not exists and tool_runner is not None:
+            live, lerr = await _read_live_file(tool_runner, path)
+            if lerr != "missing" and live is None and await _is_root_fallback(tool_runner, path):
+                lerr = "missing"              # §4QA-d r21: a big ROOT file of that name is not this one
+            exists = not (lerr == "missing")  # unknown = do not rewrite blind
+        if exists:
+            return files, (f"{path} already exists: `generate` is for NEW files — change it "
+                           f"with `edits` (or add to it with `append`)")
+    shown: Dict[str, str] = dict(existing)
+    for f in files:
+        if isinstance(f, dict) and not _is_generate_entry(f) and isinstance(f.get("content"), str):
+            shown[str(f.get("path") or "").strip()] = f["content"]   # a sibling written in full
+    out: list = []
+    done_entries: list = []
+    generated: Dict[str, str] = {}          # r20: this spec's generated files — shown FIRST (the 40k cut)
+    for f in files:
+        if not _is_generate_entry(f):
+            out.append(f)
+            continue
+        path = str(f.get("path") or "").strip()
+        np_ = _norm_path(path)
+        brief = str(f.get("generate") or "").strip()
+        hit = pending.get(np_)
+        text = hit[1] if hit else None    # same brief: `pending` holds only this plan's entries (r21)
+        if text is None:
+            ref = dict(reversed(list(generated.items())))
+            ref.update({k: v for k, v in shown.items() if k not in ref})
+            text, reason = await _generate_file(
+                llm, model, f, description=description, ledger=ledger, plan=files,
+                shown_files=ref, research_context=research_context,
+                constraints=constraints, is_background=is_background, deadline=deadline,
+                previous=own.get(np_, ""), feedback=_feedback_for(path, feedback, np_ in own))
+            if reason:
+                return done_entries, reason
+            pending[np_] = (brief, text)
+        generated[path] = text            # the later files' reference (shown first, r20)
+        entry = ({k: v for k, v in f.items() if k != "generate"}
+                 | {"content": text, _GENERATED_KEY: True})
+        out.append(entry)
+        done_entries.append(entry)
+    return out, None
 
 
 async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list,
@@ -1738,10 +2436,18 @@ async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list,
     return None
 
 
+def _merge_feedback(new: str, old: str) -> str:
+    """The new failure first, the one the retry was fixing kept (bounded)."""
+    if not old or old == new or old in new:
+        return new
+    return f"{new}\n\nEARLIER: {_short(old, 1500)}"
+
+
 async def _apply_file(tool_runner: ToolRunner, fspec: dict,
                       existing_files: Dict[str, str],
                       fresh: Optional[set] = None,
-                      touched: Optional[set] = None) -> Tuple[Optional[str], Optional[str]]:
+                      touched: Optional[set] = None,
+                      own: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[str]]:
     """Apply one file entry. Returns ``(written_path|None, fail_reason|None)``.
     A blank entry returns (None, None) — skipped, not a failure.
 
@@ -1868,7 +2574,8 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
             lerr = "missing"
         if lerr == "missing":
             return (None, f"{path} does not exist, so its {len(edits)} edit(s) "
-                          f"cannot apply — write it with `content`")
+                          f"cannot apply — write it with `content` (or, over ~100 lines, "
+                          f"`generate`)")
         touched.add(path)
         if live is None:
             # r21 m2: too large / SAMPLE ONLY — the file exists and exact-match
@@ -1935,11 +2642,14 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
     # closing </html> was almost certainly cut off at the token cap (observed:
     # task 1's shell ended mid-JS, breaking every later append). Don't build on
     # a broken file — fail so the retry produces a smaller COMPLETE one.
+    # §4SD r22: only a full PAGE (it opened <html>) — a Jinja child template
+    # or a partial never closes one and was refused on every attempt
     if (path.lower().endswith((".html", ".htm")) and content
-            and "</html>" not in content.lower()):
+            and "<html" in content.lower() and "</html>" not in content.lower()):
         return (None, f"{path} looks truncated (missing </html>) — produce a "
-                      "COMPLETE, smaller file with closing tags; add features "
-                      "in later tasks via append")
+                      "COMPLETE file with closing tags (a NEW file of more than "
+                      "~100 lines: `generate` it — it gets its own output budget), or "
+                      "a smaller one and add features in later tasks via append")
 
     # ⚠ NEVER JUDGE A REWRITE AGAINST A PREFIX (2026-08-11, §4AT-F).
     # `_gather_project_files` stores only a prefix once its 400 KB budget is
@@ -1979,8 +2689,28 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
                           f"in the file snapshot and could not be read ({lerr}) "
                           f"— use `edits` instead of `content`")
 
+    # §4SD review r10: a file this leaf generated itself, still as it wrote
+    # it, is rewritten as the new file it was — the overwrite guards would
+    # refuse a resampled (shorter) version with "use `append`"
+    # (only for a regenerated entry — review r11: a later plain `content`
+    # stub replaced a 40-function generated file — and only the size/anchor
+    # guard: a regeneration that does not parse never replaces one that does)
+    reg_old = old
+    if own and old is not None and fspec.get(_GENERATED_KEY) and _norm_path(path) in own:
+        # review r12: judged by the file ON DISK — a regeneration runs for
+        # long; an owner's edit meanwhile is not this leaf's file any more
+        live, _lerr = await _read_live_file(tool_runner, path)
+        if live is None:
+            # review r14: unreadable (over the read cap, a spent read budget)
+            # — it cannot be shown to be still the leaf's: every guard applies
+            # (a refusal costs a retry; a wrong pass costs the owner's edit)
+            pass
+        elif live == own[_norm_path(path)]:
+            reg_old = None
+        else:
+            old = reg_old = live
     # Refuse a full-overwrite that would lose prior work on an existing file.
-    reg = _regression_reason(old, content)
+    reg = _regression_reason(reg_old, content)
     if reg:
         return (None, f"refused to overwrite {path}: {reg}")
     # Python overwrite guard (2026-08-01), sibling of the append guard:
@@ -2153,7 +2883,34 @@ async def build_coding_task(
     feedback = ""
     last_written: List[str] = []
     empty_responses = 0
+    deadline = _leaf_deadline()             # §4SD: a leaf's wall clock
+    own: Dict[str, str] = {}                # §4SD: path → generated text this leaf wrote (a retry may regenerate it)
+    pending: Dict[str, Tuple[str, str]] = {}   # §4SD: path → (brief, generated text) not written yet
+    async def _write_pending() -> List[str]:
+        # r20: generated files a refused batch never reached are written out
+        # (through every guard) when the time ends, as the OutOfTime path does
+        kept_: List[str] = []
+        for _np, (_brief, _text) in list(pending.items()):
+            _p, _r = await _apply_file(tool_runner, {"path": _np, "content": _text, _GENERATED_KEY: True},
+                                       existing, fresh, set(), own=own)
+            if _p and not _r:
+                kept_.append(_p)
+                pending.pop(_np, None)
+        return kept_
+
     for _attempt in range(max(1, max_attempts)):
+        if _attempt and _time_left_s(deadline) < GENERATE_MIN_ATTEMPT_S:
+            kept = await _write_pending()
+            wrote = f" — wrote {', '.join(kept)} (not verified yet)" if kept else ""
+            if _attempt < 2:
+                # review r13: ONE attempt that ran out of room — a slow leaf,
+                # not a failing build: back to READY for the next step
+                return CodingResult(False, _short(f"out of time after one attempt{wrote} — {last}", 280),
+                                    files=kept or last_written, detail=feedback, out_of_time=True)
+            # review r10/r12: no spec call starts with seconds left; a build
+            # that kept FAILING is a failure (FAILED), not a timeout
+            return CodingResult(False, _short(f"no time for another attempt{wrote} — {last}", 280),
+                                files=kept or last_written, detail=feedback)
         if prev_touched:
             # The previous attempt touched files and failed — possibly with
             # PARTIAL edits already on disk. Re-read them so this attempt's
@@ -2171,6 +2928,7 @@ async def build_coding_task(
         except Exception as e:  # pragma: no cover - LLM/network variance
             from .llm import BackgroundDeferred as _BgDeferred
             if isinstance(e, _BgDeferred):
+                await _write_pending()      # r25: this plan's finished files first (as below)
                 raise                       # §4PG (R2-3): the owner is back — the advancer reopens the leaf
             return CodingResult(False, f"build-spec generation failed: {e}")
 
@@ -2191,6 +2949,17 @@ async def build_coding_task(
             continue
 
         files = spec.get("files") if isinstance(spec, dict) else None
+        # r21/r22: a generated text waits only for THIS plan's same entry — a
+        # path the plan now writes another way, renames, re-briefs or drops
+        # (a verify-only plan drops all) is not written later from an older
+        # plan (the time gate wrote it over the newer attempt's file)
+        _plan = {_norm_path(str(f.get("path") or "")): str(f.get("generate") or "").strip()
+                 for f in (files if isinstance(files, list) else [])[:max_files] if _is_generate_entry(f)}
+        _real_plan = (isinstance(files, list) and bool(files)) or (
+            isinstance(spec, dict) and bool(str(spec.get("verify") or "").strip())
+            and not _VERIFY_KILL_RE.search(str(spec.get("verify") or "")))   # r24: refused below — no plan
+        for _k in [k for k, (b, _t) in pending.items() if _real_plan and _plan.get(k) != b]:
+            pending.pop(_k, None)             # r23: an unusable reply is no plan — it drops nothing
         if not isinstance(files, list) or not files:
             # Empty files + a verify command means "nothing to write — the
             # deliverable already exists; just check it works". This happens
@@ -2227,7 +2996,8 @@ async def build_coding_task(
                 last = vfail
                 feedback = vfail
                 continue
-            msg = "model produced no file spec for the task"
+            msg = ("model produced no file spec for the task (a NEW file of more than "
+                   "~100 lines: name it with `generate` instead of writing it in `content`)")
             # Don't let an empty retry overwrite a more informative failure
             # (e.g. a real verify error) from a prior attempt.
             if last == "build failed":
@@ -2235,21 +3005,87 @@ async def build_coding_task(
             feedback = msg
             continue
 
+        # §4SD: files named with `generate` are written now, one call each
+        from .llm import BackgroundDeferred as _Deferred
+        try:
+            files, gfail = await _materialize_generated(
+                llm, model, files[:max_files], description=description, ledger=ledger,
+                existing=existing, own=own, pending=pending, tool_runner=tool_runner,
+                research_context=research_context, constraints=constraints,
+                is_background=is_background, deadline=deadline, feedback=feedback)
+        except _Deferred:
+            # r24: the owner kept the slot past the park — the files this plan
+            # finished are written (through every guard), as when time runs out
+            await _write_pending()
+            raise
+        if isinstance(gfail, OutOfTime):
+            # review r10: no further attempt fits; the files that completed are
+            # written (through every guard) so the next step builds on them
+            # instead of generating them again — the unattended step's cap
+            # (~44 min) is shorter than some files take
+            kept: List[str] = []
+            for f in files:
+                path, reason = await _apply_file(tool_runner, f, existing, fresh, set(), own=own)
+                pending.pop(_norm_path(str(f.get("path") or "")), None)
+                if path and not reason:
+                    kept.append(path)
+            kept += await _write_pending()    # r21: this plan's files an earlier attempt finished
+            if _attempt >= 2:
+                # r19: a build that kept FAILING is a failure (FAILED) however
+                # its time ended — as the gate above
+                return CodingResult(False, _short(f"no time for another attempt — {last}", 280),
+                                    files=kept or last_written, detail=feedback)
+            return CodingResult(False, _short(gfail + (f" — wrote {', '.join(kept)} (not verified yet); "
+                                                       "the task goes back to READY" if kept else ""), 280),
+                                files=kept or last_written, detail=feedback, out_of_time=True)
+        if gfail:
+            feedback = _merge_feedback(gfail, feedback)   # review r9: keep the reason the retry must fix
+            last = gfail
+            continue
+
         touched: set = set()
         written: List[str] = []
         fail: Optional[str] = None
         for f in files[:max_files]:
-            path, reason = await _apply_file(tool_runner, f, existing, fresh, touched)
+            path, reason = await _apply_file(tool_runner, f, existing, fresh, touched, own=own)
+            _gen = isinstance(f, dict) and bool(f.get(_GENERATED_KEY))
+            _np = _norm_path(str(f.get("path") or "")) if _gen else ""
             if reason:
                 fail = reason
+                if _gen:
+                    pending.pop(_np, None)            # refused: generate it anew, not again
+                    if (str(f.get("path") or "").strip() in touched
+                            and isinstance(f.get("content"), str)):
+                        # review r11 (r19: `path` is None here — the write landed, its check failed)
+                        own[_np] = await _disk_text(tool_runner, str(f.get("path") or "").strip(),
+                                                    f["content"])
                 break
             if path:
                 written.append(path)
+                if _gen:
+                    pending.pop(_np, None)
+                    own[_np] = await _disk_text(tool_runner, path, f["content"])   # §4SD: on disk
+                elif _norm_path(path) in own:
+                    # review r12: its own later edit/append — the file is still the leaf's
+                    _live, _ = await _read_live_file(tool_runner, path)
+                    if _live is not None:
+                        own[_norm_path(path)] = _live
+                    # (unreadable — over the read cap: it stays the leaf's, r13)
+        if fail:
+            # r20: a failed batch can have changed the leaf's own files (edit 1
+            # of 2 landed; an edit left it broken) — still the leaf's, not an
+            # owner's edit the next `generate` must keep
+            for _p in touched:
+                if _norm_path(_p) in own:
+                    _live, _ = await _read_live_file(tool_runner, _p)
+                    if _live is not None:
+                        own[_norm_path(_p)] = _live
         prev_touched = sorted(touched)
         last_written = written
         if fail:
             last = fail
-            feedback = fail
+            # review r10: a refused regeneration replaced the verify error
+            feedback = _merge_feedback(fail, feedback) if own else fail
             continue
         if not written:
             last = "build spec produced no writable files"

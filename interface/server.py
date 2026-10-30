@@ -1621,8 +1621,12 @@ async def chat_proxy(request: Request):
                     # instead of being cut mid-tool at CHAT_TIMEOUT_S (req fd89fd6d:
                     # 30 min of work, a 60 s sleep started with 61 s left, and the
                     # stitched narration delivered as the reply).
+                    # §4SD: "inf" on the STREAMED path — CHAT_TIMEOUT_S bounds the gap
+                    # between bytes, not the request, so a build that keeps writing code
+                    # runs until it stalls. The non-streamed path below receives nothing
+                    # until the end, so it really does hang up at CHAT_TIMEOUT_S.
                     _up_headers = {"X-Ghost-Key": GHOST_API_KEY,
-                                   "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S)),
+                                   "X-Ghost-Client-Timeout": "inf",
                                    **_effort}
                     if t.get("request_id"):
                         _up_headers["X-Request-ID"] = t["request_id"]

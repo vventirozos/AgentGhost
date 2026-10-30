@@ -154,6 +154,9 @@ def _read_head(path: Path, limit: int = 65536) -> Optional[str]:
     except OSError:
         return None
     try:
+        from ..tools.file_system import _block_if_regular
+        if not _stat.S_ISREG(_block_if_regular(fd).st_mode):   # §4SD: virtiofs EAGAIN; the fd, not the path
+            return None
         return os.read(fd, limit).decode("utf-8", errors="replace")
     finally:
         os.close(fd)

@@ -1302,7 +1302,9 @@ async def test_replace_read_identity_mismatch_is_the_guards_verdict(ws, home, mo
 
     def _swap_for_reader(p, flags, *a, **k):
         if (not state["done"] and str(p).endswith("a.py")
-                and _sys._getframe(1).f_code.co_name == "_read_text_guarded"):
+                # §4SD: the open now runs through `_retry_transient`
+                and "_read_text_guarded" in (_sys._getframe(1).f_code.co_name,
+                                             _sys._getframe(2).f_code.co_name)):
             state["done"] = True
             os.rename(ws / "d", ws / "tmp")
             os.rename(ws / "d2", ws / "d")

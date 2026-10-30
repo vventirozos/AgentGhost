@@ -233,9 +233,11 @@ def _x(cmd):
     return "execute:" + json.dumps({"command": cmd}, sort_keys=True)       # the production a_hash
 
 
-_P, _S = {"progress": True, "writes": 1}, {"progress": False, "writes": 1}
-_SEEN = {"progress": True, "writes": 1, "writes_at_earn": 1}          # already counted since the last write
-_IMPROVED = {"progress": True, "writes": 1, "writes_at_earn": 1, "improved": True}
+# §4SD review: a run earns against writes not made before (``new_writes``);
+# ``writes`` counts every write (the futility churn count)
+_P, _S = {"progress": True, "writes": 1, "new_writes": 1}, {"progress": False, "writes": 1, "new_writes": 1}
+_SEEN = {"progress": True, "writes": 1, "new_writes": 1, "writes_at_earn": 1}   # already counted since the last write
+_IMPROVED = {"progress": True, "writes": 1, "new_writes": 1, "writes_at_earn": 1, "improved": True}
 
 
 @pytest.mark.parametrize("fname,op,mut,target,cmd,written,err,want", [
@@ -290,6 +292,7 @@ def test_a_counted_run_needs_a_new_write_before_it_counts_again(env, req):
     _run_hook("execute", "", True, "", _x("python3 main.py"), rec, False)          # same file, no write: alternating
     assert L.request_progress_what(RID) == ""                                      # errors / a volatile port
     rec["main.py"]["writes"] += 1
+    rec["main.py"]["new_writes"] += 1
     _run_hook("execute", "", True, "", _x("python3 main.py"), rec, False)
     assert L.request_progress_what(RID) == "ran a file it wrote"
 
@@ -311,7 +314,7 @@ def test_a_refused_run_does_not_use_up_the_next_runs_earn(env, req):
 def test_the_real_verdict_and_the_hook_earn_once_per_rewrite(env, req, outputs):
     # r4: the hook fed hand-made records; here note_run_outcome makes them, as in production
     from ghost_agent.core.agent import note_run_outcome
-    rec = {"main.py": {"writes": 1, "runs": 0}}
+    rec = {"main.py": {"writes": 1, "new_writes": 1, "runs": 0}}
     earned = []
     for i, out in enumerate(outputs):
         rec["main.py"]["runs"] += 1
@@ -320,6 +323,7 @@ def test_the_real_verdict_and_the_hook_earn_once_per_rewrite(env, req, outputs):
         earned.append(L.request_progress_what(RID) == "ran a file it wrote")
     assert earned[0] and sum(earned) == 1                       # the first run after the write earns, no other
     rec["main.py"]["writes"] += 1                               # a rewrite brings the earn back
+    rec["main.py"]["new_writes"] += 1
     rec["main.py"]["runs"] += 1
     note_run_outcome(rec["main.py"], ok=True, output="something new")
     _run_hook("execute", "", True, "", _x("python3 main.py"), rec, False)
@@ -451,15 +455,20 @@ def test_the_hook_is_in_the_tool_result_loop_and_progress_is_logged():
     assert len(logs) == 1
 
 
-def test_the_slack_bot_waits_longer_than_the_agent_budget_and_sends_no_timeout():
+def test_the_slack_bot_sends_its_30_minute_budget_and_waits_longer():
+    # §4SD (operator 10-29: "set a limit to slack for 30 mins"): the bot sends
+    # X-Ghost-Client-Timeout (GHOST_SLACK_REQUEST_S, default 1800); its own wait
+    # still covers a turn queued behind a long build
     tree = _tree("interface/externals/slack_bot/main.py")
-    keys = [k.value for d in ast.walk(tree) if isinstance(d, ast.Dict)
-            for k in d.keys if isinstance(k, ast.Constant)]
-    assert "X-Ghost-Client-Timeout" not in keys                 # review m5: header would cut previews to 16k
-    defaults = [[a.value for a in c.args] for c in ast.walk(tree) if isinstance(c, ast.Call)
-                and isinstance(c.func, ast.Attribute) and c.func.attr == "get"
-                and c.args and isinstance(c.args[0], ast.Constant) and c.args[0].value == "GHOST_SLACK_AGENT_TIMEOUT"]
-    assert defaults == [["GHOST_SLACK_AGENT_TIMEOUT", "15300"]]
+    sent = [v for d in ast.walk(tree) if isinstance(d, ast.Dict)
+            for k, v in zip(d.keys, d.values)
+            if isinstance(k, ast.Constant) and k.value == "X-Ghost-Client-Timeout"]
+    assert len(sent) == 1 and "SLACK_REQUEST_S" in {n.id for n in ast.walk(sent[0]) if isinstance(n, ast.Name)}
+    defaults = {c.args[0].value: c.args[1].value for c in ast.walk(tree) if isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Attribute) and c.func.attr == "get" and len(c.args) == 2
+                and isinstance(c.args[0], ast.Constant) and isinstance(c.args[1], ast.Constant)
+                and c.args[0].value in ("GHOST_SLACK_AGENT_TIMEOUT", "GHOST_SLACK_REQUEST_S")}
+    assert defaults == {"GHOST_SLACK_AGENT_TIMEOUT": "15300", "GHOST_SLACK_REQUEST_S": "1800"}
     clients = [c for c in ast.walk(tree) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
                and c.func.attr == "AsyncClient"
                and any(k.arg == "timeout" and isinstance(k.value, ast.Name) and k.value.id == "AGENT_TIMEOUT_S"
