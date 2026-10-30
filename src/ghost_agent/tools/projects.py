@@ -323,14 +323,27 @@ async def _not_found_with_recall(context, term) -> str:
     vm = getattr(context, "memory_system", None)
     search = getattr(vm, "search_advanced", None) if vm is not None else None
     hits = []
+    # KB review 10-30 r2: the same walls as recall — this probe printed the
+    # owner's facts into a public channel reply
+    try:
+        from ..utils.logging import reply_is_public, requester_is_member
+        from ..memory.skills import _mostly_non_latin
+        if reply_is_public() or requester_is_member() or _mostly_non_latin(str(term)):
+            search = None
+    except Exception:  # noqa: BLE001 — unknown requester: no memory probe
+        search = None
     if callable(search):
         try:
             # record_retrievals=False: this is a lookup-miss probe, not a
             # real retrieval — the default bumped prune-survival stats on
             # 3 arbitrary nearby rows (including hits discarded by the
             # 1.15 gate below) on every project-name miss.
+            from ..memory.vector import AMBIENT_EXCLUDED_TYPES as _EXCL
+            # KB review 10-30: no type scope — a manual chunk or the owner's
+            # dog_name row answered "xyzzy-42" as a "related fact"
             raw = await asyncio.to_thread(
-                search, str(term), 3, record_retrievals=False)
+                search, str(term), 3, where={"type": {"$nin": list(_EXCL) + ["identity"]}},
+                record_retrievals=False)
             for h in raw or []:
                 if not isinstance(h, dict) or not h.get("text"):
                     continue
@@ -338,7 +351,11 @@ async def _not_found_with_recall(context, term) -> str:
                     score = float(h.get("score", 9.0))
                 except (TypeError, ValueError):
                     continue
-                if score < 1.15:  # tool_recall's MEDIUM-or-better band
+                from .memory import RECALL_HIGH_D
+                # KB review 10-30: tool_recall's HIGH band (cosine distance) —
+                # the old `< 1.15` was an L2-era MEDIUM band that admitted
+                # every row (random names measured 0.37–0.43)
+                if score < RECALL_HIGH_D:
                     hits.append(str(h["text"])[:200])
         except Exception:
             hits = []

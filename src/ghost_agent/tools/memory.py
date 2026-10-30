@@ -26,8 +26,8 @@ def _member_block():
         from ..utils.logging import requester_is_member
         if requester_is_member():
             return ToolOutcome.rejected(_MEMBER_BLOCK, reason_code="owner_data_blocked")
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception:  # noqa: BLE001 — KB review 10-30: unknown requester = refused, not the owner
+        return ToolOutcome.rejected(_MEMBER_BLOCK, reason_code="owner_data_blocked")
     return None
 
 
@@ -148,6 +148,32 @@ _FORGET_PROTECTED_TYPES = [
     # note above and the expansion-sweep guard below.
     "document_summary",
 ]
+
+
+def _profile_mirror_texts(profile_memory) -> set:
+    """The vector texts that are MIRRORS of a current profile field — the
+    qualified ``User <mirror_name> is <v>`` and the pre-fix ``User <key> is
+    <v>``. KB review 10-30: the forget sweep listed them as facts of their
+    own — "forget wife birthdate" defaulted to four OTHER fields' mirrors and
+    left the field itself in the profile. The profile field is the item; its
+    mirrors follow it (`forget_execute` re-syncs them). An identity row that
+    mirrors nothing stays forgettable."""
+    from ..memory.profile import mirror_name
+    out = set()
+    try:
+        data = profile_memory.load() if profile_memory is not None else {}
+    except Exception:  # noqa: BLE001
+        return out
+    for cat, sub in (data or {}).items():
+        if not isinstance(sub, dict):
+            continue
+        for k, v in sub.items():
+            for x in (v if isinstance(v, list) else [v]):
+                if x in (None, "") or isinstance(x, (dict, list)):
+                    continue
+                out.add(f"User {mirror_name(cat, k)} is {str(x).strip()}")
+                out.add(f"User {str(k).strip().lower()} is {str(x).strip()}")
+    return out
 #: Fresh review (§4KW): the largest vector distance at which an ENTITY forget
 #: removes a fact that does not literally name it. Unrelated owner facts were
 #: measured at 0.53–0.65 from short targets; a near-paraphrase is well under.
@@ -998,19 +1024,41 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     matches = [f for f in all_files if f.name.lower() == filename.lower()]
                     
                     # Priority 2: Stem match (e.g., "bitcoin" matches "bitcoin.pdf")
-                    if not matches:
-                        target_stem = Path(filename).stem.lower()
-                        matches = [f for f in all_files if f.stem.lower() == target_stem]
+                    # — only for a name WITHOUT an extension (KB review 10-30:
+                    # "notes.md" was ingested as notes.txt)
+                    # r2: a REAL extension — "report_v1.2" / "postgresql-16.4-A4"
+                    # end in ".2" / ".4-A4", which is a version, not a type
+                    _has_ext = bool(re.fullmatch(r"\.[A-Za-z][A-Za-z0-9]{0,4}", Path(filename).suffix))
+                    if not matches and not _has_ext:
+                        target_stem = Path(filename).name.lower()     # r3: "docs/bitcoin"
+                        # the model's container path ("/workspace/docs/x") and a
+                        # home path name the same directory as "docs/x" (r5)
+                        _dir = re.sub(r"^(?:/?workspace(?:/|$)|~/?)", "",
+                                      str(Path(filename).parent).replace("\\", "/")).lower().strip("/")
+                        matches = [f for f in all_files if f.stem.lower() == target_stem
+                                   and (_dir in ("", ".") or str(f.parent).lower().rstrip("/").endswith("/" + _dir)
+                                        or str(f.parent).lower() == _dir)]
                     
                     # Priority 3: Substring match
-                    if not matches:
+                    if not matches and not _has_ext:
                         matches = [f for f in all_files if filename.lower() in f.name.lower() and f.is_file()]
                     
-                    if matches:
-                        return matches[0]
-                    return None
+                    return matches
 
-                resolved_file_path = await asyncio.to_thread(_resolve_file)
+                _matches = await asyncio.to_thread(_resolve_file)
+                if len(_matches) > 1:
+                    # KB review 10-30: the first of several was ingested silently —
+                    # every project directory has a README.md
+                    _root = Path(sandbox_dir).resolve()
+                    _names = []
+                    for _m in _matches[:6]:
+                        try:
+                            _names.append(str(_m.resolve().relative_to(_root)))
+                        except ValueError:
+                            _names.append(_m.name)
+                    return (f"Error: '{filename}' matches {len(_matches)} files — give the path of the one to "
+                            f"ingest: " + ", ".join(_names) + (" …" if len(_matches) > 6 else ""))
+                resolved_file_path = _matches[0] if _matches else None
                 if resolved_file_path:
                     # ⚠ ASK THE GUARD AGAIN. The primary path above goes
                     # through `_get_safe_path`; this fallback re-derives a
@@ -1183,6 +1231,16 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                 note += " (TRUNCATED at the text cap)"
             if stats.skipped_pages:
                 note += f" ({stats.skipped_pages} unreadable pages skipped)"
+            _empty = list(getattr(stats, "empty_pages", []) or [])
+            _total = int(stats.pages_total or (stats.pages + len(_empty)) or 1)
+            if _empty:
+                _shown = ", ".join(str(p) for p in _empty[:12]) + (" …" if len(_empty) > 12 else "")
+                _what = (f"{len(_empty)} of {_total} pages have no text layer (scanned images — not OCR'd, so "
+                         f"their content is NOT searchable): pages {_shown}")
+                if len(_empty) * 5 >= _total:      # a fifth or more of the document is missing
+                    return (f"SUCCESS (PARTIAL): Ingested only the text pages of '{filename}' — {stats.pages} "
+                            f"pages, {stats.chunks} chunks. {_what}. Say so when answering from it.")
+                note += f" ({_what})"
             return (
                 f"SUCCESS: Ingested '{filename}' — {stats.pages} pages, "
                 f"{stats.sections} sections, {stats.chunks} chunks{note}. "
@@ -1254,6 +1312,9 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                 binary_exts = ['.png', '.jpg', '.jpeg', '.gif', '.zip', '.tar', '.gz', '.sqlite', '.db', '.mp4', '.exe']
                 if any(filename.lower().endswith(ext) for ext in binary_exts):
                     raise ValueError("Cannot ingest binary or media files into text memory.")
+                _why = _binary_content_reason(file_path)
+                if _why:
+                    raise ValueError(_why)
                 # Stream the file in chunks rather than `f.read()` so we
                 # can enforce the text-size cap without materialising the
                 # whole file in memory first.
@@ -1339,6 +1400,29 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
         return (f"SUCCESS (PARTIAL): Ingested the first 5 MB of '{filename}' — the rest "
                 f"was NOT stored; answers cannot come from beyond that point.")
     return f"SUCCESS: Ingested '{filename}'."
+
+def _binary_content_reason(path) -> str:
+    """Why a file is not text, from its first 8 KB, or "" (KB review 10-30:
+    an 11-extension deny-list let .docx/.xlsx/.epub through, read with
+    errors="replace" — the stored chunk was "PK\\x03\\x04…��" and the ingest
+    said SUCCESS)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+    except Exception:  # noqa: BLE001 — the sniff never fails an ingest; the read below reports
+        return ""
+    if not head or not isinstance(head, bytes):
+        return ""
+    if head.startswith(b"PK\x03\x04"):
+        return ("Cannot ingest this file as text: it is a ZIP container (a .docx/.xlsx/.pptx/.odt/.epub "
+                "document or an archive). Export it to PDF, .txt or .md first.")
+    if b"\x00" in head:
+        return "Cannot ingest this file as text: it is binary (it contains NUL bytes)."
+    text = head.decode("utf-8", errors="replace")
+    if text.count("\ufffd") > max(8, len(text) // 20):
+        return "Cannot ingest this file as text: it is not UTF-8 text (over 5% of it does not decode)."
+    return ""
+
 
 #: RAW VECTOR DISTANCE bands, measured on the live PostgreSQL manual
 #: (8,279 chunks, bge-small-en-v1.5) on 2026-09-09 — the best hit of each
@@ -1457,7 +1541,18 @@ async def tool_query_document(filename: str = None, question: str = None,
         f"a passage answers, over {_DIST_WEAK:.2f} it is unrelated; LOWER IS "
         f"CLOSER):",
     ]
-    if best >= _DIST_WEAK:
+    from ..memory.skills import _mostly_non_latin
+    if best >= _DIST_WEAK and _mostly_non_latin(question):
+        # KB review 10-30: the bands are the ENGLISH embedder's. Greek questions
+        # whose answer was ranked 1st/2nd measured 0.35–0.40 and got the
+        # no-answer banner ("do not try") over the right passage.
+        parts += [
+            "The question is not in English, and this document's distances are only "
+            "meaningful for English: read the passages below before deciding the "
+            "document does not cover it. If none answers, ONE more query in English "
+            "with the document's own terms is worth it.",
+        ]
+    elif best >= _DIST_WEAK:
         # ⚠ NOT "query again with different wording". Request e0f4a8bd: the
         # question was "how many chapters", every passage came back at 0.35+
         # (the off-topic band), and that footer told the model to keep
@@ -1817,6 +1912,134 @@ async def tool_document_outline(filename: str = None, memory_system=None,
 #: Relevance grades in order of goodness (lower rank = better match).
 _RELEVANCE_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
+#: recall's distance bands — Chroma's COSINE distance (1 − cos) on
+#: bge-small-en-v1.5 (the collection's space; it is not L2: squared L2 is
+#: twice this). KB review 10-30: the old bands (0.8 / 1.15 / keep 1.35) were
+#: L2-era and graded EVERY hit HIGH ("capital of Peru" 0.46 → HIGH). Measured
+#: on the 10-30 store with documents excluded: the right row ≤ 0.28 for 19 of
+#: 22 labelled questions (owner identity rows 0.32–0.39); the best hit of 16
+#: unrelated questions ≥ 0.36 but two (0.25 "best pizza in naples" ~ "…in
+#: athens", 0.32 "translate hello" ~ "hello ghost").
+RECALL_HIGH_D = float(os.environ.get("GHOST_RECALL_HIGH_D", "0.28") or 0.28)
+RECALL_MEDIUM_D = float(os.environ.get("GHOST_RECALL_MEDIUM_D", "0.36") or 0.36)
+RECALL_KEEP_D = float(os.environ.get("GHOST_RECALL_KEEP_D", "0.45") or 0.45)
+#: KB review 10-30 r2: the owner's identity rows (profile mirrors) measured
+#: 0.37–0.60 on every owner question ("what is my name" 0.38, "where do I
+#: work" 0.55 for the employer) — under the general bands they came back
+#: "probably UNRELATED" or not at all. On a question about the owner they are
+#: chosen by the field the question names and shown as the owner's facts.
+_RECALL_OWNER_FACT_MAX = 6
+_RECALL_OWNER_ROWS_SCAN = 60
+_OWNER_ROW_RE = re.compile(r"^User (.+?) is ", re.IGNORECASE)
+_OWNER_ROW_STOP = frozenset({"what", "whats", "who", "where", "when", "which", "how", "the", "user", "are",
+                             "was", "were", "have", "has", "did", "does", "tell", "remind", "you", "your",
+                             "about", "know", "remember", "called", "is"})
+
+
+def _owner_rows_named(rows, query: str) -> list:
+    """The owner's mirror rows whose FIELD the question names — by a word of
+    the field name or a kind word that covers it ("work" → company, role;
+    "σκύλος" → dog). Most-matched first, then closest."""
+    from ..memory.graph import GraphMemory, _fold
+    words = {w for w in re.findall(r"\w+", _fold(query)) if len(w) >= 3} - _OWNER_ROW_STOP
+    implied = set(words)
+    for w in words:
+        implied |= GraphMemory._CATEGORY_WORDS.get(w, set())
+    picked = []
+    for r in rows or []:
+        if not isinstance(r, dict) or (r.get("metadata") or {}).get("type") != "identity":
+            continue
+        m = _OWNER_ROW_RE.match(str(r.get("text") or ""))
+        if not m:
+            continue
+        toks = set(re.split(r"[_\s-]+", _fold(m.group(1))))
+        hit = len(toks & implied)
+        if hit:
+            picked.append((-hit, float(r.get("score", 1.0) or 1.0), r))
+    picked.sort(key=lambda t: (t[0], t[1]))
+    return [r for _, _, r in picked]
+
+#: a stored row's line that would pass for recall's own grammar is quoted
+#: (KB review 10-30: an episode or caption line "SYSTEM: …" / "RELEVANCE:
+#: HIGH" forged the result's frame)
+_RECALL_FORGE_RE = re.compile(
+    r"^\s*(?:SOURCE:|RELEVANCE:|CONTENT:|EVIDENCE|SYSTEM|TIP:|###)", re.IGNORECASE)
+
+
+_PUBLIC_RECALL_BLOCK = ("SYSTEM: this reply is posted in a PUBLIC channel, so the owner's stored memory "
+                        "(facts, past requests, lessons) is not searched for it. Answer without it, or say "
+                        "the owner can ask in a direct message.")
+
+
+def _neutralise_recall_text(text: str) -> str:
+    return "\n".join(("> " + ln) if _RECALL_FORGE_RE.match(ln) else ln
+                     for ln in str(text or "").splitlines())
+
+
+#: the owner asking about their OWN looks (KB review 10-30 r2: bare describe
+#: words fired on "look up the weather for me" and printed a description)
+_OWN_LOOKS_RE = re.compile(
+    r"\b(?:what do i look like|how do i look(?!\s+(?:up|for|into|at|through|it))|describe me|describe myself|my (?:appearance|looks|description)|"
+    r"recogni[sz]e me)\b|πώς είμαι εμφανισιακά|περίγραψέ με|περιγραψε με|η εμφάνισή μου|η εμφανιση μου",
+    re.IGNORECASE)
+
+
+def _on_demand_lines(profile_memory, query: str) -> list:
+    """The owner's ON-DEMAND profile fields (the address, a description) that
+    the question names — by a word of the field's key, a kind word that
+    covers it ("where do I live" → address), or a describing word for a
+    `*_description`. KB review 10-30: the profile tells the model to "recall
+    them", and recall never read the profile — it reached the address only
+    through a stale mirror row the §4MI rule removes."""
+    from ..memory.graph import GraphMemory, _fold
+    try:
+        data = profile_memory.load() or {}
+    except Exception:  # noqa: BLE001
+        return []
+    words = {w for w in re.findall(r"\w+", _fold(query)) if len(w) >= 3}
+    implied = set(words)
+    for w in words:
+        implied |= GraphMemory._CATEGORY_WORDS.get(w, set())
+    # r3: a person's fields are keyed by their NAME ("fotini_description"),
+    # the question by their role ("my wife") — the role's name field names them
+    for _cat, _sub in data.items():
+        if not isinstance(_sub, dict):
+            continue
+        for _k, _v in _sub.items():
+            _kt = set(_fold(_k).replace("-", "_").split("_"))
+            if "name" in _kt and (_kt - {"name"}) & implied and isinstance(_v, str) and len(_v) <= 60:
+                implied |= {w for w in re.findall(r"\w+", _fold(_v)) if len(w) >= 3}
+    out = []
+    for cat, sub in data.items():
+        if not isinstance(sub, dict):
+            continue
+        for k, v in sub.items():
+            try:
+                if profile_memory.is_on_demand(cat, k) is not True:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            toks = set(_fold(k).replace("-", "_").split("_"))
+            # a description is named by its person ("wife_description" ← "my
+            # wife"); the bare "description" word alone is not enough
+            _named = (toks - {"description"}) & implied
+            if str(k).endswith("description"):
+                if not (_named or (cat == "root" and _OWN_LOOKS_RE.search(str(query)))):
+                    continue
+            elif not toks & implied:
+                continue
+            vals = v if isinstance(v, list) else [v]
+            shown = "; ".join(str(x.get("value", x) if isinstance(x, dict) else x) for x in vals if x)
+            if shown:
+                out.append(f"- {cat}.{k}: {_neutralise_recall_text(shown[:400])}")
+    return out
+
+
+def recall_relevance(distance: float) -> str:
+    if distance < RECALL_HIGH_D:
+        return "HIGH"
+    return "MEDIUM" if distance < RECALL_MEDIUM_D else "LOW"
+
 # §4HB — graph-tier relevance guard. Content words of a query: folded
 # (casefold + NFKD, combining marks stripped, so Greek matches Greek),
 # longer than three characters, not a stopword, and NOT a bare number —
@@ -1861,7 +2084,7 @@ def _graph_edges_on_topic(query: str, edges):
 
 
 async def tool_recall(query: str = None, memory_system=None, graph_memory=None, session_store=None,
-                      fact_ledger=None, **kwargs):
+                      fact_ledger=None, profile_memory=None, **kwargs):
     _blocked = _member_block()
     if _blocked is not None:
         return _blocked
@@ -1869,39 +2092,99 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
     pretty_log("Memory Recall", query, icon=Icons.MEM_READ)
     if not memory_system: return "Error: Memory system is disabled."
+    # KB review 10-30: an owner turn whose reply is PUBLIC keeps the owner's
+    # private context out of the prompt (§4LB: profile, past requests,
+    # lessons), and recall served all of it anyway — health, address, family
+    # birthdates into a channel reply
+    from ..utils.logging import reply_is_public as _public
+    if _public():
+        return ToolOutcome.rejected(_PUBLIC_RECALL_BLOCK, reason_code="owner_data_blocked")
+    from ..memory.vector import AMBIENT_EXCLUDED_TYPES as _EXCL
+    _types_out = list(_EXCL)
     try:
-        # Use a higher limit for initial search, then filter strictly
-        results = await asyncio.to_thread(memory_system.search_advanced, query, limit=10)
+        # KB review 10-30: unscoped, the 8k manual chunks and caption rows
+        # out-ranked the owner's own rows ("what is my dog called" = 10 manual
+        # chunks) and reached the model raw; documents are knowledge_base's.
+        # Retrieval stats are bumped only for the rows shown.
+        results = await asyncio.to_thread(memory_system.search_advanced, query, limit=10,
+                                          where={"type": {"$nin": _types_out}}, record_retrievals=False)
     except asyncio.CancelledError:
         raise  # a cancelled turn must propagate, not read as "recall failed"
     except Exception:
         return "Error: Memory retrieval failed."
 
     valid_chunks = []
+    owner_fact_chunks = []
+    shown_ids = []
     best_relevance = None
+    from ..core.bus import MemoryBus as _MB0
+    from ..memory.skills import _mostly_non_latin
+    # r5: NOT widened to "user"/"owner" — the commonest noun of this owner's
+    # postgres/linux questions ("postgres user home directory" printed the
+    # street address); a third-person query keeps the pre-review behaviour
+    _about_owner = _MB0._asks_about_owner(str(query))
+    # KB review 10-30 r2: the embedder reads English; any Greek text sits close
+    # to any other (an unrelated Greek request at 0.15 graded HIGH), so a
+    # non-Latin question's distances grade nothing
+    _ungradable = _mostly_non_latin(str(query))
+    if _about_owner:
+        # the closest ten are usually past requests ("where do I work" → ten
+        # one-line requests at 0.38, the employer row at 0.55), and among the
+        # owner's rows the distance ranks nothing (all 24 sat at 0.37–0.60 for
+        # every owner question measured): the owner's rows are picked by the
+        # field the question names, as the graph's kind lookup does
+        try:
+            _own_rows = await asyncio.to_thread(memory_system.search_advanced, query,
+                                                limit=_RECALL_OWNER_ROWS_SCAN, where={"type": "identity"},
+                                                record_retrievals=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug("recall owner-fact search skipped: %s", e)
+            _own_rows = []
+        # r3: ADDITIVE — the graded results keep every identity row they had;
+        # a lexical miss of the field match must not take a fact recall showed
+        # before ("what cars do I have" lost `hobbies is cars` at 0.28)
+        _merged = [dict(r, _owner_named=True) for r in _owner_rows_named(_own_rows, str(query))] + [
+            r for r in (results or []) if isinstance(r, dict)]
+        _seen_txt: set = set()
+        results = [r for r in _merged
+                   if not (str(r.get("text")) in _seen_txt or _seen_txt.add(str(r.get("text"))))]
     for res in results:
         score = res.get('score', 1.0)
         source = res.get('metadata', {}).get('source', 'Unknown')
-        text = res.get('text', '')
+        text = _neutralise_recall_text(res.get('text', ''))
         m_type = res.get('metadata', {}).get('type', 'auto')
-        
-        # RAG-TUNED THRESHOLDS FOR ASYMMETRIC SEARCH
-        if score < 0.8: relevance = "HIGH"
-        elif score < 1.15: relevance = "MEDIUM"
-        else: relevance = "LOW"
-        
+        relevance = "UNGRADED" if _ungradable else recall_relevance(score)
         pretty_log("Memory Match", f"[{relevance}] {score:.2f} | {source}", icon=Icons.MEM_MATCH)
 
-        # 1.35 is a realistic upper bound for short queries against long chunks using L2 distance
-        if score < 1.35:
+        if res.get("_owner_named") and len(owner_fact_chunks) < _RECALL_OWNER_FACT_MAX:
+            if res.get("id"):
+                shown_ids.append(res["id"])
+            owner_fact_chunks.append(f"- {text}")
+            continue
+        if _ungradable and len(valid_chunks) >= 5:
+            continue
+        # r5: with documents out of scope, the owner's profile rows (0.37–0.45
+        # to anything) filled the ten slots of "chown owner of a file" or "owner
+        # email address of the domain" — the street address among them. Off an
+        # owner question a profile row needs at least a MEDIUM match.
+        if m_type == "identity" and not _about_owner and (_ungradable or score >= RECALL_MEDIUM_D):
+            continue
+        if score < RECALL_KEEP_D:
+            if res.get("id"):
+                shown_ids.append(res["id"])
             # §4FD: the relevance grade used to reach only the operator's
             # log — the model saw "highly relevant memories" over rows
             # scored LOW and invented a project codename from pg_stat
             # notes. The grade now rides each chunk, and the header names
             # the best one so an all-LOW recall reads as what it is.
-            if best_relevance is None or _RELEVANCE_RANK[relevance] < _RELEVANCE_RANK[best_relevance]:
+            if not _ungradable and (best_relevance is None
+                                    or _RELEVANCE_RANK[relevance] < _RELEVANCE_RANK[best_relevance]):
                 best_relevance = relevance
-            chunk = f"SOURCE: {source}\nRELEVANCE: {relevance} (distance {score:.2f})\nCONTENT: {text}"
+            _grade = (f"RELEVANCE: UNGRADED (distance {score:.2f} means little for a non-English question)"
+                      if _ungradable else f"RELEVANCE: {relevance} (distance {score:.2f})")
+            chunk = f"SOURCE: {source}\n{_grade}\nCONTENT: {text}"
             # Drill-down provenance: syntheses carry {"provenance": [{id,
             # excerpt}, ...]} (their merged sources are deleted, the excerpt
             # IS the surviving evidence); episode-derived skills carry
@@ -1935,7 +2218,13 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                 chunk += (f"\nEVIDENCE REFS: ep:{_ep_id} — this hit is a past "
                           f"REQUEST; expand it to read what that turn found")
             valid_chunks.append(chunk)
-            
+    if shown_ids and hasattr(memory_system, "bump_retrievals"):
+        try:
+            await asyncio.to_thread(memory_system.bump_retrievals, shown_ids)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("recall retrieval bump skipped: %s", e)
+
+    _graph_section = ""
     if graph_memory:
         import re as _re
         words = [w.strip('.,?!;"\'()[]') for w in str(query).split() if len(w.strip('.,?!;"\'()[]')) > 3]
@@ -1953,12 +2242,28 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                 edges = _graph_edges_on_topic(query, edges or [])
                 # the owner's facts asked for by their KIND ("my health
                 # conditions") — matched on the predicate, not a node (§4KX r8)
+                # r3: on every English recall, as before this review; the Greek
+                # kind words are new (σπίτι → address) and open on an owner
+                # question only ("a house for eight people" printed the address)
                 if hasattr(graph_memory, "owner_facts_matching"):
-                    _own = await asyncio.to_thread(graph_memory.owner_facts_matching, query)
+                    _ofm = graph_memory.owner_facts_matching
+                    try:
+                        import inspect as _insp
+                        _ps = _insp.signature(_ofm).parameters.values()
+                        _takes = any(p.name == "extended" or p.kind is p.VAR_KEYWORD for p in _ps)
+                    except (TypeError, ValueError):
+                        _takes = False
+                    if _takes:
+                        _own = await asyncio.to_thread(_ofm, query, extended=_about_owner)
+                    else:                                    # an older store: owner questions only
+                        _own = await asyncio.to_thread(_ofm, query) if _about_owner else []
                     if isinstance(_own, list):
                         edges = list(dict.fromkeys([e for e in _own if isinstance(e, str)] + list(edges)))
                 if edges:
-                    valid_chunks.insert(0, "### TOPOLOGICAL GRAPH EDGES:\n" + "\n".join(edges))
+                    # KB review 10-30: its own section — under the vector grade it
+                    # was labelled "probably UNRELATED" over the owner's exact facts
+                    _graph_section = "### TOPOLOGICAL GRAPH EDGES:\n" + "\n".join(
+                        _neutralise_recall_text(str(e)) for e in edges)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1982,7 +2287,8 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                 _when = __import__("datetime").datetime.fromtimestamp(_ts).strftime("%Y-%m-%d") if _ts else "undated"
                 # messages carry no time of their own: the date is the session's last activity
                 _lines.append(f"- [last active {_when} · {str(h.get('title') or 'untitled')[:60]}] {h.get('role')}: "
-                              f"{str(h.get('text') or '')[:400]} (ref session:{h.get('session_id')})")
+                              f"{_neutralise_recall_text(str(h.get('text') or '')[:400])} "
+                              f"(ref session:{h.get('session_id')})")
             if _lines:
                 _session_section = ("### PAST CONVERSATIONS (what was said THEN — may be outdated):\n"
                                     + "\n".join(_lines))
@@ -2011,25 +2317,57 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
             raise
         except Exception as e:  # noqa: BLE001
             logger.debug("recall history tier skipped: %s", e)
+    _ondemand_section = ""
+    if profile_memory is not None:
+        try:
+            from ..core.bus import MemoryBus as _MB2
+            # KB review 10-30 r2: the owner gate only — "the IRS's email address"
+            # printed the home address
+            if _about_owner:
+                _od = await asyncio.to_thread(_on_demand_lines, profile_memory, str(query))
+                if _od:
+                    _ondemand_section = ("### THE OWNER'S ON-REQUEST FACTS (from the profile; shown because asked — "
+                                         "never put them in a web search):\n" + "\n".join(_od))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug("recall on-demand tier skipped: %s", e)
+    if owner_fact_chunks:
+        _of = "### THE OWNER'S STORED PROFILE FACTS (closest to the question):\n" + "\n".join(owner_fact_chunks)
+        _ondemand_section = _of + ("\n\n" + _ondemand_section if _ondemand_section else "")
+    if _ondemand_section and not _graph_section:
+        _graph_section = _ondemand_section
+    elif _ondemand_section:
+        _graph_section = _ondemand_section + "\n\n" + _graph_section
     _extra_sections = [sct for sct in (_history_section, _session_section) if sct]
+    _ungraded = [sct for sct in (_graph_section, *_extra_sections) if sct]
 
-    if _extra_sections and not valid_chunks:
-        # §4NG review: keyword hits in past conversations are not graded by the
-        # vector relevance — they must not be labelled "probably UNRELATED"
-        _n_sess = _session_section.count(chr(10)) if _session_section else 0
+    if _ungraded and not valid_chunks:
+        # §4NG review: keyword hits in past conversations (and, KB review 10-30,
+        # the owner's graph facts) are not graded by the vector relevance —
+        # they must not be labelled "probably UNRELATED"
+        _n_sess = sum(1 for ln in _session_section.splitlines() if ln.startswith("- [")) if _session_section else 0
         _lead = (f"SYSTEM: No stored memory matched; {_n_sess} snippet(s) from past conversations matched the "
                  f"query's words." if _session_section else
+                 "SYSTEM: No stored memory matched; the owner's stored facts below did." if _graph_section else
                  "SYSTEM: No stored memory matched; the owner's fact history below did.")
-        return _lead + "\n\n" + "\n\n".join(_extra_sections)
+        return _lead + "\n\n" + "\n\n".join(_ungraded)
     if valid_chunks:
         _best = best_relevance or "LOW"
-        if _best == "LOW":
+        if _ungradable:
+            _head = (f"SYSTEM: Found {len(valid_chunks)} memories, UNGRADED: the question is not in English and "
+                     "the matcher reads English only, so closeness says nothing here. Use a memory only if it "
+                     "plainly answers the question; otherwise say nothing was found.")
+        elif _best == "LOW":
             _head = (f"SYSTEM: Found {len(valid_chunks)} memories (best match: LOW — "
                      "these are probably UNRELATED to the query; do not present them "
                      "as facts about it).")
         else:
             _head = f"SYSTEM: Found {len(valid_chunks)} memories (best match: {_best})."
-        out = _head + "\n\n" + "\n\n".join(valid_chunks + _extra_sections)
+        if _graph_section:
+            _head += " The owner's stored facts below are not graded by that match."
+        out = _head + "\n\n" + "\n\n".join(([_graph_section] if _graph_section else []) + valid_chunks
+                                            + _extra_sections)
         # Iterative drill-down affordance: when a hit carries evidence
         # handles, tell the model how to expand them (the query_document
         # "read → refine → read again" loop, generalized to memory).
@@ -2044,7 +2382,8 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
         return (
             "SYSTEM OBSERVATION: Zero high-confidence memories found for this query. "
             "Before concluding the memory doesn't exist, try ONE more recall with "
-            "different wording (a synonym, or just the key entity's name)."
+            "different wording (a synonym, or just the key entity's name). Ingested "
+            "documents are not searched here: use knowledge_base(action='query', filename=…)."
         )
 
 async def tool_expand_evidence(ref=None, episodic_memory=None,
@@ -2865,12 +3204,31 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
         return ToolOutcome.rejected("NOT deleted: the selection names no listed item.", reason_code="forget_empty_selection")
     _drop_plan(token)
     report = []
+    _fields = []
+    try:
+        _before = (profile_memory.load() or {}) if profile_memory is not None else {}
+    except Exception:  # noqa: BLE001
+        _before = {}
     for it in chosen:
         try:
             report.append(await asyncio.to_thread(_execute_item, it, memory_system, profile_memory, graph_memory,
                                                   project_store, episodic_memory, skill_memory))
         except Exception as e:  # noqa: BLE001
             report.append(f"⚠️ {it['label']}: {e}")
+        if it.get("kind") in ("profile_field", "profile_item", "profile_previous"):
+            _fields.append((it["ref"].get("category"), it["ref"].get("key")))
+    # KB review 10-30: a forgotten profile field left its mirrors live ("forget
+    # Hanzo" → `user HAS_DOG_NAME hanzo` and `User dog_name is Hanzo` stayed)
+    from ..memory.profile import ProfileMemory as _PMc
+    for _c, _k in dict.fromkeys(_fields):
+        if profile_memory is None or not _c or not _k:
+            continue
+        _cc, _kc = _PMc.canonicalize(str(_c).lower(), str(_k).lower())
+        _sub = _before.get(_cc) if isinstance(_before.get(_cc), dict) else {}
+        _lag = await sync_owner_mirrors(_c, _k, profile_memory, graph_memory, memory_system,
+                                        previous=_sub.get(_kc))
+        if _lag:
+            report.append(f"⚠️ the {', '.join(_lag)} copy of {_c}.{_k} could not be updated yet")
     # §4PE (K4): declared — a report of ❌/⚠️ lines was booked OK, and the
     # model was never told the token is spent
     _bad = [r for r in report if r.lstrip().startswith(("❌", "⚠️", "⚠"))]
@@ -3394,6 +3752,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                 hits = []
                 word_cands = []
                 literal_hits = []
+                _mirrors = _profile_mirror_texts(profile_memory)
                 if cand.get('ids'):
                     for i, dist in enumerate(cand['distances'][0]):
                         doc_text = cand['documents'][0][i]
@@ -3402,6 +3761,8 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         m_type = meta.get('type', 'auto')
                         if m_type in _FORGET_PROTECTED_TYPES:
                             continue  # belt-and-braces vs the where scope
+                        if m_type == "identity" and str(doc_text).strip() in _mirrors:
+                            continue  # KB review 10-30: a profile field's mirror — the field is the item
                         # Fresh review (§4KW): 0.8/0.6 deleted UNRELATED owner
                         # facts — `forget postgresql-19-A4.pdf` removed the
                         # owner's birth date, both sons' birthdates and home
@@ -3610,6 +3971,8 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             continue
         # Vector: delete facts that literally name the related entity.
         try:
+            _mirrors_x = _profile_mirror_texts(profile_memory)
+
             def _literal_sweep(_t=extra):
                 with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
                     # Same type scope as the primary sweep — see
@@ -3625,6 +3988,8 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                             meta = (cand.get('metadatas') or [[]])[0][i] or {}
                             if meta.get('type') in _FORGET_PROTECTED_TYPES:
                                 continue
+                            if meta.get('type') == "identity" and str(doc_text).strip() in _mirrors_x:
+                                continue      # KB review 10-30: a profile field's mirror
                             # §4R R2: `synthesis` is forgettable when the user
                             # NAMES the target (primary sweep — that is the
                             # tool's job, per the note on the protected list),
@@ -3798,18 +4163,66 @@ async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key
                 + ". Other projects' notes and system keys were kept.")
     return "Error: Unknown action (set, get, list, delete, clear)"
 
-async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, memory_system=None) -> list:
+async def resync_all_owner_mirrors(profile_memory, graph_memory=None, memory_system=None) -> tuple:
+    """Every profile field's mirrors made equal to it (store maintenance).
+    KB review 10-30: the mirrors moved to category-qualified names; this is
+    what retires each field's pre-fix unqualified duplicate and fills a
+    mirror a lagging write never wrote. Returns (fields synced, fields lagging)."""
+    if profile_memory is None:
+        return 0, 0
+    try:
+        data = profile_memory.load() or {}
+    except Exception:  # noqa: BLE001
+        return 0, 0
+    if getattr(profile_memory, "_degraded", False) is True:
+        return 0, 0
+    # KB review 10-30 r2: a missing profile file reads as the default skeleton
+    # (`root.name = "User"`, not degraded) — re-synced, it replaced the only
+    # surviving copy of the owner's name in the graph and vector store
+    _fp = getattr(profile_memory, "file_path", None)
+    if _fp is not None and not Path(str(_fp)).exists():
+        return 0, 0
+
+    def _placeholder(cat, k, v) -> bool:
+        return str(cat) == "root" and str(k) == "name" and str(v or "").strip() in ("", "User")
+
+    def _mirrorable(v) -> bool:
+        vals = v if isinstance(v, list) else [v]
+        return all(isinstance(x, (str, int, float)) or (isinstance(x, dict) and "value" in x) for x in vals)
+    done = lagging = 0
+    for cat, sub in list(data.items()):
+        if not isinstance(sub, dict) or not str(cat).strip():
+            continue
+        for k in list(sub):
+            # an empty key wrote a bare `HAS_` predicate, a nested dict wrote
+            # "User x_k is {'a': 1}" (r2 M6); the placeholder name is no fact
+            if not str(k).strip() or not _mirrorable(sub[k]) or _placeholder(cat, k, sub[k]):
+                continue
+            if await sync_owner_mirrors(cat, k, profile_memory, graph_memory, memory_system):
+                lagging += 1
+            else:
+                done += 1
+    return done, lagging
+
+
+async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, memory_system=None,
+                             previous=None) -> list:
     """§4KZ: the PROFILE is the authority for an owner field; its graph edges
     (`user HAS_<KEY>`) and vector rows (`User <key> is …`) are MIRRORS made to
     equal it after every write — by the tool, the bus or the background
     extractor — instead of each writer adding its own copy (stale HAS_WIFE /
     HAS_EMPLOYER / HAS_LOCATION edges stayed live beside the new value).
-    Returns the names of mirrors that could not be synced."""
+    Returns the names of mirrors that could not be synced. ``previous``: the
+    value(s) a delete just removed (their pre-fix unqualified mirrors go too)."""
     from ..memory.profile import ProfileMemory as _PM
     cat, k = _PM.canonicalize(str(category or "").strip().lower(), str(key or "").strip().lower())
     try:
         cur = ((profile_memory.load() or {}).get(cat) or {}).get(k)
     except Exception:  # noqa: BLE001
+        return ["profile-read"]
+    if getattr(profile_memory, "_degraded", False) is True:
+        # KB review 10-30: an unreadable profile reads as empty, which emptied
+        # every mirror of the key
         return ["profile-read"]
     values = cur if isinstance(cur, list) else ([] if cur in (None, "") else [cur])
     # §4MI: an ON-DEMAND field (the address, a physical description) is
@@ -3822,12 +4235,23 @@ async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, m
             values = []
     except Exception:  # noqa: BLE001
         pass
+    # KB review 10-30: mirrors are named by category + key (`mirror_name`); a
+    # pre-fix unqualified duplicate goes only when the root category has no
+    # field of that key (its mirror is the unqualified one)
+    from ..memory.profile import MIRROR_ROOT_CATEGORY as _ROOT
+    try:
+        _retire = cat != _ROOT and k not in ((profile_memory.load() or {}).get(_ROOT) or {})
+    except Exception:  # noqa: BLE001
+        _retire = False
+    _prev = [str(x) for x in (previous if isinstance(previous, list) else [previous])
+             if x not in (None, "") and not isinstance(x, (dict, list))]
     lag = []
     for name, store in (("graph", graph_memory), ("vector", memory_system)):
         if store is None or not hasattr(store, "sync_owner_field"):
             continue
         try:
-            await asyncio.to_thread(store.sync_owner_field, k, values)
+            await asyncio.to_thread(store.sync_owner_field, k, values, category=cat, retire_legacy=_retire,
+                                    legacy_values=_prev)
         except Exception as e:  # noqa: BLE001
             logger.warning("owner mirror %s for %s.%s lagged: %s", name, cat, k, e)
             lag.append(name)
@@ -3905,7 +4329,8 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         if isinstance(msg, str) and not msg.lower().startswith("error"):
             await sync_owner_mirrors(category, key, prof,
                                      graph_memory if graph_memory is not None else getattr(memory_bus, "graph", None),
-                                     memory_system if memory_system is not None else getattr(memory_bus, "vector", None))
+                                     memory_system if memory_system is not None else getattr(memory_bus, "vector", None),
+                                     previous=old_val)
         return msg
 
     pretty_log("Profile Update", f"{category}.{key}={value}", icon=Icons.USER_ID)

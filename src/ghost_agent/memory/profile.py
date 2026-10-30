@@ -231,6 +231,24 @@ def purge_removed_archive(path, days: float) -> int:
     return dropped
 
 
+#: the profile category whose fields mirror under their bare key (`User name
+#: is …`, `user HAS_NAME …`); every other category's fields are qualified
+MIRROR_ROOT_CATEGORY = "root"
+
+
+def mirror_name(category: str, key: str) -> str:
+    """The name a profile field's mirrors carry — the key for a ROOT field,
+    ``<category>_<key>`` otherwise (KB review 10-30: keyed by the key alone,
+    `pet.name = Hanzo` replaced the owner's own `User name is Vasilis` and
+    `user HAS_NAME vasilis`, and `health.condition` deleted the graph-only
+    `HAS_CONDITION heart failure`)."""
+    cat = str(category or "").strip().lower()
+    k = str(key or "").strip().lower()
+    if not cat or cat == MIRROR_ROOT_CATEGORY:
+        return k
+    return f"{cat}_{k}"
+
+
 class ProfileMemory:
     def __init__(self, path: Path):
         self.file_path = path / "user_profile.json"

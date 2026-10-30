@@ -359,8 +359,8 @@ async def test_a_refused_identity_write_reaches_the_user_as_a_partial():
     from ghost_agent.tools.memory import tool_update_profile
 
     vm = _mem()
-    vm.smart_update("User car is a Fiat", "identity")
-    vm.add("User car is a BMW", {"type": "auto",
+    vm.smart_update("User assets_car is a Fiat", "identity")   # KB review 10-30: qualified mirror
+    vm.add("User assets_car is a BMW", {"type": "auto",
                                  "timestamp": "2026-01-01T00:00:00Z"})
     # §4KZ: the mirror reads the (canonical) field AFTER the write — a
     # stateful profile: Fiat on file, BMW once written
@@ -379,12 +379,12 @@ async def test_a_refused_identity_write_reaches_the_user_as_a_partial():
     # the NEW value never reached the identity tier (that is the refusal)…
     identity = vm.collection.get(where={"type": "identity"},
                                  include=["documents"])
-    assert "User car is a BMW" not in identity["documents"], (
+    assert "User assets_car is a BMW" not in identity["documents"], (
         "the fact is in the identity tier after all — then this pin is "
         "testing the wrong world")
     # …and the value that WAS on file is still there: a write that cannot
     # land must not take the predecessor with it.
-    assert identity["documents"] == ["User car is a Fiat"], identity
+    assert identity["documents"] == ["User assets_car is a Fiat"], identity
     assert vm.collection.get(where={"type": "auto"})["ids"]
 
 

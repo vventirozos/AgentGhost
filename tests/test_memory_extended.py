@@ -41,7 +41,7 @@ async def test_recall(mock_context_with_mem):
     # Test recalling a fact
     res = await tool_recall("sky", mock_context_with_mem.memory_system)
     assert "sky" in res.lower()
-    mock_context_with_mem.memory_system.search_advanced.assert_called_with("sky", limit=10)
+    mock_context_with_mem.memory_system.search_advanced.assert_called_with("sky", limit=10, where={'type': {'$nin': ['document', 'document_summary', 'episode_outside']}}, record_retrievals=False)
 
 @pytest.mark.asyncio
 async def test_forget(mock_context_with_mem, temp_dirs):

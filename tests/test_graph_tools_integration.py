@@ -11,7 +11,7 @@ def mock_memory_system():
     mem_sys.add = MagicMock()
     # Mocking retrieval to return some chunks for generic hits
     mem_sys.search_advanced.return_value = [
-        {"source": "VectorDB", "text": "Dummy fact", "score": 1.0}
+        {"source": "VectorDB", "text": "Dummy fact", "score": 0.3}
     ]
     return mem_sys
 

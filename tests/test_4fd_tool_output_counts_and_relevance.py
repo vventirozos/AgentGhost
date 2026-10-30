@@ -21,7 +21,7 @@ class _Mem:
     def __init__(self, scores):
         self._scores = scores
 
-    def search_advanced(self, query, limit=10):
+    def search_advanced(self, query, limit=10, **kw):
         return [{"score": s, "text": f"chunk {i}", "metadata": {"source": f"src{i}"}}
                 for i, s in enumerate(self._scores)]
 
@@ -33,23 +33,23 @@ def _recall(scores):
 def test_all_low_recall_is_labelled_unrelated_in_the_header_and_per_chunk():
     """World where it fails: LOW rows are still announced as 'highly
     relevant' — the model cannot tell an unrelated hit from a good one."""
-    out = _recall([1.20, 1.28, 1.33])
+    out = _recall([0.37, 0.40, 0.43])
     assert out.startswith("SYSTEM: Found 3 memories (best match: LOW")
     assert "probably UNRELATED" in out
-    assert out.count("RELEVANCE: LOW (distance 1.") == 3
+    assert out.count("RELEVANCE: LOW (distance 0.") == 3
 
 
 def test_best_match_names_the_best_grade_not_the_first_row():
     """World where it fails: the header takes the first row's grade, or
     ranks grades alphabetically (HIGH < LOW < MEDIUM)."""
-    out = _recall([1.30, 0.95, 1.25])
+    out = _recall([0.40, 0.32, 0.38])
     assert "(best match: MEDIUM)" in out
-    out2 = _recall([1.30, 0.50])
+    out2 = _recall([0.40, 0.20])
     assert "(best match: HIGH)" in out2 and "UNRELATED" not in out2
 
 
 def test_rows_past_the_hard_cut_are_still_dropped():
-    out = _recall([1.40, 1.50])
+    out = _recall([0.46, 0.50])
     assert out.startswith("SYSTEM OBSERVATION: Zero high-confidence memories found")
 
 

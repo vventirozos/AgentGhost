@@ -787,6 +787,9 @@ def _store_passages(memory_system, filename: str,
             ok, msg = memory_system.ingest_document(filename, chunks[i:i + BATCH_CHUNKS], _batch=True)
             if not ok:
                 raise RuntimeError(f"embedding failed at chunk {i}: {msg}")
+        _done = getattr(memory_system, "clear_ingest_marker", None)
+        if callable(_done):  # KB review 10-30 (I5): the document is complete
+            _done(filename)
     except BaseException:
         # no half-transcript behind (§4MD M13)
         _rb = getattr(memory_system, "rollback_partial_document", None)

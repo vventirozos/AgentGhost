@@ -236,5 +236,12 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
   <li><strong>Every repair script that writes stores under <code>--apply</code></strong> calls <code>assert_no_other_writer</code> before its main block. 26 older scripts did not, and three of them opened chroma on the live store directly, which is the two-writer case that left the store segfaulting. The pin enumerates the scripts from their AST (an <code>--apply</code> constant plus a store-opening call).</li>
   <li><strong>Restore:</strong> move the live <code>memory/</code> folder aside, then copy the snapshot's folder into its place (<code>scripts/snapshot_stores.py</code>). Copying <em>into</em> a live folder left a crash's <code>-wal</code> there, and SQLite replayed it onto the restored database.</li>
 </ul>
+<h2 id="kb-review-1030">2026-10-30 review</h2>
+<ul>
+  <li><strong>The collection is cosine.</strong> A distance is 1 − cosine similarity (0 to 2). Recall's bands were rewritten for it; see <a href="../tools/memory_tools.html#kb-review-1030">the review</a>.</li>
+  <li><code>sync_owner_field(key, values, category="root", retire_legacy=False, legacy_values=())</code> writes <code>User &lt;category&gt;_&lt;key&gt; is …</code> for a non-root field; an old unqualified row is removed only for a value in the current or <code>legacy_values</code> set.</li>
+  <li><strong>ingesting.json</strong>: <code>mark_ingest_started</code> / <code>clear_ingest_marker</code> bracket an ingest; <code>_rollback_interrupted_ingests</code> runs at start-up and deletes documents whose writer pid is gone. <code>delete_document_by_name</code> clears the entry and deletes only <code>DOCUMENT_ROW_TYPES</code> rows.</li>
+</ul>
+
 </body>
 </html>

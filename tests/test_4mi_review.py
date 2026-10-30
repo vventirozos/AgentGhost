@@ -549,7 +549,7 @@ async def test_an_on_demand_profile_field_keeps_an_empty_graph_mirror():
     pm = SimpleNamespace(load=lambda: {"relationships": {"fotini_description": {"v": "tall, brown hair"}}},
                          is_on_demand=lambda cat, k: k.endswith("_description"))
     synced = []
-    gm = SimpleNamespace(sync_owner_field=lambda k, values: synced.append((k, list(values))))
+    gm = SimpleNamespace(sync_owner_field=lambda k, values, **kw: synced.append((k, list(values))))
     with patch("ghost_agent.memory.profile.ProfileMemory.canonicalize",
                staticmethod(lambda c, k: (c, k))):
         await sync_owner_mirrors("relationships", "fotini_description", pm, graph_memory=gm)

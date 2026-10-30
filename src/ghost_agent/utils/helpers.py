@@ -573,7 +573,12 @@ def recursive_split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 
     # semantic_split_text when a long header shrinks the effective
     # chunk_size below the overlap.
     chunk_size = max(1, int(chunk_size))
-    chunk_overlap = max(0, min(int(chunk_overlap), chunk_size - 1))
+    # KB review 10-30: capped at a quarter of the chunk, not chunk_size-1 — a
+    # long header shrinks the effective size below the overlap, and the
+    # hard-split step collapsed to ONE character: 20 KB of base64 under a
+    # 510-char header became 20,001 chunks / 12 M chars (≈ 110 s of embedding
+    # under the store lock; ≈ 1.5 h for 1 MB). Every step now advances ≥ 3/4.
+    chunk_overlap = max(0, min(int(chunk_overlap), chunk_size // 4))
     if len(text) <= chunk_size: return [text]
 
     separators = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
@@ -701,12 +706,19 @@ def semantic_split_text(text: str, chunk_size: int = 600, chunk_overlap: int = 1
             if re.match(r'^#{1,6}\s', part):
                 if current_section.strip():
                     sections.append((current_header, current_section.strip()))
+                    current_section = ""
+                elif current_header:
+                    # KB review 10-30 r3: a header with no body of its own
+                    # (stacked "# " comments, an H1 straight above an H2) was
+                    # in no chunk — its text rides the next section's body
+                    current_section = current_header + "\n"
                 current_header = part.strip()
-                current_section = ""
             else:
                 current_section += part
         if current_section.strip():
             sections.append((current_header, current_section.strip()))
+        elif current_header:
+            sections.append((current_header, current_header))
     else:
         sections = [("", text)]
 
@@ -714,7 +726,13 @@ def semantic_split_text(text: str, chunk_size: int = 600, chunk_overlap: int = 1
     chunks = []
     for header, section_text in sections:
         # Prepend header context to each chunk from this section
-        header_prefix = f"[Section: {header}] " if header else ""
+        # KB review 10-30: a header line can be any length (a whole paragraph
+        # after "# "); its prefix rides EVERY chunk of the section
+        header_prefix = f"[Section: {header[:120]}] " if header else ""
+        if len(header) > 120:
+            # r2: the line exists only as this prefix — cut, its tail (a
+            # long `#` comment in a script or config) was in no chunk
+            section_text = header + "\n" + section_text
         prefix_len = len(header_prefix)
         effective_size = chunk_size - prefix_len
 

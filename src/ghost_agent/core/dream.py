@@ -138,6 +138,18 @@ class Dreamer:
         except Exception as _rix:  # noqa: BLE001
             logger.warning("owner-rule integrity check skipped: %s", _rix)
 
+        # KB review 10-30: the owner's profile mirrors (graph + vector) made
+        # equal to the profile — retires the pre-fix unqualified duplicates
+        try:
+            from ..tools.memory import resync_all_owner_mirrors
+            _n, _lag = await resync_all_owner_mirrors(getattr(self.context, "profile_memory", None),
+                                                      getattr(self.context, "graph_memory", None),
+                                                      getattr(self.context, "memory_system", None))
+            if _lag:
+                logger.warning("owner mirror resync: %d field(s) lagging", _lag)
+        except Exception as _omx:  # noqa: BLE001
+            logger.warning("owner mirror resync skipped: %s", _omx)
+
         # Graph forgetting: drop weight-1 stale edges so the only uncapped
         # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
         # edges survive regardless of age. Best-effort; never fails a dream.

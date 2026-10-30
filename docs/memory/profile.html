@@ -207,5 +207,8 @@ Value := str                      # LEGACY — as_of unknown
 
 <h2 id="4mn">§4MN (2026-10-08): removals are archived first</h2>
 <p><code>delete</code>, <code>remove_item</code>, <code>drop_previous_mentioning</code> and <code>prune_value</code> append the removed value to <code>profile_removed.jsonl</code> (fsynced, kept 30 days like forgotten episodes) <em>before</em> changing the profile. If the archive cannot be written, nothing is removed, and the result starts with "Error:" so the forget report shows ⚠️, never ✅. The 30-day retention is also enforced daily by the dream (<code>purge_removed_archive</code>, line by line, so one unreadable line no longer stops it). The owner's own facts had been the one store deleted with no copy.</p>
+<h2 id="kb-review-1030">2026-10-30: mirror names</h2>
+<p><code>mirror_name(category, key)</code> is the name a field's graph and vector copies use: the bare key in <code>MIRROR_ROOT_CATEGORY</code> ("root"), <code>&lt;category&gt;_&lt;key&gt;</code> elsewhere. See <a href="../tools/memory_tools.html#kb-review-1030">the review</a>.</p>
+
 </body>
 </html>

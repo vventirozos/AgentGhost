@@ -88,7 +88,6 @@
     "unused-variable|src/ghost_agent/tools/file_system.py|Unused variable 'attempt'": 1,
     "unused-variable|src/ghost_agent/tools/file_system.py|Unused variable 'exit_code'": 1,
     "unused-variable|src/ghost_agent/tools/memory.py|Unused variable 'deleted_count'": 1,
-    "unused-variable|src/ghost_agent/tools/memory.py|Unused variable 'm_type'": 1,
     "unused-variable|src/ghost_agent/tools/memory.py|Unused variable 'preview'": 1,
     "unused-variable|src/ghost_agent/tools/projects.py|Unused variable 'start'": 1,
     "unused-variable|src/ghost_agent/tools/system.py|Unused variable 'attempt'": 2,

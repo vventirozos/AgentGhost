@@ -338,7 +338,7 @@ def test_recall_shows_the_history_section_only_behind_the_switch(production, mon
     monkeypatch.setenv(FL.ENV_FLAG, "1")
     out = asyncio.run(tool_recall(query="since when do you know where I live?", memory_system=ms, fact_ledger=led))
     assert FL.HEADER in out and "root.location = Athens, Greece — since 2026-07-07" in out and out.startswith("SYSTEM: No stored memory matched; the owner's fact history")
-    ms.search_advanced = MagicMock(return_value=[{"score": 0.5, "text": "User location is Athens, Greece", "metadata": {"source": "identity"}}])
+    ms.search_advanced = MagicMock(return_value=[{"score": 0.25, "text": "User location is Athens, Greece", "metadata": {"source": "identity"}}])
     out = asyncio.run(tool_recall(query="where do i live?", memory_system=ms, fact_ledger=led))
     assert "SYSTEM: Found 1 memories" in out and FL.HEADER in out
     out = asyncio.run(tool_recall(query="what is the capital of greece", memory_system=ms, fact_ledger=led))

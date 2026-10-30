@@ -71,7 +71,7 @@ class TestRecallSurfacesEvidence:
         vm = MagicMock()
         vm.search_advanced.return_value = [
             {
-                "score": 0.4,
+                "score": 0.2,
                 "text": "The operator's deploys fail on permissions.",
                 "metadata": {
                     "type": "synthesis",
@@ -82,7 +82,7 @@ class TestRecallSurfacesEvidence:
                 },
             },
             {
-                "score": 0.5,
+                "score": 0.25,
                 "text": "Always verify the publish path before retrying.",
                 "metadata": {"type": "skill", "source_refs": "ep:1,ep:2"},
             },

@@ -328,7 +328,11 @@ class GraphMemory:
                         # (LIKES, KNOWS, HAS_*, OWNS, IS) are excluded: expiring
                         # those is silent data loss, not an update.
                         conflicting = []
-                        if (pn in self._FUNCTIONAL_PREDICATES
+                        # raw = the profile's own mirror (`sync_owner_field`), which
+                        # retires stale values itself — KB review 10-30: a list field
+                        # (job = [dba, consultant]) under a single-valued predicate
+                        # kept one value, the other flip-flopping per sync
+                        if (pn in self._FUNCTIONAL_PREDICATES and not raw
                                 and sn not in self._EXPIRY_GENERIC_SUBJECTS):
                             conflicting = conn.execute(
                                 '''SELECT object, valid_from FROM triplets
@@ -569,8 +573,8 @@ class GraphMemory:
         "meds": {"medication", "medications", "takes"}, "drugs": {"medication", "medications"},
         "pills": {"medication", "medications"}, "illness": {"condition", "disease", "illness", "diagnosis"},
         "sick": {"condition", "disease", "illness"}, "allergic": {"allergy", "allergies", "allergic"},
-        "job": {"profession", "occupation", "works", "employed", "employer", "job"},
-        "work": {"profession", "occupation", "works", "employed", "employer", "work"},
+        "job": {"profession", "occupation", "works", "employed", "employer", "job", "company", "role"},
+        "work": {"profession", "occupation", "works", "employed", "employer", "work", "company", "role"},
         "profession": {"profession", "occupation"}, "occupation": {"profession", "occupation"},
         "family": {"married", "spouse", "wife", "husband", "son", "sons", "daughter", "daughters", "child",
                    "children", "parent", "parents", "mother", "father", "sibling", "brother", "sister", "companion"},
@@ -582,8 +586,12 @@ class GraphMemory:
         "birthdays": {"birth", "birthday", "birthdate", "born"},
         "kids": {"son", "sons", "daughter", "daughters", "child", "children"},
         "children": {"son", "sons", "daughter", "daughters", "child", "children"},
-        "live": {"lives", "resides", "home", "address", "located"}, "home": {"lives", "resides", "home", "address"},
-        "address": {"address", "lives", "resides", "home"},
+        # KB review 10-30: + "location" — the profile's root.location mirror is
+        # HAS_LOCATION, and "where do I live" never reached it (only the old
+        # extractor's LIVES_IN edges)
+        "live": {"lives", "resides", "home", "address", "located", "location"},
+        "home": {"lives", "resides", "home", "address", "location"},
+        "address": {"address", "lives", "resides", "home", "location"}, "location": {"location", "lives", "located"},
         "own": {"owns", "owned", "own", "has"}, "car": {"car", "vehicle", "owns", "drives"},
         "birthday": {"birth", "birthday", "birthdate", "born"},
         # Greek (folded)
@@ -591,7 +599,51 @@ class GraphMemory:
         "φαρμακα": {"medication", "medications", "takes"}, "φαρμακο": {"medication", "medications", "takes"},
         "δουλεια": {"profession", "occupation", "works", "employed"}, "οικογενεια": {"married", "son", "sons",
                                                                                    "daughter", "child", "children"},
+        # KB review 10-30: Greek owner questions name the kind by a verb or noun
+        # ("πού μένω;", "πώς με λένε;", "πόσα παιδιά έχω;") — "πού μένω" found nothing
+        "μενω": {"lives", "resides", "home", "address", "located", "location"},
+        "σπιτι": {"lives", "resides", "home", "address", "location"},
+        "διευθυνση": {"address", "lives", "resides", "home"},
+        "λενε": {"name", "named"}, "ονομα": {"name", "named"}, "λεγομαι": {"name", "named"},
+        "ονομαζομαι": {"name", "named"},
+        "αυτοκινητο": {"car", "vehicle", "vehicles", "owns", "drives"}, "αμαξι": {"car", "vehicle", "vehicles", "drives"},
+        "μηχανη": {"vehicle", "vehicles", "owns", "drives", "motorcycle", "scooter"},
+        "οχημα": {"vehicle", "vehicles", "owns", "drives"}, "οδηγω": {"car", "vehicle", "vehicles", "drives"},
+        "γεννηθηκα": {"birth", "birthday", "birthdate", "born"}, "γενεθλια": {"birth", "birthday", "birthdate", "born"},
+        "παιδια": {"son", "sons", "daughter", "daughters", "child", "children"},
+        "παιδι": {"son", "sons", "daughter", "daughters", "child", "children"},
+        "γιος": {"son", "sons", "child", "children"}, "γιοι": {"son", "sons", "child", "children"},
+        "κορη": {"daughter", "daughters", "child", "children"},
+        "γυναικα": {"married", "spouse", "wife"}, "συζυγος": {"married", "spouse", "wife", "husband"},
+        "σκυλος": {"dog", "pet"}, "σκυλι": {"dog", "pet"},
+        "δουλευω": {"profession", "occupation", "works", "employed", "employer", "company"},
+        "εργαζομαι": {"profession", "occupation", "works", "employed", "employer", "company"},
     }
+    # KB review 10-30 r2: keyed by the FOLDED word. `_fold` casefolds, and
+    # casefold turns a final "ς" into "σ", so "σκυλος" never matched "σκύλος"
+    _folded: dict = {}
+    for _k, _v in _CATEGORY_WORDS.items():
+        _folded.setdefault(_fold(_k), set()).update(_v)
+    _CATEGORY_WORDS = _folded
+    del _folded, _k, _v
+    # KB review 10-30 r4: the words THIS review added (Greek, "location",
+    # company/role) open on a question about the owner only — on every recall
+    # they gave "where is the Eiffel tower located" the owner's town and "how
+    # does the job scheduler work" the owner's role. The base is the
+    # vocabulary every recall had before.
+    _ADDED_KIND_WORDS = {"job": {"company", "role"}, "work": {"company", "role"},
+                         "live": {"location"}, "home": {"location"}, "address": {"location"}}
+    # the keys this review added (folded); r0's own Greek keys (δουλεια,
+    # υγεια, φαρμακα…) stay in the base (r5)
+    _ADDED_KIND_KEYS = {_fold(w) for w in (
+        "location", "μενω", "σπιτι", "διευθυνση", "λενε", "ονομα", "λεγομαι", "ονομαζομαι", "αυτοκινητο",
+        "αμαξι", "μηχανη", "οχημα", "οδηγω", "γεννηθηκα", "γενεθλια", "παιδια", "παιδι", "γιος", "γιοι",
+        "κορη", "γυναικα", "συζυγος", "σκυλος", "σκυλι", "δουλευω", "εργαζομαι")}
+    _CATEGORY_WORDS_BASE: dict = {}
+    for _k, _v in _CATEGORY_WORDS.items():          # a loop: a class-body comprehension
+        if _k not in _ADDED_KIND_KEYS:              # cannot see the class's names
+            _CATEGORY_WORDS_BASE[_k] = _v - _ADDED_KIND_WORDS.get(_k, set())
+    del _k, _v
     _INFL = ("", "s", "es", "ed", "ing", "ies")
 
     @classmethod
@@ -605,7 +657,7 @@ class GraphMemory:
             k += 1
         return k >= 4 and w[k:] in cls._INFL and tok[k:] in cls._INFL
 
-    def owner_facts_matching(self, query: str, limit: int = 20) -> List[str]:
+    def owner_facts_matching(self, query: str, limit: int = 20, extended: bool = True) -> List[str]:
         """The owner's facts (`user …` edges) whose PREDICATE names a word of
         the query or a category it covers — "what health conditions do I have"
         finds `user HAS_CONDITION heart failure`. The neighbourhood lookup
@@ -622,8 +674,9 @@ class GraphMemory:
                 "need", "request", "requested", "ask", "asked", "make", "get", "help", "use", "can"}
         asked = set(words) - stop
         implied = set()
+        _kinds = self._CATEGORY_WORDS if extended else self._CATEGORY_WORDS_BASE
         for w in words:
-            implied |= self._CATEGORY_WORDS.get(w, set())
+            implied |= _kinds.get(w, set())
         implied -= stop
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
@@ -666,12 +719,25 @@ class GraphMemory:
                 if self._node_is(r[2] if str(r[0]).strip().lower() == "user" else r[0], v)
                 and (_p is None or self.canonical_predicate(r[1]) == _p)]
 
-    def sync_owner_field(self, key: str, values) -> tuple:
-        """Make the owner's ``user HAS_<KEY>`` edges EQUAL ``values`` (the
+    def sync_owner_field(self, key: str, values, category: str = "root", retire_legacy: bool = False,
+                         legacy_values=()) -> tuple:
+        """Make the owner's ``user HAS_<NAME>`` edges EQUAL ``values`` (the
         profile field, now): stale ones deleted (archived), missing ones
         added. §4KZ: a profile change left the old HAS_WIFE/HAS_EMPLOYER/
-        HAS_LOCATION edges live beside the new. Returns (added, removed)."""
-        pred = "HAS_" + str(key or "").upper().replace(" ", "_")
+        HAS_LOCATION edges live beside the new. Returns (added, removed).
+
+        KB review 10-30: NAME is `profile.mirror_name` — ``<CATEGORY>_<KEY>``
+        outside the root category, a predicate only this mirror writes (keyed
+        by the key alone, `pet.name` deleted `HAS_NAME vasilis`, and
+        `health.condition` deleted the graph-only `HAS_CONDITION heart
+        failure`). ``retire_legacy``: a pre-fix unqualified `HAS_<KEY> <v>`
+        whose value IS this field's current value (or one of ``legacy_values``,
+        the values a delete just removed) is this field's own pre-fix mirror
+        and goes; any other legacy edge is left alone (the old extractor
+        wrote the same predicates, and only the operator can tell them apart)."""
+        from .profile import mirror_name
+        pred = "HAS_" + mirror_name(category, key).upper().replace(" ", "_")
+        legacy = "HAS_" + str(key or "").upper().replace(" ", "_")
         want = {str(v).lower().strip() for v in (values if isinstance(values, list) else [values])
                 if v not in (None, "") and str(v).strip()}
         with self._lock:
@@ -682,6 +748,17 @@ class GraphMemory:
         removed = sum(self.delete_edge("user", pred, o, mirror=True) for o in live if str(o).lower().strip() not in want)
         added = self.add_triplets([{"subject": "user", "predicate": pred, "object": v}
                                    for v in want if v not in {str(o).lower().strip() for o in live}], raw=True)
+        if retire_legacy and legacy != pred:
+            # KB review 10-30 r2: only once the qualified edges are written — a
+            # failed insert must not take the fact's last copy with it
+            with self._lock:
+                with sqlite3.connect(self.db_path) as conn:
+                    _now = {str(r[0]).lower().strip() for r in conn.execute(
+                        "SELECT object FROM triplets WHERE valid_until IS NULL AND lower(subject) = 'user' "
+                        "AND predicate = ?", (pred,)).fetchall()}
+            _own = want | {str(v).lower().strip() for v in (legacy_values or ()) if str(v).strip()}
+            removed += sum(self.delete_edge("user", legacy, v, mirror=True) for v in _own
+                           if v not in want or v in _now)
         return added, removed
 
     def count_edges(self) -> int:

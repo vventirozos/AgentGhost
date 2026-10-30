@@ -167,7 +167,8 @@ def test_deleting_a_field_removes_its_graph_edge_and_every_fragment(tmp_path):
                                       memory_system=vec, graph_memory=gm))
     assert not _edges(gm)
     # §4KZ: the vector mirror is SYNCED to the (now empty) field
-    vec.sync_owner_field.assert_called_once_with("pets", [])
+    vec.sync_owner_field.assert_called_once_with("pets", [], category="assets", retire_legacy=True,
+                                                  legacy_values=["Hanzo", "Mortimer"])
 
 
 def test_the_dedup_check_reads_the_canonical_field(tmp_path):

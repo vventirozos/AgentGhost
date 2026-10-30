@@ -40,7 +40,7 @@ class _Mem:
     def __init__(self, rows):
         self._rows = rows
 
-    def search_advanced(self, query, limit=10):
+    def search_advanced(self, query, limit=10, **kw):
         return list(self._rows)
 
 

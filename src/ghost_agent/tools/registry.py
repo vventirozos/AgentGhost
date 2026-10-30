@@ -1604,7 +1604,8 @@ def get_available_tools(context):
         "recall": lambda **kwargs: (_ISOLATED_RECALL_REFUSAL if getattr(context, "owner_memory_isolated", False) is True
                                     else tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None),
                                                     session_store=getattr(context, "session_store", None),
-                                                    fact_ledger=getattr(context, "fact_ledger", None), **kwargs)),   # §4QM
+                                                    fact_ledger=getattr(context, "fact_ledger", None),   # §4QM
+                                                    profile_memory=getattr(context, "profile_memory", None), **kwargs)),
         "execute": _run_execute,
         "browser": _run_browser,
         "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),

@@ -43,7 +43,10 @@ _MUTATING_NAME = re.compile(
     r"^_*(?:add|set|save|write|update|upsert|delete|remove|retract|prune|mark|credit|record|bump|"
     r"quarantine|unquarantine|reconcile|heal|learn|forget|wipe|ingest|reset|archive|rotate|store|"
     r"put|insert|merge|apply|purge|clear|drop|rename|restore|relabel|backfill|graduate|"
-    r"promote|demote|evict|compact|rebuild|reindex|migrate|repair|refresh)_")
+    r"promote|demote|evict|compact|rebuild|reindex|migrate|repair|refresh|"
+    # KB review 10-30: `sync_owner_field` and `rollback_partial_document` reached
+    # the real store through the façade (store maintenance now resyncs mirrors)
+    r"sync|resync|rollback|stamp)_")
 
 
 class _ReadOnlyProxy:
@@ -99,6 +102,9 @@ class ReadOnlyVectorMemory(_ReadOnlyProxy):
         # future REAL ingest of that name ("Skipped: already ingested") while
         # query_document returned nothing. Silent, permanent, hand-fixable only.
         "_update_library_index",
+        # KB review 10-30: the in-progress ingest marker (I5)
+        "mark_ingest_started", "clear_ingest_marker", "_write_ingest_marker",
+        "_rollback_interrupted_ingests",
         # legacy guessed names kept harmless in case an external caller used them
         "add_memory", "delete_memory", "forget",
     })

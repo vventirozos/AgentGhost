@@ -80,6 +80,10 @@ class IngestStats:
     outline: List[Tuple[int, str, int]] = field(default_factory=list)
     #: Pages in the FILE (``st.pages`` counts pages that yielded text).
     pages_total: int = 0
+    #: Pages that read without error but carried NO text — a scan (KB review
+    #: 10-30: a 10-page PDF with 9 image-only pages reported plain SUCCESS,
+    #: "1 pages, 1 chunks")
+    empty_pages: List[int] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -149,6 +153,72 @@ def build_page_breadcrumbs(toc, page_count: int) -> List[str]:
     return crumbs
 
 
+def build_page_sections(toc, page_count: int) -> List[Tuple[str, List[Tuple[str, str]]]]:
+    """Per page: ``(crumb at the page's START, [(title, crumb from that
+    title on), ...])`` for the TOC entries that START on that page, in order.
+
+    KB review 10-30: `build_page_breadcrumbs` gives a page ONE crumb — the
+    LAST entry starting on it — so when several sections start on one page
+    every one of them was filed under the last: 2,090 of the PostgreSQL
+    manual's 4,027 TOC entries labelled no chunk, and "1. What Is PostgreSQL?"
+    sat under "Preface › 2. A Brief History"."""
+    n = max(0, int(page_count or 0))
+    out: List[Tuple[str, List[Tuple[str, str]]]] = [("", []) for _ in range(n)]
+    entries = normalise_toc(toc) if toc else []
+    stack: List[str] = []
+    idx = 0
+    for page_i in range(n):
+        start = " › ".join(s for s in stack if s)
+        here: List[Tuple[str, str]] = []
+        while idx < len(entries) and entries[idx][2] <= page_i + 1:
+            level, title, _ = entries[idx]
+            del stack[level - 1:]
+            while len(stack) < level - 1:
+                stack.append("")
+            stack.append(title)
+            here.append((title, " › ".join(s for s in stack if s)))
+            idx += 1
+        out[page_i] = (start, here)
+    return out
+
+
+def split_page_by_sections(text: str, start_crumb: str, here: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """``[(crumb, text), ...]`` — the page cut where each starting section's
+    title appears (in order, searched forward; a title not found does not
+    cut, its crumb rides the next found one). With no entry, or none found,
+    the page is ONE piece under the page's final crumb (the old behaviour)."""
+    if not here:
+        return [(start_crumb, text)]
+    cuts: List[Tuple[int, str]] = []
+    pos = 0
+    for title, crumb in here:
+        words = title.split()
+        if not words:
+            continue
+        # r2: at a LINE START and a word end — unanchored, "Notes" cut inside
+        # "footnotes" and a glossary's "A" cut mid-word
+        m = re.compile(r"(?m)^[ \t]*(?:[\dIVXLC]+(?:\.\d+)*\.?[ \t]+)?("
+                       + r"\s+".join(re.escape(w) for w in words) + r")(?!\w)",
+                       re.IGNORECASE).search(text, pos)
+        if m:
+            cuts.append((m.start(), crumb))     # the line, numbering included
+            pos = m.end()
+        elif cuts:
+            cuts[-1] = (cuts[-1][0], crumb)       # an unfound entry nested after a found one
+    if not cuts:
+        return [(here[-1][1], text)]
+    pieces: List[Tuple[str, str]] = []
+    if cuts[0][0] > 0 and text[:cuts[0][0]].strip():
+        pieces.append((start_crumb, text[:cuts[0][0]]))
+    for i, (at, crumb) in enumerate(cuts):
+        end = cuts[i + 1][0] if i + 1 < len(cuts) else len(text)
+        if text[at:end].strip():
+            pieces.append((crumb, text[at:end]))
+    # the page's LAST crumb (entries after the last found title) carries on
+    # to the next page through `build_page_sections`' start crumb
+    return pieces
+
+
 def _clean_page_text(text: str) -> str:
     if not text:
         return ""
@@ -197,13 +267,13 @@ def iter_pdf_chunks(
         st.pages_total = page_count
         try:
             _toc = doc.get_toc()
-            crumbs = build_page_breadcrumbs(_toc, page_count)
-            st.sections = len({c for c in crumbs if c})
+            sections = build_page_sections(_toc, page_count)
             # KEEP the structure, do not just consume it (request e0f4a8bd).
             st.outline = normalise_toc(_toc)
         except Exception as e:  # noqa: BLE001 — outline is optional
             logger.debug("PDF TOC unavailable (%s); ingesting without breadcrumbs", e)
-            crumbs = [""] * page_count
+            sections = [("", [])] * page_count
+        _used: set = set()
 
         buf: List[str] = []
         buf_crumb = ""
@@ -240,25 +310,35 @@ def iter_pdf_chunks(
                 continue
             text = _clean_page_text(text)
             if not text:
+                # r2: a blank page is not a scan — only a page with an image
+                try:
+                    _img = bool(doc[page_i].get_images() or doc[page_i].get_image_info())
+                except Exception:  # noqa: BLE001
+                    _img = True
+                if _img:
+                    st.empty_pages.append(page_i + 1)
                 continue
 
             st.pages += 1
             st.chars += len(text)
-            crumb = crumbs[page_i] if page_i < len(crumbs) else ""
+            _start, _here = sections[page_i] if page_i < len(sections) else ("", [])
+            for crumb, piece_text in split_page_by_sections(text, _start, _here):
+                # Section boundary → flush what we have under the OLD breadcrumb.
+                if crumb != buf_crumb and buf:
+                    yield from _flush()
+                buf_crumb = crumb
+                if crumb:
+                    _used.add(crumb)
+                buf.append(piece_text)
+                buf_len += len(piece_text)
 
-            # Section boundary → flush what we have under the OLD breadcrumb.
-            if crumb != buf_crumb and buf:
-                yield from _flush()
-            buf_crumb = crumb
-            buf.append(text)
-            buf_len += len(text)
-
-            # Guard: a section with no TOC entries (or a huge one) must not
-            # grow unbounded — flush once it exceeds a few chunks' worth.
-            if buf_len >= chunk_size * 8:
-                yield from _flush()
+                # Guard: a section with no TOC entries (or a huge one) must not
+                # grow unbounded — flush once it exceeds a few chunks' worth.
+                if buf_len >= chunk_size * 8:
+                    yield from _flush()
 
         yield from _flush()
+        st.sections = len(_used)
     finally:
         try:
             doc.close()
@@ -297,8 +377,12 @@ def ingest_pdf_streaming(
             raise RuntimeError(f"'{filename}' is already being ingested — wait for it to finish")
         _IN_FLIGHT.add(filename)
     try:
-        return _ingest_pdf_batches(file_path, filename, memory_system,
-                                   progress=progress, **kwargs)
+        _stats = _ingest_pdf_batches(file_path, filename, memory_system,
+                                     progress=progress, **kwargs)
+        _done = getattr(memory_system, "clear_ingest_marker", None)
+        if callable(_done):  # KB review 10-30 (I5): the document is complete
+            _done(filename)
+        return _stats
     except BaseException:
         # A failure part-way left a permanent half-document: the library
         # entry is written on the FIRST batch, so a retry said "already in

@@ -123,12 +123,10 @@ def test_the_enumeration_fires_when_a_sidecar_write_escapes_the_lock():
     import ghost_agent.memory.vector as vector_mod
 
     src = inspect.getsource(vector_mod)
-    needle = """        with self._get_lock():
-            self.collection.delete(where={"source": filename})
+    needle = """                {"type": {"$in": list(self.DOCUMENT_ROW_TYPES)}}]})
             self._update_library_index(filename, "remove")"""
     assert src.count(needle) == 1
-    broken = src.replace(needle, """        with self._get_lock():
-            self.collection.delete(where={"source": filename})
+    broken = src.replace(needle, """                {"type": {"$in": list(self.DOCUMENT_ROW_TYPES)}}]})
         self._update_library_index(filename, "remove")
         if True:""")
     offenders = [(m, u) for m, u in _two_step_methods(broken) if u]

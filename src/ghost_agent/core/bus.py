@@ -582,14 +582,44 @@ class MemoryBus:
             return []
         return [{"source": "graph", "text": e} for e in await self._owner_facts(query) if e]
 
-    _FIRST_PERSON = re.compile(r"\b(?:i|i'm|im|my|me|mine|myself|μου|μας|εγώ|είμαι|έχω)\b", re.IGNORECASE)
-    _QUESTION = re.compile(r"\?|^\s*(?:what|where|who|whom|which|when|how|do|does|did|am|is|are|have|has|tell|remind|"
-                           r"τι|πού|ποιο|ποια|ποιος|πότε|πώς|θυμάσαι)\b", re.IGNORECASE)
+    # KB review 10-30 r2: NOT a bare "με" — in Greek it is mostly "with" ("ένα
+    # σπίτι με κήπο" put the owner's address into a house-price question); the
+    # object pronoun counts only before the verbs that take it about the owner
+    _FIRST_PERSON = re.compile(r"\b(?:i|i'm|im|my|me|mine|myself|μου|μας|εγώ|είμαι|έχω|μένα|εμένα)\b"
+                               r"|\bμε\s+(?:λένε|λενε|λέγανε|ξέρεις|ξερεις|θυμάσαι|θυμασαι|φωνάζουν)\b",
+                               re.IGNORECASE)
+    # KB review 10-30: Greek drops the pronoun ("πού μένω;", "πότε γεννήθηκα;") —
+    # a first-person singular verb (-ω/-ώ, -ομαι/-ούμαι, past -ηκα, -σα) is the
+    # owner too. r3 (measured on a 58-sentence probe list, then stopped — see
+    # the review): not -σσα (θάλασσα, γλώσσα), and a CAPITALISED word after the
+    # first is a name (Λάρισα, Φρόσω, Μαριγώ), never a verb; the words below end
+    # like one.
+    _GREEK_FIRST_PERSON_VERB = re.compile(
+        r"(?<!\w)[α-ωάέήίόύώϊϋΐΰ]{2,}(?:ω|ώ|ομαι|ούμαι|ηκα|ήκα|(?<!σ)(?:ησα|ισα|ασα|εσα|(?<!ο)υσα|ωσα))(?!\w)")
+    _NOT_A_VERB = frozenset({"εδώ", "κάτω", "πάνω", "έξω", "πίσω", "μέσω", "γύρω", "παρακάτω", "παραπάνω",
+                             "επάνω", "αποκάτω", "αποπάνω", "ολόγυρα", "μπρος", "ηχώ", "κλειώ", "σαπφώ",
+                             "λητώ", "ιώ", "αργώ", "καλυψώ", "πειθώ", "οκτώ", "οχτώ", "λίγο", "ίσα"})
+    _QUESTION = re.compile(r"\?|^\s*(?:what|whats|what's|where|who|whom|which|when|how|do|does|did|am|is|"
+                           r"are|have|has|tell|remind|τι|πού|που|ποι\w*|πόσ\w*|ποσ\w*|πότε|ποτε|πώς|πως|"
+                           r"θυμάσαι|θυμασαι|πες|πείτε|πειτε|θύμισέ|θύμισε|θυμισε|ξέρεις|ξερεις)\b",
+                           re.IGNORECASE)
+    # the Greek question mark is ";" (U+037E, or a plain semicolon) — a question
+    # only in Greek text; an English line may end in ";" ("my wife is Anna;")
+    _GREEK_QMARK = re.compile(r"[;;]\s*$")
+    _GREEK_LETTER = re.compile(r"[α-ωά-ώΑ-Ω]")
 
     @classmethod
     def _asks_about_owner(cls, query: str) -> bool:
         q = str(query or "")
-        return bool(cls._FIRST_PERSON.search(q) and cls._QUESTION.search(q))
+        if not (cls._QUESTION.search(q)
+                or (cls._GREEK_QMARK.search(q) and cls._GREEK_LETTER.search(q))):
+            return False
+        if cls._FIRST_PERSON.search(q):
+            return True
+        # the FIRST word may be capitalised and still a verb ("Μένω πού;")
+        _q = re.sub(r"^\s*\w", lambda mm: mm.group(0).lower(), q, count=1)
+        return any(m.group(0).lower() not in cls._NOT_A_VERB
+                   for m in cls._GREEK_FIRST_PERSON_VERB.finditer(_q))
 
     async def _fetch_skill(self, query: str, scope_request: str = "") -> List[Dict[str, Any]]:
         if not self.skill:

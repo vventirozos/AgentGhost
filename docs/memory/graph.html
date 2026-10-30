@@ -194,5 +194,13 @@
 </ul>
 <p>The graph has not reached prompts since §4NC; it is read by <code>recall</code>. The noise rows, the duplicate dog fact and its extra vector copies were removed by <code>scripts/memory_repair_4om.py</code>.</p>
 
+<h2 id="kb-review-1030">2026-10-30 review</h2>
+<ul>
+  <li>Owner mirrors outside the root category are <code>HAS_&lt;CATEGORY&gt;_&lt;KEY&gt;</code> (<code>HAS_PET_DOG_NAME</code>), so a pet's name no longer replaces the owner's. Legacy <code>HAS_&lt;KEY&gt;</code> edges are retired only for values the profile holds or just dropped.</li>
+  <li><code>add_triplets(raw=True)</code> no longer expires the other values of a functional predicate, so a list field keeps all its items.</li>
+  <li><code>_CATEGORY_WORDS</code> gained "location" and Greek kind words.</li>
+  <li>The snapshot of 10-30 held 289 triplets, about 89% noise or stale legacy edges; removing them is the owner's decision and has not been done. See <a href="../tools/memory_tools.html#kb-review-1030">the review</a>.</li>
+</ul>
+
 </body>
 </html>

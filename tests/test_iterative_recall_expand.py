@@ -88,7 +88,7 @@ class TestRecallIterationHints:
     async def test_evidence_hits_get_expand_tip(self):
         vm = MagicMock()
         vm.search_advanced.return_value = [{
-            "score": 0.5,
+            "score": 0.25,
             "text": "Always verify the publish path.",
             "metadata": {"type": "skill", "source_refs": "ep:1"},
         }]
@@ -99,7 +99,7 @@ class TestRecallIterationHints:
     async def test_plain_hits_get_no_tip(self):
         vm = MagicMock()
         vm.search_advanced.return_value = [{
-            "score": 0.5, "text": "The user lives in Athens.", "metadata": {},
+            "score": 0.25, "text": "The user lives in Athens.", "metadata": {},
         }]
         out = await tool_recall(query="where does the user live", memory_system=vm)
         assert "action='expand'" not in out
@@ -121,7 +121,7 @@ class TestProjectRecallFallback:
 
     async def test_get_miss_with_memory_hits_returns_facts(self, tmp_path):
         ctx = self._context(tmp_path, [
-            {"score": 0.76, "text": "Project Kestrel ships in September.", "metadata": {}},
+            {"score": 0.27, "text": "Project Kestrel ships in September.", "metadata": {}},
         ])
         out = await tool_manage_projects(ctx, action="get", project_id="kestrel")
         assert not out.startswith("ERROR")
@@ -137,7 +137,7 @@ class TestProjectRecallFallback:
 
     async def test_low_relevance_hits_are_not_attached(self, tmp_path):
         ctx = self._context(tmp_path, [
-            {"score": 1.4, "text": "unrelated noise", "metadata": {}},
+            {"score": 0.5, "text": "unrelated noise", "metadata": {}},
         ])
         out = await tool_manage_projects(ctx, action="get", project_id="kestrel")
         assert out.startswith("ERROR")

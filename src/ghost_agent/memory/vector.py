@@ -442,6 +442,8 @@ class VectorMemory:
                 )
                 sys.exit(1)
             self._stamp_embedder_sidecar()
+            # KB review 10-30 (I5): a document a DEAD process was still writing
+            self._rollback_interrupted_ingests()
 
         except Exception as e:
             if "already exists" in str(e) or "Embedding function conflict" in str(e):
@@ -1279,7 +1281,8 @@ class VectorMemory:
             logger.debug(f"Prune delete failed (non-critical): {e}")
             return 0
 
-    def sync_owner_field(self, key: str, values) -> tuple:
+    def sync_owner_field(self, key: str, values, category: str = "root", retire_legacy: bool = False,
+                         legacy_values=()) -> tuple:
         """Make the profile's mirror rows (`identity`, text ``User <key> is
         <value>``) EQUAL ``values`` — the EXACT key, so `wife` never touches
         `wife_birthdate` (§4KZ: `smart_update` replaced the nearest row by
@@ -1287,8 +1290,18 @@ class VectorMemory:
         other stale rows of the same key). The new rows are written FIRST and
         the stale ones go only when they all landed — a refused write must
         not take its predecessor with it (§4GK round 6). Returns
-        (added, removed)."""
-        prefix = f"User {key} is "
+        (added, removed).
+
+        KB review 10-30: a field outside the root category mirrors as
+        ``User <category>_<key> is …`` (`profile.mirror_name`) — keyed by the
+        key alone, `pet.name` replaced the owner's own name row.
+        ``retire_legacy`` (the caller knows the root category has no such
+        key): a pre-fix unqualified row ``User <key> is <v>`` whose value IS
+        this field's current value — or one of ``legacy_values``, the values a
+        delete just removed — is that field's own pre-fix mirror and goes."""
+        from .profile import mirror_name
+        prefix = f"User {mirror_name(category, key)} is "
+        legacy = f"User {str(key).strip().lower()} is " if (retire_legacy and prefix != f"User {key} is ") else None
         want = [str(v).strip() for v in (values if isinstance(values, list) else [values])
                 if v not in (None, "") and str(v).strip()]
         try:
@@ -1307,6 +1320,14 @@ class VectorMemory:
             if res in self.ADD_LANDED:
                 added += 1
         stale = [i for i, d in docs if str(d).startswith(prefix) and str(d)[len(prefix):].strip() not in want]
+        if legacy:
+            # KB review 10-30 r2: EVERY unqualified row of the key, as the
+            # pre-fix sync did — the caller proved the root category has no
+            # such field, so no other field owns it. Matching on values left a
+            # value removed by a writer that passes no `legacy_values` (a
+            # correction, a singleton replace) and an on-demand field's old row
+            # (it syncs no values) behind for good.
+            stale += [i for i, d in docs if str(d).startswith(legacy)]
         if stale:
             with self._get_lock():
                 self.collection.delete(ids=stale)
@@ -1490,6 +1511,7 @@ class VectorMemory:
 
             batch_size = 25
             with self._get_lock():
+                self.mark_ingest_started(filename)
                 for i in range(0, len(enriched_chunks), batch_size):
                     self.collection.upsert(
                         documents=enriched_chunks[i:i + batch_size],
@@ -1502,10 +1524,85 @@ class VectorMemory:
                 # concurrent ingests can't race on the index file.
                 # _update_library_index is idempotent on "add".
                 self._update_library_index(filename, "add")
+                if not _batch:
+                    # a streaming caller clears it after its LAST batch
+                    self.clear_ingest_marker(filename)
             return True, f"Successfully ingested {len(chunks)} chunks from {filename}."
         except Exception as e:
             logger.error(f"Ingest failed: {e}")
             return False, str(e)
+
+    # KB review 10-30 (I5): documents being written, {name: pid}. A streaming
+    # ingest lists the name on its first batch, so a process killed mid-ingest
+    # left half a document catalogued and the retry said "already in KB". The
+    # marker outlives the process; the next start rolls back every entry whose
+    # writer is gone. A LIVE writer's entry is never touched (a script opening
+    # the store while the agent ingests must not delete the document).
+    INGEST_MARKER = "ingesting.json"
+    #: Row types a document owns: its chunks and its summary row.
+    DOCUMENT_ROW_TYPES = ("document", "document_summary")
+
+    def _read_ingest_marker(self) -> dict:
+        try:
+            data = json.loads((self.chroma_dir / self.INGEST_MARKER).read_bytes() or b"{}")
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ingest marker unreadable: %s", e)
+            return {}
+
+    def _write_ingest_marker(self, data: dict) -> None:
+        try:
+            path = self.chroma_dir / self.INGEST_MARKER
+            if not data:
+                path.unlink(missing_ok=True)
+                return
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 — bookkeeping only
+            logger.warning("ingest marker write failed: %s", e)
+
+    def mark_ingest_started(self, filename: str) -> None:
+        with self._get_lock():
+            data = self._read_ingest_marker()
+            if data.get(filename) != os.getpid():
+                data[filename] = os.getpid()
+                self._write_ingest_marker(data)
+
+    def clear_ingest_marker(self, filename: str) -> None:
+        """The document is complete (or gone): drop its in-progress entry."""
+        with self._get_lock():
+            data = self._read_ingest_marker()
+            if filename in data:
+                data.pop(filename, None)
+                self._write_ingest_marker(data)
+
+    def _rollback_interrupted_ingests(self) -> list:
+        if getattr(self, "collection", None) is None:
+            return []
+        data = self._read_ingest_marker()
+        rolled = []
+        for name, pid in list(data.items()):
+            try:
+                pid = int(pid)
+            except Exception:  # noqa: BLE001
+                pid = -1
+            # this runs after `acquire_writer_lock`: no other process can be
+            # writing this store, so every entry but this process's own is a
+            # dead writer's (r2: a pid probe kept the half document when the
+            # dead agent's pid had been reused)
+            if pid == os.getpid():
+                continue
+            try:
+                self.delete_document_by_name(name)
+                rolled.append(name)
+                pretty_log("Memory System", f"Rolled back interrupted ingest of {name}",
+                           icon=Icons.MEM_INDEX)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("rollback of interrupted ingest %s failed: %s", name, e)
+        return rolled
 
     def rollback_partial_document(self, filename: str) -> None:
         """Remove a document an ingest wrote PART of (§4MD M13: the chunks
@@ -2063,8 +2160,14 @@ class VectorMemory:
         # RLock, so re-entry is free; what matters is that no writer can
         # interleave BETWEEN the three steps.
         with self._get_lock():
-            self.collection.delete(where={"source": filename})
+            # KB review 10-30: TYPE-scoped. Skill rows carry `source` too
+            # ("episode", "reflection", "learn_skill"…), so deleting a document
+            # of that name deleted the learned skills with it.
+            self.collection.delete(where={"$and": [
+                {"source": filename},
+                {"type": {"$in": list(self.DOCUMENT_ROW_TYPES)}}]})
             self._update_library_index(filename, "remove")
+            self.clear_ingest_marker(filename)
             # §4PP: its temporary/kept record (summarised videos) goes with the
             # catalogue line — a record outliving the document made a later
             # re-summary permanent (r4); the reconciler drops it too

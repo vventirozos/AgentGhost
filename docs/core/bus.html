@@ -47,12 +47,12 @@
   </table></div>
 
   <h2>RRF (Reciprocal Rank Fusion)</h2>
-  <p>For each ranker the bus computes (since §4NM only two rankers feed a prompt: <code>graph</code> — the owner's facts, on a question about the owner — and <code>skill</code> — the lessons and adopted rules):</p>
+  <p>For each ranker the bus computes (since §4NM only two rankers feed a prompt: <code>graph</code> — the owner's facts, on a question about the owner — and <code>skill</code> — the owner's adopted rules; automatic lessons stopped reaching prompts in §4OR):</p>
   <pre><code>score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)</code></pre>
   <p><code>k = rrf_k</code>: <code>_reciprocal_rank_fusion</code> keeps <strong>60</strong> as its classmethod default, but the hydration path now passes <code>_RRF_K = 10</code> (2026-07-22, see the review section below). Per-source weights depend on a keyword-based query intent classification. <code>MemoryBus._INTENT_WEIGHTS</code> is the <strong>only</strong> table — hand-tuned, and listing just the two live hydration sources; a source not listed fuses at weight 1.0:</p>
 
   <div class="scroll"><table>
-    <thead><tr><th>Intent</th><th>graph (owner facts)</th><th>skill (lessons)</th></tr></thead>
+    <thead><tr><th>Intent</th><th>graph (owner facts)</th><th>skill (owner rules)</th></tr></thead>
     <tbody>
       <tr><td>factual</td><td>2.0</td><td>0.5</td></tr>
       <tr><td>procedural</td><td>0.5</td><td>2.0</td></tr>
@@ -191,6 +191,9 @@
   <li><strong>The vector "memory context" tier is retired from hydration.</strong> Every type it may admit is a twin of another tier (episodes, lessons, identity) or excluded for planted-content risk (documents); it injected 0 items on 80 replayed real turns and cost an embedding + a Chroma query per turn. The fetcher returned nothing without touching the store and the instrumentation line shows <code>v=-</code>. <code>recall</code> keeps vector search. <em>2026-10-11 (§4NM): the fetcher, <code>GHOST_BUS_VECTOR_TIER</code>, <code>GHOST_VECTOR_MATCH_FLOOR</code> and the test-suite re-enable were deleted; the line still prints <code>v=-</code>.</em></li>
   <li><strong>A hard-deleted project's episodes are forgotten with it.</strong> <code>EpisodicMemory.forget_project(id, title, live_titles)</code> deletes (archived to <code>episodes_forgotten.jsonl</code>) the episodes whose OWN text — trigger, context, outcome, lesson, not tool results (a project list names every project) — names the project id, or its title when the title is distinctive: ≥2 words or ≥8 characters, and no live project's title contains it or is contained in it (a deleted "Chess Coach" vs the live "Chess Coach v3"). Called by <code>manage_projects(action='delete')</code> after the graph unlink. The existing episodes were repaired by <code>scripts/memory_repair_4mj_episodes.py</code> (54 episodes of 17 deleted projects, from the store's <code>deleted_projects</code> table).</li>
 </ul>
+
+<h2 id="kb-review-1030">2026-10-30: Greek questions about the owner</h2>
+<p><code>_asks_about_owner</code> now reads Greek: the first-person pronouns με / μένα / εμένα, first-person verb endings (-ω, -ομαι, -ηκα…, with common adverbs excluded), the Greek question words (ποιος, πόσο, πού, πώς) and a trailing <code>;</code>. Before, most Greek owner questions got no owner facts. Measured on the 10-30 snapshot: 10.6% of the owner's hydrations inject anything, at a median of about 0.4 s. See <a href="../tools/memory_tools.html#kb-review-1030">the review</a>.</p>
 
 </body>
 </html>

@@ -52,9 +52,9 @@ def test_a_changed_wife_name_leaves_one_value_in_every_store(tmp_path):
     pm, gm, vm = _stores(tmp_path)
     for i, v in enumerate(["Fotinh", "Fotini", "Φωτεινή"]):
         _update(pm, gm, vm, "relationships", "wife", v, f"req-{i}")
-    wife = [e for e in _edges(gm) if e[0] == "user" and e[1] == "HAS_WIFE"]
-    assert wife == [("user", "HAS_WIFE", "φωτεινή")]
-    assert _identity(vm) == ["User wife is Φωτεινή"]
+    wife = [e for e in _edges(gm) if e[0] == "user" and e[1] == "HAS_RELATIONSHIPS_WIFE"]
+    assert wife == [("user", "HAS_RELATIONSHIPS_WIFE", "φωτεινή")]
+    assert _identity(vm) == ["User relationships_wife is Φωτεινή"]
 
 
 def test_a_value_changed_back_is_written(tmp_path):
@@ -80,14 +80,14 @@ def test_a_key_never_touches_its_sibling_key(tmp_path):
     pm, gm, vm = _stores(tmp_path)
     _update(pm, gm, vm, "relationships", "wife_birthdate", "January 10, 1982", "req-a")
     _update(pm, gm, vm, "relationships", "wife", "Fotini", "req-b")
-    assert _identity(vm) == ["User wife is Fotini", "User wife_birthdate is January 10, 1982"]
+    assert _identity(vm) == ["User relationships_wife is Fotini", "User relationships_wife_birthdate is January 10, 1982"]
 
 
 def test_a_list_field_keeps_every_item(tmp_path):
     pm, gm, vm = _stores(tmp_path)
     _update(pm, gm, vm, "relationships", "children", "Thodoris", "req-a")
     _update(pm, gm, vm, "relationships", "children", "Leonidas", "req-b")
-    assert _identity(vm) == ["User children is Leonidas", "User children is Thodoris"]
+    assert _identity(vm) == ["User relationships_children is Leonidas", "User relationships_children is Thodoris"]
 
 
 def test_a_refused_mirror_keeps_the_old_value(tmp_path):

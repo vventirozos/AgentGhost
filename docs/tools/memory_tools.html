@@ -763,5 +763,67 @@
 <h2 id="4mn">§4MN (2026-10-08): reset_all keeps a copy</h2>
 <p>Before wiping the vector store, <code>reset_all</code> writes every row to <code>memory/vector_reset_&lt;ts&gt;.jsonl</code> (id, document, metadata), a page of 500 at a time, fsynced. If that cannot be written, nothing is wiped and the partial file is removed. The dump is kept 30 days (the dream's archive retention), then deleted. Identity, document and auto rows do not re-embed themselves, so this is their only copy.</p>
 
+<h2 id="kb-review-1030">Knowledge base, graph and recall review <span class="tag">2026-10-30</span></h2>
+<p>Five reviewers read the vector store, retrieval, ingest, the graph, and the path from a question to a prompt. What changed:</p>
+<h3>recall</h3>
+<ul>
+  <li><strong>Grades fit the distance.</strong> The store measures cosine distance (0 = same meaning, 2 = opposite). The old bands (0.8 / 1.15 / 1.35) were written for squared L2 distance, so every hit was graded <em>high</em>, unrelated ones included. New bands: high below 0.28, medium below 0.36, not shown at 0.45 or more (<code>GHOST_RECALL_HIGH_D</code>, <code>_MEDIUM_D</code>, <code>_KEEP_D</code>, see <a href="../configuration.html">configuration</a>). They were set on 22 labelled questions: the right memory was under 0.28 for 19 of them, and the owner's identity facts sat between 0.32 and 0.39.</li>
+  <li><strong>Documents are out of scope.</strong> 8,058 of the 8,420 rows were PostgreSQL manual chunks. <code>recall</code> now searches without <code>AMBIENT_EXCLUDED_TYPES</code> (documents, document summaries, outside episodes); <code>knowledge_base</code> answers from documents. When nothing matches, the reply says so.</li>
+  <li><strong>Only what is shown is credited.</strong> The search no longer bumps retrieval counts; <code>bump_retrievals</code> credits the rows that reached the model.</li>
+  <li><strong>The owner's stored facts come first, ungraded.</strong> Graph facts were labelled by the vector match of the question, which does not apply to them. The head now says they are not graded by that match.</li>
+  <li><strong>On-request facts.</strong> Fields the profile keeps out of prompts (address, descriptions) are shown when the question names them, by key word, kind word, or "describe".</li>
+  <li><strong>Refused in a public channel</strong> (<code>owner_data_blocked</code>), and a member check that raises now refuses instead of letting the call through.</li>
+  <li>Stored text that reads as a tool result or a system line is neutralised before it is shown.</li>
+  <li><code>manage_projects(get)</code>'s fallback to memory uses the same scope and attaches hits only when they are graded high.</li>
+</ul>
+<h3>Owner facts in the graph and vector store</h3>
+<ul>
+  <li><strong>Category-qualified mirrors.</strong> A profile field outside the root category used to be mirrored under its bare key, so the dog's name and the owner's name were one fact (<code>User name is Hanzo</code>). Mirrors are now named <code>&lt;category&gt;_&lt;key&gt;</code> (<code>profile.mirror_name</code>): <code>User pet_dog_name is Hanzo</code> and <code>HAS_PET_DOG_NAME</code>. Root fields keep the bare key.</li>
+  <li><strong>Old mirrors are retired only on proof.</strong> An unqualified mirror goes only when its value is the field's current value or a value just deleted, and only when the root category has no field of that key. The idle-cycle store maintenance re-syncs every field (<code>resync_all_owner_mirrors</code>) and logs any that lag.</li>
+  <li><strong>forget re-syncs.</strong> After a confirmed forget, every profile field it touched is re-synced with its old value, so its graph and vector copies go too. The forget sweeps no longer delete an identity row that is the mirror of a live profile field.</li>
+  <li>A list field (children, pets) no longer expires its own previous values on each write.</li>
+  <li>The read-only façade blocks <code>sync_*</code>, <code>resync_*</code>, <code>rollback_*</code> and <code>stamp_*</code>.</li>
+</ul>
+<h3>Ingest</h3>
+<ul>
+  <li><strong>Chunks.</strong> The overlap is clamped to a quarter of the chunk size and the section header to 120 characters; a long header plus a large overlap had split 20,001 characters into hundreds of near-copies (now 58).</li>
+  <li><strong>A name that matches several files is refused</strong> with the list, instead of ingesting the first. The stem and substring matches apply only to a name with no extension.</li>
+  <li><strong>Binary files are refused</strong>: a ZIP container (docx, xlsx, epub…), NUL bytes, or more than 5% replacement characters in the first 8 KB.</li>
+  <li><strong>Scanned PDFs.</strong> Pages with no text layer are named. When they are a fifth of the pages or more, the result is <code>SUCCESS (PARTIAL)</code>.</li>
+  <li><strong>Section names per passage.</strong> A PDF page is split at its table-of-contents entries, so each passage carries the section it belongs to, not the page's first one. Documents ingested before this keep their old labels until re-ingested.</li>
+  <li><strong>A crash mid-ingest no longer leaves half a document.</strong> Each ingest lists its file in <code>ingesting.json</code> (with the writer's pid) until the last batch lands. At start-up, <code>VectorMemory</code> rolls back every listed document whose writer is gone; a live writer's entry is left alone. Before, the retry said "already in the knowledge base" and queries answered from part of the file.</li>
+  <li><strong>Deleting a document deletes only document rows</strong> (<code>document</code>, <code>document_summary</code>). Skill rows carry a <code>source</code> too ("episode", "reflection"…), so a document of that name took the skills with it.</li>
+</ul>
+<h3>Greek questions about the owner</h3>
+<p><code>bus._asks_about_owner</code> missed most Greek questions ("πού μένω;", "πώς λέγομαι;"): it knew no first-person verb endings and no Greek question words. It now does, and the graph's kind words include the Greek ones (home, name, car, children, spouse, dog, work). A question to a document written mostly in a non-Latin script gets "the passages are in English" instead of "no answer found".</p>
+<h3>Round two</h3>
+<ul>
+  <li><strong>The owner's own rows are chosen by the field the question names</strong>, not by distance: among the 24 profile mirrors every owner question measured sat at 0.37–0.60, so "where do I work" gave hobbies and "what is my name" graded the name LOW. On a question about the owner, recall scans the identity rows and shows up to six whose field the question names, by a word of the field or a kind word ("work" covers company and role), under "THE OWNER'S STORED PROFILE FACTS".</li>
+  <li><strong>A question not written in English is not graded.</strong> The embedder reads English; any Greek text sits close to any other Greek text (an unrelated request scored 0.15). Such hits are shown as UNGRADED, at most five, with a line telling the model to use one only if it plainly answers.</li>
+  <li><strong>The owner gate no longer opens on "με"</strong>, which is mostly "with" ("ένα σπίτι με κήπο" had put the address into a house-price question): the pronoun counts only before λένε / ξέρεις / θυμάσαι. The aorist ending -σα is no longer read as "I" (Λάρισα, θάλασσα), more adverbs are excluded, and a trailing ";" is a question mark only in Greek text.</li>
+  <li>The graph's kind words are keyed by their folded form: a final "ς" folds to "σ", so σκύλος, γιος and σύζυγος never matched.</li>
+  <li>The on-request facts (address, descriptions) and the graph's kind lookup open only on a question about the owner ("the IRS's email address" printed the home address); a description needs its person named, or the owner asking about their own looks.</li>
+  <li><code>manage_projects(get)</code>'s memory fallback is refused in a public channel and for a member, skips non-English names, and never offers the owner's profile rows.</li>
+  <li>Graph edges, past-conversation lines and on-request facts are neutralised like the vector rows.</li>
+  <li><strong>Mirrors:</strong> once the root category has no field of the key, every unqualified vector row of that key goes (as before the rename), so a value removed by a correction no longer stays behind. The graph writes the qualified edge before it retires the legacy one. The idle-cycle re-sync does nothing when the profile file is missing (it would have replaced the owner's name with the placeholder "User") and skips empty keys and nested values.</li>
+  <li><strong>Ingest:</strong> a name such as <code>report_v1.2</code> is matched by its stem again (".2" is not an extension); a header line over 120 characters keeps its full text in the body; a PDF section title cuts the page only at a line start and a word end ("Notes" no longer cuts "footnotes"); a blank page is not reported as a scan (only a page with an image is); and at start-up every in-progress entry but this process's own is rolled back (the writer lock is held, so no other writer can be alive).</li>
+</ul>
+<h3>Round three, and where the owner check was stopped</h3>
+<ul>
+  <li><strong>The owner-facts section is added, never subtracted.</strong> Round two removed the identity rows from the graded results and showed only those whose field the question named, so "what cars do I have", "when was I born" and "who am I" lost facts recall used to show. The graded results now keep every row; the section on top is extra.</li>
+  <li>The graph's kind lookup runs on every English recall again (as before this review). The Greek kind words added here open it only on a question about the owner ("ένα σπίτι για οκτώ άτομα" had printed the address).</li>
+  <li>A person's fields are often keyed by their name (<code>fotini_description</code>): "my wife" reaches them through the role's name field (<code>wife_name = Fotini</code>). "How do I look up …" is not a question about the owner's looks.</li>
+  <li><strong>The Greek owner check was measured and stopped</strong> after three review rounds in which each fix opened the next hole (the pattern in the project's "a heuristic gate does not converge" lesson). On a 58-sentence probe list built from the reviewers' cases it scores 57/58 (before this review 40/58, round two 40/58, round three 48/58). The one miss, "πώς φτιάχνω μουσακά;", is a first-person question that is not about the owner; it costs nothing, because a fact is shown only when the question also names its kind. The list is pinned in the tests. Known misses outside it: "πώς τον λένε τον σκύλο;" (no first person), Greek inflections the kind words do not list (σκύλο, χόμπι).</li>
+  <li><strong>Ingest:</strong> a name with a directory ("docs/bitcoin") resolves by its file name again; a <code>#</code> line with no body under it (stacked comments, an H1 straight above an H2) keeps its text; a page whose only image is inline counts as a scan.</li>
+</ul>
+<h3>Round four</h3>
+<ul>
+  <li><strong>Two vocabularies for the graph's kind lookup.</strong> The words this review added (the Greek ones, "location", company/role under job/work) are used only on a question about the owner (<code>owner_facts_matching(…, extended=True)</code>). Every other recall uses the vocabulary it had before (<code>GraphMemory._CATEGORY_WORDS_BASE</code>): with the new words on every recall, "where is the Eiffel tower located" got the owner's town and "how does the job scheduler work" the owner's role.</li>
+  <li>The model writes recall's query, often in the third person, so a query that names "user", "owner" or "operator" (or χρήστη) counts as a question about the owner.</li>
+  <li>A name with a directory ("docs/bitcoin") is matched only inside that directory.</li>
+  <li>Accepted residue: the lookup still matches a question word straight against an edge name, as it always did, so after the first re-sync adds the missing root edges <code>HAS_LOCATION</code> / <code>HAS_COMPANY</code>, an English question with the word "location" or "company" shows them; a stacked header's text is labelled with the header below it.</li>
+</ul>
+<p>Pins: <code>tests/test_kb_review_2026_10.py</code>.</p>
+
 </body>
 </html>

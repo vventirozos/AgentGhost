@@ -21,10 +21,10 @@ async def test_tool_recall_rag_threshold_logic():
     
     # Fake a set of results stepping over the bounds
     memory_system.search_advanced = MagicMock(return_value=[
-        {"text": "High match", "metadata": {"type": "document", "source": "src1"}, "score": 0.75},
-        {"text": "Med match", "metadata": {"type": "document", "source": "src2"}, "score": 1.10},
-        {"text": "Low match", "metadata": {"type": "document", "source": "src3"}, "score": 1.30},
-        {"text": "Filtered out", "metadata": {"type": "document", "source": "src4"}, "score": 1.40},
+        {"text": "High match", "metadata": {"type": "document", "source": "src1"}, "score": 0.20},
+        {"text": "Med match", "metadata": {"type": "document", "source": "src2"}, "score": 0.33},
+        {"text": "Low match", "metadata": {"type": "document", "source": "src3"}, "score": 0.40},
+        {"text": "Filtered out", "metadata": {"type": "document", "source": "src4"}, "score": 0.46},
     ])
     
     result = await tool_recall("test query", memory_system)

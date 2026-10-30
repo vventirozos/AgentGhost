@@ -673,6 +673,9 @@ def ingest_audio_streaming(
             if len(batch) >= BATCH_CHUNKS:
                 _flush()
         _flush()
+        _done = getattr(memory_system, "clear_ingest_marker", None)
+        if callable(_done):  # KB review 10-30 (I5): the document is complete
+            _done(filename)
     except BaseException:
         # a failure part-way leaves no half-recording behind (§4MD M13)
         _rb = getattr(memory_system, "rollback_partial_document", None)
