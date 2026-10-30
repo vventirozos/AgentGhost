@@ -609,3 +609,74 @@ async def test_a_step_that_returns_with_its_leaf_still_claimed_gets_it_reopened(
     monkeypatch.setattr(PA, "advance_once", stops_open)
     await advance_unattended(ctx, pid)
     assert store.get_task(tids[0])["status"] == "READY" and _meta(store, pid)["no_progress_streak"] == 1
+
+
+async def test_a_stop_mid_build_reopens_its_task(store, ctx, notes):
+    """§4SD open items r2 (review MAJOR): Slack's hard limit (or the owner's
+    Stop) cancels a running build — `except Exception` never saw the
+    CancelledError and the leaf stayed IN_PROGRESS until the next boot."""
+    pid, tids = _coding_project(store, ["Build the login page"])
+
+    async def _stopped(*a, **k):
+        raise asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await PA.advance_once(ctx, pid, owner_requested=True, tool_runner=_runner, coding_executor=_stopped)
+    t = store.get_task(tids[0])
+    assert t["status"] == "READY" and t.get("failure_reason") == "stopped mid-step"
+
+
+async def test_a_stop_in_any_await_after_the_claim_reopens_it(store, ctx, notes):
+    """r3 (review MAJOR): the research tool run (minutes over Tor), the
+    classifier, the command generator — every await, not only the executor."""
+    pid = store.create_project("Research job", metadata={"autopilot": True})
+    store.update_project(pid, status="ACTIVE")
+    tid = store.add_task(pid, "Research the history of the abacus")
+
+    async def stopped(name, args):
+        raise asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await PA.advance_once(ctx, pid, owner_requested=True, tool_runner=stopped)
+    assert store.get_task(tid)["status"] == "READY"
+
+
+async def test_an_unattended_timeout_mid_build_is_still_charged_as_a_timeout(store, ctx, notes):
+    """r3 (review MAJOR): the reopen ran inside the step's own wait_for cancel —
+    `_after_abort` read "finished before the abort" and charged nothing."""
+    pid, tids = _coding_project(store, ["Build the login page"])
+
+    async def slow(context, description, **kw):
+        await asyncio.sleep(5)
+    res = await advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=slow, step_timeout_s=0.3)
+    assert res.classification == "timeout"
+    assert store.get_task(tids[0])["status"] == "READY"
+    assert _meta(store, pid)["steps_used"] == 1
+
+
+async def test_a_stop_does_not_reopen_a_leaf_that_left_in_progress(store, ctx, notes, monkeypatch):
+    """r3 m3: the reset wrote READY over whatever the leaf was."""
+    pid, tids = _coding_project(store, ["Build the login page"])
+
+    async def closes_then_stopped(context, description, **kw):
+        store.update_task(tids[0], status="DONE")
+        raise asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await PA.advance_once(ctx, pid, owner_requested=True, tool_runner=_runner, coding_executor=closes_then_stopped)
+    assert store.get_task(tids[0])["status"] == "DONE"
+
+
+async def test_an_unattended_step_stopped_from_outside_reopens_and_is_charged(store, ctx, notes):
+    """r4 (review MAJOR): a scheduled/probe batch stopped at its limit cancels
+    `advance_unattended` — the claim it tracks was left IN_PROGRESS."""
+    pid, tids = _coding_project(store, ["Build the login page"])
+
+    async def slow(context, description, **kw):
+        await asyncio.sleep(30)
+    t = asyncio.ensure_future(advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=slow, step_timeout_s=60))
+    await asyncio.sleep(0.5)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert store.get_task(tids[0])["status"] == "READY"
+    assert _meta(store, pid)["steps_used"] == 1
+
+    assert _meta(store, pid)["unattended_runtime_seconds"] >= 0.4          # r5 m3: its time is booked

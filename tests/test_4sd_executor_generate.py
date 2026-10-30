@@ -250,7 +250,7 @@ def test_the_unattended_step_runs_under_its_deadline():
 async def test_the_streamed_file_call_reads_the_finish_reason():
     # world: a streamed cut reads as a finished file and the tail is lost
     class _Stream:
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             for c in ({"choices": [{"delta": {"content": "line one\nline tw"}}]},
                       {"choices": [{"delta": {}, "finish_reason": "length"}]}):
                 yield f"data: {json.dumps(c)}\n\n".encode()
@@ -1585,7 +1585,7 @@ class _OwnerArrivesStream:
     def __init__(self, text, at):
         self.text, self.at, self.calls, self.foreground_requests = text, at, 0, 0
 
-    async def stream_chat_completion(self, payload, is_background=False):
+    async def stream_chat_completion(self, payload, is_background=False, **_kw):
         self.calls += 1
         call = self.calls
         lines = self.text.splitlines(keepends=True) if call == 1 else [self.rest]
@@ -1622,7 +1622,7 @@ async def test_a_yield_costs_no_round_and_is_not_a_bad_round():
         foreground_requests = 0
         calls = 0
 
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             self.calls += 1
             if self.calls <= 8:                      # the owner arrives before any whole line, 8 times (≤ _MAX_YIELDS)
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': 'x'}}]})}\n\n".encode()
@@ -1686,7 +1686,7 @@ async def test_yields_are_bounded():
     class _AlwaysYields:
         foreground_requests = 0
 
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             yield f"data: {json.dumps({'choices': [{'delta': {'content': 'x'}}]})}\n\n".encode()
             self.foreground_requests += 1
             yield f"data: {json.dumps({'choices': [{'delta': {'content': 'x'}}]})}\n\n".encode()
@@ -1706,7 +1706,7 @@ class _OwnerComesAndGoes:
         self.calls, self.foreground_requests, self.foreground_tasks = 0, 0, 0
         self.streamed = []
 
-    async def stream_chat_completion(self, payload, is_background=False):
+    async def stream_chat_completion(self, payload, is_background=False, **_kw):
         self.calls += 1
         lines = JS.splitlines(keepends=True)
         if self.calls == 1:
@@ -1739,7 +1739,7 @@ async def test_a_stream_admitted_in_an_idle_window_yields_to_the_owners_next_cal
     class _RenderWindow:
         foreground_requests, foreground_tasks = 1, 0       # the owner's request waits on the image node
 
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             for i, ln in enumerate(JS.splitlines(keepends=True)):
                 if i == 20:
                     self.foreground_tasks = 1                # the render ended: the owner's call waits
@@ -1772,7 +1772,7 @@ async def test_a_finished_stream_never_yields():
     class _LateOwner:
         foreground_requests, foreground_tasks = 0, 0
 
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             yield f"data: {json.dumps({'choices': [{'delta': {'content': 'x = 1'}}]})}\n\n".encode()
             yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
             self.foreground_requests = 1
@@ -1786,7 +1786,7 @@ async def test_a_yielded_opener_fragment_is_not_a_bad_round():
     class _S:
         foreground_requests, foreground_tasks, calls = 0, 0, 0
 
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             self.calls += 1
             if self.calls == 1:
                 chunks = [JS[:JS.index("export function step20")]]

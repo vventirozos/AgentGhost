@@ -126,6 +126,22 @@ LEAF_BUILD_MAX_S_DEFAULT = 7200.0
 #: monotonic deadline set by the caller that bounds this leaf (0 = none)
 leaf_deadline_context: contextvars.ContextVar = contextvars.ContextVar(
     "coding_leaf_deadline", default=0.0)
+#: §4SD open items r5: does the caller wait for this build when it is stopped?
+#: The unattended step does not (it reopens the leaf at once), so a stopped
+#: build there must not write late (project_advancer `_with_leaf_deadline`)
+caller_waits_context: contextvars.ContextVar = contextvars.ContextVar(
+    "coding_caller_waits", default=True)
+
+
+def _stop_requested() -> bool:
+    """§4SD open items r5 (review MAJOR): the turn's tool stop was sent — the
+    build's verify run was killed by it (exit 130), so what follows is a stop,
+    not a failed attempt (a FAILED leaf the reopen could not undo)."""
+    try:
+        from ..utils import tool_stop as _ts
+        return _ts.requested()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _leaf_budget_s() -> float:
@@ -1089,16 +1105,36 @@ async def _spec_nothink_call(llm, model: str, sys_hint: str, user: str,
             p["response_format"] = grammar
         return p
 
+    from .llm import BackgroundDeferred as _Deferred
     grammar = _spec_response_format()
+    if is_background:
+        # §4SD: streamed, so it can give the slot to the owner (`_spec_stream`);
+        # a rejected grammar ends the stream with an error frame, not a raise —
+        # an empty answer under the grammar is the cue for the retry without it
+        def _stream_payload(g):
+            return {k: v for k, v in _payload(g).items() if k != "stream"}
+        try:
+            content, reasoning, _ = await _spec_stream(llm, _stream_payload(grammar), True)
+        except Exception as e:  # noqa: BLE001 — see docstring
+            if not grammar or isinstance(e, _Deferred):      # review r1: a deferral is not a grammar failure
+                raise
+            logger.warning("coding_executor: no-think spec call with the JSON "
+                           "grammar failed (%s: %s) — retrying once without it",
+                           type(e).__name__, _short(str(e), 160))
+            content, reasoning = "", ""
+        if grammar and not content.strip() and not reasoning.strip():
+            content, reasoning, _ = await _spec_stream(llm, _stream_payload(None), True)
+        return content, reasoning
+    kw = _main_call_kw(is_background, "coding spec")
     try:
-        resp = await llm.chat_completion(_payload(grammar), is_background=is_background)
+        resp = await llm.chat_completion(_payload(grammar), is_background=is_background, **kw)
     except Exception as e:  # noqa: BLE001 — see docstring
-        if not grammar:
+        if not grammar or isinstance(e, _Deferred):
             raise
         logger.warning("coding_executor: no-think spec call with the JSON "
                        "grammar failed (%s: %s) — retrying once without it",
                        type(e).__name__, _short(str(e), 160))
-        resp = await llm.chat_completion(_payload(None), is_background=is_background)
+        resp = await llm.chat_completion(_payload(None), is_background=is_background, **kw)
     msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
     return msg.get("content") or "", msg.get("reasoning_content") or ""
 
@@ -1446,8 +1482,48 @@ def _reverted_append_reason(path: str, out: str) -> str:
             f"identifiers).")
 
 
+#: §4SD: the longest a stopped build spends writing its finished files
+STOP_FLUSH_S = 15.0
+
+#: a stream's finish (`_stream_file_text`) or abort reason
+#: (`_stream_spec_completion`) when a background stream gave the slot to the owner
+YIELDED = "yielded"
+_MAX_YIELDS = 12
+
+
+class _OwnerWatch:
+    """r22: a background stream holds the one main slot for minutes (a spec)
+    to an hour (a 64k file) — it yields as soon as a USER request starts or a
+    foreground LLM call waits (the owner waited behind it). r23: the baseline
+    is read at the FIRST chunk — after the client's park admitted the stream
+    (read before it, a call admitted after a yield, or inside an image
+    render's idle window, never yielded again)."""
+
+    def __init__(self, llm, on: bool):
+        self.llm, self.on, self.base = llm, bool(on), None
+
+    def owner_waits(self) -> bool:
+        """Called at every chunk."""
+        if not self.on:
+            return False
+        now = int(getattr(self.llm, "foreground_requests", 0) or 0)
+        if self.base is None:
+            self.base = now
+            return False
+        return now > self.base or int(getattr(self.llm, "foreground_tasks", 0) or 0) > 0
+
+
+def _main_call_kw(is_background: bool, what: str) -> Dict[str, Any]:
+    """§4SD: a FOREGROUND executor call (the owner's own build) does not open
+    with the head, so it displaces the owner's conversation in the slot — it
+    takes the §4SC side path: the conversation is saved first and the
+    request's next head call restores it. A background call has no owner
+    conversation of its own to keep (the client's background path does)."""
+    return {} if is_background else {"side_main": True, "task_label": what}
+
+
 async def _stream_spec_completion(llm, payload: Dict[str, Any],
-                                  is_background: bool):
+                                  is_background: bool, *, may_yield: bool = True):
     """Stream the build-spec generation, accumulating the content and
     reasoning channels, and ABORT a runaway think phase early.
 
@@ -1472,7 +1548,9 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
     branch retries it with thinking off.
 
     Returns ``(content, reasoning, abort_reason)`` where ``abort_reason``
-    is ``None`` (clean) or ``"loop"``. Stall/mid-stream
+    is ``None`` (clean), ``"loop"``, or `YIELDED` (§4SD: a background call
+    gave the slot to the owner — ``may_yield``; `_spec_stream` calls again).
+    Stall/mid-stream
     errors surface as an SSE error event from the llm layer — the
     accumulator stops there and the caller's existing no-spec
     diagnostics handle the partial output."""
@@ -1489,7 +1567,8 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
         # alternate backends): degrade to the single-shot call — correct
         # output, no early loop abort.
         resp = await llm.chat_completion(
-            {**payload, "stream": False}, is_background=is_background)
+            {**payload, "stream": False}, is_background=is_background,
+            **_main_call_kw(is_background, "coding spec"))
         msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
         return (msg.get("content") or "",
                 msg.get("reasoning_content") or "", None)
@@ -1498,7 +1577,10 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
     c_len = r_len = 0
     next_probe = THINKING_LOOP_PROBE_EVERY
     aborted = None
-    agen = streamer(payload, is_background=is_background)
+    agen = streamer(payload, is_background=is_background,
+                    **_main_call_kw(is_background, "coding spec"))
+    watch = _OwnerWatch(llm, is_background and may_yield)
+    finished = False
     try:
         async for raw in agen:
             line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes)
@@ -1517,7 +1599,13 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
             if obj.get("error"):
                 # Stall / mid-stream break — already logged upstream.
                 break
-            delta = (((obj.get("choices") or [{}])[0]) or {}).get("delta") or {}
+            choice = ((obj.get("choices") or [{}])[0]) or {}
+            finished = finished or bool(choice.get("finish_reason"))
+            # r1/r2: after the frame is read — a spec whose finish arrived is kept
+            if not finished and watch.owner_waits():
+                aborted = YIELDED
+                break
+            delta = choice.get("delta") or {}
             rc = delta.get("reasoning_content") or ""
             cc = delta.get("content") or ""
             if rc:
@@ -1539,6 +1627,20 @@ async def _stream_spec_completion(llm, payload: Dict[str, Any],
         except Exception:  # noqa: BLE001 — closing a broken stream
             pass
     return "".join(content_parts), "".join(reasoning_parts), aborted
+
+
+async def _spec_stream(llm, payload: Dict[str, Any], is_background: bool):
+    """§4SD: `_stream_spec_completion`, called again after it yielded the slot
+    to the owner (the partial is dropped; the next call waits in the client
+    until the owner is done) — at most `_MAX_YIELDS` times, then it runs on."""
+    for n in range(_MAX_YIELDS + 1):
+        content, reasoning, aborted = await _stream_spec_completion(
+            llm, payload, is_background, may_yield=n < _MAX_YIELDS)
+        if aborted != YIELDED:
+            return content, reasoning, aborted
+        logger.info("coding_executor: the spec call gave the slot to the owner (%d/%d) — it runs again after",
+                    n + 1, _MAX_YIELDS)
+    return content, reasoning, aborted        # unreachable: the last call never yields
 
 
 async def _generate_build_spec(llm, model: str, description: str, ledger: str, *,
@@ -1636,7 +1738,7 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         if _skip > 0 and _think_state(llm)["aborts"] >= _skip and _probe_due(llm):
             _arm_probe(llm)
         try:
-            content, reasoning, loop_aborted = await _stream_spec_completion(llm, {
+            content, reasoning, loop_aborted = await _spec_stream(llm, {
                 "model": model,
                 "messages": [{"role": "system", "content": sys_hint},
                              {"role": "user", "content": user}],
@@ -1793,11 +1895,6 @@ async def _file_call_cap(llm, messages, deadline: float) -> int:
     return min(cap, by_time)
 
 
-#: `_stream_file_text`'s finish when a background stream gave the slot to the owner
-YIELDED = "yielded"
-_MAX_YIELDS = 12
-
-
 async def _stream_file_text(llm, payload: Dict[str, Any], is_background: bool) -> Tuple[str, Optional[str]]:
     """One generated-file call, STREAMED (a 64k reply is over an hour; the
     client's non-streamed read timeout is far shorter). Returns the content
@@ -1807,30 +1904,22 @@ async def _stream_file_text(llm, payload: Dict[str, Any], is_background: bool) -
     import inspect as _inspect
     streamer = getattr(llm, "stream_chat_completion", None)
     if streamer is None or not _inspect.isasyncgenfunction(streamer):
-        resp = await llm.chat_completion({**payload, "stream": False}, is_background=is_background)
+        resp = await llm.chat_completion({**payload, "stream": False}, is_background=is_background,
+                                         **_main_call_kw(is_background, "generated file"))
         choice = ((resp or {}).get("choices") or [{}])[0] or {}
         return ((choice.get("message") or {}).get("content") or "", choice.get("finish_reason"))
     parts: List[str] = []
     finish: Optional[str] = None
-    agen = streamer(payload, is_background=is_background)
-    # r22: a background stream holds the one main slot for up to ~an hour —
-    # it yields as soon as a USER request starts or a foreground LLM call
-    # waits (the owner waited behind it); the round ends as a cut, and the
-    # next round's call waits for the owner. r23: the baseline is read at the
-    # FIRST chunk — after the client's park admitted the stream (read before
-    # it, a round admitted after a yield, or inside an image render's idle
-    # window, never yielded again)
-    owner_base: Optional[int] = None
+    agen = streamer(payload, is_background=is_background,
+                    **_main_call_kw(is_background, "generated file"))
+    # r22/r23 (`_OwnerWatch`): a yielded round ends as a cut, and the next
+    # round's call waits for the owner
+    watch = _OwnerWatch(llm, is_background)
     try:
         async for raw in agen:
-            if is_background:
-                now_req = int(getattr(llm, "foreground_requests", 0) or 0)
-                if owner_base is None:
-                    owner_base = now_req
-                elif finish is None and (now_req > owner_base
-                                         or int(getattr(llm, "foreground_tasks", 0) or 0) > 0):
-                    finish = YIELDED
-                    break
+            if finish is None and watch.owner_waits():
+                finish = YIELDED
+                break
             line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
             if not line.startswith("data:"):
                 continue
@@ -2898,236 +2987,261 @@ async def build_coding_task(
                 pending.pop(_np, None)
         return kept_
 
-    for _attempt in range(max(1, max_attempts)):
-        if _attempt and _time_left_s(deadline) < GENERATE_MIN_ATTEMPT_S:
-            kept = await _write_pending()
-            wrote = f" — wrote {', '.join(kept)} (not verified yet)" if kept else ""
-            if _attempt < 2:
-                # review r13: ONE attempt that ran out of room — a slow leaf,
-                # not a failing build: back to READY for the next step
-                return CodingResult(False, _short(f"out of time after one attempt{wrote} — {last}", 280),
-                                    files=kept or last_written, detail=feedback, out_of_time=True)
-            # review r10/r12: no spec call starts with seconds left; a build
-            # that kept FAILING is a failure (FAILED), not a timeout
-            return CodingResult(False, _short(f"no time for another attempt{wrote} — {last}", 280),
-                                files=kept or last_written, detail=feedback)
-        if prev_touched:
-            # The previous attempt touched files and failed — possibly with
-            # PARTIAL edits already on disk. Re-read them so this attempt's
-            # prompt and guards see the CURRENT state; re-rendering the stale
-            # pre-edit excerpt made the model re-emit already-applied edits
-            # that burned every retry on "anchor not found" (2026-07-20).
-            await _refresh_existing(tool_runner, existing, fresh, prev_touched)
-            prev_touched = []
+    async def _write_pending_on_stop() -> None:
+        # §4SD open items r3 (review MAJOR): a stop (Slack's hard limit, the
+        # owner's Stop) cancels the build — the finished files are written
+        # first, shielded and bounded (a write does not read the tool stop)
         try:
-            spec, was_empty = await _generate_build_spec(
-                llm, model, description, ledger,
-                existing_files=existing, single_file=single_file,
-                feedback=feedback, research_context=research_context,
-                is_background=is_background, constraints=constraints)
-        except Exception as e:  # pragma: no cover - LLM/network variance
-            from .llm import BackgroundDeferred as _BgDeferred
-            if isinstance(e, _BgDeferred):
-                await _write_pending()      # r25: this plan's finished files first (as below)
-                raise                       # §4PG (R2-3): the owner is back — the advancer reopens the leaf
-            return CodingResult(False, f"build-spec generation failed: {e}")
+            await asyncio.wait_for(asyncio.shield(_write_pending()), STOP_FLUSH_S)
+        except BaseException:  # noqa: BLE001 — the stop goes on whatever happens here
+            logger.warning("coding_executor: finished files not all written on the stop")
 
-        # A fully EMPTY upstream response is contention/infra, not a code
-        # problem: feedback can't fix it. Back off briefly and retry, but cap
-        # these separately so we don't burn every attempt hammering the server
-        # (observed live: 8 instant empty calls). Report it honestly on exhaust.
-        if was_empty:
-            empty_responses += 1
-            if empty_responses >= MAX_EMPTY_RETRIES:
-                return CodingResult(
-                    False,
-                    f"LLM returned empty responses ({empty_responses}x) — likely "
-                    "upstream contention/overload, not a code problem; retry later",
-                    files=last_written)
-            await asyncio.sleep(_EMPTY_BACKOFF_S)
-            feedback = ""   # nothing useful to feed back about an empty response
-            continue
+    try:
+        for _attempt in range(max(1, max_attempts)):
+            if _stop_requested():
+                raise asyncio.CancelledError()
+            if _attempt and _time_left_s(deadline) < GENERATE_MIN_ATTEMPT_S:
+                kept = await _write_pending()
+                wrote = f" — wrote {', '.join(kept)} (not verified yet)" if kept else ""
+                if _attempt < 2:
+                    # review r13: ONE attempt that ran out of room — a slow leaf,
+                    # not a failing build: back to READY for the next step
+                    return CodingResult(False, _short(f"out of time after one attempt{wrote} — {last}", 280),
+                                        files=kept or last_written, detail=feedback, out_of_time=True)
+                # review r10/r12: no spec call starts with seconds left; a build
+                # that kept FAILING is a failure (FAILED), not a timeout
+                return CodingResult(False, _short(f"no time for another attempt{wrote} — {last}", 280),
+                                    files=kept or last_written, detail=feedback)
+            if prev_touched:
+                # The previous attempt touched files and failed — possibly with
+                # PARTIAL edits already on disk. Re-read them so this attempt's
+                # prompt and guards see the CURRENT state; re-rendering the stale
+                # pre-edit excerpt made the model re-emit already-applied edits
+                # that burned every retry on "anchor not found" (2026-07-20).
+                await _refresh_existing(tool_runner, existing, fresh, prev_touched)
+                prev_touched = []
+            try:
+                spec, was_empty = await _generate_build_spec(
+                    llm, model, description, ledger,
+                    existing_files=existing, single_file=single_file,
+                    feedback=feedback, research_context=research_context,
+                    is_background=is_background, constraints=constraints)
+            except Exception as e:  # pragma: no cover - LLM/network variance
+                from .llm import BackgroundDeferred as _BgDeferred
+                if isinstance(e, _BgDeferred):
+                    await _write_pending()      # r25: this plan's finished files first (as below)
+                    raise                       # §4PG (R2-3): the owner is back — the advancer reopens the leaf
+                return CodingResult(False, f"build-spec generation failed: {e}")
 
-        files = spec.get("files") if isinstance(spec, dict) else None
-        # r21/r22: a generated text waits only for THIS plan's same entry — a
-        # path the plan now writes another way, renames, re-briefs or drops
-        # (a verify-only plan drops all) is not written later from an older
-        # plan (the time gate wrote it over the newer attempt's file)
-        _plan = {_norm_path(str(f.get("path") or "")): str(f.get("generate") or "").strip()
-                 for f in (files if isinstance(files, list) else [])[:max_files] if _is_generate_entry(f)}
-        _real_plan = (isinstance(files, list) and bool(files)) or (
-            isinstance(spec, dict) and bool(str(spec.get("verify") or "").strip())
-            and not _VERIFY_KILL_RE.search(str(spec.get("verify") or "")))   # r24: refused below — no plan
-        for _k in [k for k, (b, _t) in pending.items() if _real_plan and _plan.get(k) != b]:
-            pending.pop(_k, None)             # r23: an unusable reply is no plan — it drops nothing
-        if not isinstance(files, list) or not files:
-            # Empty files + a verify command means "nothing to write — the
-            # deliverable already exists; just check it works". This happens
-            # when a prior interactive turn already built the file and the
-            # autoadvance tick re-picks the task (observed live: the Model
-            # Architecture task FAILED in autoadvance though model.py existed
-            # and ran). Honour the verify instead of failing on no-files.
-            _verify = (spec.get("verify") or "").strip() if isinstance(spec, dict) else ""
-            if _verify and _VERIFY_KILL_RE.search(_verify):
-                # _run_verify skips kill-shaped verifies as a PASS on the
-                # rationale "the files may be good" — but here there ARE no
-                # files: the verify is the only check, so skipping it would
-                # close the task on nothing (review finding, 2026-08-01).
-                last = ("verify-only spec refused: its verify command "
-                        "manages processes (kill/pkill/fuser -k) and there "
-                        "are no files, so nothing would be verified. Provide "
-                        "a verify that TESTS the existing deliverable (run "
-                        "the script, curl the already-running service).")
+            # A fully EMPTY upstream response is contention/infra, not a code
+            # problem: feedback can't fix it. Back off briefly and retry, but cap
+            # these separately so we don't burn every attempt hammering the server
+            # (observed live: 8 instant empty calls). Report it honestly on exhaust.
+            if was_empty:
+                empty_responses += 1
+                if empty_responses >= MAX_EMPTY_RETRIES:
+                    return CodingResult(
+                        False,
+                        f"LLM returned empty responses ({empty_responses}x) — likely "
+                        "upstream contention/overload, not a code problem; retry later",
+                        files=last_written)
+                await asyncio.sleep(_EMPTY_BACKOFF_S)
+                feedback = ""   # nothing useful to feed back about an empty response
+                continue
+
+            files = spec.get("files") if isinstance(spec, dict) else None
+            # r21/r22: a generated text waits only for THIS plan's same entry — a
+            # path the plan now writes another way, renames, re-briefs or drops
+            # (a verify-only plan drops all) is not written later from an older
+            # plan (the time gate wrote it over the newer attempt's file)
+            _plan = {_norm_path(str(f.get("path") or "")): str(f.get("generate") or "").strip()
+                     for f in (files if isinstance(files, list) else [])[:max_files] if _is_generate_entry(f)}
+            _real_plan = (isinstance(files, list) and bool(files)) or (
+                isinstance(spec, dict) and bool(str(spec.get("verify") or "").strip())
+                and not _VERIFY_KILL_RE.search(str(spec.get("verify") or "")))   # r24: refused below — no plan
+            for _k in [k for k, (b, _t) in pending.items() if _real_plan and _plan.get(k) != b]:
+                pending.pop(_k, None)             # r23: an unusable reply is no plan — it drops nothing
+            if not isinstance(files, list) or not files:
+                # Empty files + a verify command means "nothing to write — the
+                # deliverable already exists; just check it works". This happens
+                # when a prior interactive turn already built the file and the
+                # autoadvance tick re-picks the task (observed live: the Model
+                # Architecture task FAILED in autoadvance though model.py existed
+                # and ran). Honour the verify instead of failing on no-files.
+                _verify = (spec.get("verify") or "").strip() if isinstance(spec, dict) else ""
+                if _verify and _VERIFY_KILL_RE.search(_verify):
+                    # _run_verify skips kill-shaped verifies as a PASS on the
+                    # rationale "the files may be good" — but here there ARE no
+                    # files: the verify is the only check, so skipping it would
+                    # close the task on nothing (review finding, 2026-08-01).
+                    last = ("verify-only spec refused: its verify command "
+                            "manages processes (kill/pkill/fuser -k) and there "
+                            "are no files, so nothing would be verified. Provide "
+                            "a verify that TESTS the existing deliverable (run "
+                            "the script, curl the already-running service).")
+                    feedback = last
+                    continue
+                if _verify:
+                    vfail, _vran = await _run_verify_ex(tool_runner, spec, [])
+                    if vfail:
+                        _note_nothink_verify_failure(llm, _short(description, 60))
+                    if not vfail:
+                        summary = (spec.get("summary") if isinstance(spec, dict) else "") \
+                            or "verified existing deliverable (nothing to build)"
+                        ledger_note = (spec.get("ledger") if isinstance(spec, dict) else "") or ""
+                        return CodingResult(True, _short(summary, 300), files=[],
+                                            ledger_note=_short(ledger_note, 200),
+                                            verified=bool(_vran))   # §4PG: it ran; §4QA: an existence check is not a run
+                    # Verify failed — fall through with that as the reason so the
+                    # retry/feedback path gets the real error, not "no file spec".
+                    last = vfail
+                    feedback = vfail
+                    continue
+                msg = ("model produced no file spec for the task (a NEW file of more than "
+                       "~100 lines: name it with `generate` instead of writing it in `content`)")
+                # Don't let an empty retry overwrite a more informative failure
+                # (e.g. a real verify error) from a prior attempt.
+                if last == "build failed":
+                    last = msg
+                feedback = msg
+                continue
+
+            # §4SD: files named with `generate` are written now, one call each
+            from .llm import BackgroundDeferred as _Deferred
+            try:
+                files, gfail = await _materialize_generated(
+                    llm, model, files[:max_files], description=description, ledger=ledger,
+                    existing=existing, own=own, pending=pending, tool_runner=tool_runner,
+                    research_context=research_context, constraints=constraints,
+                    is_background=is_background, deadline=deadline, feedback=feedback)
+            except _Deferred:
+                # r24: the owner kept the slot past the park — the files this plan
+                # finished are written (through every guard), as when time runs out
+                await _write_pending()
+                raise
+            if isinstance(gfail, OutOfTime):
+                # review r10: no further attempt fits; the files that completed are
+                # written (through every guard) so the next step builds on them
+                # instead of generating them again — the unattended step's cap
+                # (~44 min) is shorter than some files take
+                kept: List[str] = []
+                for f in files:
+                    path, reason = await _apply_file(tool_runner, f, existing, fresh, set(), own=own)
+                    pending.pop(_norm_path(str(f.get("path") or "")), None)
+                    if path and not reason:
+                        kept.append(path)
+                kept += await _write_pending()    # r21: this plan's files an earlier attempt finished
+                if _attempt >= 2:
+                    # r19: a build that kept FAILING is a failure (FAILED) however
+                    # its time ended — as the gate above
+                    return CodingResult(False, _short(f"no time for another attempt — {last}", 280),
+                                        files=kept or last_written, detail=feedback)
+                return CodingResult(False, _short(gfail + (f" — wrote {', '.join(kept)} (not verified yet); "
+                                                           "the task goes back to READY" if kept else ""), 280),
+                                    files=kept or last_written, detail=feedback, out_of_time=True)
+            if gfail:
+                feedback = _merge_feedback(gfail, feedback)   # review r9: keep the reason the retry must fix
+                last = gfail
+                continue
+
+            touched: set = set()
+            written: List[str] = []
+            fail: Optional[str] = None
+            for f in files[:max_files]:
+                path, reason = await _apply_file(tool_runner, f, existing, fresh, touched, own=own)
+                _gen = isinstance(f, dict) and bool(f.get(_GENERATED_KEY))
+                _np = _norm_path(str(f.get("path") or "")) if _gen else ""
+                if reason:
+                    fail = reason
+                    if _gen:
+                        pending.pop(_np, None)            # refused: generate it anew, not again
+                        if (str(f.get("path") or "").strip() in touched
+                                and isinstance(f.get("content"), str)):
+                            # review r11 (r19: `path` is None here — the write landed, its check failed)
+                            own[_np] = await _disk_text(tool_runner, str(f.get("path") or "").strip(),
+                                                        f["content"])
+                    break
+                if path:
+                    written.append(path)
+                    if _gen:
+                        pending.pop(_np, None)
+                        own[_np] = await _disk_text(tool_runner, path, f["content"])   # §4SD: on disk
+                    elif _norm_path(path) in own:
+                        # review r12: its own later edit/append — the file is still the leaf's
+                        _live, _ = await _read_live_file(tool_runner, path)
+                        if _live is not None:
+                            own[_norm_path(path)] = _live
+                        # (unreadable — over the read cap: it stays the leaf's, r13)
+            if fail:
+                # r20: a failed batch can have changed the leaf's own files (edit 1
+                # of 2 landed; an edit left it broken) — still the leaf's, not an
+                # owner's edit the next `generate` must keep
+                for _p in touched:
+                    if _norm_path(_p) in own:
+                        _live, _ = await _read_live_file(tool_runner, _p)
+                        if _live is not None:
+                            own[_norm_path(_p)] = _live
+            prev_touched = sorted(touched)
+            last_written = written
+            if fail:
+                last = fail
+                # review r10: a refused regeneration replaced the verify error
+                feedback = _merge_feedback(fail, feedback) if own else fail
+                continue
+            if not written:
+                last = "build spec produced no writable files"
                 feedback = last
                 continue
-            if _verify:
-                vfail, _vran = await _run_verify_ex(tool_runner, spec, [])
-                if vfail:
-                    _note_nothink_verify_failure(llm, _short(description, 60))
-                if not vfail:
-                    summary = (spec.get("summary") if isinstance(spec, dict) else "") \
-                        or "verified existing deliverable (nothing to build)"
-                    ledger_note = (spec.get("ledger") if isinstance(spec, dict) else "") or ""
-                    return CodingResult(True, _short(summary, 300), files=[],
-                                        ledger_note=_short(ledger_note, 200),
-                                        verified=bool(_vran))   # §4PG: it ran; §4QA: an existence check is not a run
-                # Verify failed — fall through with that as the reason so the
-                # retry/feedback path gets the real error, not "no file spec".
+
+            vfail, _verify_ran_ok = await _run_verify_ex(tool_runner, spec, written)
+            _verify_ran_ok = bool(_verify_ran_ok) and not vfail
+            if vfail:
+                _note_nothink_verify_failure(llm, _short(description, 60))   # §4FJ
                 last = vfail
                 feedback = vfail
                 continue
-            msg = ("model produced no file spec for the task (a NEW file of more than "
-                   "~100 lines: name it with `generate` instead of writing it in `content`)")
-            # Don't let an empty retry overwrite a more informative failure
-            # (e.g. a real verify error) from a prior attempt.
-            if last == "build failed":
-                last = msg
-            feedback = msg
-            continue
 
-        # §4SD: files named with `generate` are written now, one call each
-        from .llm import BackgroundDeferred as _Deferred
-        try:
-            files, gfail = await _materialize_generated(
-                llm, model, files[:max_files], description=description, ledger=ledger,
-                existing=existing, own=own, pending=pending, tool_runner=tool_runner,
-                research_context=research_context, constraints=constraints,
-                is_background=is_background, deadline=deadline, feedback=feedback)
-        except _Deferred:
-            # r24: the owner kept the slot past the park — the files this plan
-            # finished are written (through every guard), as when time runs out
-            await _write_pending()
-            raise
-        if isinstance(gfail, OutOfTime):
-            # review r10: no further attempt fits; the files that completed are
-            # written (through every guard) so the next step builds on them
-            # instead of generating them again — the unattended step's cap
-            # (~44 min) is shorter than some files take
-            kept: List[str] = []
-            for f in files:
-                path, reason = await _apply_file(tool_runner, f, existing, fresh, set(), own=own)
-                pending.pop(_norm_path(str(f.get("path") or "")), None)
-                if path and not reason:
-                    kept.append(path)
-            kept += await _write_pending()    # r21: this plan's files an earlier attempt finished
-            if _attempt >= 2:
-                # r19: a build that kept FAILING is a failure (FAILED) however
-                # its time ended — as the gate above
-                return CodingResult(False, _short(f"no time for another attempt — {last}", 280),
-                                    files=kept or last_written, detail=feedback)
-            return CodingResult(False, _short(gfail + (f" — wrote {', '.join(kept)} (not verified yet); "
-                                                       "the task goes back to READY" if kept else ""), 280),
-                                files=kept or last_written, detail=feedback, out_of_time=True)
-        if gfail:
-            feedback = _merge_feedback(gfail, feedback)   # review r9: keep the reason the retry must fix
-            last = gfail
-            continue
-
-        touched: set = set()
-        written: List[str] = []
-        fail: Optional[str] = None
-        for f in files[:max_files]:
-            path, reason = await _apply_file(tool_runner, f, existing, fresh, touched, own=own)
-            _gen = isinstance(f, dict) and bool(f.get(_GENERATED_KEY))
-            _np = _norm_path(str(f.get("path") or "")) if _gen else ""
-            if reason:
-                fail = reason
-                if _gen:
-                    pending.pop(_np, None)            # refused: generate it anew, not again
-                    if (str(f.get("path") or "").strip() in touched
-                            and isinstance(f.get("content"), str)):
-                        # review r11 (r19: `path` is None here — the write landed, its check failed)
-                        own[_np] = await _disk_text(tool_runner, str(f.get("path") or "").strip(),
-                                                    f["content"])
-                break
-            if path:
-                written.append(path)
-                if _gen:
-                    pending.pop(_np, None)
-                    own[_np] = await _disk_text(tool_runner, path, f["content"])   # §4SD: on disk
-                elif _norm_path(path) in own:
-                    # review r12: its own later edit/append — the file is still the leaf's
-                    _live, _ = await _read_live_file(tool_runner, path)
-                    if _live is not None:
-                        own[_norm_path(path)] = _live
-                    # (unreadable — over the read cap: it stays the leaf's, r13)
-        if fail:
-            # r20: a failed batch can have changed the leaf's own files (edit 1
-            # of 2 landed; an edit left it broken) — still the leaf's, not an
-            # owner's edit the next `generate` must keep
-            for _p in touched:
-                if _norm_path(_p) in own:
-                    _live, _ = await _read_live_file(tool_runner, _p)
-                    if _live is not None:
-                        own[_norm_path(_p)] = _live
-        prev_touched = sorted(touched)
-        last_written = written
-        if fail:
-            last = fail
-            # review r10: a refused regeneration replaced the verify error
-            feedback = _merge_feedback(fail, feedback) if own else fail
-            continue
-        if not written:
-            last = "build spec produced no writable files"
-            feedback = last
-            continue
-
-        vfail, _verify_ran_ok = await _run_verify_ex(tool_runner, spec, written)
-        _verify_ran_ok = bool(_verify_ran_ok) and not vfail
-        if vfail:
-            _note_nothink_verify_failure(llm, _short(description, 60))   # §4FJ
-            last = vfail
-            feedback = vfail
-            continue
-
-        # Post-build gates (2026-07-08, from the chess-session post-mortem).
-        # Smoke first (mechanical, cheap): py_compile every written .py and
-        # sweep Flask routes with test_client — three crash-on-first-touch
-        # bugs shipped in one session because no handler was ever exercised.
-        from .build_gates import constraint_gate, files_from_specs, smoke_gate
-        sfail = await smoke_gate(tool_runner, written)
-        if sfail:
-            last = sfail
-            feedback = sfail
-            continue
-        # Then the constraint audit (one background LLM call): the spec
-        # verify checks "does it run"; this checks "is it what the user
-        # ALLOWED" — the session's engine-instead-of-Ghost build passed
-        # every mechanical check while violating the stated constraint.
-        if constraints:
-            cok, creason = await constraint_gate(
-                context, constraints, files_from_specs(files),
-                is_background=is_background)
-            if not cok:
-                last = creason
-                feedback = creason
+            # Post-build gates (2026-07-08, from the chess-session post-mortem).
+            # Smoke first (mechanical, cheap): py_compile every written .py and
+            # sweep Flask routes with test_client — three crash-on-first-touch
+            # bugs shipped in one session because no handler was ever exercised.
+            from .build_gates import constraint_gate, files_from_specs, smoke_gate
+            sfail = await smoke_gate(tool_runner, written)
+            if sfail:
+                last = sfail
+                feedback = sfail
                 continue
+            # Then the constraint audit (one background LLM call): the spec
+            # verify checks "does it run"; this checks "is it what the user
+            # ALLOWED" — the session's engine-instead-of-Ghost build passed
+            # every mechanical check while violating the stated constraint.
+            if constraints:
+                cok, creason = await constraint_gate(
+                    context, constraints, files_from_specs(files),
+                    is_background=is_background)
+                if not cok:
+                    last = creason
+                    feedback = creason
+                    continue
 
-        summary = (spec.get("summary") if isinstance(spec, dict) else "") or \
-            f"wrote {', '.join(written)}"
-        ledger_note = (spec.get("ledger") if isinstance(spec, dict) else "") or ""
-        return CodingResult(True, _short(summary, 300), files=written,
-                            ledger_note=_short(ledger_note, 200),
-                            verified=bool(_verify_ran_ok))   # §4PG r3: the verify RAN and passed
+            summary = (spec.get("summary") if isinstance(spec, dict) else "") or \
+                f"wrote {', '.join(written)}"
+            ledger_note = (spec.get("ledger") if isinstance(spec, dict) else "") or ""
+            return CodingResult(True, _short(summary, 300), files=written,
+                                ledger_note=_short(ledger_note, 200),
+                                verified=bool(_verify_ran_ok))   # §4PG r3: the verify RAN and passed
+        if _stop_requested():
+            raise asyncio.CancelledError()
+    except asyncio.CancelledError:
+        # §4SD open items r3/r4 (review MAJORs): a stop (Slack's hard limit, the
+        # owner's Stop) cancels the build at ANY await of an attempt — the
+        # finished files waiting in `pending` are written first. r5: an owner's
+        # (foreground) build only — the unattended step reopens its leaf without
+        # waiting for this task, and a late flush landed in the next build
+        # (r5: keyed on the caller, not `is_background` — a scheduled batch's
+        # build is foreground and unattended)
+        if not is_background and caller_waits_context.get():
+            await _write_pending_on_stop()
+        raise
 
     return CodingResult(False, _short(last, 280), files=last_written, detail=feedback)

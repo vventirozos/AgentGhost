@@ -4826,8 +4826,12 @@ class LLMClient:
 
         raise Exception("Max retries exceeded")
 
-    async def stream_chat_completion(self, payload: Dict[str, Any], use_coding: bool = False, is_background: bool = False):
+    async def stream_chat_completion(self, payload: Dict[str, Any], use_coding: bool = False, is_background: bool = False,
+                                     side_main: bool = False, task_label: str = ""):
         # §4OT: a stream lands on the main slot unless a coding pool serves it.
+        # ``side_main`` (§4SD): a foreground stream that does not open with the
+        # head (the coding executor's spec and file calls) takes the §4SC side
+        # path, as `chat_completion(side_main=True)` does.
         # Counted from dispatch (after any park), marked only once the server
         # answered (r1: a parked or refused stream never touched the slot)
         _on_main = not (use_coding and getattr(self, "coding_clients", None))
@@ -4854,7 +4858,13 @@ class LLMClient:
                 async with self._foreground_lock:
                     self.foreground_tasks += 1
                 try:
-                    if _on_main:
+                    if _on_main and side_main:
+                        _what_tok = _side_call_what_ctx.set(f"this request's {task_label or 'side'} call")
+                        try:
+                            await self._before_side_main_dispatch(payload)
+                        finally:
+                            _side_call_what_ctx.reset(_what_tok)
+                    elif _on_main:
                         await self._before_main_dispatch(payload)
                     _opened()
                     async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):
@@ -4868,7 +4878,9 @@ class LLMClient:
         finally:
             if _state["open"]:
                 self._main_streams_open = max(0, int(getattr(self, "_main_streams_open", 1) or 1) - 1)
-            if _on_main and _state["answered"]:
+            # §4SD: a side stream that failed mid-prefill left its own tokens
+            # in the slot — counted as displaced (as `chat_completion`'s side path)
+            if _on_main and (_state["answered"] or (side_main and not is_background and _state["open"])):
                 note_main_slot_prompt(self, payload, "stream", background=is_background,
                                       opened_at=_state.get("opened_at"))
 

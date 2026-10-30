@@ -93,7 +93,7 @@ class StreamingFakeLLM:
         self.chat_payloads = []
         self.retry_content = retry_content
 
-    async def stream_chat_completion(self, payload, is_background=False):
+    async def stream_chat_completion(self, payload, is_background=False, **_kw):
         self.stream_calls += 1
         chunks = self.queue.pop(0) if self.queue else _ceiling_chunks()
         for c in chunks:
@@ -255,7 +255,7 @@ async def test_streamed_think_call_never_carries_a_grammar(monkeypatch):
     seen = []
 
     class Spy(StreamingFakeLLM):
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             seen.append(payload)
             async for c in super().stream_chat_completion(payload, is_background):
                 yield c

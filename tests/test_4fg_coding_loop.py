@@ -258,3 +258,29 @@ def test_advancer_forwards_the_project_id_to_the_executor():
     for c in calls:
         kws = {k.arg: ast.unparse(k.value) for k in c.keywords}
         assert kws.get("project_id") == "project_id", kws
+
+
+def test_a_verify_killed_by_the_stop_ends_the_agentic_leaf_as_a_stop(monkeypatch, tmp_path):
+    """§4SD open items r6 (review MAJOR): the agentic sibling of the r5 fix — a
+    verify the stop killed (exit 130) returned FAILED before the cancel landed."""
+    from ghost_agent.utils import tool_stop as TS
+    ctx = _ctx(tmp_path)
+    stop = TS.ToolStop()
+
+    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
+        (tmp_path / "x.py").write_text("v")
+        return "VERIFY: python -m pytest -q\nSUMMARY: try"
+    monkeypatch.setattr(cl, "run_leaf_turn", fake_turn)
+
+    async def killed(name, args):
+        stop.request()
+        return "killed\nEXIT CODE: 130"
+
+    async def run():
+        tok = TS.bind(stop)
+        try:
+            return await cl.build_coding_task_agentic(ctx, "fix x", tool_runner=killed, max_attempts=1)
+        finally:
+            TS.unbind(tok)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())

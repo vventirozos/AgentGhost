@@ -57442,3 +57442,37 @@ Fresh-eye round 5 (one reader on round 4's fixes): no new defect. Its MAJOR is t
 - The HTML truncation guard applies only to a full page (it opened `<html`): Jinja child templates and partials were refused on every attempt.
 - Reference: this spec's generated files lead the 40k reference (they were the first cut).
 Accepted residue (docs/core/coding_executor.html §4sd-generate): prose around a fence / mid-file fences (left to the syntax check and gates); a marker line inside a multi-line string; prose files keep a wrapper; a docstring/HTML text line that a cut lands right before and that reads as an opener goes; a closing sentence after code with no marker stays; a regenerated .js/.html that does not parse is written and flagged after; continuation rounds see only the file's head/tail, not the plan; the step's hard timeout can drop unwritten generated files; a deferral right after an owner turn that created the same path can write over it; the inherited `side_main` gap (foreground owner builds do not take §4SC's side path — predates §4SD).
+
+### §4SD open items — closed (2026-10-30, operator: "fix all the remaining open items. let's close this. keep following the same verification protocol." → "proceed with your recommendation.")
+Four items, each fixed and reviewed to convergence:
+1. **The background spec call yields the main slot to the owner** (`_OwnerWatch`, `_spec_stream`, ≤ `_MAX_YIELDS` 12; the background no-think call is streamed so it can yield too).
+2. **A foreground (owner) build's LLM calls go `side_main`**: spec, file, and the advancer's analysis/classify/command calls. The owner's conversation is saved before the slot is displaced (§4SC).
+3. **Rewrite loop breaker**: a whole-file rewrite of one path counts as progress at most `MAX_COUNTED_REWRITES` (5) times per request (`note_code_progress(rewrite_of=…)`, futility `new_writes`).
+4. **A finite client timeout (Slack's 30 min) is a hard limit**: `watch_hard_limit` calls `interrupt_tools`, then `cancel`, and the reply carries the files line.
+
+Item 4's history:
+- Rounds r1–r6 each found a MAJOR in what a mid-build stop set off:
+  - r1: cancel-first, so tools never stopped.
+  - r2/r3: the claimed leaf was stuck IN_PROGRESS.
+  - r3: pending files were lost, and the unattended timeout went uncharged.
+  - r4: an unattended step stopped from outside stayed claimed.
+  - r5: a stop-killed verify was booked FAILED.
+  - r6: the same in the agentic leaf.
+- All those fixes stay, because the owner's Stop still cuts builds.
+- The operator chose to SPARE a running `manage_projects` call at the limit. It is waited for, up to `HARD_LIMIT_SPARE_MAX_S` (30 min). The forced report then gets max(300 s, `effective_report_floor`), counted from when the build was last seen running. Then the turn is cut.
+- r7 (two reviewers) and r8 found no MAJOR.
+
+Verification:
+- Hand mutants o1–o34 and p1–p5 all killed.
+- Battery round 9 (`scripts/mutate_4sd.py`, Y1–Y52): killed 52 of 52, control behaved, `RESTORED identical=True`, src identical to the snapshot.
+- Suite: 28,058 passed; 1 failure, the known HF-cache flake (`test_contextual_memory`). The `docs/logging.html` title table was regenerated.
+- Lint OK.
+
+Accepted residue (docs/core/agent.html `#4sd-hard-limit`, coding_executor.html `#4sd-open-items`):
+- The file stream's owner check runs before the frame is parsed.
+- A spared agentic leaf or `research` call can run a Slack reply to about 55 min.
+- The build is seen by 5 s sampling.
+- Any `manage_projects` call counts as a build.
+- The "INTERRUPTED BY THE USER" wording.
+- The files line lists only the turn's own writes.
+- With `GHOST_QUEUED_MESSAGES` off, nothing is spared.

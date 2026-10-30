@@ -83,7 +83,7 @@ class StreamingFakeLLM:
         self.chat_payloads = []
         self.retry_content = retry_content
 
-    async def stream_chat_completion(self, payload, is_background=False):
+    async def stream_chat_completion(self, payload, is_background=False, **_kw):
         self.stream_calls += 1
         for c in self.chunks:
             self.consumed += 1

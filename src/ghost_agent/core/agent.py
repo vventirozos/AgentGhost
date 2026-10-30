@@ -6477,6 +6477,133 @@ def turn_room_fits_time(ceiling_s, elapsed_s) -> bool:
     return ceil - spent >= TURN_ROOM_MIN_TIME_LEFT_S
 
 
+#: §4SD: how often the hard-limit watch reads the request's clock (seconds)
+HARD_LIMIT_POLL_S = 5.0
+#: §4SD: the cancel reason a hard limit stops a turn with (the reply's note)
+HARD_LIMIT_REASON = "this request reached its time limit"
+#: §4SD open items (operator 10-30, "proceed with your recommendation"): tools a
+#: hard limit never cuts — a project build sizes its calls by the request's
+#: time and returns "out of time" on its own; cutting it mid-build set off six
+#: review rounds of task-state and lost-file defects. The turn stops once it returns.
+HARD_LIMIT_SPARED_TOOLS = frozenset({"manage_projects"})
+#: §4SD: after a spared build returns past the limit, the report the loop forces
+#: (tools off) gets this long before the turn is stopped — else the owner got
+#: the cancel note and nothing about what the build did
+HARD_LIMIT_REPORT_GRACE_S = 300.0
+#: §4SD r7: a build still running this long past the limit is cut (a wedged
+#: step held the one turn lock — web, CLI and idle loops — for hours)
+HARD_LIMIT_SPARE_MAX_S = 1800.0
+
+
+def _spared_running(turn) -> List[str]:
+    """The spared tools `turn` is running right now ([] when none)."""
+    stop = getattr(turn, "tool_stop", None)
+    try:
+        names = stop.running_tools() if stop is not None else []
+    except Exception:  # noqa: BLE001
+        names = []
+    return [n for n in names if n in HARD_LIMIT_SPARED_TOOLS]
+
+
+def hard_limit_applies(client_deadline_s) -> bool:
+    """§4SD: a client that SENT a finite timeout (the Slack bot's 30 min) has
+    a HARD limit — the turn running when it passes is stopped, not let finish
+    (a 16k turn begun inside the report reserve ran ~13 min over). ``inf``
+    (web, CLI) and no header (probes, background) keep the soft deadline."""
+    try:
+        d = float(client_deadline_s or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < d < math.inf
+
+
+async def watch_hard_limit(req_id, registry, *, poll_s: float = HARD_LIMIT_POLL_S,
+                           client_s: float = 0.0, report_grace_s: Optional[float] = None,
+                           spare_max_s: float = HARD_LIMIT_SPARE_MAX_S) -> bool:
+    """§4SD: wait until the request's deadline IN FORCE passes (earned
+    extensions included — read each time), then stop the turn the way Stop
+    does: the cooperative cancel (a generation reads it within
+    ``CANCEL_POLL_S``) and the running tool calls' stop. Queued messages it
+    had not read go to the conversation's leftovers. Never before the
+    client's own timeout ``client_s`` (review r1: a 4 h non-streamed client
+    under the server's 1 h cap was stopped at 1 h). A running project build
+    (`HARD_LIMIT_SPARED_TOOLS`) is waited for, up to ``spare_max_s`` past the
+    limit; the forced report then has ``report_grace_s`` from the build's end
+    (r7: also a build that returned just BEFORE the limit — its report was
+    cut at once) before the turn is stopped. The grace defaults to the
+    request's own report reserve (`effective_report_floor`, never below
+    HARD_LIMIT_REPORT_GRACE_S — r7: a fixed 300 s was under the measured
+    report turn).
+    Returns True when it stopped the turn; False when the request closed or
+    has no deadline."""
+    req_id = str(req_id or "")
+    last_spared = past_since = None       # when a spared build was last seen; when the limit passed
+    logged = False
+    while True:
+        rem = _glog.request_remaining_s(req_id)
+        if rem is None:
+            return False
+        el = _glog.request_elapsed_s(req_id)
+        if client_s and el is not None:
+            rem = max(rem, float(client_s) - el)
+        turn = registry.get(req_id)
+        if turn is None or turn.cancelled:
+            return False
+        now = time.monotonic()
+        spared = _spared_running(turn)
+        if spared:
+            last_spared = now
+        wait = None
+        if rem > 0:
+            wait = rem
+        else:
+            past_since = now if past_since is None else past_since
+            if spared and now - past_since < float(spare_max_s):
+                wait = float(poll_s)
+                if not logged:
+                    logged = True
+                    pretty_log("Client Deadline",
+                               f"the limit passed during {', '.join(spared)} — the turn stops once it returns",
+                               level="WARNING", icon=Icons.WARN)
+            elif not spared and last_spared is not None:
+                if report_grace_s is None:
+                    try:
+                        report_grace_s = max(HARD_LIMIT_REPORT_GRACE_S, effective_report_floor(
+                            max(float(_glog.request_deadline_s(req_id) or 0.0), float(client_s or 0.0)), req_id))
+                    except Exception:
+                        report_grace_s = HARD_LIMIT_REPORT_GRACE_S
+                if now < last_spared + float(report_grace_s):
+                    wait = last_spared + float(report_grace_s) - now      # the report's grace
+        if wait is None:
+            break
+        await asyncio.sleep(max(0.05, min(float(poll_s), float(wait))))
+    limit = max(_glog.request_deadline_s(req_id), float(client_s or 0.0))     # r2 m1: the limit that fired
+    # BEFORE the cancel (as the Stop route): `interrupt_tools` refuses a turn
+    # already cancelled, and a running batch never reads the cooperative flag
+    stopped = registry.interrupt_tools(req_id)
+    res = registry.cancel(req_id, reason=f"{HARD_LIMIT_REASON} ({_span(limit)})")
+    try:
+        registry.add_leftovers(turn.session_id, turn.kind, res.get("undelivered_items") or [])
+    except Exception:  # noqa: BLE001
+        pass
+    pretty_log("Client Deadline",
+               f"the {_span(limit)} limit passed — stopping the turn"
+               + (f" and its running {', '.join(stopped)}" if stopped else ""),
+               level="WARNING", icon=Icons.STOP)
+    return True
+
+
+def hard_limit_files_line(tools_run) -> str:
+    """§4SD: the files a turn stopped at its hard limit wrote, for its reply
+    ("" when none)."""
+    try:
+        from .task_state import task_state_facts
+        files = task_state_facts(tools_run or [])["files"]
+    except Exception:  # noqa: BLE001
+        return ""
+    return ("Files written so far: " + ", ".join(f"`{p}`" for p in files) + ".") if files else ""
+
+
 def turn_takes_room(payload, is_final_generation) -> bool:
     """§4SD: the per-turn room applies to a TOOL turn carrying the default
     cap — not a final answer or report (review: they would get up to 64k
@@ -6671,6 +6798,15 @@ def is_code_progress(fname, op, target, is_error, *, ran_written=False) -> bool:
     if fname != "file_system" or str(op or "").lower() not in CODE_WRITE_OPS:
         return False
     return str(target or "").lower().endswith(CODE_PROGRESS_EXTS)
+
+
+def is_whole_rewrite(op, args) -> bool:
+    """§4SD: a `write` that replaces the whole file — not ``append=true`` (the
+    next part of a file written in parts)."""
+    if str(op or "").strip().lower() != "write":
+        return False
+    app = (args or {}).get("append") if isinstance(args, dict) else None
+    return not (app is True or str(app).strip().lower() in ("true", "1", "yes"))
 
 
 def request_checkpoint_namespace(req_id) -> str:
@@ -24793,7 +24929,12 @@ class GhostAgent:
                                     _seen_w = _rec.setdefault("write_keys", set())
                                     if _wk not in _seen_w:
                                         _seen_w.add(_wk)
-                                        _rec["new_writes"] = _rec.get("new_writes", 0) + 1
+                                        # §4SD: past the cap a whole rewrite re-arms no run's earn either
+                                        _whole = is_whole_rewrite(ptool_op, _recorded_args)
+                                        if _whole:
+                                            _rec["rewrites"] = _rec.get("rewrites", 0) + 1
+                                        if not _whole or _rec["rewrites"] <= _glog.MAX_COUNTED_REWRITES:
+                                            _rec["new_writes"] = _rec.get("new_writes", 0) + 1
                             elif fname == "execute":
                                 # §4OE-2 (review CRITICAL): a FAILING run (pytest exit 1) is an
                                 # error result — counted here regardless, else the report tier
@@ -24911,7 +25052,9 @@ class GhostAgent:
                                                      else "ran a file it wrote",
                                                      # §4SD review: the same write again is not progress
                                                      key=(hashlib.sha1(str(a_hash).encode("utf-8", "replace")).hexdigest()
-                                                          if fname == "file_system" else ""))
+                                                          if fname == "file_system" else ""),
+                                                     rewrite_of=(_fs_norm(ptarget or "") if fname == "file_system"
+                                                                 and is_whole_rewrite(ptool_op, _recorded_args) else ""))
                     except Exception:  # noqa: BLE001
                         pass
                     # §4RA end
@@ -30254,6 +30397,10 @@ class GhostAgent:
                                client_deadline_line(_glog.request_deadline_s(str(req_id or "")),
                                                     _glog.extension_ceiling_s(str(req_id or ""))),
                                icon=Icons.REQ_WAIT, level="INFO")
+                if hard_limit_applies(_cdl):
+                    # §4SD: a finite client timeout is a hard limit (stopped in the finally)
+                    _hard_watch = _glog.spawn_bg(watch_hard_limit(str(req_id), _turn_reg, client_s=_cdl),
+                                               name="hard-limit")
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen3.8-27b"), body.get("stream", False)
                 if requester_is_member():
                     # A member's turn does not stream (R8): the streamed drain
@@ -32645,6 +32792,9 @@ class GhostAgent:
             _content = (f"{_partial}\n\n{_note}" if _partial.strip()
                         else f"{_note} No output was produced before the "
                              f"cancellation.")
+            if str(_tc.reason or "").startswith(HARD_LIMIT_REASON):
+                _hl_files = hard_limit_files_line(locals().get("tools_run_this_turn"))   # §4SD: what exists now
+                _content = f"{_content}\n\n{_hl_files}" if _hl_files else _content
             # §4IB: a cancelled turn is still a turn — record it.
             self._record_aborted_turn(
                 req_id=req_id, reason=f"cancelled: {_tc.reason}",
@@ -32685,6 +32835,9 @@ class GhostAgent:
             raise
 
         finally:
+            _hw = locals().get("_hard_watch")
+            if _hw is not None and not _hw.done():
+                _hw.cancel()                     # §4SD: the turn is over — no limit to watch
             # Queued messages: the loop is over — nothing more is read, even
             # while a streamed final still drains. Pending ones → leftovers.
             # §4SB: and the ones drained for a model call that never completed

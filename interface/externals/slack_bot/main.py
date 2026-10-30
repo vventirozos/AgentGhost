@@ -130,8 +130,8 @@ if AGENT_TIMEOUT_S <= 0:
 #: §4SD (operator 10-29: "set a limit to slack for 30 mins"): a Slack request's
 #: own budget, sent as X-Ghost-Client-Timeout. The agent takes the lower of it
 #: and GHOST_MAX_REQUEST_S and never extends past a client's figure; the last
-#: minutes go to a state report. Not a hard stop: a turn already running when the
-#: report is due finishes first (16k at ~15 tok/s is up to ~18 min), then the report.
+#: minutes go to a state report. A hard limit (§4SD open items, 10-30): the turn
+#: still running when it passes is stopped, and the reply names the files written.
 try:
     SLACK_REQUEST_S = float(os.environ.get("GHOST_SLACK_REQUEST_S", "1800") or 1800)
 except ValueError:

@@ -228,7 +228,7 @@ def _hook(fname, op, target, a_hash):
     self.context._script_iter = {}
     outcome = _Ctx()
     outcome.is_rejection = False
-    g = {**vars(A), "self": self, "fname": fname, "ptool_op": op, "is_mutating": True, "ptarget": target,
+    g = {**vars(A), "self": self, "fname": fname, "ptool_op": op, "_recorded_args": {}, "is_mutating": True, "ptarget": target,
          "a_hash": a_hash, "_res_is_error": False, "_res_unresolved": False, "_outcome": outcome}
     tok = L.request_id_context.set(RID)
     try:
@@ -279,7 +279,7 @@ def _run_futility(si, fname, a_hash, target):
                        and any(isinstance(c, ast.Constant) and c.value == "file_system" for c in v.comparators)
                        for v in n.test.values)
                and any(isinstance(x, ast.Name) and x.id == "_bn" for x in ast.walk(n)))
-    g = {**vars(A), "_si": si, "fname": fname, "is_mutating": True, "ptarget": target,
+    g = {**vars(A), "_si": si, "fname": fname, "ptool_op": "write", "_recorded_args": {}, "is_mutating": True, "ptarget": target,
          "_res_is_error": False, "a_hash": a_hash, "_CODE_EXTS": (".py", ".sh", ".js", ".mjs", ".ts")}
     exec(compile(ast.fix_missing_locations(ast.Module(body=blk.body, type_ignores=[])), "<futility-write>", "exec"), g)
 

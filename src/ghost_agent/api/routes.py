@@ -1390,8 +1390,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         # request alone (the store takes a turn ending in a user row), so no
         # later history or smart-memory arc carries a "_(Turn cancelled" stub
         # (live 10-29 05:36: one was consolidated into smart memory)
+        # (§4SD r3: a hard-limit stop's "Files written so far" line is no reply
+        # either — the state of work keeps the files)
         if re.fullmatch(r"_\(Turn cancelled:[^\n]*?\.\)_"
-                        r"(?:\s*No output was produced before the cancellation\.)?",
+                        r"(?:\s*No output was produced before the cancellation\.)?"
+                        r"(?:\s*Files written so far: [^\n]*\.)?",
                         str(assistant_text or "").strip()):
             assistant_text, prefix_len = "", 0
         # queued messages the turn READ belong before its reply: [u1, q1, a]

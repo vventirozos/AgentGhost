@@ -268,7 +268,7 @@ def _run_hook(fname, op, mut, target, cmd, written, err, unresolved=False, rejec
     self.context._script_iter = written
     outcome = _Ctx()
     outcome.is_rejection = rejection
-    g = {**vars(A), "self": self, "fname": fname, "ptool_op": op, "is_mutating": mut, "ptarget": target,
+    g = {**vars(A), "self": self, "fname": fname, "ptool_op": op, "_recorded_args": {}, "is_mutating": mut, "ptarget": target,
          "a_hash": cmd, "_res_is_error": err, "_res_unresolved": unresolved, "_outcome": outcome}
     tok = L.request_id_context.set(RID)
     try:

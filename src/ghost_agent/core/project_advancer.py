@@ -932,7 +932,8 @@ async def _generate_self_analysis(context, description: str) -> str:
         # §4QA: background ONLY when no user request is live — inside the
         # owner's own autoadvance a background call parks behind its OWN
         # request for 600 s, then raises (live 13:04→13:14, req 571a5020)
-        }, is_background=_idle_invocation(context), task_label="project-self-analysis")
+        }, is_background=_idle_invocation(context), task_label="project-self-analysis",
+            side_main=True)     # §4SD: a foreground call saves the owner's conversation first
         text = ((data or {}).get("choices", [{}])[0]
                 .get("message", {}).get("content") or "").strip()
         if text:
@@ -1000,10 +1001,33 @@ async def advance_once(context, project_id: str, *args, owner_requested: bool = 
     `autoadvance` — so autopilot in production never reads as the owner's work."""
     from ..utils.logging import event_origin_context as _eoc
     _tok = _eoc.set(_tick_origin(owner_requested))
+    # §4SD open items r2/r3 (review MAJORs): a stop after the claim (Slack's
+    # hard limit, the owner's Stop) cancels the tool — every await of the body
+    # caught `Exception` only, and the leaf stayed IN_PROGRESS, unclaimable
+    # until the next boot. A caller that tracks the claim itself (`claim_sink`:
+    # the unattended step, whose `_after_abort` charges and reopens) keeps it.
+    _own = kwargs.get("claim_sink") is None
+    if _own:
+        kwargs["claim_sink"] = []
     try:
         return await _advance_once_body(context, project_id, *args, owner_requested=owner_requested, **kwargs)
+    except asyncio.CancelledError:
+        if _own:
+            _reopen_stopped(getattr(context, "project_store", None), project_id, kwargs["claim_sink"])
+        raise
     finally:
         _eoc.reset(_tok)
+
+
+def _reopen_stopped(store, project_id, claimed) -> None:
+    """The leaf a stopped tick claimed goes back to READY — only while it is
+    still IN_PROGRESS (a leaf the tick had closed, or the owner changed, stays)."""
+    for tid in claimed or []:
+        if store is not None and _task_status(store, project_id, tid) == "IN_PROGRESS":
+            try:
+                store.update_task(tid, status="READY", failure_reason="stopped mid-step")
+            except Exception:  # noqa: BLE001
+                logger.debug("stopped leaf not reset", exc_info=True)
 
 
 def _tick_origin(owner_requested: bool) -> str:
@@ -1784,7 +1808,7 @@ def default_llm_classifier(context):
                     "decision/approval/publish). Output ONLY the one word."
                     "\n\nTASK: " + str(description)[:500])}],
                 "temperature": 0.0, "max_tokens": 8, "stream": False,
-            })
+            }, side_main=True, task_label="project-classify")     # §4SD: the owner's conversation saved first
             out = ((r or {}).get("choices", [{}])[0]
                    .get("message", {}).get("content", "") or "").strip().lower()
             for label in ("needs_user", "coding", "research"):
@@ -1816,7 +1840,7 @@ def default_code_generator(context):
             # carry a whole inline program — 1024 (~3 KB) truncated those mid-
             # script, leaving an unterminated quote.
             "temperature": 0.2, "max_tokens": 4096, "stream": False,
-        })
+        }, side_main=True, task_label="project-command")         # §4SD: the owner's conversation saved first
         out = ((r or {}).get("choices", [{}])[0]
                .get("message", {}).get("content", "") or "").strip()
         if out.startswith("```"):
@@ -1976,11 +2000,13 @@ async def _with_leaf_deadline(coro, deadline: float):
     """§4SD: run ``coro`` with `coding_executor.leaf_deadline_context` set, so a
     coding leaf inside it sizes each file call by the step's time left (and
     stops as out of time rather than starting one the step's cap would cut)."""
-    from .coding_executor import leaf_deadline_context
+    from .coding_executor import caller_waits_context, leaf_deadline_context
     tok = leaf_deadline_context.set(deadline)
+    tok_w = caller_waits_context.set(False)      # §4SD r5: a stopped step does not wait for its build
     try:
         return await coro
     finally:
+        caller_waits_context.reset(tok_w)
         leaf_deadline_context.reset(tok)
 
 
@@ -2063,6 +2089,17 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
         except asyncio.TimeoutError:
             res = _after_abort(store, project_id, claimed, t0,
                                "timeout", f"step passed its {int(timeout)} s cap")
+        except asyncio.CancelledError:
+            # §4SD open items r4 (review MAJOR): the step stopped from outside
+            # (a scheduled/probe batch at its limit, a Stop) — `advance_once`
+            # leaves a tracked claim to this caller: reopened and charged
+            try:                                   # r6 m3: nothing here replaces the cancel
+                _after_abort(store, project_id, claimed, t0, "stopped", "step was stopped")
+                _bump_meta(store, project_id, lambda m: {**m, "unattended_runtime_seconds": float(   # r5 m3
+                    m.get("unattended_runtime_seconds") or 0) + (time.time() - t0)})
+            except Exception:  # noqa: BLE001
+                logger.warning("stopped unattended step not booked", exc_info=True)
+            raise
         except Exception as e:  # noqa: BLE001 — r2 m3: a raising step is charged and scored too
             logger.warning("unattended step on %s raised: %s", project_id, e, exc_info=True)
             res = _after_abort(store, project_id, claimed, t0, "error", f"step raised {type(e).__name__}: {e}")

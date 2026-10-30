@@ -165,6 +165,9 @@ def _chat(c, sid, text):
     CANCEL,
     CANCEL + " No output was produced before the cancellation.",
     "  " + CANCEL + "\n",
+    # §4SD r3: the hard limit's stop adds the files written (the state of work keeps them)
+    "_(Turn cancelled: this request reached its time limit (30 min).)_ No output was produced before the "
+    "cancellation.\n\nFiles written so far: `app.py`, `index.html`.",
 ])
 def test_a_cancel_note_alone_stores_the_request_only(tmp_path, reply):
     async def cancelled(body, bg, request_id=None):

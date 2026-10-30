@@ -224,7 +224,7 @@ async def test_a_raising_stream_leaves_no_stale_probe_flag():
     """§4FJ review M-1: if the stream raises, the bookkeeping still runs, so a
     later unrelated abort is not logged as a failed probe."""
     class Raising(StreamingFakeLLM):
-        async def stream_chat_completion(self, payload, is_background=False):
+        async def stream_chat_completion(self, payload, is_background=False, **_kw):
             self.stream_calls += 1
             raise RuntimeError("socket gone")
             yield  # pragma: no cover

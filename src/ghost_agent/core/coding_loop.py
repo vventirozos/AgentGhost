@@ -524,7 +524,10 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
     # attempt gates and registers them too (else ungated, unregistered)
     carried: List[str] = []
     carried = sorted(set(carried) | set(_CARRY_ACROSS.pop(_carry_key(project_id, description), [])))   # §4PG r3
+    from .coding_executor import _stop_requested
     for attempt in range(1, max(1, int(max_attempts)) + 1):
+        if _stop_requested():                  # §4SD r6: a verify the stop killed is a stop
+            raise asyncio.CancelledError()
         leaf_id = f"{leaf_base}-a{attempt}"
         before = snapshot_workspace(ws)
         prompt = _leaf_prompt(description, ledger, existing_files, research_context,
@@ -664,5 +667,7 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
         detail_parts.append(f"attempt {attempt}: {reason}")
         pretty_log("Leaf Loop", f"attempt {attempt} failed — {_short(reason, 120)}",
                    level="WARNING", icon=Icons.WARN)
+    if _stop_requested():
+        raise asyncio.CancelledError()
     return CodingResult(False, f"agentic leaf failed after {max_attempts} attempt(s): "
                         f"{_short(witness, 200)}", [], "", detail="; ".join(detail_parts))

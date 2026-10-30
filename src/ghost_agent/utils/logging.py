@@ -734,20 +734,34 @@ def note_report_floor(req_id: str, floor_s: float) -> None:
             s["floor_s"] = f
 
 
-def note_code_progress(req_id: str, what: str = "", key: str = "") -> bool:
+#: §4SD: whole-file rewrites of ONE file that count as progress per request —
+#: a loop rewriting a file with different text every time earned extensions
+#: forever (no time ceiling on web/CLI); appends, edits and runs still count
+MAX_COUNTED_REWRITES = 5
+
+
+def note_code_progress(req_id: str, what: str = "", key: str = "",
+                       rewrite_of: str = "") -> bool:
     """§4RA: this request just made coding progress (the turn loop decides
     what counts — `core.agent.is_code_progress`). §4SD review: with no time
     ceiling a loop that writes the SAME content again never stalled — a
     ``key`` (the write's operation, target and arguments) counts once per
-    request. Returns whether it counted."""
+    request. §4SD: ``rewrite_of`` names the file a whole-file write replaced;
+    past `MAX_COUNTED_REWRITES` of it, a rewrite is not progress. Returns
+    whether it counted."""
     with _REQ_STATE_LOCK:
         s = _REQ_STATE.get(req_id)
         if s is None:
             return False
-        if key:
-            seen = s.setdefault("progress_keys", set())
-            if key in seen:
+        seen = s.setdefault("progress_keys", set())
+        if key and key in seen:
+            return False
+        if rewrite_of:
+            rewrites = s.setdefault("rewrites", {})
+            if rewrites.get(rewrite_of, 0) >= MAX_COUNTED_REWRITES:
                 return False
+            rewrites[rewrite_of] = rewrites.get(rewrite_of, 0) + 1
+        if key:
             seen.add(key)
         s["progress_t"] = time.monotonic()
         s["progress_what"] = str(what or "")
