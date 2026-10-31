@@ -724,10 +724,11 @@ async def _run_in_sandbox(sandbox_manager, cmd_str, *, timeout=_EXEC_TIMEOUT_S,
         _delegate_run = False
     if getattr(sandbox_manager, "supports_job_promotion", False) is not True \
             or runner is None or _delegate_run:
-        # §4NS: a delegated sub-agent's command is never promoted — its
-        # landing woke the MAIN agent with the full tool surface (outside the
-        # sub-agent's allow-list), survived a cancel, and a probe's delegate
-        # woke a real turn. It runs to its budget like any sub-agent work.
+        # §4NS: a `sub-job-` turn's command is never promoted — its landing
+        # woke the MAIN agent with the full tool surface, survived a cancel,
+        # and a probe's job woke a real turn. (The delegate sub-agents that
+        # first used the prefix were removed in §4SI; `main._resume_after_job`
+        # still starts background wake turns as `sub-job-…`.)
         output, exit_code = await asyncio.to_thread(
             sandbox_manager.execute, cmd_str, timeout=timeout, **kwargs)
         return output, exit_code, None
@@ -1990,8 +1991,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         forbidden_modules = [
             "knowledge_base", "system_utility", "manage_tasks",
             "postgres_admin", "web_search", "fact_check", "deep_research",
-            "vision_analysis", "delegate_to_swarm",
-            "learn_skill", "update_profile", "dream_mode", "browser",
+            "vision_analysis",
+            "learn_skill", "update_profile", "browser",
         ]
         
         # Check for direct imports or pip installs

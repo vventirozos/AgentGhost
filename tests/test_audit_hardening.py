@@ -55,12 +55,10 @@ def test_agent_extract_json_fallback_logging():
 async def test_llm_client_node_optional_none_getters():
     client = LLMClient("http://mock-url")
     # Since we changed type hints to Optional[str], calling with None should resolve dynamically
-    swarm_res = client.get_swarm_node(target_model=None)
     vision_res = client.get_vision_node(target_model=None)
     worker_res = client.get_worker_node(target_model=None)
     coding_res = client.get_coding_node(target_model=None)
     
-    assert swarm_res is None or isinstance(swarm_res, dict)
     assert vision_res is None or isinstance(vision_res, dict)
     assert worker_res is None or isinstance(worker_res, dict)
     assert coding_res is None or isinstance(coding_res, dict)

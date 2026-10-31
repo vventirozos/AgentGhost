@@ -112,25 +112,6 @@ def test_weather_never_geocodes_the_street_address(tmp_path):
 
 
 # ── delegates and public replies ─────────────────────────────────────────────
-def test_a_delegate_carries_no_owner_memory(tmp_path):
-    """Fails where sub-agents and coding leaves rebuilt a bus from the
-    read-only stores and shared the owner's scratchpad and past requests."""
-    from ghost_agent.core.subagent import build_subagent_context
-    from ghost_agent.core.coding_loop import build_leaf_context
-    from ghost_agent.core.agent import GhostAgent
-    from ghost_agent.core.bus import MemoryBus
-    ctx = MagicMock()
-    ctx.sandbox_dir = tmp_path
-    ctx.args = SimpleNamespace(sandbox_dir=str(tmp_path))
-    ctx.scratchpad = MagicMock(list_all=MagicMock(return_value="MARK-SCRATCH"))
-    for iso in (build_subagent_context(ctx, job_id="j1", allowed_tools=["web_search"]),
-                build_leaf_context(ctx, leaf_id="l1")):
-        assert iso.owner_memory_isolated is True
-        assert "MARK-SCRATCH" not in str(iso.scratchpad.list_all())
-        bus = GhostAgent._get_memory_bus(SimpleNamespace(context=iso))
-        assert isinstance(bus, MemoryBus) and bus.vector is None and bus.graph is None
-
-
 @pytest.mark.asyncio
 async def test_a_public_owner_reply_carries_no_private_context(monkeypatch, tmp_path):
     """Fails where the PUBLIC REPLY notice said "not loaded" while the
@@ -261,39 +242,6 @@ async def test_the_tool_itself_scrubs_a_call_that_skips_the_dispatch(tmp_path):
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
     await _egress_scrubbed("darkweb_research", inner, ctx)(query="Makedonias 83 Thrakomakedones")
     assert "Makedonias 83" not in inner.await_args.kwargs["query"]
-
-
-@pytest.mark.asyncio
-async def test_a_delegate_cannot_recall_and_its_searches_are_scrubbed(tmp_path):
-    """Fails where a delegate's `recall` read the owner's store ("User address
-    is Makedonias 83 …") and, with no profile, its web_search was unscrubbed."""
-    from ghost_agent.core.subagent import build_subagent_context
-    from ghost_agent.tools.registry import get_available_tools
-    from tests.helpers import make_context
-    ctx = make_context()
-    ctx.sandbox_dir = tmp_path
-    ctx.profile_memory = _profile(tmp_path)
-    ctx.memory_system = MagicMock()
-    ctx.tor_proxy = None
-    iso = build_subagent_context(ctx, job_id="j1", allowed_tools=["web_search", "recall"])
-    tools = get_available_tools(iso)
-    out = tools["recall"](query="user home")
-    out = await out if asyncio.iscoroutine(out) else out
-    assert "not available" in out
-    ctx.memory_system.search_advanced.assert_not_called()
-    import ghost_agent.tools.registry as R
-    seen = {}
-
-    async def _search(**kw):
-        seen.update(kw)
-        return "results"
-    R_tool = R.tool_search
-    try:
-        R.tool_search = _search
-        await get_available_tools(iso)["web_search"](query="pizza Makedonias 83")
-    finally:
-        R.tool_search = R_tool
-    assert "Makedonias 83" not in seen["query"] and "Thrakomakedones" in seen["query"]
 
 
 def test_weather_uses_the_locality_of_an_address():

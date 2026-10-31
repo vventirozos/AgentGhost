@@ -33,7 +33,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>memory / readonly.py — read-only store façades</h1>
-  <p class="subtitle">Isolate an agent that may READ the operator's memory but must never WRITE it — today the delegated <a href="../core/delegation.html">sub-agent</a>.</p>
+  <p class="subtitle">Isolate an agent that may READ the operator's memory but must never WRITE it — today the <a href="../core/coding_loop.html">coding-loop leaves</a> (and the knowledge-base path in tools/memory.py). It was written for the delegated sub-agent, removed 2026-10-30 (&sect;4SI).</p>
 
   <h2>Model (hardened 2026-07-14 bug hunt)</h2>
   <p><strong>Default-allow-reads / explicit-deny-writes.</strong> A base <code>_ReadOnlyProxy</code> proxies every attribute through to the real store EXCEPT: names in the subclass <code>_MUTATORS</code> set (return a no-op) and names in <code>_BLOCKED_ATTRS</code> (return <code>None</code>). <code>is_read_only = True</code> is exposed so callers that branch on it (the agent's simulation check that labels such turns <code>sim</code>, and the Perfect-It skip) see the wrap. The real store is held as <code>_real</code>, so <code>proxy.real</code> hits <code>__getattr__</code> and is blocked.</p>

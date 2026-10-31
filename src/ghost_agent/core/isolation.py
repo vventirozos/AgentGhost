@@ -325,8 +325,7 @@ class BackgroundOnlyLLM:
     production client — that counter is what the biological watchdog
     waits on, and a self-play cycle holding it blocked the watchdog for
     the whole cycle. Moved out of ``synthetic_self_play`` with the
-    façades; ``core/subagent.py`` still carries its own identical copy
-    (its context build is a different, proven recipe — left alone)."""
+    façades (``core/subagent.py`` carried its own copy until §4SI removed it)."""
 
     def __init__(self, inner):
         self._inner = inner
@@ -861,9 +860,9 @@ def _remove_workspace(workspace: Path) -> bool:
 # Tool containment
 # ---------------------------------------------------------------------------
 
-#: Tools a replayed episode must never call, as a superset of the two
-#: precedents in this repo: ``core/subagent.py::FORBIDDEN_TOOLS`` and the
-#: self-play denylist in ``core/dream.py``. Everything here writes state
+#: Tools a replayed episode must never call, as a superset of the
+#: precedents in this repo: the self-play denylist in ``core/dream.py`` (and
+#: ``core/subagent.py::FORBIDDEN_TOOLS`` until §4SI removed it). Everything here writes state
 #: the fork does not own, reaches the operator, or recurses into the
 #: machinery running the replay.
 #:
@@ -872,10 +871,8 @@ def _remove_workspace(workspace: Path) -> bool:
 #: dropped at selection time — running it with the tool denied produces a
 #: verdict about a crippled agent, which is worse than no verdict.
 REPLAY_FORBIDDEN_TOOLS = frozenset({
-    # recursion into the machinery running the replay
-    "dream_mode",
     # operator-visible / outward
-    "notify_operator", "delegate", "delegate_to_swarm", "deploy",
+    "notify_operator", "deploy",
     # §4QA: main-slot model calls + a project write — never inside a replay
     "probe_model",
     # HOST-PROCESS EGRESS. `network="none"` covers the CONTAINER; these
@@ -908,7 +905,7 @@ def restrict_tool_surface(agent, forbidden=None) -> frozenset:
     Filtering the dispatch dict alone does not contain an agent — the
     model is still SHOWN the tool in its schema and keeps proposing it,
     and a dispatch MISS rebuilds the dict from the full registry.
-    ``core/subagent.py`` paid for each of these separately; the same
+    ``core/subagent.py`` (removed §4SI) paid for each of these separately; the same
     three levers are applied here:
 
       1. ``disabled_tools`` — the only lever that filters the advertised

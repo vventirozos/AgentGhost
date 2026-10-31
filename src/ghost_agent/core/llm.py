@@ -719,7 +719,7 @@ def _stamp_leg(result, leg: str, fell_back_from: str = "",
 def served_leg(result) -> dict:
     """`{"served_by": …, "fell_back_from": …}` for a chat_completion result.
 
-    `served_by` is one of: main, worker, critic, vision, coding, swarm.
+    `served_by` is one of: main, worker, critic, vision, coding.
     `fell_back_from` names the pool that was REQUESTED and failed (empty when
     the requested leg served it)."""
     if isinstance(result, dict):
@@ -1083,7 +1083,7 @@ DEFAULT_UPSTREAM_URL = "http://127.0.0.1:8088"
 
 
 class LLMClient:
-    def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None, node_api_key: Optional[str] = None):
+    def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None, node_api_key: Optional[str] = None):
         self.upstream_url = upstream_url
         limits = httpx.Limits(max_keepalive_connections=3, max_connections=15, keepalive_expiry=30.0)
 
@@ -1202,26 +1202,6 @@ class LLMClient:
             follow_redirects=True,
             http2=False
         )
-
-        self.swarm_clients = []
-        self._swarm_index = 0
-
-        if swarm_nodes:
-            for node in swarm_nodes:
-                client = httpx.AsyncClient(
-                    base_url=node["url"],
-                    timeout=1200.0,
-                    limits=limits,
-                    proxy=get_proxy(node["url"]),
-                    trust_env=False,
-                    follow_redirects=True,
-                    http2=False
-                )
-                self.swarm_clients.append({
-                    "client": client,
-                    "url": node["url"],
-                    "model": node["model"]
-                })
 
         self.worker_clients = []
         self._worker_index = 0
@@ -1790,7 +1770,7 @@ class LLMClient:
         import contextlib
         with contextlib.suppress(Exception):
             await self.http_client.aclose()
-        for attr in ('swarm_clients', 'worker_clients', 'vision_clients',
+        for attr in ('worker_clients', 'vision_clients',
                      'coding_clients', 'image_gen_clients', 'critic_clients'):
             for node in getattr(self, attr, []) or []:
                 client = node.get("client") if isinstance(node, dict) else None
@@ -1809,36 +1789,6 @@ class LLMClient:
         self._node_slot_built_cap.clear()
         self._node_slot_locks.clear()
         self._node_cap_retry_at.clear()
-
-    def get_swarm_node(self, target_model: Optional[str] = None, *,
-                              require_healthy: bool = False) -> Optional[Dict[str, Any]]:
-        if not getattr(self, 'swarm_clients', []):
-            return None
-
-        # Consult the circuit breaker on the target-model match too — the
-        # ONLY thing get_swarm_node was missing vs the vision/worker/coding
-        # selectors. Without it a dead swarm node stayed in round-robin
-        # rotation forever, eating a full 300 s timeout on every cycle. (The
-        # round-robin fallback when a target_model isn't matched is deliberate
-        # best-effort — same as the sibling selectors.)
-        if target_model:
-            target_lower = target_model.lower()
-            for node in self.swarm_clients:
-                if target_lower in node["model"].lower() and self.circuit_breaker.is_available(node["url"]):
-                    return node
-
-        for _ in range(len(self.swarm_clients)):
-            node = self.swarm_clients[self._swarm_index]
-            self._swarm_index = (self._swarm_index + 1) % len(self.swarm_clients)
-            if self.circuit_breaker.is_available(node["url"]):
-                return node
-        # All nodes tripped. See the sibling selectors: returning a sick node
-        # anyway is deliberate for callers whose alternative is worse, and
-        # `require_healthy=True` is the opt-in for callers with a free
-        # fallback (LLM review R2 lens B, item 1).
-        if require_healthy:
-            return None
-        return self.swarm_clients[self._swarm_index]
 
     def get_vision_node(self, target_model: Optional[str] = None, *,
                                require_healthy: bool = False) -> Optional[Dict[str, Any]]:
@@ -2622,7 +2572,7 @@ class LLMClient:
     # a missing attribute into a DEAD USER TURN. This is pure diagnostics;
     # it must never be able to break a stream.
     #
-    # (The `_BackgroundOnlyLLM` shims in subagent.py / dream.py are NOT a
+    # (The `BackgroundOnlyLLM` shims in isolation.py / coding_loop.py are NOT a
     # reason: they delegate `stream_chat_completion` to the inner REAL
     # client, so `self` here is never the shim. Checked, not assumed.)
     def _inflight_map(self) -> Dict[str, int]:
@@ -2691,7 +2641,7 @@ class LLMClient:
         except Exception:  # noqa: BLE001
             return None
 
-    async def _do_chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None) -> Dict[str, Any]:
+    async def _do_chat_completion(self, payload: Dict[str, Any], use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None) -> Dict[str, Any]:
         """
         Sends a chat completion request to the upstream LLM with robust retry logic.
         """
@@ -2889,8 +2839,7 @@ class LLMClient:
         _requested_pool = ("vision" if use_vision else
                            "worker" if use_worker else
                            "critic" if use_critic else
-                           "coding" if use_coding else
-                           "swarm" if use_swarm else "")
+                           "coding" if use_coding else "")
         # Read by nothing since R4 removed the unconfigured-pool raise; kept
         # only because the log line below reads better with a name than with
         # the expression. If you find yourself branching on it, re-read the
@@ -2900,8 +2849,7 @@ class LLMClient:
             getattr(self, "vision_clients", None) if use_vision else
             getattr(self, "worker_clients", None) if use_worker else
             getattr(self, "critic_clients", None) if use_critic else
-            getattr(self, "coding_clients", None) if use_coding else
-            getattr(self, "swarm_clients", None) if use_swarm else True)
+            getattr(self, "coding_clients", None) if use_coding else True)
         # Heartbeat traffic logs transitions, not ticks (see keepalive_workers)
         # — its per-ping routing/failure lines stay at debug.
         # Heartbeat-class callers: their whole point is to run constantly, so
@@ -3345,93 +3293,6 @@ class LLMClient:
                     pretty_log("Coding Compute Failed", "All coding nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
                 fell_back_from_node = True
 
-        elif use_swarm and self.swarm_clients:
-            _pool_leg = "swarm"
-            target_model = payload.get("model")
-            tried_nodes = []
-
-            node = self.get_swarm_node(target_model, require_healthy=require_healthy)
-            if node is None:
-                # Same guard as worker/critic/coding: a pool that
-                # yields nothing must set the fallback flag, or
-                # `off_main_only` is skipped and the timeout is
-                # stripped. R2 added this to three branches and
-                # missed the two the comment did not sit next to
-                # (found independently by R3 lenses A and B).
-                fell_back_from_node = True
-
-            if node:
-                for _ in range(len(self.swarm_clients)):
-                    if not node:
-                        break
-
-                    if node in tried_nodes:
-                        target_model = None
-                        node = self.get_swarm_node(target_model, require_healthy=require_healthy)
-
-                    loop_breaker = 0
-                    while node in tried_nodes and loop_breaker < len(self.swarm_clients):
-                        node = self.get_swarm_node(None, require_healthy=require_healthy)
-                        loop_breaker += 1
-
-                    # Every swarm node has been exhausted — break the outer
-                    # retry loop instead of re-appending and hammering the
-                    # same dead node again (mirrors the vision/coding guard).
-                    if node in tried_nodes:
-                        break
-
-                    tried_nodes.append(node)
-
-                    pretty_log("Edge Compute", f"Routing request to Swarm Node ({node['model']})", level="INFO", icon=Icons.NODE_EDGE)
-                    try:
-                        import copy as _copy, json
-                        node_payload = _copy.deepcopy(payload)
-                        node_payload["model"] = node["model"]
-
-                        body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('utf-8')
-
-                        kwargs = {}
-                        _untried = max(1, len(self.swarm_clients) - len(tried_nodes) + 1)
-                        async with self._node_slot(
-                                node, wait_timeout=_gate_wait(_untried)):
-                            _t = _http_budget(timeout)
-                            if _t is _BUDGET_BLOWN:
-                                raise NodeSaturated(
-                                f"{node.get('model') or node.get('url')}: "
-                                f"the caller's total budget is spent; "
-                                f"declining the permit rather than "
-                                f"POSTing a request that cannot finish")
-                            if _t is not None:
-                                kwargs["timeout"] = _t
-                            resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
-                            # ⚠ READ IT INSIDE THE PERMIT. `_on_node_success`
-                            # runs after this block, by which point the gate's
-                            # `finally` has already discarded the bookkeeping —
-                            # so `observe()` was handed 1 on EVERY call and the
-                            # whole normalisation was dead code. Measured: 3
-                            # inside the permit, 1 after it.
-                            _conc = self._run_concurrency(node.get("url") or "")
-                        resp.raise_for_status()
-                        return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
-                    except Exception as e:
-                        if _charge_node_fault(self, node, e, task_label):
-                            self.circuit_breaker.record_failure(node["url"])
-                        if not _quiet:
-                            pretty_log("Swarm Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
-                        target_model = None
-                        node = self.get_swarm_node(target_model, require_healthy=require_healthy)
-                        continue
-
-                if off_main_only:
-                    if not _quiet:
-                        pretty_log("Edge Nodes Unavailable",
-                                   "all swarm nodes failed; this caller is "
-                                   "off-main-only, so nothing runs on the 35B",
-                                   level="WARNING", icon=Icons.WARN)
-                elif not _quiet:
-                    pretty_log("Edge Compute Failed", "All swarm nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
-                fell_back_from_node = True
-
         # ---- main-upstream fallback -------------------------------------
         # Reached either because no off-main pool was requested/configured, or
         # because every node in the requested pool FAILED.
@@ -3487,7 +3348,7 @@ class LLMClient:
             # sized for the 35B, not the caller's node budget and not
             # infinity (three independent lenses, 2026-08-18).
             timeout = _main_fallback_budget(timeout)
-        elif use_worker or use_critic or use_coding or use_swarm:
+        elif use_worker or use_critic or use_coding:
             # ⚠ NO `timeout is not None` GUARD. R4 removed the
             # unconfigured-pool raise on the stated grounds that "the correct
             # handling already exists twenty lines below: this arm bounds the
@@ -3539,8 +3400,8 @@ class LLMClient:
                         requested=_requested_pool or "main")
                 except ValueError as je:   # JSONDecodeError subclasses ValueError
                     # NB: do not reference `json` here — conditional `import json`
-                    # in the swarm branches above makes the name function-local
-                    # and thus unbound on this (no-swarm) path.
+                    # in the node branches above makes the name function-local
+                    # and thus unbound on this (main-only) path.
                     body_len = len(resp.text or "")
                     if attempt < 1:
                         # A LARGE non-JSON 200 body that starts with "data:"
@@ -3621,7 +3482,7 @@ class LLMClient:
                 self._idle_window_admits = 0
 
     _POOL_ATTR = {"worker": "worker_clients", "critic": "critic_clients", "vision": "vision_clients",
-                  "swarm": "swarm_clients", "coding": "coding_clients"}
+                  "coding": "coding_clients"}
 
     def _served_on_main_box(self, served: str) -> bool:
         """§4OT r1: the leg that served a call ran on the single MAIN slot —
@@ -3795,10 +3656,10 @@ class LLMClient:
             raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'} "
                                      "(a request started during the conversation save)")
 
-    def _pool_is_main_box(self, use_swarm, use_worker, use_vision, use_coding, use_critic) -> bool:
+    def _pool_is_main_box(self, use_worker, use_vision, use_coding, use_critic) -> bool:
         """§4RW-g: the requested pool's every node is the main server (live:
         the vision pool, http://127.0.0.1:8088)."""
-        flags = (("swarm", use_swarm), ("worker", use_worker), ("vision", use_vision),
+        flags = (("worker", use_worker), ("vision", use_vision),
                  ("coding", use_coding), ("critic", use_critic))
         pool = next((name for name, on in flags if on), None)
         return bool(pool) and self._served_on_main_box(pool)
@@ -3830,7 +3691,7 @@ class LLMClient:
         except Exception as e:  # noqa: BLE001
             logger.info("before-main-dispatch hook skipped: %s: %s", type(e).__name__, e)
 
-    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None, before_dispatch=None, side_main: bool = False) -> Dict[str, Any]:
+    async def chat_completion(self, payload: Dict[str, Any], use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None, before_dispatch=None, side_main: bool = False) -> Dict[str, Any]:
         # ``side_main`` (§4SC): a foreground call of the request's own that does
         # NOT open with the head (the §4OB cut-write continuation) displaces the
         # conversation in the slot exactly as a picture look does — llama cannot
@@ -3840,7 +3701,7 @@ class LLMClient:
         if is_background:
             # The foreground wait protects exactly one resource: the MAIN
             # inference slot. A call that will be served by an off-main
-            # pool (worker/critic/vision/swarm) doesn't contend for it, so
+            # pool (worker/critic/vision/coding) doesn't contend for it, so
             # parking it behind an active user request is pure added
             # latency — and for calls awaited inline it was a deadlock-
             # shaped self-stall (the request waits on a call that waits on
@@ -3879,7 +3740,6 @@ class LLMClient:
                 (use_worker and _pool_is_off_main(getattr(self, "worker_clients", None)))
                 or (use_critic and _pool_is_off_main(getattr(self, "critic_clients", None)))
                 or (use_vision and _pool_is_off_main(getattr(self, "vision_clients", None)))
-                or (use_swarm and _pool_is_off_main(getattr(self, "swarm_clients", None)))
                 or (use_coding and _pool_is_off_main(getattr(self, "coding_clients", None)))
             )
             # §4O A-MAJOR-1: only MAIN-targeted background calls contend for
@@ -3945,7 +3805,7 @@ class LLMClient:
                         if (str(task_label or "").startswith("main-prefix")
                                 and int(getattr(self, "foreground_requests", 0) or 0) > 0):
                             raise BackgroundDeferred(f"background call deferred: {task_label}")
-                _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
+                _result = await self._do_chat_completion(payload, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)
                 _leg = served_leg(_result)
@@ -3966,7 +3826,7 @@ class LLMClient:
                 self.foreground_tasks += 1
             try:
                 _side = False
-                if side_main and not off_main_only and not (use_swarm or use_worker or use_vision
+                if side_main and not off_main_only and not (use_worker or use_vision
                                                             or use_coding or use_critic):
                     _side = True                                   # §4SC: the cut-write continuation
                     # §4SC-b: named by its label (fact-check verify, probe,
@@ -3979,9 +3839,9 @@ class LLMClient:
                         await self._before_side_main_dispatch(payload)
                     finally:
                         _side_call_what_ctx.reset(_what_tok)
-                elif not (use_swarm or use_worker or use_vision or use_coding or use_critic or off_main_only):
+                elif not (use_worker or use_vision or use_coding or use_critic or off_main_only):
                     await self._before_main_dispatch(payload)
-                elif self._pool_is_main_box(use_swarm, use_worker, use_vision, use_coding, use_critic):
+                elif self._pool_is_main_box(use_worker, use_vision, use_coding, use_critic):
                     # §4SC-d: `off_main_only` governs the FALLBACK, not where the
                     # pool lives — a pool that IS the main box displaces the
                     # conversation either way; `_side` so a failed prefill is
@@ -3989,7 +3849,7 @@ class LLMClient:
                     _side = True
                     await self._before_side_main_dispatch(payload)
                 try:
-                    _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
+                    _result = await self._do_chat_completion(payload, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 except BaseException:
                     if _side:
                         # §4RW-g review: a look that timed out mid-prefill left

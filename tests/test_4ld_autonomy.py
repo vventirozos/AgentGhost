@@ -126,18 +126,6 @@ def test_a_probe_cannot_confirm_a_deletion():
     assert not _not_the_user("web-5")
 
 
-def test_sub_agents_are_capped_across_calls():
-    """Fails where the per-call cap let a turn delegate again and again."""
-    from ghost_agent.core.jobs import get_job_registry
-    from ghost_agent.tools.delegate import tool_delegate, MAX_RUNNING_DELEGATES
-    ctx = SimpleNamespace(llm_client=SimpleNamespace(foreground_requests=0))
-    reg = get_job_registry(ctx)
-    for i in range(MAX_RUNNING_DELEGATES):
-        reg.register("subagent", f"t{i}")
-    out = asyncio.run(tool_delegate(task="research X", context=ctx))
-    assert "already running" in out
-
-
 # ── unprompted messages ──────────────────────────────────────────────────────
 def test_a_launched_job_is_not_reported_done(monkeypatch, tmp_path):
     """Fails where "notify me when it's done" sent "Done — I've started the
@@ -150,7 +138,7 @@ def test_a_launched_job_is_not_reported_done(monkeypatch, tmp_path):
     import ghost_agent.core.autonomous_activity as aa
     monkeypatch.setattr(aa, "get_activity_log", lambda c: log)
     job = get_job_registry(ctx).register("subagent", "run the benchmark")
-    tools = [{"name": "delegate", "content": f"Started {job.id} (running in the background)"}]
+    tools = [{"name": "execute", "content": f"Started {job.id} (running in the background)"}]
     fired = A._notify_promise_backstop(ctx, last_user_content="run the benchmark and notify me when it's done",
                                        tools_run=tools, final_content=f"I've started {job.id}.", req_id="web-1",
                                        had_failures=False)

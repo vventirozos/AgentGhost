@@ -228,8 +228,7 @@ def test_the_dispatch_path_actually_USES_the_gate():
     pools = [("vision_clients", "_vision_index", dict(use_vision=True)),
              ("worker_clients", "_worker_index", dict(use_worker=True)),
              ("critic_clients", "_critic_index", dict(use_critic=True)),
-             ("coding_clients", "_coding_index", dict(use_coding=True)),
-             ("swarm_clients", "_swarm_index", dict(use_swarm=True))]
+             ("coding_clients", "_coding_index", dict(use_coding=True))]
     ungated = []
     for attr, idx, kw in pools:
         c = LLMClient("http://main.invalid:8088")

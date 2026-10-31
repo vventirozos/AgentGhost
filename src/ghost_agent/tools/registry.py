@@ -11,15 +11,11 @@ from .browser import tool_browser
 from .sandbox_services import (
     tool_manage_services, MANAGE_SERVICES_TOOL_DEFINITION,
 )
-from .delegate import (
-    tool_delegate, tool_jobs,
-    DELEGATE_TOOL_DEFINITION, JOBS_TOOL_DEFINITION,
-)
+from .delegate import tool_jobs, JOBS_TOOL_DEFINITION
 from .probe_model import tool_probe_model, PROBE_MODEL_TOOL_DEFINITION  # §4QA
 from .notify_tool import (
     tool_notify_operator, NOTIFY_OPERATOR_TOOL_DEFINITION,
 )
-from .swarm import tool_delegate_to_swarm
 from .acquired_skills import tool_create_skill, tool_manage_skills, AcquiredSkillManager
 from .composed_skills import (
     register_composed_skills,
@@ -581,45 +577,14 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]],
     return out
 
 TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "delegate_to_swarm",
-            "description": "Send MULTIPLE time-consuming tasks to a background cluster of specialized AI workers. Provide an array of tasks. They will run simultaneously and save answers to your SCRAPBOOK.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "instruction": {"type": "string", "description": "Exactly what the swarm worker should do with the data."},
-                                "input_data": {"type": "string", "description": "The raw text, URL contents, or data to be processed."},
-                                "output_key": {"type": "string", "description": "The Scratchpad key where the result will be saved (e.g., 'api_docs_summary')."},
-                                "worker_persona": {"type": "string", "description": "Optional. A custom system prompt to inject into the swarm worker (e.g., 'You are a strict security auditor. Find vulnerabilities in this code.')."},
-                                "target_model": {"type": "string", "description": "Optional model name to target a specific swarm node."}
-                            },
-                            "required": ["instruction", "input_data", "output_key"]
-                        },
-                        "description": "List of tasks to execute in parallel."
-                    },
-                    "await_results": {
-                        "type": "boolean",
-                        "description": "If true, BLOCK until every dispatched task completes and return the aggregated results in the response. Defaults to false (fire-and-forget — the call returns immediately with task IDs and results land in the SCRAPBOOK asynchronously). Set this to true ONLY when you have no other useful work to do until the swarm responds.",
-                        "default": False
-                    }
-                },
-                "required": ["tasks"]
-            }
-        }
-    },
     {"type": "function", "function": {"name": "system_utility", "description": "MANDATORY for Real-Time Data. Use this to perform DIAGNOSTICS/FULL HEALTH CHECK, get user location, or get the weather: current conditions plus a 7-day daily forecast, every day labelled with its weekday and date (answer 'tomorrow' / 'at the weekend' from those labels). (Do NOT use this for time, the exact current time is already in your SYSTEM STATE).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["check_weather", "check_health", "check_location"]}, "location": {"type": "string", "description": "Required ONLY for 'check_weather'. Specify the city name (e.g., 'Paris'). Leave empty for local weather."}, "hourly": {"type": "boolean", "description": "Only for 'check_weather': true also returns today and tomorrow in 3-hour steps — for a time of day ('this evening', 'at 6pm'). Default false."}}, "required": ["action"]}}},
     {
         "type": "function",
         "function": {
             "name": "file_system",
-            "description": "Unified file manager. ALWAYS use this to list, read, write. Use operation='search' for instantaneous high-performance ripgrep text searching across the codebase. Use operation='find' to locate files by wildcard name (e.g. '*.py'). To change an existing file use operation='edit' (old_string → new_string, exact and unique). LARGE FILES: one reply carries at most ~16k–64k tokens including your thinking (fewer the longer the conversation; 16k ≈ 40KB of code, less for Greek text) — a bigger 'write' is CUT OFF and nothing is written. Write a file of any size in PARTS split at line boundaries: the first with operation='write' and more_parts=true, each next one (~15KB) with append=true and more_parts=true, the LAST with append=true only; or split the work into several files (index.html + style.css + app.js); or write a compact skeleton and fill its sections with operation='edit' (each fill under ~15KB — a longer call is cut off). To ADD text at the END of a file always use append=true, never an 'edit' (its anchor must be unique, and long text repeats lines). DARK-WEB FILES: operation='download' with a .onion URL fetches over Tor into a QUARANTINE outside the workspace (owner only): the file cannot be read, run, opened or served; it gets a sha256 id. operation='quarantine_inspect' (quarantine_id) returns a safe report made in an isolated container (type, hashes, strings, PDF text, archive listing — never an extraction); 'quarantine_list' and 'quarantine_delete' manage the files, which are purged after 7 days.",
+            # §4SH/§4SI (2026-10-30): the parts text names the close-by-content rule,
+            # the empty-append finish and "do not draft the whole file in your thinking".
+            "description": "Unified file manager. ALWAYS use this to list, read, write. Use operation='search' for instantaneous high-performance ripgrep text searching across the codebase. Use operation='find' to locate files by wildcard name (e.g. '*.py'). To change an existing file use operation='edit' (old_string → new_string, exact and unique). LARGE FILES: one reply carries at most ~16k–64k tokens including your thinking (fewer the longer the conversation; 16k ≈ 40KB of code, less for Greek text) — a bigger 'write' is CUT OFF (a new file's cut write is saved as a first part; anything else is not written). Write a file of any size in PARTS split at line boundaries: the first with operation='write' and more_parts=true, each next one (~15KB) with append=true and more_parts=true, the LAST with append=true only (an appended part that ends the document — </html>, </svg>, complete JSON — closes the file by itself; do not draft the whole file in your thinking first, write it part by part); or split the work into several files (index.html + style.css + app.js); or write a compact skeleton and fill its sections with operation='edit' (each fill under ~15KB — a longer call is cut off). To ADD text at the END of a file always use append=true, never an 'edit' (its anchor must be unique, and long text repeats lines). DARK-WEB FILES: operation='download' with a .onion URL fetches over Tor into a QUARANTINE outside the workspace (owner only): the file cannot be read, run, opened or served; it gets a sha256 id. operation='quarantine_inspect' (quarantine_id) returns a safe report made in an isolated container (type, hashes, strings, PDF text, archive listing — never an extraction); 'quarantine_list' and 'quarantine_delete' manage the files, which are purged after 7 days.",
             "parameters": {
                 "type": "object",
                 "properties": {"name": {"type": "string", "description": "operation='symbols' ONLY: the symbol (function / class / constant) whose DEFINITION you want to locate across the project."}, 
@@ -662,11 +627,11 @@ TOOL_DEFINITIONS = [
                     },
                     "append": {
                         "type": "boolean",
-                        "description": "Optional for 'write' (default false): add 'content' to the END of the existing file instead of replacing it — how a file too big for one reply is written in parts. The file must already exist (write the first part without append)."
+                        "description": "Optional for 'write' (default false): add 'content' to the END of the existing file instead of replacing it — how a file too big for one reply is written in parts. The file must already exist (write the first part without append). append=true with content='' finishes a file left open for parts."
                     },
                     "more_parts": {
                         "type": "boolean",
-                        "description": "Optional for 'write' (default false): more parts of this file follow, so it is not checked for syntax yet. Leave it off on the LAST part."
+                        "description": "Optional for 'write' (default false): more parts of this file follow, so its syntax verdict waits for the last part. Leave it off on the LAST part. An appended part that ends the document closes the file even if this is set."
                     },
                     "replace_all": {
                         "type": "boolean",
@@ -733,7 +698,6 @@ TOOL_DEFINITIONS = [
         }
     },
     MANAGE_SERVICES_TOOL_DEFINITION,
-    DELEGATE_TOOL_DEFINITION,
     JOBS_TOOL_DEFINITION,
     NOTIFY_OPERATOR_TOOL_DEFINITION,
     PROBE_MODEL_TOOL_DEFINITION,
@@ -750,7 +714,6 @@ TOOL_DEFINITIONS = [
     {"type": "function", "function": {"name": "update_profile", "description": "Save a permanent fact about the user (name, preferences, location). To DELETE a stored fact, pass its key with an empty value (\"\").", "parameters": {"type": "object", "properties": {"category": {"type": "string", "description": "The category for this fact (e.g., 'root', 'preferences', 'projects', 'assets', 'relationships', 'interests')."}, "key": {"type": "string"}, "value": {"type": "string", "description": "The fact to store. An empty string deletes the key from the profile."}}, "required": ["category", "key", "value"]}}},
     MANAGE_PROJECTS_TOOL_DEF,
     {"type": "function", "function": {"name": "manage_tasks", "description": "Consolidated task manager. Actions: 'create' (a TIME-based scheduled task — fires on a cron/interval clock), 'watch' (a REACTIVE task — polls a shell condition and fires only WHEN it becomes true), 'list', 'stop', 'stop_all'. Tasks persist across agent restarts. A name already in use is refused — stop the old task first ('stop') or choose another name. Use 'watch' when the trigger is a CONDITION not a time — e.g. 'when the NetMon dashboard reports the internet is down, notify me', 'when errors appear in the deploy log, investigate', 'when disk on ghost exceeds 90%, clean up'. The check_command runs in your sandbox (reaches the LAN/tailnet directly), and fires the reaction the moment it first exits 0 (edge-triggered — it won't spam while the condition stays true).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "watch", "list", "stop", "stop_all"]}, "task_name": {"type": "string", "description": "A short name for the task (required for 'create'/'watch')."}, "cron_expression": {"type": "string", "description": "For 'create': standard cron format OR 'interval:seconds' (e.g., 'interval:60'). Day of week: 0 or 7 = Sunday, 1-5 = Monday-Friday. NOTE: cron times are UTC and do NOT follow daylight saving — convert a local time first (09:00 Athens = '0 6 * * *' in summer, '0 7 * * *' in winter)."}, "prompt": {"type": "string", "description": "The instruction the background agent runs — for 'create' when the clock fires, for 'watch' when the condition becomes true (required for both)."}, "check_command": {"type": "string", "description": "For 'watch': a shell command that EXITS 0 when the thing to react to is TRUE (shell 'if' semantics), e.g. \"grep -q ' ERROR ' /path/app.log\", \"! curl -sf https://host/health\", \"[ $(some-metric) -gt 90 ]\". Runs in the sandbox."}, "interval_secs": {"type": "integer", "description": "For 'watch': how often (seconds, >=60) to poll the check_command."}, "task_identifier": {"type": "string", "description": "The ID of the task to kill (required for 'stop')."}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "dream_mode", "description": "Runs memory upkeep (store care, graph pruning). It does not create lessons — lessons come only from rules the owner approves or dictates. Use this when the user asks to 'sleep', 'rest', or 'consolidate memories'.", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {"name": "list_lessons", "description": "Show LESSONS the agent has learned (mistakes-and-fixes the agent has internalized). Use this EVERY TIME the user asks 'what have you learned today / this week / so far' or asks to see the LESSON playbook / your lessons / what mistakes you've fixed. Do NOT call this for 'show me your skills' — that means the agent's TOOLS / custom skills and routes to `manage_skills`. Do NOT answer from memory — always call this tool so the list is authoritative. These are NOT the owner's rules (### OWNER RULES, candidate/proposed rules): no tool lists or changes those.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "enum": ["today", "week", "all", "self_play_only"], "description": "Time / source filter. 'today' = since local midnight. 'week' = last 7 days. 'all' = every lesson on file. 'self_play_only' = only lessons whose source is self-play, no time filter. Default: 'today'."}, "limit": {"type": "integer", "description": "Max lessons to return (1-100). Default 20."}}, "required": []}}},
     {"type": "function", "function": {"name": "replan", "description": "Call this tool if your current strategy is failing or if you need to pause and rethink. It forces a fresh planning step.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Why are you replanning?"}}, "required": ["reason"]}}},
     {"type": "function", "function": {"name": "abort_attempt", "description": "ESCAPE HATCH. Call this ONLY when you have proven the current task cannot be completed as specified — e.g. you have demonstrated that the validator / test has a structural bug (like `''.split('\\n')` comparing to `len(exp)==0`), the spec is internally contradictory, or a mandatory file the task depends on was never provided and cannot be generated. Do NOT call this for normal retries, for tasks you simply don't know how to solve, or to escape a hard problem — use `replan` for those. After this tool runs, the turn loop exits and the outer simulation stops retrying.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Concrete, specific proof that the task is unwinnable. Name the exact line of the broken validator, the contradictory spec clauses, or the missing dependency. Vague reasons ('too hard', 'keeps failing') are not valid."}}, "required": ["reason"]}}},
@@ -1139,19 +1102,6 @@ def get_active_tool_definitions(context, query: str = None, *,
     """
     active_tools = list(TOOL_DEFINITIONS)
 
-    # Don't advertise delegate_to_swarm when no swarm cluster is configured
-    # (no --swarm-nodes). Otherwise the model is shown the tool AND steered
-    # into it, every call returns "Error: The Swarm Cluster is not configured"
-    # (swarm.py), and that Error-prefixed result burns a strike — observed
-    # live. Mirrors the image_generation gating below (schema advertised only
-    # when image_gen_clients exist). The dispatch entry stays registered so a
-    # hallucinated call still gets the helpful "process synchronously" steer.
-    if not (context and getattr(context.llm_client, 'swarm_clients', None)):
-        active_tools = [
-            t for t in active_tools
-            if t.get("function", {}).get("name") != "delegate_to_swarm"
-        ]
-    
     # Native vision allows us to always include vision_analysis for Qwen 3.5
     if True:
         active_tools.append({
@@ -1476,10 +1426,7 @@ def _egress_scrubbed(name, fn, context):
 
 
 def get_available_tools(context):
-    from .memory import (
-        tool_dream_mode,
-        tool_list_lessons,
-    )  # Lazy import to avoid circular dependencies
+    from .memory import tool_list_lessons  # Lazy import to avoid circular dependencies
 
     def _proj_ws(stateful: bool = False):
         """Working directory for file ops + code execution — see
@@ -1596,7 +1543,6 @@ def get_available_tools(context):
             sandbox_manager=context.sandbox_manager,
             project_id=getattr(context, "current_project_id", None),
             **kwargs),
-        "delegate": lambda **kwargs: tool_delegate(context=context, **kwargs),
         "jobs": lambda **kwargs: tool_jobs(context=context, **kwargs),
         "notify_operator": lambda **kwargs: tool_notify_operator(context=context, **kwargs),
         "probe_model": lambda **kwargs: tool_probe_model(context=context, **kwargs),
@@ -1622,12 +1568,10 @@ def get_available_tools(context):
         "scratchpad": lambda **kwargs: tool_scratchpad(scratchpad=context.scratchpad, **kwargs),
         "manage_tasks": lambda **kwargs: tool_manage_tasks(scheduler=context.scheduler, memory_system=context.memory_system, **kwargs),
         "manage_projects": lambda **kwargs: tool_manage_projects_for_model(context, **kwargs),
-        "dream_mode": lambda **kwargs: tool_dream_mode(context=context),
         "list_lessons": lambda **kwargs: tool_list_lessons(context=context, **kwargs),
         "replan": _replan,
         "abort_attempt": _abort_attempt,
         "postgres_admin": lambda **kwargs: tool_postgres_admin(default_uri=getattr(context.args, 'default_db', 'postgresql://ghost@127.0.0.1:5432/agent'), _metacog_bundle=getattr(context, "metacog", None), **kwargs),
-        "delegate_to_swarm": lambda **kwargs: tool_delegate_to_swarm(llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), scratchpad=context.scratchpad, context=context, **kwargs),
         "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
         "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
         "manage_composed_skills": lambda **kwargs: tool_manage_composed_skills(

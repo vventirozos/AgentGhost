@@ -57,7 +57,6 @@
     <tbody>
       <tr><td><code>--worker-nodes url|model</code></td><td>Conversation compaction/summarization (inline — the most painful blocking call on a 240k-context agent), the mid-turn "shield" summarizer, <em>(follow-up query expansion — removed 2026-10-11, §4NQ)</em>, smart-memory consolidation, the constraint-gate screen, the autoadvance task classifier.</td></tr>
       <tr><td><code>--critic-nodes url|model</code></td><td>The self-evaluation verifier; the post-response gate becomes non-blocking. <em>In production (2026-10-26) this is the same Nova server as the worker pool (no separate critic server since 2026-10-25), and with the LLM judge off since &sect;4OW (2026-10-14) it carries the visual pixel check (<code>GHOST_VISUAL_CHECK_POOL=critic</code>), not claim verdicts.</em> <em>Caveat: verdicts feed lesson-scrubbing, so a weak judge degrades that signal — enable, then watch CONFIRMED/REFUTED rates. (Verdicts also fed the calibration corpus until its removal in &sect;4PJ, 2026-10-16.)</em></td></tr>
-      <tr><td><code>--swarm-nodes</code></td><td><code>delegate_to_swarm</code> fan-out (stateless, tool-less workers).</td></tr>
       <tr><td><code>--coding-nodes</code> · <code>--visual-nodes</code> · <code>--image-gen-nodes</code></td><td>Self-play coding (off unless <code>GHOST_CODING_PRACTICE=1</code>, §4ND), vision, image generation.</td></tr>
     </tbody>
   </table></div>

@@ -66,7 +66,7 @@
       <tr><td><strong>FAILED</strong></td><td>Tried and did not succeed.</td><td>no, unless <code>world_changed=True</code></td><td><code>browser</code> <code>STATUS: ERROR</code></td></tr>
       <tr><td><strong>REJECTED</strong></td><td>Refused before running. Touched <em>nothing</em>.</td><td>no</td><td><code>file_system</code> refusals, the loop's pre-dispatch guards</td></tr>
       <tr><td><strong>PARTIAL</strong></td><td>Half-landed.</td><td>yes</td><td>a write that landed on a file that does not parse; a multi-block replace where some blocks failed</td></tr>
-      <tr><td><strong>UNRESOLVED</strong></td><td><em>No verdict yet</em> &mdash; still running.</td><td>no</td><td><code>execute</code>'s promoted background job; <code>swarm</code>'s still-running branch</td></tr>
+      <tr><td><strong>UNRESOLVED</strong></td><td><em>No verdict yet</em> &mdash; still running.</td><td>no</td><td><code>execute</code>'s promoted background job (the second producer, <code>swarm</code>'s still-running branch, was removed 2026-10-30, §4SI)</td></tr>
     </tbody>
   </table></div>
   <p><code>world_changed=True</code> exists for one measured case: a truncating write that then hit

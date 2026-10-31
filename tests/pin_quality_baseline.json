@@ -65,9 +65,8 @@
     "test_conversational_filler_guard.py": 5,
     "test_core_math_verifier.py": 1,
     "test_deep_audit_fixes.py": 7,
-    "test_delegation_and_dataflow.py": 4,
+    "test_delegation_and_dataflow.py": 2,
     "test_dialog_layer_4o.py": 8,
-    "test_direct_terminal_tool_summary.py": 10,
     "test_dispatch_pipeline_extraction.py": 5,
     "test_distill_budget_sizing.py": 3,
     "test_egress_failclosed_4gi.py": 2,
@@ -217,5 +216,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 900
+  "total_textual": 888
 }

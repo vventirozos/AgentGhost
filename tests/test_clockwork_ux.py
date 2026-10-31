@@ -1096,7 +1096,7 @@ def test_face_signals_match_the_browsers():
     assert {g["phase"] for g in got} >= {"search", "read", "tool", "verify", None}
     assert [g["verdict"] for g in got if g["verdict"]] == ["pass", "refute"]
     # the table itself, key for key — the steps above reach only some of it
-    assert turnstatus.FACE_PHASE_BY_TITLE == want["table"] and len(want["table"]) >= 15
+    assert turnstatus.FACE_PHASE_BY_TITLE == want["table"] and len(want["table"]) >= 14   # §4SI: the delegate row left
 
 
 HEADER = "┌─ 99 9961f364  request started  15:16:26 ─────────────"

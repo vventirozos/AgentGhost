@@ -172,22 +172,6 @@ class TestTheCorpusAndTheContextPath:
                 f"a declared outcome — and it mutates the SAME dicts "
                 f"`tools_run_this_turn` holds: {a[:70]}")
 
-    def test_the_deterministic_fast_path_keeps_the_status(self):
-        """`memory.py` was migrated to `append_note` so `dream.py`'s six
-        declared failures survive; they died 90 lines away in a fast path
-        that `str()`s the answer AND bypasses the dispatch loop entirely."""
-        import ghost_agent.core.agent as A
-
-        tree = ast.parse(inspect.getsource(A.GhostAgent).lstrip())
-        assigns = [ast.unparse(n.value) for n in ast.walk(tree)
-                   if isinstance(n, ast.Assign) and len(n.targets) == 1
-                   and getattr(n.targets[0], "id", None) == "_det_raw"]
-        assert assigns, "the deterministic dispatch moved"
-        assert any("_wt(" in a or "with_text(" in a for a in assigns), (
-            "the deterministic dispatch stringifies the status away — and "
-            f"this path BYPASSES the loop entirely: {assigns}")
-
-
 class TestTheBannerActuallyEmits:
     def test_a_failure_shaped_result_gets_a_banner(self):
         """Round 6 added a fallback and then always declined to use it: the

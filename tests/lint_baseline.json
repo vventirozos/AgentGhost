@@ -44,7 +44,6 @@
     "unused-import|src/ghost_agent/core/planning.py|Unused Callable imported from typing": 1,
     "unused-import|src/ghost_agent/core/planning.py|Unused import json": 1,
     "unused-import|src/ghost_agent/core/project_safety.py|Unused import time": 1,
-    "unused-import|src/ghost_agent/core/subagent.py|Unused Optional imported from typing": 1,
     "unused-import|src/ghost_agent/core/turns.py|Unused Any imported from typing": 1,
     "unused-import|src/ghost_agent/distill/outcome_heuristics.py|Unused Tuple imported from typing": 1,
     "unused-import|src/ghost_agent/eval/metrics.py|Unused import math": 1,

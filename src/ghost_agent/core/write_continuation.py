@@ -29,6 +29,7 @@ Mirrors the text-answer auto-continuation (`MAX_TRUNCATION_CONTINUATIONS`).
 """
 from __future__ import annotations
 
+import json
 import logging
 import asyncio
 import re
@@ -170,6 +171,28 @@ def strip_tail_overlap(shown_tail: str, cont: str) -> str:
                 and [ln.strip() for ln in tail_lines].count(run[0]) == 1):
             return "\n".join(cont_lines[k:])
     return cont
+
+
+def _document_left_open(path, text: str) -> str:
+    """§4SH r7: why a document kind still looks unfinished ("" = it does not).
+    Only the kinds with a definite end; code and prose are the model's to judge."""
+    from ..tools.file_system import document_ends_here, html_cut_finding
+    name = str(path).lower()
+    text = str(text or "").lstrip("\ufeff")
+    try:
+        if name.endswith((".html", ".htm")):
+            return html_cut_finding(text)     # r10: the finish's and the settle's own verdict
+        if name.endswith((".svg", ".xhtml")):
+            return "" if document_ends_here(path, text) else "the file does not end its document"
+        if name.endswith(".json"):
+            try:
+                json.loads(text)
+            except ValueError as exc:
+                if getattr(exc, "pos", 0) >= len(text.rstrip()) or "Unterminated string" in str(exc):
+                    return "the JSON ends before it is complete"
+    except RecursionError:          # r8: nesting too deep to judge — the syntax note says it
+        return ""
+    return ""
 
 
 def to_last_complete_line(text: str) -> str:
@@ -345,12 +368,15 @@ def _in_progress_note(path: str, hp: Path, appended: int, why: str) -> str:
         shown = hp.read_text(encoding="utf-8", errors="replace").rstrip("\n")[-400:]
     except Exception:  # noqa: BLE001
         shown = ""
-    return (f"\n⚠ Your write was CUT OFF by the output limit; the system continued it automatically for "
-            f"{appended} more part(s) and stopped ({why}). The file is IN PROGRESS and now ends with:\n"
+    _done = (f"the system continued it automatically for {appended} more part(s) and stopped" if appended
+             else "it was not continued")       # r10
+    return (f"\n⚠ Your write was CUT OFF by the output limit; {_done} ({why}). The file is IN PROGRESS "
+            f"and now ends with:\n"
             f"<<<\n{shown}\n>>>\nContinue from exactly there with append=true — your next call is "
             f"{{\"operation\": \"write\", \"path\": \"{path}\", \"append\": true, \"more_parts\": true, "
             f"\"content\": \"<only the text that comes after the lines above, ~15 KB>\"}} — leave "
-            f"more_parts off on the last part. Do not start the file over: what is saved stays.")
+            f"more_parts off on the last part. Do not start the file over: what is saved stays. If the file "
+            f"is in fact complete, finish it: append=true with content='' (an empty string).")   # §4SH r8
 
 
 async def continue_cut_write(context, path: str, inner, *, ask: str = "", llm=None, cancelled=None,
@@ -377,6 +403,11 @@ async def continue_cut_write(context, path: str, inner, *, ask: str = "", llm=No
         _note_progress(req_id, path)              # §4RA r2 M-B: the saved first part is progress
         t0 = time.monotonic()
         rounds, bad, done, appended, prev_finish, why = 0, 0, False, 0, None, ""
+        # §4SH r5: no "already ends the document" shortcut — the saved first part was CUT,
+        # so text followed its last whole line (cb27058e: scripts came after </html>)
+        from ..tools.file_system import document_ends_here
+        refused = False              # r9: a "done" refused — the note says why, even with nothing appended
+        last_cut = True              # r5–r8: the last part (at first: the saved one) was cut at the limit
         while rounds < CUT_WRITE_CONTINUATIONS and not done:
             if time.monotonic() - t0 > CONTINUATION_TOTAL_S:
                 why = f"{CONTINUATION_TOTAL_S / 60:.0f} min of continuation used"
@@ -424,8 +455,10 @@ async def continue_cut_write(context, path: str, inner, *, ask: str = "", llm=No
             finish = choice.get("finish_reason")
             cont, done = clean_round(raw)
             _chatter = False
+            _cut_tail = False
             if finish == "length" and not done:
                 cont = to_last_complete_line(cont)
+                _cut_tail = True        # r5/r8: a round cut at the limit — more followed, even on a newline
             cont = strip_tail_overlap(tail, cont)
             if not cont.strip() and not done:
                 if prev_finish == "stop" and finish != "length":
@@ -483,27 +516,67 @@ async def continue_cut_write(context, path: str, inner, *, ask: str = "", llm=No
                     continue
                 else:
                     appended += 1
+                    last_cut = _cut_tail
                     _note_progress(req_id, path)  # §4RA r2 M-B: and so is each appended part
+                    if not done and not _cut_tail:   # r5: a cut round's dropped text followed it
+                        # §4SH r3: a round whose text ENDS the document finished the file —
+                        # another round would only add a second </body></html>
+                        from ..tools.file_system import document_ends_here
+                        try:
+                            done = bool(document_ends_here(path, await asyncio.to_thread(
+                                hp.read_text, encoding="utf-8", errors="replace")))
+                        except OSError:
+                            pass
             prev_finish = finish
             size = hp.stat().st_size
             pretty_log("Write Continued",
                        f"{path} — round {rounds}/{CUT_WRITE_CONTINUATIONS}: +{len(cont):,} chars "
                        f"(now {size:,} bytes){' — file complete' if done else ''}",
                        icon=Icons.TOOL_FILE_W)
+        if not done and appended and not last_cut:
+            # §4SH r2: a continuation whose text ENDS its document finished it, marker or not
+            try:
+                done = bool(document_ends_here(path, await asyncio.to_thread(
+                    hp.read_text, encoding="utf-8", errors="replace")))
+            except OSError:
+                pass
+        if done:
+            # §4SH r5–r7: "done" is not proof. Not right after a round whose cut dropped text
+            # (the model believes it sent that text); and a document kind must not look cut
+            # (a page: no unclosed script/comment/tag — scripts after </html> are whole,
+            # cb27058e; JSON: not truncated — another parse error is the syntax note's to say)
+            try:
+                _left = ("the last round was cut and nothing followed it" if last_cut
+                         else _document_left_open(path, await asyncio.to_thread(
+                             hp.read_text, encoding="utf-8", errors="replace")))
+            except OSError:
+                _left = ""
+            if _left:
+                if last_cut and not appended:
+                    _left = "the saved part was cut mid-line, so its last line may be missing"
+                done, why, refused = False, f"the model said it was done, but {_left}", True
         if not done:
             why = why or f"{CUT_WRITE_CONTINUATIONS} rounds used"
             pretty_log("Write Continued", f"{path} — left in progress: {why}", icon=Icons.WARN, level="WARNING")
             _mark_in_progress(hp, True)   # a plain write must not replace what was saved
-            if not appended:
+            if not appended and not refused:
                 return first
             # an OK result with the note, like the tool's own cut-save: the
             # file GREW — a partial would book a strike (review)
             return _canonical_result(path, hp, host_dir) + _in_progress_note(path, hp, appended, why)
         _mark_in_progress(hp, False)
         note = await _syntax_feedback(hp, path)      # the finished file, checked like any write
+        page = ""
+        if str(path).lower().endswith((".html", ".htm")):   # §4SH r2: and its whole-page notes (advisory:
+            from ..tools.file_system import html_page_notes  # in the text, never a partial)
+            try:
+                page = await asyncio.to_thread(html_page_notes, await asyncio.to_thread(
+                    hp.read_text, encoding="utf-8", errors="replace"))
+            except Exception:  # noqa: BLE001 — advice only; the finished file stands (r3)
+                pass
         text = (_canonical_result(path, hp, host_dir)
                 + f" The write hit the output limit and was continued automatically in {appended + 1} parts; "
-                  "the file is complete." + (cap_note or ""))   # review C: the §4OA cap persists — say so
+                  "the file is complete." + (cap_note or "") + page)   # r9: done always appended (the saved part is cut)   # review C: the §4OA cap persists — say so
         if note:
             return ToolOutcome.partial(text + note, world_changed=True, reason_code="written_but_syntax_failed")
         return text

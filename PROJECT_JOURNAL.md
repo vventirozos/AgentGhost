@@ -57524,3 +57524,69 @@ Deploy (operator: "stop all current requests and deploy when ready" → stopped 
 **Rollback.** `interface/face_backups/20261030-pretemperament/` (matrix_graph.js, app.js, index.html, status.js, style.css, sw.js, server.py). Copy back and bump ?v= above 17.6.
 
 **§4SG v1.2/1.3 — the body (operator: "can't say i saw a huge difference").** Confirmed first that the operator's device (100.93.181.31) HAD fetched matrix_graph 17.6 + temperament 1.1 — so the effect was too small, not undeployed. Two causes: every v1.1 effect sat within a few percent (breath ±1.2%, lean 3%, gaze ±0.1), and the gaze steered `_lookTarget`, which the camera-static forms (tesseract — the operator's — and vortex) never read: their idle glances did literally nothing. Fix: temperament BODY outputs (yaw/pitch/roll, offX/offY, scaleMul, bright, glow) applied to the scene on every form after `_applySceneBlend` and taken back off before the per-form code reads it; coil −10%·anticipation → release +8% on the first words; startle shake ~7 Hz; doze sink −0.16 + dim; wake lift + flare; speech brightness + per-chunk bloom glow; intensity knob (default 1.5, `localStorage.ghost_face_intensity`, 0–3). Found by the existing tests: setForm snapshotted the scene WITH the body (first blend frame applied it twice — 0.11 scale jump), the startle flare cancelled the network-error dim (and ignored reduced motion), and a `rnd()` call inside `step` would have tied the random sequence to frame rate. The vortex-law test now compares with the body taken off (`getDebugState().body`). Live headless: glance yaw 0.22 rad at K=1, coil 0.96 → release 1.04, startle bright 1.23; default raised to 1.5 after looking at the stills. Tests 21 (+2: body visible / intensity 0 neutral; no double body through a form switch); mutants B1–B4 killed, B5 (position take-back) EQUIVALENT today — every form sets the scene position absolutely. 1,697 interface tests, lint OK. Versions app/matrix_graph 17.8, temperament 1.3.
+
+## §4SH — Files in parts close by their content; `evaluate` as interact; the record keeps code (2026-10-30, operator on req cb27058e: "fix 1 and 3, 1. has been problematic from the begining, come up with a nice and generalized way to fix this. the agent should be able to support large files perfectly." + "also fix the trejectory record")
+
+**The request.** cb27058e ("write a webos, make it look awesome and give it some functional apps"): 69 min, 22 model calls, 97% of the wall clock in the model, ~18–19 tok/s, 96% of the prompt cached (no re-prefill). Turn 1 thought for 32 min (30.7k reasoning tokens): it planned three files, drafted their code in its thinking, then switched to one index.html at +1467 s and wrote it out again. That is model behaviour; BIG_FILE_GUIDANCE already says "do not draft a whole file in your thinking", and it only appears at a cut. Not changed here.
+
+**How the agent confused the model (the defect).** The last part (ending `</body></html>`) went with more_parts=true.
+- From then on, the TASK STATE said every turn "the LAST part has not been sent … Send the remaining part(s) without more_parts". Nothing remained to send, and an empty append was refused.
+- The model's thinking: it noticed (+2858 s), called the note "stale" (+3336 s), then falsely recalled "my last call had NO more_parts" (+3360 s), and ignored it.
+- Effects: the closing syntax check and page check never ran, and the reply footer told the owner a page the agent had tested three times was "incomplete and never checked".
+- The bug they would have shown took ~10 min of model reasoning to find: part 3 ended `</script>` and part 4 began with code.
+
+**The fix.** The flag is the model's intent; the file's content decides.
+1. An APPENDED part that ends its document is the last part: `.html/.htm/.xhtml` `</html>`, `.svg` `</svg>`, `.json` that parses (≤8 MB). The result says so and the file is checked whole; a later append reopens it.
+   - Never a FIRST part. The replay showed cb27058e's own part 1 was the whole skeleton through `</html>`, with the scripts appended after it. The first version closed it there and would have told the model "nothing more needs to be sent" mid-build.
+   - An edit that makes the document end closes it too.
+   - Code never closes by parsing.
+2. An empty last part (`append=true, content=''`, no more_parts) finishes an open file. Every open part's result and the TASK STATE line say how; the line also shows size and ending.
+3. At the reply the system closes what is still open and judges it. A file that passes is silent; a failing check is named; an uncheckable kind is named with its last characters.
+4. New page check: three or more JS statement lines outside any script/style/pre/code/textarea/template/comment, named with the line and the `</script>` before it. On the replayed parts: "from line 1003 … the last </script> before it is at line 1001".
+
+**#3: browser `evaluate`.** `operation='evaluate'` (and the other interact-only actions) with actions or a top-level js now runs as interact and states the form; without them, the refusal shows the form. It was a strike before. The agent's composed-URL 404 guard now covers these operations.
+
+**Record.** The 5-char "gap" in part 3 was the redactor: `form_secret_assignment` read `case 'pwd': print(` as a password. Call, index and type-word values are now spared; secrets are still redacted. Kept: the home-path rule still writes `/home/ghost` as `/home/<user>` (privacy, deliberately broad).
+
+Tests: `tests/test_4sh_parts_close.py` (9) plus the reworked §4OI pair. The real cb27058e parts were replayed through the tool: parts 1–3 open, part 4 closes with the page check. Docs: docs/tools/file_system.html#4sh.
+
+
+### §4SH review — twelve fresh-eye rounds (2026-10-30, operator: "make sure you review all your changes using fresh eye reviewers, the usual verification protocol." + "run the full suite once when you are done with all rounds of reviews until they all come clean (no majors, no important minors) try to save time with full tests and mutations.")
+
+Each round: fresh-eye reviewers on a frozen snapshot of the tree, the sharpest claims re-run by me, then a two-tier mutation battery (pins + importing tests first; survivors on the 381-file related selection) with a no-op control (must survive) and a known-bad control (must die). A queued fix always beat a running battery: it was stopped, the tree verified byte-identical, the fix applied, and the battery rebuilt.
+
+**MAJORs, by round, and where they came from:**
+- r1: 1 CRIT + 5 MAJOR in the first §4SH code: empty finish blocked by the turn-loop guard, evaluate readers, the redactor code-value rule, finish/settle disagreement.
+- r2: an unclosed `<script>` passed at the reply; five swarm-removal containment guards unpinned (`tests/test_4si_containment_pins.py`).
+- r3: none. The regex script scan became a tokenizer.
+- r4: three. `İ` lowercases to two characters (the scan indexed a lowercased copy, a cut script hid); a secret after `==`/`:=` leaked (my r3 rule); the fallback cut content containing `"append": true` (my r3 regex).
+- r5: three. The continuation called a cut page complete (my r4 pre-check: the saved part is cut after its last whole line); the fallback lost a trailing newline and `""` endings; plus older redactor leaks (left: see below).
+- r6: one. The r5 trailing-key search was quadratic (40 s on 250 kB on the event loop) → a 4 KB tail window.
+- r7: one. The r6 closers-only guard ignored its own round's cut and lost the scripts after `</html>`, the cb27058e case again. The in-loop "said done" machinery was REMOVED, not patched; one after-loop judgement replaced it.
+- r8: one. A length round cut exactly on a newline was not counted as cut → any `finish == "length"` round is cut; the saved first part counts as cut.
+- r9–r12: no MAJOR. Important minors: a refusal that gave no reason; `</html>` inside a script string read as the end; fragment and BOM verdicts disagreeing between callers; a page cut before its `<html>` tag; an HTML5 page ending `</body>` without `</html>`.
+
+**The lesson again:** every MAJOR from r4 on was inside the previous round's fix (memory: the-fix-that-breaks-what-it-fixed). What converged was removing a heuristic (r7) and making a rule exact (r8: "length = cut"), not adding a layer.
+
+**Left as they are (told to the operator):**
+- A continuation round that re-sends the file's own ending lines doubles that ending (the overlap trimmer keeps structural lines; the r6 guard that tried lost text).
+- Older redactor gaps: a quoted literal after `==`, a hard-coded fallback after a code value, Bearer tokens outside `Authorization`. These need a redactor review of their own; the redactor only shapes trajectories stored locally.
+- A malformed call with unescaped quotes AND no closing quote on its content is a guess.
+- The script double-escape state; `.md`/`.txt` open files still get the "nothing here can check" footer (by design).
+
+Batteries: `scripts/mutate_4si_r1.py` … `mutate_4si_r12.py` (logs in the session scratchpad). Final battery (`mutate_4si_r12.py`, 62 runs on the finished code): 55 killed first time; 6 survivors were each a real unpinned behaviour (the stop reason, a leading newline in the fallback, an island's return to its svg, the svg/JSON done kinds, deep JSON), all pinned and re-run killed — 61/61, no-op control survived, known-bad died. The r1–r3 template carried a second `PINS =` line that overrode the round's pins: agent.py mutants went straight to the full selection, so the results stand; fixed from r3 on.
+
+## §4SI — The swarm, sub-agents and dream_mode removed; manage_projects shrunk; the parts protocol in the schema (2026-10-30, operator: "remove dream mode and delegate, the whole swarm functionality is not needed any more" → "proceed with your recommendation for manage_project, let's shrink it." → "also remember to add the changes for the filesystem file split changes we did to the prompt, let's do one reload")
+
+**Removed.** `dream_mode`, `delegate` and the swarm (sub-agent dispatch, swarm nodes) are gone from the registry, the tool schema, the prompts, `main`/`llm`/`agent`, the client captions (`turn_caption.js`, `app.js`, clockwork `turnstatus.py`; cache-bust 17.9 / 1.1) and the docs (`tools/swarm.html` deleted; `core/delegation.html` is now "Background jobs"). Backups: `~/Data/AI/Data/system/code_backups/20261030-4si-swarm/`.
+- Kept on purpose: the leaf/isolated contexts the coding loop and replay use (`build_leaf_context`, `run_leaf_turn`, `REPLAY_FORBIDDEN_TOOLS`); `main._resume_after_job`'s `sub-job-` check (live); the launcher's comment line 42 naming `--swarm-nodes` (a comment only; the launcher is never edited in place).
+- The containment guards the deleted tests used to pin are pinned again in `tests/test_4si_containment_pins.py`: the leaf has no owner memory; the isolated recall is refused; a rebuild re-narrows to the allowlist and re-drops disabled tools; the leaf turn hides tools and fails closed; the replay deny-list.
+
+**manage_projects** schema shrunk to ~7.5k chars of JSON (the original is in the backup), keeping every operation and the rules the model gets wrong (clone = source id + new title; create_version description = the change; constraint_retire; the ledger on task_update DONE).
+
+**file_system schema**: the parts rules from §4SH: the LAST part with append=true only; an appended part that ends the document closes the file; an empty append finishes; do not draft the whole file in thinking; a cut write of a new file is saved as a first part.
+
+Tools render before the system prompt, so the schema change costs one head re-prefill: done at ONE reload, gated on `foreground_requests == 0`.
+
+**§4SI deploy (2026-10-30 23:44).** Full suite once: 28,140 passed; 7 errors = the known VectorMemory embedding-load flake (`test_recall_regression_eval.py`, passes alone); 1 real failure: `test_interface_face_cube2_v2_2026_09_21.py::test_busy_is_hotter_than_idle`, a §4SG regression in the TEST's measure — it compared the hottest shell (capped at 0.62) on one frame, and the temperament's wall-clock-driven speed moves which frame the rest sample lands on (rest max 0.60–0.61, needs < 0.60). Earlier runs had this file ERRORing, so it was masked. Now the mean over shells: rest 0.345 → turn 0.374 (pre-temperament 0.355 → 0.428), bound +0.015; the pre-temperament file passes, a no-turn-heat mutant fails (0.345 → 0.336), 4/4 stable. Lint OK. Restart gated on foreground_requests==0: listener 71274 → 46007, one process, ready count stable; the new head re-prefilled once and saved: **26,144 tokens (was 28,230)**.
+Live probes after the restart (all X-Ghost-Origin: probe, ids probe-…): three-part page closed by its `</html>` part; empty finish closed a .txt; an edit mid-parts got the open-part note (no SYNTAX CHECK FAILED); manage_projects list OK on the shrunk schema; no swarm/delegate/dream_mode tool; a write cut at 12,483 chars was saved to its last full line and continued by the system for 6 rounds to "file complete" — 1,200 rows, none missing or doubled, one `</html>` (the model's hand-computed cubes were wrong from n=93: arithmetic, not stitching); the head came back after the continuation in 0.6 s; trajectories keep code. Probe files removed.

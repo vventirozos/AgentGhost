@@ -8,9 +8,7 @@ Unit 8 (skills):
    unresolved $var → "" not "$var"; branch-loop execution cap; name-shadow reject
  - acquired: save_skill returns a status; tool_create_skill no longer reports a
    LIVE tool when the save was rejected; retire_degraded_skills is now wired
- - swarm: not-configured / 0-dispatched use an "Error:" prefix (so the loop
-   registers a failure); await_results reports real per-task failure; non-dict
-   task and non-str input_data no longer crash
+ - (swarm: removed with the tool, §4SI)
 
 Unit 7 (knowledge):
  - memory: failed ingest no longer reported SUCCESS; forget fuzzy sweep won't
@@ -173,33 +171,6 @@ class TestCreateSkillReportsFailure:
         # covered above. Here assert save_skill's return contract directly.
         mgr = AcquiredSkillManager(tmp_path, memory_system=None)
         assert mgr.save_skill("../nope", "d", {}, "x=1") is False
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Unit 8 — swarm
-# ══════════════════════════════════════════════════════════════════════
-
-from ghost_agent.tools.swarm import tool_delegate_to_swarm
-
-
-class TestSwarm:
-    async def test_not_configured_uses_error_prefix(self):
-        llm = MagicMock()
-        llm.swarm_clients = None
-        out = await tool_delegate_to_swarm(llm, "m", MagicMock(),
-                                           tasks=[{"instruction": "i", "input_data": "d", "output_key": "k"}])
-        # "Error:" so the agent loop registers a failure (was "SYSTEM WARNING",
-        # which the loop treated as success — resolving the unit-4 needle finding).
-        assert out.startswith("Error")
-        assert "not configured" in out
-
-    async def test_non_dict_task_is_skipped_not_crash(self):
-        llm = MagicMock()
-        llm.swarm_clients = [object()]
-        # A list-of-strings tasks payload must not raise AttributeError.
-        out = await tool_delegate_to_swarm(llm, "m", MagicMock(), tasks=["just a string"])
-        assert isinstance(out, str)
-        assert "Error" in out or "skipped" in out.lower() or "0 of" in out
 
 
 # ══════════════════════════════════════════════════════════════════════

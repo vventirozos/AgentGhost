@@ -88,9 +88,9 @@
     12/hour rate limit, and an <em>honesty contract</em> — the confirmation
     names only the delivery channels that are actually live (push transport
     configured? has the Slack consumer ever polled?) instead of claiming
-    "sent to Slack" blindly. Delegated sub-agents can NOT reach this tool
+    "sent to Slack" blindly. Delegated sub-agents could NOT reach this tool
     (not in their allowlist — the main agent reports; a delegate paging the
-    operator is spam surface). Tests:
+    operator is spam surface; sub-agents were removed 2026-10-30, §4SI). Tests:
     <code>tests/test_notify_operator.py</code> (14).
     <br><strong>Finish-line guard (2026-07-13, req 11fe11d8):</strong> the model
     can PLAN the notify call in its reasoning and then finalize without making
@@ -387,7 +387,7 @@
   promoted command — a <code>job-…</code> id in its tool results) no longer sends "Done —" at launch: sub-agent and swarm
   jobs are armed (<code>job.meta["notify_owner_req"]</code>) and <code>jobs.notify_owner_job_finished</code> writes the
   notice with the real outcome when the job finishes; sandbox jobs already wake a turn that reports theirs. The in-loop
-  steer stands down the same way.</li>
+  steer stands down the same way. (Delegates and the swarm were removed 2026-10-30, §4SI; promoted commands remain.)</li>
   <li>A negation cancels a notification ask only in its own clause ("stop pinging me so often, but notify me when the
   build is done" is an ask).</li>
   <li>Scheduled-task pages: see <a href="../tools/tasks.html#4ld">tasks §4LD</a>. The Slack bot warns at start when

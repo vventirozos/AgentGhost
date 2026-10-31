@@ -380,7 +380,7 @@ def with_privacy_note(result, area: str):
 #: whose own text is the owner's (a letter it writes) — are checked on their
 #: URLs only (§4MB review).
 QUERY_TOOLS = frozenset({"web_search", "deep_research", "darkweb_search", "darkweb_research",
-                         "fact_check", "browser", "system_utility", "delegate", "delegate_to_swarm"})
+                         "fact_check", "browser", "system_utility"})
 CODE_TOOLS = frozenset({"execute", "jobs", "manage_services"})
 URL_ONLY_TOOLS = frozenset({"file_system", "knowledge_base", "vision_analysis"})
 #: §4MG: tools where only the `subjects` argument leaves the machine (searched

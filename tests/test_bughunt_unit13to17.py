@@ -3,7 +3,7 @@
 See BUGHUNT.md. Fixed bugs pinned here:
 
 Unit 13 (core-llm):
- - get_swarm_node consults the circuit breaker; compute_tor_proxy checks the
+ - (get_swarm_node: removed §4SI); compute_tor_proxy checks the
    parsed hostname (not a URL substring); bus dedup ignores metadata.timestamp;
    bus adaptive budget floors at the default; prompts tolerates null updated_at
 Unit 14 (core-planning):
@@ -60,25 +60,6 @@ class TestBusDedup:
         f1 = {"text": "fact A", "metadata": {"timestamp": "t"}}
         f2 = {"text": "fact B", "metadata": {"timestamp": "t"}}
         assert MemoryBus._fact_signature("insert_fact", f1) != MemoryBus._fact_signature("insert_fact", f2)
-
-
-class TestGetSwarmNodeCircuitBreaker:
-    def test_dead_node_skipped_in_round_robin(self):
-        from ghost_agent.core.llm import LLMClient
-        client = LLMClient(
-            upstream_url="http://ghost:8088",
-            swarm_nodes=[
-                {"url": "http://node1:8088", "model": "a"},
-                {"url": "http://node2:8088", "model": "b"},
-            ],
-        )
-        # Trip node1's breaker.
-        for _ in range(5):
-            client.circuit_breaker.record_failure("http://node1:8088")
-        # Round-robin (no target) must skip the dead node.
-        picks = {client.get_swarm_node()["url"] for _ in range(4)}
-        assert "http://node1:8088" not in picks
-        assert "http://node2:8088" in picks
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Delegation, jobs & pipelines — Ghost Agent</title>
+<title>Background jobs — Ghost Agent</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -15,12 +15,11 @@
     <a href="../glossary.html">Glossary</a>
     <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
-    <a class="current" href="delegation.html">delegation &amp; jobs</a>
+    <a class="current" href="delegation.html">background jobs</a>
     <a href="autonomous_activity.html">autonomous_activity</a>
     <a href="dream.html">dream</a>
     <h3>Tools</h3>
     <a href="../tools/composed_skills.html">composed_skills</a>
-    <a href="../tools/swarm.html">swarm</a>
     <h3>Related</h3>
     <a href="../sandbox/jobs.html">sandbox.jobs</a>
   </nav>
@@ -28,152 +27,20 @@
 <main>
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
-  <h1>Delegation, jobs &amp; pipelines</h1>
-  <p class="subtitle">core/subagent.py · core/jobs.py · tools/delegate.py ·
-  the <code>save_as</code> data-flow in tools/composed_skills.py — 2026-07-11.
-  Three gaps, one theme: the agent could dispatch work but never COMPOSE it.</p>
+  <h1>Background jobs</h1>
+  <p class="subtitle">core/jobs.py · tools/delegate.py (the <code>jobs</code> tool). The page keeps its old
+  file name so existing links still work.</p>
+  <p class="warn"><strong>Removed 2026-10-30 (&sect;4SI).</strong> The <code>delegate</code> tool
+  (tool-using sub-agents, core/subagent.py) and <code>delegate_to_swarm</code> (tools/swarm.py and the
+  LLM swarm pool) were removed: the operator no longer needed the swarm. tools/delegate.py now holds only
+  the <code>jobs</code> tool. The <code>save_as</code> data-flow that used to be described here is on
+  <a href="../tools/composed_skills.html">composed_skills</a>.</p>
 
-  <h2>The gap</h2>
-  <p>The 2026-07 feature survey found that <strong>no orchestration primitive
-  could pass a value from one step to the next</strong>:</p>
-  <ul>
-    <li><code>composed_skills._resolve_args</code> resolved <code>$var</code>
-    only against the macro's <em>initial</em> params — a step could never
-    consume the previous step's output, so "fetch → transform → act on the
-    fetched value" was inexpressible and the skill-graduation loop (removed 2026-10-11, §4NM) minted
-    macros that were structurally incapable of being pipelines.</li>
-    <li><code>delegate_to_swarm</code>'s workers are stateless single
-    completions with <strong>no tools</strong> — delegation could summarise
-    text you already had, never go and get it.</li>
-    <li>Fire-and-forget work (swarm ids, scheduled tasks) had <strong>no status
-    surface</strong>: results appeared only if the model remembered to read a
-    specific scratchpad key.</li>
-  </ul>
-
-  <h2>1. Composed-skill data-flow (<code>save_as</code>)</h2>
-  <p>A sequential step may bind its result to a name:
-  <code>{"tool": "browser", "save_as": "page"}</code>. Later steps interpolate
-  it as <code>$page</code> — either as a whole value
-  (<code>{"text": "$page"}</code>, substituted with its native type) or inside
-  surrounding text (<code>{"prompt": "Summarise: $page"}</code>,
-  <code>${page}</code> also accepted).</p>
-  <p><code>_execute_sequential</code> keeps a live <strong>binding scope</strong>
-  — the initial params plus every completed step's <code>save_as</code> —
-  and resolves each step against the scope as it stands when that step runs, so
-  bindings only flow FORWARD. The caller's params dict is copied, never mutated.
-  A bound value is capped at <code>MAX_BOUND_VALUE_CHARS</code> (16 KB — larger
-  than the 4 KB display cap, since a downstream step may legitimately need a big
-  fetched body). An <code>optional</code> step that FAILED still binds, so a
-  later step can deliberately inspect the error text.</p>
-  <p><strong>Authoring is validated, not silently degraded</strong>
-  (<code>_validate_dataflow</code>, run at <code>define</code> time): a forward
-  reference, a self-reference, a duplicate binding, or any <code>save_as</code>
-  in a <code>parallel</code> macro is REJECTED with an explanatory error —
-  parallel steps start simultaneously, so no sibling can observe another's
-  result. A name that no step produces is fine: that's a runtime param the
-  caller supplies (the pre-existing contract). The advertised schema subtracts
-  step-produced names from the macro's parameter list, so the LLM is never asked
-  to supply a value the pipeline computes for itself.</p>
-
-  <h2>2. Tool-using sub-agents (<code>delegate</code>)</h2>
-  <p><code>core.subagent.run_subagent</code> runs the REAL agent loop (tools,
-  sandbox, memory reads) in an isolated context, bounded by a tool allowlist and
-  a turn cap, and returns its final answer as a job result. Isolation follows the
-  pattern dream's self-play temp agent established — for the same reasons, with
-  the same failure modes already paid for:</p>
-  <ul>
-    <li><code>workspace_model = None</code> — a sub-agent runs under its OWN
-    semaphore; leaving the shared model attached would let it clobber the live
-    turn's event-stamp pointer and write synthetic outcomes into the real
-    activity log (the 2026-07-09 stamping race).</li>
-    <li><code>trajectory_collector</code> / <code>episodic_memory</code> /
-    <code>journal</code> = None — a sub-agent's turns must not be mined for
-    auto-macros or reflected on as if they were user work.</li>
-    <li>Memory stores wrapped <strong>read-only</strong>
-    (<a href="../memory/readonly.html">memory.readonly</a>) and
-    <code>memory_bus = None</code> — a delegate has no hydration bus at all, so
-    a stray publish can't reach the production stores; a delegate researches, it
-    does not rewrite the operator's memory.</li>
-    <li>The LLM client is forced to <strong>background mode</strong>, so a
-    delegated job can never starve a live user turn of the single upstream slot.</li>
-  </ul>
-  <p class="warn"><strong>wait=True deadlock downgrade (2026-07-22 LLM-stack
-  review).</strong> Because a sub-agent's LLM calls are forced background, they
-  park on <code>_wait_for_foreground_clear</code> for as long as a user request
-  is active. <code>delegate(wait=True)</code> blocks the parent request inside
-  <code>reg.wait</code> while that request still holds
-  <code>foreground_requests</code> up — so the sub-agent parks on the very
-  request awaiting it: a circular wait that produced ~600s of dead air, then a
-  timed-out <code>FAILED</code> job. <code>tool_delegate</code> now treats
-  <code>foreground_requests &gt; 0</code> (which is true precisely on an
-  interactive turn, and false in an idle/autoadvance context) as the deadlock
-  condition and <strong>downgrades <code>wait=True</code> to fire-and-forget</strong>
-  there: it spawns the jobs, returns immediately with the job ids and an
-  explanatory note, and the model collects them on a later turn (by which point
-  the foreground request has ended and the sub-agents can actually run). In an
-  idle/background context <code>wait=True</code> is honoured unchanged. Tests:
-  <code>test_delegate_swarm_review_fixes.py</code>.</p>
-  <p class="warn"><strong>Containment hardening (2026-07-14 bug hunt).</strong>
-  Two escapes made the isolation above nominal-only and are now closed:
-  <strong>(1) tool surface</strong> — the old code filtered only the dispatch
-  DICT and left <code>_subagent_allowed_tools</code> unused, so the SCHEMA the
-  model saw was the full registry (it was shown <code>delegate</code>/
-  <code>jobs</code>/<code>manage_*</code> and invited to call them), and a
-  dispatch miss <em>healed</em> the dict back to the full registry. Fixed:
-  <code>run_subagent</code> sets <code>disabled_tools</code> = advertised −
-  allowlist (filters the schema AND blocks dispatch by name), and
-  <code>GhostAgent._rebuild_available_tools</code> re-narrows to the allowlist on
-  every miss. <strong>(2) read-only memory</strong> — the old
-  <code>readonly.py</code> no-op'd GUESSED method names that don't exist on the
-  stores, while the real mutators (<code>add</code>, <code>ingest_document</code>,
-  <code>add_triplets</code>, <code>delete_by_target</code>,
-  <code>remove_by_trigger</code> …) and the raw <code>.real</code>/
-  <code>.collection</code> handles passed straight through. Rewritten as a
-  default-allow-reads / explicit-deny-writes proxy pinned to the real method
-  names, with a test that fails if a store grows an unblocked writer. Tests:
-  <code>test_subagent_containment.py</code>, <code>test_readonly_memory.py</code>.</p>
-  <p class="warn"><strong>Rebuild re-drops the disabled set <span class="tag">2026-07-22</span>.</strong>
-  <code>_rebuild_available_tools</code> (which heals the dispatch dict back from
-  the registry after a hallucinated-name miss) re-narrowed only via
-  <code>_subagent_allowed_tools</code>. But dream's self-play temp agent contains
-  differently — it SETS <code>disabled_tools</code> and pops them from
-  <code>available_tools</code>, and never sets the allowlist — so a dispatch miss
-  healed the popped tools back in, and an aliased variant
-  (<code>"websearch"</code>→<code>"web_search"</code>) could then reach the
-  network-egress tools self-play disables. The rebuild now also drops
-  <code>self.disabled_tools</code>; since dispatch requires
-  <code>fname in available_tools</code> and canonicalisation only returns names
-  already in it, a disabled tool can never fire post-rebuild. Also hardens the
-  sub-agent path (it sets <code>disabled_tools</code> too). Test:
-  <code>test_subagent_containment.py::TestRebuild</code>.</p>
-  <p class="warn"><strong>Containment now fails CLOSED <span class="tag">2026-07-22</span>.</strong>
-  The three-gate restriction block sat in one broad <code>try/except</code> that
-  only <code>logger.debug</code>'d on failure — so if the registry import or the
-  defs shape ever threw, the sub-agent ran with the <em>full</em> schema and
-  dispatch dict: a containment boundary that failed OPEN. It now
-  <code>logger.error</code>s and raises, landing a <code>FAILED</code> job via
-  the same path as the timeout bound (<code>JobRegistry._on_done</code> converts
-  the task exception to <code>STATUS_FAILED</code>). Deny-all was rejected because
-  gate 1 (<code>disabled_tools</code>) is a <em>denylist</em> that requires
-  enumerating the registry — impossible precisely when the registry can't be
-  read — so aborting is the only guaranteed-safe state. Test:
-  <code>test_subagent_failclosed.py</code>.</p>
-  <p><strong>Rails.</strong> <code>FORBIDDEN_TOOLS</code> is absolute — a
-  sub-agent can never delegate (no recursive fan-out), schedule
-  (<code>manage_tasks</code>), run daemons (<code>manage_services</code>), mutate
-  projects, author selfhood, or write profile memory. Turn cap
-  <code>MAX_SUBAGENT_TURNS</code> (12), wall-clock timeout, and at most 4
-  parallel delegates per call (<code>MAX_PARALLEL_DELEGATES</code>; they share one upstream slot — more is slower, not
-  faster) and at most 8 running at once across calls (<code>MAX_RUNNING_DELEGATES</code>, &sect;4LD). Its sandbox is a per-job subdir under the REAL sandbox
-  (<code>delegated/&lt;job-id&gt;/</code>), not a temp dir like self-play: the
-  point of delegation is to produce artifacts the main agent can then read.</p>
-
-  <h2>3. The job registry (<code>jobs</code>)</h2>
+  <h2>The job registry (<code>jobs</code>)</h2>
   <p><code>core.jobs.JobRegistry</code> is the status surface every
-  fire-and-forget mechanism was missing. <code>delegate</code> and
-  <code>delegate_to_swarm</code> both register into it — as does a promoted
-  sandbox command (below) — so the <code>jobs</code>
-  tool reports them together: <code>status</code> (running + recently finished),
+  fire-and-forget mechanism was missing. A promoted sandbox command (below)
+  registers into it (so did <code>delegate</code> and <code>delegate_to_swarm</code> until
+  &sect;4SI), and the <code>jobs</code> tool reports every job together: <code>status</code> (running + recently finished),
   <code>collect</code> (a finished job's full result — or every unread result),
   <code>cancel</code>. In-memory by design: jobs are per-process (their asyncio
   tasks die with the process), so persisting them would only resurrect zombies.
@@ -223,47 +90,22 @@
   by-id re-fetch hint. An explicit <code>collect(job_id=…)</code> still returns
   that job's result <em>unconditionally</em> (explicit re-fetch is never hidden).
   Test: <code>test_jobs_collect_readmark.py</code>.</p>
-  <p class="warn"><strong>Swarm result surfacing (2026-07-14 bug hunt).</strong>
-  A swarm worker returns a <em>bool</em> while its real output lands in the
-  scratchpad, so <code>jobs(action='collect')</code> on a swarm job returned
-  <code>"True"</code>. <code>Job</code> gained an optional
-  <code>result_resolver</code> that maps the raw task result to the real payload;
-  <code>delegate_to_swarm</code> wires it to read the scratchpad
-  <code>output_key</code>, so collect now returns the content (or the failure
-  ALERT). Test: <code>test_bughunt_20260714.py</code>.</p>
+  <p>History: <code>Job.result_resolver</code> was added (2026-07-14 bug hunt) so a swarm job, whose worker
+  returned a bool while its output landed in the scratchpad, collected its real content. The swarm is gone
+  (&sect;4SI); the optional hook stays on <code>Job</code>.</p>
 
-  <h2>Why this matters beyond convenience</h2>
-  <p>It is the fix for the deepest finding of the ablation program: "recalled
-  skills are prose never executed", and B4's mediation ≈ 0. A learned lesson
-  injected as advisory text measurably does nothing; a learned skill that is an
-  <em>executable pipeline</em> is load-bearing by construction. Data-flow turns
-  the learning stack's output from advice into capability.</p>
-
-  <h2>Tests</h2>
-  <p><code>tests/test_delegation_and_dataflow.py</code> (55) — arg resolution
-  (whole-value / interpolated / braced / unresolved), multi-stage chains,
-  params-not-mutated, bound-value cap, optional-failure binding, disk round-trip,
-  schema subtraction, all four validation rejections; job registry (success /
-  exception / cancel / eviction / idempotent finish); sub-agent tool policy
-  (incl. no-recursive-delegation); the <code>delegate</code> and
-  <code>jobs</code> tools; and the sub-agent isolation contract.</p>
-<h2 id="4ns">§4NS — sub-agents and background jobs <span class="tag">2026-10-12</span></h2>
+<h2 id="4ns">§4NS — background jobs <span class="tag">2026-10-12</span></h2>
 <ul>
-  <li><strong>A sub-agent that did not finish FAILS.</strong> Its turn returning an abort marker, a cancelled turn or no
-  text (LLM failure, deferred behind a long owner turn) landed DONE and could send "Done —" to the owner; it now raises
-  (FAILED). One that ran out of turns returns "[PARTIAL — the sub-agent ran out of turns before finishing]".</li>
-  <li><strong>Its execute runs in its own folder</strong> (<code>/workspace/delegated/&lt;job&gt;</code>) — <code>file_system</code> was
-  confined there but <code>execute</code> ran from the owner's sandbox root.</li>
-  <li><strong>Its commands are never promoted</strong> to background jobs: a landing woke the MAIN agent with the full
-  tool surface (outside the sub-agent's allow-list), survived a cancel, and a probe's delegate woke a real turn.</li>
-  <li><strong>Polling:</strong> its model calls wait while a foreground turn runs, so the launching turn cannot see it
-  finish (a probe collected 43 times in 91 s). The launch message and a running job's collect answer now say: finish your
-  turn and collect next turn.</li>
   <li><strong>Results</strong> over 8,000 characters say they were cut; every alias of collect (<code>get</code>, <code>fetch</code>)
   marks the output untrusted; a restart-lost result is named as such.</li>
-  <li><strong>Ownership:</strong> a turn that is not the owner's (probe, scheduled run, job wake, sub-agent) sees, collects
+  <li><strong>Ownership:</strong> a turn that is not the owner's (probe, scheduled run, job wake) sees, collects
   and cancels only the jobs IT started (<code>started_by</code> on every job).</li>
+  <li>The sub-agent fixes made in &sect;4NS (FAILED on unfinished turns, own execute folder, no command
+  promotion, polling hint) went with <code>delegate</code> in &sect;4SI.</li>
 </ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_jobs_tool_sandbox.py</code>, <code>tests/test_jobs_collect_readmark.py</code>, and the registry part of <code>tests/test_delegation_and_dataflow.py</code>.</p>
 </main>
 </body>
 </html>

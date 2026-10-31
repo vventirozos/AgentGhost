@@ -710,10 +710,10 @@ class _FakeAgent:
 
 
 async def test_containment_denies_the_union_of_both_precedents():
-    """The replay list must not be weaker than either sibling — it is
-    applied to the workload with the largest blast radius."""
-    from ghost_agent.core.subagent import FORBIDDEN_TOOLS
-    assert FORBIDDEN_TOOLS <= REPLAY_FORBIDDEN_TOOLS
+    """The replay list is applied to the workload with the largest blast
+    radius. (Its sibling precedents — core.subagent's FORBIDDEN_TOOLS and
+    dream.py's self-play denylist — were removed in §4SI/§4NM; the names they
+    denied are pinned literally in test_4si_containment_pins.)"""
     # …plus the tools NEITHER sibling denies, found by the S1 review.
     for gap in ("manage_composed_skills", "notify_operator", "deploy",
                 "rotate_secrets", "knowledge_base"):

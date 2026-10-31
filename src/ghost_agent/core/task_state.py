@@ -287,8 +287,10 @@ def untested_pages(tools_run) -> List[str]:
         op = str(a.get("operation") or "").lower()
         body = str(t.get("content") or "")
         if n == "browser":
-            acts = [x for x in (a.get("actions") or []) if isinstance(x, dict)] if op == "interact" else []
-            url = str(a.get("url") or next((x.get("url") for x in acts if str(x.get("action")) == "goto"
+            from ..tools.browser_support import browser_effective_call
+            op, acts = browser_effective_call(a)              # r1: evaluate/fill ran as interact
+            acts = acts if op == "interact" else []
+            url = str(a.get("url") or a.get("link") or a.get("href") or next((x.get("url") for x in acts if str(x.get("action")) == "goto"
                                             and x.get("url")), "") or last_url)
             last_url = url or last_url
             head = body.lstrip()[:200]
@@ -317,6 +319,10 @@ def untested_pages(tools_run) -> List[str]:
             continue
         if op not in _MUTATING_OPS or not p.lower().endswith((".html", ".htm")):
             continue
+        _app = a.get("append")
+        if op == "write" and a.get("content") == "" and (
+                _app is True or str(_app).strip().lower() in ("true", "1", "yes")):
+            continue                                           # r1/r4: an empty finish changes nothing
         changed[p] = i
         text = " ".join(str(a.get(k) or "") for k in ("content", "new_string", "replace_with"))
         if re.search(r"<script|<[a-z][^>]*\son[a-z]+\s*=", text, re.I):
@@ -383,6 +389,22 @@ def _download_links(tools_run, files, prefix: str = "") -> List[str]:
     return out
 
 
+def _open_part_line(path) -> str:
+    """§4SH: an open parts file as the model needs to judge it — its size and
+    how it ends (req cb27058e: the file ended `</html>` and the bare "the LAST
+    part has not been sent" read as stale to the model, which then ignored it)."""
+    name = str(path).rsplit("/", 1)[-1]
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 160))
+            tail = " ".join(fh.read().decode("utf-8", "replace").split())[-60:]
+    except OSError:
+        return f"`{name}`"
+    return f"`{name}` ({size:,} bytes, ends «…{tail}»)"
+
+
 def render_task_state(tools_run, *, ask: str = "", turn: int = 0, note: str = "", link_prefix: str = "") -> str:
     """The TASK STATE block for DYNAMIC STATE — empty until a tool has run."""
     facts = task_state_facts(tools_run, ask=ask)
@@ -410,9 +432,11 @@ def render_task_state(tools_run, *, ask: str = "", turn: int = 0, note: str = ""
     except Exception:  # noqa: BLE001
         _parts = []
     if _parts:
-        lines.append("Still being written in parts — the LAST part has not been sent, so these files are incomplete "
-                     "and unchecked: " + ", ".join(f"`{str(x).rsplit('/', 1)[-1]}`" for x in _parts[:6])
-                     + ". Send the remaining part(s) without more_parts before calling the work done.")
+        lines.append("Open for parts — more is expected, so these files are not checked yet: "
+                     + ", ".join(_open_part_line(x) for x in _parts[:6])
+                     + ". Append the next part — or, if a file is already complete, finish it: file_system "
+                       "operation='write', append=true, content='' (nothing is added; the finish says what "
+                       "was checked).")
     _sides = facts.get("sides") or {}
     if _sides.get("tests") or _sides.get("source"):
         lines.append(f"Code edits this request: {_sides.get('source', 0)} to source files, "

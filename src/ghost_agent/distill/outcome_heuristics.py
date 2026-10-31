@@ -831,7 +831,10 @@ def classify_chat_outcome(
             if url and url != last_url and not _tool_call_failed(tc):
                 seen.clear()
                 last_url = url
-            actions = [s for s in (args.get("actions") or []) if isinstance(s, dict)]
+            from ..tools.browser_support import browser_effective_call
+            _eop, actions = browser_effective_call(args)     # r1: evaluate/fill ran as interact
+            if _eop == "interact":
+                op = "interact"
             # The live tool's multi-step shape is op="interact" with the
             # navigation INSIDE the actions list ({"action": "goto", …});
             # a successful one is the same observable progress as a

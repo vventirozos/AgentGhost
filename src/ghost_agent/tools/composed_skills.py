@@ -240,9 +240,9 @@ def macro_step_inputs(param_template) -> List[str]:
 
 #: Tools that can never be a macro STEP (§4LS): the macro manager (a macro
 #: running it ran itself 197 levels deep) and the tools that create or retire
-#: skills or run the dream cycle.
+#: skills.
 MACRO_FORBIDDEN_STEP_TOOLS = frozenset({
-    "manage_composed_skills", "create_skill", "manage_skills", "dream_mode",
+    "manage_composed_skills", "create_skill", "manage_skills",
     "probe_model",   # §4QA: an experiment is the owner's turn, not a macro step
 })
 

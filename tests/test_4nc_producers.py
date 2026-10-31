@@ -122,10 +122,10 @@ def test_the_model_facing_text_promises_no_lesson_making():
     import json
     from ghost_agent.tools.registry import TOOL_DEFINITIONS
     from ghost_agent.core import prompts
-    for name in ("dream_mode",):   # §4NM: self_play left the registry
-        t = json.dumps(next(d for d in TOOL_DEFINITIONS if d["function"]["name"] == name))
-        assert "lesson" in t and "Active Memory Consolidation" not in t and "training curriculum" not in t
-    texts = [v for v in vars(prompts).values() if isinstance(v, str) and "SLEEP/REST" in v]
-    assert texts and not any("extract heuristics" in v for v in texts)
+    # §4NM: self_play left the registry; §4SI: dream_mode and its SLEEP/REST line too
+    names = {d["function"]["name"] for d in TOOL_DEFINITIONS}
+    assert not {"self_play", "dream_mode"} & names
+    texts = [v for v in vars(prompts).values() if isinstance(v, str)]
+    assert not any("SLEEP/REST" in v or "extract heuristics" in v for v in texts)
 
 

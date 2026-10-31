@@ -967,7 +967,6 @@ class Icons:
     IMAGE_GEN    = "🎨"
     REPORT_PDF   = "📄"
     NODE_WORKER  = "🔧"   # background / edge worker-node compute (wide-base; was ⚙️)
-    NODE_EDGE    = "🛸"   # swarm edge-node compute (wide-base; was 🛰️)
 
     # --- Memory & Identity ---
     MEM_SAVE     = "📝"

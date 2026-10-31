@@ -47,7 +47,6 @@ export const TURN_CAPTIONS = {
     'memory save':      { i: '📝', t: 'saving to memory' },
     'project tool':     { i: '📋', t: 'working on a project' },
     'verifier':         { i: '🧪', t: 'checking the answer' },
-    'delegate':         { i: '🔧', t: 'delegating a subtask' },
     'worker compute':   { i: '🔧', t: 'delegating to the worker node' },
 };
 // {text, icon} for the status line, or null (keep the caption). Pure.

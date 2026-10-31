@@ -47,7 +47,7 @@ def _bare_client():
     c._foreground_lock = asyncio.Lock()
     c._bg_queue_sem = asyncio.Semaphore(3)
     c.upstream_url = "http://127.0.0.1:8088"
-    c.worker_clients = c.critic_clients = c.vision_clients = c.swarm_clients = c.coding_clients = []
+    c.worker_clients = c.critic_clients = c.vision_clients = c.coding_clients = []
     c._maybe_record_call = lambda *a, **k: None
     c.before_main_dispatch = None
     return c
@@ -329,7 +329,7 @@ async def test_the_hook_runs_before_a_plain_main_call_only():
     c._do_chat_completion = do
     await c.chat_completion({"messages": [1]})
     assert seen == [{"messages": [1]}] and order == ["hook", "call"]
-    for kw in ("use_worker", "use_critic", "use_vision", "use_swarm", "use_coding", "off_main_only"):
+    for kw in ("use_worker", "use_critic", "use_vision", "use_coding", "off_main_only"):
         seen.clear()
         await c.chat_completion({"messages": [2]}, **{kw: True})
         assert seen == [], kw

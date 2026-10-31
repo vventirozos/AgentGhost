@@ -150,10 +150,3 @@ def test_system_prompt_parallel_execution():
     assert "PARALLEL EXECUTION:" in QWEN_TOOL_PROMPT
     assert "execute MULTIPLE tools in a single turn" in QWEN_TOOL_PROMPT
     assert "output multiple `<tool_call>` blocks sequentially" in QWEN_TOOL_PROMPT
-
-def test_swarm_worker_persona_registry():
-    """Verify that worker_persona is present in the delegate_to_swarm tool schema."""
-    swarm_tool = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "delegate_to_swarm")
-    props = swarm_tool["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]
-    assert "worker_persona" in props
-    assert "Optional." in props["worker_persona"]["description"]

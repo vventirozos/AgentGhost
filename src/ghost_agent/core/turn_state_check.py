@@ -695,7 +695,8 @@ def _check_empty_evidence(body: str, rows: List[Dict[str, Any]]) -> Optional[str
             except Exception:  # noqa: BLE001
                 pass
             args = r.get("arguments") if isinstance(r.get("arguments"), dict) else {}
-            op = str(args.get("operation") or "").lower()
+            from ..tools.browser_support import browser_effective_call
+            op = browser_effective_call(args)[0]      # r1: evaluate/fill ran as interact
             if op in _BROWSER_ACTION_OPS:
                 # a click / interact whose page loaded is a read (review §4IY); one that errored is
                 # a failed action, not an absent source

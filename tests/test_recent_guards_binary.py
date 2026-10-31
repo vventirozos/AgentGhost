@@ -36,10 +36,10 @@ async def test_execute_forbidden_modules_extended(tmp_path):
     assert "FORBIDDEN IMPORT" in result
     assert "vision_analysis" in result
 
-    code2 = "from delegate_to_swarm import something"
+    code2 = "from learn_skill import something"
     result2 = await tool_execute("script2.py", code2, sandbox, manager)
     assert "FORBIDDEN IMPORT" in result2
-    assert "delegate_to_swarm" in result2
+    assert "learn_skill" in result2
 
 # 3. Test memory ingestion binary guard
 from ghost_agent.tools.memory import tool_gain_knowledge

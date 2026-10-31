@@ -126,7 +126,7 @@
     <li>Construct the FastAPI app and attach the lifespan coroutine.</li>
     <li>Lifespan startup:
       <ul>
-        <li><code>LLMClient</code> with foreground + swarm/worker/visual/coding/image_gen pools.</li>
+        <li><code>LLMClient</code> with foreground + worker/visual/coding/image_gen pools.</li>
         <li><code>DockerSandbox.ensure_running()</code> in a worker thread.</li>
         <li><code>ProjectStore</code> always (for user-driven multi-session projects).</li>
         <li>Memory stores (vector, graph, profile, episodes, adaptive threshold) — <strong>skipped under <code>--no-memory</code></strong>.</li>

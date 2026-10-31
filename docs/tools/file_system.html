@@ -28,7 +28,6 @@
     <a href="workspace_track.html">workspace_track</a>
     <a href="vision.html">vision</a>
     <a href="image_gen.html">image_gen</a>
-    <a href="swarm.html">swarm</a>
     <a href="tasks.html">tasks</a>
     <a href="projects.html">projects</a>
     <a href="acquired_skills.html">acquired_skills</a>
@@ -894,6 +893,110 @@ arguments - Unterminated string", so it regenerated the same full-size write. Th
   server stopped at its cap.</li>
   <li>Pins: <code>tests/test_4nu_big_files.py</code> (incl. the real parser on cut XML in both dialects).</li>
 </ul>
+
+  <h2 id="4sh">A file in parts is judged by what is in it <span class="tag">2026-10-30 &sect;4SH</span></h2>
+  <p><strong>Why.</strong> Request cb27058e (a 76 KB web desktop in four parts) sent its LAST part, the one ending
+  <code>&lt;/body&gt;&lt;/html&gt;</code>, with <code>more_parts=true</code>. Before this change, only that flag decided whether a file was finished. So:
+  <ul>
+    <li>the file stayed "in progress" for the 17 turns that followed;</li>
+    <li>the closing checks never ran;</li>
+    <li>every TASK STATE said "send the remaining part(s)" when nothing remained, and an empty append was refused. The model decided the line was stale and ignored it;</li>
+    <li>the reply ended with "incomplete and was never checked", about a page it had tested three times in the browser.</li>
+  </ul>
+  The page check that never ran would also have caught the real bug: part 3 ended with
+  <code>&lt;/script&gt;</code> and part 4 began with code. It took about 10 minutes of model reasoning to find.</p>
+  <ul>
+    <li><strong>An appended part that ends its document is the last part</strong>, whatever <code>more_parts</code> says
+    (<code>document_ends_here</code>):
+    <ul>
+      <li><code>.html/.htm/.xhtml</code> ending <code>&lt;/html&gt;</code>;</li>
+      <li><code>.svg</code> ending <code>&lt;/svg&gt;</code>;</li>
+      <li><code>.json</code> that parses whole (up to 8 MB).</li>
+    </ul>
+    The result says so, the whole file is checked, and a later append just reopens it. A FIRST part is never closed this way, because cb27058e's part 1 was the
+    whole skeleton through <code>&lt;/html&gt;</code> with the scripts appended after it. Code (<code>.py/.js</code>) never closes by
+    parsing, since a file split at function boundaries parses after every part. An <code>edit</code> that makes the document end closes it too.</li>
+    <li><strong>An empty last part finishes the file.</strong> <code>write</code> + <code>append=true</code> + <code>content=''</code>
+    (without <code>more_parts</code>) on an open file adds nothing, closes it and checks it whole (<code>finish_parts_file</code>).
+    On a file that is not open it is refused with the reason. Every part that leaves the file open says how to do this
+    (<code>OPEN_PART_NOTE</code>), and so does the TASK STATE line. That line also shows each open file's size and how it ends, so the model can judge
+    the claim against its own file.</li>
+    <li><strong>At the reply the system closes what is still open</strong> (<code>settle_open_parts</code>) and judges each file by its
+    content. A file whose check passes is not mentioned. A failing check (syntax, a page that looks cut short — see the review notes below — a page check)
+    is named. A file type nothing can check (<code>.md</code>, <code>.txt</code> …) is named with its last characters, so the owner can see where it stops.
+    <code>unfinished_parts_note</code> is async now; both reply paths await it.</li>
+    <li><strong>Page check: JavaScript outside any &lt;script&gt;</strong> (<code>html_stray_script_note</code>, joined to the handler check as
+    <code>html_page_notes</code> at every whole-page check). Three or more JS statement lines outside script/style/pre/code/textarea/template/comments are reported
+    with the first line and the <code>&lt;/script&gt;</code> before it. It is advisory and never a failure. On the replayed cb27058e parts it names
+    "from line 1003 … the last &lt;/script&gt; before it is at line 1001" in the closing part's result.</li>
+  </ul>
+  <p>Also in §4SH:</p>
+  <ul>
+    <li><code>browser operation='evaluate'</code> (or <code>fill</code>, <code>dblclick</code>, <code>wait_for_selector</code>, <code>sleep</code>, <code>goto</code>), with an <code>actions</code> list or a top-level <code>js</code>, runs as <code>interact</code>. The result says the right form. Without actions it is refused with that form. The composed-URL 404 guard covers these too.</li>
+    <li>The trajectory redactor's <code>form_secret_assignment</code> no longer redacts a code value (a call, an index, a type word). <code>case 'pwd': print('/home/ghost')</code> had been recorded as <code>case 'pwd': &lt;REDACTED&gt;'/home/…')</code>.</li>
+  </ul>
+  <h3 id="4sh-review">After the fresh-eye review (r1–r12) <span class="tag">2026-10-30 &sect;4SH</span></h3>
+  <p>Twelve review rounds, each followed by a mutation battery. What the rules are now:</p>
+  <ul>
+    <li><strong>How a page is read.</strong> <code>_html_scan</code> follows the HTML tokenizer only as far as these verdicts need it, and stays linear on multi-MB input:
+    <ul>
+      <li><strong>Raw text.</strong> Raw-text elements (script, style, textarea, title, …) run to their first real closing tag, so <code>const t = "&lt;script&gt;"</code> inside a script is text.</li>
+      <li><strong>Things that open nothing.</strong> Comments do not open anything: <code>&lt;!--&gt;</code> and <code>&lt;!---&gt;</code> are whole, and <code>--!&gt;</code> ends a comment. Attribute values do not either; a quote inside an <em>unquoted</em> value is plain text.</li>
+      <li><strong>CDATA</strong> counts only inside <code>&lt;svg&gt;</code>/<code>&lt;math&gt;</code>. Elsewhere it is a bogus comment that ends at <code>&gt;</code>.</li>
+      <li><strong>SVG and MathML inside a page.</strong> Inside them nothing is raw text, until a breakout tag (<code>&lt;div&gt;</code>, <code>&lt;p&gt;</code>, …) ends that region. An integration point (foreignObject, desc, title, annotation-xml, mi/mo/mn/ms/mtext) holds HTML again.</li>
+      <li><strong>Positions</strong> are taken on the text itself. A lowercased copy is longer after <code>İ</code>, and that hid a cut script.</li>
+    </ul></li>
+    <li><strong>"Looks cut short"</strong> (<code>html_cut_finding</code>, which the finish note, the reply-time settle and the continuation all use):
+    <ul>
+      <li>the page ends inside a script, another raw-text element, a comment or a tag;</li>
+      <li>or it is a page (a doctype, or an <code>&lt;html&gt;</code>, <code>&lt;head&gt;</code> or <code>&lt;body&gt;</code> tag) with no <code>&lt;/html&gt;</code> or <code>&lt;/body&gt;</code> TAG. A tag inside a script string does not count.</li>
+    </ul>
+    A fragment (<code>&lt;div&gt;…&lt;/div&gt;</code>) needs neither tag. Scripts after <code>&lt;/html&gt;</code> are a whole page (cb27058e's shape).</li>
+    <li><strong>An appended part ends the file</strong> (<code>document_ends_here</code>) when its text ends with the document's closing tag, and the scan finds nothing left open.
+    <ul>
+      <li>The closing tag may carry attributes, and comments may follow it.</li>
+      <li>An <code>.svg</code> is closed when its outermost <code>&lt;svg&gt;</code> closes; an <code>&lt;svg</code> inside a comment or CDATA does not count.</li>
+      <li>A <code>.json</code> must parse; a leading BOM is ignored.</li>
+    </ul></li>
+    <li><strong>System continuation of a cut write</strong> (<code>continue_cut_write</code>):
+    <ul>
+      <li>Any round that hit the output limit counts as cut, even one cut exactly on a newline. Its last partial line was dropped, so its document end never finishes the file. The saved first part counts as cut too, and there is no shortcut before the first round.</li>
+      <li>A "done" (the END marker, or an empty round after a stop) is refused in three cases:
+      <ul>
+        <li>right after a cut part;</li>
+        <li>on a page that looks cut short, or an <code>.svg</code>/<code>.xhtml</code> that does not end its document;</li>
+        <li>on a JSON that is truncated. Any other parse error, such as comments in a <code>tsconfig.json</code>, is left to the syntax note.</li>
+      </ul></li>
+      <li>A refused file stays open. The note says why, and how to finish it with an empty append if it is in fact complete.</li>
+    </ul></li>
+    <li><strong>Edits and finishes.</strong>
+    <ul>
+      <li>An <code>edit</code> to a file still open for parts gets the deferred verdict ("waits for the last part") and the open-part note. Before, it got "SYNTAX CHECK FAILED — fix this before any other step".</li>
+      <li>An empty finish on a file with nothing pending is an informational NOTE. On a missing file it says the file does not exist, or is a directory, instead of advising the same call.</li>
+      <li>An extra finish does not count as changing a tested page.</li>
+    </ul></li>
+    <li><strong>The malformed-call fallback</strong> (text JSON that does not parse):
+    <ul>
+      <li>The parts flags are read only outside the content: before the content key, or in the simple key list that ends the call. That list is searched in a bounded tail window (linear on 1 MB).</li>
+      <li>Only the content's one closing quote and the call's braces are stripped. Its own trailing newline and quotes stay.</li>
+    </ul></li>
+    <li><strong>Redactor.</strong>
+    <ul>
+      <li>Code values are spared: a call or index on a known root, an attribute on one (<code>self.password</code>, <code>process.env.PW</code>), type words including <code>string;</code>, a self-name (<code>password=password</code>), and a comparison (<code>a == b</code>, <code>a === b</code>).</li>
+      <li>A value after a doubled separator (<code>password==X</code>, <code>secret:=X</code>) is judged on X.</li>
+      <li>The reply's unfinished-parts footer is stripped only as the system's own line.</li>
+    </ul></li>
+  </ul>
+  <p><strong>Known and left as they are:</strong>
+  <ul>
+    <li>A continuation round that re-sends the file's own ending lines doubles that ending. The overlap trimmer keeps structural lines on purpose, and the guard tried in r6 lost text.</li>
+    <li>These redactor gaps existed before this change: a quoted literal after <code>==</code>, a hard-coded fallback after a code value (<code>os.getenv("PW", "…")</code>), and Bearer tokens outside <code>Authorization</code>. They need a review of the redactor itself.</li>
+    <li>A malformed call with unescaped quotes AND no closing quote on its content is a guess.</li>
+    <li>The script "double-escape" state is not modelled.</li>
+  </ul></p>
+  <p>Pins: <code>tests/test_4sh_parts_close.py</code> (r1–r12 sections and the battery survivors), <code>tests/test_4oi_open_items.py</code>,
+  <code>tests/test_4ob_write_continuation.py</code>, <code>tests/test_4ec_parser_dialects.py</code>
+  (row <code>extreme_file_system_parts_flags</code>).</p>
 
   <h2 id="4nw-b">A write that starts the file over replaces its parts <span class="tag">2026-10-12 &sect;4NW</span></h2>
   <p>Live request c7f06c37 built a 72 KB page in parts and re-emitted the whole file from <code>&lt;!DOCTYPE html&gt;</code>

@@ -61,7 +61,7 @@ face.setForm('tesseract'); tick(300);
 const d0 = face.getDebugState(); const sceneZ0 = scene.rotation.z;
 const rest = { lines: { ...d0.tesseract.lines }, wob: d0.tesseract.wob, spin: d0.tesseract.kernelSpin,
                uLineSweep: lines.material.uniforms.uLineSweep.value, reach: lines.material.uniforms.uSweepReach.value,
-               seedsMax: Math.max(...d0.tesseract.seeds), twMax: Math.max(...d0.tesseract.tw.map(Math.abs)) };
+               seedsMax: Math.max(...d0.tesseract.seeds), seedsMean: d0.tesseract.seeds.reduce((a, b) => a + b, 0) / d0.tesseract.seeds.length, twMax: Math.max(...d0.tesseract.tw.map(Math.abs)) };
 const idle = run(1200);
 const spin1 = face.getDebugState().tesseract.kernelSpin;
 const turn = run(900, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
@@ -86,7 +86,7 @@ const snap = snapshot(); let nan = 0; for (const p of snap) if (p && !Number.isF
 emit({ rest, idleP95: p95Of(idle), turnP95: p95Of(turn), turnMax: maxOf(turn),
        spinIdleRate: (spin1 - d0.tesseract.kernelSpin) / 20, spinTurnRate: (dT.tesseract.kernelSpin - spin1) / 15,
        twMaxTurn: Math.max(...twAbs), twNonZero: twAbs.filter(t => t > 0.05).length,
-       seedsTurnMax: Math.max(...dT.tesseract.seeds), edgePhaseBases: bases.size,
+       seedsTurnMax: Math.max(...dT.tesseract.seeds), seedsTurnMean: dT.tesseract.seeds.reduce((a, b) => a + b, 0) / dT.tesseract.seeds.length, edgePhaseBases: bases.size,
        flashTool: dTool.gaitFlash, cornerSizesTool, wobPass, twPassDecay: twB / Math.max(1e-9, twA), shudder,
        sweepOn, nan, wraps: turn.reduce((m, s) => m + s.wraps, 0), lines: lines.geometry.drawRange.count / 2, linesNow: { ...face.getDebugState().tesseract.lines },
        kernelBase: d0.tesseract.kernelBase, shells: d0.tesseract.shells, kernelN: d0.tesseract.kernelN,
@@ -197,7 +197,10 @@ def test_newborn_shells_inherit_a_bounded_twist(mech):
 
 
 def test_busy_is_hotter_than_idle(mech):
-    assert mech["seedsTurnMax"] > mech["rest"]["seedsMax"] + 0.02, mech
+    # The mean over shells: every shell warms on a turn. The hottest shell
+    # sits at the 0.62 cap at rest too whenever one is newborn, and the
+    # temperament (§4SG) moves which frame the rest sample lands on.
+    assert mech["seedsTurnMean"] > mech["rest"]["seedsMean"] + 0.015, mech
 
 
 def test_every_edge_has_its_own_packet_phase(mech):

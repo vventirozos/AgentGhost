@@ -126,16 +126,6 @@ class TestWiring:
                / "tools" / "registry.py").read_text()
         assert '"notify_operator": lambda' in src
 
-    def test_subagents_cannot_page_the_operator(self):
-        # Delegated sub-agents must not reach this tool — the MAIN agent
-        # reports; a delegate paging the operator directly is spam surface.
-        from ghost_agent.core.subagent import (
-            resolve_allowed_tools, DEFAULT_ALLOWED_TOOLS,
-        )
-        assert "notify_operator" not in DEFAULT_ALLOWED_TOOLS
-        assert "notify_operator" not in resolve_allowed_tools(
-            ["notify_operator", "web_search"])
-
     def test_slack_bot_has_emoji_for_agent_message(self):
         bot = (Path(__file__).resolve().parents[1] / "interface" /
                "externals" / "slack_bot" / "main.py").read_text()

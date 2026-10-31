@@ -1,8 +1,8 @@
 """Read-only façades over the memory stores.
 
 Used to isolate an agent that must be able to READ the operator's memory
-but must never WRITE to it — today the delegated sub-agent
-(:mod:`core.subagent`).
+but must never WRITE to it — today the coding-loop leaves (the delegated
+sub-agent that first used it was removed in §4SI).
 
 Design (hardened 2026-07-14): a **default-allow-reads / explicit-deny-writes**
 proxy. Every genuine mutator is intercepted and no-op'd by NAME, and the raw

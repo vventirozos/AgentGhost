@@ -29,7 +29,7 @@ import pytest
 
 from ghost_agent.core.agent import GhostAgent, _PURE_TRIGGER_TOOLS, _STATIC_TOOL_NAMES
 
-PURE = "dream_mode"          # properties:{} in TOOL_DEFINITIONS
+PURE = "zz_pure_trigger"     # §4SI: dream_mode (the last properties:{} tool) left; simulated below
 STATIC = "web_search"        # static, takes arguments
 RUNTIME = "zz_runtime_macro"  # registered at runtime, not in TOOL_DEFINITIONS
 UNKNOWN = "no_such_tool_xyz"  # not exposed at all
@@ -75,11 +75,20 @@ for shape, kind in itertools.product(RAW, ("pure", "static", "runtime", "unknown
     else:
         EXPECTED[(shape, kind)] = False
 
+@pytest.fixture(autouse=True)
+def _a_pure_trigger_tool(monkeypatch):
+    import ghost_agent.core.agent as A
+    monkeypatch.setattr(A, "_PURE_TRIGGER_TOOLS", A._PURE_TRIGGER_TOOLS | {PURE})
+    monkeypatch.setattr(A, "_STATIC_TOOL_NAMES", A._STATIC_TOOL_NAMES | {PURE})
+
+
 NAME = {"pure": PURE, "static": STATIC, "runtime": RUNTIME, "unknown": UNKNOWN}
 
 
 def test_fixture_premises():
     # The table only discriminates if the tool kinds are what they claim.
+    import ghost_agent.core.agent as A
+    _PURE_TRIGGER_TOOLS, _STATIC_TOOL_NAMES = A._PURE_TRIGGER_TOOLS, A._STATIC_TOOL_NAMES
     assert PURE in _PURE_TRIGGER_TOOLS and PURE in _STATIC_TOOL_NAMES
     assert STATIC in _STATIC_TOOL_NAMES and STATIC not in _PURE_TRIGGER_TOOLS
     assert RUNTIME not in _STATIC_TOOL_NAMES and RUNTIME not in _PURE_TRIGGER_TOOLS

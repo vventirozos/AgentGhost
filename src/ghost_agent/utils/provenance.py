@@ -28,7 +28,7 @@ from typing import List, Optional
 UNTRUSTED_SOURCE_TOOLS = frozenset({
     "web_search", "deep_research", "news_headlines", "darkweb_search",
     "darkweb_research", "browser", "fact_check", "youtube_transcribe",
-    "vision_analysis", "recall", "delegate", "delegate_to_swarm",
+    "vision_analysis", "recall",
     "probe_model",          # §4QA: another model's answers, not the owner's words
 })
 #: knowledge_base actions that only WRITE or administer (every other action

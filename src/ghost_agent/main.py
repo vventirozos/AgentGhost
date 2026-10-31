@@ -323,7 +323,6 @@ def parse_args():
     # explicitly, so this only changes what a bare invocation gets.
     from .core.llm import DEFAULT_UPSTREAM_URL as _DEF_UP
     parser.add_argument("--upstream-url", default=_DEF_UP)
-    parser.add_argument("--swarm-nodes", default=None, help="Comma-separated list of url|model nodes")
     parser.add_argument("--worker-nodes", default=None, help="Comma-separated list of url|model nodes for background/edge tasks")
     parser.add_argument("--visual-nodes", default=None, help="Comma-separated list of url|model nodes for vision models")
     parser.add_argument("--coding-nodes", default=None, help="Comma-separated list of url|model nodes for code generation")
@@ -385,7 +384,6 @@ def parse_args():
         parser.add_argument(_gone, type=float, default=None, help="Removed (§4PT host telemetry); accepted and ignored.")
     args = parser.parse_args()
     
-    args.swarm_nodes_parsed = _parse_node_list(args.swarm_nodes, "swarm")
     args.worker_nodes_parsed = _parse_node_list(args.worker_nodes, "worker")
     args.visual_nodes_parsed = _parse_node_list(args.visual_nodes, "visual")
     args.coding_nodes_parsed = _parse_node_list(args.coding_nodes, "coding")
@@ -1056,7 +1054,6 @@ async def lifespan(app):
     context.llm_client = LLMClient(
         args.upstream_url,
         tor_proxy=context.tor_proxy,
-        swarm_nodes=args.swarm_nodes_parsed,
         worker_nodes=args.worker_nodes_parsed,
         visual_nodes=getattr(args, 'visual_nodes_parsed', None),
         coding_nodes=getattr(args, 'coding_nodes_parsed', None),

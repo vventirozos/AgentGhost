@@ -96,7 +96,8 @@ def test_method_carries_the_pipeline_landmarks():
                    # "unescape_xml_values" left with the blanket decode (§4RD)
         assert marker in src, f"pipeline landmark missing: {marker}"
     # the two rewritten control-flow statements
-    assert "return True  # was `break`" in src
+    # §4SI: the only `break` (the terminal-tool direct summary) was removed
+    assert "return True  # was `break`" not in src
     assert "return False  # was `continue`" in src
 
 

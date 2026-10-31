@@ -31,7 +31,7 @@ logger = logging.getLogger("GhostAgent")
 # How many recent requests keep their facts. Sized like the experiments ring:
 # enough to cover a streamed turn still draining while later requests run,
 # small enough to stay a rounding error in memory. Contexts are shallow-copied
-# for sub-agents (`core/subagent.py`) and dream (`core/dream.py`), so this dict
+# for coding-loop leaves and dream (`core/dream.py`), so this dict
 # can be SHARED across those — which is why only requests that actually record
 # a fact take a slot.
 _MAX_REQUESTS = 16

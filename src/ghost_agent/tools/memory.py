@@ -5174,17 +5174,6 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     return _kb_unknown_action_error(action)
 
-async def tool_dream_mode(context):
-    """
-    Manually triggers the Active Memory Consolidation (Dream Mode).
-    """
-    from ..core.dream import Dreamer
-    dreamer = Dreamer(context)
-    result = await dreamer.dream()
-    from .outcome import append_note
-    return append_note(result, "\n\nSYSTEM: SESSION FINISHED. STAND BY.")
-
-
 _VALID_LESSON_SCOPES = {"today", "week", "all", "self_play_only"}
 
 

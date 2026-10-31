@@ -14,6 +14,9 @@ import time
 import uuid
 import contextlib
 import re
+
+#: §4SH r6: the tail of a malformed file_system call searched for its trailing keys
+_FTAIL_WINDOW = 4096
 import unicodedata
 import sys
 import gc
@@ -856,7 +859,7 @@ _CORRECTION_JUDGE_TIMEOUT_S = float(
 _BOOKKEEPING_TOOL_NAMES = frozenset({
     "manage_projects", "manage_tasks", "manage_skills",
     "scratchpad", "learn_skill", "update_profile",
-    "replan", "abort_attempt", "dream_mode", "list_lessons",
+    "replan", "abort_attempt", "list_lessons",
     "knowledge_base",  # insert_fact / forget return confirmations only
 })
 
@@ -1749,8 +1752,8 @@ def _browser_loaded_but_never_extracted(tools_run, target: str) -> bool:
         # the breaker's target is `primary_target_from_args`: lower-cased and
         # cut at 200 chars — compare the same form
         _url = str(args.get("url") or "").strip().lower()[:200]
-        op = str(args.get("operation") or "").strip().lower()
-        _acts = [a for a in (args.get("actions") or []) if isinstance(a, dict)]
+        from ..tools.browser_support import browser_effective_call
+        op, _acts = browser_effective_call(args)        # r1: evaluate/fill ran as interact
         # §4LN: a url-less extract (the form the schema teaches: it re-opens
         # the page just navigated) and an interact extract are reads too
         _reads = op == "extract_text" or (op == "interact" and any(
@@ -3965,7 +3968,7 @@ _WORK_VERB_RE = re.compile(
 #: manage_projects, workspace, introspect).
 _WORK_TOOLS = frozenset({"execute", "browser", "web_search", "deep_research", "darkweb_search",
                          "darkweb_research", "image_generation", "deploy", "manage_services",
-                         "delegate", "delegate_to_swarm", "create_skill", "probe_model"})
+                         "create_skill", "probe_model"})
 
 
 def status_only_refusal_text() -> str:
@@ -4453,6 +4456,8 @@ _FS_WROTE_PAIR_RE = re.compile(
     r"Script-side path \(from sandbox cwd\): '(.+?)'\.")
 _FS_PRODUCE_RES = (
     re.compile(r"^SUCCESS: (?:Wrote|Appended) \d+ chars to '(.+?)'\."),
+    # §4SH: an empty last part finishing a file written in parts
+    re.compile(r"^SUCCESS: Finished '(.+?)' — written in parts, nothing added now;"),
     # §4KC operation='edit' — path LAST and end-anchored, so a filename
     # containing `' — replaced` cannot plant a phantom path.
     re.compile(r"^SUCCESS: edited — replaced \d+ occurrence\S* of old_string "
@@ -5930,21 +5935,21 @@ def _read_doc_for_check(path: str, roots, limit: int = 2_000_000) -> str:
     return ""
 
 
-def unfinished_parts_note(req_id) -> str:
-    """§4OI (iii): a file this request began writing in parts and never
-    finished — said in the reply, so a "complete, open it and play" over an
-    unterminated file cannot stand alone (census turn 065)."""
+async def unfinished_parts_note(req_id) -> str:
+    """§4OI (iii) + §4SH: the files this request left OPEN for parts (the last
+    part left them open for more) are closed here and judged by their content.
+    Only a file whose check finds something is named (census turn 065: a
+    "complete, open it and play" over an unterminated file); one that passes
+    says nothing (req cb27058e: a page tested three times in the browser was
+    reported "incomplete and never checked" because of the flag alone)."""
     try:
-        from ..tools.file_system import files_left_in_progress
-        left = files_left_in_progress(req_id)
+        from ..tools.file_system import settle_open_parts
+        settled = await settle_open_parts(req_id)
     except Exception:  # noqa: BLE001
         return ""
-    if not left:
-        return ""
-    names = ", ".join(f"`{str(x).rsplit('/', 1)[-1]}`" for x in left[:4])
-    return (f"\n\n⚠️ {names} {'was' if len(left) == 1 else 'were'} written in parts and the last part was never "
-            f"sent — the file{'' if len(left) == 1 else 's are'}{' is' if len(left) == 1 else ''} incomplete and "
-            f"{'was' if len(left) == 1 else 'were'} never checked.")
+    lines = [f"⚠️ `{name}` was written in parts and was left open for more, but nothing "
+             f"followed — {finding.rstrip('.')}." for name, finding in settled if finding]
+    return ("\n\n" + "\n".join(lines[:4])) if lines else ""
 
 
 def unopened_citation_note(tools_run, roots) -> str:
@@ -7489,70 +7494,6 @@ def _scrub_fallback_message(intended: str, task_closed: bool) -> str:
     return msg
 
 
-def _distill_terminal_tool_summary(tool_name: str, raw: str) -> str:
-    """Turn a terminal tool's return string into a short user-facing
-    summary. `tool_dream_mode` returns a blob that mixes user-relevant
-    status with a ``SYSTEM: ...`` trailer meant for the summary-turn LLM.
-    Dumping the whole blob into the chat window leaks the directive and
-    makes the reply noisy; we strip the trailers and extract the key
-    facts (``Status:`` / ``Learned task:`` lines when present), else
-    fall back to the first ~400 chars of the cleaned text.
-    """
-    if not raw:
-        return ""
-
-    # Strip trailers meant for other consumers.
-    cleaned = re.sub(
-        r"\n*SYSTEM INSTRUCTION:.*$",
-        "", raw, flags=re.DOTALL | re.IGNORECASE,
-    ).strip()
-    cleaned = re.sub(
-        r"^CURIOSITY:.*?$", "", cleaned, flags=re.MULTILINE
-    ).strip()
-    cleaned = re.sub(
-        r"\n*SYSTEM:\s*[A-Z_ ]+?(DONE|FINISHED|STAND BY)\.?\s*$",
-        "", cleaned, flags=re.IGNORECASE,
-    ).strip()
-    # dream_mode's footer is two clauses joined by a period
-    # ("SESSION FINISHED. STAND BY."). The single-keyword pattern above
-    # can't span it — the period isn't in its [A-Z_ ] class — so strip the
-    # combined form explicitly. (Pre-existing: the model-driven dream bypass
-    # leaked this footer too; cleaned up alongside the deterministic path.)
-    cleaned = re.sub(
-        r"\n*SYSTEM:\s*SESSION\s+FINISHED\.?\s*STAND BY\.?\s*$",
-        "", cleaned, flags=re.IGNORECASE,
-    ).strip()
-
-    status_m = re.search(r"^Status:\s*(.+)$", cleaned, re.MULTILINE)
-    cluster_m = re.search(r"^Cluster:\s*(\S+)", cleaned, re.MULTILINE)
-    gate_m = re.search(r"^Skill gate:\s*(.+)$", cleaned, re.MULTILINE)
-    learned_m = re.search(r"^Learned task:\s*(.+)$", cleaned, re.MULTILINE)
-
-    status = status_m.group(1).strip() if status_m else ""
-    cluster = cluster_m.group(1).strip() if cluster_m else ""
-    gate = gate_m.group(1).strip() if gate_m else ""
-    learned = learned_m.group(1).strip() if learned_m else ""
-
-    lines = []
-    if cluster and status:
-        # Em-dash separator reads better than nested parens; status
-        # already contains its own parenthetical like
-        # "SUCCESS (in 1 attempts)".
-        lines.append(f"Challenge: {cluster} — {status}.")
-    elif status:
-        lines.append(f"Result: {status}.")
-    if learned:
-        lines.append(f"Lesson learned: \"{learned}\".")
-    elif gate:
-        lines.append(f"Skill gate: {gate}.")
-
-    if lines:
-        return "\n".join(lines)
-
-    # Unrecognised shape — show the cleaned raw, capped.
-    return cleaned[:400] + ("..." if len(cleaned) > 400 else "")
-
-
 def _challenge_output_prefixes(challenge_text) -> list:
     """Extract literal output-line prefixes a self-play challenge pins down.
 
@@ -7585,55 +7526,6 @@ def _challenge_output_prefixes(challenge_text) -> list:
             if literal not in prefixes:
                 prefixes.append(literal)
     return prefixes
-
-
-# Phrases that, when they DOMINATE a short user message, mean "run a memory-
-# consolidation (dream) cycle now". `dream_mode` is a terminal tool subject
-# to the replay bug (its summary is persisted as a plain-text turn and
-# re-hydrated). Deliberately multi-word / unambiguous:
-# bare "sleep"/"rest"/"dream" are avoided because they substring-match prose
-# ("interesting" contains "rest", "daydream" contains "dream").
-_DREAM_COMMAND_PHRASES = (
-    "dream mode",
-    "go to sleep",
-    "time to sleep",
-    "get some sleep",
-    "consolidate memories",
-    "consolidate your memories",
-    "consolidate memory",
-    "consolidate your memory",
-    "memory consolidation",
-)
-
-
-def _is_dream_command(text: str) -> bool:
-    """True when `text` is *predominantly* an explicit memory-consolidation
-    (dream) command (e.g. "dream mode", "go to sleep", "consolidate
-    memories"). This gates a deterministic, pre-LLM dispatch of the
-    `dream_mode` tool: without it a bare command runs the tool only on the
-    FIRST ask and is replayed from the persisted plain-text summary
-    thereafter. `dream_mode` has no continuous-loop variant, so there are
-    no loop markers to exclude — just a command phrase and a length cap so
-    a prose mention is left to the model."""
-    if not text:
-        return False
-    lc = " ".join(str(text).lower().split())
-    if not any(p in lc for p in _DREAM_COMMAND_PHRASES):
-        return False
-    return len(lc.split()) <= 6
-
-
-def _explicit_terminal_command(text: str):
-    """Return the terminal tool name (``"dream_mode"``) the message is an
-    unambiguous, command-dominant request for, or ``None``.
-
-    Single source of truth for the pre-LLM deterministic dispatch in
-    ``handle_chat``: the terminal tool's summary is persisted as a
-    plain-text turn with no tool_call and re-hydrated by the memory bus,
-    so it is force-dispatched here."""
-    if _is_dream_command(text):
-        return "dream_mode"
-    return None
 
 
 def _json_args_cut_off(raw, err) -> bool:
@@ -8433,7 +8325,7 @@ logger = logging.getLogger("GhostAgent")
 
 def _compute_pure_trigger_tools():
     """Names of tools that take NO parameters — a call with empty args is a
-    COMPLETE call for these (dream_mode), not a
+    COMPLETE call for these (none since dream_mode was removed, §4SI), not a
     degenerate one. Derived from TOOL_DEFINITIONS so it stays in sync as the
     tool list changes (guard the thing, not a hardcoded list). Used by the
     usable-native gate: an empty-args native call is only allowed to win over a
@@ -9720,15 +9612,15 @@ _JOB_ID_RE = re.compile(r"\bjob-[0-9a-f]{6,12}\b")
 
 
 def _launched_background_jobs(tools_run) -> list:
-    """The job ids this turn's tool results report as STARTED (a delegate,
-    a swarm, a command promoted to a background job). §4LD: a "notify me
+    """The job ids this turn's tool results report as STARTED (a command
+    promoted to a background job). §4LD: a "notify me
     when it's done" turn that only LAUNCHED the work sent "Done — I've
     started the benchmark…" while it ran; the job's own completion is the
     notice."""
     ids = []
     for t in tools_run or []:
         if isinstance(t, dict) and str(t.get("name") or "") in (
-                "delegate", "delegate_to_swarm", "execute", "jobs", "file_system"):
+                "execute", "jobs", "file_system"):
             for jid in _JOB_ID_RE.findall(str(t.get("content") or "")):
                 if jid not in ids:
                     ids.append(jid)
@@ -9737,7 +9629,7 @@ def _launched_background_jobs(tools_run) -> list:
 
 def _notify_when_jobs_finish(context, job_ids, req_id) -> int:
     """Arm the job registry to notify the owner when each still-running
-    sub-agent/swarm job finishes (they sent no completion notice at all).
+    background job finishes.
     Sandbox jobs already wake a turn that reports their result. Returns the
     number armed."""
     try:
@@ -9799,7 +9691,7 @@ def _notify_promise_backstop(context, *, last_user_content, tools_run,
         if log is None or _rate_limited():
             return False
         # §4LD: the turn LAUNCHED the work — "Done" would be false. The jobs
-        # notify on finishing (sub-agents/swarms armed here; sandbox jobs wake
+        # notify on finishing (sandbox jobs wake
         # a turn that reports the real result)
         _launched = _launched_background_jobs(tools_run)
         # only when a finish notice was actually ARMED (§4LI review: a turn
@@ -10836,7 +10728,9 @@ class _UrlProvenance:
     def refusal(self, cname: str, args: dict):
         if cname != "browser" or not isinstance(args, dict):
             return None
-        if str(args.get("operation") or "") not in ("navigate", "extract_text", "screenshot", "click", "interact"):
+        from ..tools.browser import _INTERACT_ONLY_ACTIONS     # §4SH: these run AS interact
+        _op = str(args.get("operation") or "")
+        if _op not in ("navigate", "extract_text", "screenshot", "click", "interact") and _op not in _INTERACT_ONLY_ACTIONS:
             return None
         for u in self._urls_of(args):
             h = self.host(u)
@@ -12877,19 +12771,10 @@ class GhostAgent:
         "postgresadmin": "postgres_admin",
         "postgres-admin": "postgres_admin",
         "postgres": "postgres_admin",
-        "delegatetoswarm": "delegate_to_swarm",
-        "delegate-to-swarm": "delegate_to_swarm",
-        # NOTE: no bare "delegate" alias — that is the real sub-agent tool
-        # (tools/delegate.py, added 2026-07-11). The alias table is consulted
-        # BEFORE the exact norm_to_real match, so aliasing "delegate" here
-        # would hijack every case/paren variant of the real tool ("Delegate",
-        # "delegate()") to delegate_to_swarm — wrong tool, wrong schema, strike.
         "listlessons": "list_lessons",
         "list-lessons": "list_lessons",
         "whathaveyoulearned": "list_lessons",
         "lessons": "list_lessons",
-        "dreammode": "dream_mode",
-        "dream-mode": "dream_mode",
     }
 
     @classmethod
@@ -21576,8 +21461,10 @@ class GhostAgent:
                 args = (tc.get("function") or {}).get("arguments")
                 if isinstance(args, str):
                     args = json.loads(args or "{}")
-                if not isinstance(args, dict) or not str(args.get("content") or "").strip():
-                    continue                       # the dispatcher's empty-write block
+                _fin = isinstance(args, dict) and isinstance(args.get("content"), str) and (
+                    args.get("append") is True or str(args.get("append")).strip().lower() in ("true", "1", "yes"))
+                if not isinstance(args, dict) or (not str(args.get("content") or "").strip() and not _fin):
+                    continue                       # the dispatcher's empty-write block (§4SH r2: a finish passes)
                 kwargs = {k: v for k, v in args.items()
                           if k not in ("cut_off_saved", "append_after", "cut_note_extra")}
                 _egress_ref = _cer("file_system", args, self.context)
@@ -22240,8 +22127,16 @@ class GhostAgent:
                             elif tool_name_fallback == 'file_system' and 'path' in block_content:
                                 op_match = re.search(r'(?:"|\')operation(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
                                 p_match = re.search(r'(?:"|\')path(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
-                                c_match = re.search(r'(?:"|\')content(?:"|\')\s*:\s*(?:"|\')(.*?)(?=(?:,\s*(?:"|\')replace_with(?:"|\')\s*:|$))', block_content, re.DOTALL)
-                                rw_match = re.search(r'(?:"|\')replace_with(?:"|\')\s*:\s*(?:"|\')(.*)', block_content, re.DOTALL)
+                                # §4SH r4: the parts flags count only OUTSIDE the content — in the
+                                # key list that ends the block, or before the content key (content
+                                # holding `"append": true` was cut there and the flag taken from it)
+                                _ftail = re.search(r'(?<=["\'])(?:\s*,\s*(?:"|\')(?!(?:content|replace_with)["\'])[A-Za-z_]\w{0,31}(?:"|\')\s*:\s*(?:true|false|null|-?\d{1,12}|"(?:\\.|[^"\\]){0,200}"))+[\s}]*$', block_content[-_FTAIL_WINDOW:], re.IGNORECASE)   # r5–r7: simple trailing keys right after the content's closing quote, in a bounded tail window (the search backtracks per comma)
+                                _ftail_at = len(block_content) - len(block_content[-_FTAIL_WINDOW:]) + _ftail.start() if _ftail else -1
+                                _body = block_content[:_ftail_at] if _ftail else block_content
+                                _ckey = re.search(r'(?:"|\')content(?:"|\')\s*:', _body)
+                                _fzone = (block_content[:_ckey.start()] + (_ftail.group(0) if _ftail else "")) if _ckey else block_content
+                                c_match = re.search(r'(?:"|\')content(?:"|\')\s*:\s*(?:"|\')(.*?)(?=(?:,\s*(?:"|\')replace_with(?:"|\')\s*:|$))', _body, re.DOTALL)
+                                rw_match = re.search(r'(?:"|\')replace_with(?:"|\')\s*:\s*(?:"|\')(.*)', _body, re.DOTALL)
 
                                 if op_match and p_match:
                                     args_dict = {
@@ -22249,12 +22144,19 @@ class GhostAgent:
                                         "path": p_match.group(1)
                                     }
                                     if c_match:
-                                        raw_content = c_match.group(1).strip('\r\n')
-                                        if raw_content.endswith('}'): raw_content = raw_content[:-1].strip('\r\n')
-                                        if raw_content.endswith(','): raw_content = raw_content[:-1].strip('\r\n')
-                                        if raw_content.endswith('"""'): raw_content = raw_content[:-3].strip('\r\n')
-                                        elif raw_content.endswith('"') or raw_content.endswith("'"): raw_content = raw_content[:-1].strip('\r\n')
+                                        raw_content = c_match.group(1)
+                                        # r4/r5: drop exactly the closing quote and the call's `}}` — the content's
+                                        # own whitespace (a part's trailing newline) and quotes stay
+                                        _cend = re.search(r'(["\'])[ \t\r\n,}]*\Z', raw_content)
+                                        if _cend:
+                                            raw_content = raw_content[:_cend.start()]
                                         args_dict["content"] = raw_content.replace('\\"', '"')   # §4RD: a JSON slice
+
+                                    # §4SH r3: the parts flags survive the fallback (an `append=true,
+                                    # content=''` finish came back as an empty plain write and was blocked)
+                                    for _flag_k in ("append", "more_parts"):
+                                        if re.search(r'(?:"|\')' + _flag_k + r'(?:"|\')\s*:\s*(?:true|1|"(?:true|yes|1)")(?![\w"])', _fzone, re.IGNORECASE):
+                                            args_dict[_flag_k] = True
 
                                     if rw_match:
                                         raw_rw = rw_match.group(1).strip('\r\n')
@@ -22520,7 +22422,8 @@ class GhostAgent:
         step 2) against `TurnState`; the only rewrites are the two
         turn-loop control-flow statements (the region was the loop-body
         tail): returns True to BREAK the turn loop, False to continue
-        with the next iteration. State repack happens in `finally` so a
+        with the next iteration. (No path returns True since §4SI removed
+        the terminal-tool direct summary, its only `break`.) State repack happens in `finally` so a
         raising tool path leaves ts as up-to-date as the old inline
         code left handle_chat's locals.
         """
@@ -23342,7 +23245,10 @@ class GhostAgent:
 
                 if _cname == "file_system":
                     op = t_args.get("operation")
-                    if op == "write":
+                    _app_flag = t_args.get("append")
+                    _finishing = isinstance(t_args.get("content"), str) and (   # r2: "" finishes, "\n" appends
+                        _app_flag is True or str(_app_flag).strip().lower() in ("true", "1", "yes"))
+                    if op == "write" and not _finishing:   # §4SH r1: append=true, content='' finishes a parts file (the tool judges it)
                         content_val = t_args.get("content")
                         if not content_val or not str(content_val).strip():
                             # Allow empty writes for filenames that
@@ -23378,7 +23284,11 @@ class GhostAgent:
                                     f"(path={_p_raw!r}, basename={_basename!r})",
                                     icon=Icons.STOP,
                                 )
-                                err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.rejected(f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution.", reason_code="empty_write_blocked")}
+                                _fin_hint = (" — to FINISH a file written in parts send content='' (an empty "
+                                             "string) with append=true; do not re-send the file"
+                                             if _app_flag is True or str(_app_flag).strip().lower() in ("true", "1", "yes")
+                                             else "")      # §4SH r3
+                                err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.rejected(f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file{_fin_hint}. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution.", reason_code="empty_write_blocked")}
                                 messages.append(err_msg)
                                 tools_run_this_turn.append({**err_msg, "_synthetic": True})
                                 execution_failure_count += 1
@@ -25993,86 +25903,6 @@ class GhostAgent:
                             and not binding_failure_count and not _batch_all_stopped:
                         execution_failure_count = max(0, execution_failure_count - 1)
 
-                    # Terminal tool: `dream_mode` is a self-contained
-                    # cycle. Once it returns,
-                    # the expected next turn is a conversational
-                    # summary to the user — NEVER another call.
-                    # Without this gate, the main LLM (seeing the
-                    # system prompt's "Call this tool EVERY TIME
-                    # the user requests it" alongside the original
-                    # user intent still in history) re-fires the
-                    # same tool 2–3x per user ask and burns minutes
-                    # per extra run. Setting force_final_response
-                    # routes the next turn through the text-only
-                    # streaming path; the tool_call suppressor
-                    # above catches any stragglers in non-stream
-                    # mode. The directive message is belt-and-
-                    # suspenders for the model's benefit.
-                    terminal_names = {"dream_mode"}
-                    just_ran_terminal = any(
-                        t.get("name") in terminal_names
-                        # §4RZ step 5 (s5-r5): a stopped dream is not "complete"
-                        and getattr(t.get("content"), "reason_code", None) != "user_interrupted"
-                        for t in tools_run_this_turn[-len(results):]
-                    )
-                    if just_ran_terminal and not force_final_response:
-                        # --- DIRECT-FROM-TOOL SUMMARY ---
-                        # We used to set force_final_response=True
-                        # here and let the LLM summarise the tool
-                        # result on a follow-up turn. That worked on
-                        # the first invocation but deterministically
-                        # failed from the second invocation onward:
-                        # the conversation window now contained a
-                        # repeated `user → <tool_call name="dream_mode">
-                        # → tool result` pattern, and the model's
-                        # attention attractor beat the "text-only"
-                        # directive — it emitted yet another
-                        # <tool_call> for the same tool, which the
-                        # stream scrub stripped, which left the user
-                        # with a generic fallback message instead of
-                        # a real summary.
-                        #
-                        # The fix is to stop running the summary LLM
-                        # turn at all. dream_mode already
-                        # return a structured, user-readable string;
-                        # we format it deterministically here and
-                        # assign it straight to `final_ai_content`,
-                        # then flip `force_stop` so the turn loop
-                        # exits before any further LLM call runs.
-                        # No LLM summary = no pattern priming = no
-                        # tool_call leak = no scrub = no fallback.
-                        _terminal_result = ""
-                        _terminal_name = ""
-                        for _t in reversed(tools_run_this_turn[-len(results):]):
-                            if _t.get("name") in terminal_names:
-                                _terminal_result = str(_t.get("content", "")).strip()
-                                _terminal_name = _t.get("name")
-                                break
-                        # Distill the raw tool output into a short
-                        # user-facing summary. The raw blob mixes
-                        # user-relevant status with internal
-                        # telemetry (`CURIOSITY: ...`) and an LLM-
-                        # facing `SYSTEM INSTRUCTION:` trailer —
-                        # the helper strips those and extracts
-                        # the 1-3 key facts (cluster, status,
-                        # skill-gate or learned lesson).
-                        _summary_body = _distill_terminal_tool_summary(
-                            _terminal_name, _terminal_result
-                        )
-                        _prefix = {
-                            "dream_mode": "Dream cycle complete.",
-                        }.get(_terminal_name, f"`{_terminal_name}` complete.")
-                        final_ai_content = (
-                            f"{_prefix}\n\n{_summary_body}"
-                            if _summary_body else _prefix
-                        )
-                        force_stop = True
-                        pretty_log(
-                            "Terminal Tool",
-                            f"Bypassed summary LLM — direct result displayed ({_terminal_name})",
-                            icon=Icons.STOP,
-                        )
-                        return True  # was `break` — exit the turn loop
             # §4KL R4/R5: a member who keeps making refused calls AFTER reading
             # the refusal ends in a report, not the turn cap. Counted in whole
             # batches (a first fan-out of three refused calls is one batch the
@@ -26705,7 +26535,7 @@ class GhostAgent:
         await self._census_record(req_id, final_ai_content, last_user_content, messages,
                                   tools_run_this_turn, _fc_quote_stats, path="finalize")
         try:                                                                # §4OI (iii): an unfinished parts file
-            _up_note = unfinished_parts_note(request_id_context.get() or req_id)
+            _up_note = await unfinished_parts_note(request_id_context.get() or req_id)
             if _up_note:
                 final_ai_content = (final_ai_content or "").rstrip() + _up_note
                 pretty_log("Unfinished File", _up_note.strip()[:200], icon=Icons.WARN, level="WARNING")
@@ -31420,83 +31250,6 @@ class GhostAgent:
                             "and the task is not finished — say where the work stands and where the files are",
                             last_user_content)})
 
-                    # --- DETERMINISTIC TERMINAL-TOOL DISPATCH (turn 0) -------
-                    # A bare "self play" / "self play again" (and likewise
-                    # "dream mode" / "go to sleep") used to run the cycle only
-                    # on the FIRST ask; every repeat replayed the previous
-                    # turn's text summary instead of re-firing. Root cause: the
-                    # direct-from-tool-summary bypass below persists the cycle
-                    # result as a PLAIN-TEXT assistant turn with NO tool_call,
-                    # and the memory bus re-hydrates it as "Context: Self-play
-                    # complete…", so the model's only in-context example says
-                    # the right response to "self play" is to reprint that text
-                    # — which it does (identical 126-char reply, tool=- in
-                    # metacog), never re-running.
-                    #
-                    # Fix: when the message is unambiguously a single-cycle
-                    # terminal command (self_play or dream_mode), dispatch the
-                    # tool deterministically here and bypass the LLM turn
-                    # entirely — the model's indecision can no longer swallow
-                    # the request. We also append a real assistant tool_call +
-                    # tool result to history so the in-context example shows a
-                    # TOOL invocation, not bare text; any future model-driven
-                    # turn (longer phrasings that skip this fast path) then
-                    # imitates the tool, not the summary. Breaking the
-                    # `for turn` loop falls straight through to the post-loop
-                    # metacog/calibration finalisation, so the reading still
-                    # records (domain=memory, tool=<name>) exactly as the
-                    # model-driven path did.
-                    _det_tool = (
-                        _explicit_terminal_command(last_user_content)
-                        if (turn == 0 and not force_stop)
-                        else None
-                    )
-                    if _det_tool is not None and requester_is_member():
-                        _det_tool = None                 # a member never runs the owner's dream (R4)
-                    if _det_tool is not None and _det_tool in self.available_tools:
-                        pretty_log(
-                            "Terminal Tool",
-                            f"Explicit '{_det_tool}' command — dispatching deterministically (bypassing LLM turn).",
-                            icon=Icons.STOP,
-                        )
-                        try:
-                            from ..tools.outcome import with_text as _wt
-                            _det_res = await self.available_tools[_det_tool]() or ""
-                            _det_raw = _wt(_det_res, str(_det_res).strip())
-                        except Exception as _det_exc:
-                            logger.error(f"Deterministic {_det_tool} dispatch failed: {_det_exc}")
-                            _det_raw = ""
-                        # Record as a genuine tool_call + result so subsequent
-                        # turns imitate the tool, not the text summary.
-                        _det_call_id = f"det_{_det_tool}_{turn}"
-                        messages.append({
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": _det_call_id,
-                                "type": "function",
-                                "function": {"name": _det_tool, "arguments": "{}"},
-                            }],
-                        })
-                        _det_tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": _det_call_id,
-                            "name": _det_tool,
-                            "content": _det_raw,
-                        }
-                        messages.append(_det_tool_msg)
-                        tools_run_this_turn.append(dict(_det_tool_msg))
-                        _det_body = _distill_terminal_tool_summary(_det_tool, _det_raw)
-                        _det_prefix = {
-                            "dream_mode": "Dream cycle complete.",
-                        }.get(_det_tool, f"`{_det_tool}` complete.")
-                        final_ai_content = (
-                            f"{_det_prefix}\n\n{_det_body}"
-                            if _det_body else _det_prefix
-                        )
-                        force_stop = True
-                        break
-
                     # --- CHECKPOINT & RESUME ---
                     # At turn milestones, save a structured progress summary
                     # to the scratchpad so earlier context can be pruned
@@ -34432,18 +34185,11 @@ class GhostAgent:
                 if _fn_m:
                     _intended = _fn_m.group(1)
 
-                # The "cycle already completed" branch that
-                # used to live here was retired once terminal
-                # tools (self_play, dream_mode) started
-                # bypassing the summary LLM turn entirely —
-                # see the DIRECT-FROM-TOOL SUMMARY block in
-                # the tool-execution path. That path now
-                # writes directly to `final_ai_content` and
-                # flips `force_stop`, so we never reach this
-                # stream-scrub fallback when a terminal tool
-                # ran in the same handle_chat. This
-                # single-branch fallback handles only the
-                # remaining case: the planner routed the
+                # (The "cycle already completed" branch and the
+                # terminal-tool direct summary it gave way to
+                # are both gone — §4NM self_play, §4SI
+                # dream_mode.) This single-branch fallback
+                # handles one case: the planner routed the
                 # turn as text-only but the model still
                 # emitted a tool_call.
                 # When the turn was finalized BECAUSE a project
@@ -34767,7 +34513,7 @@ class GhostAgent:
 
             # §4OI (iii): a file left unfinished in parts, said after the answer
             try:
-                _up_note = unfinished_parts_note(_stream_req_id)
+                _up_note = await unfinished_parts_note(_stream_req_id)
                 if _up_note:
                     yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _up_note}, 'finish_reason': None}]})}\n\n".encode('utf-8')
                     full_content = (full_content or "") + _up_note

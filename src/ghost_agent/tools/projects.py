@@ -5445,88 +5445,56 @@ MANAGE_PROJECTS_TOOL_DEF = {
     "type": "function",
     "function": {
         "name": "manage_projects",
+        # §4SI (2026-10-30, operator: "let's shrink it"): 13,951 → ~7.4k chars. The
+        # rules kept are the ones that decide behaviour (when to create, pacing,
+        # DONE honesty, the user's yes before release/unrelease/delete, archive vs
+        # delete); per-action detail is one phrase.
         "description": (
-            "Create and operate on long-term projects (coding or general) with task/subtask trees that "
-            "survive across sessions. Use this when the user wants to START a new named multi-step "
-            "effort, RESUME prior work, inspect the task tree, advance a task, or switch projects. GATING "
-            "for `create`: only create a project when (1) the user EXPLICITLY asks to start/track a "
-            "project, OR (2) the deliverable GENUINELY spans MULTIPLE files/modules AND needs MULTIPLE "
-            "turns to build. Do NOT use this for ad-hoc chat or one-shot queries — those stay in "
-            "free-chat mode. A self-contained SINGLE-FILE deliverable (even a large one — a one-file "
-            "browser OS, game, or script) is a one-shot: build it directly with file_system write, do NOT "
-            "create a project for it. Past similar projects in memory are NOT a reason to create a new "
-            "one. Do NOT call `create` twice for the same effort — if a project already appears in "
-            "DYNAMIC SYSTEM STATE under CURRENT PROJECT, work on THAT one. Workflow: `create` or `switch` "
-            "to enter project mode; `task_decompose` (with ONLY `subtasks`, no `task_id`) to fan out a "
-            "fresh project's top-level tasks; `task_decompose` WITH `task_id` to break a specific task "
-            "into subtasks; `task_add` for one-off SINGLE additions — if the user provides a LIST "
-            "(numbered, bulleted, or comma-separated) of 2+ tasks to add, use `task_decompose` with "
-            "subtasks=[…] instead. `task_next` to find the next leaf to execute; `task_update` to mark "
-            "DONE/FAILED/PAUSED/NEEDS_USER (pass `task_ids=[…]` to update many at once — strongly "
-            "preferred over looping). IMPORTANT: `task_add` creates tasks in PENDING status; 'Added' does "
-            "NOT mean 'Done'. Do NOT mark a task DONE until its described work is actually complete. "
-            "PACING: after you create or decompose a plan, present it and STOP — advance ONE task per "
-            "explicit user go-ahead ('proceed to next task'), never the whole tree in a single turn (that "
-            "floods the context window on large projects). `resume` when the user asks to pick up an old "
-            "project. `ledger` records a durable fact surfaced every turn (or pass `ledger=…` on a DONE "
-            "task_update). `exit` to leave project mode; `archive` to HIDE a project (reversible — "
-            "status→ARCHIVED, files kept, `resume` brings it back); `delete` to PERMANENTLY remove a "
-            "project, ALL its data AND its files (NOT reversible). Use `delete` only when the user "
-            "clearly means to erase it; otherwise prefer `archive`. `release`, `unrelease` and `delete` "
-            "first return a preview: ask the user, and repeat the call with its confirm_token only after "
-            "they say yes. `autopilot` (enabled=true|false, only on the user's request) lets the idle "
-            "loop advance the project between their turns, or stops it; without `enabled` it reports the "
-            "setting; project_id='all' with enabled=false stops every project (a step already running "
-            "finishes first). Autopilot pauses itself after 3 steps with no progress, at each check-in, "
-            "or when its budget is used — tell the user why. `budget` (only on the user's request; "
-            "metadata={steps_cap, runtime_cap_hours, checkpoint_every}) sets the project's budget — "
-            "steps_cap counts every advance step (the user's too), runtime_cap_hours is the unattended "
-            "time between the user's looks; without metadata it reports it. `promote_from_context` only "
-            "when the user has explicitly accepted a suggestion to convert the current chat into a "
-            "project. `research` to web-research a topic (pass `topic`) or auto-derive several from the "
-            "project goal (omit `topic`); `research_list` lists the briefs (research/<slug>.md) — read "
-            "one with file_system before re-researching. `artifact_list` to read back recorded artifacts "
-            "(scope with task_id/artifact_kind; long payloads are cut to 400 chars). `cleanup` to remove debris from the project workspace "
-            "NOW (never deliverables or sources) when the user asks to tidy up. `describe_file` to record "
-            "WHAT a file is/does the moment you learn it (file_path + description, optional file_role); "
-            "call it whenever you create a file or work out an undescribed one. `file_history` "
-            "(file_path) to see every recorded action that touched a file — check it BEFORE re-reading a "
-            "large file to answer 'what changed / what was tried'. `release` (ONLY when the USER "
-            "explicitly confirms the project works): promotes a DONE project to RELEASED — pass "
-            "`directions` (a usage runbook for the user); it cold-starts services, verifies deliverables "
-            "and freezes a release dossier. A RELEASED project is IMMUTABLE: to change it use "
-            "`create_version` (optional description = the requested change), which forks a v(n+1) copy; "
-            "the released version keeps running untouched. `unrelease` (user command only) demotes "
-            "RELEASED→DONE for in-place fixes. `verify_release` health-checks a released project against "
-            "its dossier — use when the user asks whether a released app still runs. `task_delete` "
-            "(task_id) removes a mistaken/duplicate task permanently. `search` (query) finds WHICH "
-            "project touched a file / used a technique; use it before answering 'which project did X'. "
-            "`set_dependency` (depends_on=[ids/titles]) makes this project wait for others: autoadvance "
-            "holds until every dependency is DONE/RELEASED. `clone` (project_id=SOURCE, title=NEW name, "
-            "optional description/goal) starts a FRESH project from an existing one's files+knowledge "
-            "WITHOUT lineage — use for 'make another one like X'; for changing a RELEASED project itself "
-            "use create_version instead."
+            "Long-term projects (coding or general) with task trees that survive across sessions. "
+            "GATING for `create`: only when the user EXPLICITLY asks to start/track a project, or the "
+            "deliverable spans MULTIPLE files/modules AND needs MULTIPLE turns. A SINGLE-FILE deliverable "
+            "(even a large one — a one-file browser OS, game, script) is a one-shot: write it with "
+            "file_system, do NOT create a project for it. Past similar projects in memory are NOT a reason "
+            "to create one. Never create twice for one effort — if DYNAMIC SYSTEM STATE shows a CURRENT "
+            "PROJECT, work on it. "
+            "PACING: after create/decompose, present the plan and STOP; advance ONE task per user go-ahead. "
+            "A task is DONE only when its work is really complete (task_add makes PENDING tasks — 'Added' "
+            "does NOT mean 'Done'). "
+            "release, unrelease and delete first return a PREVIEW + confirm_token: ask the user, repeat "
+            "with the token only after they say yes. delete erases the project AND its files for good — "
+            "prefer archive (reversible) unless the user clearly means erase. autopilot and budget only "
+            "on the user's request. "
+            "Actions: create · switch · resume · exit · status · get · list · update · archive · delete · "
+            "clone (project_id = the SOURCE id, title = the NEW name; copies its files, settings and constraints, no "
+            "lineage) · promote_from_context (only after the "
+            "user accepted turning this chat into a project) · task_decompose (subtasks=[…]; with task_id "
+            "= break that task down; use it for any LIST of 2+ tasks) · task_add (ONE task) · task_next · "
+            "task_update (task_ids=[…] for many) · task_delete · task_list · autoadvance (count) · "
+            "autopilot (enabled) · budget (metadata={steps_cap, runtime_cap_hours, checkpoint_every}) · "
+            "ledger · config · constraint_retire (a requirement the user dropped or that is met) · research (topic/topics; omit both to derive from the "
+            "goal) · research_list · artifact_add · artifact_list · describe_file (call when you create "
+            "or work out a file) · file_history (check BEFORE re-reading a large file to see what changed) · "
+            "unregister_file · cleanup (debris only, on request) · search (which project did X) · "
+            "set_dependency · release (DONE→RELEASED, only when the USER confirms it works; pass "
+            "directions) · create_version (change a RELEASED project: forks v(n+1); description = the "
+            "requested change) · unrelease · "
+            "verify_release (does a released app still run) · event_log."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": sorted(_ACTIONS),
-                    "description": "Which sub-operation to perform.",
-                },
-                "title": {"type": "string", "description": "Project title (create/promote_from_context)."},
-                "kind": {"type": "string", "enum": ["CODING", "GENERAL"],
-                         "description": "Project kind (defaults to GENERAL)."},
-                "goal": {"type": "string", "description": "One-sentence project goal."},
-                "metadata": {"type": "object", "description": "Optional free-form project metadata."},
-                "project_id": {"type": "string", "description": "Target project id (omit for the current project)."},
-                "task_id": {"type": "string",
-                            "description": "A SINGLE task id (bare string like 'eed65da9a1e4'). For task_* and artifact_add actions. DO NOT wrap it in brackets — `task_id=\"[\"abc\"]\"` is wrong; use `task_ids=[\"abc\"]` instead for the list form."},
+                "action": {"type": "string", "enum": sorted(_ACTIONS)},
+                "title": {"type": "string", "description": "Project title (create, clone, promote_from_context)."},
+                "kind": {"type": "string", "enum": ["CODING", "GENERAL"]},
+                "goal": {"type": "string", "description": "One-sentence goal."},
+                "metadata": {"type": "object", "description": "Free-form project metadata; budget's caps."},
+                "project_id": {"type": "string", "description": "Target project (omit = current; 'all' for autopilot off)."},
+                "task_id": {"type": "string", "description": "ONE bare task id, e.g. 'eed65da9a1e4' (never a bracketed list)."},
                 "task_ids": {"type": "array", "items": {"type": "string"},
-                             "description": "A LIST of task ids for batch task_update only — e.g. mark several tasks DONE in one call. Use this (not task_id) whenever you have more than one id. Pass as a real JSON array, not a string."},
-                "parent_id": {"type": "string", "description": "Parent task id when creating a subtask."},
-                "description": {"type": "string", "description": "Task description (task_add/task_update) — OR, for action=describe_file, the one-line 'what this file is/does' text to record (REQUIRED there, e.g. 'Node/Express static host + API on port 8100')."},
+                             "description": "Several task ids (batch task_update), as a JSON array."},
+                "parent_id": {"type": "string", "description": "Parent task id for a subtask."},
+                "description": {"type": "string",
+                                "description": "Task description; for describe_file the one-line 'what this file does' (required)."},
                 "status": {"type": "string",
                            "enum": ["PENDING", "READY", "IN_PROGRESS", "DONE",
                                     "FAILED", "BLOCKED", "PAUSED", "NEEDS_USER"]},
@@ -5534,52 +5502,51 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "alternatives": {"type": "array", "items": {"type": "string"}},
                 "postconditions": {"type": "array", "items": {"type": "string"}},
                 "constraints": {"type": "array", "items": {"type": "string"},
-                                "description": "EXPLICIT user requirements/prohibitions quoted from their message, verbatim or near-verbatim (e.g. \"don't come up with some random AI\", \"YOU will play against me\", \"no external libraries\"). Pass on create/task_add/task_decompose/task_update. They GATE task completion. Negations and role assignments (what the user said YOU must do) belong here, never paraphrased away."},
+                                "description": "The user's explicit requirements/prohibitions, quoted near-verbatim "
+                                               "(incl. what YOU must do); they gate DONE."},
                 "depends_on": {"type": "array", "items": {"type": "string"},
-                               "description": "task_add: ids of sibling tasks that must be DONE before THIS task becomes eligible to run (a prerequisite edge, distinct from parent/child). Use it to order peer tasks; omit for independent tasks."},
-                "sequential": {"type": "boolean",
-                               "description": "task_decompose: when true, chain the subtasks so each one only runs after the previous is DONE (the autoadvancer executes them in order). Default false = all subtasks independently runnable."},
-                "topic": {"type": "string",
-                          "description": "action=research: a single topic to research now. Saved as research/<slug>.md. Omit topic (and topics) to auto-derive several topics from the project goal + open tasks."},
-                "topics": {"type": "array", "items": {"type": "string"},
-                           "description": "action=research: an explicit list of topics to research (each persisted as its own brief). If omitted and no single topic is given, topics are auto-derived from the project."},
-                "max_topics": {"type": "integer",
-                               "description": "action=research: cap on how many auto-derived topics to research (default 5)."},
-                "result": {"type": "string", "description": "Short result summary (task_update with status=DONE)."},
+                               "description": "task_add: sibling task ids that must be DONE first; set_dependency: projects."},
+                "sequential": {"type": "boolean", "description": "task_decompose: run the subtasks in order."},
+                "topic": {"type": "string", "description": "research: one topic (saved as research/<slug>.md)."},
+                "topics": {"type": "array", "items": {"type": "string"}, "description": "research: several topics."},
+                "max_topics": {"type": "integer", "description": "research: cap on derived topics (default 5)."},
+                "result": {"type": "string", "description": "task_update DONE: short result summary."},
                 "failure_reason": {"type": "string"},
                 "subtasks": {"type": "array", "items": {"type": "string"},
-                             "description": "Ordered subtask descriptions for task_decompose / promote_from_context. GRANULARITY: make each task own a FILE or a clearly-bounded function/module you can build AND verify on its own (e.g. 'src/parser.py: parse the CSV', 'apps/terminal.js: terminal app'). Do NOT split one file into N tasks; prefer a thin entrypoint + one file per feature."},
-                "artifact_kind": {"type": "string",
-                                  "enum": ["file", "url", "note", "tool_call"]},
+                             "description": "Ordered task descriptions; each owns one file or a bounded module "
+                                            "you can build and verify alone (do not split one file into N tasks)."},
+                "artifact_kind": {"type": "string", "enum": ["file", "url", "note", "tool_call"]},
                 "payload": {"type": "string",
-                            "description": "artifact_add: the artifact body/path. constraint_retire: WHICH active constraint to retire — its exact text, its 0-based index, or 'all'. Retiring stops the constraint from replaying into future requests/verifier checks (it is kept in metadata.constraints_retired; the user restating it re-arms it). Project DONE retires all constraints automatically. Use when a stored constraint no longer reflects user intent — e.g. a phrasing rule for deliverables that keeps firing on ordinary replies."},
+                            "description": "artifact_add: the body/path; constraint_retire: the constraint's text, "
+                                           "index or 'all'."},
                 "deliverables": {"type": "array", "items": {"type": "string"},
-                                 "description": "task_update with status=DONE: the project-relative paths of files the USER should keep (the actual deliverables — reports, code, generated images). Everything else in the project workspace (screenshots, helper scripts, temp files) is DELETED when the project finishes, so list every file worth keeping here. Paths are relative to the project workspace, e.g. [\"report.pdf\", \"src/solver.py\"]."},
+                                 "description": "task_update DONE: project-relative paths to KEEP — every other file "
+                                                "in the workspace is deleted when the project finishes."},
                 "status_filter": {"type": "string"},
                 "limit": {"type": "integer"},
                 "event_type": {"type": "string"},
-                "context_summary": {"type": "string",
-                                    "description": "Optional textual snapshot captured at promotion time."},
+                "context_summary": {"type": "string", "description": "promote_from_context: snapshot of the chat."},
                 "confirm_token": {"type": "string",
-                                  "description": "action=release / unrelease / delete: these are the USER's decisions. The first call only PREVIEWS and returns a confirm_token; show the user what will happen and, ONLY after they say yes in their next message, repeat the call with this token."},
-                "enabled": {"type": "boolean",
-                            "description": "action=autopilot: true lets the idle loop advance this project between the owner's turns, false stops it; omit to report. Only on the owner's request."},
+                                  "description": "release/unrelease/delete: the preview's token — only after the user's yes."},
+                "enabled": {"type": "boolean", "description": "autopilot: true/false; omit to report."},
                 "count": {"type": "string",
-                          "description": "action=autoadvance: how many tasks to advance autonomously in a bounded loop — a number (e.g. \"3\") or \"all\" to run to completion. Use this ONLY for an explicit MULTI-task request: 'do the next 3 tasks' → count=\"3\"; 'proceed with all remaining tasks' / 'finish the project' → count=\"all\". A single 'proceed'/'next' you do YOURSELF as one focused full turn — do NOT route that here (autoadvance runs a lighter single-step-per-task executor)."},
+                          "description": "autoadvance: '3' or 'all' — ONLY for an explicit multi-task ask; a single "
+                                         "'proceed' you do yourself as one full turn."},
                 "ledger": {"type": "string",
-                           "description": "action=ledger: ONE durable fact to append to the project's design ledger (file layout, key API name, convention), surfaced in the briefing every turn. Omit `ledger` to read the current ledger back. May also be passed on a task_update status=DONE to record the decision as the task closes."},
+                           "description": "ledger: one durable fact (layout, API name, convention), shown in the briefing "
+                                          "every turn; omit to read. Also accepted on task_update DONE."},
                 "config_key": {"type": "string",
-                               "description": "action=config: the name of ONE durable project setting to record — an env var, key flag, dependency version, the model, a port, a DB URI (e.g. 'GHOST_MODEL', 'port', 'torch'). Surfaced in the briefing every turn. Omit both config_key and config_value to read the current config map back; pass config_key with an empty config_value to delete that setting."},
-                "config_value": {"type": "string",
-                                 "description": "action=config: the value for `config_key` (e.g. 'qwen-3.6-35b-a3', '8000', '2.3.1'). Empty value deletes the key."},
+                               "description": "config: one durable setting (env var, port, version); omit key+value "
+                                              "to read, empty value deletes."},
+                "config_value": {"type": "string", "description": "config: the value."},
                 "file_path": {"type": "string",
-                              "description": "actions describe_file/file_history/unregister_file: the project-relative file (e.g. 'server.js', 'src/app.py'). unregister_file removes a RENAMED/DELETED file from the deliverable record + file map (then re-register the new name)."},
-                "file_role": {"type": "string",
-                              "description": "action=describe_file: optional short role tag, e.g. 'entrypoint', 'styles', 'data-layer'."},
-                "query": {"type": "string",
-                          "description": "action=search: what to find across ALL projects (a filename, technique, library, topic)."},
+                              "description": "describe_file/file_history/unregister_file: project-relative path "
+                                             "(unregister after a rename/delete)."},
+                "file_role": {"type": "string", "description": "describe_file: role tag, e.g. 'entrypoint'."},
+                "query": {"type": "string", "description": "search: what to find across all projects."},
                 "directions": {"type": "string",
-                               "description": "action=release (REQUIRED there): the usage runbook for the USER — what the project is, how to use it, features, known limitations. Written in second person, ≥2 sentences. The tool appends the VERIFIED service commands/ports itself; do not guess them here."},
+                               "description": "release (required): the user's runbook, second person, ≥2 sentences; "
+                                              "the tool adds the verified commands/ports."},
             },
             "required": ["action"],
         },

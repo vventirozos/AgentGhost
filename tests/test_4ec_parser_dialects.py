@@ -218,6 +218,13 @@ ROWS = {
         '"path": "a.py", "content": "old", "replace_with": "new"\n</tool_call>',
         ("file_system", {"operation": "replace", "path": "a.py",
                          "content": "old", "replace_with": "new"})),
+    # §4SH r3: the parts flags after content survive the fallback (a finish
+    # `append=true, content=''` must not come back as an empty plain write)
+    "extreme_file_system_parts_flags": (
+        '<tool_call>\n<name>file_system</name> "operation": "write", '
+        '"path": "a.html", "content": "<p>x</p>", "append": true, "more_parts": true\n</tool_call>',
+        ("file_system", {"operation": "write", "path": "a.html", "content": "<p>x</p>",
+                         "append": True, "more_parts": True})),
     "extreme_execute_filename_content": (
         '<tool_call>{"filename": "a.py", "content": "print(1)"}</tool_call>',
         ("execute", {"filename": "a.py", "content": "print(1)"})),
@@ -366,7 +373,7 @@ def test_xml_path_scrubs_tool_xml_from_the_ui_text():
 # (there is no other dict-key write in the method). Counted by SHAPE, not by
 # variable name, so a sink under a new name (the first version of this guard
 # missed the five `args_dict` sinks of the extreme fallback) still counts.
-EXPECTED_EXTRACTION_SINKS = 18   # 16 args_val/args_fallback + 2 args_dict (subscript writes only); §4EC removed the Format-0a CDATA sink (masking) and the repair-None arm (F4); §4LM moved the vision `action` write into `_salvage_vision_args` (row: extreme_vision_target_tag)
+EXPECTED_EXTRACTION_SINKS = 19   # 16 args_val/args_fallback + 3 args_dict (§4SH r3: parts flags, row extreme_file_system_parts_flags) (subscript writes only); §4EC removed the Format-0a CDATA sink (masking) and the repair-None arm (F4); §4LM moved the vision `action` write into `_salvage_vision_args` (row: extreme_vision_target_tag)
 
 
 def test_every_extraction_sink_has_a_dialect_row():

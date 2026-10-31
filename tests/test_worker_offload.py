@@ -219,7 +219,7 @@ class TestHealthExposesNodes:
         app = FastAPI()
         app.include_router(router)
         llm = SimpleNamespace(
-            worker_clients=WORKER, critic_clients=[], swarm_clients=[],
+            worker_clients=WORKER, critic_clients=[],
             coding_clients=[], vision_clients=[], image_gen_clients=[],
             foreground_requests=0, foreground_tasks=0,
         )
@@ -234,7 +234,7 @@ class TestHealthExposesNodes:
             nodes = c.get("/api/health").json()["nodes"]
         assert nodes["worker"] == ["http://mini:8088"]
         assert nodes["critic"] == []
-        assert set(nodes) == {"worker", "critic", "swarm", "coding",
+        assert set(nodes) == {"worker", "critic", "coding",
                               "vision", "image_gen"}
 
 

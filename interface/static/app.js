@@ -1,7 +1,7 @@
-import * as matrixGraphFace from './matrix_graph.js?v=17.8';
+import * as matrixGraphFace from './matrix_graph.js?v=17.9';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
-import { turnCaption } from './turn_caption.js?v=1.0';   // what the status line under the reply shows
+import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -2758,7 +2758,6 @@ const TICKER_VERBS = {
     'graph updated': 'updating the knowledge graph',
     'system weather': 'checking the weather',
     'vision': 'looking at an image',
-    'delegate': 'delegating a subtask',
 };
 // What the turn status line SHOWS lives in turn_caption.js (2026-10-27).
 // What a ticker line means to the FACE (2026-09-11): a gait for the
@@ -2769,7 +2768,7 @@ const _FACE_PHASE_BY_TITLE = {
     'memory recall': 'search', 'file read': 'read',
     'sandbox tree': 'read', 'vision': 'read', 'sandbox exec': 'tool',
     'execution task': 'tool', 'file write': 'tool', 'worker compute': 'tool',
-    'delegate': 'tool', 'memory save': 'tool', 'graph updated': 'tool',
+    'memory save': 'tool', 'graph updated': 'tool',
     'verifier': 'verify', 'tool call': 'tool',
 };
 function faceSignalsForTicker(title, icon, detail) {

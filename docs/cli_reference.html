@@ -172,7 +172,6 @@
   <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Used for</th><th>Selector</th></tr></thead>
     <tbody>
-      <tr><td><code>--swarm-nodes</code></td><td>Parallel inference / planning fan-out</td><td><code>chat_completion(use_swarm=True)</code></td></tr>
       <tr><td><code>--worker-nodes</code></td><td>Cheap classifier sub-tasks (failure tagging, summaries; query expansion was removed in §4NQ); also the verifier fallback when <code>--critic-nodes</code> is not set</td><td><code>route(task=...)</code> dispatch</td></tr>
       <tr><td><code>--visual-nodes</code></td><td>Multimodal vision (PDF + image)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
       <tr><td><code>--coding-nodes</code></td><td>Code generation specialists</td><td><code>chat_completion(use_coding=True)</code></td></tr>

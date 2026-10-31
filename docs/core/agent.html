@@ -2040,6 +2040,25 @@
   <li><strong>Subject spelling</strong> (<code>_subject_spelling_fix</code>): a no-photo result for a name whose surname is not in the user's own recent words but a close variant is (same first 3 letters, similarity ≥ 0.7, not just an ending) gets one line: retry once with the user's exact spelling (7d6617ad: "Konstantopoulou" → model "Konstantinou"). §4QG-b: the hint's <code>subjects=</code> list holds only the found subjects and the names it could fix; if a missing name has no close spelling in the user's words the hint says not to retry and to ask about that name. The missing-subject block pairs each missing name with its own suggestion — fixing one name never excuses another.</li>
   <li><strong>Not changed:</strong> the ~34 s re-read after every collage verdict. The verdict runs on the single main slot and evicts the conversation's cache; the head re-warm restores only the head and is forbidden mid-request (§4MU). Options are infrastructure decisions: a second vision slot/node, slot save/restore (§4OS checkpoint lever), or <code>--cache-ram</code> (off since §4OH — <strong>back on since §4QV, 2026-10-23</strong>: the conversation state is restored after the verdict, so this re-read is gone; <a href="llm.html">llm, §4QV</a>).</li>
 </ul>
+
+<h2 id="4si">§4SI (2026-10-30): the swarm, sub-agents and <code>dream_mode</code> removed</h2>
+<p>Operator: "the whole swarm functionality is not needed any more". Removed:</p>
+<ul>
+  <li><strong><code>delegate_to_swarm</code></strong> and the swarm: <code>tools/swarm.py</code>, LLMClient's swarm pool
+  (<code>swarm_nodes</code>, <code>swarm_clients</code>, <code>get_swarm_node</code>, <code>use_swarm</code>), the
+  <code>--swarm-nodes</code> flag, the "swarm" pool in <code>/api/health</code> <code>nodes</code>, and
+  <code>Icons.NODE_EDGE</code> 🛸.</li>
+  <li><strong><code>delegate</code></strong> (tool-using sub-agents) and <code>core/subagent.py</code>.
+  <code>tools/delegate.py</code> now holds only the <code>jobs</code> tool; the registry <code>core/jobs.py</code> stays
+  (<a href="delegation.html">background jobs</a>).</li>
+  <li><strong><code>dream_mode</code></strong>, the model-callable tool, with the "SLEEP/REST" and "SWARM DELEGATION"
+  prompt rows and the deterministic terminal-tool dispatch (<code>_is_dream_command</code>,
+  <code>_explicit_terminal_command</code>, <code>_distill_terminal_tool_summary</code>). The idle-time
+  <a href="dream.html">Dreamer</a> upkeep job still runs.</li>
+  <li><strong>Kept on purpose:</strong> the <code>_swarm_task_id::</code> reserved scratchpad prefix and
+  <code>projects._background_job_keys</code> (hygiene for old data); <code>_subagent_allowed_tools</code> (coding-loop
+  leaves and <a href="isolation.html">core/isolation</a> use it); <a href="../memory/readonly.html">memory/readonly.py</a>.</li>
+</ul>
 </main>
 
 <h2 id="4mm">§4MM (2026-10-08): image provenance, the disclaimer guard, the promotion footer</h2>

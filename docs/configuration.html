@@ -100,7 +100,6 @@
       <tr><td><code>--coding-nodes</code></td><td>Code generation, if you have a model that's better at it.</td></tr>
       <tr><td><code>--visual-nodes</code></td><td>Image analysis. Production points this at the main server itself.</td></tr>
       <tr><td><code>--image-gen-nodes</code></td><td>Image generation. Without this, the image tool doesn't exist.</td></tr>
-      <tr><td><code>--swarm-nodes</code></td><td>Parallel fan-out when a task is split across several models.</td></tr>
     </tbody>
   </table>
   </div>
@@ -258,7 +257,6 @@
       <tr><td><code>GHOST_SANDBOX_EXEC_STREAM</code></td><td><code>1</code></td><td>Sandbox: stream exec output as it is produced (progress-aware promotion of long commands) instead of collecting it at exit. <code>0</code> collects.</td></tr>
       <tr><td><code>GHOST_SANDBOX_GHOSTJOB_MAX_AGE_H</code></td><td><code>48</code></td><td>Sandbox reaper: hours after which a detached job with no owner is a ghost and is reaped.</td></tr>
       <tr><td><code>GHOST_SANDBOX_REAP_GHOSTJOBS</code></td><td><code>1</code></td><td>Sandbox reaper: <code>0</code> disables reaping of ghost jobs entirely (they then live until the container restarts).</td></tr>
-      <tr><td><code>GHOST_SWARM_AWAIT_DEADLINE</code></td><td>unset</td><td>Swarm tool: an explicit wall-clock deadline (seconds) for awaiting the swarm's sub-agents; unset uses the tool's computed deadline.</td></tr>
       <tr><td><code>GHOST_TOR_SERVICE_LABEL</code></td><td><code>com.local.tor</code></td><td>The launchd label of the Tor service the helpers restart/inspect when the SOCKS port stops answering.</td></tr>
       <tr><td><code>GHOST_REMOTE_SERVE_SCRIPT</code> · <code>GHOST_REMOTE_UNSERVE_SCRIPT</code></td><td><code>~/Data/AI/bin/serve-remote.sh</code> · <code>unserve-remote.sh</code></td><td>Sandbox services: the host-side scripts that publish / unpublish a sandbox service port on the remote host (the §4EJ funnel); override to point at your own.</td></tr>
       <tr><td><code>GHOST_TTS_BON_K</code></td><td>the module default (<code>core/tts.py</code>)</td><td>Adaptive best-of-N on the verifier's wobble band: how many candidate finals are sampled when <code>GHOST_TTS_ADAPTIVE_BON</code> fires. <code>GHOST_TTS_ADAPTIVE_BON</code> (default <code>0</code>) alone decides whether adaptive best-of-N runs; the <code>tts_bon</code> experiment arm that could override it went with the experiments registry (§4NN).</td></tr>

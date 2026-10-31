@@ -209,11 +209,62 @@ def _redact_prose_secret(m: "re.Match[str]") -> str:
     shape; leave ordinary prose ("the password is wrong") untouched."""
     value = m.group(2).rstrip(".!?)")
     trail = m.group(2)[len(value):]
+    if _is_code_value(m.group(2)):                  # §4SH r2: `password = sys.argv[1]` is code
+        return m.group(0)
     has_digit = any(ch.isdigit() for ch in value)
     has_alpha = any(ch.isalpha() for ch in value)
     if len(value) >= 8 and has_digit and has_alpha:
         return f"{m.group(1)}<REDACTED>{trail}"
     return m.group(0)
+
+
+# §4SH (req cb27058e): in CODE the "value" after a secret-ish name is often
+# code, not a secret — `case 'pwd': print('/home/ghost')` was recorded as
+# `case 'pwd': <REDACTED>'/home/…')`, so the trajectory no longer held what
+# was written. r2: shape rules leaked both ways (`Sunshine(Summer)!` kept,
+# `sys.argv[1]` redacted), so a value is spared only as a call or index on a
+# KNOWN code root, or a bare type word; anything else is redacted.
+_CODE_ROOTS = frozenset({
+    "print", "input", "getpass", "os", "sys", "environ", "getenv", "secrets", "base64", "hashlib",
+    "hmac", "json", "uuid", "random", "crypto", "process", "self", "this", "cls", "config", "settings",
+    "args", "kwargs", "request", "req", "res", "response", "params", "options", "opts", "env", "str",
+    "int", "bytes", "Optional", "Union", "List", "Dict", "Literal", "Field", "SecretStr", "keyring",
+    "localStorage", "sessionStorage", "document", "window", "console",
+})   # no bare verbs (`get(`, `load(`): "my password is get(x7Y9z2q)" is a password
+_CODE_VALUE_RE = re.compile(r"^([A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*[(\[]")
+_TYPE_WORD_RE = re.compile(
+    r"^(?:str|int|float|bool|bytes|None|null|undefined|true|false|True|False|string|number|any|SecretStr)[;)\]]*$")
+#: r4: an attribute on a known root (`self.password`, `args.token`, `process.env.PW`)
+_CODE_ATTR_RE = re.compile(r"^([A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)+[;)\]]*$")
+
+
+def _is_code_value(v: str) -> bool:
+    if _TYPE_WORD_RE.match(v):                   # r4: before the `;` rule — `password: string;`
+        return True
+    if ";" in v or "=" in v:                     # r3: `env[k];secret=AbC123` carries a second pair
+        return False
+    m = _CODE_VALUE_RE.match(v) or _CODE_ATTR_RE.match(v)
+    return bool(m and m.group(1) in _CODE_ROOTS)
+
+
+def _names_itself(name_part: str, v: str) -> bool:
+    """r3: `password=password`, `login(…, password=password)` — the value is
+    the variable again, never a secret (they were redacted, so trajectories lost the code)."""
+    name = re.sub(r"[\"'\s=:]+$", "", name_part).rsplit(".", 1)[-1].lower()
+    return bool(name) and v.rstrip(")];").lower() == name
+
+
+def _redact_form_secret(m: "re.Match[str]") -> str:
+    """Redact the value of a `name: value` / `name=value` credential pair
+    unless the value is code (a call or index on a known root, a type word)."""
+    v = m.group(2)
+    lead = v[:len(v) - len(v.lstrip("="))]      # r4–r6: `password==x`, `secret:=x`, `a === b` — judge x
+    rest = v[len(lead):]
+    if not rest:                                 # `if password == confirm`: a comparison
+        return m.group(0)
+    if _is_code_value(rest) or _names_itself(m.group(1), rest):
+        return m.group(0)
+    return f"{m.group(1)}{lead}<REDACTED>"
 
 
 _BUILTIN_RULES: List[_BuiltinRule] = [
@@ -320,7 +371,7 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r"(?:password|passwd|secret|token|api_key|apikey|access_key|private_key|ghost[_\-]?key)"
         r"|(?:[a-z0-9_\-]+[_\-])?(?:pwd|auth))"
         r"[\"']?[ \t]*[=:][ \t]*[\"']?)([^\s&\"',]+)"
-    ), r"\1<REDACTED>"),
+    ), _redact_form_secret),
 
     # Credential-bearing URL QUERY PARAMETERS. `form_secret_assignment`
     # above deliberately refuses a bare `key=` — in prose `key: value` is

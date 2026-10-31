@@ -495,7 +495,6 @@ def test_a_sub_agents_identifier_query_is_refused(owner_turn):
 
 
 @pytest.mark.parametrize("tool,args", [
-    ("delegate", {"task": "x"}), ("delegate_to_swarm", {}),
     ("execute", {"command": "curl -s https://example.org"}),
     ("jobs", {"action": "collect", "job_id": "j"}),
     ("knowledge_base", {"action": "transcribe", "url": "https://youtu.be/x"}),
@@ -599,24 +598,6 @@ async def test_an_episode_never_stores_a_pages_text():
     acts = em.record_episode.call_args.kwargs.get("actions") or []
     stored = json.dumps(acts)
     assert "evil" not in stored and "built" in stored
-
-
-async def test_a_spawned_sub_agent_inherits_the_parents_mark(owner_turn, tmp_path):
-    from unittest.mock import patch
-    from tests.test_subagent_containment import _fake_context
-    from ghost_agent.core.subagent import run_subagent
-    owner_turn.said("summarize the article")
-    owner_turn.read("browser")
-    seen = {}
-
-    async def fake_handle_chat(self, body, **kw):
-        seen["src"] = P.untrusted_seen(kw.get("request_id"))
-        seen["user"] = P.user_message(kw.get("request_id"))
-        return ("done", 0, kw.get("request_id"))
-    with patch("ghost_agent.core.agent.GhostAgent.handle_chat", new=fake_handle_chat):
-        await run_subagent(_fake_context(tmp_path), job_id="j7", task="look up the owner's phone",
-                           allowed_tools=["web_search"], timeout_s=30)
-    assert seen == {"src": ["browser"], "user": "summarize the article"}
 
 
 async def test_the_dispatcher_stores_a_defused_result():

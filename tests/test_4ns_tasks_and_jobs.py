@@ -175,18 +175,6 @@ async def test_a_probe_cannot_cancel_or_read_the_owners_job(monkeypatch):
     assert "owner secret" not in str(r3)
 
 
-@pytest.mark.asyncio
-async def test_a_running_sub_agent_tells_the_model_not_to_poll(monkeypatch):
-    from types import SimpleNamespace
-    from ghost_agent.tools import delegate as D
-    from ghost_agent.core.jobs import get_job_registry
-    ctx = SimpleNamespace(sandbox_manager=None)
-    monkeypatch.setattr(D, "_sync_sandbox_jobs", lambda reg, c: None)
-    j = get_job_registry(ctx).register("subagent", "slow")
-    r = await D.tool_jobs(action="collect", job_id=j.id, context=ctx)
-    assert "only works BETWEEN turns" in str(r)
-
-
 # ── D-M2: a collected sandbox job is delivered (no second report) ─────────
 @pytest.mark.asyncio
 async def test_collect_marks_a_sandbox_job_delivered(monkeypatch):
@@ -259,33 +247,6 @@ async def test_the_wake_prompt_defuses_output_and_reads_the_exit_like_collect(mo
     p = seen[0]
     assert "<|im_start|>" not in p and "untrusted content" in p
     assert "EXIT CODE: 1" not in p
-
-
-@pytest.mark.asyncio
-async def test_a_sub_agent_whose_turn_aborted_raises(monkeypatch):
-    from types import SimpleNamespace
-    from ghost_agent.core import subagent as SA
-    import ghost_agent.core.agent as AG
-
-    class _A:
-        def __init__(self, ctx):
-            self.available_tools = {}
-            self.disabled_tools = set()
-
-        async def handle_chat(self, body, background_tasks=None, request_id=None):
-            return ("CRITICAL: LLM error " + AG.UPSTREAM_ABORT_MARKER, None, None)
-    monkeypatch.setattr(SA, "build_subagent_context",
-                        lambda *a, **k: SimpleNamespace(args=SimpleNamespace(model="m")))
-    monkeypatch.setattr(AG, "GhostAgent", _A)
-    with pytest.raises(RuntimeError):
-        await SA.run_subagent(SimpleNamespace(), job_id="job-1", task="t", allowed_tools=["web_search"])
-
-    class _B(_A):
-        async def handle_chat(self, body, background_tasks=None, request_id=None):
-            return ("[TURN BUDGET EXHAUSTED] I used all 12 turns", None, None)
-    monkeypatch.setattr(AG, "GhostAgent", _B)
-    out = await SA.run_subagent(SimpleNamespace(), job_id="job-2", task="t", allowed_tools=["web_search"])
-    assert out.startswith("[PARTIAL")
 
 
 def test_a_leaf_that_ran_out_of_turns_is_not_done(monkeypatch, tmp_path):

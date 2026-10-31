@@ -17,7 +17,16 @@ from ghost_agent.core.strikes import StrikeLedger
 from unittest.mock import AsyncMock, MagicMock
 
 
-def _parser_agent(names=("dream_mode", "web_search", "recall", "execute",
+
+@pytest.fixture(autouse=True)
+def _a_pure_trigger_tool(monkeypatch):
+    """§4SI: dream_mode was the last zero-parameter tool; the pure-trigger
+    path these tests name is exercised through a simulated one."""
+    import ghost_agent.core.agent as A
+    monkeypatch.setattr(A, "_PURE_TRIGGER_TOOLS", A._PURE_TRIGGER_TOOLS | {"zz_pure_trigger"})
+    monkeypatch.setattr(A, "_STATIC_TOOL_NAMES", A._STATIC_TOOL_NAMES | {"zz_pure_trigger"})
+
+def _parser_agent(names=("zz_pure_trigger", "web_search", "recall", "execute",
                          "file_system")):
     agent = GhostAgent.__new__(GhostAgent)
     agent.available_tools = {n: (lambda **kw: None) for n in names}
@@ -45,15 +54,15 @@ class TestUsableNativeGateHardened:
 
 
     def test_no_arg_trigger_wins_over_echoed_tag_in_prose(self):
-        # F1a: dream_mode (no-arg) + prose that ECHOES a real tool tag → the
+        # F1a: zz_pure_trigger (no-arg) + prose that ECHOES a real tool tag → the
         # native trigger must win; the echo must NOT be executed.
         agent = _parser_agent()
         content = f"entering dream mode. (a search looks like {_XML})"
         msg = {"content": content, "tool_calls": [{
             "id": "n", "type": "function",
-            "function": {"name": "dream_mode", "arguments": "{}"}}]}
+            "function": {"name": "zz_pure_trigger", "arguments": "{}"}}]}
         tcs, ui, reason = agent._parse_assistant_tool_calls(content, msg)
-        assert _names(tcs) == ["dream_mode"]
+        assert _names(tcs) == ["zz_pure_trigger"]
 
     def test_truncated_native_args_string_yields_to_xml(self):
         # F1b: a truncated/unparseable native args string is degenerate.

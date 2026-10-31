@@ -139,13 +139,12 @@ def test_info_content_truncated_at_the_limit():
 def test_icon_glyphs_decollided():
     assert Icons.MEM_LIBRARY != Icons.MEM_INGEST
     assert Icons.MEM_SPLIT != Icons.CUT
-    assert Icons.NODE_EDGE != Icons.SYSTEM_BOOT
 
 
 def test_new_icons_present_and_distinct():
     new = {
         "TOOL_BROWSER", "IMAGE_GEN", "REPORT_PDF",
-        "NODE_WORKER", "NODE_EDGE", "SELF_STATE",
+        "NODE_WORKER", "SELF_STATE",
     }
     glyphs = []
     for name in new:

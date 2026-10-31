@@ -214,7 +214,7 @@
   <h2>Tool-orchestration routing rules (SYSTEM_PROMPT)</h2>
   <p>A block of <strong>MANDATORY TRIGGERS</strong> in <code>SYSTEM_PROMPT</code> maps user intents to specific tool calls so the LLM doesn't improvise. Current rules include:</p>
   <ul>
-    <li><code>SLEEP / REST</code> → <code>dream_mode</code></li>
+    <li><em>The <code>SLEEP / REST</code> → <code>dream_mode</code> and <code>SWARM DELEGATION</code> rows were removed with those tools on 2026-10-30 (§4SI).</em></li>
     <li><em>The <code>SELF-PLAY</code> routing rows (<code>self_play</code> / <code>self_play_loop</code> / <code>stop_self_play</code>) were removed with synthetic self-play on 2026-10-11 (§4NM).</em></li>
     <li><code>LESSONS SURFACE</code> → <code>list_lessons</code> — for "what have you learned today/so far/this week", "show me your lessons", "show me the lesson playbook". Picks <code>scope</code> ∈ <code>{today, week, all}</code> from phrasing. A LESSON is a mistake-and-fix the agent has internalized — distinct from a SKILL (a tool).</li>
     <li><code>SKILLS SURFACE</code> → <code>manage_skills(action="list")</code> — for "show me your skills", "list your skills", "what skills do you have", "show me your custom skills". A SKILL is a TOOL or set of tools, NOT a lesson. The historical "skill playbook" wording was the conflation that misrouted skill queries to <code>list_lessons</code>; both the tool description and this rule now disambiguate.</li>

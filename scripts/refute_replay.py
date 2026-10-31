@@ -375,7 +375,6 @@ def build_agent(argv: List[str], home: Path, sandbox_dir: Path):
     ctx.llm_client = LLMClient(
         args.upstream_url,
         tor_proxy=ctx.tor_proxy,
-        swarm_nodes=args.swarm_nodes_parsed,
         worker_nodes=args.worker_nodes_parsed,
         visual_nodes=getattr(args, "visual_nodes_parsed", None),
         coding_nodes=getattr(args, "coding_nodes_parsed", None),

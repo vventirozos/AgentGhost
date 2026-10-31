@@ -30,7 +30,7 @@ def test_llm_node_failover_uses_title_plus_content():
     src = inspect.getsource(llm_mod)
     # The whole message must NOT be the title (it'd truncate to 18 chars,
     # losing the error). Each failover gets a short title + content.
-    for kind in ("Vision", "Worker", "Coding", "Swarm"):
+    for kind in ("Vision", "Worker", "Coding"):
         assert f'pretty_log(f"{kind} node' not in src
         assert f'"{kind} Node Failed"' in src
 

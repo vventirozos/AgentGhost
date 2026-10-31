@@ -29,7 +29,7 @@
   <p class="subtitle">Native PDF report generator. Produces a multi-page A4 document from markdown sections and writes it into the sandbox so it can be downloaded through <code>/api/download/&lt;file&gt;</code>.</p>
 
   <h2>Tool: <code>report_pdf</code></h2>
-  <p>Always advertised — there is no remote-service gate (unlike <code>image_generation</code>, which depends on the GPU swarm). Rendering happens locally and offline. The tool slots into the same artefact lifecycle as image generation: write a binary file into <code>sandbox_dir</code>, return a markdown link the LLM is told to emit verbatim so the user can open it.</p>
+  <p>Always advertised — there is no remote-service gate (unlike <code>image_generation</code>, which depends on a remote image node). Rendering happens locally and offline. The tool slots into the same artefact lifecycle as image generation: write a binary file into <code>sandbox_dir</code>, return a markdown link the LLM is told to emit verbatim so the user can open it.</p>
 
   <h3>Why a native tool instead of <code>execute</code></h3>
   <ul>
@@ -71,7 +71,7 @@ exact markdown so the file is offered for download:
   <h3>Example prompt</h3>
   <pre>&gt;&gt;&gt; Look up the top 5 upcoming tech trends for next year, compile a
     market analysis report, and save it as a PDF.</pre>
-  <p>The agent fans out research via <code>deep_research</code> / <code>delegate_to_swarm</code>, assembles findings in the scratchpad, then makes one <code>report_pdf</code> call with section-shaped <code>{heading, body}</code> entries. The reply ends with the markdown download link, which the <a href="../interfaces/web_server.html">web client</a> auto-promotes into a clickable card with inline PDF preview.</p>
+  <p>The agent gathers research via <code>deep_research</code>, assembles findings in the scratchpad, then makes one <code>report_pdf</code> call with section-shaped <code>{heading, body}</code> entries. The reply ends with the markdown download link, which the <a href="../interfaces/web_server.html">web client</a> auto-promotes into a clickable card with inline PDF preview.</p>
 
   <h2>Compile from files (<code>source_files</code>)</h2>
   <p>For a detailed report built from files the agent already wrote (per-task <code>.md</code> findings), passing <code>source_files=["a.md", "b.md", …]</code> makes the tool <strong>read each file and split it into sections on its headers</strong> — so the full content flows file → PDF without the model re-transcribing it into the tool-call argument. That re-transcription was the real failure on the meta-cognitive report: a small model squeezing 5 detailed files through its output tokens either stalled (30 s aborts) or collapsed to a thin 1-page summary (<code>sections=1</code>). The tool schema now steers the model toward <code>source_files</code> for "all findings from all tasks" requests, and <code>title</code> is the only hard-required field (provide <code>sections</code> <em>or</em> <code>source_files</code>). Missing files are skipped and reported. Covered by <code>tests/test_report_pdf_source_files.py</code>.</p>

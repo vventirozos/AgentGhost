@@ -39,7 +39,7 @@
   <p>Why that is exactly right and not over-broad:</p>
   <ul>
     <li>Anonymised traffic egresses through the Tor SOCKS proxy at <code>127.0.0.1:9050</code> — the socket layer sees a <strong>loopback</strong> connect, which is allowed. With <code>socks5h</code>, even DNS is resolved by Tor's exit, so no public connect appears here.</li>
-    <li>Local infrastructure — the llama.cpp upstream, ChromaDB, a LAN Postgres, LAN swarm / image-gen nodes (e.g. <code>192.168.0.20</code>, or a <strong>Tailscale/CGNAT</strong> GPU at <code>100.83.184.117</code>) — is not globally routable, so it is allowed (such traffic does not deanonymise via a Tor exit, and a Tor exit cannot route a tailnet address anyway).</li>
+    <li>Local infrastructure — the llama.cpp upstream, ChromaDB, a LAN Postgres, LAN worker / image-gen nodes (e.g. <code>192.168.0.20</code>, or a <strong>Tailscale/CGNAT</strong> GPU at <code>100.83.184.117</code>) — is not globally routable, so it is allowed (such traffic does not deanonymise via a Tor exit, and a Tor exit cannot route a tailnet address anyway).</li>
     <li>The ONLY thing blocked is a <strong>direct connection to a public IP</strong> — which by construction is a connection that bypassed Tor. That is precisely the leak the README claims is impossible.</li>
   </ul>
 

@@ -134,10 +134,10 @@ def test_write_edit_and_the_closing_append_carry_the_handler_note_without_failin
     r = _fs(tmp_path, operation="edit", path="os.html", old_string="<button onclick=\"openApp('calc')\">",
             new_string="<button onclick=\"launchApp('calc')\">")
     assert str(r).startswith("SUCCESS") and "`launchApp`" in str(r)
-    # parts: no note on a part even when it carries a whole broken page (battery H8);
-    # the note on the closing append (the whole page is checked)
+    # parts: no note on a FIRST part even when it carries a whole broken page (battery H8;
+    # §4SH: a first part through </html> is a skeleton the next parts append to)
     r0 = _fs(tmp_path, operation="write", path="q.html", content=WEBOS, more_parts=True)
-    assert "HANDLER CHECK" not in str(r0)
+    assert "HANDLER CHECK" not in str(r0) and "taken as the LAST part" not in str(r0)
     head, tail = WEBOS.split("<script>")
     r1 = _fs(tmp_path, operation="write", path="p.html", content=head, more_parts=True)
     assert "HANDLER CHECK" not in str(r1)
@@ -145,37 +145,48 @@ def test_write_edit_and_the_closing_append_carry_the_handler_note_without_failin
     assert "HANDLER CHECK" in str(r2) and "`calcEval`" in str(r2)
 
 
-def test_a_file_left_unfinished_in_parts_is_named_in_task_state_and_the_reply(tmp_path):
+def test_a_file_left_open_in_parts_is_named_in_task_state_and_judged_at_the_reply(tmp_path):
     """Fails where the census voxel game was written with more_parts=true, the
-    last part never came, and the reply said "complete — open it and play"."""
+    last part never came, and the reply said "complete — open it and play" —
+    and (§4SH, req cb27058e) where a COMPLETE page left open by the flag was
+    reported "incomplete and never checked"."""
     from ghost_agent.utils.logging import request_id_context
     tok = request_id_context.set("req-4oi-parts")
+    note_of = lambda: asyncio.run(unfinished_parts_note("req-4oi-parts"))   # noqa: E731
     try:
         _fs(tmp_path, operation="write", path="game/index.html", content="<html><body>", more_parts=True)
         assert FS.files_left_in_progress("req-4oi-parts")
         rows = [{"name": "file_system", "args": {"operation": "write", "path": "game/index.html"},
                  "content": "SUCCESS: Wrote 12 chars to 'game/index.html'. Script-side path (from sandbox cwd): 'game/index.html'."}]
         text = TS.render_task_state(rows, ask="build it", turn=3)
-        assert "Still being written in parts" in text and "`index.html`" in text
-        note = unfinished_parts_note("req-4oi-parts")
-        assert "`index.html` was written in parts and the last part was never sent" in note
+        assert "Open for parts" in text and "`index.html` (12 bytes, ends «…<html><body>»)" in text
+        assert "append=true, content=''" in text                    # the close is always within reach
+        note = note_of()
+        assert "`index.html` was written in parts and was left open for more" in note
+        assert "cut short" in note
+        assert not FS.files_left_in_progress("req-4oi-parts")       # the reply closed it
         # the note is ours: it hands nothing over and is stripped for the judges
         wrote = ToolCall(name="file_system", arguments={"operation": "write", "path": "game/index.html"},
                          result="SUCCESS: Wrote 12 chars to 'game/index.html'.")
         assert not delivered_ok_from_calls([wrote], "The project is complete." + note)
         assert strip_system_notes("The project is complete." + note) == "The project is complete."
-        # finishing the parts clears it
-        _fs(tmp_path, operation="write", path="game/index.html", content="</body></html>", append=True)
-        assert unfinished_parts_note("req-4oi-parts") == "" and "Still being written" not in TS.render_task_state(rows, turn=4)
+        assert "Open for parts" not in TS.render_task_state(rows, turn=4)
+        # a file whose content passes its check says nothing (req cb27058e)
+        _fs(tmp_path, operation="write", path="a.py", content="x = 1\n", more_parts=True)
+        assert note_of() == ""
+        # a broken one is named with what its check found
+        _fs(tmp_path, operation="write", path="b.py", content="def f(:\n", more_parts=True)
+        assert "`b.py`" in note_of()
+        # a kind nothing checks shows its end, for the owner to judge
+        _fs(tmp_path, operation="write", path="story.md", content="Chapter one ends here", more_parts=True)
+        assert "«…Chapter one ends here»" in note_of()
         # a deleted parts file is not "unfinished"; a renamed one follows the file (r1 m5)
         _fs(tmp_path, operation="write", path="g.html", content="<html>", more_parts=True)
         _fs(tmp_path, operation="delete", path="g.html")
-        assert unfinished_parts_note("req-4oi-parts") == ""
+        assert note_of() == ""
         _fs(tmp_path, operation="write", path="h.html", content="<html>", more_parts=True)
         _fs(tmp_path, operation="rename", path="h.html", destination="i.html")
-        assert "`i.html`" in unfinished_parts_note("req-4oi-parts")
-        _fs(tmp_path, operation="write", path="i.html", content="</html>", append=True)
-        assert unfinished_parts_note("req-4oi-parts") == ""
+        assert "`i.html`" in note_of()
     finally:
         FS.forget_request_receipts("req-4oi-parts")
         request_id_context.reset(tok)

@@ -1,6 +1,6 @@
 """Tests for Feature 2 (2026-07-11):
   * composed-skill DATA-FLOW (`save_as` → `$var` threading between steps)
-  * tool-using sub-agent delegation (core.subagent + tools.delegate)
+  * (tool-using sub-agent delegation was removed 2026-10-30, §4SI)
   * the unified background-job registry (core.jobs + the `jobs` tool)
 """
 
@@ -23,11 +23,7 @@ from ghost_agent.core.jobs import (
     JobRegistry, get_job_registry,
     STATUS_RUNNING, STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED,
 )
-from ghost_agent.core.subagent import (
-    resolve_allowed_tools, DEFAULT_ALLOWED_TOOLS, FORBIDDEN_TOOLS,
-    MAX_SUBAGENT_TURNS,
-)
-from ghost_agent.tools.delegate import tool_delegate, tool_jobs
+from ghost_agent.tools.delegate import tool_jobs
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -364,109 +360,8 @@ class TestJobRegistry:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Sub-agent tool policy
+# jobs tool
 # ══════════════════════════════════════════════════════════════════════
-
-class TestSubagentToolPolicy:
-    def test_default_allowlist(self):
-        assert set(resolve_allowed_tools()) == set(DEFAULT_ALLOWED_TOOLS)
-
-    def test_requested_narrows(self):
-        assert resolve_allowed_tools(["web_search", "browser"]) == \
-            ["browser", "web_search"]
-
-    def test_forbidden_never_granted(self):
-        for bad in FORBIDDEN_TOOLS:
-            assert bad not in resolve_allowed_tools([bad, "web_search"])
-
-    def test_no_recursive_delegation(self):
-        # The headline rail: a sub-agent can never spawn more sub-agents.
-        assert "delegate" not in resolve_allowed_tools(["delegate"])
-        assert "delegate" not in DEFAULT_ALLOWED_TOOLS
-        assert "delegate_to_swarm" not in DEFAULT_ALLOWED_TOOLS
-
-    def test_unknown_tool_dropped(self):
-        assert resolve_allowed_tools(["made_up_tool"]) == []
-
-    def test_no_memory_writes_or_scheduling(self):
-        allowed = set(resolve_allowed_tools())
-        for t in ("update_profile", "manage_tasks", "manage_services",
-                  "manage_projects", "self_state"):
-            assert t not in allowed
-
-
-# ══════════════════════════════════════════════════════════════════════
-# delegate / jobs tools
-# ══════════════════════════════════════════════════════════════════════
-
-class TestDelegateTool:
-    def test_requires_task(self):
-        out = asyncio.run(tool_delegate(context=SimpleNamespace()))
-        assert "'task'" in out and "required" in out
-
-    def test_requires_context(self):
-        out = asyncio.run(tool_delegate(task="x"))
-        assert "no agent context" in out
-
-    def test_too_many_tasks(self):
-        out = asyncio.run(tool_delegate(
-            tasks=[f"t{i}" for i in range(9)], context=SimpleNamespace()))
-        assert "at most" in out
-
-    def test_spawns_jobs_and_returns_ids(self, monkeypatch):
-        import ghost_agent.tools.delegate as dmod
-
-        async def fake_run(context, *, job_id, task, allowed_tools,
-                           max_turns, timeout_s):
-            return f"ANSWER for {task}"
-        monkeypatch.setattr(dmod, "run_subagent", fake_run)
-
-        async def go():
-            ctx = SimpleNamespace()
-            out = await tool_delegate(task="research otters", context=ctx)
-            await asyncio.sleep(0.05)
-            return out, get_job_registry(ctx)
-
-        out, reg = asyncio.run(go())
-        assert "Delegated 1 task" in out and "job-" in out
-        jobs = reg.list()
-        assert len(jobs) == 1 and jobs[0].status == STATUS_DONE
-        assert jobs[0].result == "ANSWER for research otters"
-
-    def test_wait_true_returns_results_inline(self, monkeypatch):
-        import ghost_agent.tools.delegate as dmod
-
-        async def fake_run(context, *, job_id, task, allowed_tools,
-                           max_turns, timeout_s):
-            return f"RESULT[{task}]"
-        monkeypatch.setattr(dmod, "run_subagent", fake_run)
-        out = asyncio.run(tool_delegate(
-            tasks=["a", "b"], wait=True, context=SimpleNamespace()))
-        assert "RESULT[a]" in out and "RESULT[b]" in out
-
-    def test_failed_subagent_surfaces(self, monkeypatch):
-        import ghost_agent.tools.delegate as dmod
-
-        async def fake_run(context, **kw):
-            raise RuntimeError("upstream died")
-        monkeypatch.setattr(dmod, "run_subagent", fake_run)
-        out = asyncio.run(tool_delegate(task="x", wait=True,
-                                        context=SimpleNamespace()))
-        assert "FAILED" in out and "upstream died" in out
-
-    def test_max_turns_clamped(self, monkeypatch):
-        import ghost_agent.tools.delegate as dmod
-        seen = {}
-
-        async def fake_run(context, *, job_id, task, allowed_tools,
-                           max_turns, timeout_s):
-            seen["max_turns"] = max_turns
-            return "ok"
-        monkeypatch.setattr(dmod, "run_subagent", fake_run)
-        asyncio.run(tool_delegate(task="x", max_turns=999, wait=True,
-                                  context=SimpleNamespace()))
-        assert seen["max_turns"] == MAX_SUBAGENT_TURNS
-
 
 class TestJobsTool:
     def test_status_empty(self):
@@ -541,9 +436,11 @@ class TestWiring:
     def test_tools_advertised_and_dispatchable(self):
         from ghost_agent.tools.registry import TOOL_DEFINITIONS
         names = [t["function"]["name"] for t in TOOL_DEFINITIONS]
-        assert "delegate" in names and "jobs" in names
+        assert "jobs" in names
+        # §4SI: delegate / delegate_to_swarm / dream_mode were removed
+        assert not {"delegate", "delegate_to_swarm", "dream_mode"} & set(names)
         src = (_SRC / "tools" / "registry.py").read_text()
-        assert '"delegate": lambda' in src and '"jobs": lambda' in src
+        assert '"jobs": lambda' in src and '"delegate": lambda' not in src
 
     def test_composed_schema_documents_save_as(self):
         from ghost_agent.tools.registry import TOOL_DEFINITIONS
@@ -552,16 +449,3 @@ class TestWiring:
         step_props = (d["function"]["parameters"]["properties"]["steps"]
                       ["items"]["properties"])
         assert "save_as" in step_props
-
-    def test_swarm_registers_in_job_registry(self):
-        src = (_SRC / "tools" / "swarm.py").read_text()
-        assert "get_job_registry" in src
-
-    def test_subagent_isolation_contract(self):
-        src = (_SRC / "core" / "subagent.py").read_text()
-        # The isolation the dream/self-play path proved is necessary.
-        for must in ("workspace_model = None", "trajectory_collector = None",
-                     "episodic_memory = None", "journal = None",
-                     "memory_bus = None", "ReadOnlyVectorMemory",
-                     "is_background", "max_turns_override"):
-            assert must in src, f"subagent missing isolation: {must}"

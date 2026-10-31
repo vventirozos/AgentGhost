@@ -52,7 +52,7 @@ logger = logging.getLogger("GhostAgent")
 # Persistent per-sandbox browser profile — lives inside the sandbox
 # workspace so it survives across turns / tool calls but doesn't leak
 # onto the host filesystem outside GHOST_SANDBOX_DIR.
-from .browser_support import _BROWSER_PROFILE_DIR  # noqa: E402 — one definition
+from .browser_support import _BROWSER_PROFILE_DIR, _INTERACT_ONLY_ACTIONS, run_action_as_interact  # noqa: E402 — one definition; §4SH
 
 
 def _interact_read_failed(parsed) -> bool:
@@ -878,6 +878,8 @@ async def tool_browser(
     if not operation:
         return _reject(f"Missing 'operation'. Valid: {valid_list}.")
     operation = str(operation)
+    if operation in _INTERACT_ONLY_ACTIONS:      # §4SH: an interact action named as the operation
+        return await run_action_as_interact(tool_browser, dict(locals()), _reject)
     if operation not in _VALID_OPS:
         return _reject(f"Unknown operation {operation!r}. Valid: {valid_list}.")
     if not sandbox_dir or not sandbox_manager:

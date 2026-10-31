@@ -488,7 +488,13 @@ WORK_REST_FACTOR = 1.5
 
 #: §4OH (a): the end-of-request disclosure of unopened citations — ours, not the model's
 SOURCE_CHECK_NOTE_RE = re.compile(r"\n{0,4}_Source check: [^\n]*_[ \t]*$", re.MULTILINE)
-UNFINISHED_PARTS_NOTE_RE = re.compile(r"\n{0,4}⚠️ [^\n]* written in parts and the last part was never sent[^\n]*$", re.MULTILINE)
+#: every phrasing the unfinished-parts footer has had (§4OI, §4SH, §4SH r3) — the ONE list
+#: both readers below use (r3: a rename reached the regex and missed the guard)
+UNFINISHED_PARTS_PHRASES = ("the last part was never sent", "its last part said more would follow",
+                            "was left open for more")
+UNFINISHED_PARTS_NOTE_RE = re.compile(r"\n{0,4}^⚠️ `[^`\n]+` [^\n]*?written in parts and (?:"   # r4: our line only, from its start
+                                      + "|".join(re.escape(p) for p in UNFINISHED_PARTS_PHRASES)
+                                      + r")[^\n]*$", re.MULTILINE)
 
 
 #: §4OH (b) r3: the ONLY paragraphs the stream may leave out before the answer exists —
@@ -668,7 +674,7 @@ def strip_system_notes(text: str) -> str:
         out = SOURCE_CHECK_NOTE_RE.sub("", out).rstrip()
     # §4OI (iii): so is the unfinished-parts warning (it names the file in a code span —
     # it must never read as the reply handing that file over)
-    if "written in parts and the last part was never" in out:
+    if any("written in parts and " + p in out for p in UNFINISHED_PARTS_PHRASES):
         out = UNFINISHED_PARTS_NOTE_RE.sub("", out).rstrip()
     return out.rstrip("\n") if out != text else out
 

@@ -51,7 +51,7 @@
   <p>The breaker records both transport failures (httpx exceptions, 5xx) and per-call timeouts (default 1200 s on chat completion calls). Application errors (401, 403) trip the breaker too — the node is unreachable from this process's perspective.</p>
 
   <h2>Where it shows up in tools</h2>
-  <p><a href="../tools/swarm.html">delegate_to_swarm</a> records success/failure on the corresponding node directly so background workers also feed the breaker.</p>
+  <p><em>(Until 2026-10-30, §4SI, <code>delegate_to_swarm</code> also recorded success/failure on its swarm node; the swarm is removed.)</em></p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

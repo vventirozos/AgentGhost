@@ -213,34 +213,3 @@ def test_shutdown_is_not_a_node_fault():
     assert _is_node_fault(RuntimeError("Cannot send a request, as the client has been closed.")) is False
     assert _is_node_fault(RuntimeError("something else")) is True
 
-
-async def test_swarm_does_not_charge_a_4xx_to_the_node(monkeypatch):
-    """Fails in the world where every swarm exception — a 4xx included —
-    counts toward the breaker (three retries of one bad payload opened it)."""
-    import httpx
-    from unittest.mock import MagicMock
-    from ghost_agent.core.llm import NodeCircuitBreaker
-    from ghost_agent.tools import swarm
-
-    async def _no_sleep(*_a, **_k):
-        return None
-    monkeypatch.setattr(swarm.asyncio, "sleep", _no_sleep)
-    resp = httpx.Response(400, request=httpx.Request("POST", "http://swarm:1"))
-    node = {"url": "http://swarm:1", "model": "m", "client": MagicMock()}
-
-    async def post(*a, **k):
-        return resp
-    node["client"].post = post
-    client = MagicMock()
-    client.circuit_breaker = NodeCircuitBreaker()
-    client.get_swarm_node = MagicMock(return_value=node)
-    with pytest.raises(swarm.SwarmWorkerError):
-        await swarm._swarm_worker("do it", "data", "k", client, "m", MagicMock(), preselected_node=node)
-    assert client.circuit_breaker._get_state(node["url"])["failures"] == 0
-
-    async def timeout_post(*a, **k):
-        raise httpx.ReadTimeout("node stuck")
-    node["client"].post = timeout_post
-    with pytest.raises(swarm.SwarmWorkerError):
-        await swarm._swarm_worker("do it", "data", "k", client, "m", MagicMock(), preselected_node=node)
-    assert client.circuit_breaker._get_state(node["url"])["failures"] >= 1      # a real node fault still counts

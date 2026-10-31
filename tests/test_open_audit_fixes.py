@@ -5,7 +5,7 @@ Coverage map:
   CRITICAL-2  qwen_bridge ContextVar isolation (module DELETED 2026-07-27 —
               the agent_qwen variant was unreachable dead code)
   CRITICAL-3  interface/server.py proxy auth + path traversal guard
-  HIGH-4      swarm failure surfaced synchronously (no fake SUCCESS)
+  HIGH-4      (swarm — removed §4SI)
   HIGH-5      database activity query has LIMIT 50 + ORDER BY
   HIGH-6      agent.py XML reconstruction uses json.dumps for complex args
   HIGH-7      extract_code_from_markdown picks the longest block
@@ -183,72 +183,6 @@ def test_interface_download_rejects_path_traversal():
     assert " or " in _guard[0] and " and " not in _guard[0], (
         f"the traversal guard is conjunctive — either half alone lets the "
         f"other payload through: {_guard[0].strip()}")
-
-
-# =====================================================================
-# HIGH-4 — swarm dispatch surfaces failure synchronously
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_swarm_returns_warning_when_no_nodes_configured():
-    from ghost_agent.tools.swarm import tool_delegate_to_swarm
-    llm = MagicMock()
-    llm.swarm_clients = None
-    scratchpad = MagicMock()
-    result = await tool_delegate_to_swarm(
-        llm_client=llm, model_name="x", scratchpad=scratchpad,
-        tasks=[{"instruction": "i", "input_data": "d", "output_key": "k"}],
-    )
-    # "Error:" prefix (was "SYSTEM WARNING") so the agent loop registers a
-    # failure and the delegate_to_swarm fallback hint fires.
-    assert result.startswith("Error")
-    assert "not configured" in result
-    assert "Swarm" in result
-
-
-@pytest.mark.asyncio
-async def test_swarm_returns_warning_when_all_nodes_missing():
-    """Configured swarm but get_swarm_node returns None — all tasks
-    should be reported as skipped, NOT as 'SUCCESS: N dispatched'."""
-    from ghost_agent.tools.swarm import tool_delegate_to_swarm
-    llm = MagicMock()
-    llm.swarm_clients = [{"client": MagicMock(), "model": "any"}]  # non-empty
-    llm.get_swarm_node = MagicMock(return_value=None)
-    scratchpad = MagicMock()
-    result = await tool_delegate_to_swarm(
-        llm_client=llm, model_name="x", scratchpad=scratchpad,
-        tasks=[
-            {"instruction": "i1", "input_data": "d", "output_key": "k1"},
-            {"instruction": "i2", "input_data": "d", "output_key": "k2"},
-        ],
-    )
-    assert "0 of 2" in result or "WARNING" in result
-    # Scrapbook must have been stamped with the failure alerts
-    assert scratchpad.set.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_swarm_partial_success_reports_mixed_result():
-    from ghost_agent.tools.swarm import tool_delegate_to_swarm
-    llm = MagicMock()
-    llm.swarm_clients = [{"client": MagicMock(), "model": "any"}]
-    node_results = [
-        {"client": MagicMock(), "model": "fast"},  # first task: ok
-        None,                                       # second task: no node
-    ]
-    llm.get_swarm_node = MagicMock(side_effect=node_results)
-    scratchpad = MagicMock()
-    # Patch asyncio.create_task so we don't actually spawn background workers
-    with patch("ghost_agent.tools.swarm.asyncio.create_task", return_value=MagicMock()):
-        result = await tool_delegate_to_swarm(
-            llm_client=llm, model_name="x", scratchpad=scratchpad,
-            tasks=[
-                {"instruction": "i1", "input_data": "d", "output_key": "k1"},
-                {"instruction": "i2", "input_data": "d", "output_key": "k2"},
-            ],
-        )
-    assert "PARTIAL" in result or "1/2" in result
 
 
 # =====================================================================

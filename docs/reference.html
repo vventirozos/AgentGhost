@@ -106,7 +106,7 @@
     <a class="card" href="core/project_research.html"><h3>project_research</h3><p>Research inside a project.</p></a>
     <a class="card" href="core/autonomous_activity.html"><h3>autonomous_activity</h3><p>The background activity ledger.</p></a>
     <a class="card" href="core/workspace_cleanup.html"><h3>workspace_cleanup</h3><p>Tidying the sandbox.</p></a>
-    <a class="card" href="core/delegation.html"><h3>delegation</h3><p>Sub-agents, jobs and pipelines.</p></a>
+    <a class="card" href="core/delegation.html"><h3>delegation</h3><p>Background jobs (<code>jobs</code> tool, core/jobs.py).</p></a>
   </div>
 
   <h2>Memory <span class="card-count">the stores</span></h2>
@@ -145,7 +145,6 @@
     <a class="card" href="tools/image_gen.html"><h3>image_gen</h3><p>Image generation.</p></a>
     <a class="card" href="tools/report_pdf.html"><h3>report_pdf</h3><p>PDF report generation.</p></a>
     <a class="card" href="tools/probe_model.html"><h3>probe_model</h3><p>Real model runs for experiments; the system writes the transcript.</p></a>
-    <a class="card" href="tools/swarm.html"><h3>swarm</h3><p>Fan-out delegation.</p></a>
     <a class="card" href="tools/tasks.html"><h3>tasks</h3><p>Scheduled and reactive tasks.</p></a>
     <a class="card" href="tools/projects.html"><h3>projects</h3><p>The project management tool.</p></a>
     <a class="card" href="tools/introspect.html"><h3>introspect</h3><p>Reading its own state.</p></a>
@@ -187,7 +186,7 @@
       <tr><td><code>optim/</code></td><td>The prompt loader, signatures and gate contract that render tool descriptions. (The optimizer, its autonomy loop and the A/B evaluator were removed on 2026-10-11, §4NM.)</td></tr>
       <tr><td><code>eval/</code></td><td>The evaluation suite and baselines. (The bench banks were removed on 2026-10-11, §4NM.)</td></tr>
       <tr><td><code>utils/</code></td><td>Logging, redaction, the egress guard, tokenisation, constraint handling.</td></tr>
-      <tr><td>~20 <code>core/</code> modules</td><td>Including <code>metacog</code>, <code>turns</code>, <code>subagent</code>, <code>jobs</code>, <code>failure_replay</code>, <code>learning_health</code>, <code>stream_guards</code>.</td></tr>
+      <tr><td>~20 <code>core/</code> modules</td><td>Including <code>metacog</code>, <code>turns</code>, <code>jobs</code>, <code>failure_replay</code>, <code>learning_health</code>, <code>stream_guards</code>.</td></tr>
     </tbody>
   </table>
   </div>

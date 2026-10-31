@@ -4704,6 +4704,56 @@ def html_handler_note(text: str) -> str:
             f"listeners in code; do not call the page working until a click on them has been tested.")
 
 
+#: §4SH: regions whose text is code or verbatim content BY DESIGN — blanked
+#: (newlines kept, so line numbers hold) before looking for stray code. An
+#: opener never closed runs to the end of the file, as it does in a browser.
+#: r1: every other TAG is blanked too, quoted attribute values included — a
+#: multi-line onclick is not stray code, and a `<!--` inside an attribute
+#: opens no comment; a custom element (`<code-editor>`) is not `<code>`;
+#: `[^<>]` keeps an opener without `>` from scanning to the end (quadratic).
+_VERBATIM_REGION_RE = re.compile(
+    r"<(script|style|pre|code|textarea|template|xmp)(?![\w-])[^<>]*>(?:.*?</\1\s*>|.*\Z)"
+    r"|<[A-Za-z][\w:.-]*(?:\s+[^\s=<>\"'/]+(?:\s*=\s*(?:\"[^\"]{0,8000}\"|'[^']{0,8000}'|[^\s<>\"']+))?)*\s*/?>"
+    r"|<!--.*?(?:-->|\Z)",
+    re.IGNORECASE | re.DOTALL)
+#: a JavaScript STATEMENT line — declarations and function assignments only,
+#: never the prose a page shows
+_STRAY_JS_LINE_RE = re.compile(
+    r"^[ \t]*(?:(?:const|let|var)[ \t]+[\w$]+[ \t]*=|(?:async[ \t]+)?function[ \t]*\*?[ \t]*[\w$]+[ \t]*\("
+    r"|[\w$]+(?:\.[\w$]+)+[ \t]*=[ \t]*(?:async[ \t]+)?(?:function\b|\([^)\n]*\)[ \t]*=>|[\w$]+[ \t]*=>))",
+    re.MULTILINE)
+STRAY_JS_MIN_LINES = 3
+
+
+def html_stray_script_note(text: str) -> str:
+    """§4SH (req cb27058e): JavaScript sitting OUTSIDE any <script> — the
+    browser shows it as page text and never runs it. The shape a part
+    boundary makes: part 3 ended with </script> and part 4 began with code,
+    so the app never started and the model spent ~10 minutes finding why.
+    Advisory, never a failure; "" when nothing is wrong."""
+    t = str(text or "")
+    if len(t) > HANDLER_CHECK_MAX_BYTES or "<" not in t:
+        return ""
+    bare = _VERBATIM_REGION_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), t)   # same length: offsets hold
+    hits = list(_STRAY_JS_LINE_RE.finditer(bare))
+    if len(hits) < STRAY_JS_MIN_LINES:
+        return ""
+    first = bare.count("\n", 0, hits[0].start()) + 1
+    _close = [m for m in re.finditer(r"</script\s*>", t[:hits[0].start()], re.IGNORECASE)]
+    after = (f" (the last </script> before it is at line {t.count(chr(10), 0, _close[-1].start()) + 1})"
+             if _close else "")
+    return (f"\nPAGE CHECK: from line {first}, {len(hits)} lines of JavaScript sit OUTSIDE any <script>{after} — "
+            f"the browser shows them as page text and never runs them. A part most likely began after a "
+            f"</script> without opening its own <script>: put <script> before line {first} and make sure "
+            f"a </script> closes it.")
+
+
+def html_page_notes(text: str) -> str:
+    """Every whole-page HTML check (advisory): undefined inline handlers and
+    code outside any <script>."""
+    return html_handler_note(text) + html_stray_script_note(text)
+
+
 async def _syntax_feedback(path: Path, filename: str, *, in_progress: bool = False,
                            last_rows: Optional[int] = None) -> str:
     """Best-effort post-write syntax check. Returns "" when clean or unknown.
@@ -4782,8 +4832,8 @@ async def _syntax_feedback(path: Path, filename: str, *, in_progress: bool = Fal
                     err = "\n".join(ln[:200] for ln in lines if ln.strip())[:800]
         elif ext == "json":
             try:
-                json.loads(await asyncio.to_thread(
-                    path.read_text, encoding="utf-8", errors="replace"))
+                json.loads((await asyncio.to_thread(
+                    path.read_text, encoding="utf-8", errors="replace")).lstrip("\ufeff"))   # §4SH r10: as the end check
             except json.JSONDecodeError as je:
                 err = f"{je.msg} (line {je.lineno}, col {je.colno})"
         elif ext in ("js", "mjs", "cjs"):
@@ -5261,18 +5311,29 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     # Whole-file defs diff: symbols defined in the previous content but not
     # in the new content were removed by this edit; surviving references to
     # them get named in the result (see _orphaned_symbol_warning).
-    _syn = await _syntax_feedback(path, filename)
+    _end = ""
+    if _is_in_progress(path):
+        # §4SH: the edit finished the document. r1: only when THIS edit made it end — a
+        # typo fix in a part-1 skeleton that already ran through </html> closes nothing
+        _end = (document_ends_here(filename, new_content)
+                if not document_ends_here(filename, prev_content) else "")
+        if _end:
+            _mark_in_progress(path, False)
+    _open = _is_in_progress(path)
+    # §4SH r3: a file still open for parts gets the deferred verdict, as its write and
+    # append parts do ("Fix this BEFORE any other step" told the model to close it early)
+    _syn = await _syntax_feedback(path, filename, in_progress=_open)
     _text = (success_msg
              + _orphaned_symbol_warning(prev_content, new_content, new_content)
-             + _syn)
-    if str(filename).lower().endswith((".html", ".htm")) and not _is_in_progress(path):
-        _text += await asyncio.to_thread(html_handler_note, new_content)   # §4OI (iii): advisory
-    if _syn:
-        # §4RB r2: an edit adding to a file still written in parts (the §4NZ habit) keeps its
-        # syntax note (edits may finish the file) but is not "the edit broke it"
-        return ToolOutcome.partial(_text, world_changed=True,
-                                   reason_code=("syntax_failed_file_in_parts" if _is_in_progress(path)
-                                                else "written_but_syntax_failed"))
+             + (_PARTS_PENDING_NOTE if (_open and _syn) else _syn))
+    if _end:
+        _text += _finished_by_end_note(filename, _end)
+    elif _open:
+        _text += OPEN_PART_NOTE                  # r4: as its write and append parts say
+    if str(filename).lower().endswith((".html", ".htm")) and not _open:
+        _text += await asyncio.to_thread(html_page_notes, new_content)   # §4OI (iii) + §4SH: advisory
+    if _syn and not _open:
+        return ToolOutcome.partial(_text, world_changed=True, reason_code="written_but_syntax_failed")
     return _text
 
 
@@ -5490,7 +5551,7 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path, more_p
             f"{summary}{syntax_note}{rewrite_note}{_stray_note}"
         )
         if not more_parts and ext in ("html", "htm"):
-            _text += await asyncio.to_thread(html_handler_note, content)   # §4OI (iii): advisory, never a failure
+            _text += await asyncio.to_thread(html_page_notes, content)   # §4OI (iii) + §4SH: advisory, never a failure
         if syntax_note and more_parts:
             # §4NU: part 1 of a file written in parts — not parseable yet
             return (f"SUCCESS: Wrote {len(content)} chars to '{filename}'. "
@@ -5699,6 +5760,320 @@ def files_left_in_progress(req_id) -> list:
     return out
 
 
+#: §4SH: the bound on a JSON file parsed whole to see whether a part ended it
+DOC_END_JSON_MAX_BYTES = 8 * 1024 * 1024
+#: extensions `_syntax_feedback` can judge (.js/.mjs/.cjs only with node)
+_CHECKED_EXTS = frozenset({"py", "sh", "bash", "json", "csv", "tsv", "html", "htm"})
+_NODE_EXTS = frozenset({"js", "mjs", "cjs"})
+
+
+#: r5: the closing tag at the end, optionally followed by comments (`</html>\n<!-- built -->`)
+_ENDS_WITH_RE = {k: re.compile(r"</" + k + r"(?:[\t\n\f\r /][^>]*)?>(?:\s*<!--(?:(?!-->)[\s\S])*-->)*\s*\Z", re.IGNORECASE)
+                 for k in ("html", "svg")}
+_END_WINDOW = 20000
+
+
+def document_ends_here(filename, text) -> str:
+    """§4SH: the closing token when `text` is a WHOLE document of the kind
+    the file's extension names, else "". A format with a definite end says
+    itself when the last part has landed — nothing legitimately follows
+    `</html>`, and a JSON value that parses is complete — so a part that ends
+    the document is the last part whatever `more_parts` said (req cb27058e:
+    the part ending `</body></html>` was sent with more_parts=true and the
+    file stayed "unfinished", unchecked, for 17 turns). Code formats are not
+    judged: a .py/.js split at function boundaries parses after every part."""
+    ext = str(filename).rsplit(".", 1)[-1].lower() if "." in str(filename) else ""
+    t = str(text or "")
+    if ext in ("html", "htm", "xhtml"):
+        # r1/r2: `</html>` inside a still-open <script> (a template literal) ends nothing
+        # r4: or inside a comment, <style>, tag or quoted value — the page is whole only outside all of them
+        if not _ENDS_WITH_RE["html"].search(t[-_END_WINDOW:]) or html_tail_state(t, xml=ext == "xhtml"):
+            return ""
+        return "</html>"
+    if ext == "svg":
+        # r4/r5: the outermost <svg> closed, read by the scan (an `<svg` in a comment, CDATA
+        # or quoted value is not an opener); a trailing comment may follow it
+        if not _ENDS_WITH_RE["svg"].search(t[-_END_WINDOW:]):
+            return ""
+        state, depth, _seen = _html_scan(t, xml=True)
+        return "</svg>" if not state and depth == 0 else ""
+    if ext == "json" and t.strip() and len(t) <= DOC_END_JSON_MAX_BYTES:
+        try:
+            json.loads(t.lstrip("\ufeff"))       # r9: a BOM is not the document
+        except (ValueError, RecursionError):     # r8: nesting too deep is no proof of an end
+            return ""
+        return "a whole JSON value"
+    return ""
+
+
+def _ext_of(filename) -> str:
+    n = Path(str(filename)).name
+    return n.rsplit(".", 1)[-1].lower() if "." in n else ""
+
+
+def _whole_check_phrase(filename, text=None) -> str:
+    """r1: what the finish can truthfully say — "checked whole" only for a
+    kind something here checks (an .svg/.md/.txt was claimed checked too).
+    r3: an .svg/.xhtml is judged by its closing tag (as the reply-time settle
+    does); ``text`` None = the caller already found the document's end."""
+    ext = _ext_of(filename)
+    if ext in _CHECKED_EXTS or (ext in _NODE_EXTS and _find_node()):
+        return "was checked whole"
+    if ext in ("svg", "xhtml"):
+        if text is None or document_ends_here(filename, text):
+            return "was checked: it ends with its closing tag"
+        return "does NOT end with its closing tag — if a part is missing, append it"
+    return f"nothing here checks a .{ext or 'extensionless'} file, so look at how it ends"
+
+
+#: r3: the elements whose content is RAW text in the HTML tokenizer — a `<script>`
+#: inside them opens nothing (`<textarea><script></textarea>`, `<title>… <script> …`)
+_RAWTEXT_TAGS = frozenset({"script", "style", "textarea", "title", "noscript", "xmp", "iframe",
+                           "noembed", "noframes"})
+_TAG_NAME_RE = re.compile(r"<([A-Za-z][^\s/>]*)")
+_TAG_STOP_RE = re.compile(r">|=[ \t\r\n\f]*([\"'])")     # a quote opens a value only after `=`
+_END_NAME_RE = re.compile(r"</([A-Za-z][^\s/>]*)")
+_FOREIGN_TAGS = frozenset({"svg", "math"})     # r4: nothing in them is raw text
+_COMMENT_END_RE = re.compile(r"--!?>")
+#: r5: HTML5 — these start tags end foreign (svg/math) content; these elements hold HTML inside it
+_HTML_BREAKOUT_TAGS = frozenset("b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 h5 h6 "
+                                "head hr i img li listing menu meta nobr ol p pre ruby s small span strong "
+                                "strike sub sup table tt u ul var".split())
+_PAGE_MARKS = frozenset({"!doctype", "html", "head", "body"})
+_INTEGRATION_TAGS = frozenset({"foreignobject", "desc", "title", "annotation-xml",
+                               "mi", "mo", "mn", "ms", "mtext"})   # r10: the MathML text points too
+
+
+def _start_tag_end(t: str, j: int) -> int:
+    """Index after the `>` closing a start tag whose name ends at ``j`` — a
+    `>` inside a quoted attribute value is text. -1: the file ends inside the
+    tag. Linear (a regex with quoted alternatives rescanned to the end for
+    every `<` in an unclosed quote)."""
+    while True:
+        m = _TAG_STOP_RE.search(t, j)
+        if not m:
+            return -1
+        if not m.group(1):
+            return m.end()
+        # r5: inside an UNQUOTED value (`href=/s?q="`) a quote is text — the
+        # word before this `=` already holds one (bounded by j: linear)
+        eq = m.start()
+        ws = max(t.rfind(c, j, eq) for c in " \t\n\r\f")
+        if "=" in t[max(ws + 1, j):eq]:
+            j = m.end()
+            continue
+        q = t.find(m.group(1), m.end())
+        if q < 0:
+            return -1
+        j = q + 1
+
+
+def _html_scan(text: str, *, xml: bool = False):
+    """r2–r9: (where the page ENDS, the svg/math depth there, the html tags
+    seen as tags), read with the
+    HTML tokenizer's rules for what matters here — "" (outside everything: the page may be whole),
+    "script" (its last <script> is never closed), "<name>" for another
+    raw-text element (style, textarea, title, …), "comment", "tag" (inside a
+    tag, a quoted value or a doctype). A raw-text element runs to its first
+    `</name` + tab/LF/FF/CR/space, `/` or `>` (so `const t = "<script>"`
+    inside a script is text); comments (`<!-->` and `<!--->` are whole, `--!>`
+    ends one), CDATA inside <svg>/<math> (elsewhere a bogus comment to `>`),
+    doctype/processing instructions and attribute values (`data-x="<script>"`)
+    open nothing; inside <svg>/<math> nothing is raw text (an svg `<script/>`
+    or `<title/>` closes itself) until an HTML breakout tag (`<div>`, `<p>`, …)
+    ends it or an integration point (foreignObject, desc, title,
+    annotation-xml, the MathML text points mi/mo/mn/ms/mtext) holds HTML;
+    ``seen``: the doctype and html/head/body/`</html>` met as TAGS; ``xml`` (XHTML, .svg):
+    `<script …/>` is a complete element. Indices are on the text itself
+    (r4: a lowercased copy is longer after `İ`). Linear. Not modelled: the
+    script "double-escape" (`<!--` + `<script>` inside a script)."""
+    t = str(text or "")
+    n, pos, foreign = len(t), 0, 0
+    islands: list = []          # r5: (element, foreign depth) of an HTML island inside svg/math
+    seen: set = set()           # r9: "html" / "/html" seen as TAGS (not inside a script string)
+    while True:
+        i = t.find("<", pos)
+        if i < 0 or i + 1 >= n:
+            return "", foreign, seen
+        if t.startswith("<!--", i):
+            if t.startswith("<!-->", i):
+                pos = i + 5
+                continue
+            if t.startswith("<!--->", i):
+                pos = i + 6
+                continue
+            end = _COMMENT_END_RE.search(t, i + 4)
+            if not end:
+                return "comment", foreign, seen
+            pos = end.end()
+            continue
+        if foreign and t.startswith("<![CDATA[", i):
+            end = t.find("]]>", i + 9)
+            if end < 0:
+                return "comment", foreign, seen
+            pos = end + 3
+            continue
+        if t[i + 1] == "/":
+            m = _END_NAME_RE.match(t, i)
+            end = t.find(">", i + 2)
+            if end < 0:
+                return "tag", foreign, seen
+            _en = m.group(1).lower() if m else ""
+            if _en in ("html", "body"):
+                seen.add("/" + _en)                  # r12: HTML5 may omit </html> after </body>
+            if islands and _en == islands[-1][0]:
+                foreign = islands.pop()[1]           # back inside the svg/math
+            elif foreign and _en in _FOREIGN_TAGS:
+                foreign -= 1
+            pos = end + 1
+            continue
+        if t[i + 1] in "!?":                         # doctype, PI: to the next `>`
+            end = t.find(">", i + 2)
+            if end < 0:
+                return "tag", foreign, seen
+            if t[i + 1:i + 9].lower() == "!doctype":
+                seen.add("!doctype")                 # r11: a document, not a fragment
+            pos = end + 1
+            continue
+        m = _TAG_NAME_RE.match(t, i)
+        if not m:
+            pos = i + 1                              # a `<` that starts no tag is text
+            continue
+        end = _start_tag_end(t, m.end())
+        if end < 0:
+            return "tag", foreign, seen                    # the file ends inside a tag
+        name = m.group(1).lower()
+        pos = end
+        if name in ("html", "head", "body"):
+            seen.add(name)                           # r11: what makes it a whole page (not a fragment)
+        closes_itself = t[m.end():end - 1].rstrip().endswith("/")
+        if name in _FOREIGN_TAGS:
+            foreign += not closes_itself
+            continue
+        if foreign and not xml:
+            if name in _HTML_BREAKOUT_TAGS:
+                foreign, islands = 0, []             # HTML5: this tag ends the foreign content
+            elif name in _INTEGRATION_TAGS and not closes_itself:
+                islands.append((name, foreign))      # foreignObject/desc/title: HTML inside
+                foreign = 0
+            continue
+        if foreign or name not in _RAWTEXT_TAGS or (xml and closes_itself):
+            continue
+        close = re.compile(r"</" + re.escape(name) + r"[\t\n\f\r />]", re.IGNORECASE | re.ASCII).search(t, pos)
+        if not close:
+            return name, foreign, seen                     # a raw-text element runs to the end
+        end = t.find(">", close.end() - 1)
+        pos = n if end < 0 else end + 1
+
+
+def html_tail_state(text: str, *, xml: bool = False) -> str:
+    """Where the page ends (see `_html_scan`): "" outside everything, else
+    "script", another raw-text tag name, "comment" or "tag"."""
+    return _html_scan(text, xml=xml)[0]
+
+
+def html_unclosed_script(text: str, *, xml: bool = False) -> bool:
+    """r2: the page's last <script> is never closed (see `html_tail_state`)."""
+    return html_tail_state(text, xml=xml) == "script"
+
+
+def html_cut_finding(text: str) -> str:
+    """r2: the one judgement of whether a page looks cut short — the finish
+    note and the reply-time settle both say it (they disagreed: a
+    skeleton-first page was "fine" at the reply and "missing a part" at the
+    finish). "" when the page reads as whole."""
+    t = str(text or "")
+    state, _depth, seen = _html_scan(t)
+    if state == "script":
+        return "its last <script> is never closed, so it looks cut short"
+    if state:                                    # r4: a comment, <style>, tag or quote left open
+        what = {"comment": "a comment", "tag": "a tag (or a quoted value)"}.get(state, f"<{state}>")
+        return f"it ends inside {what} that is never closed, so it looks cut short"
+    # r9–r11: a `</html>` in a script string is not the end; a fragment (no doctype, <html>,
+    # <head> or <body>) needs none — a page cut before its <html> tag still does
+    if seen & _PAGE_MARKS and not seen & {"/html", "/body"}:
+        return "it ends without </html>, so it looks cut short"
+    return ""
+
+
+def _finished_by_end_note(filename, end: str) -> str:
+    return (f"\nNOTE: this ends the document ({end}), so it was taken as the LAST part — '{filename}' is "
+            f"finished and {_whole_check_phrase(filename)}. (If more parts do follow, append them as usual: "
+            f"the file reopens.)")
+
+
+#: §4SH: said on every part that leaves the file open — how to close it is
+#: always within reach (the model that mis-set the flag had no way out)
+OPEN_PART_NOTE = (" The file stays OPEN for the next part (append=true). If this was the last part, finish it: "
+                  "operation='write', append=true, content='' — nothing is added, the file is closed and the "
+                  "finish says what was checked.")
+
+
+def _first_line(note: str) -> str:
+    return next((ln.strip() for ln in str(note or "").splitlines() if ln.strip()), "")[:240]
+
+
+async def finish_parts_file(path: Path, filename: str):
+    """§4SH: `write` + append=true + empty content on a file open for parts:
+    nothing is added, the file is closed and checked whole."""
+    _mark_in_progress(path, False)
+    try:
+        text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"Error: {e}"
+    syn = await _syntax_feedback(path, filename)
+    is_html = str(filename).lower().endswith((".html", ".htm"))
+    page = await asyncio.to_thread(html_page_notes, text) if is_html else ""
+    end = ""
+    _cut = html_cut_finding(text) if is_html else ""
+    if _cut:
+        end = f"\nNOTE: {_cut} — if a part is missing, append it."
+    out = (f"SUCCESS: Finished '{filename}' — written in parts, nothing added now; it is "
+           f"{len(text.encode('utf-8')):,} bytes and {_whole_check_phrase(filename, text)}.{syn}{page}{end}")
+    pretty_log("File Finished", f"{filename}: closed by an empty last part"
+               + (f" — {_first_line(syn)}" if syn else ""), icon=Icons.TOOL_FILE_W)
+    if syn:
+        return ToolOutcome.partial(out, world_changed=False, reason_code="written_but_syntax_failed")
+    return out
+
+
+async def settle_open_parts(req_id) -> list:
+    """§4SH: at the reply, the files THIS request left open for parts are
+    closed by the system and judged by what is IN them — not by the flag.
+    Returns [(name, finding)]; finding "" = the file passes its checks (the
+    reply then says nothing: req cb27058e told the owner a complete page,
+    tested three times in the browser, was "incomplete and never checked")."""
+    rid = str(req_id or "")
+    out = []
+    for p in files_left_in_progress(rid):
+        _IN_PROGRESS.pop((rid, p), None)
+        path, name = Path(p), Path(p).name
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        try:
+            text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        finding = _first_line(await _syntax_feedback(path, name))
+        if ext in ("html", "htm"):
+            # r1: a page whose </html> came in an EARLIER part (the skeleton first, its
+            # scripts appended after it) renders; r2: a never-closed <script> is cut short
+            if not finding:
+                finding = html_cut_finding(text)
+            if not finding:
+                finding = _first_line(await asyncio.to_thread(html_stray_script_note, text))
+        elif ext in ("svg", "xhtml") and not finding and not document_ends_here(name, text):
+            finding = "it ends without its closing tag, so it looks cut short"
+        checked = ext in _CHECKED_EXTS or ext in ("svg", "xhtml") or (ext in _NODE_EXTS and _find_node())
+        if not finding and not checked:
+            tail = " ".join(text[-90:].split())
+            finding = f"nothing here can check a .{ext or 'extensionless'} file, so look at how it ends: «…{tail}»"
+        pretty_log("Parts File", f"{name}: left open by the last part — closed at the reply; "
+                   + (finding or "it passes its checks (nothing said)"),
+                   icon=Icons.WARN if finding else Icons.TOOL_FILE_W, level="WARNING" if finding else "INFO")
+        out.append((name, finding))
+    return out
+
+
 def forget_request_receipts(req_id) -> int:
     """§4OG-1 (h): drop every receipt of a finished request (the tables were
     one 512-slot LRU across requests). Returns the number removed."""
@@ -5803,8 +6178,7 @@ def _cut_saved_note(raw_len: int, path: Path, shown_path: str = "") -> str:
 #: §4NU: the note on a part written with more_parts=true whose file does not
 #: parse yet (instead of a syntax-failure verdict — part 1 of a .py/.json is
 #: never complete)
-_PARTS_PENDING_NOTE = (" More parts follow (more_parts=true), so the file is not checked for syntax yet — "
-                       "it is checked when you write the LAST part without more_parts.")
+_PARTS_PENDING_NOTE = " More parts follow (more_parts=true), so its syntax verdict waits for the last part."
 #: §4NU: an append rewrites the file; beyond this the file is too big for it
 APPEND_MAX_FILE_BYTES = 64 * 1024 * 1024
 #: §4NU r1: a part this long that the file already ENDS with is a re-send
@@ -5935,7 +6309,7 @@ async def tool_append_file(filename: str, content: Any, sandbox_dir: Path, more_
         if not more_parts and str(filename).lower().endswith((".html", ".htm")):
             try:                                                     # §4OI (iii): the finished page, checked whole
                 _handler = await asyncio.to_thread(
-                    html_handler_note, path.read_text(encoding="utf-8", errors="replace"))
+                    html_page_notes, path.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 pass
         if syntax_note and more_parts:
@@ -7352,11 +7726,39 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         final_content = _held
         _held_redeemed = True
 
+    # §4SH: an EMPTY last part finishes a file written in parts — the way out
+    # for a model whose real last part went with more_parts=true
+    def _flag(v):
+        return v is True or str(v).strip().lower() in ("true", "1", "yes")
+    if (operation == "write" and target_path and content == "" and not final_content
+            and _flag(kwargs.get("append"))):     # r1: exactly '' (a "\n" append appends)
+        try:
+            _fin = _get_safe_path(sandbox_dir, target_path)
+        except Exception:  # noqa: BLE001
+            _fin = None
+        if _fin is not None and _fin.is_file() and _is_in_progress(_fin):
+            return await finish_parts_file(_fin, str(target_path))
+        if _fin is not None and _fin.is_file():
+            # r3: information, not a refusal — an extra finish after a part that already closed
+            # the file is harmless (a REJECTED read as a failure of the file)
+            return (f"NOTE: '{target_path}' has no part pending in this request (it is not open for parts), so an "
+                    f"empty append has nothing to finish and nothing was changed. To add text at its end, send "
+                    f"it in 'content' with append=true.")
+        # r4: a finish on a missing file — the MANDATORY refusal below advised this very call
+        _why = ("is not a usable path in the sandbox" if _fin is None else "is a directory" if _fin.is_dir()
+                else "is not a regular file" if _fin.exists() else "does not exist")      # r5/r6
+        return ToolOutcome.rejected(f"'{target_path}' {_why}, so there is nothing to finish — check the "
+                                    f"path. A new file is written with operation='write' and its full content.",
+                                    reason_code="missing_file")
+
     # If the LLM put the content in 'path' but didn't provide 'content' (common for write)
     if (operation == "write" and target_path and not final_content
             and not (content == "" and Path(str(target_path)).name.lower() in _EMPTY_OK_NAMES)):
         # Check if the LLM accidentally sent the content as the only other parameter
-        return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY for write operations. You must provide the full text to write.", reason_code="missing_content")
+        _fin_hint = (" To FINISH a file written in parts, send content='' (an empty string) with append=true — "
+                     "do not re-send the file." if _flag(kwargs.get("append")) else "")      # §4SH r3
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY for write operations. "
+                                    "You must provide the full text to write." + _fin_hint, reason_code="missing_content")
 
     sandbox_manager = kwargs.get("sandbox_manager")
 
@@ -7788,6 +8190,23 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
                 f"were ADDING to it, send each part with append=true (~15 KB per part). Only to REPLACE "
                 f"it: the first part with a plain write and more_parts=true, then append=true for the "
                 f"rest.", world_changed=False, reason_code="tool_call_cut_off")
+        _ends = ""
+        if _more and _app and not _cut and _wpath is not None:
+            # §4SH: an appended part that ENDS its document is the last part, whatever
+            # more_parts says. Not a FIRST part: cb27058e's part 1 was the whole
+            # skeleton through </html>, and its scripts were appended after it.
+            try:
+                _x = _wpath.suffix.lower()
+                _big = (_x == ".json" and _wpath.is_file() and _wpath.stat().st_size > DOC_END_JSON_MAX_BYTES)
+                # r1: only a format with a definite end is read, and off the event loop
+                if _x in (".html", ".htm", ".xhtml", ".svg", ".json") and not _big and _wpath.is_file():
+                    _prior = await asyncio.to_thread(_wpath.read_text, encoding="utf-8", errors="replace")
+                    _ends = await asyncio.to_thread(document_ends_here, target_path,
+                                                    _prior + str(final_content or ""))
+            except Exception:  # noqa: BLE001
+                _ends = ""
+            if _ends:
+                _more = False
         if _app:
             res = await tool_append_file(target_path, final_content, sandbox_dir, more_parts=_more)
         else:
@@ -7803,6 +8222,10 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
                                        "above is satisfied (read the file), write again with content='<<HELD>>'.")
         if _wpath is not None and str(res).startswith("SUCCESS"):
             _mark_in_progress(_wpath, _more)
+            if _ends:
+                res = append_note(res, _finished_by_end_note(target_path, _ends))
+            elif _more and not _cut:
+                res = append_note(res, OPEN_PART_NOTE)
             if not _app:
                 _mark_written(_wpath)       # review: an append to an owner's file is not "this request's file"
             else:

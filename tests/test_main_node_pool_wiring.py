@@ -27,7 +27,6 @@ def _driven_call_kwargs():
     args.visual_nodes_parsed = ["VISUAL"]
     args.critic_nodes_parsed = ["CRITIC"]
     args.image_gen_nodes_parsed = ["IMAGEGEN"]
-    args.swarm_nodes_parsed = ["SWARM"]
     args.coding_nodes_parsed = ["CODING"]
     args.api_key = "k"
     ctx = MagicMock()
@@ -67,7 +66,7 @@ def test_each_pool_reaches_its_own_slot():
         "critic pool is not in the critic slot — verdicts would route to the "
         "wrong node")
     assert kw.get("image_gen_nodes") == ["IMAGEGEN"], kw
-    assert kw.get("swarm_nodes") == ["SWARM"], kw
+    assert "swarm_nodes" not in kw, kw   # §4SI: the swarm pool was removed
     assert kw.get("coding_nodes") == ["CODING"], kw
     # upstream is the one positional; tor_proxy/api_key are keyword.
     assert call.args and call.args[0] == "http://main.invalid:8088"

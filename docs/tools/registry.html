@@ -26,7 +26,6 @@
     <a href="vision.html">vision</a>
     <a href="image_gen.html">image_gen</a>
     <a href="report_pdf.html">report_pdf</a>
-    <a href="swarm.html">swarm</a>
     <a href="tasks.html">tasks (scheduler)</a>
     <a href="projects.html">projects</a>
     <a href="acquired_skills.html">acquired_skills</a>
@@ -45,7 +44,6 @@
   <div class="scroll"><table>
     <thead><tr><th>Tool name</th><th>Module</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>delegate_to_swarm</code></td><td><a href="swarm.html">swarm</a></td><td>Fire-and-forget background task dispatch with optional blocking await.</td></tr>
       <tr><td><code>system_utility</code></td><td><a href="system.html">system</a></td><td>Diagnostics / health / weather / location.</td></tr>
       <tr><td><code>file_system</code></td><td><a href="file_system.html">file_system</a></td><td>Unified read / write / search / list / find / download / move / delete.</td></tr>
       <tr><td><code>knowledge_base</code></td><td><a href="memory_tools.html">memory tools</a></td><td>Document memory and transcriber: transcribe (alias of ingest_document), ingest_document, query, outline, transcript, expand, insert_fact, forget (preview, then confirm with the token), list_docs, reset_all (preview, then confirm).</td></tr>
@@ -61,7 +59,7 @@
       <tr><td><code>update_profile</code></td><td>memory tools</td><td>Persistent user facts.</td></tr>
       <tr><td><code>manage_projects</code></td><td><a href="projects.html">projects</a></td><td>Project lifecycle + tasks.</td></tr>
       <tr><td><code>manage_tasks</code></td><td><a href="tasks.html">tasks</a></td><td>Cron / interval background jobs.</td></tr>
-      <tr><td><code>dream_mode</code></td><td>memory tools</td><td>The maintenance cycle on request (store care, graph prune/merge). It creates no lessons.</td></tr>
+      <tr><td><code>jobs</code></td><td><a href="../core/delegation.html">background jobs</a></td><td>Status / collect / cancel for background jobs (a long <code>execute</code> command moved to the background). <code>delegate</code>, <code>delegate_to_swarm</code> and <code>dream_mode</code> were removed 2026-10-30 (&sect;4SI).</td></tr>
       <tr><td><code>list_lessons</code></td><td>memory tools</td><td>Surface the LESSON playbook (mistakes-and-fixes the agent has internalized). <code>scope ∈ {today, week, all, self_play_only}</code>. Read-only; exempt from the meta-task compliance nudge. NOT for "show me your skills" — that is a TOOL list and routes to <code>manage_skills</code>.</td></tr>
       <tr><td><code>replan</code></td><td>core/agent</td><td>Strategy reset signal.</td></tr>
       <tr><td><code>abort_attempt</code></td><td>core/agent</td><td>Escape hatch for unsolvable tasks.</td></tr>

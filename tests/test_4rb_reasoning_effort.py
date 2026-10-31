@@ -679,10 +679,11 @@ def test_an_edit_to_a_file_in_parts_is_not_stuck(tmp_path):
     finally:
         L.request_id_context.reset(tok)
         FS.forget_request_receipts(rid)
-    assert getattr(r, "reason_code", None) == "syntax_failed_file_in_parts"
-    assert "SYNTAX CHECK FAILED" in str(r)          # the model still sees it (an edit may finish the file)
+    # §4SH r3: the verdict waits for the last part, as for a write/append part (the old
+    # "SYNTAX CHECK FAILED — fix this BEFORE any other step" told the model to close it early)
+    assert "SYNTAX CHECK FAILED" not in str(r) and "verdict waits for the last part" in str(r)
     assert E.stuck_reason("file_system", "edit", "c.py", refused=bool(getattr(r, "is_rejection", False)),
-                          result_text=str(r), reason_code=r.reason_code) == ""
+                          result_text=str(r), reason_code=getattr(r, "reason_code", None)) == ""
 
 
 def test_the_trigger_passes_the_outcome_and_only_written_files():

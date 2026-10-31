@@ -82,12 +82,10 @@ def _make_llm_with_pool(pool_attr: str):
         {"url": "http://node-a", "model": "alpha"},
         {"url": "http://node-b", "model": "beta"},
     ]
-    # Use the same node list for swarm/worker so the constructor is happy;
-    # we only care about the specific pool we patch in.
+    # We only care about the specific pool we patch in.
     client = LLMClient(
         upstream_url="http://upstream",
         tor_proxy=None,
-        swarm_nodes=[],
         worker_nodes=[],
         visual_nodes=nodes if pool_attr == "vision_clients" else None,
         coding_nodes=nodes if pool_attr == "coding_clients" else None,

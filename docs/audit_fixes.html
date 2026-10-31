@@ -41,7 +41,6 @@
     <a href="tools/memory_tools.html">memory tools</a>
     <a href="tools/browser.html">browser</a>
     <a href="tools/projects.html">projects</a>
-    <a href="tools/swarm.html">swarm</a>
     <a href="tools/search.html">search</a>
     <a href="tools/acquired_skills.html">acquired_skills</a>
     <a href="tools/registry.html">registry</a>
@@ -430,7 +429,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>GEPA adapter</td><td>From inside a running event loop the dspy LM adapter fell through to <code>asyncio.run()</code> and raised. Now runs the coroutine on a worker thread.</td><td><code>optim/run_gepa.py</code></td></tr>
       <tr><td>Hypothesis testing</td><td>An error <em>result</em> was force-marked inconsistent and dropped — but a test designed to surface an error can be the one that <em>confirms</em> its hypothesis. Error results are now left ambiguous and deferred to evaluation.</td><td><code>core/hypothesis</code> (removed §4NN)</td></tr>
       <tr><td>Project decompose</td><td><code>zip(ids, subtasks)</code> mis-aligned knowledge-graph links when a blank subtask was dropped from <code>ids</code>. Pairs are now built as tasks are created.</td><td><a href="tools/projects.html">tools/projects</a></td></tr>
-      <tr><td>Swarm routing</td><td><code>get_swarm_node</code> was called twice per task (dispatch + worker), double-advancing the round-robin index. The validated node is now passed to the worker.</td><td><a href="tools/swarm.html">tools/swarm</a></td></tr>
+      <tr><td>Swarm routing</td><td><code>get_swarm_node</code> was called twice per task (dispatch + worker), double-advancing the round-robin index. The validated node is now passed to the worker.</td><td>tools/swarm (removed 2026-10-30, §4SI)</td></tr>
       <tr><td>Episodic recall</td><td>Referenced a <code>search_raw</code> method that never existed (permanently dead). Now calls the real <code>search_advanced</code>.</td><td><a href="memory/episodes.html">memory/episodes</a></td></tr>
       <tr><td>Vector store</td><td>A recoverable embedding-provider conflict called <code>sys.exit(1)</code> despite logging "Resetting collection". Now actually drops + recreates the collection.</td><td><a href="memory/vector.html">memory/vector</a></td></tr>
       <tr><td>Projects API <span class="badge">contract</span></td><td><code>DELETE</code> returned a 4-byte <code>null</code> body on a <code>204</code> (RFC violation). Now an empty <code>Response</code>.</td><td><a href="api/projects_routes.html">api/projects_routes</a></td></tr>
@@ -734,7 +733,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
   <p>Deferred (in <code>BUGHUNT.md</code>): the process-global <code>current_project_id</code> cross-conversation race (spans projects + api; structural — same class already tracked); the projects metadata split-lock RMW and skills cross-process lock (multi-process JSON stores need file locks like frontier's <code>fcntl</code>); the unwired <code>graph.execute_graph_compression</code> resurrecting expired facts; the vector <code>smart_update</code> template over-match and <code>correct_fragment</code> id-collision; the router serve-only <code>context_turn_coupling</code> feature (inert, needs training-data plumbing) and its raw-count feature scaling (needs a retrain); and a handful of low store nits (scratchpad connection reuse, competence fractional evidence, episode float timestamp, load <code>UnicodeDecodeError</code> guards).</p>
 
   <h2>Round 9, units 7 &amp; 8: tools-knowledge + tools-skills (2026-07-03)</h2>
-  <p>Two units in one pass: the knowledge tools (memory, database, report_pdf, postmortem_review) and the self-authored-tooling layer (composed_skills, acquired_skills, swarm, qwen_bridge). Four review lenses produced ~35 findings; ~30 fixed, each pinned in <code>tests/test_bughunt_unit78_tools_knowledge_skills.py</code> (19 tests); the rest deferred. This pass also resolved a unit-4 deferred item.</p>
+  <p>Two units in one pass: the knowledge tools (memory, database, report_pdf, postmortem_review) and the self-authored-tooling layer (composed_skills, acquired_skills, swarm, qwen_bridge; swarm removed 2026-10-30, §4SI). Four review lenses produced ~35 findings; ~30 fixed, each pinned in <code>tests/test_bughunt_unit78_tools_knowledge_skills.py</code> (19 tests); the rest deferred. This pass also resolved a unit-4 deferred item.</p>
   <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>

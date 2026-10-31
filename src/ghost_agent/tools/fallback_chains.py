@@ -36,9 +36,6 @@ FALLBACK_CHAINS = {
     # sent the model to a binary-file refusal that points back at vision, and
     # contradicted the failure's own advice ("Do NOT retry"); each vision
     # failure message carries its own next step.
-    "delegate_to_swarm": [
-        ("execute", "If swarm delegation failed, try executing the task directly with execute."),
-    ],
 }
 
 

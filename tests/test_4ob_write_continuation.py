@@ -123,11 +123,12 @@ def test_fences_chatter_tail_repeats_and_the_marker_alone(ctx):
     r = _run(ctx, "g.py", body, llm)
     text = (ctx.sandbox_dir / "g.py").read_text()
     assert text == body + '    "fact 2",\n]\n' and "complete" in str(r)
-    # the marker alone: the saved part was the whole file
+    # the marker alone: §4SH r8 — the saved part was CUT after its last whole line, so
+    # "done" with nothing added is not proof; the file stays as saved, still open
     body2 = "x = 1\n"
     llm2 = FakeLLM([(W.END_MARKER, "stop")])
     r2 = _run(ctx, "h.py", body2, llm2)
-    assert "in 1 parts" in str(r2) and (ctx.sandbox_dir / "h.py").read_text() == body2
+    assert "is complete" not in str(r2) and (ctx.sandbox_dir / "h.py").read_text() == body2
 
 
 def test_a_syntax_error_at_the_end_is_reported_as_partial(ctx):
@@ -343,10 +344,11 @@ def test_a_re_emitted_end_with_the_marker_completes_the_file(ctx):
     twice and gave up on a complete file (review)."""
     closers = "".join("</div>\n" for _ in range(40)) + "</body>\n</html>\n"
     body = "<!DOCTYPE html>\n<html>\n<body>\n" + "".join(f"<div>{i}</div>\n" for i in range(40)) + closers
-    llm = FakeLLM([(closers + W.END_MARKER, "stop")])
-    r = _run(ctx, "p.html", body, llm)
-    assert "complete" in str(r) and (ctx.sandbox_dir / "p.html").read_text() == body
-    assert len(llm.payloads) == 1                      # the refusal + marker ended it; no second round
+    for name in ("p.html", "p.xml"):                   # §4SH r5: a judged kind and an unjudged one
+        llm = FakeLLM([(closers + W.END_MARKER, "stop")])
+        r = _run(ctx, name, body, llm)
+        assert "complete" in str(r) and (ctx.sandbox_dir / name).read_text() == body
+        assert len(llm.payloads) == 1                  # the refusal + marker ended it; no second round
 
 
 def test_the_dispatcher_passes_a_real_cancel_check():

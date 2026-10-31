@@ -5,7 +5,7 @@ Covers:
 - Token budget enforcement (#2/#14)
 - Foreground lock starvation fix (#3)
 - Per-command resource limits (#5)
-- Swarm retry with backoff (#8)
+- (#8 swarm retry: removed with the swarm, §4SI)
 - DB connection pooling (#11)
 - Streaming error recovery (#16)
 - Streaming file replace (#19)
@@ -15,7 +15,7 @@ Covers:
 import pytest
 import asyncio
 import time
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 
@@ -138,88 +138,6 @@ class TestForegroundLockStarvation:
         # background concurrency instead of strict mutual exclusion.
         assert hasattr(client, '_bg_queue_sem')
         assert hasattr(client, '_foreground_lock')
-
-
-# ============================================================
-# #8: Swarm Retry with Backoff
-# ============================================================
-
-class TestSwarmRetry:
-    @pytest.mark.asyncio
-    async def test_swarm_retries_on_failure(self):
-        from ghost_agent.tools.swarm import _swarm_worker
-        from ghost_agent.memory.scratchpad import Scratchpad
-
-        scratchpad = Scratchpad()
-        mock_client = MagicMock()
-        mock_llm = MagicMock()
-
-        # First call fails, second succeeds
-        mock_node_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "choices": [{"message": {"content": "Result after retry"}}]
-        }
-        mock_response.raise_for_status = MagicMock()
-
-        call_count = 0
-        async def mock_post(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ConnectionError("Node offline")
-            return mock_response
-
-        mock_node_client.post = mock_post
-
-        mock_llm.get_swarm_node = MagicMock(return_value={
-            "client": mock_node_client,
-            "model": "test-model",
-            "url": "http://test:8080"
-        })
-
-        await _swarm_worker(
-            "do something", "input data", "result_key",
-            mock_llm, "fallback-model", scratchpad
-        )
-
-        result = scratchpad.get("result_key")
-        assert result == "Result after retry"
-        assert call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_swarm_fails_after_all_retries(self):
-        from ghost_agent.tools.swarm import _swarm_worker
-        from ghost_agent.memory.scratchpad import Scratchpad
-
-        scratchpad = Scratchpad()
-        mock_llm = MagicMock()
-        mock_node_client = MagicMock()
-
-        async def mock_post(*args, **kwargs):
-            raise ConnectionError("Always fails")
-
-        mock_node_client.post = mock_post
-
-        mock_llm.get_swarm_node = MagicMock(return_value={
-            "client": mock_node_client,
-            "model": "test-model",
-            "url": "http://test:8080"
-        })
-
-        # 2026-07-22: a swarm worker now RAISES SwarmWorkerError on failure
-        # (so the job registry lands it FAILED, not a success-shaped [done])
-        # AFTER writing the SYSTEM ALERT to the scratchpad.
-        from ghost_agent.tools.swarm import SwarmWorkerError
-        with pytest.raises(SwarmWorkerError):
-            await _swarm_worker(
-                "do something", "input data", "result_key",
-                mock_llm, "fallback-model", scratchpad
-            )
-
-        result = scratchpad.get("result_key")
-        assert "failed after" in result.lower()
 
 
 # ============================================================

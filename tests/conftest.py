@@ -976,13 +976,12 @@ def _restore_contents(v, contents):
 #:   * search._ddgs_patch_state — a one-time patch applied to the ddgs LIBRARY
 #:     (restored → "patch NOT applied" warnings: the library stays patched);
 #:   * database._connection_pool / _conn_locks — open connections and their locks;
-#:   * swarm._swarm_tasks / _swarm_task_registry, routes._STORE_INFLIGHT —
+#:   * routes._STORE_INFLIGHT —
 #:     references that keep running asyncio tasks alive.
 _LIVE_STATE_CONTAINERS = frozenset({
     "tools.search._ddgs_patch_state",
     "tools.database._connection_pool", "tools.database._conn_locks",
     "core.project_advancer._project_locks",
-    "tools.swarm._swarm_tasks", "tools.swarm._swarm_task_registry",
     "api.routes._STORE_INFLIGHT", "utils.logging._BG_TASKS",
 })
 #: Module globals (rebinding) that record live outside state: the egress

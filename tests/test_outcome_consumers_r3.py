@@ -396,29 +396,6 @@ class TestTheNewlyMigratedProducers:
                             f"{nxt.lineno}"
                         )
 
-    def test_swarm_still_running_is_unresolved_not_partial(self):
-        """PARTIAL is a failure status, so it drew a strike and fed the
-        same-failure breaker for tasks the message itself says "were NOT
-        cancelled — do not re-dispatch them"."""
-        import ghost_agent.tools.swarm as SW
-
-        # §4GJ: two `needle in src` greps -> the AST. The property is that
-        # the still-running branch constructs an UNRESOLVED outcome carrying
-        # that reason code — a comment naming either satisfied the greps.
-        unresolved = [
-            n for n in ast.walk(ast.parse(inspect.getsource(SW)))
-            if isinstance(n, ast.Call)
-            and ast.unparse(n.func).endswith("ToolOutcome.unresolved")
-        ]
-        assert unresolved, (
-            "the still-running branch is a PARTIAL again — that is a "
-            "failure verdict for work explicitly still in flight")
-        assert any(kw.arg == "reason_code"
-                   and getattr(kw.value, "value", None)
-                   == "swarm_await_still_running"
-                   for n in unresolved for kw in n.keywords), (
-            "the still-running outcome lost its reason code")
-
     @pytest.mark.asyncio
     async def test_a_write_that_lands_but_does_not_parse_is_partial(
             self, tmp_path):

@@ -727,18 +727,6 @@ async def test_no_header_behaves_identically_on_any_request_id(monkeypatch, tmp_
     assert seen[0] == seen[1] == (True, True, True, True, True), seen
 
 
-async def test_a_member_cannot_run_the_owners_dream_by_typing_it(monkeypatch, tmp_path):
-    """R4 review: the deterministic terminal-command shortcut ran dream_mode
-    for a member ("dream mode") without asking the model."""
-    agent, ctx, _ = _agent(monkeypatch, tmp_path)
-    dream = AsyncMock(return_value="Dream cycle complete.")
-    agent.available_tools = {"dream_mode": dream}
-    ctx.llm_client.chat_completion = AsyncMock(return_value=_resp("Not available here."))
-    await agent.handle_chat({"messages": [{"role": "user", "content": "dream mode"}]},
-                            FakeBgTasks(), request_id="web-1", requester_role="member")
-    dream.assert_not_awaited()
-
-
 async def test_a_member_turn_runs_with_no_project_and_keeps_the_owners_binding(monkeypatch, tmp_path):
     agent, ctx, _ = _agent(monkeypatch, tmp_path)
     ctx.current_project_id = "p-owner"

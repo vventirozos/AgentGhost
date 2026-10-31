@@ -631,10 +631,6 @@ _FALLBACK_HINTS = {
         ("connection_string is required", "No DB URI is configured. Either ask the user for one or skip this tool — do not retry without configuration."),
         ("statement_timeout", "The query exceeded the timeout. Add a `LIMIT` clause, push filters into the WHERE, or run EXPLAIN ANALYZE first to identify the slow part."),
     ],
-    "delegate_to_swarm": [
-        ("not configured", "The swarm cluster isn't set up. Process the task synchronously in your main context — do not retry delegate_to_swarm."),
-        ("0 of", "No swarm node could route the task. Process synchronously."),
-    ],
     "vision_analysis": [
         # §4LM's remote-404 entry is gone (§4QE): the tool's own 404 result
         # now carries that advice, and never says "Client error" any more.

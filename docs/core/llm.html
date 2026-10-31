@@ -38,12 +38,11 @@
   <p class="subtitle">Multi-pool LLM orchestrator. Owns httpx async clients, round-robin scheduling, and per-node circuit breakers.</p>
 
   <h2>Pool topology</h2>
-  <p>Seven logical pools, each backed by zero-or-more <code>(url, model)</code> nodes plus the always-present foreground client.</p>
+  <p>Six logical pools (the swarm pool was removed 2026-10-30, §4SI), each backed by zero-or-more <code>(url, model)</code> nodes plus the always-present foreground client.</p>
   <div class="scroll"><table>
     <thead><tr><th>Pool</th><th>Used for</th><th>Selector</th></tr></thead>
     <tbody>
       <tr><td>foreground</td><td>Default chat completion</td><td><code>chat_completion()</code> with no flags</td></tr>
-      <tr><td>swarm</td><td>Parallel inference / fan-out</td><td><code>chat_completion(use_swarm=True)</code></td></tr>
       <tr><td>worker</td><td>Cheap classifier / verifier sub-tasks</td><td><code>route(task, ...)</code></td></tr>
       <tr><td>visual</td><td>Multi-modal (image / PDF)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
       <tr><td>coding</td><td>Code-specialist generation</td><td><code>chat_completion(use_coding=True)</code></td></tr>
@@ -202,7 +201,7 @@
   verify payload exceeding Nova's <code>n_ctx</code>) and force every routed
   call onto the single main slot for 60&nbsp;s. Timeouts, connection errors and
   5xx stay node faults. Applied at all five pool branches
-  (worker/critic/coding/swarm/vision).</p>
+  (worker/critic/coding/vision; the swarm branch was removed 2026-10-30, §4SI).</p>
 
   <h2>HTTP client</h2>
   <p>One <code>httpx.AsyncClient</code> per node with:</p>
@@ -266,10 +265,10 @@
   <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>async chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, is_background, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)</code></td><td>Pool-aware dispatch. Falls back across nodes when a circuit is OPEN.</td></tr>
+      <tr><td><code>async chat_completion(payload, use_worker, use_vision, use_coding, use_critic, is_background, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)</code></td><td>Pool-aware dispatch. Falls back across nodes when a circuit is OPEN.</td></tr>
       <tr><td><code>async route(task, payload, max_tokens=128, temperature=0.0, fallback=None, timeout=None, total_budget=None)</code></td><td>Send a small classification / repair task to the worker pool with a low max_tokens to keep cost down. Bounded by <code>_ROUTE_TIMEOUT_S</code> (12&nbsp;s, raised from 8&nbsp;s 2026-07-14: a call that queued behind <em>two</em> others on the small-<code>-np</code> worker — e.g. VERIFY firing alongside the request-start burst — died at exactly 8&nbsp;s; 12&nbsp;s clears the double-queued ~2×5.3&nbsp;s case while still failing fast on a sick node). Callers with genuinely slow judged tasks override per-call via <code>timeout</code> — the <a href="verifier.html">verifier</a> passes its own 45&nbsp;s budget since 2026-07-16, because a 7–11&nbsp;s verdict under any node contention died at exactly the 12&nbsp;s routing ceiling. On timeout the caller gets its free <code>fallback</code>, never a main-model retry (<code>off_main_only=True</code>).</td></tr>
       <tr><td><code>async generate_image(payload)</code></td><td>POST to a node from the <code>image_gen</code> pool; returns base64 PNG.</td></tr>
-      <tr><td><code>get_*_node()</code></td><td>Round-robin selection helpers (swarm / worker / vision / coding / critic / image_gen).</td></tr>
+      <tr><td><code>get_*_node()</code></td><td>Round-robin selection helpers (worker / vision / coding / critic / image_gen).</td></tr>
       <tr><td><code>async close()</code></td><td>Closes all underlying httpx clients on lifespan shutdown.</td></tr>
     </tbody>
   </table></div>
@@ -393,7 +392,7 @@
   <ul>
     <li><strong>Inline self-stall (fixed):</strong> three calls awaited <em>inline by the user's own turn</em> carried <code>is_background=True</code> and parked in <code>_wait_for_foreground_clear</code> against their <em>own</em> still-active request — a deterministic stall up to the 600s ceiling that read as &ldquo;agent went silent&rdquo; on long-output turns. Fixed to foreground: the <a href="agent.html">Context Shield</a> summarizer (fires on any oversized non-exempt tool result), the <code>_prune_context</code> history condenser, and the <code>--perfect-it</code> inline optimization (its shared helper takes <code>foreground=</code>; the deferred internal-learning path keeps background priority).</li>
     <li><strong>Foreground learning work (fixed; reflection and post-mortems were later removed, 2026-10-11 §4NM):</strong> the reflection closures (<code>_critique_fn</code>, <code>_verify_plan_fn</code>) and post-mortem closures (<code>_analyze_fn</code>, <code>_patch_fn</code>) in <code>main.py</code> ran at foreground priority — contending with the user's next turn for the 35B slot and inflating <code>foreground_tasks</code> so the &ldquo;is a user live?&rdquo; checks misread an idle reflection as an active user. Now <code>is_background=True</code>; if a user turn is running, the Reflector's per-call timeout simply defers the trajectory to the idle backstop.</li>
-    <li><strong>Off-main skip (new):</strong> a background call that will be served by an existing off-main pool (<code>use_worker</code>/<code>use_critic</code>/<code>use_vision</code>/<code>use_swarm</code>/<code>use_coding</code> with a non-empty pool) skips the wait entirely — it never touches the main slot, so parking it was pure latency. The <code>use_coding</code> pool was added to this predicate <span class="tag">2026-07-22</span> (it had been the one off-main pool still misclassified as main-targeted). If every pool node fails, <code>_do_chat_completion</code> may still fall back to main: a rare, already-bounded edge, same as proceeding after the 600s ceiling.</li>
+    <li><strong>Off-main skip (new):</strong> a background call that will be served by an existing off-main pool (<code>use_worker</code>/<code>use_critic</code>/<code>use_vision</code>/<code>use_coding</code> with a non-empty pool) skips the wait entirely — it never touches the main slot, so parking it was pure latency. The <code>use_coding</code> pool was added to this predicate <span class="tag">2026-07-22</span> (it had been the one off-main pool still misclassified as main-targeted). If every pool node fails, <code>_do_chat_completion</code> may still fall back to main: a rare, already-bounded edge, same as proceeding after the 600s ceiling.</li>
   </ul>
   <p>Observability: a background caller parked <b>120s</b> behind an active request now logs one <code>BG Queue Wait</code> line, so the operator's stream shows the park instead of a silent multi-minute gap. Covered by the priority-routing section of <code>tests/test_foreground_yield.py</code>.</p>
 

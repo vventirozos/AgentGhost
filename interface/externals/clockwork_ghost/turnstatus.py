@@ -215,7 +215,6 @@ TICKER_VERBS = {
     "graph updated": "updating the knowledge graph",
     "system weather": "checking the weather",
     "vision": "looking at an image",
-    "delegate": "delegating a subtask",
 }
 
 # ── what a step means to the FACE (port of app.js, 2026-10-01) ──────────────
@@ -230,7 +229,7 @@ FACE_PHASE_BY_TITLE = {
     "memory recall": "search", "file read": "read",
     "sandbox tree": "read", "vision": "read", "sandbox exec": "tool",
     "execution task": "tool", "file write": "tool", "worker compute": "tool",
-    "delegate": "tool", "memory save": "tool", "graph updated": "tool",
+    "memory save": "tool", "graph updated": "tool",
     "verifier": "verify", "tool call": "tool",
 }
 _CONFIRMED_RE = re.compile(r"^\s*CONFIRMED", re.I)

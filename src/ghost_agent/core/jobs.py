@@ -4,9 +4,9 @@ Before this, the agent had three fire-and-forget mechanisms (swarm workers,
 scheduled tasks, self-play) and NO way to ask "what is running / did it
 finish / what did it say". Swarm results only surfaced if the model
 remembered to read a specific scratchpad key; task ids were returned but
-never queryable. This registry is the missing status surface, shared by
-``delegate_to_swarm`` and the tool-using sub-agent delegation
-(:mod:`core.subagent`).
+never queryable. This registry is the missing status surface. (Its first
+users — ``delegate_to_swarm`` and the ``delegate`` sub-agents — were removed
+2026-10-30, §4SI; promoted sandbox commands remain.)
 
 In-memory by design: jobs are per-process (their asyncio tasks die with the
 process), so persisting them would only ever resurrect zombies. Completed
@@ -38,7 +38,7 @@ MAX_RESULT_CHARS = 8000    # per-job result cap (context safety)
 @dataclass
 class Job:
     id: str
-    kind: str                       # "swarm" | "subagent" | …
+    kind: str                       # "sandbox" | …
     label: str
     status: str = STATUS_RUNNING
     created_at: float = field(default_factory=time.time)

@@ -16,6 +16,57 @@ _BROWSER_WRITTEN: set = set()
 _PROTECTED_IMAGE_NAME_RE = re.compile(r"^(?:gen_[0-9a-f]{8}|vision_[0-9a-f]{12})\.[A-Za-z]{3,4}$")
 
 
+#: §4SH: interact sub-actions that are not operations of their own — named as
+#: the operation, the call runs as interact (click/extract_text/screenshot ARE ops)
+_INTERACT_ONLY_ACTIONS = frozenset({"evaluate", "fill", "dblclick", "wait_for_selector", "sleep", "goto"})
+
+
+def _as_interact_actions(operation, actions, kwargs):
+    """The actions an interact-only action named as the operation runs with
+    (the one rule `run_action_as_interact` and `browser_effective_call` share)."""
+    _js = kwargs.get("js") or kwargs.get("expression") or kwargs.get("script")
+    if not actions and operation == "evaluate" and _js:
+        actions = [{"action": "evaluate", "js": _js}]
+    return actions if isinstance(actions, list) and actions else None
+
+
+def browser_effective_call(args) -> tuple:
+    """(operation, actions) as the browser tool RUNS a recorded call. r1
+    (§4SH review): `evaluate`/`fill`/`dblclick` sent as the operation run as
+    interact, but every check reading the call saw the model's name — a page
+    exercised that way stayed "never tested"."""
+    a = args if isinstance(args, dict) else {}
+    # r2: the tool's own aliases (browser.py's "hallucination healing")
+    op = str(a.get("operation") or a.get("op") or a.get("action") or "").strip().lower()
+    acts = a.get("actions") or a.get("steps") or a.get("sequence")
+    if op in _INTERACT_ONLY_ACTIONS:
+        ran = _as_interact_actions(op, acts, a)
+        if ran:
+            return "interact", [x for x in ran if isinstance(x, dict)]
+    return op, [x for x in (acts if isinstance(acts, list) else []) if isinstance(x, dict)]
+
+
+async def run_action_as_interact(tool_fn, call: dict, reject):
+    """§4SH (req cb27058e): `operation='evaluate'` with an `actions` list was
+    refused as unknown and booked a strike — the model meant interact. The
+    same call (`call` = the tool's locals at the check) runs as interact and
+    says the right form; with no actions and nothing to build one from, the
+    refusal shows that form."""
+    from .outcome import append_note
+    operation, actions, kwargs = call["operation"], call.get("actions"), dict(call.get("kwargs") or {})
+    actions = _as_interact_actions(operation, actions, kwargs)
+    form = f"{{\"operation\": \"interact\", \"url\": \"…\", \"actions\": [{{\"action\": \"{operation}\", …}}]}}"
+    if not actions:
+        return reject(f"'{operation}' is an ACTION inside interact, not an operation of its own. Send {form}.")
+    co = tool_fn.__code__
+    named = {k: v for k, v in call.items() if k in co.co_varnames[:co.co_argcount]}
+    rest = {k: v for k, v in kwargs.items()
+            if k not in ("op", "action", "js", "expression", "script", "steps", "sequence")}
+    res = await tool_fn(**{**named, "operation": "interact", "actions": actions}, **rest)
+    return append_note(res, f"\nNOTE: '{operation}' is an ACTION inside interact, not an operation — this call "
+                            f"ran as operation='interact' with your actions. Next time send {form}.")
+
+
 def _overwrite_refusal(host_path) -> str:
     """Why a screenshot must NOT be written over this existing file, or "".
     A screenshot is a PNG; an existing file that is not one (a user's

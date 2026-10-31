@@ -247,7 +247,7 @@ class TestOffMainOnlyNeverClaimsAMainFallback:
         from ghost_agent.core.llm import LLMClient
         src = inspect.getsource(LLMClient._do_chat_completion)
         lines = src.splitlines()
-        for label in ("Critic", "Coding", "Edge"):
+        for label in ("Critic", "Coding"):   # §4SI: "Edge" was the removed swarm pool
             idx = next(n for n, ln in enumerate(lines)
                        if f'"{label} Compute Failed"' in ln)
             # The gate sits immediately above the claim; a 700-char window
@@ -455,7 +455,7 @@ def test_require_healthy_and_the_fallback_flag_reach_EVERY_pool():
     import re
     src = inspect.getsource(LLMClient._do_chat_completion)
     for sel in ("get_vision_node", "get_worker_node", "get_critic_node",
-                "get_coding_node", "get_swarm_node"):
+                "get_coding_node"):   # §4SI: get_swarm_node removed with the swarm
         hits = [m.start() for m in re.finditer(re.escape(f"self.{sel}("), src)]
         assert len(hits) >= 3, (
             f"{sel} is called {len(hits)}x — the branch was restructured; "

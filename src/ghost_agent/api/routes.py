@@ -780,7 +780,7 @@ async def api_health(request: Request):
     # inference slot. Without this block there was NO WAY to confirm from
     # outside whether a configured node was actually wired — you'd have to
     # read the boot log. Empty pool = that work runs on the main model.
-    _pool_names = ("worker", "critic", "swarm", "coding", "vision", "image_gen")
+    _pool_names = ("worker", "critic", "coding", "vision", "image_gen")
     nodes = {}
     for _p in _pool_names:
         try:
