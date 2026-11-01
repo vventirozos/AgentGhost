@@ -164,5 +164,5 @@ class TestHydrationEndToEnd:
                   "how do quantum computers factor integers",
                   "recipe for chocolate chip cookies"):
             out = await env.bus.hydrate_context(q)
-            assert "Alekhine" not in out, f"off-topic {q!r} surfaced a golden fact"
+            assert "alekhine" not in str(out).lower(), f"off-topic {q!r} surfaced a golden fact"
             assert "EACCES" not in out, f"off-topic {q!r} surfaced a golden fact"

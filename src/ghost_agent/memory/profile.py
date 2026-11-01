@@ -1102,6 +1102,17 @@ class ProfileMemory:
         is never marked either — absent provenance is not evidence of age.
         """
         text = _derive(str(unwrap(item)))
+        # Retrieval review 2026-10-31: the age was derived only for a value
+        # that SAYS "born …" — `root.birthdate: 1980-01-29` and
+        # `wife_birthdate` were shown raw and "how old am I?" left the model
+        # to subtract (the design: it never does). A birth-date KEY's value
+        # gets the same gloss, the value itself unchanged.
+        _kl = str(key).strip().lower()
+        if (_kl in ("birthdate", "birthday", "dob", "date_of_birth") or _kl.endswith(("_birthdate", "_birthday"))) \
+                and "born" not in text.lower():
+            _g = _derive(f"born {text}")
+            if " → " in _g:
+                text = f"{text} → {_g.split(' → ', 1)[1]}"
         marker = cls._staleness_marker(key, stamp_of(item))
         return f"{text}{marker}"
 

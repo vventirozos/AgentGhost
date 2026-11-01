@@ -113,8 +113,8 @@ def test_note_turn_seconds_keeps_the_longest(env, req):
 def test_the_budget_line_says_no_limit(env):
     # world: the log reads "extendable to inf min"
     assert _span(math.inf) == "no limit"
-    assert "no time limit while code is being written" in client_deadline_line(3600, math.inf)
-    assert "extendable to 180 min" in client_deadline_line(3600, 10800)
+    assert client_deadline_line(3600, math.inf) == "60 min, 5 min kept for the reply; no limit while coding"
+    assert client_deadline_line(3600, 10800).endswith("; up to 180 min while coding")
 
 
 def _cli():

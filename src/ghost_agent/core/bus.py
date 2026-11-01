@@ -67,7 +67,6 @@ class MemoryBus:
         # hydration take the stash before the first turn's judge (staggered
         # up to 90 s) read it; 96 of 318 real turns had another hydrating
         # turn start inside that window
-        self._hydration_by_turn: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         # LRU of recently-published fact signatures, used by publish_fact to
         # short-circuit duplicate writes from looping callers.
         self._publish_lru: "OrderedDict[str, bool]" = OrderedDict()
@@ -337,8 +336,11 @@ class MemoryBus:
             await asyncio.to_thread(self._credit_surfaced, survivors)
         except Exception as e:
             logger.debug(f"MemoryBus surfaced-credit failed (non-critical): {e}")
-        # Stash this turn's injected items for the post-turn usefulness
-        # judge. Timestamped so a turn that dies before finalization can't
+        # Stash this turn's injected items for the lesson-outcome credit
+        # (`_surfaced_lesson_triggers` reads the skill survivors; the
+        # post-turn usefulness judge that also read it was removed in §4NM,
+        # and with it the per-turn `_hydration_by_turn` map — written every
+        # turn and read by nothing, retrieval review 2026-10-31). Timestamped so a turn that dies before finalization can't
         # leak stale survivors into the next turn's judgment, and stamped
         # with the turn id so an overlapping turn's judge (or a turn that
         # skipped hydration) can't consume another turn's stash and
@@ -348,10 +350,6 @@ class MemoryBus:
                 "intent": intent, "survivors": survivors, "ts": time.time(),
                 "turn_id": str(turn_id or ""),
             }
-            if turn_id:
-                self._hydration_by_turn[str(turn_id)] = self.last_hydration
-                while len(self._hydration_by_turn) > 32:
-                    self._hydration_by_turn.popitem(last=False)
         else:
             # Survivor-less hydration: clear only OUR OWN (or an unstamped)
             # stash. Blindly writing None here destroyed an overlapping

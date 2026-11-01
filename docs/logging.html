@@ -439,7 +439,7 @@
       <tr><td><code>Idle Scheduler</code> 🫀</td><td><code>Biological Daemon — Native asyncio watchdog started</code></td><td><code>started; jobs: &lt;list&gt;</code>, the list computed from <code>IDLE_SCHEDULER_JOBS</code> in <code>core/agent.py</code> and this boot's flags. With the production launcher: <code>memory-journal consolidation, maintenance, store-hygiene, workspace tidy, project autoadvance (autopilot projects only), self narrative, stale open questions, workspace narrative, failure replay + regression suite (when an owner failure or a due test exists)</code>.</td></tr>
       <tr><td><code>Idle Cycle</code> 📡</td><td>same tag</td><td>§4PQ: <code>idle Nm — ran &lt;job&gt; (&lt;what the job is for&gt;): &lt;what it did&gt; | …</code>, e.g. <code>idle 15m — ran tidy (deletes leftover screenshots and scratch files in project workspaces): nothing to remove in 3 project workspace(s)</code>; a job that raised ends <code>FAILED (see the warning above)</code>, and one marked failed by the rate-limited phase warning ends <code>had an error (see the log)</code>, followed by its outcome when it went on. The purposes are <code>IDLE_JOB_PURPOSE</code> in <code>core/agent.py</code>, keyed by the scheduler's job labels. The failure-replay slot's outcome is one of <code>nothing to do (no owner failure to replay, no test due)</code>, <code>skipped — a supervised run holds the slot</code>, or <code>stopped — the owner returned</code>. The slot is listed as <code>failure-replay</code>.</td></tr>
       <tr><td><code>Idle Maintenance</code> 💭</td><td><code>Biological Hook</code></td><td>What the maintenance pass did, in words: <code>N project activity digests written; N project file descriptions written; store backup taken (&lt;file&gt;) / no store backup this pass (one a day) / FAILED; memory graph cleaned: N stale links removed, N duplicate entities merged</code> (or <code>memory graph cleanup not due (every 6 h)</code> / <code>FAILED</code>), then the memory reconcile's repairs when it made any, led by <code>nothing needed — </code> when the pass changed nothing (§4PQ; it read <code>maintenance: project digests N, manifests N, snapshot yes/no, graph pruned N, graph merged N</code> until 2026-10-16).</td></tr>
-      <tr><td><code>Memory Journal</code></td><td><code>Hippocampus</code></td><td><code>Consolidated N memor(ies): …</code>; <code>owner returned — paused with N item(s) left</code> (was <code>User returned! Suspending…</code>); re-queue and drop warnings. The entry line <code>Waking up to process N buffered memories...</code> was removed.</td></tr>
+      <tr><td><code>Memory Journal</code></td><td><code>Hippocampus</code></td><td><code>read N memories (M without an owner fact cue, not read)</code> (§4SN 2026-10-31: was <code>consolidated N memories</code>, which also counted items that never reached the model); <code>worker node unavailable — kept N item(s) for the next idle window</code>; <code>extraction failed for N item(s) — dropped</code>; <code>owner returned — paused with N item(s) left</code> (was <code>User returned! Suspending…</code>); re-queue and drop warnings. The entry line <code>Waking up to process N buffered memories...</code> was removed.</td></tr>
       <tr><td><code>Maintenance Digests</code> · <code>Maintenance Manifest</code> · <code>Trajectory Archive</code></td><td><code>Dream Projects</code> · <code>Dream Manifest</code> · <code>Dream Mode</code></td><td>Lines from <code>core/dream.py</code>. Its return text no longer says <code>(no REM — …)</code>.</td></tr>
       <tr><td>logger <code>idle failure-replay slot: …</code></td><td><code>idle self-play: …</code></td><td>Cooldown skips and missed dice rolls (file log, DEBUG).</td></tr>
       <tr><td><code>Memory Bus Init</code> 🔀</td><td><code>Cognitive event bus initialized</code></td><td><code>prompt hydration from owner facts (graph) + lessons (skill); recall searches every store</code>.</td></tr>
@@ -463,7 +463,7 @@
     node", the evidence digest, "verdict deferred" (the verdict lands later as its own line), a committed reply stream,
     claim-binding shadow disagreements that changed nothing, the service supervisor's port/pid/workdir probes (8 "sandbox
     exec" lines per service restart), per-turn metacog readings at DEBUG, repeat "stale process" notices, and the memory
-    journal's digests (the stream shows "consolidated N memories", not the owner's conversation text).</li>
+    journal's digests (the stream shows "read N memories", not the owner's conversation text).</li>
     <li><strong>Lines about removed systems, reworded.</strong> idle cycle "ran self-play" → "failure-replay" (and a
     cooldown no longer reads "ran idle-window"); "LATE REFUTED … scrubbing this turn's lessons" → "late verdict REFUTED
     (90%) — reply already sent: &lt;full reason&gt;"; self-consistency "treatment … control" → "stopped after N of M
@@ -486,8 +486,8 @@
     <li><strong>Icons.</strong> A verdict line wears its verdict (✅ CONFIRMED, 📌 REFUTED, ❌ verifier error, 🔶 UNCERTAIN) instead of
     🧪 for everything; idle maintenance is 🌙 (💭 is live thinking); calibration 📐 (removed with the refit in &sect;4PJ); owner commands 📋; recovery plans 🔄.
     The web face and the ClockworkPi detect verdicts from any "verif…" title.</li>
-    <li><strong>Clearer content.</strong> "client deadline" says "time budget 30 min (the last 5 min are kept for the
-    final report)"; "upstream fatal" names the main model server and the task; the rule/test command line shows the
+    <li><strong>Clearer content.</strong> "client deadline" says "60 min, 5 min kept for the reply; no limit while
+    coding" (shortened 2026-10-31); "upstream fatal" names the main model server and the task; the rule/test command line shows the
     owner's command, not the model-facing note.</li>
     <li><strong>Loggers that reached nowhere.</strong> Six modules (audio and YouTube ingest, the YouTube canary,
     helpers, the edit ledger, the rubric grader) logged under their module name, which neither the stream nor the
@@ -525,7 +525,7 @@
   the ~24k-token head far slower; <code>prefix warmup slow</code> fired on every boot. The line still appears if the warmup
   takes longer than 5 minutes.</p>
   <!-- LOG-TITLES:BEGIN (generated by scripts/gen_log_titles.py — do not edit) -->
-  <h2 id="titles">Every log title <span class="tag">generated · 458 titles</span></h2>
+  <h2 id="titles">Every log title <span class="tag">generated · 459 titles</span></h2>
   <p>Each literal title the code can print, as it appears in the stream (lower-cased), with the icon(s) and level(s) its call sites use. Titles built at run time (e.g. <code>Verify depth</code>, <code>Recovery Plan #N</code>) are not listed. Regenerate with <code>python scripts/gen_log_titles.py</code>.</p>
   <div class="scroll"><table>
     <tr><th>Title</th><th>Icon</th><th>Level</th><th>Where</th></tr>
@@ -548,10 +548,10 @@
     <tr><td><code>bg queue wait</code></td><td>🌅 🔄 🔶</td><td>INFO, WARNING</td><td>core/llm.py</td></tr>
     <tr><td><code>blind regeneration</code></td><td>🛑</td><td>WARNING</td><td>core/agent.py</td></tr>
     <tr><td><code>blocked page</code></td><td>📌</td><td>INFO</td><td>core/agent.py</td></tr>
-    <tr><td><code>browser</code></td><td>🌎 🔶</td><td>INFO, WARNING</td><td>tools/browser.py</td></tr>
+    <tr><td><code>browser</code></td><td>🌎 🔶</td><td>INFO, WARNING</td><td>tools/browser.py, tools/browser_support.py</td></tr>
     <tr><td><code>browser failed</code></td><td>❌ 🌎</td><td>ERROR, WARNING</td><td>tools/browser.py, tools/browser_support.py</td></tr>
     <tr><td><code>browser note</code></td><td>🌎</td><td>INFO</td><td>tools/browser_support.py</td></tr>
-    <tr><td><code>browser retry</code></td><td>🔄</td><td>WARNING</td><td>tools/browser.py</td></tr>
+    <tr><td><code>browser retry</code></td><td>🔄</td><td>INFO, WARNING</td><td>tools/browser.py, tools/browser_support.py</td></tr>
     <tr><td><code>browser skipped</code></td><td>🌎</td><td>INFO</td><td>tools/browser.py</td></tr>
     <tr><td><code>checklist nudge</code></td><td>🔒</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>chunked read</code></td><td>📖</td><td>INFO</td><td>tools/file_system.py</td></tr>
@@ -864,6 +864,7 @@
     <tr><td><code>service kill</code></td><td>🔒</td><td>ERROR</td><td>sandbox/services.py</td></tr>
     <tr><td><code>service probe unclear</code></td><td>🔶</td><td>WARNING</td><td>sandbox/services.py</td></tr>
     <tr><td><code>service registry</code></td><td>📦</td><td>INFO</td><td>main.py</td></tr>
+    <tr><td><code>service replaced</code></td><td>🔄</td><td>INFO</td><td>sandbox/services.py</td></tr>
     <tr><td><code>service stop</code></td><td>❌</td><td>ERROR</td><td>sandbox/services.py</td></tr>
     <tr><td><code>sessions</code></td><td>📔</td><td>INFO</td><td>main.py</td></tr>
     <tr><td><code>sessions failed</code></td><td>🔶</td><td>WARNING</td><td>main.py</td></tr>

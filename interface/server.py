@@ -2203,7 +2203,8 @@ async def download_proxy(filename: str):
 
 @app.post("/api/stt", dependencies=[Depends(verify_interface_key)])
 async def stt_proxy(request: Request):
-    """Transcribe an uploaded voice clip on the local Gemma 4 audio node.
+    """Transcribe an uploaded voice clip on nova (whisper-server when
+    GHOST_STT_URL is set — §4SL — else the Gemma 4 audio node).
 
     Formerly a proxy to a Raspberry-Pi voice server that no longer exists;
     now ffmpeg transcode + nova (see interface/voice.py). The wire contract

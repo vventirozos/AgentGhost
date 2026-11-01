@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import json
 import logging
@@ -1282,7 +1283,7 @@ class VectorMemory:
             return 0
 
     def sync_owner_field(self, key: str, values, category: str = "root", retire_legacy: bool = False,
-                         legacy_values=()) -> tuple:
+                         legacy_values=(), as_of_by_value=None) -> tuple:
         """Make the profile's mirror rows (`identity`, text ``User <key> is
         <value>``) EQUAL ``values`` — the EXACT key, so `wife` never touches
         `wife_birthdate` (§4KZ: `smart_update` replaced the nearest row by
@@ -1314,7 +1315,11 @@ class VectorMemory:
         for v in want:
             if v in have:
                 continue
-            res = self.add(prefix + v, {"type": "identity", "timestamp": get_utc_timestamp()})
+            # stamped when the profile learned it (retrieval review 10-31)
+            _w = (as_of_by_value or {}).get(v.lower())
+            _ts = (datetime.datetime.fromtimestamp(float(_w), tz=datetime.timezone.utc)
+                   .isoformat().replace("+00:00", "Z")) if _w else get_utc_timestamp()
+            res = self.add(prefix + v, {"type": "identity", "timestamp": _ts})
             if res in self.ADD_REFUSALS:
                 raise MemoryWriteRefused(f"{prefix}{v}: {res}")
             if res in self.ADD_LANDED:
@@ -1636,7 +1641,10 @@ class VectorMemory:
             self._bump_retrieval_stats(uniq)
 
     def bump_helpful(self, ids: list):
-        """Usefulness credit from the post-turn hydration judge (MemoryBus).
+        """Usefulness credit (``helpful_count``). Its producer, the post-turn
+        hydration judge (MemoryBus), was removed in §4NM: nothing in src/
+        calls this now, and the counts already stored keep ranking as below
+        (retrieval review 2026-10-31).
 
         `bump_retrievals` credits SURFACING (the item entered the prompt);
         this credits USE (the reply actually drew on it) — the signal that

@@ -12,7 +12,10 @@ was previously invisible to the agent: nothing in the stack could read a
 ``.wav``/``.mp3`` at all. Transcription runs on nova's Gemma 4 E4B with an
 audio projector — the agent's own node over the tailnet, keyless, no
 internet egress — so ingesting a talk costs nothing but idle time on a node
-the agent already runs.
+the agent already runs. **§4SL (2026-10-31):** with ``GHOST_STT_URL`` set,
+windows go to whisper.cpp's ``whisper-server`` on nova instead (Gemma wrote
+Greek at 60.8 % WER, a third of it in Latin letters; Whisper 12.2 %); the
+Gemma notes below describe the path used when it is unset.
 
 **The breadcrumb is a TIMESTAMP RANGE.** PDF ingest uses TOC sections as the
 retrieval unit because that is a document's natural structure; audio has no
@@ -59,6 +62,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -76,6 +80,13 @@ logger = logging.getLogger("GhostAgent")   # §4NV: __name__ reached neither the
 # what stranded the previous (now-deleted) voice server.
 AUDIO_NODE_URL = os.environ.get("GHOST_AUDIO_NODE_URL", "http://100.83.184.117:8088")
 AUDIO_NODE_MODEL = os.environ.get("GHOST_AUDIO_NODE_MODEL", "gemma")
+# §4SL (2026-10-31): whisper.cpp `whisper-server` on nova. When set, every
+# window goes to `{STT_URL}/inference` and the Gemma chat path above is not
+# used (measured on nova: Greek WER 60.8 % on Gemma vs 12.2 % on Whisper
+# large-v3 q5_0 + tuned VAD, 9.1 s vs 3.4 s per clip). Whisper decodes long audio itself in 30 s
+# chunks, so no llama slot limits the window. Same variable as interface/voice.py.
+STT_URL = os.environ.get("GHOST_STT_URL", "").strip().rstrip("/")
+STT_LANGUAGE = os.environ.get("GHOST_STT_LANGUAGE", "").strip() or "auto"
 
 # The window must fit ONE llama-server slot: audio at ~25 tokens per second
 # (measured: a 720 s window = 18,068 prompt tokens), plus the transcript it
@@ -96,6 +107,15 @@ PROMPT_RESERVE_TOKENS = 512
 MIN_WINDOW_SECONDS = 60.0
 # Enough to carry a sentence across a seam without meaningful duplication.
 WINDOW_OVERLAP_SECONDS = env_positive("GHOST_AUDIO_WINDOW_OVERLAP_S", 15.0)
+# §4SL: whisper-server serves ONE request at a time, and push-to-talk shares
+# it — a 480 s window held it for ~1 min, longer than the uConsole's 60 s STT
+# wait. A 120 s window holds it ~30 s (large-v3 q5 on nova: a 30 s clip took
+# 7.3 s) and gets its own language detection, so a talk that switches between
+# Greek and English is not decoded in one language for 8 minutes; the 5 s seam
+# repeats ~4 % of the audio (60 s windows repeated ~9 % and doubled the log).
+if STT_URL:
+    WINDOW_SECONDS = env_positive("GHOST_STT_WINDOW_S", 120.0)
+    WINDOW_OVERLAP_SECONDS = env_positive("GHOST_STT_WINDOW_OVERLAP_S", 5.0)
 if WINDOW_OVERLAP_SECONDS >= WINDOW_SECONDS:
     # An overlap ≥ the window makes the step 1 s → 720 node calls per window.
     WINDOW_OVERLAP_SECONDS = WINDOW_SECONDS / 4.0
@@ -110,6 +130,10 @@ WINDOW_MAX_TOKENS = int(env_positive("GHOST_AUDIO_MAX_TOKENS", 8192))
 # timeout — a starved node that accepts TCP and never answers must not cost
 # the whole read budget just to be diagnosed as down.
 WINDOW_TIMEOUT_S = env_positive("GHOST_AUDIO_TIMEOUT_S", 900.0)
+# §4SL: a 120 s whisper window takes ~30 s; 900 s per window let a server that
+# accepts and never answers hold an ingest ~90 min before the 3-failure abort.
+if STT_URL:
+    WINDOW_TIMEOUT_S = env_positive("GHOST_STT_WINDOW_TIMEOUT_S", 180.0)
 CONNECT_TIMEOUT_S = env_positive("GHOST_AUDIO_CONNECT_TIMEOUT_S", 10.0)
 # ffmpeg cuts a window in seconds; it used to borrow the 900 s network budget.
 CUT_TIMEOUT_S = env_positive("GHOST_AUDIO_CUT_TIMEOUT_S", 180.0)
@@ -333,6 +357,39 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
         raise TransientNodeError("audio node returned a non-JSON body") from exc
 
 
+def _backend_name() -> str:
+    """What failure messages call the transcription backend."""
+    return "whisper server" if STT_URL else "audio node"
+
+
+def _post_inference(url: str, payload: dict, timeout: float) -> dict:
+    """§4SL: POST one WAV window to whisper-server as multipart.
+
+    ``payload`` is ``{"wav": bytes, "fields": {...}}`` — the same
+    ``(url, payload, timeout)`` shape as :func:`_post_json`, so ``post_fn``
+    injection works for both backends. Transport faults and 429/5xx are
+    TRANSIENT (one retry per window), like the chat path."""
+    import httpx
+
+    limits = httpx.Timeout(connect=CONNECT_TIMEOUT_S, read=timeout, write=60.0, pool=CONNECT_TIMEOUT_S)
+    try:
+        with httpx.Client(timeout=limits) as client:
+            resp = client.post(url, files={"file": ("window.wav", payload["wav"], "audio/wav")},
+                               data=payload.get("fields") or {})
+    except httpx.TransportError as exc:
+        raise TransientNodeError(f"whisper server unreachable: {type(exc).__name__}: {exc}") from exc
+    if resp.status_code in (429, 500, 502, 503, 504):
+        raise TransientNodeError(
+            f"whisper server returned HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"whisper server returned HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise TransientNodeError("whisper server returned a non-JSON body") from exc
+
+
 def node_slot_ctx() -> Optional[int]:
     """The audio node's per-slot context in tokens (llama-server ``/props``
     ``default_generation_settings.n_ctx``), or None when it cannot be read."""
@@ -428,6 +485,8 @@ def transcribe_window_full(wav_bytes: bytes, *, post_fn: Optional[Callable] = No
     any reason other than the end of the transcript (``finish_reason`` not
     ``stop``). ``post_fn`` is injectable so tests never touch the network.
     """
+    if STT_URL:
+        return _transcribe_window_whisper(wav_bytes, post_fn=post_fn)
     post = post_fn or _post_json
     data = post(f"{AUDIO_NODE_URL}/v1/chat/completions", build_payload(wav_bytes), WINDOW_TIMEOUT_S)
     try:
@@ -452,6 +511,39 @@ def transcribe_window_full(wav_bytes: bytes, *, post_fn: Optional[Callable] = No
     if is_sentinel:
         return "", False
     return speech, truncated
+
+
+#: a bracketed tag whisper emits for non-speech ([BLANK_AUDIO], (music), [Μουσική])
+_WHISPER_TAG = re.compile(r"[\[(][^\])]{0,40}[\])]")
+
+
+def whisper_reply_is_silence(text: str) -> bool:
+    """§4SL: True when a whisper reply carries no word outside its tags."""
+    return not re.search(r"\w", _WHISPER_TAG.sub(" ", str(text or "")))
+
+
+def _transcribe_window_whisper(wav_bytes: bytes, *, post_fn: Optional[Callable] = None) -> Tuple[str, bool]:
+    """§4SL: one window through whisper-server. Whisper has no token budget
+    to exhaust, so a window is never TRUNCATED; ``{"error": …}`` in a 200
+    body is a failure (a gap), never silence."""
+    post = post_fn or _post_inference
+    data = post(f"{STT_URL}/inference",
+                {"wav": wav_bytes,
+                 "fields": {"response_format": "json", "temperature": "0.0", "language": STT_LANGUAGE}},
+                WINDOW_TIMEOUT_S)
+    if not isinstance(data, dict):
+        raise RuntimeError("malformed response from the whisper server: not a JSON object")
+    if data.get("error"):
+        raise RuntimeError(f"whisper server error: {str(data['error'])[:200]}")
+    # segment line breaks → spaces; the chunker re-splits by sentence anyway
+    text = " ".join(str(data.get("text") or "").split())
+    # Whisper's tags are not the Gemma sentinels: "(Music) Thanks everyone
+    # for coming." is speech after a tag and is kept whole; only a reply with
+    # no word outside its tags ("[BLANK_AUDIO]", "♪", " .") is silence. Same
+    # rule as interface/voice.py, so the mic and ingest agree.
+    if whisper_reply_is_silence(text):
+        return "", False
+    return text, False
 
 
 def transcribe_window(wav_bytes: bytes, *, post_fn: Optional[Callable] = None) -> str:
@@ -511,7 +603,8 @@ def iter_audio_chunks(
 
     # §4RR: fit the window to the slot of the node the windows go to. An
     # injected ``post_fn`` is not that node, so it is only sized on request.
-    if slot_ctx_fn is None and post_fn is None:
+    # §4SL: whisper is not a llama slot — nothing to fit (and its server has no /props)
+    if slot_ctx_fn is None and post_fn is None and not STT_URL:
         slot_ctx_fn = node_slot_ctx
     if slot_ctx_fn is not None:
         fitted = fit_window_seconds(window_seconds, slot_ctx_fn())
@@ -587,8 +680,8 @@ def iter_audio_chunks(
                 # answering (transient faults) or one whose output was unusable
                 # (an exhausted token budget / repetition loop, not retried)
                 _stop(f"{consecutive} consecutive windows failed (last: {cause[:120]}) — "
-                      + ("the audio node is not answering" if last_transient
-                         else "the audio node returned unusable output"))
+                      + (f"the {_backend_name()} is not answering" if last_transient
+                         else f"the {_backend_name()} returned unusable output"))
                 break
             continue
 
@@ -663,7 +756,7 @@ def ingest_audio_streaming(
         logger.info("audio ingest %s: waiting for the running transcription to finish", filename)
         if not _INGEST_LOCK.acquire(timeout=LOCK_WAIT_S):
             raise RuntimeError(
-                f"another transcription has held the audio node for over "
+                f"another transcription has held the {_backend_name()} for over "
                 f"{format_timestamp(LOCK_WAIT_S)}; nothing was stored for '{filename}' — "
                 f"try again when it finishes.")
     try:

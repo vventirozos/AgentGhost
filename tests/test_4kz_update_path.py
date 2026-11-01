@@ -283,7 +283,7 @@ def test_owner_facts_newest_first_with_dates(tmp_path):
         c.execute("UPDATE triplets SET timestamp='2026-08-05 00:00:00'")
     g.add_triplets([{"subject": "user", "predicate": "HAS_ADDRESS", "object": "thrakomakedones"}])
     out = g.owner_facts_matching("where do I live, my home address")
-    assert "Thrakomakedones" in out[0] and "(as of" in out[0]
+    assert "thrakomakedones" in out[0] and "(as of" in out[0]
 
 
 @pytest.mark.parametrize("q", ["who is my wife", "my sons birthdays"])
@@ -300,7 +300,7 @@ def test_hydration_carries_owner_facts_by_kind(tmp_path):
     g = GraphMemory(tmp_path)
     g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "thrakomakedones"}])
     items = asyncio.run(MemoryBus(graph_memory=g)._fetch_graph("where do I live?"))
-    assert any("Thrakomakedones" in i["text"] for i in items)
+    assert any("thrakomakedones" in i["text"] for i in items)
 
 
 

@@ -581,6 +581,34 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
   which is accurate.</p>
   <p>Pins: <code>tests/test_4rx_browser_reliability.py</code> (46), <code>tests/test_blocked_pages_are_not_strikes.py</code>,
   <code>tests/test_browser_tor_diagnostics.py</code>.</p>
+
+  <h2 id="4sk">Launch race: the runner waits for the previous Chromium; a selector's attribute values <span class="tag">2026-10-31 &sect;4SK</span></h2>
+  <p><strong>Launch race.</strong> 34 retries since 10-09, all 34 recovered — the model never saw the error. 27 came within 10 s of the previous launch:
+  the shared profile was still held by the Chromium of the call before (the <code>screenshot</code> + <code>interact</code> pair the model issues in one turn hit it
+  every time). The runner now waits, right before <code>launch_persistent_context</code>, until no process carries
+  <code>--user-data-dir=&lt;profile&gt;</code> (<code>/proc</code> scan, 6 × 0.5 s, nothing where there is no /proc), and reports the wait as
+  <code>profile_settle_s</code>; the host logs it once, as information. The retry line is INFO and carries the runner's own text (7 of the 34 came 16 s to 15 min
+  after any browser activity — a second cause the "still tearing down" explanation does not cover; the text is what will name it); WARNING only when the retry fails too.</p>
+  <p><strong>Attribute values.</strong> <code>_require_selector</code>'s "did not match" error listed buttons, links and inputs — on the webOS page the dock items are
+  divs with listeners, so it listed the open windows' controls and the model blamed timing for its <code>data-app="calculator"</code> (the page says <code>calc</code>):
+  two interact turns. When the selector tests an attribute and no element has that value, the error now says
+  <code>no element has data-app="calculator"; data-app values on the page: finder, terminal, notes, calc, …</code> (<code>_attribute_hint</code>; id/class/style excluded;
+  nothing is said when the value exists).</p>
+  <p><strong>Fresh-eye review (round 2), checked in the sandbox's Chromium.</strong> The hint now asks the page about the attribute test as written
+  (<code>root.querySelector(test)</code>, operators kept) in the document and every open shadow root, and names a test only when it matches nothing:
+  <code>no element matches [data-app="calculator"]; data-app values on the page: …</code>. The 24-value list had named a matching <code>item-30</code>, and a dropped
+  <code>~=</code>/<code>^=</code> had named matching tests as the cause; a shadow-DOM attribute read as absent. Tests inside <code>:not(…)</code> and non-CSS engines
+  (<code>text=</code>, <code>xpath=</code>, <code>//</code>) say nothing; an escaped quote and the <code>i</code>/<code>s</code> flag parse; at most 3 evaluates; a list
+  past 24 ends with "…", a value past 60 characters is marked "(cut)". The profile scan matches the whole <code>--user-data-dir=</code> argument (NUL-terminated) and skips its
+  parent shell as well as itself.</p>
+  <p><strong>Round 3.</strong> A selector is read per <code>&gt;&gt;</code> part: engine parts (<code>text=</code>, <code>nth=</code>, <code>internal:role=</code> …)
+  are dropped; <code>:not()</code> and the text pseudo-classes (<code>:has-text()</code>, <code>:text()</code>, <code>:text-is()</code>, <code>:text-matches()</code>) are
+  removed with their balanced, quote-aware arguments at any depth (<code>a:has-text("[Edit]")</code> had blamed an <code>Edit</code> attribute). Past the
+  20&nbsp;000-element scan the hint never claims an attribute is absent.</p>
+  <p><strong>Round 4.</strong> The attribute tests are read in ONE quote-aware pass (<code>_attr_tests</code>): <code>&gt;&gt;</code> splits only outside quotes,
+  engine parts are skipped, <code>:not()</code>/text pseudo-classes are skipped with balanced arguments, and every <code>[…]</code> outside quotes is a candidate.
+  The round-2/3 regex layers each let a quoted value leak into the structure (<code>[aria-label="Next &gt;&gt;"]</code> was cut at its <code>&gt;&gt;</code>).</p>
+  <p>Pins: <code>tests/test_4sk_webos_request_defects.py</code>.</p>
 </main>
   <h2 id="4pc-review">Fresh-eye review: the browser and the search→page hand-off <span class="tag">2026-10-14 &sect;4PC</span></h2>
   <p>Three independent read-only reviewers (tool, hand-off + loop, runner + sandbox) and a two-week corpus lens. The corpus number that framed the review: of 137 pages that answered 404, <strong>121 (88 %) were addresses the model composed</strong> — a path it assembled on a host it had seen — against 16 it had been given; a composed path on a known host 404s 37 % of the time, a given URL 4 %. After a 404 the same host was re-hit 199 times in the same request. Scope, threat model and the probe-vs-live correction are in the journal.</p>

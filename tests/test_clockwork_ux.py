@@ -1450,7 +1450,8 @@ def test_deploy_ships_every_module_the_client_imports():
     assert all((_DIR / m).exists() for m in shipped), "deploy.sh lists a file that does not exist"
 
 
-def _deploy(tmp_path, probe_rc=0, compile_rc=0, pids="4242 4242", crash_line="", old_backups=0):
+def _deploy(tmp_path, probe_rc=0, compile_rc=0, pids="4242 4242", crash_line="", old_backups=0,
+            static=None):
     """Run the REAL deploy.sh end to end against a fake device.
 
     `ssh` is replaced by a stub that runs the remote command LOCALLY, with
@@ -1480,7 +1481,8 @@ def _deploy(tmp_path, probe_rc=0, compile_rc=0, pids="4242 4242", crash_line="",
     tree = tmp_path / "repo" / "interface" / "externals" / "clockwork_ghost"
     (tree / "webface").mkdir(parents=True)
     (tmp_path / "repo" / "interface" / "static").mkdir(parents=True)
-    (tmp_path / "repo" / "interface" / "static" / "matrix_graph.js").write_text("// canonical\n")
+    for name, text in (static or {"matrix_graph.js": "// canonical\n"}).items():
+        (tmp_path / "repo" / "interface" / "static" / name).write_text(text)
     deploy = (_DIR / "deploy.sh").read_text()
     assert deploy.count("STAGE=/home/vasilis/bin/.stage") == 1
     (tree / "deploy.sh").write_text(
@@ -1538,6 +1540,43 @@ set -- {pids}; shift $n; echo "$1"
     def read(name):
         return (rec / name).read_text() if (rec / name).exists() else ""
     return proc, home, read
+
+
+def test_deploy_ships_the_modules_the_face_imports(tmp_path):
+    """2026-10-31: matrix_graph.js gained `import … from './temperament.js?v=1.3'`
+    (§4SG) and deploy.sh copied only matrix_graph.js — the device's face died
+    on a failed dynamic import, on a black background. Every ./sibling.js the
+    face imports is shipped, followed transitively; three/addons are not."""
+    proc, home, read = _deploy(tmp_path, static={
+        "matrix_graph.js": "import * as THREE from 'three';\n"
+                           "import { createTemperament } from './temperament.js?v=1.3';\n"
+                           "import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';\n",
+        "temperament.js": 'import { x } from "./mood.js";\n// temperament\n',
+        "mood.js": "import { y } from './temperament.js';\n// mood\n",   # a cycle ends
+        "unrelated.js": "// not imported\n",
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    face = home / "bin" / "webface"
+    assert (face / "temperament.js").read_text().endswith("// temperament\n")
+    assert (face / "mood.js").read_text().endswith("// mood\n")
+    assert not (face / "unrelated.js").exists()
+    assert proc.stdout.count("+ temperament.js") == 1 and proc.stdout.count("+ mood.js") == 1
+
+
+def test_deploy_stops_before_the_device_when_a_face_import_is_missing(tmp_path):
+    proc, home, read = _deploy(tmp_path, static={
+        "matrix_graph.js": "import { createTemperament } from './temperament.js?v=1.3';\n"})
+    assert proc.returncode != 0
+    assert read("ssh") == "" and read("scp") == "", "reached the device"
+    assert (home / "bin" / "client.py").read_text() == "OLD BUILD\n"
+
+
+def test_the_real_face_imports_exist_in_static():
+    """The canonical face's sibling imports are files in interface/static."""
+    static = _ROOT / "interface" / "static"
+    deps = re.findall(r"""from +['"]\./([A-Za-z0-9_.-]+\.js)""", (static / "matrix_graph.js").read_text())
+    assert "temperament.js" in deps
+    assert all((static / d).exists() for d in deps)
 
 
 def test_a_deploy_stages_probes_installs_and_restarts(tmp_path):

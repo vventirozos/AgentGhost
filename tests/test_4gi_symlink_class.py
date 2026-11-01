@@ -336,6 +336,13 @@ TREE_OP_ALLOWLIST = {
         "sweep_own_forks globs /tmp for THIS pid's fork stamps and reads the "
         "stamp only to compare a pid; a planted stamp yields a mismatch and "
         "is skipped, and `shutil.rmtree` refuses a symlinked directory",
+    # §4SK: the browser runner, INSIDE the container, lists /proc and reads
+    # /proc/<pid>/cmdline for a substring (the profile path) — a kernel tree,
+    # not model-writable, and the read decides only how long to wait
+    ("src/ghost_agent/tools/browser_runner.py", "walk-read"):
+        "_profile_holders scans /proc/*/cmdline in the sandbox for the Chromium holding the "
+        "shared profile; /proc is kernel-provided, never model-writable, and the bytes read only "
+        "answer a substring test that bounds a wait",
 }
 
 #: REAL offences this round did not own (§4GJ round 3 fixed file_system,

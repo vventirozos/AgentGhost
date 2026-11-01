@@ -315,7 +315,7 @@ def test_the_client_deadline_line_states_the_real_reserve(secs, budget, reserve)
     """Fails where every budget printed "the last 5 min are kept" (the
     reserve is capped at a quarter of the budget)."""
     from ghost_agent.core.agent import client_deadline_line
-    assert client_deadline_line(secs) == f"time budget {budget} (the last {reserve} are kept for the final report)"
+    assert client_deadline_line(secs) == f"{budget}, {reserve} kept for the reply"
 
 
 def test_lines_that_must_stay_visible_and_say_what_they_mean():

@@ -112,6 +112,17 @@
   design — a request to remember is an instruction); the contrived "Imagine my surprise, we just moved to Patras" is
   dropped as role-play; "by the way do you remember …" states (the lead-in list is fixed); a role-play cue anywhere
   still empties the turn (§4KZ). The r4 102-sentence probe went 35 → 9 (r4 patch) → 2 wrong (§4QN).</p>
+  <h2 id="4sn">Corrections, cessation and the newest message (2026-10-31, §4SN)</h2>
+  <ul>
+    <li><code>field_kind(category, key)</code> returns the single-valued kind a profile field holds (<code>LIVES_IN</code> for location/address, <code>MARRIED_TO</code>, <code>HAS_PROFESSION</code> …), or "" for a field with no kind (vehicles, a pet). <code>predicate_kind(p)</code> returns the kind an extractor predicate states (<code>IS_A</code> → <code>HAS_PROFESSION</code>; <code>TRAVELING_TO</code> and <code>SELLING</code> → none).</li>
+    <li><strong><code>_apply_owner_corrections</code> (core/agent.py):</strong> the graph leg already honoured the predicate, but the profile leg deleted <em>any</em> field whose value matched. A negated statement now removes only a field of the same kind. "I'm not a doctor" still removes <code>root.role</code> = doctor. A field with no kind is removed only by a <em>removal</em>.</li>
+    <li><strong>A removal</strong> is a removal triplet the owner stated affirmatively ("we sold the BMW", "I gave away the BMW"). "I never sold the BMW" and "I'm not selling the BMW after all" are not removals. A negated statement of a kinded fact still corrects that kind ("I don't live in Patras anymore" removes <code>root.location</code> Patras, not <code>root.birthplace</code> Patras).</li>
+    <li><strong>Built and removed: a "stopped" rule.</strong> Rounds 1–3 tried a rule that read "I don't have the BMW anymore" as a removal of a possession. Every round found it deleting the wrong fact: a cessation about the son or wife, the reason half of a sentence ("…because I have the BMW", "…since we moved to Athens"), the wife's own fields. It is gone. A possession leaves the profile by a removal or the owner's <code>forget</code>, never by a negation. Do not rebuild it.</li>
+    <li><strong>A reason is its own clause.</strong> <code>_CLAUSE_SPLIT</code> also splits at because, since, γιατί, επειδή and αφού, so "I don't live in Patras anymore since we moved to Athens" negates Patras, not Athens.</li>
+    <li><strong><code>field_subject(category, key)</code></strong> says who a field is about beyond the owner (spouse, pet, child, parent, sibling, other: office, school, friend …). <code>field_kind</code> gives such a field no owner kind (review r2: <code>wife_employer</code> read as WORKS_AT, every <code>*_name</code> as HAS_NAME), except a spouse's name (MARRIED_TO). A field whose words name two kinds (<code>work_location</code>) has none.</li>
+    <li><code>latest_owner_episode(episode)</code> returns the episode cut to its last <code>USER:</code> message plus its continuation lines. A legacy item without speaker marks comes back unchanged; one whose last owner message carries another person's label comes back as "".</li>
+  </ul>
+
 </main>
 </body>
 </html>

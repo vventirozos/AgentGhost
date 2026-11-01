@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { createTemperament } from './temperament.js?v=1.3';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -446,6 +447,24 @@ let gazeX = 0.0, gazeY = 0.0, targetGazeX = 0.0, targetGazeY = 0.0;
 let errorKind = null, errorKindEnv = 0.0;
 let idleTwitch = 0.0, idleTwitchNode = -1, idleTwitchAt = 0.0;
 let twitchAmp = 0.0;         // rendered twitch: eased attack, not a pop
+// The inner state (temperament.js, 2026-10-30): events nudge its drives
+// and every kick below is scaled by the gain it returns; `animate` reads
+// its outputs (`TS`) once per frame. Rollback: interface/face_backups/.
+// Its clock is FRAME-INTEGRATED (deterministic under the node harness,
+// which seeds Math.random) and re-syncs FORWARD to the wall clock only
+// when the tab was paused — so a real absence still reads as one.
+let _temperNow = Date.now();
+function _readIntensity() {
+    try { const v = parseFloat(localStorage.getItem('ghost_face_intensity')); return isFinite(v) ? v : null; }
+    catch (e) { return null; }
+}
+const temper = createTemperament({ seed: Math.floor(Math.random() * 4294967296), now: _temperNow,
+                                    intensity: _readIntensity() });
+// The body offsets applied to the scene LAST frame — taken back off before
+// the per-form code reads scene.rotation/position (some forms keep the
+// current value as their target), then re-applied after the blend.
+const _bodyPrev = { rx: 0, ry: 0, rz: 0, px: 0, py: 0, s: 1 };
+let TS = temper.step(0, _temperNow);
 
 // ── Tunables ───────────────────────────────────────────────────────
 // Every amplitude the signal layer uses, in one table (the face lab
@@ -1291,8 +1310,10 @@ export function setForm(name) {
     if (scene && camera) {
         const F = _sceneFrom;
         F.on = true;
-        F.rx = scene.rotation.x; F.ry = scene.rotation.y; F.rz = scene.rotation.z;
-        F.px = scene.position.x; F.py = scene.position.y; F.s = scene.scale.x;
+        // without the temperament's body: it is re-applied on top of the blend
+        const B = _bodyPrev;
+        F.rx = scene.rotation.x - B.rx; F.ry = scene.rotation.y - B.ry; F.rz = scene.rotation.z - B.rz;
+        F.px = scene.position.x - B.px; F.py = scene.position.y - B.py; F.s = scene.scale.x / B.s;
         F.camZ = camera.position.z;
         F.lx = _lookNow.x; F.ly = _lookNow.y; F.lz = _lookNow.z;
     }
@@ -1315,14 +1336,14 @@ export function setPhase(name) {
 
 // One discrete kick per tool invocation.
 export function noteToolCall() {
-    toolPulse = Math.min(1.0, toolPulse + 0.6);
+    toolPulse = Math.min(1.0, toolPulse + 0.6 * temper.event('tool'));
     return toolPulse;
 }
 
 // A memory / knowledge-base hit: a comet from the periphery ignites one
 // node. Cross-form.
 export function noteRecall() {
-    recallSpark = 1.0;
+    recallSpark = Math.min(1.0, 0.45 + 0.45 * temper.event('recall'));
     recallNode = Math.floor(Math.random() * NODE_COUNT);
     const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
     recallDir = [Math.sin(ph) * Math.cos(th), Math.cos(ph), Math.sin(ph) * Math.sin(th)];
@@ -1333,8 +1354,9 @@ export function noteRecall() {
 // 'refute' shudders and re-weaves, anything else exhales.
 export function noteVerdict(kind) {
     verdict = kind === 'pass' || kind === 'refute' ? kind : 'stop';
-    verdictEnv = 1.0;
-    if (verdict === 'refute') flinch = Math.min(1.0, flinch + 0.5);
+    const _g = temper.event('verdict:' + verdict);
+    verdictEnv = Math.min(1.0, 0.6 + 0.4 * _g);
+    if (verdict === 'refute') flinch = Math.min(1.0, flinch + 0.5 * _g);
     return verdict;
 }
 
@@ -1667,7 +1689,7 @@ function _installParallaxListeners() {
 // BLENDS into the accent tint over time — a slow mood shift, never a
 // flash cut.
 export function noteActivity(weight, color) {
-    const w = Math.max(0, Math.min(1, weight || 0.15));
+    const w = Math.max(0, Math.min(1, (weight || 0.15) * temper.event('activity')));
     activityTarget = Math.min(1.0, activityTarget + w);
     if (color) {
         try {
@@ -1694,7 +1716,8 @@ export function noteError(kind) {
     // Recoil: the body flinches — one sharp agitated pulse cycle — in
     // addition to the hot tint. Motion + color together read as a
     // startle response rather than a rendering glitch.
-    flinch = Math.min(1.0, flinch + 0.8);
+    const _g = temper.event('error');
+    flinch = Math.min(1.0, flinch + 0.8 * Math.min(1.25, _g));
     activityTarget = Math.min(1.0, activityTarget + 0.3);
     if (_spikeClearTimeout) clearTimeout(_spikeClearTimeout);
     _spikeClearTimeout = setTimeout(() => {
@@ -1718,6 +1741,16 @@ export function setAudioLevel(level) {
     audioLevel += (clamped - audioLevel) * 0.35;
 }
 
+// Richer signals (2026-10-30): every live log line (its icons say the
+// work kind and the outcome) and every streamed reply chunk (the token
+// rate, and whether the model is inside <think>) feed the temperament.
+export function noteLogLine(content, isError) { return temper.ingestLog(content, isError); }
+export function noteStreamChunk(text) {
+    temper.ingestChunk(text);
+    activityTarget = Math.min(1.0, activityTarget + 0.012);
+}
+export function getTemperament() { return { out: { ...TS }, ...temper.debug() }; }
+
 // Introspection for headless verification / tuning — never used by the
 // render path itself.
 export function getDebugState() {
@@ -1734,7 +1767,7 @@ export function getDebugState() {
         vortexTravel,
         tunnelFlow,
         phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
-        backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv,
+        backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv, body: { ..._bodyPrev },
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
         dtF, clock: time, cubeRunnerFlow, cube2Flow, cube2Travel, twitchAmp,
         vortexSpin, linkBudget: _linkBudget, maxLines: MAX_LINES,
@@ -1749,6 +1782,8 @@ export function getDebugState() {
 // goes in flight, false when the reply completes/aborts. Ambient
 // activity must never call this (that's what setWorkingState is for).
 export function setUserTurn(isActive) {
+    const _was = targetUserTurnState > 0.5;
+    if (isActive !== _was) temper.event(isActive ? 'turn:start' : 'turn:end');
     targetUserTurnState = isActive ? 1.0 : 0.0;
 }
 
@@ -1971,6 +2006,10 @@ function _emitCube2Edges(pos, uv, hue, fade, connected, lineIdx) {
 
 // ── Scene/camera form-switch blend helpers (§4PR) ──────────────────
 function _smooth01(x) { return x * x * (3.0 - 2.0 * x); }
+// The temperament's clock and amplitude multipliers; reduced motion
+// keeps the old fixed behaviour (no extra speed-ups or swells).
+function _tsSpeed() { return PREFERS_REDUCED_MOTION ? 1.0 : TS.speedMul; }
+function _tsAmp() { return PREFERS_REDUCED_MOTION ? 1.0 : TS.ampMul; }
 // This frame's steady look target (the form branches call it).
 function _lookTarget(x, y, z) { _sceneT.lx = x; _sceneT.ly = y; _sceneT.lz = z; }
 // Write the scene transform + camera z / look target: the steady targets
@@ -2109,6 +2148,12 @@ function animate(ts) {
     // called (TTS queue drained), the residual level dies out fast.
     audioLevel *= decay(0.92);
 
+    // ── Temperament (2026-10-30): one step per frame ───────────────
+    _temperNow += dtF * (1000 / 60);
+    if (Date.now() - _temperNow > 5000) _temperNow = Date.now();
+    TS = temper.step(dtF / 60, _temperNow);
+    if (TS.startleKick > 0) flinch = Math.min(1.0, flinch + 0.45 * TS.startleKick);
+
     // ── Signal-layer envelopes (2026-09-11) ─────────────────────────
     for (const k of PHASES) gait[k] += ((phase === k ? 1 : 0) - gait[k]) * ease(0.04);
     toolPulse *= decay(0.93);
@@ -2118,9 +2163,9 @@ function animate(ts) {
     verdictEnv *= decay(verdict === 'pass' ? TUNE.passHold : 0.975);   // pass holds ~2s, others ~1s
     if (verdictEnv < 0.01) { verdictEnv = 0; verdict = null; }
     backgroundBusy += (targetBackgroundBusy - backgroundBusy) * ease(0.01);
-    moodHue += (targetMoodHue - moodHue) * ease(0.0008);     // ~1 min to settle
-    gazeX += (targetGazeX - gazeX) * ease(0.03);
-    gazeY += (targetGazeY - gazeY) * ease(0.03);
+    moodHue += (targetMoodHue + TS.hueShift - moodHue) * ease(0.0008);     // ~1 min to settle
+    gazeX += (targetGazeX + TS.gazeX - gazeX) * ease(0.03);
+    gazeY += (targetGazeY + TS.gazeY - gazeY) * ease(0.03);
     errorKindEnv *= decay(0.985);
     if (errorKindEnv < 0.01) { errorKindEnv = 0; errorKind = null; }
     sweepAngle += (dtF / 60) * TUNE.sweepSpeed * gait.search;
@@ -2135,7 +2180,8 @@ function animate(ts) {
     const still = Math.min(1.0, Math.max(
         verdict === 'pass' ? TUNE.stillPass * verdictEnv : 0,
         errorKind === 'refusal' ? 0.9 * errorKindEnv : 0,
-        TUNE.stillVerify * gait.verify, TUNE.stillRead * gait.read));
+        TUNE.stillVerify * gait.verify, TUNE.stillRead * gait.read,
+        PREFERS_REDUCED_MOTION ? 0 : TS.stillness));
     const motionMul = 1.0 - still;
 
     // Immersion follows the USER-TURN state with a slower, asymmetric
@@ -2235,7 +2281,7 @@ function animate(ts) {
     // tStep is THIS frame's advance of the shared clock; the per-form
     // integrated phases below (runner flow, cube churn/spin) step by it
     // so they stay locked to `time` at constant rate.
-    const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF;
+    const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF * _tsSpeed();
     time += tStep;
 
     // Idle breathing: ±1% scene-scale sine at ~0.1Hz. Below the
@@ -2247,7 +2293,8 @@ function animate(ts) {
     // Two incommensurate frequencies: the breath never repeats exactly —
     // a metronomic single sine is precisely what read as "not alive".
     const breathe = 1.0 + 0.011 * Math.sin(time * 0.55)
-        + 0.006 * Math.sin(time * 0.173 + 1.7);
+        + 0.006 * Math.sin(time * 0.173 + 1.7)
+
     // Scale boost trimmed 0.7 → 0.55: the swell is what sells the
     // swallow, but it also DILUTES local node density exactly when the
     // camera is closest — the interior looked empty at 0.7 even with
@@ -2269,6 +2316,8 @@ function animate(ts) {
     // the blend toward them after a form switch) below — §4PR.
     const T = _sceneT;
     T.s = sceneScale;
+    scene.rotation.x -= _bodyPrev.rx; scene.rotation.y -= _bodyPrev.ry; scene.rotation.z -= _bodyPrev.rz;
+    scene.position.x -= _bodyPrev.px; scene.position.y -= _bodyPrev.py;
 
     // Slow continuous orbit (faster while working) plus a gentle tilt
     // gives the network real depth and life at idle. Skipped entirely
@@ -2352,6 +2401,18 @@ function animate(ts) {
     // blend below applies this frame, or exactly the steady targets.
     _applySceneBlend(formBlend < 1.0 && _sceneFrom.on
         ? _smooth01(Math.min(1.0, formBlend + (dtF / 60) / 1.4)) : 1.0);
+    // The temperament's BODY (2026-10-30 v1.2): head turn/tilt, shake,
+    // sink, coil/release — on every form, over whatever the form did.
+    {
+        const B = _bodyPrev, on = !PREFERS_REDUCED_MOTION;
+        B.rx = on ? TS.pitch : 0; B.ry = on ? TS.yaw : 0; B.rz = on ? TS.roll : 0;
+        B.px = on ? TS.offX : 0; B.py = on ? TS.offY : 0;
+        scene.rotation.x += B.rx; scene.rotation.y += B.ry; scene.rotation.z += B.rz;
+        scene.position.x += B.px; scene.position.y += B.py;
+        const sm = on ? TS.scaleMul : 1;
+        B.s = sm;
+        scene.scale.set(scene.scale.x * sm, scene.scale.y * sm, scene.scale.z * sm);
+    }
 
     // Structure changes form slowly when idle, faster when busy. "Busy"
     // is the max of an in-flight chat turn (workingState) and ambient
@@ -2372,12 +2433,12 @@ function animate(ts) {
     // agitates both rate and amplitude — a recoil, not a flash.
     pulsePhase += (dtF / 60) * (0.20 + 0.105 * currentShapeSpeed)
         * (1.0 + flinch * 1.2)
-        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul;
+        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul * _tsSpeed();
     flinch *= decay(0.97);
 
     const pulseAmp = (0.16 + 0.10 * drive + 0.22 * flinch)
         * (PREFERS_REDUCED_MOTION ? 0.45 : 1.0)
-        * (1.0 + 0.25 * audioLevel);
+        * (1.0 + 0.25 * audioLevel) * _tsAmp();
     // Contraction as felt at the bell margin (drives tentacle tug + the
     // swim bob) — the wave reaches the margin 0.16 cycles after the apex.
     const cMargin = _pulseShape(_fract(pulsePhase - 0.16));
@@ -2784,7 +2845,11 @@ function animate(ts) {
     idleTwitch *= decay(0.94);
     twitchAmp += (idleTwitch - twitchAmp) * ease(0.35);
     if (drive < 0.15 && userTurnState < 0.1 && !PREFERS_REDUCED_MOTION
-        && time - idleTwitchAt > 0.3 * (6 + Math.random() * 8) && Math.random() < 0.02 * dtF) {
+        // a twitch the temperament asks for still waits for the last one to
+        // fade (≥ 4 s, amplitude ~0): moving the twitch to a NEW node while
+        // the old one is still up pops that node (0.054/frame, measured).
+        && ((TS.twitch && time - idleTwitchAt > 0.3 * 4 && twitchAmp < 0.05)
+            || (time - idleTwitchAt > 0.3 * (9 + Math.random() * 12) && Math.random() < 0.012 * dtF))) {
         idleTwitchAt = time;
         idleTwitch = 1.0;
         idleTwitchNode = Math.floor(Math.random() * NODE_COUNT);
@@ -2969,6 +3034,10 @@ function animate(ts) {
         formDim *= 1.0 - TUNE.timeoutFade * errorKindEnv;
     }
     if (verdict === 'pass') formDim *= 1.0 + TUNE.passDim * verdictEnv;
+    // temperament: flares, dozing dim, speech glow — never over an error
+    // kind's own dim (network flicker, timeout fade, refusal) and never
+    // under reduced motion (a steady face)
+    if (!PREFERS_REDUCED_MOTION && !errorKind) formDim *= TS.bright;
 
     const nUniforms = instancedMesh.material.uniforms;
     const clk = shaderClock(time);   // wrapped / CPU-side phases (§4PR)
@@ -3037,7 +3106,8 @@ function animate(ts) {
     bloomPass.strength = (0.88 + workingState * 0.3 + activity * 0.35
         + errorState * 0.5 + 0.20 * toolPulse + 0.25 * recallSpark
         + (verdict === 'pass' ? 0.2 * verdictEnv : 0)
-        + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9)))
+        + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9))
+        + 0.35 * TS.glow)
         * BLOOM_SCALE * (1.0 - 0.5 * camDive) * 0.65;
 
     composer.render();

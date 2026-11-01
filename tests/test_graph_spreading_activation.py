@@ -113,29 +113,29 @@ def test_get_neighborhood_returns_2hop_chain(populated_gm):
     edges = populated_gm.get_neighborhood(["user"])
     # §4MJ: the longest chain carries its own prefixes — the direct edge and
     # the 2-hop chain are NOT returned again as separate items
-    assert "- (User) -[OWNS]-> (Dog) -[NAMED]-> (Max) -[BREED]-> (Husky)" in edges
-    assert "- (User) -[OWNS]-> (Dog)" not in edges
-    assert "- (User) -[OWNS]-> (Dog) -[NAMED]-> (Max)" not in edges
+    assert "- (User) -[OWNS]-> (dog) -[NAMED]-> (max) -[BREED]-> (husky)" in edges
+    assert "- (User) -[OWNS]-> (dog)" not in edges
+    assert "- (User) -[OWNS]-> (dog) -[NAMED]-> (max)" not in edges
     # Also surfaces the other branch
-    assert any("Berlin" in e for e in edges)
+    assert any("berlin" in e for e in edges)
 
 
 def test_get_neighborhood_skips_disconnected_components(populated_gm):
     edges = populated_gm.get_neighborhood(["user"])
     joined = " ".join(edges)
-    assert "Moon" not in joined and "Earth" not in joined
+    assert "moon" not in str(joined).lower() and "earth" not in str(joined).lower()
 
 
 def test_get_neighborhood_fuzzy_seed_mapping(populated_gm):
     """A misspelled query should still map onto the closest exact node."""
     edges = populated_gm.get_neighborhood(["berln"])  # missing 'i'
-    assert any("Berlin" in e for e in edges)
-    assert any("Germany" in e for e in edges)
+    assert any("berlin" in e for e in edges)
+    assert any("germany" in e for e in edges)
 
 
 def test_get_neighborhood_substring_seed_mapping(populated_gm):
     edges = populated_gm.get_neighborhood(["germ"])
-    assert any("Germany" in e for e in edges)
+    assert any("germany" in e for e in edges)
 
 
 def test_get_neighborhood_weights_rank_paths(gm):
@@ -145,8 +145,8 @@ def test_get_neighborhood_weights_rank_paths(gm):
     gm.add_triplets([{"subject": "user", "predicate": "LIKES", "object": "coffee"}])
     edges = gm.get_neighborhood(["user"])
     # The reinforced edge ranks first.
-    assert edges[0].endswith("(Tea) [Score 3]") or "[Score 3]" in edges[0]
-    assert any("(Coffee)" in e for e in edges)
+    assert edges[0].endswith("(tea) [Score 3]") or "[Score 3]" in edges[0]
+    assert any("(coffee)" in e for e in edges)
 
 
 def test_get_neighborhood_global_limit_enforced(gm):
@@ -179,7 +179,7 @@ def test_through_chain_via_seed(gm):
         {"subject": "bob", "predicate": "LIKES", "object": "coding"},
     ])
     edges = gm.get_neighborhood(["bob"])
-    assert "- (Alice) -[KNOWS]-> (Bob) -[LIKES]-> (Coding)" in edges
+    assert "- (alice) -[KNOWS]-> (bob) -[LIKES]-> (coding)" in edges
 
 
 def test_backward_chain_terminates_at_seed(gm):
@@ -189,4 +189,4 @@ def test_backward_chain_terminates_at_seed(gm):
         {"subject": "team", "predicate": "BUILDS", "object": "product"},
     ])
     edges = gm.get_neighborhood(["product"])
-    assert any("Alice" in e and "Team" in e and "Product" in e for e in edges)
+    assert any("alice" in e and "team" in e and "product" in e for e in edges)

@@ -520,6 +520,14 @@
   <h2 id="recall-relevance">recall: the relevance grade reaches the model (§4FD, 2026-09-07)</h2>
   <p><code>tool_recall</code> graded every hit HIGH / MEDIUM / LOW (distance &lt; 0.8 / &lt; 1.15 / &lt; 1.35) — into the operator's log only. The model saw "Found N highly relevant memories" over rows scored LOW, and invented a project codename from pg_stat notes (trajectories 929115b8, c8ee1d80). Each chunk now carries <code>RELEVANCE: &lt;grade&gt; (distance d)</code>, and the header names the best grade; an all-LOW recall reads <code>SYSTEM: Found N memories (best match: LOW — these are probably UNRELATED to the query; do not present them as facts about it).</code> That header is one of the empty shapes the <a href="../core/evidence_gate.html">evidence gate</a> recognises. Rows past the 1.35 cut are still dropped. Tests: <code>tests/test_4fd_tool_output_counts_and_relevance.py</code>.</p>
 
+  <h2 id="4sn">recall — retrieval review (2026-10-31, §4SN)</h2>
+  <ul>
+    <li><strong>One copy of each edge.</strong> The owner-fact lookup adds " (as of …)" and the neighbourhood lookup does not, so every owner edge printed twice. They are now deduplicated ignoring that suffix.</li>
+    <li><strong>"user" is not a topic word.</strong> Every owner edge contains "(User)", so "what's the postgres user home directory" kept all 15 owner edges. "user"/"users" are now in <code>_GRAPH_STOPWORDS</code>. Owner facts reach an owner question through the kind lookup instead.</li>
+    <li><strong>A past request is shown only when it shares a content word with the question</strong> (<code>_episode_on_topic</code>: a word of 3+ letters, or a 4+ letter word inside the row, so "car", "bmw", "tax" and "vpn" count). Time and conversation words (morning, two days ago, talked, χθες, συζητήσαμε…) and Greek function words (μου, για, τον…) are not topic words, and a plural matches its singular (kids ~ kid). A question with no content words keeps every row. One-line rows like "status update !" (retrieval count 325) sat at MEDIUM under 9 of 18 replayed owner questions.</li>
+    <li><strong>An on-request value stays out of the graph.</strong> <code>sync_owner_mirrors</code> checked only the field, never the value. A street address under <code>root.location</code> was hidden from the profile render but mirrored into the graph, and "where do I live?" put it into the prompt. Each value is now checked, as the render does.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 
   <h2>A missing file is told what ingest does NOT do <span class="tag">2026-09-09 &sect;4FR</span></h2>

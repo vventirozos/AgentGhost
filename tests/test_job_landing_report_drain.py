@@ -424,7 +424,9 @@ async def test_a_DEFERRED_wake_is_retried_on_the_next_tick():
     main_mod._resume_after_job = _deferring_resume
     try:
         task = asyncio.ensure_future(main_mod._reap_sandbox_jobs(_Ctx()))
-        for _ in range(50):
+        # 5 s budget, early exit: 1 s missed the second tick on a loaded
+        # machine (the §4SN battery's no-op control, twice)
+        for _ in range(250):
             await asyncio.sleep(0.02)
             if len(attempts) >= 2:
                 break

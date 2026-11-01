@@ -57590,3 +57590,196 @@ Tools render before the system prompt, so the schema change costs one head re-pr
 
 **§4SI deploy (2026-10-30 23:44).** Full suite once: 28,140 passed; 7 errors = the known VectorMemory embedding-load flake (`test_recall_regression_eval.py`, passes alone); 1 real failure: `test_interface_face_cube2_v2_2026_09_21.py::test_busy_is_hotter_than_idle`, a §4SG regression in the TEST's measure — it compared the hottest shell (capped at 0.62) on one frame, and the temperament's wall-clock-driven speed moves which frame the rest sample lands on (rest max 0.60–0.61, needs < 0.60). Earlier runs had this file ERRORing, so it was masked. Now the mean over shells: rest 0.345 → turn 0.374 (pre-temperament 0.355 → 0.428), bound +0.015; the pre-temperament file passes, a no-turn-heat mutant fails (0.345 → 0.336), 4/4 stable. Lint OK. Restart gated on foreground_requests==0: listener 71274 → 46007, one process, ready count stable; the new head re-prefilled once and saved: **26,144 tokens (was 28,230)**.
 Live probes after the restart (all X-Ghost-Origin: probe, ids probe-…): three-part page closed by its `</html>` part; empty finish closed a .txt; an edit mid-parts got the open-part note (no SYNTAX CHECK FAILED); manage_projects list OK on the shrunk schema; no swarm/delegate/dream_mode tool; a write cut at 12,483 chars was saved to its last full line and continued by the system for 6 rounds to "file complete" — 1,200 rows, none missing or doubled, one `</html>` (the model's hand-computed cubes were wrong from n=93: arithmetic, not stitching); the head came back after the continuation in 0.6 s; trajectories keep code. Probe files removed.
+
+## §4SJ — `news_headlines` made richer (2026-10-31, operator: "look into a custom skill that the agent made : acquired_skills/news_headlines.py and make it richer")
+
+**Before.** The owner's daily "tell me the news" (47 runs, 0 failures, 14 owner turns 10-16 → 10-31) read ONE feed, Naftemporiki (a business paper, hence market-heavy briefings); descriptions came back as raw HTML cut mid-tag; links carried utm tracking.
+
+**Now** (stdlib, sandbox, Tor egress):
+- 18 keyless feeds fetched in parallel in ~5 s: 11 Greek, 7 world. Kathimerini (410), ekathimerini (403) and keeptalkinggreece (bad XML) are dropped.
+- The same story is merged across outlets: titles must share at least two words, and the IDF-weighted overlap of title + summary opening must reach 0.4; matching items join by union-find. Stories rank by outlet count, then recency; routine items (name days, horoscopes, lotteries) go to the back.
+- The default briefing is about 2/3 Greece and 1/3 world, with caps per outlet and per topic that a final pass relaxes.
+- Scope means what a story is about: a Greek outlet's foreign story is world.
+- Arguments: region/topic/query/hours/sources/count. Unknown values become `notes`, never a failure.
+- A dead feed shows in `sources_failed`; only a run where every feed fails is a failure.
+- Tuned on a live pool of 560 items: the Poland crisis was told 9 ways and became 1 story; no false merges were seen. Two mistakes were caught during tuning: "transport" matched sports, and query-filtering before clustering skewed the weights.
+
+**Pins**: `tests/test_skill_news_headlines.py` (15, offline). Mutants: 10 out of 10 killed, and the control survived. The fixtures need a backdrop of unrelated stories, because IDF over a 6-item pool merges everything.
+
+**Install**: `AcquiredSkillManager.save_skill`, gated on `foreground_requests == 0`. Backup: `system/code_backups/20261031-news-headlines/`. The usage count is kept. The embedding still holds the old description, which is harmless below 25 skills. The head grew 26,144 → 26,546 tokens: one re-prefill, and the next quiet re-warm saves it.
+
+**Live** (probe): "tell me the news please." gave grouped World/Greece briefings; "what happened in Greek sports today?" made the model call `region=greece, topic=sports`. The skill's data was right. The model mis-transliterated Greek names (Montero → "Ndoye", Karetsas → "Kareltsas", Vezenkov → "Vassenkov"), and once garbled the two EuroLeague scores inside one merged story.
+
+**Left**: a story told in both Greek and English stays two stories; follow-ups to one story can stay separate.
+
+**2026-10-31 log line.** "client deadline" shortened (operator: "no need for it to be that long"): `60 min, 5 min kept for the reply; no limit while coding` (or `up to N min while coding`). Pins updated in test_4nv_log_lines, test_4sd_no_ceiling_budget, test_4ra_deadline_extension; docs/logging.html. Live at the next restart.
+
+## §4SK — request a60aa2de defects: service replace, own-host brake, launch race, selector hint, asset links (2026-10-31, operator: "look … for mechanical defects" → "proceed, usual verification process")
+
+**Source.** Request a60aa2de, a 91-minute webOS build, read from its thinking and every tool call, plus the operator's question about the recurring `browser retry Chromium launch race (TargetClosedError)` line.
+
+**Five defects, five fixes.**
+1. **A stale service read as "already running".** The registry held a `webos` entry from an earlier day (`cd /workspace/webos && python3 -m http.server` on 8101), its pid alive and its directory deleted. A start with a new command and port got "already running … use it as it is", and the model spent 4 turns on it. Now `start` with a different command replaces the service in one call ("Replaced the running …"). A served directory that no longer exists counts as dead even for the same command. The note names the served directory (`served_dir`), not the workdir. Unknown liveness (§4GI) is never replaced. The directory probe reads missing only on its own "no".
+2. **The composed-URL brake refused the agent's own server.** A 404 on 127.0.0.1:8101 blocked 127.0.0.1:8100. Loopback, LAN and file:// are skipped (`_UrlProvenance._own`, using `browser_routes._is_own_host`).
+3. **Launch race.** There were 34 retries since 10-09, all recovered. 27 came within 10 s of the previous launch, because the host lock serialises runners, not Chromium's shutdown. The runner now waits, bounded at 6 × 0.5 s, until no process holds `--user-data-dir=<profile>`, and reports `profile_settle_s`. The retry line is INFO with the runner's text, because 7 of the 34 are unexplained. A failed retry is a WARNING. A host-side settle exec was tried first and reverted, since it broke the one-call-one-exec contract (~25 tests).
+4. **The selector error did not say why.** `[data-app="calculator"]` failed on a page with `data-app="calc"`, and the clickable-elements list omitted the div dock items. The error now names the attribute's values on the page.
+5. **Asset URLs were flagged as citations.** In .html/.htm/.xhtml, asset tags and CSS url()/@import are dropped before the link check and the source check. `<a href>` and bare URLs still count.
+
+**Fresh-eye review, round 2.** Three Opus reviewers ran, after the first three died on the Fable rate limit. Every claim was verified against the code and, for the hint, in the sandbox's Chromium.
+- **Services, three MAJOR.**
+  - The old service was killed before the cap and workdir checks. The stop now runs after them and before the port lease.
+  - A replacement that failed lost the old row and never said so. `start` now wraps `_start_impl`; the failure keeps the old row (stopped) and leads with the Replaced note.
+  - `served_dir` read any `-d` (`php -S … -d display_errors=1` churned a healthy service). Now only after `http.server`, every `cd` prefix is read, and `~`/`$` paths are unknown.
+  - Identical starts churned when the allocator had moved a taken port. Entries now store `asked`/`asked_port`.
+  - MINOR: an explicit workdir/port is part of the command; unknown liveness skips the directory probe.
+- **Browser, two MAJOR.**
+  - The hint named matching tests as the cause (24-value cap, dropped `~=`/`^=`), and shadow DOM read as absent. The page now answers for the test as written, walking open shadow roots.
+  - MINOR: `:not()` and non-CSS engines are skipped, escaped quotes parse, at most 3 evaluates, cut values are marked, and the profile needle is NUL-terminated and skips the parent.
+- **Links, one MAJOR.**
+  - Inline `<script>` bodies (fetch, CDN imports, JSON-LD) were flagged. A linear scan now strips them.
+  - MINOR: quoted `>` in attributes, `<image>`/`<input type=image>`, a bounded CSS scan (39 s → <1 s), `lstrip("www.")` → `removeprefix`, and .xhtml in the document check.
+  - Left: Markdown image embeds still count as citations.
+- R4: the two `inspect.getsource` pins were replaced by behavioural pins (a fake playwright context; a fake page through `_require_selector`).
+
+**Pins.** `tests/test_4sk_webos_request_defects.py` (63). `test_sandbox_services.py` and `test_4ri_request_43fe95a2.py` were retargeted to "replaced". `test_4gi_symlink_class.py` gained an allowlist entry for the runner's /proc read. Battery: `scripts/mutate_4sk_r1.py` (66 mutants + 2 controls).
+
+**Round 3** (two Opus reviewers, every claim reproduced; runner checked in the sandbox's Chromium).
+- **Services, two MAJOR.**
+  - A port-hijacked replacement was reported "did NOT start", with restart advice that would have run the NEW command. The wrapper now decides by the row's token: a registered new run is the service. The note is written only there; three in-line copies were removed after the battery showed them redundant.
+  - A restart forgot the asked command. It now passes `_asked`.
+  - MINOR: a port the command names is now the asked port. An exception after the stop is now a declared failure that restores the old row.
+- **Browser and links, one MAJOR.**
+  - Past the 20,000-element scan the hint claimed "no element has X". It no longer claims absence there.
+  - MINOR:
+    - Engines are now judged per `>>` part, including `internal:` and `nth=`.
+    - `:has-text`, `:text*` and nested `:not()` are removed quote-aware.
+    - Offsets from `lower()` drifted on "İ"; the searches now run on the text itself.
+    - `<script-note>` and `<link-card>` read as script/asset tags; tag names now need a real boundary.
+    - Comments are stripped, and an unclosed script or comment keeps the rest of the page.
+    - Scripts are stripped before code spans.
+
+**Battery tooling** (operator: "the mutants run for over an hour … how can we do this faster?").
+- New `scripts/battery_cov.py`: one per-test coverage map; each mutant runs only the tests executing its anchor; 6 rsync'd trees outside the repo; `src/` is never mutated.
+- 68 mutants: >2 h before → 10:55 serial → 5:01 parallel, including the map build. Verdicts were identical to the old method on the 30 mutants run both ways.
+- The selection gap it exposed (a pin reading a module constant directly) is closed by adding test files that name the defined symbol.
+- Round 3 battery: 86/86 killed, no-op survived. One equivalent mutant was dropped (E11: the message prints `m.group(0)`).
+
+**Round 4** (two Opus reviewers).
+- **Services, two MAJOR.** Both sat inside the round-3 exception layer, the "the fix that breaks what it fixed" pattern.
+  - An exception after the launch orphaned the new process.
+  - An exception after the save said "did NOT start" over a registered run.
+  - The layer was deleted, not patched. An exception after a stop now leaves the registry alone and says liveness is unknown.
+  - MINOR: the wrapper now holds the lock across the call.
+  - Accepted: a reserved-port kill keeps the dead new row.
+- **Hint, one MAJOR.** A `>>` inside quotes split the selector (`[aria-label="Next >>"]`), the same leak class again. The three regex layers were replaced by one quote-aware pass, `_attr_tests`. MINOR: quoted `:not(` in values.
+- **Links, MINOR.** Comments now follow the HTML spec's early closes.
+- **Battery.** 95 mutants. Three survivors were all pin gaps:
+  - a port refusal between the stop and the provisional row (it exercises the token check);
+  - an unquoted text-pseudo argument;
+  - a quoted `[x]` in an unknown pseudo-class.
+  - Two pins first used `[3]`, a name the attribute regex never accepts.
+  - After those fixes every mutant was killed.
+
+**Round 5: converged.**
+- Services: no CRIT or MAJOR. Two MINOR, both infra-fault only.
+  - One got a wording fix: after an exception, status may read the new run DEAD with no pid.
+  - The other was accepted: an exception inside `_kill_service` re-raises, but the old row is still on disk.
+- Hint and links: nothing worth fixing.
+  - The hint was checked on 18 hard selectors and in real Chromium; link stripping was fuzzed on 1,500 pages against Chromium, with 0 dropped visible links.
+  - Accepted: an escaped `\)` inside `:not()`; Tailwind escaped quotes (the hint goes silent, never wrong); a raw `<!--` inside `<style>`/`<textarea>`/`<title>`/attribute values.
+- Lint caught `done` unpacking of a possibly-None thread-local. `_replace_record()` now returns `()`.
+
+**Gate.** Full suite once after the last edit: 28,271 passed, 73 skipped, 4:58. Lint OK. Restarted 2026-10-31 after the agent's one in-flight request finished: `launchctl kill SIGTERM`, new pid, one process, no respawn.
+
+## §4SL — speech-to-text moves from Gemma to Whisper on nova (2026-10-31, operator: "is there any voice (speech to text) that can run alongside gemma that is better, faster with greek support?" → "proceed")
+
+**Measured first** (nova, whisper.cpp 1.9.5 brew, FLEURS read speech converted to the 16-bit WAV production sends; Gemma called with interface/voice.py's exact request). WER after lower-casing and stripping punctuation:
+
+| model | Greek WER / CER (100 clips) | English WER (50) | median per clip |
+|---|---|---|---|
+| Gemma 4 E4B (old path) | 60.8 % / 40.9 % | 6.6 % | 9.1 s Greek, 5.2 s English |
+| Whisper large-v3-turbo q8_0 | 13.5 % / 5.1 % | 5.0 % | 2.0 s (1.2 s with language=el) |
+| Whisper large-v3-turbo f16 | 13.6 % | 5.2 % | 2.1 s — no gain over q8 |
+| Whisper large-v3 q5_0, no VAD | 11.9 % / 4.4 % | 4.8 % | 3.3 s |
+| large-v3 q5_0 + default VAD | 12.5 % | 7.8 % | 3.5 s |
+| **large-v3 q5_0 + tuned VAD (production)** | **12.2 % / 4.6 %** | **5.2 %** | **3.4 s / 2.7 s** |
+
+- Gemma wrote 30/100 Greek clips in Latin transliteration ("Oflios eche ipachos…"); 55/100 had > half the words wrong. The agent only sees the transcript.
+- large-v3 vs turbo on the same 100 Greek clips: better 34, worse 18. Whisper beside a busy Gemma: 2.0 → 2.8 s, Gemma unaffected.
+- Dropped without running: BuzzASR/greek (large-v3 fine-tune; its own card shows Common Voice CER 5.04 vs 4.47 zero-shot), Parakeet TDT v3 (Greek FLEURS 20.7 %), Voxtral (Greek not listed).
+- **VAD is required.** Without it silence/noise → "Υπότιτλοι AUTHORWAVE", and a clip with 4 s of room noise around real speech returned ONLY that phrase. Default Silero VAD (30 ms pad) cut first words ("In fact, it is not easy…" → "not easy…"); `-vp 300 -vsd 500 -vt 0.35` fixed it and still returns "" on silence/noise.
+
+**Built.** `GHOST_STT_URL` (+ `GHOST_STT_LANGUAGE`, default auto) in interface/voice.py and memory/audio_ingest.py — when set, `/inference` multipart and NO Gemma fallback (60 % Greek WER is worse than "unavailable"). Silence = no word outside whisper's tags (one rule, both processes); a 200 with `{"error"}` is a failure; segment newlines joined. Ingest: no llama slot fitting, 120 s windows / 5 s overlap / 180 s read timeout (`GHOST_STT_WINDOW_S`, `_OVERLAP_S`, `_WINDOW_TIMEOUT_S`) because whisper-server serves one request at a time and push-to-talk shares it (a 480 s window held it ~1 min, past the uConsole's 60 s wait). conftest pins the STT vars to "" (both launchers export them). nova: LaunchDaemon `com.local.whisper-server` → `~/Data/AI/bin/start-whisper-server.sh` (:8090, models in `~/Data/AI/Models/whisper/`, turbo-q8 kept for a one-line swap); Gemma llama-server untouched, nova 24 % free with both. Launcher backups `*.pre-4sl`.
+
+**Review.** Two fresh-eye rounds: r1 6 findings (push-to-talk starved behind 8-min ingest windows; Gemma sentinel rule dropped "(Music) Thanks everyone…"; Gemma-path pins broke with the launcher env; backend named wrong in messages; numbers inconsistent; language detection per 8-min window) — all fixed; r2 7 MINOR inside the fixes (900 s timeout per window, 9 % seam duplication at 60 s, stale 21-min message, doc drift) — 4 fixed, 3 accepted (bracketed one-word replies read as silence; no client-side hallucination guard — VAD is the mechanism; Gemma-path pins run with the URL unset). Battery `scripts/mutate_4sl.py`: 35/35 killed (2 tag-regex mutants only by the full pin file — module-level regex anchors under-select in battery_cov), no-op control survived. Pins `tests/test_4sl_whisper_stt.py` (44). Full suite once: 28,386 passed, 73 skipped, 2 load flakes (test_clockwork_ux deploy, test_4rn clock) pass alone; lint OK. Deployed 2026-10-31 (agent + interface restarted at 0 foreground requests); live `/api/stt` returned the Greek clip correctly.
+
+**Open:** Gemma's remaining jobs on nova (worker + pixel check) are untouched; the operator plans to replace Gemma with another LLM — Whisper no longer needs it. Gemma's STT code paths can go once that swap lands. Not measured: real owner push-to-talk recordings (FLEURS is read speech).
+
+### §4SM — uConsole deploy shipped a face without its temperament module (2026-10-31)
+- Operator: "deploy to clockwork". The first run probed OK (109/109), installed and restarted the client (pid 2822), then failed with `[face] ERROR module load: TypeError: Failed to fetch dynamically imported module …/matrix_graph.js`, leaving a black background.
+- Cause: the canonical `interface/static/matrix_graph.js` now imports `./temperament.js?v=1.3` (§4SG face temperament). `deploy.sh` copied only matrix_graph.js into `webface/`, so the import 404'd on the device. Since §4SG landed, the handheld face had been broken on any deploy.
+- Fix: `deploy.sh` reads `from './x.js'` imports and copies each sibling from interface/static, following imports transitively with a seen set, so cycles end. A missing sibling fails under `set -e` before any ssh/scp. three/addons stay vendored through the import map.
+- Tests: 3 new tests in tests/test_clockwork_ux.py (transitive copy plus cycle and not-imported file; missing import stops before the device; the real face's imports exist). The file passes 410/410. Two hand mutants (drop the cp; drop the queue append) were each killed.
+- Redeployed: `+ temperament.js (imported by matrix_graph.js)`, probe 109/109, client pid 3875 stable, `[face] opening on 'tesseract'`, no `[face] ERROR`. turnstatus.py changes went out in the same deploy.
+- Docs: docs/interfaces/clockwork_ghost.html, deploy list.
+
+## §4SN — Memory consolidation + retrieval review: 21 defects fixed, one rule built and removed (2026-10-31, operator: "perfect next review how memory consolidation works, look for weaknesses and defects." + "also evaluate the memory retrieval" → "wait for the retrieval review results and fix both properly. usual verification protocol")
+- **Evidence (live, 24 days):** the drain logged 348 items "consolidated". 176 reached the extractor; 5 facts were stored, 3 distinct; 0 extractor profile writes. Hanzo was stored twice 5 s apart; one memory-usage note ended up under three keys. The retrieval reviewer replayed 40 owner questions on a copy of the stores.
+- **Consolidation (C1–C7):**
+  - **C1 corrections:** the profile leg deleted ANY field whose value matched, regardless of kind. "I'm not selling the BMW after all" deleted the BMW; "not going to Athens this weekend" deleted the location. Corrections are now kind-gated: `field_kind`, `predicate_kind`, `field_subject`. Fields about someone else carry no owner kind.
+  - **C2 outage:** a Nova outage acked the lost items as "✅ consolidated". Now `ConsolidationNodeDown` (retryable): a failing item steps aside; two in a row = outage → keep everything, no retry spent. An item counts only when another item reached the model in the same drain.
+  - **Honest count:** the summary line reads "read N memories (M without an owner fact cue, not read)", and failures are reported.
+  - **C3 negation:** a negation in the fact no longer ended the task before the profile write.
+  - **C4 one fact, one home:** extractor categories fold onto the standard drawers. A value a RELATED field already holds (same subject + same kind or a shared key word) is not filed again.
+  - **C5 newest message only:** extraction reads only the item's own owner message (`latest_owner_episode`, plus the item's `data.user` check, with unclosed-fence and image-turn handling). The "summary request" skip is gone. The pre-filter reads continuation lines.
+  - **C7 anchoring:** dates and the stamp come from the item's `ts`.
+- **Retrieval (R1–R9):**
+  - **Kind vocabulary:** owner-only kind words (heart/καρδιά, pets, vehicles, kid, expertise). Greek inflection matching (`_greek_kind_key`: case-ending whitelist; only noun keys may be cut).
+  - **Dates and display:** dates shown are `valid_from`; mirror edges are stamped from when the profile learned the value (`scripts/restamp_owner_mirrors_4sn.py` for existing rows, earlier only). Names are shown as stored.
+  - **Recall noise:** one copy per edge (as-of/score suffix dedup). "user" is no longer a topic word. On-request values stay out of the graph.
+  - **Past requests:** shown only when on topic (`_episode_on_topic`: time/conversation and Greek function words stopped, plurals folded, an empty topic keeps every row).
+  - **Smaller:** a birth date carries an age gloss; the unused bus hydration was removed.
+- **Reviews: 3 fresh-eye rounds — r1 4 MAJOR, r2 7 MAJOR, r3 4 MAJOR — nearly all inside the previous round's fixes.**
+  - **Removed: the "stopped" rule.** It read "I don't have the BMW anymore" as a removal. It produced MAJORs in every round (the son's/wife's cessations, the reason half of a sentence, the wife's fields) and was deleted in r3, not patched. Trade-off: a possession now leaves the profile only by a removal verb or the owner's forget. Reasons now split clauses (because/since/γιατί/επειδή/αφού).
+  - **Removed: a 6-h age rule for node-down,** which drained the journal in a long outage.
+  - Don't rebuild either.
+- **Tests:** `tests/test_consolidation_review_1031.py` and `tests/test_retrieval_review_1031.py` (106 + 53). Pins edited in about 12 files for the lowercase display and the KB fixtures. `test_worker_offload` now scopes to the function body instead of a byte window.
+- **Battery:** `scripts/mutate_4sn.py`. Every mutant now also runs the pin files, because the coverage map missed a script's own pin (R3e survived beside a test that kills it).
+- **Docs:** memory/journal, memory/attribution, memory/graph, memory/profile, tools/memory_tools (#4sn), logging, troubleshooting.
+
+## §4SO — a long request's follow-up gets the head first, judged by growth (2026-11-01, operator: "i run request 2ee352dd as a follow up to request 6c7ee05f, the llama loaded 28.4k tokens, why ?" → "proceed with the usual verification process")
+- **Finding (llama log + agent log):**
+  - 6c7ee05f made 21 main calls with big turns (18k-char writes, 11k-char edits) and grew the slot from ~27.9k to 67,025 tokens.
+  - The follow-up 2ee352dd shares the slot only up to where 6c7ee05f's own messages began (head + stable first message; between requests tool turns are dropped, by design — operator 11-01: "re-reading the file is fine"). llama matched 27,279 tokens (`f_keep 0.407` × 67,025).
+  - Every checkpoint at or below that point had been evicted (erasures logged at n_tokens 25,517 and 26,942), so llama re-read all 28,490 tokens from 0 in 168 s; ~1.2k were new.
+  - Two gaps:
+    - §4SA's head-first gate `GHOST_CONV_HEAD_FIRST_CALLS` was OFF (0), waiting for exactly this case.
+    - It would not have fired anyway: the conversation restore after 6c7ee05f's own picture look (07:44) reset the call counter to 0, so the record read 1 call.
+- **llama b11960 `create_checkpoint`, read in source:**
+  - When the list is full, llama first drops earlier tasks' checkpoints within `--checkpoint-min-step` (1024) of the previous one, then the OLDEST.
+  - Each call adds checkpoints at user-message starts and 4+n_ubatch / 4 tokens before its prompt's end.
+  - So the low checkpoint goes only after (N−1) spaced checkpoints sit above it: more than (12−1)×1024 tokens of growth over several calls. A call count alone is the wrong measure: 31 small calls kept it in the §4SA probe, 21 big ones lost it (the 9th call evicted the last checkpoint below the start).
+- **Fix:**
+  - `llm.checkpoint_span_passed(calls, start, end)` = `calls ≥ n//2` and `end − start > (n−1)×step` (n, step from `GHOST_LLAMA_CTX_CHECKPOINTS` / `GHOST_LLAMA_CHECKPOINT_MIN_STEP`, default 12 / 1024 = the llama launcher).
+  - `note_main_slot_prompt(…, usage=)` records `_slot_request_start` (the first MEASURED prompt_tokens of the conversation's OWN call) and `_slot_request_end` (the PEAK prompt_tokens of any call).
+  - `usage_tokens()` reads usage from the completion and from the stream's final SSE chunk (str or bytes). `release_slot_session` clears the counters.
+  - `_conv_save` writes calls/start/end to the meta (ints or None). `_conv_restore` gates a file past the span unless the same request saved it, carries the counters over on a same-request restore, and resets them otherwise.
+  - `_long_followup` and the file gate use the predicate. 📀/🧳 lines: "its last made N calls and grew the slot N tokens, past llama's checkpoints".
+  - `GHOST_CONV_HEAD_FIRST_CALLS` removed (code, tests, docs).
+- **Reviews: 3 fresh-eye rounds — r1 1 MAJOR + 4 MINOR, r2 1 MAJOR + 3 MINOR, r3 none. Both MAJORs were inside my own code (r2's inside r1's fix).**
+  - **r1 MAJOR:** a conversation restore names the request in the slot BEFORE its first call, so "start on a new request's first call" never ran: any request that began from a file had start=None and the gate off.
+  - **r1 MINORs fixed:** start = first measured call (a stream cut before its usage lost it); end = peak prompt, not last prompt + completion (completions make no checkpoints; a compacted request under-reported).
+  - **r2 MAJOR (in the r1 fix):** a picture look's or verify's small prompt, after a main stream cut before its usage, became the start and the gate fired falsely. Fixed: start only when `not llm._slot_moved_on`.
+- **Accepted, open:**
+  - The call floor n//2 errs toward an unneeded head restore (6×6k, 8 calls with one 30k result, 11×1.1k kept their checkpoint in r1's simulation). That costs ~the conversation past the head, never the 28k+ from zero.
+  - A mid-request head fallback (own-file restore refused) sets start too high, so the gate can miss.
+  - If skill routing (>25 active skills) or tuned tool descriptions ever change a request's tool list from the warmed head's, start stays None and the gate is silently off (it fails toward resume).
+  - Conversation files saved before 11-01 have no start/end.
+- **Verification:**
+  - Battery `scripts/mutate_4so.py`: 49 mutants + 2 controls, all killed (no-op survived, known-bad killed). Rounds 1/2 had 6 survivors, all pinned; `_int_or_none`'s bool clause deleted as dead.
+  - Enumeration: AST walk over llm.py's `note_main_slot_prompt` calls (foreground, outside `except`, not the outside-call label) must pass `usage=`. Seen to fire: R8/R9 killed.
+  - Pins: `tests/test_4sa_head_review_fixes.py` §7 (+ the spy in `test_4rp_slot_keep.py`).
+  - Full suite once: 28,465 passed / 73 skipped / 5:25. Lint OK. The pin-quality ratchet caught 4 source-text pins (a launcher-flag text check removed; the enumeration rewritten as pure AST).
+- **Deploy:** 11-01 09:39, listener 98028 → 65118. The shutdown save was skipped (1,963 tokens past the head, under the floor); the boot head restore had 26,536 of 26,540 tokens cached.
+- **Live check:** not probe-able, because probes have no conversation key. Watch the owner's next long request + follow-up for the 📀 "its last made N calls and grew the slot" line and llama's `prompt eval time … N tokens` ≈ new tokens only.
+- **Docs:** core/head_saves (#head-first, env table, log table), core/llm (#4so), configuration.

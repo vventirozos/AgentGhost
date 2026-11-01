@@ -481,36 +481,119 @@ def substitute_command_port(command, old_port, new_port) -> str:
                   str(command or ""))
 
 
-def already_running_message(name, entry: dict, command) -> str:
-    """§4NW (req 6b3e22a6): the refusal said "use restart to replace it" to
-    a start with a NEW command — restart relaunches the STORED one (the
-    model's fix of a wrong --directory served the old root again)."""
-    def _n(c):
-        return " ".join(str(c or "").split())
-    old, new = _n(entry.get("command")), _n(command)
-    # the stored command is the one that RAN: a dropped `cd <workdir> &&`
-    # and an added port are not a different command
+def _norm_cmd(c) -> str:
+    return " ".join(str(c or "").split())
+
+
+def _abs_workdir(wd) -> str:
+    import posixpath
+    wd = str(wd or "").strip()
+    if not wd.startswith("/"):
+        wd = f"{CONTAINER_WORKDIR}/{wd}"
+    return posixpath.normpath(wd)
+
+
+def same_command(entry: dict, command, *, workdir=None, port=None) -> bool:
+    """Is ``command`` the one ``entry`` already runs? The stored command is
+    the one that RAN: a dropped `cd <workdir> &&` and an added port are not
+    a different command; another port literal IS (§4NW). The command as it
+    was ASKED (before the allocator moved a taken port) is the same too —
+    §4SK r2: re-issuing it killed and relaunched a healthy service. An
+    explicit ``workdir``/``port`` the entry does not have is a difference."""
+    if workdir is not None and str(workdir).strip():
+        _have = _abs_workdir(entry.get("workdir") or CONTAINER_WORKDIR)
+        _want = _abs_workdir(workdir)
+        if _have not in (_want, _abs_workdir(CONTAINER_WORKDIR + _want)):
+            return False
+    if port is not None:
+        try:
+            _p = int(port)
+        except (TypeError, ValueError):
+            _p = None
+        if _p and _p not in (entry.get("port"), entry.get("asked_port")):
+            return False
+    old, new = _norm_cmd(entry.get("command")), _norm_cmd(command)
+    if new and entry.get("asked") and _norm_cmd(entry.get("asked")) == new:
+        return True
     _variants = {new}
     _m = re.match(r"^\s*cd\s+([^\s;&|]+)\s*&&\s*(.+)$", new, re.DOTALL)
     _wd = str(entry.get("workdir") or "").rstrip("/")
     if _m and _wd and _wd.endswith("/" + _m.group(1).strip("/")):
-        _variants.add(_n(_m.group(2)))      # the start dropped this same cd
+        _variants.add(_norm_cmd(_m.group(2)))      # the start dropped this same cd
     for v in list(_variants):
         try:
-            _variants.add(_n(add_default_port(v, entry.get("port"))[0]))
-            _variants.add(_n(add_default_port(v, entry.get("port"), loopback=True)[0]))
+            _variants.add(_norm_cmd(add_default_port(v, entry.get("port"))[0]))
+            _variants.add(_norm_cmd(add_default_port(v, entry.get("port"), loopback=True)[0]))
         except Exception:  # noqa: BLE001
             pass
+    return bool(old) and old in _variants
+
+
+def _join_dir(base: str, rel: str) -> str:
+    import posixpath
+    rel = str(rel or "").strip().strip("'\"")
+    if not rel:
+        return base
+    return posixpath.normpath(rel if rel.startswith("/") else posixpath.join(base, rel))
+
+
+_CD_PREFIX_RE = re.compile(r"""^\s*cd\s+("[^"]*"|'[^']*'|[^\s;&|]+)\s*&&\s*""")
+
+
+def served_dir(entry: dict) -> str:
+    """The directory the stored command serves, absolute in the container:
+    the workdir, moved by a leading `cd X &&`, then by a static server's
+    `--directory X`/`-d X`. §4SK (req a60aa2de): the note said "serving
+    /workspace" for `cd /workspace/webos && python3 -m http.server` — the
+    workdir, not the directory the command cd'd into, which no longer
+    existed."""
+    wd = str(entry.get("workdir") or CONTAINER_WORKDIR).rstrip("/") or "/"
+    cmd = str(entry.get("command") or "")
+    # every leading `cd X &&`, quoted or not (r2: `cd a && cd b` stopped at a)
+    while True:
+        m = _CD_PREFIX_RE.match(cmd)
+        if not m:
+            break
+        wd = _join_dir(wd, m.group(1))
+        cmd = cmd[m.end():]
+    # `-d`/`--directory` is http.server's flag only (r2: `php -S … -d
+    # display_errors=1`, `serve -d -l 8100` and `rails s -d` are options,
+    # not directories — a healthy service read as gone and was relaunched)
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        toks = []
+    if "http.server" in toks:
+        for i, t in enumerate(toks[toks.index("http.server") + 1:], toks.index("http.server") + 1):
+            if t in ("-d", "--directory") and i + 1 < len(toks):
+                wd = _join_dir(wd, toks[i + 1])
+                break
+            if t.startswith("--directory="):
+                wd = _join_dir(wd, t.split("=", 1)[1])
+                break
+    # a path the shell expands (~, $VAR) is not known here: say nothing
+    return "" if ("~" in wd or "$" in wd or "`" in wd) else wd
+
+
+def already_running_message(name, entry: dict, command, served: Optional[str] = None) -> str:
+    """§4NW (req 6b3e22a6): the refusal said "use restart to replace it" to
+    a start with a NEW command — restart relaunches the STORED one (the
+    model's fix of a wrong --directory served the old root again).
+    §4SK: `start` itself now replaces a service on a different command, so
+    the DIFFERENT branch here is reached only by direct callers."""
+    old, new = _norm_cmd(entry.get("command")), _norm_cmd(command)
+    _same = same_command(entry, command)
     # §4RI (request 43fe95a2): "already running" is INFORMATION, not a
     # refusal. The `Error:` head made the tool declare it REJECTED, which
     # counted as a failure strike — strike 1 of the 4 that fired a recovery
     # plan — for a call whose only fault was that the server was already
     # there. The note names the port and the directory it serves, so the
     # model can use it without a second call.
-    _where = ((f" serving {entry.get('workdir')}" if entry.get("workdir") else "")
+    _dir = served if served is not None else served_dir(entry)
+    _where = ((f" serving {_dir}" if _dir else "")
               + (f" at http://127.0.0.1:{entry.get('port')}/" if entry.get("port") else ""))
     head = f"Note: service '{name}' is already running (pid {entry.get('pid')}){_where} — nothing was launched"
-    if old and new and old not in _variants:
+    if old and new and not _same:
         return (f"{head}; it runs a DIFFERENT command: `{old[:200]}`"
                 + (f" (port {entry.get('port')})" if entry.get("port") else "") + ". "
                 f"Use it as it is if it serves what you need. action='restart' would relaunch THAT stored "
@@ -542,6 +625,17 @@ def _same_port(port, entry: dict) -> bool:
 
 
 from ..tools.outcome import ToolOutcome
+
+#: §4SK r2: a start that stopped the running service to replace it, then
+#: failed — (note, key, old entry) for the `start` wrapper (per thread)
+_REPLACE_TLS = threading.local()
+
+
+def _replace_record() -> tuple:
+    """This thread's (note, old key, old entry, new key), or () — never None,
+    so every caller unpacks a sequence."""
+    rec = getattr(_REPLACE_TLS, "done", None)
+    return rec if isinstance(rec, tuple) else ()
 
 
 def _launch_redirect_failed(out: str) -> bool:
@@ -746,6 +840,18 @@ class ServiceSupervisor:
         """Strict liveness — UNKNOWN reads as not-alive. Only where that is
         the safe direction (confirming a kill landed)."""
         return self._pid_state(pid) is True
+
+    def _dir_exists(self, path: str) -> bool:
+        """Does ``path`` exist as a directory in the container? Only the
+        probe's own "no" says missing; a failed probe (no output, an infra
+        error, an exception) reads as EXISTS — never call a live service
+        stale on an infra fault."""
+        try:
+            out, _ = self._exec(
+                f"sh -c 'test -d {shlex.quote(str(path))} && echo yes || echo no'", timeout=10)
+        except Exception:  # noqa: BLE001
+            return True
+        return str(out or "").strip().splitlines()[-1:] != ["no"]
 
     def _port_listening(self, port) -> bool:
         py = ("import socket,sys; s=socket.socket(); s.settimeout(1.5); "
@@ -1160,7 +1266,67 @@ class ServiceSupervisor:
     # -- operations ----------------------------------------------------------
 
     def start(self, name: str, command: str, *, port=None,
-              workdir: Optional[str] = None, project_id=None) -> str:
+              workdir: Optional[str] = None, project_id=None, _asked=None) -> str:
+        """§4SK: a start that REPLACED a running service says so on every
+        path, and the registry decides what happened. A row with a pid and a
+        fresh token IS the service now — the note leads the result. No such
+        row: the new command did not start, the old row is put back
+        (stopped) so `restart` brings the old command back. An exception
+        after the stop changes nothing in the registry (r4: a guessed
+        restore orphaned a launched process and contradicted a saved row);
+        the reply says what is known. The lock is held across the whole call
+        (r4: a stop between the run and the verdict was undone).
+        ``_asked``: (command, port) as originally asked — restart carries
+        them, so a restart does not forget a moved port."""
+        with self._lock:
+            _REPLACE_TLS.done = None
+            try:
+                out = self._start_impl(name, command, port=port, workdir=workdir,
+                                       project_id=project_id, _asked=_asked)
+            except Exception as e:  # noqa: BLE001
+                done = _replace_record()
+                if not done:
+                    raise
+                return ToolOutcome.failed(
+                    f"{done[0]} Then the start failed with {type(e).__name__}: {e} — the old service is "
+                    "stopped; whether the new command is running is NOT known (status may read it DEAD "
+                    "with no pid even if it runs — check with execute, e.g. `ps`, before a restart).",
+                    world_changed=True, reason_code="service_replace_failed")
+            finally:
+                done = _replace_record()
+                _REPLACE_TLS.done = None
+            if not done:
+                return out
+            note, old_key, old_entry, new_key = done
+            reg = self._load()
+            cur = reg.get(new_key)
+            if cur and cur.get("pid") and cur.get("token") != old_entry.get("token"):
+                # the ONE place the note is written (r3: three in-line copies)
+                if isinstance(out, ToolOutcome):
+                    return ToolOutcome(f"{note}\n{out}", status=out.status, world_changed=True,
+                                       reason_code=out.reason_code)
+                return f"{note}\n{out}"
+            if old_key not in reg:
+                reg[old_key] = old_entry        # old pid → reads DEAD, truthfully
+                self._save(reg)
+        _, _nm = split_key(old_key)
+        return ToolOutcome.failed(
+            f"{note} The new command did NOT start: {str(out).strip()} "
+            f"The old registration was kept (stopped): action='restart' name='{_nm}' "
+            "runs the old command again.",
+            world_changed=True,
+            reason_code=getattr(out, "reason_code", None) or "service_replace_failed")
+
+    def _start_impl(self, name: str, command: str, *, port=None,
+                    workdir: Optional[str] = None, project_id=None, _asked=None) -> str:
+        _asked_cmd = command
+        try:
+            _asked_port = int(port) if port is not None else None
+        except (TypeError, ValueError):
+            _asked_port = None
+        _asked_fixed = bool(_asked and _asked[0])
+        if _asked_fixed:                        # restart: the ORIGINAL ask, not the stored rewrite
+            _asked_cmd, _asked_port = _asked[0], _asked[1]
         # Callers (restart, project tooling) may pass a scoped KEY as the
         # name — normalize to (project_id, display-name) first so validation
         # and file stems see the display name. An explicit key's project
@@ -1222,8 +1388,35 @@ class ServiceSupervisor:
             if key is not None:
                 _, name = split_key(key)
             entry = reg.get(key) if key else None
-            if entry and self._entry_alive_or_unknown(entry):
-                return already_running_message(name, entry, command)
+            _replaced_note = ""
+            _replace = None
+            _state = self._entry_state(entry) if entry else False
+            if entry and _state is not False:
+                # §4SK (req a60aa2de): a `webos` entry from an earlier day
+                # — `cd /workspace/webos && python3 -m http.server`, the
+                # directory since deleted, every request a 404 — answered a
+                # start with a NEW command and port as "already running …
+                # use it as it is"; the model navigated to it, tried to copy
+                # its file into the missing directory, then did the stop and
+                # the start it had been told to do: 4 turns. A start that
+                # names a different command is a replace, done here in one
+                # call; a service whose served directory is gone is dead
+                # whatever its pid says.
+                # UNKNOWN liveness (an infra fault, §4GI) is never replaced:
+                # a kill that cannot be confirmed is a gamble — the note
+                if _state is None:
+                    return already_running_message(name, entry, command)
+                _dir = served_dir(entry)
+                _gone = bool(_dir) and not self._dir_exists(_dir)
+                if same_command(entry, command, workdir=workdir, port=port) and not _gone:
+                    return already_running_message(name, entry, command, served=_dir)
+                # the stop waits for the checks that can still refuse (the
+                # cap, the workdir): r2 — a refused workdir used to come back
+                # "nothing was launched" with the old service already killed
+                _replace = (key, entry, _dir,
+                            ("its directory " + _dir + " no longer exists" if _gone
+                             else "it ran a different command"))
+                reg.pop(key, None)
             # Re-key a resolved LEGACY (unscoped) entry into the bound
             # project's scope: the replacement entry below records the
             # ownership the old one lacked.
@@ -1237,6 +1430,78 @@ class ServiceSupervisor:
             if alive >= _max:
                 return (f"Error: {_max} services already running — "
                         f"stop one first (action='status' to list).")
+
+            # Resolve + VALIDATE the workdir BEFORE anything launches
+            # (2026-07-12). The launch below runs `cd <wd> && setsid …` inside
+            # an async subshell, where a cd failure is INVISIBLE: the service
+            # log's redirection opens after the cd, so nothing is written
+            # anywhere — the model saw only "not listening" and thrashed
+            # through identical retries (observed live: workdir
+            # '/projects/<id>' — a container-absolute path missing the
+            # /workspace prefix — cost a 137s request 3 failed launches).
+            # Default workdir: the bound project's workspace when it exists
+            # (a project's service serves ITS output — `python3 -m
+            # http.server` from /workspace would serve EVERY project's
+            # files), else the sandbox root as before.
+            if workdir is None and project_id:
+                _proj_wd = f"{CONTAINER_WORKDIR}/projects/{project_id}"
+                _, _p_code = self._exec(
+                    f"test -d {shlex.quote(_proj_wd)}", timeout=10)
+                if _p_code == 0:
+                    workdir = _proj_wd
+            wd = str(workdir or CONTAINER_WORKDIR)
+            if not wd.startswith("/"):
+                # Relative paths are relative to /workspace by contract.
+                wd = f"{CONTAINER_WORKDIR}/{wd}"
+            _root_file_server = (
+                wd.rstrip("/") == CONTAINER_WORKDIR.rstrip("/")
+                and re.search(r"\bhttp\.server\b|\bphp\s+-S\b", str(command))
+                and not re.search(r"--directory\b|(?<![\w-])-d\s", str(command)))
+            _, _wd_code = self._exec(f"test -d {shlex.quote(wd)}", timeout=10)
+            if _wd_code != 0:
+                _healed = None
+                if not wd.startswith(CONTAINER_WORKDIR):
+                    _cand = f"{CONTAINER_WORKDIR}{wd}"
+                    _, _h = self._exec(f"test -d {shlex.quote(_cand)}",
+                                       timeout=10)
+                    if _h == 0:
+                        _healed = _cand
+                if _healed:
+                    logger.info("manage_services: healed workdir %s -> %s",
+                                wd, _healed)
+                    wd = _healed
+                else:
+                    return (f"Error: workdir {wd!r} does not exist in the "
+                            f"sandbox. Paths are inside the container — use a "
+                            f"path relative to {CONTAINER_WORKDIR} (e.g. "
+                            f"'projects/<id>') or the full "
+                            f"{CONTAINER_WORKDIR}/... path. Nothing was "
+                            f"launched.")
+
+            if _replace is not None:
+                # §4SK: the replace's stop, after every check that can refuse
+                # without touching the old service and before the port lease
+                # (whose bind probe would read the old process's port as taken)
+                _old_key, _old_entry, _dir, _why = _replace
+                self._last_kill_survived = False
+                self._kill_service(_old_entry, others=reg.values())
+                if getattr(self, "_last_kill_survived", False):
+                    reg[_old_key] = _old_entry
+                    self._save(reg)
+                    return ToolOutcome.failed(
+                        f"Service '{name}' could NOT be replaced — the running process "
+                        f"(pid {_old_entry.get('pid')}) survived TERM+KILL and still holds its port. "
+                        f"Retry, or check {CONTAINER_SERVICES_DIR}/{_file_stem(_old_key)}.log",
+                        world_changed=False, reason_code="service_kill_survived")
+                _old_port = _old_entry.get("port")
+                _replaced_note = (f"Replaced the running '{name}' (pid {_old_entry.get('pid')}, "
+                                  f"`{_norm_cmd(_old_entry.get('command'))[:160]}`"
+                                  + (f" on port {_old_port}" if _old_port else "")
+                                  + (f", serving {_dir}" if _dir else "")
+                                  + f") — {_why}.")
+                _REPLACE_TLS.done = (_replaced_note, _old_key, _old_entry, key)
+                pretty_log("Service Replaced", f"{name}: {_why} — relaunching with the new command",
+                           icon=Icons.RETRY)
             # ── Port lease (2026-07-30, §4G) ──
             # Services exist to expose a project's output over HTTP
             # (operator definition), so EVERY start is granted a lease
@@ -1259,6 +1524,8 @@ class ServiceSupervisor:
                     if _cmd_port is not None:
                         if self._validate_port(_cmd_port) is None:
                             _requested = _cmd_port
+                            if not _asked_fixed and _asked_port is None:
+                                _asked_port = _cmd_port      # r3: the port the command asked for
                             _alloc_notes.append(
                                 f"no port argument — the command names "
                                 f"port {_cmd_port}, using it as the "
@@ -1316,52 +1583,6 @@ class ServiceSupervisor:
             # frameworks read it) and the explicit GHOST_SERVICE_PORT are set.
             self.host_dir.mkdir(parents=True, exist_ok=True)
 
-            # Resolve + VALIDATE the workdir BEFORE anything launches
-            # (2026-07-12). The launch below runs `cd <wd> && setsid …` inside
-            # an async subshell, where a cd failure is INVISIBLE: the service
-            # log's redirection opens after the cd, so nothing is written
-            # anywhere — the model saw only "not listening" and thrashed
-            # through identical retries (observed live: workdir
-            # '/projects/<id>' — a container-absolute path missing the
-            # /workspace prefix — cost a 137s request 3 failed launches).
-            # Default workdir: the bound project's workspace when it exists
-            # (a project's service serves ITS output — `python3 -m
-            # http.server` from /workspace would serve EVERY project's
-            # files), else the sandbox root as before.
-            if workdir is None and project_id:
-                _proj_wd = f"{CONTAINER_WORKDIR}/projects/{project_id}"
-                _, _p_code = self._exec(
-                    f"test -d {shlex.quote(_proj_wd)}", timeout=10)
-                if _p_code == 0:
-                    workdir = _proj_wd
-            wd = str(workdir or CONTAINER_WORKDIR)
-            if not wd.startswith("/"):
-                # Relative paths are relative to /workspace by contract.
-                wd = f"{CONTAINER_WORKDIR}/{wd}"
-            _root_file_server = (
-                wd.rstrip("/") == CONTAINER_WORKDIR.rstrip("/")
-                and re.search(r"\bhttp\.server\b|\bphp\s+-S\b", str(command))
-                and not re.search(r"--directory\b|(?<![\w-])-d\s", str(command)))
-            _, _wd_code = self._exec(f"test -d {shlex.quote(wd)}", timeout=10)
-            if _wd_code != 0:
-                _healed = None
-                if not wd.startswith(CONTAINER_WORKDIR):
-                    _cand = f"{CONTAINER_WORKDIR}{wd}"
-                    _, _h = self._exec(f"test -d {shlex.quote(_cand)}",
-                                       timeout=10)
-                    if _h == 0:
-                        _healed = _cand
-                if _healed:
-                    logger.info("manage_services: healed workdir %s -> %s",
-                                wd, _healed)
-                    wd = _healed
-                else:
-                    return (f"Error: workdir {wd!r} does not exist in the "
-                            f"sandbox. Paths are inside the container — use a "
-                            f"path relative to {CONTAINER_WORKDIR} (e.g. "
-                            f"'projects/<id>') or the full "
-                            f"{CONTAINER_WORKDIR}/... path. Nothing was "
-                            f"launched.")
 
             # Strip a redundant leading `cd X && ` when workdir already puts
             # us in X — the model habitually passes BOTH, and the inner
@@ -1525,6 +1746,9 @@ class ServiceSupervisor:
                 "token": _svc_token,
                 "workdir": wd, "started_at": time.time(),
                 "project_id": project_id,
+                # §4SK r2: the command and port as ASKED (before a taken port
+                # was moved) — the same start again is the same service
+                "asked": _norm_cmd(_asked_cmd), "asked_port": _asked_port,
                 "container_id": self._container_generation(),
             }
             self._save(reg)
@@ -1668,6 +1892,8 @@ class ServiceSupervisor:
                 # pid; comparing this at liveness time stops recycled pids
                 # from reading as RUNNING (review 2026-07-22).
                 "container_id": self._container_generation(),
+                # §4SK r2: as ASKED, before a taken port was moved
+                "asked": _norm_cmd(_asked_cmd), "asked_port": _asked_port,
             }
             self._save(reg)
 
@@ -2186,7 +2412,10 @@ class ServiceSupervisor:
             out = self.start(key, entry.get("command") or "",
                              port=_new_port,
                              workdir=entry.get("workdir"),
-                             project_id=entry.get("project_id"))
+                             project_id=entry.get("project_id"),
+                             # r3: the original ask survives the restart
+                             _asked=((entry.get("asked"), entry.get("asked_port"))
+                                     if entry.get("asked") else None))
             if out.startswith("Error:"):
                 reg2 = self._load()
                 if key not in reg2:

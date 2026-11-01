@@ -86,6 +86,35 @@ def _overwrite_refusal(host_path) -> str:
     return (f"'{Path(host_path).name}' already exists and is not a browser screenshot — "
             "a screenshot will not overwrite it. Pick a new out_path (e.g. shot_1.png).")
 
+def log_launch_race(pretty_log, operation, parsed, *, retry_failed=False) -> None:
+    """§4SK: the launch-race retry is information — 34 of 34 since 10-09
+    recovered and the model never saw the error. The runner's text rides
+    along: 7 of those came 16 s to 15 min after any browser activity, a
+    cause "still tearing down" does not cover. A retry that fails too is
+    the WARNING."""
+    from ..utils.logging import Icons
+    text = " ".join(str(parsed).split())[:240]
+    if retry_failed:
+        pretty_log("Browser Retry", f"{operation}: the launch-race retry failed too — {text[:200]}",
+                   icon=Icons.RETRY, level="WARNING")
+    else:
+        pretty_log("Browser Retry", "Chromium launch race (TargetClosedError) — retrying once after "
+                   f"settle — runner said: {text}", icon=Icons.RETRY)
+
+
+def log_profile_settle(pretty_log, operation, ok, parsed) -> None:
+    """§4SK: the runner waited for the previous call's Chromium to leave the
+    shared profile before launching (`profile_settle_s`) — said once."""
+    from ..utils.logging import Icons
+    try:
+        secs = float(parsed.get("profile_settle_s") or 0) if ok and isinstance(parsed, dict) else 0.0
+    except (TypeError, ValueError):
+        secs = 0.0
+    if secs:
+        pretty_log("Browser", f"{operation}: waited {secs:.1f}s for the previous Chromium to release the profile",
+                   icon=Icons.TOOL_BROWSER)
+
+
 async def _exec_holding_lock(fn, *args, **kwargs):
     """Run the (blocking) runner exec in a thread — and when the CALLER is
     cancelled, keep waiting for that thread before letting the lock go.

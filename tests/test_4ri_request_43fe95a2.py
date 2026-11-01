@@ -28,15 +28,17 @@ from tests.test_sandbox_services import FakeSandbox, happy_handler
 # ── already running = information, not a strike ─────────────────────────────
 
 def test_a_start_on_a_running_service_is_a_note_that_names_where_it_serves(tmp_path):
-    """Fails in the measured world: an `Error:` head, declared REJECTED, strike 1."""
+    """Fails in the measured world: an `Error:` head, declared REJECTED, strike 1.
+    §4SK: the note is for the SAME command; a different one replaces (see
+    test_4sk_webos_request_defects)."""
     sup = ServiceSupervisor(FakeSandbox(tmp_path, happy_handler()))
-    sup.start("webos", "cd /workspace/webos && python3 -m http.server ${PORT:-8100}", port=8101,
-              workdir="/workspace/webos")
-    out = sup.start("webos", "python3 -m http.server 8100", port=8100, workdir="/workspace/webos")
+    cmd = "cd /workspace/webos && python3 -m http.server 8101"
+    sup.start("webos", cmd, port=8101, workdir="/workspace/webos")
+    out = sup.start("webos", cmd, port=8101, workdir="/workspace/webos")
     assert out.startswith("Note: service 'webos' is already running")
     assert not out.lstrip().startswith(("Error:", "ERROR:"))
     assert "http://127.0.0.1:8101/" in out and "/workspace/webos" in out
-    assert "DIFFERENT command" in out and "action='stop'" in out        # the §4NW guidance stays
+    assert "same command" in out
 
 
 async def test_the_tool_declares_a_running_service_ok(tmp_path):
@@ -47,7 +49,7 @@ async def test_the_tool_declares_a_running_service_ok(tmp_path):
                                        port=8101, sandbox_manager=sb)
     assert first.status == OutcomeStatus.OK, str(first)
     again = await tool_manage_services(action="start", name="webos", command="python3 -m http.server 8100",
-                                       port=8100, sandbox_manager=sb)
+                                       port=8101, sandbox_manager=sb)
     assert again.status == OutcomeStatus.OK and not again.is_failure, str(again)
     assert "already running" in str(again) and "nothing was launched" in str(again)
     refused = await tool_manage_services(action="stop", name="no-such-service", sandbox_manager=sb)

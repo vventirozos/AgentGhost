@@ -508,6 +508,52 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
       "'&lt;name&gt;' was not started — the sandbox could not create its log file (…). Nothing is running." with the shell's own error.</li>
   </ul>
   <p>Pins: <code>tests/test_4rd_service_launch.py</code>; battery <code>scripts/mutate_4rd_b.py</code>.</p>
+
+  <h2 id="4sk">A start with a new command replaces; a vanished directory is dead <span class="tag">2026-10-31 &sect;4SK</span></h2>
+  <p>Request <code>a60aa2de</code> (a 91-minute webOS build): the registry held a <code>webos</code> entry from an earlier day —
+  <code>cd /workspace/webos &amp;&amp; python3 -m http.server</code> on 8101, pid alive, the directory since deleted, every request a 404.
+  The model's <code>start webos</code> with <code>python3 -m http.server 8100</code> was answered "already running (pid 758) serving /workspace
+  at http://127.0.0.1:8101/ — it runs a DIFFERENT command … use it as it is if it serves what you need, otherwise stop then start".
+  It navigated there (404), tried to copy its file into the missing directory, then did the stop and the start: four turns.</p>
+  <ul>
+    <li><strong>Served directory.</strong> <code>served_dir(entry)</code>: the workdir, moved by a leading <code>cd X &amp;&amp;</code>, then by a static server's
+    <code>--directory X</code>/<code>-d X</code>. The note says "serving /workspace/webos", not the workdir.</li>
+    <li><strong>A different command replaces.</strong> <code>start</code> with a command that is not the stored one (<code>same_command</code>: a dropped
+    <code>cd &lt;workdir&gt; &amp;&amp;</code> and an added port are the same; another port literal is not) stops the running service and launches the new one in
+    the same call. The result starts with <code>Replaced the running '&lt;name&gt;' (pid, `old command` on port P, serving D) — it ran a different command.</code>
+    A process that survives TERM+KILL is a declared failure (<code>service_kill_survived</code>) and the row is kept, as in <code>stop</code>.</li>
+    <li><strong>A vanished directory is dead.</strong> When the served directory no longer exists (<code>test -d</code> in the container), the entry is replaced
+    even for the same command — "its directory /workspace/webos no longer exists". A failed probe reads as present (never call a live service stale on an infra fault).</li>
+    <li><strong>Unknown liveness is never replaced.</strong> When the pid check cannot answer (an infra fault, <a href="#4gi">§4GI</a>), the start returns the note: a kill that cannot be confirmed would be a gamble on a service that may be live.</li>
+    <li><strong>Same command, directory present</strong> stays the §4RI note ("already running … same command — nothing to do").</li>
+  </ul>
+  <p><strong>Fresh-eye review (round 2).</strong></p>
+  <ul>
+    <li><strong>The stop waits for the checks.</strong> The old service is stopped only after the service cap and the workdir check pass, and before the port lease
+    (its bind probe would read the old process's port as taken). A refused workdir no longer kills the running service and says "Nothing was launched".</li>
+    <li><strong>A replacement that fails says so.</strong> When the new command does not come up (exits at once, no pid, launch error, no port), the reply starts with the
+    "Replaced the running …" line, then "The new command did NOT start: …", and the old row is kept (stopped) so <code>action='restart'</code> runs the old command again.
+    It is a declared failure that changed the world (<code>start</code> wraps <code>_start_impl</code>; the note travels per thread).</li>
+    <li><strong>The command as asked.</strong> Each entry stores <code>asked</code>/<code>asked_port</code>, the command and port before the allocator moved a taken port.
+    Re-issuing <code>python3 -m http.server 8100</code> that was stored as <code>… 8101</code> is the same service, not a kill and relaunch.</li>
+    <li><strong>An explicit <code>workdir</code> or <code>port</code> is part of the command.</strong> The same command in <code>projects/b</code> while the service serves
+    <code>projects/a</code> replaces it; a healed <code>/projects/a</code> is still <code>/workspace/projects/a</code>.</li>
+    <li><strong>The served directory reads only what it can know.</strong> Every leading <code>cd X &amp;&amp;</code>, quoted or not; <code>-d</code>/<code>--directory</code>
+    only after <code>http.server</code> (php's <code>-d</code> is an ini option, <code>serve -d</code> and <code>rails s -d</code> take no directory); a path with
+    <code>~</code>, <code>$</code> or a backtick is unknown and never called gone.</li>
+    <li>Unknown liveness returns the note without probing the directory.</li>
+  </ul>
+  <p><strong>Round 3.</strong> The registry decides, not the text: when the row holds a fresh token after a replace, the new run IS the service
+  (a port answered by another process included) and the note leads whatever the result says; otherwise the old row is put back and the reply says the
+  new command did not start. The note is written in that one place (three in-line copies removed). An exception after the stop becomes that declared
+  failure; one without a replace still raises. <code>restart</code> carries the original <code>asked</code>/<code>asked_port</code>, and a port the command
+  names is the asked port, so neither a restart nor <code>port=8100</code> on a moved service causes a kill and relaunch.</p>
+  <p><strong>Round 4.</strong> An exception after the stop no longer guesses: the registry is left as the run left it and the reply says the old
+  service is stopped and whether the new command runs is NOT known (check <code>action='status'</code>) — the round-3 restore had orphaned a launched process
+  and contradicted a saved row. <code>start</code> holds the lock for the whole call, so a <code>stop</code> from another thread cannot land between the run
+  and the verdict. Accepted: a new run killed for binding a RESERVED port keeps its (dead) row; its message says it was stopped.</p>
+  <p>Pins: <code>tests/test_4sk_webos_request_defects.py</code>; <code>test_sandbox_services.py</code> and <code>test_4ri_request_43fe95a2.py</code> retargeted
+  from "told to stop then start" to "replaced".</p>
 </main>
 </body>
 </html>

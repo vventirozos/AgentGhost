@@ -34,7 +34,7 @@ def test_the_address_and_descriptions_are_on_request_only(tmp_path):
     """Fails where the street address and a physical description rode 40/40
     owner turns (relevant to 4)."""
     out = _profile(tmp_path).get_context_string()
-    assert "Makedonias" not in out and "long straight hair" not in out
+    assert "makedonias" not in str(out).lower() and "long straight hair" not in out
     assert "Fotini" in out and "Athens" in out
     assert "root.address" in out and "relationships.fotini_description" in out   # named, so it can be asked for
 
@@ -54,7 +54,7 @@ def test_the_owner_can_add_on_demand_fields(tmp_path):
 def test_the_coding_persona_gets_the_preferences_only(tmp_path):
     from ghost_agent.core.agent import _specialist_profile
     out = _specialist_profile(SimpleNamespace(profile_memory=_profile(tmp_path)), "")
-    assert "ripgrep" in out and "Fotini" not in out and "Athens" not in out
+    assert "ripgrep" in out and "fotini" not in str(out).lower() and "athens" not in str(out).lower()
 
 
 def test_the_profile_closes_the_system_prompt():
@@ -108,7 +108,7 @@ def test_weather_never_geocodes_the_street_address(tmp_path):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "address", "Makedonias 83 Thrakomakedones 13676, Athens, Greece")
     loc = S._find_location_in_profile(pm.load())
-    assert not loc or "Makedonias" not in str(loc)
+    assert not loc or "makedonias" not in str(str(loc)).lower()
 
 
 # ── delegates and public replies ─────────────────────────────────────────────
@@ -136,7 +136,7 @@ def test_graph_chains_through_the_agents_own_nodes_are_dropped(tmp_path):
     g.add_triplets([{"subject": "ai", "predicate": "RESPONDED_TO", "object": "moe models"},
                     {"subject": "moe models", "predicate": "USE", "object": "sparse experts"}])
     out = g.get_neighborhood(["moe", "models"], 10)
-    assert out and not any("(Ai)" in x for x in out)
+    assert out and not any("(ai)" in x for x in out)
 
 
 @pytest.mark.asyncio
@@ -216,7 +216,7 @@ def test_an_address_under_any_key_is_hidden_and_scrubbed(tmp_path):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "location", "Athens, Greece")
     pm.update("root", "home_address", "Kifisias 10, Marousi")
-    assert "Kifisias" not in pm.get_context_string()
+    assert "kifisias" not in str(pm.get_context_string()).lower()
     out = _scrub_owner_private(json.dumps({"query": "gyms near Kifisias 10"}),
                                SimpleNamespace(profile_memory=pm), "web_search")
     assert "Kifisias 10" not in out
@@ -323,7 +323,7 @@ def test_request_verbs_do_not_name_owner_facts(tmp_path):
     g.add_triplets([{"subject": "user", "predicate": "KNOWS", "object": "regex"},
                     {"subject": "user", "predicate": "LIVES_IN", "object": "thrakomakedones"}])
     assert not any("KNOWS" in x for x in g.owner_facts_matching("do you know my view", 8))
-    assert any("Thrakomakedones" in x for x in g.owner_facts_matching("where do I live", 8))
+    assert any("thrakomakedones" in x for x in g.owner_facts_matching("where do I live", 8))
 
 
 def test_the_agent_filter_drops_only_the_agents_own_lines(tmp_path):
@@ -334,7 +334,7 @@ def test_the_agent_filter_drops_only_the_agents_own_lines(tmp_path):
                     {"subject": "framework", "predicate": "USES", "object": "python"},
                     {"subject": "assistant", "predicate": "GENERATED", "object": "framework diagram"}])
     out = g.get_neighborhood(["ghost", "framework"], 10)
-    assert any("Ghost" in x for x in out) and not any("(Assistant)" in x for x in out)
+    assert any("ghost" in x for x in out) and not any("(assistant)" in x for x in out)
 
 
 def test_the_off_topic_gate_measures_only_kept_rows():

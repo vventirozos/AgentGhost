@@ -301,7 +301,7 @@ def test_merge_drops_edge_between_the_merged_nodes(gm):
     assert rows == [("new york", "IN", "usa")]
     assert not gm.nx_graph.has_edge("new york", "new york")
     # No neighbourhood duplication from a phantom loop.
-    assert gm.get_neighborhood(["new york"]) == ["- (New York) -[IN]-> (Usa)"]
+    assert gm.get_neighborhood(["new york"]) == ["- (new york) -[IN]-> (usa)"]
 
 
 def test_merge_keeps_genuine_self_loop(gm):

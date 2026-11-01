@@ -82,7 +82,9 @@ async def test_agent_graph_ingestion_background_task(mock_agent):
         
         # Verify profile_memory was dispatched
         # §4QM: the extractor passes the ledger source (the owner's clause) as a kwarg
-        assert any(c.args[:4] == (agent.context.profile_memory.update, "likes", "food", "apples")
+        # Review 2026-10-31: the extractor's free-form category folds onto the
+        # standard drawer ("likes" → preferences), so a fact gets one home
+        assert any(c.args[:4] == (agent.context.profile_memory.update, "preferences", "food", "apples")
                    and c.kwargs.get("source", {}).get("via") == "extractor"
                    for c in mock_to_thread.call_args_list), mock_to_thread.call_args_list
         

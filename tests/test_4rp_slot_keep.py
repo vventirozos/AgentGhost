@@ -184,9 +184,9 @@ async def test_the_stream_reports_when_it_opened():
     real = L.note_main_slot_prompt
     t0 = time.monotonic()
 
-    def spy(llm, payload, label="", background=False, opened_at=None):
+    def spy(llm, payload, label="", background=False, opened_at=None, usage=None):
         seen["opened_at"] = opened_at
-        return real(llm, payload, label, background, opened_at)
+        return real(llm, payload, label, background, opened_at, usage)
     L.note_main_slot_prompt = spy
     try:
         async for _ in c.stream_chat_completion(_head("q")):

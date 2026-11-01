@@ -1143,7 +1143,7 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
             file_size = int(stat_res.st_size)
             # Audio/video are EXEMPT from the byte cap (2026-08-02). The cap
             # exists to stop a huge text/PDF being pulled into RAM — but a
-            # recording never is: ffmpeg seeks to each ~12-minute window and
+            # recording never is: ffmpeg seeks to each window (2 min on Whisper, §4SL) and
             # only that window's WAV is resident, so peak memory is flat
             # regardless of file size. The operative bound for a recording is
             # DURATION (GHOST_AUDIO_MAX_S, enforced in audio_ingest), not
@@ -1253,7 +1253,8 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
         # meetings) used to be unreachable: it would fall through to the
         # plain-text branch below and decode as replacement-char noise, so a
         # whole media class was invisible to the knowledge base. It is now
-        # transcribed on the Gemma 4 audio node ~12 minutes at a time, and
+        # transcribed on nova (Whisper since §4SL, 2 minutes at a time; the
+        # Gemma 4 audio node when GHOST_STT_URL is unset), and
         # every chunk is stamped with its TIMESTAMP RANGE so a retrieved
         # passage is citable back to the moment in the recording. Video
         # containers work too — ffmpeg simply takes the audio track.
@@ -2049,7 +2050,59 @@ the a an of and or to in for on with by from at is are was were be been
 being as that this these those it its into about over under how what
 when where which who why not no do does did can could should would will
 may might must i you he she they we us our your their his her
+user users
 """.split())
+# Retrieval review 2026-10-31: "user"/"users" were content words, and every
+# owner edge carries "(User)" — "what's the postgres user home directory"
+# kept all 15 owner edges (Fotini's birthdate, places visited). The owner's
+# facts reach an OWNER question through `owner_facts_matching`, not this
+# topical filter. (§4SE r5 fixed the same query for the vector rows only.)
+
+#: the " [Score N]" and " (as of 2026-10-30)" suffixes the two graph lookups
+#: add to an edge line (review r1: a weighted edge still printed twice)
+_AS_OF_SUFFIX = __import__("re").compile(r"(?:\s*\[Score \d+\]|\s*\(as of [^)]*\))+\s*$")
+
+#: request words that name no topic, for the past-request filter
+_EPISODE_FILTER_STOP = frozenset({"what", "did", "say", "said", "tell", "told", "ask", "asked", "about",
+                                  "remember", "yesterday", "today", "last", "time", "week", "earlier",
+                                  "the", "and", "you", "for", "was", "were", "how", "who", "why", "when",
+                                  "where", "which", "can", "could", "would", "should", "does", "this", "that",
+                                  "user", "users", "know", "have", "has", "had", "with", "from", "into",
+                                  # review r2: a WHEN or a "we talked" is not a topic — "what did we talk
+                                  # about this morning?" hid every row
+                                  "talk", "talked", "discuss", "discussed", "chat", "chatted", "mention",
+                                  "mentioned", "morning", "afternoon", "evening", "night", "tonight", "ago",
+                                  "day", "days", "hour", "hours", "minutes", "month", "recently", "before",
+                                  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                                  "our", "your", "mine", "any", "all", "some", "something", "things", "thing",
+                                  "other", "two", "three", "few", "couple", "weekend", "been", "talking",
+                                  "discussing", "asking", "saying", "doing", "earlier", "previous", "ago",
+                                  # Greek function and time words (review r2: "μου", "για" passed everything)
+                                  "μου", "σου", "του", "της", "μας", "σας", "τους", "για", "τον", "την", "τη",
+                                  "των", "στο", "στη", "στην", "στον", "στα", "και", "που", "τι", "τις", "τα",
+                                  "ειπα", "ειπες", "ειπαμε", "συζητησαμε", "μιλησαμε", "ρωτησα", "χθες", "εχθες",
+                                  "σημερα", "πριν", "πρωι", "βραδυ", "εβδομαδα", "θυμασαι", "ποτε", "ηταν",
+                                  "ζητησα", "ειχαμε", "πει", "προηγουμενη", "περασμενη", "μερες", "μερα"})
+# the query is casefolded (ς → σ) before the lookup
+_EPISODE_FILTER_STOP = frozenset(w.replace("ς", "σ") for w in _EPISODE_FILTER_STOP)
+
+
+def _episode_word(w: str) -> str:
+    """Plural/possessive folded: "kids" ~ "kid", "cars" ~ "car" (review r2)."""
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+
+def _episode_on_topic(query: str, text: str) -> bool:
+    """A past request shares a content word (3+ letters) with the question.
+    Review r1: the 4-letter graph rule hid "my car makes a noise" from "what
+    did I say about my car yesterday" (car, bmw, dog, tax, ssh, vpn)."""
+    import re as _re
+    q = {_episode_word(w) for w in _re.findall(r"\w+", _graph_fold(query))
+         if len(w) >= 3 and w not in _EPISODE_FILTER_STOP and not w.isdigit()}
+    if not q:
+        return True
+    t = {_episode_word(w) for w in _re.findall(r"\w+", _graph_fold(text))}
+    return bool(q & t) or any(len(w) > 3 and w in _graph_fold(text) for w in q)
 
 
 def _graph_fold(text: str) -> str:
@@ -2165,6 +2218,13 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
             continue
         if _ungradable and len(valid_chunks) >= 5:
             continue
+        # Retrieval review 2026-10-31: a past REQUEST row ("status update !",
+        # "proceed", retrieval_count 325) sits at MEDIUM distance from almost
+        # any short question; 9 of 18 replayed owner questions read "best
+        # match: MEDIUM" over such rows only. A past request is shown when it
+        # shares a content word with the question (the graph tier's rule).
+        if m_type == "episode" and not _episode_on_topic(str(query), str(text)):
+            continue
         # r5: with documents out of scope, the owner's profile rows (0.37–0.45
         # to anything) filled the ten slots of "chown owner of a file" or "owner
         # email address of the domain" — the street address among them. Off an
@@ -2258,7 +2318,17 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                     else:                                    # an older store: owner questions only
                         _own = await asyncio.to_thread(_ofm, query) if _about_owner else []
                     if isinstance(_own, list):
-                        edges = list(dict.fromkeys([e for e in _own if isinstance(e, str)] + list(edges)))
+                        # Retrieval review 2026-10-31: keyed WITHOUT the
+                        # " (as of …)" suffix the owner-fact lookup adds and
+                        # the neighbourhood does not — every owner edge was
+                        # printed twice ("is high memory usage ok…")
+                        _seen_e, _merged = set(), []
+                        for e in [e for e in _own if isinstance(e, str)] + list(edges):
+                            _key = _AS_OF_SUFFIX.sub("", str(e)).strip().lower()
+                            if _key not in _seen_e:
+                                _seen_e.add(_key)
+                                _merged.append(e)
+                        edges = _merged
                 if edges:
                     # KB review 10-30: its own section — under the vector grade it
                     # was labelled "probably UNRELATED" over the owner's exact facts
@@ -4205,6 +4275,27 @@ async def resync_all_owner_mirrors(profile_memory, graph_memory=None, memory_sys
     return done, lagging
 
 
+def _profile_learned_epochs(profile_memory, cat: str, k: str) -> dict:
+    """folded value → epoch the profile LEARNED it (its stored ``as_of``), for
+    the mirrors (retrieval review 2026-10-31). {} when unknown. Never raises."""
+    try:
+        import datetime as _dt
+        from ..memory.profile import unwrap as _uw, stamp_of as _st
+        raw = ((profile_memory.load_raw() or {}).get(cat) or {}).get(k)
+        out = {}
+        for it in (raw if isinstance(raw, list) else [raw]):
+            iso = _st(it)
+            if not iso:
+                continue
+            d = _dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=_dt.timezone.utc)
+            out[str(_uw(it)).lower().strip()] = d.timestamp()
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, memory_system=None,
                              previous=None) -> list:
     """§4KZ: the PROFILE is the authority for an owner field; its graph edges
@@ -4233,6 +4324,14 @@ async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, m
     try:
         if profile_memory.is_on_demand(cat, k) is True:     # `is True`: a test double is truthy
             values = []
+        else:
+            # Retrieval review 2026-10-31: the check passed no value, so a
+            # street address under an ordinary key (root.location =
+            # "Makedonias 83, Thrakomakedones 13676") was hidden from the
+            # profile render but mirrored into the graph — and "where do I
+            # live?" put it into the prompt. The render checks each VALUE;
+            # so does the mirror.
+            values = [v for v in values if profile_memory.is_on_demand(cat, k, value=v) is not True]
     except Exception:  # noqa: BLE001
         pass
     # KB review 10-30: mirrors are named by category + key (`mirror_name`); a
@@ -4245,13 +4344,20 @@ async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, m
         _retire = False
     _prev = [str(x) for x in (previous if isinstance(previous, list) else [previous])
              if x not in (None, "") and not isinstance(x, (dict, list))]
+    _when = _profile_learned_epochs(profile_memory, cat, k)
     lag = []
     for name, store in (("graph", graph_memory), ("vector", memory_system)):
         if store is None or not hasattr(store, "sync_owner_field"):
             continue
         try:
-            await asyncio.to_thread(store.sync_owner_field, k, values, category=cat, retire_legacy=_retire,
-                                    legacy_values=_prev)
+            _kw = dict(category=cat, retire_legacy=_retire, legacy_values=_prev)
+            try:
+                import inspect as _insp
+                if "as_of_by_value" in _insp.signature(store.sync_owner_field).parameters:
+                    _kw["as_of_by_value"] = _when
+            except (TypeError, ValueError):
+                pass
+            await asyncio.to_thread(store.sync_owner_field, k, values, **_kw)
         except Exception as e:  # noqa: BLE001
             logger.warning("owner mirror %s for %s.%s lagged: %s", name, cat, k, e)
             lag.append(name)

@@ -144,7 +144,8 @@
   <p>A healthy Slack bot is <em>quiet</em>. Its error log staying empty is the signal that it's fine; check the info log for its heartbeat if you want positive confirmation it's alive.</p>
 
   <h2>Voice</h2>
-  <p>Built into the web UI rather than a separate service. Speech-to-text runs on a worker node over your tailnet; text-to-speech is the local <code>say</code> command on macOS.</p>
+  <p>Built into the web UI rather than a separate service. Hold the mic button and speak; when you let go, the clip is transcribed and sent as an ordinary message. Speech-to-text runs on Whisper (large-v3) on the helper box over your tailnet, in Greek or English — the language is detected per clip. Text-to-speech is the local <code>say</code> command on macOS.</p>
+  <p>Measured on read speech, Whisper gets about 1 word in 8 wrong in Greek and 1 in 20 in English, in about 3 seconds per clip. Background noise before and after you speak is cut by voice-activity detection; without it Whisper tends to invent a phrase on silence.</p>
   <p>Both halves are local or tailnet-only, which matters: no cloud speech service means no account, no API key, and your voice never leaves your own network. That constraint is why it's built this way rather than using a hosted transcription API.</p>
 
   <h2>Desktop client</h2>

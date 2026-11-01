@@ -109,7 +109,10 @@ _TAG_Q = re.compile(r"\b(?:right|correct|huh|eh|yes|no)\s*$|(?<!\w)(?:σωστα
 #: SENTENCE level only, in `owner_statements` and `owner_clause_for` alike
 _LEAD_IN = re.compile(r"^\s*(?:(?:hi|hey|hello|yo|ok(?:ay)?|so|and|well|also|ghost|γει[αά](?:\s+σου)?|ε|λοιπον|λοιπόν)[,!\s]+)+",
                       re.IGNORECASE)
-_CLAUSE_SPLIT = r",|;|:|\bbut\b|\binstead\b|\bwhereas\b|(?<!\w)αλλ[αά](?!\w)"
+#: review r3 (2026-10-31): a reason is its own clause — "I don't live in
+#: Patras anymore since we moved to Athens" negated Athens too
+_CLAUSE_SPLIT = (r",|;|:|\bbut\b|\binstead\b|\bwhereas\b|\bbecause\b|\bsince\b|(?<!\w)αλλ[αά](?!\w)"
+                 r"|(?<!\w)(?:γιατ[ιί]|επειδ[ηή]|αφο[υύ])(?!\w)")
 #: words that say nothing about WHICH fact it is
 _STOP = frozenset("""user users the a an and or of to in on at for with is are was were has have had be been being
 their his her its this that who which as by from also now currently am do does did very really just about
@@ -153,6 +156,35 @@ def owner_lines(episode: str) -> list:
             # like speaker marks are quoted by the arc builder (`_unmark_roles`)
             out.append(ln.strip())
     return out
+
+
+def latest_owner_episode(episode: str) -> str:
+    """The episode cut down to its LAST owner message (``USER:`` line plus its
+    unmarked continuation lines), still speaker-marked so `owner_lines` and
+    `owner_statements` read it as before.
+
+    Consolidation review 2026-10-31: a journal item carries the last four
+    messages, so the owner's sentence from the previous turn was extracted
+    AGAIN on this turn's item — "my dog's name is Hanzo" stored twice 5 s
+    apart, and the memory-usage note written under two different keys 4 s
+    apart. Each owner message has its own journal item; extraction reads only
+    that one. An episode with no speaker marks (a legacy item) is returned
+    unchanged; one whose last owner message is another person's (labelled)
+    returns ""."""
+    text = str(episode or "")
+    lines = text.splitlines()
+    roles = [re.match(r"\s*(user|ai|assistant|system|tool)\s*:", ln, re.IGNORECASE) for ln in lines]
+    if not any(roles):
+        return text
+    start = None
+    for i, m in enumerate(roles):
+        if m and m.group(1).lower() == "user":
+            start = i
+    if start is None:
+        return ""
+    end = next((j for j in range(start + 1, len(lines)) if roles[j]), len(lines))
+    out = "\n".join(lines[start:end])
+    return "" if not owner_lines(out) else out
 
 
 def owner_statements(episode: str) -> list:
@@ -243,6 +275,71 @@ def cue_for_field(category, key) -> str:
         if toks & keys:
             return PREDICATE_CUES.get(pred, "")
     return ""
+
+
+#: a field ABOUT someone or something other than the owner's own life —
+#: grouped, so `assets.dogs` and `pet.dog_name` are about the same subject
+_FIELD_SUBJECTS = {
+    "spouse": {"wife", "husband", "spouse", "partner", "girlfriend", "boyfriend", "fiance", "fiancee"},
+    "pet": {"pet", "pets", "dog", "dogs", "cat", "cats", "puppy", "kitten"},
+    "child": {"son", "sons", "daughter", "daughters", "kid", "kids", "child", "children", "baby"},
+    "parent": {"father", "mother", "dad", "mom", "mum", "parent", "parents"},
+    "sibling": {"brother", "brothers", "sister", "sisters", "sibling", "siblings"},
+    "other": {"friend", "friends", "boss", "colleague", "colleagues", "neighbour", "neighbor", "office", "school",
+              "business", "previous", "former", "old", "holiday", "vacation", "summer", "family"},
+}
+
+
+def _field_tokens(category, key):
+    return (set(re.split(r"[^a-z]+", str(category or "").lower())) - {""},
+            set(re.split(r"[^a-z]+", str(key or "").lower())) - {""})
+
+
+def field_subject(category, key) -> frozenset:
+    """Who/what a profile field is about, beyond the owner: {"spouse"} for
+    relationships.wife_employer, {"pet"} for assets.dogs, empty for
+    root.employer. Review r2: `wife_employer` read as the OWNER's employer."""
+    ct, kt = _field_tokens(category, key)
+    return frozenset(g for g, words in _FIELD_SUBJECTS.items() if (ct | kt) & words)
+
+
+def field_kind(category, key) -> str:
+    """The single-valued predicate KIND a profile field holds (``LIVES_IN`` for
+    root.location, ``MARRIED_TO`` for relationships.wife_name …), or "" for a
+    field with no kind (assets.vehicles, pet.dog_name).
+
+    Review r2: every ``*_name`` was HAS_NAME (son_name ~ father_name) and a
+    relative's field took the owner's kind (wife_employer → WORKS_AT,
+    office_location → LIVES_IN). A field about someone else has a kind only
+    when it IS the spouse (wife_name → MARRIED_TO); one whose words name two
+    kinds (work_location) has none."""
+    ct, kt = _field_tokens(category, key)
+    subj = field_subject(category, key)
+    if subj:
+        if subj == {"spouse"} and kt <= _FIELD_SUBJECTS["spouse"] | {"name", "named", "full", "first"}:
+            return "MARRIED_TO"
+        return ""
+    kinds = {pred for pred, keys in _FIELD_CUES if (ct | kt) & keys}
+    return next(iter(kinds)) if len(kinds) == 1 else ""
+
+
+#: extractor predicates → the field kind they state (beyond the graph's own
+#: canonical_predicate aliases), for matching an owner correction to a field
+_PREDICATE_KINDS = {
+    "HAS_LOCATION": "LIVES_IN", "HAS_ADDRESS": "LIVES_IN", "LOCATED_IN": "LIVES_IN", "LIVES_AT": "LIVES_IN",
+    "WORKS_FOR": "WORKS_AT", "EMPLOYED_BY": "WORKS_AT", "HAS_EMPLOYER": "WORKS_AT", "WORKS_IN": "WORKS_AT",
+    "IS_A": "HAS_PROFESSION", "IS_AN": "HAS_PROFESSION", "IS": "HAS_PROFESSION", "WORKS_AS": "HAS_PROFESSION",
+    "HAS_OCCUPATION": "HAS_PROFESSION", "HAS_ROLE": "HAS_PROFESSION", "HAS_JOB_TITLE": "HAS_PROFESSION",
+    "IS_NAMED": "HAS_NAME", "NAMED": "HAS_NAME", "IS_CALLED": "HAS_NAME",
+}
+
+
+def predicate_kind(canonical_predicate) -> str:
+    """The field kind an (already canonicalised) predicate states, or ""."""
+    p = str(canonical_predicate or "").upper().strip()
+    if p in PREDICATE_CUES:
+        return p
+    return _PREDICATE_KINDS.get(p, "")
 
 
 #: what a statement must SAY for a single-valued owner fact to change — a

@@ -110,7 +110,7 @@ def test_a_project_name_miss_does_not_offer_random_rows_as_related_facts():
     from ghost_agent.tools import projects as P
     m = _Mem([_row(0.373, text="User dog_name is Hanzo")])
     out = str(asyncio.run(P._not_found_with_recall(SimpleNamespace(memory_system=m), "xyzzy-42")))
-    assert "Hanzo" not in out
+    assert "hanzo" not in str(out).lower()
     assert m.calls[0]["where"] == {"type": {"$nin": ["document", "document_summary", "episode_outside",
                                                      "identity"]}}
     m2 = _Mem([_row(0.20, text="Project Kestrel ships in September.")])
@@ -303,7 +303,7 @@ def test_recall_shows_an_on_demand_field_the_question_names(tmp_path):
     out = asyncio.run(mem.tool_recall("where do I live?", memory_system=_Mem([]), profile_memory=pm))
     assert "Makedonias 83" in out and "UNRELATED" not in out
     out2 = asyncio.run(mem.tool_recall("what is my dog called?", memory_system=_Mem([]), profile_memory=pm))
-    assert "Makedonias" not in out2
+    assert "makedonias" not in str(out2).lower()
 
 
 # ── ingest ───────────────────────────────────────────────────────────────────
@@ -535,17 +535,21 @@ def test_r2_owner_rows_chosen_by_field_not_distance():
     from ghost_agent.tools.memory import tool_recall
     ident = [{"id": "a", "score": 0.42, "text": "User location is Athens", "metadata": {"type": "identity"}},
              {"id": "b", "score": 0.55, "text": "User company is EvolMonkey", "metadata": {"type": "identity"}}]
-    ep = [{"id": "e", "score": 0.38, "text": "proceed", "metadata": {"type": "episode"}}]
+    # §4SN: a past request is shown only when it shares a word with the question
+    ep = [{"id": "e", "score": 0.38, "text": "plan my work week", "metadata": {"type": "episode"}}]
     out = str(asyncio.run(tool_recall(query="where do I work?", memory_system=_recall_vm(ep, ident))))
     assert "User company is EvolMonkey" in out and "User location is Athens" not in out
-    assert out.index("STORED PROFILE FACTS") < out.index("CONTENT: proceed")
+    assert out.index("STORED PROFILE FACTS") < out.index("CONTENT: plan my work week")
 
 
 def test_r2_greek_question_is_ungraded():
     from ghost_agent.tools.memory import tool_recall
-    rows = [{"id": "g", "score": 0.15, "text": "άλογα ιπποδρόμου", "metadata": {"type": "episode"}}]
+    # §4SN: the row shares a word with the question (an unrelated past request is not shown)
+    rows = [{"id": "g", "score": 0.15, "text": "η πρωτεύουσα της Χιλής", "metadata": {"type": "episode"}},
+            {"id": "h", "score": 0.10, "text": "άλογα ιπποδρόμου", "metadata": {"type": "episode"}}]
     out = str(asyncio.run(tool_recall(query="Ποια είναι η πρωτεύουσα του Περού;", memory_system=_recall_vm(rows, []))))
     assert "UNGRADED" in out and "RELEVANCE: HIGH" not in out and "best match: HIGH" not in out
+    assert "Χιλής" in out and "ιπποδρόμου" not in out
 
 
 def test_r2_project_fallback_respects_public_and_skips_identity(monkeypatch, tmp_path):
@@ -557,7 +561,7 @@ def test_r2_project_fallback_respects_public_and_skips_identity(monkeypatch, tmp
     ctx = SimpleNamespace(memory_system=vm)
     monkeypatch.setattr(L, "reply_is_public", lambda: True)
     out = asyncio.run(_not_found_with_recall(ctx, "dog website"))
-    assert "Hanzo" not in out and not vm.search_advanced.called
+    assert "hanzo" not in str(out).lower() and not vm.search_advanced.called
     monkeypatch.setattr(L, "reply_is_public", lambda: False)
     asyncio.run(_not_found_with_recall(ctx, "dog website"))
     assert "identity" in vm.search_advanced.call_args.kwargs["where"]["type"]["$nin"]
@@ -713,7 +717,7 @@ def test_r3_greek_kind_lookup_needs_an_owner_question():
         ["(User) -[HAS_ADDRESS]-> (Thrakomakedones)"] if extended or q.isascii() else [])
     vm = _recall_vm([], [])
     out = str(asyncio.run(tool_recall(query="πόσο κοστίζει ένα σπίτι για οκτώ άτομα;", memory_system=vm, graph_memory=gm)))
-    assert "Thrakomakedones" not in out
+    assert "thrakomakedones" not in str(out).lower()
     out = str(asyncio.run(tool_recall(query="πού είναι το σπίτι μου;", memory_system=vm, graph_memory=gm)))
     assert "Thrakomakedones" in out
     out = str(asyncio.run(tool_recall(query="health conditions", memory_system=vm, graph_memory=gm)))
@@ -751,7 +755,7 @@ def test_r5_user_or_owner_in_a_query_does_not_open_the_owner_sections():
     for q in ("postgres user home directory", "github repository owner address", "user's wife name"):
         out = str(asyncio.run(tool_recall(query=q, memory_system=_recall_vm([], []), graph_memory=gm,
                                           profile_memory=_P())))
-        assert "Makedonias" not in out and gm.owner_facts_matching.call_args.kwargs["extended"] is False
+        assert "makedonias" not in str(out).lower() and gm.owner_facts_matching.call_args.kwargs["extended"] is False
 
 
 def test_r5_base_vocabulary_is_the_pre_review_one():
@@ -788,7 +792,7 @@ def test_r5_profile_rows_need_a_medium_match_off_an_owner_question():
     rows = [{"id": "a", "score": 0.40, "text": "User address is Makedonias 83", "metadata": {"type": "identity"}},
             {"id": "b", "score": 0.30, "text": "User grep_tool is ripgrep", "metadata": {"type": "identity"}}]
     out = str(asyncio.run(tool_recall(query="owner email address of the domain", memory_system=_recall_vm(rows, []))))
-    assert "Makedonias" not in out and "ripgrep" in out
+    assert "makedonias" not in str(out).lower() and "ripgrep" in out
 
 
 # ── battery survivors (scripts/mutate_kb_1030.py r1) ──

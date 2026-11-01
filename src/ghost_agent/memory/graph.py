@@ -618,6 +618,25 @@ class GraphMemory:
         "σκυλος": {"dog", "pet"}, "σκυλι": {"dog", "pet"},
         "δουλευω": {"profession", "occupation", "works", "employed", "employer", "company"},
         "εργαζομαι": {"profession", "occupation", "works", "employed", "employer", "company"},
+        # Retrieval review 2026-10-31 (replayed misses on the live stores):
+        # "do I have heart problems?", "τι προβλήματα υγείας έχω;" (the
+        # inflection is matched below), "what pets do I have", "what
+        # motorcycle do I ride", "what's my kid's name", "what do I
+        # specialise in" — each found nothing in the tail block
+        "heart": {"condition", "conditions", "medication", "medications", "diagnosis", "disease", "health"},
+        "καρδια": {"condition", "conditions", "medication", "medications", "diagnosis", "disease", "health"},
+        "pet": {"pet", "dog", "cat"}, "pets": {"pet", "dog", "cat"}, "dog": {"pet", "dog"}, "cat": {"pet", "cat"},
+        "κατοικιδιο": {"pet", "dog", "cat"}, "κατοικιδια": {"pet", "dog", "cat"},
+        "cars": {"car", "vehicle", "vehicles", "owns", "drives"},
+        "vehicles": {"car", "vehicle", "vehicles", "owns", "drives"},
+        "motorcycle": {"vehicle", "vehicles", "motorcycle", "drives"},
+        "motorcycles": {"vehicle", "vehicles", "motorcycle", "drives"},
+        "motorbike": {"vehicle", "vehicles", "motorcycle", "drives"},
+        "bike": {"vehicle", "vehicles", "motorcycle", "drives"},
+        "kid": {"son", "sons", "daughter", "daughters", "child", "children"},
+        "specialise": {"specializes", "specialized", "specialty", "expertise"},
+        "specialize": {"specializes", "specialized", "specialty", "expertise"},
+        "expertise": {"specializes", "specialized", "specialty", "expertise"},
     }
     # KB review 10-30 r2: keyed by the FOLDED word. `_fold` casefolds, and
     # casefold turns a final "ς" into "σ", so "σκυλος" never matched "σκύλος"
@@ -638,13 +657,57 @@ class GraphMemory:
     _ADDED_KIND_KEYS = {_fold(w) for w in (
         "location", "μενω", "σπιτι", "διευθυνση", "λενε", "ονομα", "λεγομαι", "ονομαζομαι", "αυτοκινητο",
         "αμαξι", "μηχανη", "οχημα", "οδηγω", "γεννηθηκα", "γενεθλια", "παιδια", "παιδι", "γιος", "γιοι",
-        "κορη", "γυναικα", "συζυγος", "σκυλος", "σκυλι", "δουλευω", "εργαζομαι")}
+        "κορη", "γυναικα", "συζυγος", "σκυλος", "σκυλι", "δουλευω", "εργαζομαι",
+        # retrieval review 10-31: owner questions only ("a heart rate monitor",
+        # "a bike route", "my cat command" must not print the owner's facts
+        # on an ordinary recall)
+        "heart", "καρδια", "pet", "pets", "dog", "cat", "κατοικιδιο", "κατοικιδια", "motorcycle", "motorcycles",
+        "motorbike", "cars", "vehicles",
+        "bike", "kid", "specialise", "specialize", "expertise")}
     _CATEGORY_WORDS_BASE: dict = {}
     for _k, _v in _CATEGORY_WORDS.items():          # a loop: a class-body comprehension
         if _k not in _ADDED_KIND_KEYS:              # cannot see the class's names
             _CATEGORY_WORDS_BASE[_k] = _v - _ADDED_KIND_WORDS.get(_k, set())
     del _k, _v
     _INFL = ("", "s", "es", "ed", "ing", "ies")
+    #: what may follow the shared stem in a Greek inflection (folded: no accents)
+    _GREEK_ENDINGS = frozenset({"", "α", "ας", "ασ", "ες", "εσ", "ε", "ων", "ου", "υ", "ους", "ουσ", "υς", "υσ",
+                                "ο", "ος", "οσ", "οι", "ι", "η", "ης", "ησ", "ν", "ς", "σ", "ιου", "ιων", "ια",
+                                "ιας", "ιασ", "ιες", "ιεσ",
+                                "τα", "τος", "τοσ", "των"})      # -μα nouns: ονομα → ονοματα (review r3)
+
+    @staticmethod
+    def _greek_kind_key(w: str, kinds: dict) -> str:
+        """The kind key a GREEK word is an inflection of ("υγειας" → υγεια,
+        "παιδιων" → παιδια), or "". Retrieval review 2026-10-31: the lookup
+        was exact, so the genitive in "τι προβλήματα υγείας έχω;" found no
+        health fact. Greek only: a shared stem of ≥ 3 letters, the key cut by at
+        most its last letter, and the rest of the word a case ending
+        (`_GREEK_ENDINGS`: "παιδεια" and "παιδικο" are not "παιδι"); English
+        keeps exact keys."""
+        if not w or w.isascii() or w in kinds:
+            return w if w in kinds else ""
+        best = ""
+        for k in kinds:
+            if k.isascii():
+                continue
+            n = 0
+            for a, b in zip(w, k):
+                if a != b:
+                    break
+                n += 1
+            # the KEY may differ only in its last letter (υγεια/υγειας,
+            # παιδια/παιδιων) — review r1: "παιδεία" (education) shared the
+            # stem παιδ- of παιδιά (children)
+            # review r2: the word's remainder must be a CASE ENDING — "γιο",
+            # "γιου", "κορες" were missed and "παιδικο" (kindergarten) /
+            # "σπιτικο" (homemade) matched παιδι / σπιτι
+            # The key's cut letter is a NOUN ending (γιοσ → γιο, κορη → κορες);
+            # a verb key's ω is not cut ("μεν" is a particle, not μενω)
+            if (n >= max(3, len(k) - 1) and k[n:] in ("", "σ", "ς", "α", "η")
+                    and w[n:] in GraphMemory._GREEK_ENDINGS and n > len(best)):
+                best = k
+        return best
 
     @classmethod
     def _word_names_predicate_token(cls, w: str, tok: str) -> bool:
@@ -676,17 +739,24 @@ class GraphMemory:
         implied = set()
         _kinds = self._CATEGORY_WORDS if extended else self._CATEGORY_WORDS_BASE
         for w in words:
-            implied |= _kinds.get(w, set())
+            # the inflected form opens on an OWNER question only (the base
+            # vocabulary stays exact: "υγείας υπουργείο νέα" is news)
+            implied |= _kinds.get(w, set()) or (
+                _kinds.get(self._greek_kind_key(w, _kinds), set()) if extended else set())
         implied -= stop
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 # NEWEST first, and the date is shown (§4KZ: by weight, a
                 # stale "located at kyllini" outranked the current home and
                 # the model could not tell which was newer)
+                # Retrieval review 2026-10-31: the date shown is WHEN IT WAS
+                # STATED (valid_from), not the row's last touch (timestamp —
+                # rewritten by every re-sync and weight bump)
                 rows = conn.execute(
-                    "SELECT subject, predicate, object, COALESCE(weight, 1), timestamp FROM triplets "
+                    "SELECT subject, predicate, object, COALESCE(weight, 1), "
+                    "COALESCE(strftime('%Y-%m-%d', valid_from, 'unixepoch'), timestamp) FROM triplets "
                     "WHERE valid_until IS NULL AND (lower(subject) = 'user' OR lower(object) = 'user') "
-                    "ORDER BY timestamp DESC").fetchall()
+                    "ORDER BY COALESCE(valid_from, CAST(strftime('%s', timestamp) AS REAL)) DESC").fetchall()
         out = []
         for s_, p_, o_, _w, _ts in rows:
             raw = _fold(p_).split("_")
@@ -720,7 +790,7 @@ class GraphMemory:
                 and (_p is None or self.canonical_predicate(r[1]) == _p)]
 
     def sync_owner_field(self, key: str, values, category: str = "root", retire_legacy: bool = False,
-                         legacy_values=()) -> tuple:
+                         legacy_values=(), as_of_by_value=None) -> tuple:
         """Make the owner's ``user HAS_<NAME>`` edges EQUAL ``values`` (the
         profile field, now): stale ones deleted (archived), missing ones
         added. §4KZ: a profile change left the old HAS_WIFE/HAS_EMPLOYER/
@@ -746,8 +816,22 @@ class GraphMemory:
                     "SELECT object FROM triplets WHERE valid_until IS NULL AND lower(subject) = 'user' "
                     "AND predicate = ?", (pred,)).fetchall()]
         removed = sum(self.delete_edge("user", pred, o, mirror=True) for o in live if str(o).lower().strip() not in want)
-        added = self.add_triplets([{"subject": "user", "predicate": pred, "object": v}
-                                   for v in want if v not in {str(o).lower().strip() for o in live}], raw=True)
+        # Retrieval review 2026-10-31: a mirror edge is stated WHEN THE PROFILE
+        # LEARNED the value (``as_of_by_value``: folded value → epoch), not when
+        # the mirror was (re)written — the 10-30 re-sync made every owner edge
+        # read "as of 2026-10-30" beside the profile's "as of 2026-07-07", and
+        # the model chose "the most recent data"
+        _live_f = {str(o).lower().strip() for o in live}
+        _when = {str(k).lower().strip(): w for k, w in (as_of_by_value or {}).items() if w}
+        added = 0
+        _plain = [v for v in want if v not in _live_f and v not in _when]
+        if _plain:
+            added += self.add_triplets([{"subject": "user", "predicate": pred, "object": v} for v in _plain],
+                                       raw=True)
+        for v in want:
+            if v not in _live_f and v in _when:
+                added += self.add_triplets([{"subject": "user", "predicate": pred, "object": v}],
+                                           raw=True, as_of=float(_when[v]))
         if retire_legacy and legacy != pred:
             # KB review 10-30 r2: only once the qualified edges are written — a
             # failed insert must not take the fact's last copy with it
@@ -1591,11 +1675,17 @@ class GraphMemory:
 
     @staticmethod
     def _format_path(chain: Tuple[Tuple[str, str, str], ...], score: int) -> str:
+        # Retrieval review 2026-10-31: names are stored folded to lowercase
+        # (the dedup key), and `.title()` re-cased them wrongly — the model saw
+        # "Bmw 118I", "Evolmonkey - Postgresql Services", "(Born 2016-11-25)"
+        # and repeated them. Shown as stored; only the owner node is named.
+        def _disp(x):
+            return "User" if str(x).strip().lower() == "user" else str(x)
         first = chain[0][0]
-        parts = [f"({first.title()})"]
+        parts = [f"({_disp(first)})"]
         for s, p, o in chain:
             parts.append(f"-[{p}]->")
-            parts.append(f"({o.title()})")
+            parts.append(f"({_disp(o)})")
         line = "- " + " ".join(parts)
         if score > len(chain):
             line += f" [Score {score}]"

@@ -297,7 +297,7 @@ grep "\[SYSTEM\]" "$GHOST_HOME/system/ghost-agent.log" | tail -40</pre>
   <pre>2026-08-04 19:35:16 - GhostStream - INFO  - [1165839c +0.08s] llm request — Turn 1 | Temp 0.20
 2026-08-04 19:35:24 - GhostStream - DEBUG - [1165839c +7.78s] thinking — The user is asking for the…
 2026-08-04 19:35:24 - GhostStream - INFO  - [1165839c +7.79s] system weather — Location: Reykjavik
-2026-08-04 20:10:41 - GhostStream - INFO  - [SYSTEM] memory journal — Consolidated 1 memor(ies): smart_memory: I moved to Reykjavik last month</pre>
+2026-08-04 20:10:41 - GhostStream - INFO  - [SYSTEM] memory journal — read 1 memory</pre>
 
   <p><code>[SYSTEM]</code> in place of a request id means the agent did that on its own — background work, not something you asked for. Filtering on it is the quickest way to see what the idle scheduler has been doing; each idle pass that did work leaves one <code>idle cycle — ran …</code> line, ending with the failure-replay slot's result when that slot ran.</p>
 

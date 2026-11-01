@@ -2059,6 +2059,28 @@
   <code>projects._background_job_keys</code> (hygiene for old data); <code>_subagent_allowed_tools</code> (coding-loop
   leaves and <a href="isolation.html">core/isolation</a> use it); <a href="../memory/readonly.html">memory/readonly.py</a>.</li>
 </ul>
+
+<h2 id="4sk">§4SK (2026-10-31): the composed-URL brake and the link check learn what is the agent's own</h2>
+<ul>
+  <li><strong>Brake.</strong> <code>_UrlProvenance</code> keyed its 404 memory by hostname: a 404 on <code>127.0.0.1:8101</code> (a stale server) refused
+  <code>127.0.0.1:8100/index.html</code> (the server the model had just started) as "a composed address". Loopback, LAN and <code>file://</code> addresses are the
+  agent's own apps and services, never guesses from a search; they are skipped in <code>note_failure</code> and <code>refusal</code>, by the browser tool's own
+  <code>browser_routes._is_own_host</code>, so both say the same thing.</li>
+  <li><strong>Link check.</strong> <code>unfetched_links(…, markup=True)</code> for <code>.html</code>/<code>.htm</code>/<code>.xhtml</code> drops the page's asset tags
+  (<code>link</code>, <code>script</code>, <code>img</code>, <code>source</code>, <code>iframe</code>, <code>meta</code>, media, <code>embed</code>, <code>object</code>, <code>use</code>, <code>base</code>)
+  and CSS <code>url()</code>/<code>@import</code> before reading URLs; an <code>&lt;a href&gt;</code> and a bare URL in text still count — that is how an HTML report cites.
+  Both the write-time LINK CHECK and the reply-time Source check use it (<code>is_markup_path</code>). Live: a web app's Google Fonts <code>&lt;link&gt;</code> was reported twice as an unread citation.</li>
+  <li><strong>Review round 2.</strong> In markup, the code inside <code>&lt;script&gt;…&lt;/script&gt;</code> (a <code>fetch()</code> of an API, an ES-module CDN import,
+  JSON-LD) is not a citation (a linear <code>str.find</code> scan, an unclosed script runs to the end); a quoted attribute value may hold <code>&gt;</code>;
+  <code>&lt;image&gt;</code> and <code>&lt;input type=image&gt;</code> are assets; every run is bounded (20k unclosed <code>url(</code> took 39 s, now under 1 s).
+  <code>.xhtml</code> documents are link-checked. The brake's host drops only a <code>www.</code> prefix (<code>lstrip("www.")</code> made <code>web.archive.org</code>
+  <code>eb.archive.org</code> and the refusal told the model to search <code>site:3.org</code> for <code>www.w3.org</code>). Markdown image embeds are still read as citations (left).</li>
+  <li><strong>Review round 3.</strong> Scripts and comments are found with case-insensitive searches on the text itself (offsets from <code>lower()</code>
+  drift on "İ" and cut a citation), with a real tag-name boundary (<code>&lt;script-note&gt;</code>, <code>&lt;link-card&gt;</code> are custom elements); an
+  unclosed script or comment keeps the rest of the page; scripts go before the code-span strip (a backtick in two inline scripts swallowed the citation
+  between them).</li>
+  <li><strong>Review round 4.</strong> HTML comments close as the spec says: <code>&lt;!--&gt;</code> and <code>&lt;!---&gt;</code> are empty, <code>--!&gt;</code> closes one.</li>
+</ul>
 </main>
 
 <h2 id="4mm">§4MM (2026-10-08): image provenance, the disclaimer guard, the promotion footer</h2>

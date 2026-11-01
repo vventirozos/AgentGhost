@@ -24,6 +24,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
 import time
 import shutil
 import socket
@@ -538,6 +539,49 @@ def _attach_diagnostics(page):
     return js_errors, console_msgs
 
 
+#: §4SK: how long a launch waits for the previous call's Chromium to leave
+#: the shared profile (6 × 0.5 s)
+_PROFILE_SETTLE_STEPS = 6
+_PROC = "/proc"
+
+
+def _profile_holders(profile_dir) -> int:
+    """Processes whose argv carries `--user-data-dir=<profile_dir>` — the
+    previous call's Chromium still shutting down (0 where /proc is absent)."""
+    # the whole argument (r2: `/tmp/p` counted a Chromium on `/tmp/p2`)
+    needle = ("--user-data-dir=" + str(profile_dir or "")).encode() + b"\0"
+    n = 0
+    try:
+        for d in os.listdir(_PROC):
+            if not d.isdigit() or int(d) in (os.getpid(), os.getppid()):
+                continue
+            try:
+                with open(f"{_PROC}/{d}/cmdline", "rb") as f:
+                    if needle in f.read(65536) + b"\0":
+                        n += 1
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return n
+
+
+async def _settle_profile(profile_dir) -> float:
+    """§4SK (req a60aa2de): the host lock serialises runner processes, not
+    Chromium's own shutdown — 27 of the 34 launch-race retries since 10-09
+    came within 10 s of the previous launch (the screenshot+interact pair the
+    model issues in one turn hit it every time). Wait here, bounded, until
+    no Chromium holds the profile; returns the seconds waited."""
+    if not profile_dir or not _profile_holders(profile_dir):
+        return 0.0
+    t0 = time.time()
+    for _ in range(_PROFILE_SETTLE_STEPS):
+        await asyncio.sleep(0.5)
+        if not _profile_holders(profile_dir):
+            break
+    return time.time() - t0
+
+
 async def _with_context(profile_dir, proxy, timeout_ms, op_fn, total_ms=None, on_timeout=None):
     """Open a persistent context, run op_fn(page), close cleanly.
 
@@ -553,6 +597,7 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn, total_ms=None, on
     agent can SEE a silent JS crash instead of guessing at a frozen page.
     """
     os.makedirs(profile_dir, exist_ok=True)
+    _waited = await _settle_profile(profile_dir)           # §4SK
     async with async_playwright() as p:
         launch_kwargs = dict(
             user_data_dir=profile_dir,
@@ -642,6 +687,8 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn, total_ms=None, on
                     result.setdefault("js_errors", js_errors)
                 if console_msgs:
                     result.setdefault("console", console_msgs)
+                if _waited >= 0.4:
+                    result.setdefault("profile_settle_s", round(_waited, 1))
             return result
         finally:
             try:
@@ -900,6 +947,168 @@ _CANDIDATES_JS = """() => {
 
 _MISSING_SELECTORS: set = set()       # per runner process = per browser call
 
+#: §4SK: the `[attr="value"]` tests in a selector (`#dock .dock-app[data-app="calculator"]`);
+#: r2: escaped quotes inside a value, the `i`/`s` case flag
+_ATTR_TEST_RE = re.compile(
+    r'\[\s*([A-Za-z_][\w:-]*)\s*(?:[~|^$*]?=\s*(?:"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|([^\]\s]+)))?'
+    r'\s*(?:[iIsS]\s*)?\]')
+#: an attribute test inside `:not(…)` asks for its ABSENCE (r2); the text
+#: pseudo-classes take TEXT, not attribute tests (r3: `a:has-text("[Edit]")`
+#: blamed an `Edit` attribute) — both skipped with their balanced arguments
+_PSEUDO_SKIP_RE = re.compile(r":(?:not|has-text|text|text-is|text-matches)\(", re.IGNORECASE)
+#: a Playwright engine prefix that is not CSS (`text=[foo]`, `xpath=…`, `//…`,
+#: `internal:role=…`, `nth=3`) — judged per `>>` part (r3)
+_ENGINE_RE = re.compile(r"^\s*(?://|\.\.|(?!css=)[A-Za-z_:-]+=)")
+_ATTR_HINT_TESTS = 3                  # at most this many page evaluates per hint
+
+#: r2: does THIS attribute test match anything (operators kept: `~=`, `^=` …),
+#: and which values does the attribute take (first 24) — the document and
+#: every open shadow root, as Playwright's CSS engine sees them
+_ATTR_TEST_JS = """([test, a]) => {
+  const roots = [document];
+  const vals = [];
+  let hit = false, more = false, capped = false, seen = 0;
+  for (let r = 0; r < roots.length && seen < 20000; r++) {
+    const root = roots[r];
+    try { if (root.querySelector(test)) hit = true; } catch (e) { return null; }
+    for (const e of root.querySelectorAll('*')) {
+      if (++seen > 20000) { capped = true; break; }
+      if (e.shadowRoot) roots.push(e.shadowRoot);
+      const v = e.getAttribute(a);
+      if (v !== null && !vals.includes(v)) {
+        if (vals.length < 24) vals.push(v); else more = true;
+      }
+    }
+  }
+  return {hit, vals, more: more || capped, capped};
+}"""
+
+
+def _skip_quoted(s: str, i: int) -> int:
+    """Index after the quoted string that opens at ``s[i]`` (backslash
+    escapes respected); ``len(s)`` when it never closes."""
+    q, i = s[i], i + 1
+    while i < len(s):
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == q:
+            return i + 1
+        i += 1
+    return len(s)
+
+
+def _skip_to(s: str, i: int, open_c: str, close_c: str) -> int:
+    """Index after the ``close_c`` that balances an ``open_c`` just before
+    ``s[i]``, quotes respected; -1 when it never closes."""
+    depth = 1
+    while i < len(s):
+        c = s[i]
+        if c in "\"'":
+            i = _skip_quoted(s, i)
+            continue
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if not depth:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _attr_tests(sel):
+    """§4SK r4: the attribute tests of a Playwright selector the hint may
+    name, read in ONE quote-aware pass — r2/r3 layered regexes over the raw
+    text and each round found a quoted value leaking into the structure
+    (`[aria-label="Next >>"]` was cut at its `>>`; `[title=":not(x)"]` lost
+    its value). `>>` splits only outside quotes; an engine part (`text=`,
+    `nth=`, `internal:role=`, xpath) is skipped; `:not(…)` and the text
+    pseudo-classes are skipped with their arguments; every `[…]` outside
+    quotes is a candidate. Returns [(test text, match of _ATTR_TEST_RE)]."""
+    s = str(sel or "")
+    parts, start, i = [], 0, 0
+    while i < len(s):
+        if s[i] in "\"'":
+            i = _skip_quoted(s, i)
+            continue
+        if s.startswith(">>", i):
+            parts.append(s[start:i])
+            i += 2
+            start = i
+            continue
+        i += 1
+    parts.append(s[start:])
+    out = []
+    for part in parts:
+        if _ENGINE_RE.match(part):
+            continue
+        p = part.strip()
+        p = p[4:] if p.startswith("css=") else p
+        i = 0
+        while i < len(p):
+            c = p[i]
+            if c in "\"'":
+                i = _skip_quoted(p, i)
+                continue
+            m = _PSEUDO_SKIP_RE.match(p, i) if c == ":" else None
+            if m:
+                j = _skip_to(p, m.end(), "(", ")")
+                if j < 0:
+                    break
+                i = j
+                continue
+            if c == "[":
+                j = _skip_to(p, i + 1, "[", "]")
+                if j < 0:
+                    break
+                mm = _ATTR_TEST_RE.fullmatch(p[i:j])
+                if mm:
+                    out.append((p[i:j], mm))
+                i = j
+                continue
+            i += 1
+    return out
+
+
+async def _attribute_hint(page, sel) -> str:
+    """§4SK (req a60aa2de): the selector tested `data-app="calculator"` on a
+    page whose dock items say `data-app="calc"`. The candidates list names
+    buttons, links and inputs — the dock items are divs with listeners, so
+    it listed the open windows' controls and the model blamed timing, two
+    interact turns. The certain fact: this attribute test matches nothing,
+    and the values the attribute DOES take. r2: the test itself is asked of
+    the page (the 24-value list and a dropped `~=`/`^=` named a matching
+    test as the cause); a test that matches is never named."""
+    parts = []
+    seen = set()
+    tried = 0
+    for test, m in _attr_tests(sel):
+        attr = m.group(1)
+        if attr.lower() in seen or attr.lower() in ("id", "class", "style"):
+            continue
+        seen.add(attr.lower())
+        if tried >= _ATTR_HINT_TESTS:
+            break
+        tried += 1
+        try:
+            res = await page.evaluate(_ATTR_TEST_JS, [test, attr])
+        except Exception:
+            continue
+        if not isinstance(res, dict) or res.get("hit") or not isinstance(res.get("vals"), list):
+            continue
+        vals = res["vals"]
+        if not vals:
+            if not res.get("capped"):           # r3: past the scan cap, absence is not known
+                parts.append(f"no element on the page has a {attr} attribute")
+        elif any(g is not None for g in m.groups()[1:]):
+            shown = ", ".join(str(v) if len(str(v)) <= 60 else str(v)[:60] + "…(cut)" for v in vals)
+            parts.append(f"no element matches {test}; {attr} values on the page: "
+                         + shown + (", …" if res.get("more") else ""))
+        if len(parts) >= 2:
+            break
+    return " ".join(p + "." for p in parts)
+
 #: §4NW: a cheap signature of what the page shows — the URL plus a hash of
 #: the live DOM (inline styles and classes included, so an opened window, a
 #: toggled class or a typed digit all change it).
@@ -1091,11 +1300,13 @@ async def _require_selector(page, sel, timeout_ms):
         cands = await page.evaluate(_CANDIDATES_JS)
     except Exception:
         cands = []
+    _attr_hint = await _attribute_hint(page, sel)
     _MISSING_SELECTORS.add(sel)
     listed = "; ".join(cands) if cands else "none found"
     raise ValueError(
         f"selector {sel!r} did not match any element within {probe_ms}ms. "
-        f"Clickable elements on this page: {listed}. Use one of those "
+        + (_attr_hint + " " if _attr_hint else "")
+        + f"Clickable elements on this page: {listed}. Use one of those "
         f"selectors (or read the page with extract_text first) — do not guess.")
 
 

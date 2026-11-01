@@ -198,9 +198,9 @@ def test_what_counts_as_coding_progress(fname, op, target, err, ran, want):
 
 def test_the_budget_line_names_the_ceiling_only_when_there_is_one():
     line = client_deadline_line(3600, 10800)
-    assert line.startswith("time budget 60 min") and "extendable to 180 min" in line
-    assert "extendable" not in client_deadline_line(3600)
-    assert "extendable" not in client_deadline_line(3600, 3600)
+    assert line == "60 min, 5 min kept for the reply; up to 180 min while coding"
+    assert "while coding" not in client_deadline_line(3600)
+    assert "while coding" not in client_deadline_line(3600, 3600)
 
 
 # ── the progress hook, run as the turn loop runs it ───────────────────────── #

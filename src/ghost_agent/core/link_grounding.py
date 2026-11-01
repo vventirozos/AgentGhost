@@ -185,11 +185,87 @@ def _cite_norm(url: str) -> str:
     return f"{host}{m.group(3).rstrip('/')}"
 
 
-def unfetched_links(text: str, fetched: Iterable[str]) -> List[str]:
+#: §4SK (req a60aa2de): in an HTML page the URLs of its ASSETS — stylesheets,
+#: fonts, scripts, images, frames, `url()` in CSS — are not citations; the
+#: Google Fonts <link> of a web app was flagged twice as "a link written into
+#: the file that was not opened". An <a href> is kept: that is how an HTML
+#: report cites.
+#: r2: a quoted attribute value may hold `>` (`alt="a>b"`, `onclick="if(a>b)…"`);
+#: each value is bounded so an unclosed quote cannot scan the whole file per tag
+_ASSET_TAG_RE = re.compile(
+    r"<(?:link|script|img|image|input|source|iframe|meta|video|audio|track|embed|object|use|base)(?=[\s/>])"
+    r"(?:\"[^\"]{0,1500}\"|'[^']{0,1500}'|[^'\">]){0,1500}>",
+    re.IGNORECASE)
+#: bounded runs (r2: an unclosed `url(https://…` scanned to the end of the
+#: text from every match start — 20k repeats took 39 s)
+_CSS_URL_RE = re.compile(r"url\(\s*['\"]?https?://[^)'\"\s]{0,2000}['\"]?\s*\)"
+                         r"|@import\s+(?:url\()?['\"]?https?://[^;'\")\s]{1,2000}",
+                         re.IGNORECASE)
+
+
+#: r3: a real tag-name boundary (`<script-note>` is a custom element), case-insensitive
+#: searches on the TEXT itself — offsets taken from `body.lower()` drift where lowering
+#: changes the length ("İ" → 2 characters) and cut a citation instead of a script
+_NOISE_OPEN_RE = re.compile(r"<!--|<script(?=[\s/>])", re.IGNORECASE)
+_SCRIPT_END_RE = re.compile(r"</script\s*>", re.IGNORECASE)
+_COMMENT_END_RE = re.compile(r"--!?>")
+
+
+def _strip_script_bodies(body: str) -> str:
+    """The code inside `<script>…</script>` — a `fetch()` of an API, an ES
+    module import from a CDN, JSON-LD — is not a citation (r2), and neither
+    is an HTML comment (r3: `<!-- TODO add <script> analytics -->` opened a
+    "script" that swallowed every later citation). An UNCLOSED script or
+    comment is left as it is: dropping the rest of the page would drop
+    citations; flagging a script URL is the safer error. Linear."""
+    out, i = [], 0
+    while True:
+        m = _NOISE_OPEN_RE.search(body, i)
+        if not m:
+            break
+        if m.group(0) == "<!--":
+            # r4: the HTML spec's early closes — `<!-->` and `<!--->` are empty
+            # comments, `--!>` closes one too (each ran on to the next `-->`)
+            if body.startswith(">", m.end()):
+                close = m.end() + 1
+            elif body.startswith("->", m.end()):
+                close = m.end() + 2
+            else:
+                e = _COMMENT_END_RE.search(body, m.end())
+                if not e:
+                    break
+                close = e.end()
+            out.append(body[i:m.start()])
+            i = close
+            continue
+        gt = body.find(">", m.end())
+        if gt < 0:
+            break
+        e = _SCRIPT_END_RE.search(body, gt + 1)
+        if not e:
+            break
+        out.append(body[i:gt + 1])
+        i = e.start()
+    out.append(body[i:])
+    return "".join(out)
+
+
+def is_markup_path(path) -> bool:
+    return str(path or "").lower().rstrip().endswith((".html", ".htm", ".xhtml"))
+
+
+def unfetched_links(text: str, fetched: Iterable[str], *, markup: bool = False) -> List[str]:
     """§4OG-3 (d): the http(s) URLs in `text` (prose or markdown links, code
-    spans skipped) that no fetched-OK URL matches, in order, deduplicated."""
+    spans skipped) that no fetched-OK URL matches, in order, deduplicated.
+    ``markup``: the text is an HTML page — its asset tags and CSS url()s are
+    dropped first (§4SK)."""
     have = {_cite_norm(u) for u in (fetched or []) if u}
-    body = _CODE_RE.sub(" ", str(text or ""))
+    body = str(text or "")
+    if markup:
+        # scripts first (r3): a backtick in one inline script paired with one
+        # in a later script and the code-span strip took the text between
+        body = _CSS_URL_RE.sub(" ", _ASSET_TAG_RE.sub(" ", _strip_script_bodies(body)))
+    body = _CODE_RE.sub(" ", body)
     out: List[str] = []
     seen = set()
     for m in _URL_RE.finditer(body):

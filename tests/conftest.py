@@ -82,6 +82,13 @@ for _live_var, _live_default in (
         # §4OW: the LLM judge is OFF in production (operator); its logic stays pinned by the
         # legacy tests — tests/test_4ow_judge_off.py pins the default.
         ("GHOST_VERIFIER_JUDGE", "1"),
+        # §4SL: both launchers export GHOST_STT_URL (whisper on nova); a suite run
+        # from a shell carrying it would send every Gemma-path pin to the real
+        # server. tests/test_4sl_whisper_stt.py sets the whisper backend itself.
+        ("GHOST_STT_URL", ""),
+        ("GHOST_STT_LANGUAGE", ""),
+        ("GHOST_STT_WINDOW_S", ""),
+        ("GHOST_STT_WINDOW_OVERLAP_S", ""),
 ):
     os.environ[_live_var] = _live_default
 

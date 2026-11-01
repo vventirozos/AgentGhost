@@ -24,6 +24,13 @@ class RetryableConsolidationError(Exception):
     log-and-swallow made the drop permanent and invisible."""
 
 
+class ConsolidationNodeDown(RetryableConsolidationError):
+    """Every worker node failed (consolidation review 2026-10-31): the item is
+    kept WITHOUT spending a retry and the drain stops — the rest of the batch
+    would fail the same way, and an outage of hours must not exhaust
+    ``JOURNAL_MAX_RETRIES`` and drop the owner's facts."""
+
+
 # --- transient classification -------------------------------------------
 # Phrases that only ever appear in a failure whose *cause* is upstream
 # state (a restarted / busy / disconnected llama-server), i.e. re-running
@@ -435,8 +442,10 @@ class MemoryJournal:
         in at recovery and the item was consolidated twice."""
         try:
             e = entry
-            if isinstance(entry, dict) and "retries" in entry:
-                e = {k: v for k, v in entry.items() if k != "retries"}
+            # `node_down` (§4SN): the worker-outage counter, mutated like retries
+            _volatile = ("retries", "node_down")
+            if isinstance(entry, dict) and any(k in entry for k in _volatile):
+                e = {k: v for k, v in entry.items() if k not in _volatile}
             return json.dumps(e, sort_keys=True)
         except Exception:
             return None

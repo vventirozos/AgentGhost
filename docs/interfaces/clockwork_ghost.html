@@ -673,6 +673,20 @@
       running script), the three newest backups are kept, and the restart is confirmed by the
       <em>same pid six seconds apart</em> and no <code>CRASHED</code> line &mdash; "a client is
       alive" passed on a crash loop, because the launcher had restarted it.</li>
+    <li><strong>The face's own modules ship with it (2026-10-31).</strong> <code>deploy.sh</code>
+      copied only <code>matrix_graph.js</code> into <code>webface/</code>; when the web face
+      began importing <code>./temperament.js</code> (<a href="web_server.html">face
+      temperament, §4SG</a>) the handheld's face failed its module load and the deploy
+      reported <em>THE FACE FAILED TO START</em> on a black background. The deploy now reads
+      the face's <code>from './x.js'</code> import lines and copies every sibling from
+      <code>interface/static/</code>, following their imports in turn (so a future sibling
+      ships by itself). <code>three</code> and <code>three/addons/…</code> come from
+      <code>webface/vendor/</code> through the page's import map and are not copied. A sibling
+      missing from <code>interface/static/</code> stops the deploy before anything reaches the
+      device. Pins: <code>test_deploy_ships_the_modules_the_face_imports</code>,
+      <code>test_deploy_stops_before_the_device_when_a_face_import_is_missing</code>,
+      <code>test_the_real_face_imports_exist_in_static</code> in
+      <code>tests/test_clockwork_ux.py</code>.</li>
     <li><strong><code>device_probe.py</code></strong> builds the real <code>MainWindow</code>
       offscreen on the device, with the WebGL face replaced by a recorder and the agent by a fake
       served from a thread, and drives real turns through it: 98 checks. It replaces the three

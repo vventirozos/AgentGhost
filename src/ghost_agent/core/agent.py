@@ -2014,6 +2014,75 @@ def _query_has_tokens(text) -> bool:
         return False
 
 
+#: the extractor's free-form category → the profile's standard drawer
+#: (consolidation review 2026-10-31: "technical preference" became a new
+#: section the coding persona's `preferences` filter never shows)
+_EXTRACTOR_CATEGORY_RULES = (
+    (re.compile(r"\b(?:prefer\w*|tastes?|likes?|settings?)\b"), "preferences"),
+    (re.compile(r"\b(?:relation\w*|family|spouse|wife|husband|child(?:ren)?|kids?|sons?|daughters?|parents?)\b"),
+     "relationships"),
+    (re.compile(r"\b(?:interests?|hobb(?:y|ies)|passions?)\b"), "interests"),
+    (re.compile(r"\b(?:assets?|vehicles?|cars?|propert(?:y|ies)|possessions?|belongings?)\b"), "assets"),
+    (re.compile(r"^(?:root|identity|personal|basic|user|owner|bio|about|profile)"
+                r"(?: (?:info|information|details|data|profile|facts))?$"), "root"),
+)
+
+
+def _extractor_category(category) -> str:
+    """Fold an extractor category onto the profile's standard drawers; an
+    unrecognised one is kept (folded to lowercase, single-spaced)."""
+    c = " ".join(str(category or "").strip().lower().replace("_", " ").split())
+    for rx, drawer in _EXTRACTOR_CATEGORY_RULES:
+        if rx.search(c):
+            return drawer
+    return c
+
+
+#: key words that name no subject of their own ("dog_name" is about a dog)
+_GENERIC_KEY_WORDS = frozenset({"name", "names", "info", "note", "notes", "value", "values", "detail", "details",
+                                "general", "other", "misc", "current", "main", "my", "the", "of"})
+
+
+def _key_stems(key) -> set:
+    toks = {t for t in re.split(r"[^a-z0-9]+", str(key or "").lower()) if t and t not in _GENERIC_KEY_WORDS}
+    return {t[:-1] if len(t) > 3 and t.endswith("s") else t for t in toks}
+
+
+def _profile_field_holding(profile_memory, value, category=None, key=None) -> str:
+    """``"category.key"`` of a RELATED profile field whose value (or list
+    item) IS ``value`` (case/accent-folded), else "". Related = the same
+    single-valued kind (both location fields) or a shared key word
+    (`dogs` / `dog_name`, `memory_usage` / `memory_usage_tolerance`).
+    Review r1: any field matched, so "we moved to Athens" was skipped because
+    `root.birthplace` said Athens. Never raises."""
+    try:
+        from ..memory.profile import _fold as _pf
+        from ..memory.attribution import field_kind as _fk, field_subject as _fs
+        want = _pf(str(value or "")).strip()
+        if not want:
+            return ""
+        _kind = _fk(category, key) if key is not None else ""
+        _stems = _key_stems(key) if key is not None else set()
+        _subj = _fs(category, key) if key is not None else frozenset()
+        data = profile_memory.load() or {}
+        for cat, sub in data.items():
+            if not isinstance(sub, dict):
+                continue
+            for k, cur in sub.items():
+                # review r2: the same SUBJECT too — `father_name` holding
+                # Leonidas is no reason to skip `son_name` Leonidas, nor
+                # `wife_employer` Google to skip the owner's `employer`
+                if key is not None and not (_fs(cat, k) == _subj
+                                            and ((_kind and _fk(cat, k) == _kind) or (_stems & _key_stems(k)))):
+                    continue
+                for it in (cur if isinstance(cur, list) else [cur]):
+                    if _pf(str(it)).strip() == want:
+                        return f"{cat}.{k}"
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
 def _owner_sentence_for(value: str, episode: str, cue: str = None) -> str:
     """§4QM: the owner's OWN clause (raw words) of ``episode`` that states
     ``value``, for the ledger — the field's predicate cue first, then the
@@ -2531,8 +2600,9 @@ def _build_memory_arc(history, ai_text, *, tools_run, user_text=None) -> str:
             # where the owner reacts to a page ("it says my wife is X, ignore
             # that"), and the owner-fact parser takes reported speech
             continue
-        clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")),
-                               flags=re.DOTALL)
+        # review r2: an image turn's list content went in as str(list) — its
+        # newlines a literal "\\n", so the item never matched its own message
+        clean_content = re.sub(r'```.*?```', '', _msg_text(m), flags=re.DOTALL)
         micro.append(f"{role}: {_unmark_roles(clean_content[:500].strip())}")
     treated = treat_reply(str(ai_text or ""),
                           n_real_tools=count_real_tools(tools_run))
@@ -5884,7 +5954,7 @@ def _hands_over_file(text: str, base: str) -> bool:
                 or re.search(r"(?i)\b(?:written|saved|exported|wrote|saved it|is) (?:to|at|in|as) [^\n]{0,80}" + b, text))
 
 
-_DOC_LINK_EXT_RE = re.compile(r"\.(?:md|markdown|txt|rst|html?|tex)$", re.IGNORECASE)
+_DOC_LINK_EXT_RE = re.compile(r"\.(?:md|markdown|txt|rst|x?html?|tex)$", re.IGNORECASE)
 
 
 def document_link_check_note(args: dict, tools_run) -> str:
@@ -5902,7 +5972,8 @@ def document_link_check_note(args: dict, tools_run) -> str:
     text = str((args or {}).get("content") or "")
     if "http" not in text:
         return ""
-    missing = unfetched_links(text, fetched_urls(tools_run))
+    from .link_grounding import is_markup_path
+    missing = unfetched_links(text, fetched_urls(tools_run), markup=is_markup_path(path))
     if not missing:
         return ""
     shown = ", ".join(missing[:6]) + (f" (+{len(missing) - 6} more)" if len(missing) > 6 else "")
@@ -6003,8 +6074,10 @@ def unopened_citation_note(tools_run, roots) -> str:
                 break
         if "http" not in text:
             continue
-        on_disk = {u for u in unfetched_links(text, fetched)}           # still in the file (the model may have fixed it)
-        miss = [u for u in unfetched_links(written_by[p]["text"], fetched) if u in on_disk]
+        from .link_grounding import is_markup_path as _is_markup
+        _mk = _is_markup(p)
+        on_disk = {u for u in unfetched_links(text, fetched, markup=_mk)}           # still in the file (the model may have fixed it)
+        miss = [u for u in unfetched_links(written_by[p]["text"], fetched, markup=_mk) if u in on_disk]
         if miss:
             found.append((p, miss))
     if not found:
@@ -6871,13 +6944,12 @@ def client_deadline_line(deadline_s, ceiling_s=0.0) -> str:
     """§4NV: the turn's time budget and the ACTUAL report reserve (it is
     capped at a quarter of the budget — a flat "5 min" was wrong for any
     budget under 20 min). §4RA: and the extension ceiling, when there is one."""
-    line = (f"time budget {_span(deadline_s)} (the last {_span(effective_report_floor(deadline_s))} "
-            "are kept for the final report)")
+    line = f"{_span(deadline_s)}, {_span(effective_report_floor(deadline_s))} kept for the reply"
     try:
         if math.isinf(float(ceiling_s or 0.0)):
-            line += "; no time limit while code is being written (§4SD: it stops after a stall)"
+            line += "; no limit while coding"
         elif float(ceiling_s or 0.0) > float(deadline_s or 0.0):
-            line += f"; extendable to {_span(ceiling_s)} while code is being written"
+            line += f"; up to {_span(ceiling_s)} while coding"
     except (TypeError, ValueError):
         pass
     return line
@@ -10689,7 +10761,7 @@ class _UrlProvenance:
     def host(u: str) -> str:
         try:
             from urllib.parse import urlparse
-            return (urlparse(str(u)).hostname or "").lower().lstrip("www.")
+            return (urlparse(str(u)).hostname or "").lower().removeprefix("www.")   # §4SK r2: lstrip ate web.→eb.
         except Exception:  # noqa: BLE001
             return ""
 
@@ -10715,12 +10787,25 @@ class _UrlProvenance:
                     out.append(str(a["url"]))
         return out
 
+    @staticmethod
+    def _own(u) -> bool:
+        """§4SK (req a60aa2de): loopback, LAN and file:// addresses are the
+        agent's own apps and services, never guesses from a search — a 404
+        on 127.0.0.1:8101 (a stale server) blocked 127.0.0.1:8100/index.html
+        (the server it had just started), 2 turns. The browser tool's own
+        classification, so both say the same thing."""
+        try:
+            from ..tools.browser_routes import _is_own_host
+            return bool(_is_own_host(str(u or "")))
+        except Exception:  # noqa: BLE001
+            return False
+
     def note_failure(self, args: dict, result_text) -> None:
         """A browser result for a COMPOSED address that was a 404 marks the host."""
         if "HTTP 404" not in str(result_text or "") and "HTTP 410" not in str(result_text or ""):
             return
         for u in self._urls_of(args):
-            if not self.is_given(u):
+            if not self.is_given(u) and not self._own(u):
                 h = self.host(u)
                 if h:
                     self.hosts_404.add(h)
@@ -10734,7 +10819,7 @@ class _UrlProvenance:
             return None
         for u in self._urls_of(args):
             h = self.host(u)
-            if h and h in self.hosts_404 and not self.is_given(u):
+            if h and h in self.hosts_404 and not self.is_given(u) and not self._own(u):
                 return (f"SYSTEM: {u} is a COMPOSED address on {h}, where a composed address already "
                         "came back 404 this request. Addresses are not guessed: open a URL that appeared "
                         "in your search results or in a page's LINKS block, or run "
@@ -11879,6 +11964,11 @@ def _bounded_verdict(fn):
         finally:
             _dvc.reset(_tok)
     return wrapper
+
+
+def _int_or_none(v):
+    """§4SO: a token count for a JSON meta — an int, else None."""
+    return v if isinstance(v, int) else None
 
 class GhostAgent:
     def _rebuild_available_tools(self):
@@ -14212,10 +14302,15 @@ class GhostAgent:
                          "(window is %.0f < idle <= %.0f)",
                          idle_secs, self._bio_scaled(900), self._bio_scaled(3600))
 
+    #: drains an item may fail with every worker node down before it joins
+    #: the bounded retry path (review r1: a poison item blocked the queue)
+    _NODE_DOWN_MAX = 6
+
     async def process_journal_queue(self, *, respect_idle: bool = True):
         from ..memory.journal import (
             JOURNAL_MAX_RETRIES as _JRL_MAX,
             RetryableConsolidationError as _RetryableConsolidation,
+            ConsolidationNodeDown as _NodeDown,
         )
         # `hasattr` was the wrong test: every isolated run sets
         # `context.journal = None` (core/isolation), which PASSES hasattr
@@ -14231,7 +14326,10 @@ class GhostAgent:
         # the "Waking up to process N buffered memories..." entry line went —
         # the pass reports its RESULT ("Consolidated N memor(ies): …") below.
 
-        processed = 0
+        processed = 0       # items the extractor READ (the model ran)
+        skipped = 0         # items that stopped before the model (no owner fact cue)
+        failed = 0          # items whose extraction failed non-transiently (dropped)
+        _nd_failed, _nd_rest, _nd_row = [], [], 0   # worker failures (see `except _NodeDown`)
         _done_digests = []  # per-item digests for the consolidation summary
         requeue = []  # items that failed upstream-transiently → back to the journal
 
@@ -14256,14 +14354,31 @@ class GhostAgent:
                 idle_secs = (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
                 if idle_secs < 30:
                     pretty_log("Memory Journal", f"owner returned — paused with {len(items)-i} item(s) left", icon=Icons.STOP)
-                    await asyncio.to_thread(self.context.journal.push_front, requeue + items[i:])
-                    requeue = []
+                    await asyncio.to_thread(self.context.journal.push_front, requeue + items[i:] + _nd_failed)
+                    requeue, _nd_failed = [], []
                     break
 
             try:
+                _outcome = "skipped"
                 if item["type"] == "smart_memory":
-                    await self.run_smart_memory_task(item["data"]["text"], item["data"]["model"], self.context.args.smart_memory,
-                                                     as_of=item.get("ts"), req_id=str((item.get("data") or {}).get("req_id") or ""))
+                    _outcome = await self.run_smart_memory_task(
+                        item["data"]["text"], item["data"]["model"], self.context.args.smart_memory,
+                        as_of=item.get("ts"), req_id=str((item.get("data") or {}).get("req_id") or ""),
+                        owner_text=str((item.get("data") or {}).get("user") or ""))
+                if _outcome == "extracted":
+                    _nd_row = 0     # review r3: a skipped item proves nothing about the worker
+                # Review 2026-10-31: "consolidated N" counted every item —
+                # 348 in 24 days, of which 172 never reached the model and a
+                # Nova outage's lost items read "✅ consolidated".
+                if _outcome == "failed":
+                    failed += 1
+                    await asyncio.to_thread(_ack_terminal, item)
+                    await asyncio.sleep(0.5)
+                    continue
+                if _outcome != "extracted":
+                    skipped += 1
+                    await asyncio.to_thread(_ack_terminal, item)
+                    continue
                 processed += 1
                 # Digest for the summary line: type + a head of what the item
                 # was about, so "consolidated N memories" names its subjects.
@@ -14275,6 +14390,25 @@ class GhostAgent:
                 except Exception:
                     _done_digests.append(str(item.get("type", "?")))
                 await asyncio.to_thread(_ack_terminal, item)
+            except _NodeDown as e:
+                # The worker failed this item. Review r1: the pool books ANY
+                # failure (a 90 s ReadTimeout, a 4xx) as a node failure, so
+                # one item that always fails came back at the HEAD of every
+                # drain and blocked everything behind it. Review r2: counting
+                # it then dropped the whole journal during a ~15-min outage.
+                # So: the item steps aside and the NEXT item is tried; two
+                # failures in a row is an outage — keep the rest, spend no
+                # retry, stop. Counting happens after the loop.
+                _nd_failed.append(item)
+                _nd_row += 1
+                if _nd_row >= 2:
+                    _nd_rest = items[i + 1:]
+                    pretty_log("Memory Journal",
+                               f"worker node unavailable — kept {len(_nd_rest) + len(_nd_failed)} item(s) "
+                               f"for the next idle window: {e}", level="WARNING", icon=Icons.RETRY)
+                    break
+                await asyncio.sleep(0.5)
+                continue
             except _RetryableConsolidation as e:
                 # The item was already popped, so dropping it here is
                 # PERMANENT — the fact never reaches memory and nothing
@@ -14307,15 +14441,45 @@ class GhostAgent:
                 await asyncio.to_thread(_ack_terminal, item)
             await asyncio.sleep(0.5)
 
-        if requeue:
-            await asyncio.to_thread(self.context.journal.push_front, requeue)
-        if processed > 0:
+        # A stepped-aside item counts a worker failure only when ANOTHER item
+        # reached the model in this drain (the worker was up — this item is
+        # the problem) and the drain did not end on an outage. Past
+        # _NODE_DOWN_MAX it joins the bounded retry path. Nothing counts by
+        # time (review r3: a 6-h age rule drained the journal in a long
+        # outage); a lone failing item waits for the next item to prove the
+        # worker up — every owner turn appends one.
+        _nd_keep = []
+        for _it in _nd_failed:
+            _nd = int(_it.get("node_down", 0) or 0) + (1 if processed and _nd_row < 2 else 0)
+            if _nd <= self._NODE_DOWN_MAX:
+                _it["node_down"] = _nd
+                _nd_keep.append(_it)
+                continue
+            retries = int(_it.get("retries", 0) or 0)
+            if retries < _JRL_MAX:
+                _it["retries"] = retries + 1
+                _nd_keep.append(_it)
+                pretty_log("Memory Journal", f"item failed on the worker in {_nd - 1} drains — now on the retry "
+                           f"path (attempt {retries + 1}/{_JRL_MAX})", level="WARNING", icon=Icons.RETRY)
+            else:
+                pretty_log("Memory Journal", f"Dropping {_it.get('type')} item after {_nd - 1} worker failures "
+                           f"and {_JRL_MAX} re-queues", level="WARNING", icon=Icons.WARN)
+                await asyncio.to_thread(_ack_terminal, _it)
+        if requeue or _nd_rest or _nd_keep:
+            await asyncio.to_thread(self.context.journal.push_front, requeue + _nd_rest + _nd_keep)
+        if failed:
+            pretty_log("Memory Journal", f"extraction failed for {failed} item(s) — dropped (see the error above)",
+                       level="WARNING", icon=Icons.WARN)
+        if processed > 0 or skipped > 0:
             # Name WHAT was consolidated, not just how many (audit B4). The
             # durable mirror keeps every digest; the stream shows the head.
             # §4NV: the stream shows the count; the owner's conversation text
             # stays in the durable record
-            pretty_log("Memory Journal", f"consolidated {processed} memor{'y' if processed == 1 else 'ies'}",
-                       icon=Icons.OK)
+            _line = f"read {processed} memor{'y' if processed == 1 else 'ies'}"
+            if skipped:
+                _line += f" ({skipped} without an owner fact cue, not read)"
+            pretty_log("Memory Journal", _line, icon=Icons.OK)
+        if processed > 0:
             pretty_log("Memory Journal", " | ".join(_done_digests), icon=Icons.OK,
                        durable_only=True)
 
@@ -14394,10 +14558,35 @@ class GhostAgent:
             except Exception:  # noqa: BLE001
                 continue
             v = _f(value).strip()
+            # Consolidation review 2026-10-31 (CRITICAL): the graph leg above
+            # honoured the predicate but this profile leg matched the VALUE in
+            # every field — "I'm not selling the BMW after all" (SELLING)
+            # deleted assets.vehicles "BMW 118i", "I'm not going to Athens
+            # this weekend" (TRAVELING_TO) deleted root.location. A negated
+            # statement now removes only a field of the SAME KIND (LIVES_IN →
+            # a location field); a field with no kind is removed only by a
+            # removal ("we sold the BMW", predicate None).
+            from ..memory.attribution import field_kind as _fkind, predicate_kind as _pkind
+            _want_kind = None
+            if predicate is not None:
+                _canon_p = (gm.canonical_predicate(predicate) if gm is not None and hasattr(gm, "canonical_predicate")
+                            else str(predicate).upper())
+                _want_kind = _pkind(_canon_p)
+                if not _want_kind:
+                    # a kind no profile field holds: graph only. Review r1–r3
+                    # (2026-10-31): a "stopped" rule ("I don't have the BMW
+                    # anymore" removes possessions) was built and REMOVED —
+                    # each round found it deleting the wrong fact ("…since we
+                    # moved to Athens", "…because I have the BMW", the wife's
+                    # fields). A possession leaves the profile by a removal
+                    # ("we sold the BMW") or the owner's forget.
+                    continue
             for cat, sub in list(data.items()):
                 if not isinstance(sub, dict):
                     continue
                 for k, cur in list(sub.items()):
+                    if _want_kind is not None and _fkind(cat, k) != _want_kind:
+                        continue
                     items = cur if isinstance(cur, list) else [cur]
                     hit = [it for it in items if _f(it).strip() == v or _f(it).strip().startswith(v + " ")]
                     if not hit:
@@ -14412,14 +14601,42 @@ class GhostAgent:
                     await sync_owner_mirrors(cat, k, pm, gm, getattr(self.context, "memory_system", None))
 
     async def run_smart_memory_task(self, interaction_context: str, model_name: str, selectivity: float,
-                                    as_of: float = None, req_id: str = ""):
+                                    as_of: float = None, req_id: str = "", owner_text: str = ""):
         from ..memory.journal import RetryableConsolidationError as _RetryableConsolidation
-        if not self.context.memory_system: return
+        if not self.context.memory_system: return "skipped"
 
         # --- ⚡ FAST-ABORT HEURISTIC (ZERO LLM COMPUTE) ---
         import re
+        # Consolidation review 2026-10-31: a journal item carries the last
+        # four messages, and the owner's sentence from the PREVIOUS turn was
+        # extracted again on this turn's item (Hanzo stored twice 5 s apart;
+        # one memory-usage note written under two keys 4 s apart). Each owner
+        # message has its own item: extraction, attribution and this filter
+        # read only the newest one.
+        from ..memory.attribution import latest_owner_episode as _latest_ep
+        interaction_context = _latest_ep(interaction_context)
+        if not interaction_context.strip():
+            return "skipped"
+        # review r1: when THIS turn's message is not in the arc (the builder
+        # left it out), the last owner message is the PREVIOUS turn's — the
+        # very re-extraction this cut removes. The item names its message.
+        if owner_text.strip():
+            from ..memory.attribution import owner_lines as _ol_chk
+            from ..memory.profile import _fold as _f_chk
+            # the arc builder's own transforms (fenced code out, 500 chars,
+            # inner role marks quoted), or a code-led message never matches
+            # review r2: the stored message is cut at 500 chars, so a long
+            # code block's closing fence is gone — an unclosed one goes too
+            _ot = re.sub(r'```.*?(?:```|$)', '', str(owner_text), flags=re.DOTALL)
+            _ot = _unmark_roles(_ot[:500].strip())
+            _head = " ".join(_f_chk(" ".join(_ol_chk("USER: " + _ot))).split())[:60]
+            if _head and _head not in " ".join(_f_chk(" ".join(_ol_chk(interaction_context))).split()):
+                return "skipped"
         # We only care if the user said something memorable. Extract user lines.
-        user_lines = [line.split("USER:", 1)[-1] for line in interaction_context.splitlines() if line.startswith("USER:")]
+        # review r1: owner_lines keeps a multi-line message's continuation
+        # lines ("Some notes:\nOur office moved to Patras." was skipped)
+        from ..memory.attribution import owner_lines as _ol_fast
+        user_lines = _ol_fast(interaction_context)
         user_text = " ".join(user_lines).lower() if user_lines else interaction_context.lower()
 
         # Fast exit if no identity/preference keywords are present
@@ -14431,19 +14648,19 @@ class GhostAgent:
                          r"|(?<!\w)(μου|μας|είμαι|ειμαι|έχω|εχω|εγώ|εγω|μένω|μενω|δουλεύω|δουλευω|δεν)(?!\w)"
                          r"|\w+(?:αμε|άμε|ουμε|ούμε)(?!\w)",   # Greek "we" verbs (§4KZ: "πουλήσαμε το BMW")
                          user_text):
-            return
+            return "skipped"
 
 
         async with self.memory_semaphore:
             interaction_context = interaction_context.encode('utf-8', 'replace').decode('utf-8').replace("\r", "")
             # Strict control character scrubbing for C++ JSON parsers
             interaction_context = "".join(ch for ch in interaction_context if ord(ch) >= 32 or ch in "\n\t")
-            ic_lower = interaction_context.lower()
-            summary_triggers = ["summarize", "summary", "recall", "tell me about", "what is", "recap", "forget", "list documents"]
-            is_requesting_summary = any(w in ic_lower for w in summary_triggers)
-
-            if is_requesting_summary and len(interaction_context) > 1500:
-                return
+            # (A "summary request" skip lived here: any arc over 1500 chars
+            # whose text — the ASSISTANT's reply included — said "summary",
+            # "what is", "recall"… was never extracted. It guarded against the
+            # extractor re-storing an echoed summary; since §4NG the extractor
+            # reads the owner's lines only, so it only cost owner facts.
+            # Removed, consolidation review 2026-10-31.)
 
             # the CURRENT TIME the prompt's temporal rule refers to (§4KY:
             # it was never given)
@@ -14455,7 +14672,7 @@ class GhostAgent:
             from ..memory.attribution import owner_lines as _own_lines
             _owner_only = "\n".join(f"USER: {ln}" for ln in _own_lines(interaction_context) if str(ln).strip())
             if not _owner_only:
-                return
+                return "skipped"
             final_prompt = (SMART_MEMORY_PROMPT + f"\n\n### CURRENT TIME\n{_now_ts()}"
                             + f"\n\n### EPISODE LOG:\n{_owner_only}")
             try:
@@ -14481,7 +14698,14 @@ class GhostAgent:
                     # drain loop to re-queue the journal item — the old
                     # log-and-swallow path dropped the consolidation
                     # permanently (the item was already popped).
-                    from ..memory.journal import is_upstream_transient as _iut
+                    from ..memory.journal import is_upstream_transient as _iut, ConsolidationNodeDown as _NodeDown
+                    from .llm import OffMainNodeUnavailable as _OffMainDown
+                    if isinstance(_ue, _OffMainDown):
+                        # every worker node failed (Nova down / restarting /
+                        # being swapped): the catch-all below swallowed it and
+                        # the drain acked the item as "consolidated" — the
+                        # owner's fact was lost (review 2026-10-31)
+                        raise _NodeDown(f"{type(_ue).__name__}: {_ue}") from _ue
                     if _iut(_ue):
                         raise _RetryableConsolidation(f"{type(_ue).__name__}: {_ue}") from _ue
                     raise
@@ -14512,10 +14736,17 @@ class GhostAgent:
                 # never typed, and every age update was refused; a fact needs
                 # only one shared word, which anchoring keeps)
                 _raw_pv = str((profile_up or {}).get("value") or "") if isinstance(profile_up, dict) else ""
+                # Consolidation review 2026-10-31: anchored to WHEN IT WAS SAID
+                # (the item's `as_of`), not the drain — "my son is 9" drained
+                # 400 days late gave "born ~2017-04"
+                import datetime as _dt_said
+                _said_dt = (_dt_said.datetime.fromtimestamp(float(as_of), tz=_dt_said.timezone.utc)
+                            if as_of else None)
+                _said_iso = _said_dt.isoformat().replace("+00:00", "Z") if _said_dt else None
                 if fact:
-                    fact = _anchor_temporal(fact)
+                    fact = _anchor_temporal(fact, said_at=_said_dt)
                 if profile_up is not None and profile_up.get("value"):
-                    profile_up["value"] = _anchor_temporal(profile_up["value"])
+                    profile_up["value"] = _anchor_temporal(profile_up["value"], said_at=_said_dt)
 
                 # --- UNCONDITIONAL KNOWLEDGE GRAPH INGESTION ---
                 from ..utils.helpers import is_removal_or_negation_text, is_removal_triplet
@@ -14563,8 +14794,12 @@ class GhostAgent:
                     _v = strip_negation(_other)
                     _cp = _canon(_p)
                     _said = owner_said(_v, _stmts, cue=PREDICATE_CUES.get(_cp))
-                    if is_removal_triplet(_t) and owner_said(_v, _stmts) is not None:
-                        # "we sold the BMW": every owner edge naming it goes
+                    _said_any = owner_said(_v, _stmts)
+                    # A removal needs an AFFIRMATIVE owner clause: "I'm not
+                    # selling the BMW" said it only negated (review 10-31)
+                    if is_removal_triplet(_t) and _said_any == "stated":
+                        # "we sold the BMW": every owner edge and profile
+                        # value naming it goes
                         _corrections.append((_v, None))
                         continue
                     if _said == "negated" or (_v != _fold_attr(_other).strip() and _said is not None):
@@ -14637,8 +14872,14 @@ class GhostAgent:
                 # every `forget`. Bail before the fact is embedded. (The
                 # graph triplets above were already filtered.)
                 if is_removal_or_negation_text(fact):
+                    # Blank the fact, do NOT return (review 2026-10-31): the
+                    # return skipped the profile write below — "I no longer
+                    # drink coffee, I drink tea now" never wrote tea.
                     pretty_log("Auto Memory Skip", f"not saved — it states a removal or negation: {fact}", icon=Icons.SKIP)
-                    return
+                    fact = ""
+                if profile_up is not None and is_removal_or_negation_text(str(profile_up.get("value") or "")):
+                    pretty_log("Profile Skip", "profile value states a removal or negation — not written", icon=Icons.SKIP)
+                    profile_up = None
                 # Project-state backstop (2026-07-25): the prompt now scores
                 # tracked-project state at 0.2, but a small model inflates —
                 # observed live: 3 project-status "facts" stored at 0.90 AND
@@ -14688,8 +14929,23 @@ class GhostAgent:
                 # saved with a tool scores < 0.5, and "remember that I moved"
                 # never reached the profile) — and the mirrors follow it.
                 if profile_up and self.context.profile_memory and str(profile_up.get("value") or "").strip():
-                    _cat_p = profile_up.get("category")
-                    _key_p = profile_up.get("key")
+                    # Review 2026-10-31 (live): the extractor names category
+                    # and key freely, so one fact got a home per extraction —
+                    # `pet.dog_name` beside the tool's `assets.dogs`, and
+                    # "memory usage: High" under `technical preference.memory
+                    # usage tolerance` AND `.memory usage` 4 s apart (a
+                    # category the coding persona's `preferences` filter
+                    # never shows). The category folds onto the standard set,
+                    # and a value the profile already holds is not re-filed.
+                    _cat_p = _extractor_category(profile_up.get("category"))
+                    _key_p = "_".join(str(profile_up.get("key") or "").strip().lower().split())
+                    _held = _profile_field_holding(self.context.profile_memory, profile_up.get("value"),
+                                                   _cat_p, _key_p)
+                    if _held:
+                        pretty_log("Profile Skip", f"already in the profile as {_held} — not filed again",
+                                   icon=Icons.SKIP)
+                        profile_up = None
+                if profile_up and self.context.profile_memory and str(profile_up.get("value") or "").strip():
                     # §4QM: the ledger row names the owner's own sentence
                     # behind this value, not the request in flight (the
                     # drain runs under SYSTEM, minutes after the turn)
@@ -14787,7 +15043,7 @@ class GhostAgent:
                     # silently mishandled.
                     if not (is_personal or is_technical):
                         pretty_log("Auto Memory Skip", f"Discarded generic knowledge: {fact}", icon=Icons.SKIP)
-                        return
+                        return "extracted"
                     # `identity` still requires genuine high confidence. This
                     # one IS a semantic judgement about what deserves to be a
                     # profile fact, not a safety filter, so an absolute bar is
@@ -14802,7 +15058,7 @@ class GhostAgent:
                     # is an `auto` fact ranked by when it was stated.
                     from ..utils.helpers import get_utc_timestamp
                     _res = await asyncio.to_thread(self.context.memory_system.add, fact,
-                                                   {"timestamp": get_utc_timestamp(), "type": "auto"})
+                                                   {"timestamp": _said_iso or get_utc_timestamp(), "type": "auto"})
                     if isinstance(_res, str) and _res.startswith("refused"):
                         pretty_log("Auto Memory Skip", f"{_res}: {fact[:80]}", icon=Icons.SKIP)
                     else:
@@ -14811,7 +15067,10 @@ class GhostAgent:
 
             except _RetryableConsolidation:
                 raise  # handled by process_journal_queue (bounded re-queue)
-            except Exception as e: logger.error(f"Smart memory task failed: {e}")
+            except Exception as e:
+                logger.error(f"Smart memory task failed: {e}")
+                return "failed"
+            return "extracted"
 
     # =================================================================
     # ARCHITECTURAL OPTIMISATION #4: REQUEST-SCOPED CACHE
@@ -15429,11 +15688,15 @@ class GhostAgent:
             await self._conv_save(llm, f"this conversation's change to {cur_level} effort", _late)
         if cur_level is not None:
             self._slot_level = cur_level             # what this call leaves in the slot
-        from .llm import conv_head_first_calls
+        from .llm import checkpoint_span_passed
         _calls = int(getattr(llm, "_slot_request_calls", 0) or 0)
-        _head_first = conv_head_first_calls()
+        _start = getattr(llm, "_slot_request_start", None)
+        _end = getattr(llm, "_slot_request_end", None)
+        # §4SO: by the growth llama's checkpoint eviction depends on, not a
+        # call count alone (req 2ee352dd: 21 big calls lost the checkpoint, 31
+        # small ones in the §4SA probe kept it)
         _long_followup = (_conv and owner == key and isinstance(held_by, str) and bool(held_by)
-                          and held_by != rid and 0 < _head_first <= _calls)
+                          and held_by != rid and checkpoint_span_passed(_calls, _start, _end))
         # §4RV: under GHOST_CONV_KEEP the next request's first message is the
         # previous one's, so it resumes from llama's checkpoint — no head restore
         # (§4SA: unless the previous request made so many calls that llama may
@@ -15516,8 +15779,8 @@ class GhostAgent:
         _side_what = _side_what.replace("this request's ", "", 1)
         _whose = (f"this request after its own {_side_what}" if _after_side and not level_moved else
                   f"this conversation at {cur_level or 'the default'} effort" if _same else
-                  f"this conversation's next request (its last made {_calls} calls, past llama's "
-                  f"{_head_first}-call checkpoint span)" if _long_followup else
+                  f"this conversation's next request (its last made {_calls} calls and grew the slot "
+                  f"{int(_end) - int(_start):,} tokens, past llama's checkpoints)" if _long_followup else
                   "this conversation's next request" if next_request else
                   "another conversation's first call" if owner else "this request")
         if ok:
@@ -15770,6 +16033,9 @@ class GhostAgent:
             # does not) — the restore sets the head mark from it
             _extra = {"head_in_slot": getattr(llm, "_head_displaced", False) is not True,
                       "calls": int(getattr(llm, "_slot_request_calls", 0) or 0),   # §4SA: for the head-first gate
+                      # §4SO: and the growth (ints or None: the meta is JSON)
+                      "start": _int_or_none(getattr(llm, "_slot_request_start", None)),
+                      "end": _int_or_none(getattr(llm, "_slot_request_end", None)),
                       "rid": str(getattr(llm, "_slot_request", "") or ""),       # (r2: the gate exempts this request)
                       "conv": _head_saves.conv_key(hs.get("identity", ""), owner)}  # (r2: prune counts conversations)
             if getattr(self, "_slot_level", None):
@@ -15872,18 +16138,17 @@ class GhostAgent:
             # §4SA review: the file holds the previous request's last 12
             # checkpoints exactly as the slot did — past the gate, the head is
             # the better start for it too (else llama re-reads from token 0)
-            from .llm import conv_head_first_calls
-            _gate, _calls_saved = conv_head_first_calls(), _head_saves.meta_field(hs["dir"], ckey, "calls")
-            try:
-                _calls_saved = int(_calls_saved or 0)
-            except (TypeError, ValueError):
-                _calls_saved = 0
+            from .llm import checkpoint_span_passed
+            _calls_saved = _head_saves.meta_field(hs["dir"], ckey, "calls")
+            _start_saved = _head_saves.meta_field(hs["dir"], ckey, "start")
+            _end_saved = _head_saves.meta_field(hs["dir"], ckey, "end")
             _saved_rid = str(_head_saves.meta_field(hs["dir"], ckey, "rid") or "")
-            if 0 < _gate <= _calls_saved and _saved_rid != rid:
+            if _saved_rid != rid and checkpoint_span_passed(_calls_saved, _start_saved, _end_saved):
                 # (r2: a file this request saved before its own look extends
                 # into its next prompt whole — no checkpoint needed; not gated)
-                pretty_log("Conversation", f"not restored — its last request made {_calls_saved} calls, past "
-                           f"llama's {_gate}-call checkpoint span; the head instead", icon=Icons.CONV_LEFT)
+                pretty_log("Conversation", f"not restored — its last request made {_calls_saved} calls and "
+                           f"grew the slot {int(_end_saved) - int(_start_saved):,} tokens, past llama's "
+                           f"checkpoints; the head instead", icon=Icons.CONV_LEFT)
                 return False
             if saved_level and level and str(saved_level) != level:
                 # §4RW-f: saved at another effort level — it parts from this request
@@ -15940,7 +16205,20 @@ class GhostAgent:
         now = time.monotonic()
         llm._slot_changed_at = now                  # §4SA review: a change of hands
         llm._slot_session, llm._slot_session_used, llm._slot_request = session, now, rid
-        llm._slot_request_calls = 0                 # §4SA review: this request's calls, not the last one's
+        # §4SA review: this request's calls, not the last one's. §4SO: a file this
+        # SAME request saved (before its own picture look) carries its count and
+        # growth on — reset, its follow-up's gate read only the calls after the
+        # look (req 6c7ee05f: 21 calls, the record said 1)
+        if rid and _saved_rid == rid:
+            try:
+                llm._slot_request_calls = int(_head_saves.meta_field(hs["dir"], ckey, "calls") or 0)
+            except (TypeError, ValueError):
+                llm._slot_request_calls = 0
+            llm._slot_request_start = _int_or_none(_head_saves.meta_field(hs["dir"], ckey, "start"))
+            llm._slot_request_end = _int_or_none(_head_saves.meta_field(hs["dir"], ckey, "end"))
+        else:
+            llm._slot_request_calls = 0
+            llm._slot_request_start = llm._slot_request_end = None
         llm._conv_saved = (session, now)            # the slot is what the file holds
         # §4SA: the file says whether its state opens with the head (the owner on
         # Slack's does not); either way the slot holds this conversation's own state
@@ -20091,7 +20369,8 @@ class GhostAgent:
                         (getattr(sm, "last_playbook_triggers", []) or [])
                         if t)
             # ⚠ Read the bus surface from the JUDGE-IMMUNE stamp first
-            # (§4L R3 MAJOR-1): the hydration judge consumes
+            # (§4L R3 MAJOR-1; the hydration judge was removed in §4NM — the
+            # stamp stays the primary read): the judge consumed
             # `last_hydration = None` at coroutine ENTRY, and on the
             # streamed path (the common case) it is scheduled before the
             # credit read — so bus-only lessons vanished from this union
@@ -30038,7 +30317,8 @@ class GhostAgent:
                         tools_run=tools_run_this_turn, user_text=last_user_content)
                     if getattr(self.context, 'journal', None):
                         await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': model,
-                                                                         'req_id': str(request_id_context.get() or "")[:64]})
+                                                                         'req_id': str(request_id_context.get() or "")[:64],
+                                                                         'user': (_msg_text({"content": last_user_content}) if isinstance(last_user_content, list) else str(last_user_content or ""))[:500]})
                 return "break"
 
             # #5 step 2: the tool guard/dispatch/result pipeline lives in
@@ -34774,7 +35054,8 @@ class GhostAgent:
                     if getattr(self.context, 'journal', None):
 
                         await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model,
-                                                                         'req_id': str(request_id_context.get() or "")[:64]})
+                                                                         'req_id': str(request_id_context.get() or "")[:64],
+                                                                         'user': (_msg_text({"content": last_user_content}) if isinstance(last_user_content, list) else str(last_user_content or ""))[:500]})
 
                 # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
                 # RAW on purpose (§4FV): this reads the model's <think>

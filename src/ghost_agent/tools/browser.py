@@ -87,7 +87,7 @@ from .browser_support import (_note_sandbox_down, _sandbox_down_recently, _sandb
 _BROWSER_PROFILE_LOCK = asyncio.Lock()
 _MAX_INTERACT_ACTIONS = 60
 from .browser_support import (  # noqa: E402 — §4LN helpers, re-exported
-    _exec_holding_lock, _overwrite_refusal,
+    _exec_holding_lock, _overwrite_refusal, log_launch_race, log_profile_settle,
     _UNSEEN_SCREENSHOT_NOTE, _runner_failure_hint, budget_used_up_line, _log_runner_failure, runner_cmd, _last_url_filename, _runner_first_url, interact_notes, no_effect_line, _note_shot)
 _STEP_WAIT_KEYS = ("ms", "timeout_ms", "wait_for_hidden_ms", "settle_ms", "post_click_ms")
 
@@ -1198,10 +1198,7 @@ async def tool_browser(
     # bounded retry after a short settle absorbs it; without this the agent
     # self-heals but burns ~2 turns and an error strike doing so.
     if not ok and "TargetClosedError" in str(parsed):
-        pretty_log("Browser Retry",
-                   "Chromium launch race (TargetClosedError) — retrying once "
-                   "after settle",
-                   icon=Icons.RETRY, level="WARNING")
+        log_launch_race(pretty_log, operation, parsed)           # §4SK: INFO, with the runner's text
         await asyncio.sleep(1.5)
         _retry_t = _exec_timeout_for(_deadline, subprocess_timeout)
         if not _retry_t:
@@ -1219,8 +1216,11 @@ async def tool_browser(
                         timeout=_retry_t, **_wd_kw
                     )
                 ok, parsed = _parse_runner_output(output or "", _nonce)
+                if not ok:
+                    log_launch_race(pretty_log, operation, parsed, retry_failed=True)
             except Exception as e:
                 logger.debug("TargetClosedError retry failed: %s", e)
+    log_profile_settle(pretty_log, operation, ok, parsed)          # §4SK
 
     # Degraded-milestone navigate retry (2026-07-18). Over Tor a slow exit
     # circuit stalls subresources and even `domcontentloaded` can miss the

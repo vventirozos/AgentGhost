@@ -823,9 +823,10 @@ OUTSIDE_CALL_LABEL = "outside call"
 
 
 def note_main_slot_prompt(llm, payload, label: str = "", background: bool = False,
-                          opened_at: Optional[float] = None) -> None:
+                          opened_at: Optional[float] = None, usage: Optional[tuple] = None) -> None:
     """A call just ran (or started streaming) on the MAIN slot: mark whether
-    the slot still opens with the head. No reference yet → no mark."""
+    the slot still opens with the head. No reference yet → no mark.
+    ``usage`` (§4SO): the call's (prompt_tokens, completion_tokens), if known."""
     try:
         if not background and opened_at is not None:
             changed_at = getattr(llm, "_slot_changed_at", None)
@@ -889,8 +890,25 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
                 # §4SA: how many main calls this request has made on the slot —
                 # llama keeps 12 checkpoints and erases the oldest first, so a
                 # long request can push out the one its follow-up resumes from
+                _same_req = bool(rid) and rid == getattr(llm, "_slot_request", None)
                 llm._slot_request_calls = (int(getattr(llm, "_slot_request_calls", 0) or 0) + 1
-                                           if rid and rid == getattr(llm, "_slot_request", None) else 1)
+                                           if _same_req else 1)
+                # §4SO: where this request's own part began (its first MEASURED
+                # main prompt — r1 MAJOR: a conversation restore names the
+                # request before its first call, so "first call" never came)
+                # and the largest prompt it sent (checkpoints are made while a
+                # prompt is read, never during the completion; the peak, so a
+                # compacted request or a small side prompt does not hide it).
+                # The follow-up's head-first gate reads the growth between them.
+                if not _same_req:
+                    llm._slot_request_start = llm._slot_request_end = None
+                if usage:
+                    # (r2 review MAJOR: only the conversation's OWN call — a
+                    # look's or a verify's small prompt after a main stream cut
+                    # before its usage became the start, and the gate fired)
+                    if not getattr(llm, "_slot_request_start", None) and not llm._slot_moved_on:
+                        llm._slot_request_start = usage[0]
+                    llm._slot_request_end = max(int(getattr(llm, "_slot_request_end", None) or 0), usage[0])
                 llm._slot_request = rid
     except Exception:  # noqa: BLE001
         pass
@@ -986,21 +1004,72 @@ def slot_moved_on(llm) -> bool:
     return getattr(llm, "_slot_moved_on", False) is True
 
 
-#: §4SA: a same-conversation follow-up restores the head first when the
-#: previous request made at least this many main calls (0 = never). llama
-#: keeps --ctx-checkpoints (12) and erases the oldest first, so a request of
-#: many tool turns can lose the checkpoint at its message; the follow-up then
-#: re-reads from token 0 (head included, ~166 s) unless the head comes back
-#: first and only the conversation is re-read. Off until measured.
-CONV_HEAD_FIRST_CALLS_ENV = "GHOST_CONV_HEAD_FIRST_CALLS"
+#: §4SA/§4SO: llama's checkpoint settings (= the llama launcher's
+#: --ctx-checkpoints / --checkpoint-min-step; env only if those move).
+LLAMA_CTX_CHECKPOINTS_ENV = "GHOST_LLAMA_CTX_CHECKPOINTS"
+LLAMA_CHECKPOINT_MIN_STEP_ENV = "GHOST_LLAMA_CHECKPOINT_MIN_STEP"
+LLAMA_CTX_CHECKPOINTS_DEFAULT = 12
+LLAMA_CHECKPOINT_MIN_STEP_DEFAULT = 1024
 
 
-def conv_head_first_calls() -> int:
-    raw = (os.getenv(CONV_HEAD_FIRST_CALLS_ENV) or "").strip()
+def _env_pos_int(name: str, default: int) -> int:
     try:
-        return max(0, int(raw)) if raw else 0
+        v = int((os.getenv(name) or "").strip() or default)
+        return v if v > 0 else default
     except ValueError:
-        return 0
+        return default
+
+
+def checkpoint_span_passed(calls, start, end) -> bool:
+    """§4SO: did a request push out the checkpoint its follow-up resumes from?
+
+    A same-conversation follow-up shares the slot up to where the previous
+    request's own messages began (~ its first main prompt, ``start``) and
+    llama resumes there only from a context checkpoint at or below that
+    point (``end``: the largest prompt the request sent). llama b11960
+    (`create_checkpoint`) keeps --ctx-checkpoints, and
+    once the list is full it first drops earlier tasks' checkpoints within
+    --checkpoint-min-step of the one before, then the OLDEST. So the low
+    checkpoint goes only when the request left (N-1) checkpoints spaced more
+    than min-step apart above it: the slot grew by more than (N-1) × min-step
+    tokens (``end - start``), over at least N/2 calls (each call keeps ~one
+    after thinning, two while it is the current task — r1 review: a call
+    whose growth comes in one block keeps ~one, so the call floor errs toward
+    an unneeded head restore, ~1k tokens re-read, never toward the 28k+ from
+    zero; live 6c7ee05f lost it at its 9th call). Live: 21 calls / +38k
+    tokens lost it (req 2ee352dd re-read 28,490 tokens from 0); 31 calls /
+    +3k and 17 calls / +1k kept it (§4SA probes). Unknown counts → False
+    (resume, as before)."""
+    try:
+        calls, start, end = int(calls), int(start), int(end)
+    except (TypeError, ValueError):
+        return False
+    n = _env_pos_int(LLAMA_CTX_CHECKPOINTS_ENV, LLAMA_CTX_CHECKPOINTS_DEFAULT)
+    step = _env_pos_int(LLAMA_CHECKPOINT_MIN_STEP_ENV, LLAMA_CHECKPOINT_MIN_STEP_DEFAULT)
+    return start > 0 and calls >= max(1, n // 2) and end - start > (n - 1) * step
+
+
+def usage_tokens(obj) -> Optional[tuple]:
+    """§4SO: (prompt_tokens, completion_tokens) from a completion or one raw
+    SSE line carrying ``usage``; None when absent or unreadable. llama's
+    prompt_tokens is the whole prompt, cached part included."""
+    try:
+        if isinstance(obj, (bytes, bytearray)):
+            obj = obj.decode("utf-8", "replace")
+        if isinstance(obj, str):
+            body = obj.strip()
+            if body.startswith("data:"):
+                body = body[5:].strip()
+            if not body or body == "[DONE]" or '"usage"' not in body:
+                return None
+            obj = json.loads(body)
+        u = obj.get("usage") if isinstance(obj, dict) else None
+        if not isinstance(u, dict):
+            return None
+        p, c = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
+        return (p, c) if p > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def release_slot_session(llm, stamp: bool = True) -> None:
@@ -1013,6 +1082,7 @@ def release_slot_session(llm, stamp: bool = True) -> None:
         llm._slot_session = None
         llm._slot_request = None
         llm._slot_request_calls = 0           # §4SA review: a count never outlives its request
+        llm._slot_request_start = llm._slot_request_end = None   # §4SO: nor its growth
         if stamp:
             llm._slot_changed_at = time.monotonic()
     except Exception:  # noqa: BLE001
@@ -3869,7 +3939,7 @@ class LLMClient:
                 _leg = served_leg(_result)
                 _served = _leg.get("served_by") or ""
                 if self._served_on_main_box(_served):
-                    note_main_slot_prompt(self, payload, task_label)   # §4OT
+                    note_main_slot_prompt(self, payload, task_label, usage=usage_tokens(_result))   # §4OT, §4SO
                 self._maybe_record_call(payload, _result,
                                         use_worker=(_served == "worker"),
                                         use_vision=(_served == "vision"),
@@ -4729,6 +4799,9 @@ class LLMClient:
                     _opened()
                     async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):
                         _state["answered"] = True
+                        if _on_main and ('"usage"' in chunk if isinstance(chunk, str) else
+                                         isinstance(chunk, (bytes, bytearray)) and b'"usage"' in chunk):
+                            _state["usage"] = usage_tokens(chunk) or _state.get("usage")   # §4SO
                         yield chunk
                 finally:
                     async with self._foreground_lock:
@@ -4742,7 +4815,7 @@ class LLMClient:
             # in the slot — counted as displaced (as `chat_completion`'s side path)
             if _on_main and (_state["answered"] or (side_main and not is_background and _state["open"])):
                 note_main_slot_prompt(self, payload, "stream", background=is_background,
-                                      opened_at=_state.get("opened_at"))
+                                      opened_at=_state.get("opened_at"), usage=_state.get("usage"))
 
     async def stream_openai(self, model: str, content: str, created_time: int, req_id: str,
                             extra: Optional[Dict[str, Any]] = None):

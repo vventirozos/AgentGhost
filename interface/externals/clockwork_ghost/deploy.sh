@@ -8,7 +8,8 @@
 #   2. webface/matrix_graph.js must be a COPY of the canonical web-UI file
 #      (interface/static/matrix_graph.js). Re-copying on every deploy is what
 #      keeps the handheld's face identical to the browser's instead of slowly
-#      drifting into a fork.
+#      drifting into a fork. The same goes for every ./sibling.js it imports
+#      (temperament.js since §4SG) — they are copied too, read from its imports.
 #   3. (2026-10-01) client.py cannot be imported anywhere but on the device —
 #      PyQt6 lives there — so a NameError in it used to be discovered by the
 #      operator, on the panel, after the old client had already been killed.
@@ -29,8 +30,26 @@ CANON="$HERE/../../static/matrix_graph.js"
 MODULES="client.py webface.py chatlog.py turnstatus.py facestate.py markup.py speech.py devstatus.py agentapi.py commands.py device_probe.py"
 STAGE=/home/vasilis/bin/.stage
 
-echo "→ syncing canonical face module"
+echo "→ syncing canonical face modules"
 cp "$CANON" "$HERE/webface/matrix_graph.js"
+# (2026-10-31) …and every sibling module it imports, followed transitively.
+# matrix_graph.js gained `import … from './temperament.js?v=1.3'` (§4SG); only
+# matrix_graph.js was copied, so the device's face died on a failed dynamic
+# import and the deploy installed a client on a black background. Read from
+# the import lines, so the next sibling the face grows ships by itself. A
+# sibling missing from interface/static stops the deploy HERE (set -e) —
+# before anything reaches the device.
+STATIC="$(dirname "$CANON")"
+queue="matrix_graph.js"; seen=" matrix_graph.js "
+while [ -n "$queue" ]; do
+  set -- $queue; cur="$1"; shift; queue="$*"
+  for dep in $(grep -oE "from +['\"]\./[A-Za-z0-9_.-]+\.js" "$STATIC/$cur" | sed -E "s#.*['\"]\./##" || true); do
+    case "$seen" in *" $dep "*) continue ;; esac
+    seen="$seen$dep "; queue="$queue $dep"
+    cp "$STATIC/$dep" "$HERE/webface/$dep"
+    echo "  + $dep (imported by $cur)"
+  done
+done
 
 echo "→ staging the new build (the live client is untouched)"
 ssh "$HOST" "rm -rf $STAGE && mkdir -p $STAGE/webface"

@@ -68,12 +68,12 @@ def test_get_neighborhood_basic(temp_graph):
     edges = temp_graph.get_neighborhood(["bob"])
 
     # Disconnected (charlie/david) component must not appear.
-    assert all("Charlie" not in e and "David" not in e for e in edges)
+    assert all("charlie" not in str(e).lower() and "david" not in str(e).lower() for e in edges)
     # 2-hop through-chain produced by spreading activation; §4MJ: its own
     # 1-hop pieces are contained in it and are not returned again
-    assert "- (Alice) -[KNOWS]-> (Bob) -[LIKES]-> (Coding)" in edges
-    assert "- (Alice) -[KNOWS]-> (Bob)" not in edges
-    assert "- (Bob) -[LIKES]-> (Coding)" not in edges
+    assert "- (alice) -[KNOWS]-> (bob) -[LIKES]-> (coding)" in edges
+    assert "- (alice) -[KNOWS]-> (bob)" not in edges
+    assert "- (bob) -[LIKES]-> (coding)" not in edges
 
 def test_get_neighborhood_short_words_ignored(temp_graph):
     """Test that words under 3 characters are completely skipped in traversal."""
@@ -90,7 +90,7 @@ def test_get_neighborhood_fuzzy_node_mapping(temp_graph):
     # 'super' is not an exact node, but fuzzy/substring mapping lands on 'superman'.
     edges = temp_graph.get_neighborhood(["SUPER"])
     assert len(edges) == 1
-    assert "- (Superman) -[FLIES]-> (Fast)" in edges
+    assert "- (superman) -[FLIES]-> (fast)" in edges
 
 def test_delete_by_target(temp_graph):
     """Test dropping edges based on loose target matching."""
@@ -107,7 +107,7 @@ def test_delete_by_target(temp_graph):
     # Verify remaining edges
     all_edges = temp_graph.get_neighborhood(["superman", "batman", "gotham", "lois lane", "daily planet"])
     assert len(all_edges) == 1
-    assert "Batman" in all_edges[0]
+    assert "batman" in all_edges[0]
 
 def test_delete_by_target_short_word(temp_graph):
     """Test short words are rejected."""

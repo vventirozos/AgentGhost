@@ -460,14 +460,23 @@ class TestRemoteAccessHint:
         assert "No module named flask" in out
         assert sup._load() == {}  # not registered
 
-    def test_start_twice_requires_restart(self, tmp_path):
+    def test_start_twice_with_the_same_command_is_a_note(self, tmp_path):
         sup = ServiceSupervisor(FakeSandbox(tmp_path, happy_handler()))
         sup.start("dash", "cmd1", port=8100)
+        out = sup.start("dash", "cmd1", port=8100)
+        assert "already running" in out and "same command" in out
+
+    def test_start_twice_with_a_new_command_replaces_the_service(self, tmp_path):
+        """§4SK (req a60aa2de): a start naming a DIFFERENT command used to be
+        told "already running … do stop then start" — 3 turns for one
+        intent. Now one call replaces it and says what it replaced."""
+        sb = FakeSandbox(tmp_path, happy_handler())
+        sup = ServiceSupervisor(sb)
+        sup.start("dash", "cmd1", port=8100)
         out = sup.start("dash", "cmd2", port=8101)
-        assert "already running" in out
-        # §4NW: and which step runs the NEW command (restart relaunches the
-        # stored one — the live directory-listing turn)
-        assert "DIFFERENT command" in out and "action='stop'" in out
+        assert out.startswith("Replaced the running 'dash'") and "`cmd1`" in out and "port 8100" in out
+        assert "RUNNING" in out and "already running" not in out
+        assert any("sig TERM" in c or "kill" in c for c in sb.calls)      # the old process was stopped
 
     def test_max_services_cap(self, tmp_path):
         sup = ServiceSupervisor(FakeSandbox(tmp_path, happy_handler()))

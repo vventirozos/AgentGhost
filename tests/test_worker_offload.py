@@ -200,7 +200,10 @@ class TestOffloadWiring:
         # bounded `timeout=90.0` + an explanatory comment, pushing the
         # `use_worker=True` kwarg further into the function body.
         # 3200→5200 (§4KY): the prefilter and the CURRENT TIME line grew the head
-        block = src.split("async def run_smart_memory_task", 1)[1][:5200]
+        # §4SN: the whole function body (the owner_text check grew the head
+        # again) — a byte window kept breaking on comment growth
+        import re as _re
+        block = _re.split(r"\n    (?:async )?def ", src.split("async def run_smart_memory_task", 1)[1], 1)[0]
         assert "use_worker=True" in block
 
     def test_constraint_gate_screens_on_worker(self):

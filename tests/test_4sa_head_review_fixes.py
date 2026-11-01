@@ -15,7 +15,8 @@ save-restore chain and its seven fixes.
 5. CONV_MIN_PAST_TOKENS 1024 → 3072, env-overridable;
 6. the save bound grows with the state like the restore's;
 7. a same-conversation follow-up restores the head first when the previous
-   request made ≥ GHOST_CONV_HEAD_FIRST_CALLS main calls (0 = off).
+   request pushed out llama's checkpoint (§4SO, 2026-11-01: by its growth and
+   calls — `checkpoint_span_passed`; the §4SA call-count env is gone).
 """
 from __future__ import annotations
 
@@ -470,33 +471,224 @@ async def test_a_big_conversations_save_gets_the_bigger_bound(cwarm, monkeypatch
     assert bounds[0] > H.SAVE_TIMEOUT_S
 
 
-# ── 7. a long request's follow-up gets the head first (gated) ────────────────
+# ── 7. a long request's follow-up gets the head first (§4SO: by growth) ──────
+# §4SO (2026-11-01): req 6c7ee05f (21 calls, slot 27.9k → 67k) → follow-up
+# 2ee352dd re-read 28,490 tokens from 0: llama had evicted every checkpoint at
+# or below the follow-up's 27,279-token match. The §4SA call-count gate was
+# off, and a call count is not what evicts them (31 small calls kept it).
 
-@pytest.mark.parametrize("raw,want", [(None, 0), ("", 0), ("8", 8), ("-1", 0), ("x", 0)])
-def test_the_head_first_gate_comes_from_the_env(monkeypatch, raw, want):
-    monkeypatch.delenv(L.CONV_HEAD_FIRST_CALLS_ENV, raising=False)
-    if raw is not None:
-        monkeypatch.setenv(L.CONV_HEAD_FIRST_CALLS_ENV, raw)
-    assert L.conv_head_first_calls() == want
+_LIVE = (21, 27900, 65481)          # req 6c7ee05f: calls, first prompt, largest prompt
 
 
-def test_the_record_counts_a_requests_main_calls():
+@pytest.mark.parametrize("calls,start,end,want", [
+    (*_LIVE, True),                                   # the live loss
+    (31, 27000, 30000, False),                        # §4SA probe 3: 31 calls, +3k — kept
+    (17, 27000, 28000, False),                        # §4SA probe 2
+    (5, 27000, 90000, False),                         # too few calls to fill 11 spaced slots
+    (6, 27000, 27000 + 11 * 1024, False),             # growth exactly (N-1)·step: not past it
+    (6, 27000, 27000 + 11 * 1024 + 1, True),          # the boundary, both sides
+    (None, 27000, 90000, False), (21, None, 90000, False), (21, 27000, None, False),
+    ("junk", 27000, 90000, False), (21, 0, 90000, False),
+])
+def test_the_checkpoint_span_table(monkeypatch, calls, start, end, want):
+    monkeypatch.delenv(L.LLAMA_CTX_CHECKPOINTS_ENV, raising=False)
+    monkeypatch.delenv(L.LLAMA_CHECKPOINT_MIN_STEP_ENV, raising=False)
+    assert L.checkpoint_span_passed(calls, start, end) is want
+
+
+@pytest.mark.parametrize("n,step,calls,grow,want", [
+    ("4", "100", 2, 301, True), ("4", "100", 2, 300, False), ("4", "100", 1, 9999, False),
+    ("x", "", 6, 11 * 1024 + 1, True), ("0", "-5", 6, 11 * 1024, False),   # junk → the launcher's 12 / 1024
+])
+def test_the_span_follows_llamas_settings(monkeypatch, n, step, calls, grow, want):
+    monkeypatch.setenv(L.LLAMA_CTX_CHECKPOINTS_ENV, n)
+    monkeypatch.setenv(L.LLAMA_CHECKPOINT_MIN_STEP_ENV, step)
+    assert L.checkpoint_span_passed(calls, 1000, 1000 + grow) is want
+
+
+@pytest.mark.parametrize("obj,want", [
+    ({"usage": {"prompt_tokens": 27900, "completion_tokens": 50}}, (27900, 50)),
+    ('data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":7}}', (100, 7)),
+    (b'data: {"usage":{"prompt_tokens":100}}', (100, 0)),
+    ("data: [DONE]", None), ('data: {"choices":[{"delta":{"content":"x"}}]}', None),
+    ({"usage": {"prompt_tokens": 0, "completion_tokens": 9}}, None), ({"usage": "x"}, None),
+    ("data: {broken usage", None), (None, None), ({"choices": []}, None),
+    ('data: {"usage": {"prompt_tokens": 1', None),                     # a cut frame: JSON error, not a raise
+    ({"usage": {"prompt_tokens": "x"}}, None),                         # an unreadable count
+])
+def test_usage_tokens_reads_a_result_or_an_sse_line(obj, want):
+    assert L.usage_tokens(obj) == want
+
+
+def _note(c, rid, usage=None):
+    tok = request_id_context.set(rid)
+    try:
+        L.note_main_slot_prompt(c, _head("q"), "stream", usage=usage)
+    finally:
+        request_id_context.reset(tok)
+
+
+def test_the_record_keeps_a_requests_calls_start_and_peak():
     c = _bare_client()
     L.note_head_reference(c, _head())
     slot_session_context.set("sess-a")
-    for rid, want in (("r1", 1), ("r1", 2), ("r1", 3), ("r2", 1), ("r2", 2)):
-        tok = request_id_context.set(rid)
-        try:
-            L.note_main_slot_prompt(c, _head("q"), "stream")
-        finally:
-            request_id_context.reset(tok)
-        assert (c._slot_request, c._slot_request_calls) == (rid, want)
+    _note(c, "r1", (27900, 400))
+    assert (c._slot_request_calls, c._slot_request_start, c._slot_request_end) == (1, 27900, 27900)
+    _note(c, "r1", (33000, 900))
+    _note(c, "r1")                                         # a call without usage moves nothing
+    assert (c._slot_request_calls, c._slot_request_start, c._slot_request_end) == (3, 27900, 33000)
+    _note(c, "r1", (1200, 300))                            # a small side prompt never lowers the peak …
+    _note(c, "r1", (30500, 50))                            # … nor does a compacted later prompt
+    assert (c._slot_request_start, c._slot_request_end) == (27900, 33000)
+    L.release_slot_session(c)                              # a release forgets a MEASURED request
+    assert (c._slot_request_calls, c._slot_request_start, c._slot_request_end) == (0, None, None)
+    _note(c, "r1", (27900, 400))
+    _note(c, "r2", (28400, 100))                           # a new request starts its own
+    assert (c._slot_request, c._slot_request_calls, c._slot_request_start, c._slot_request_end) == \
+        ("r2", 1, 28400, 28400)
+    _note(c, "r3")                                         # its first call unmeasured (a stream cut
+    _note(c, "r3", (29000, 100))                           # before its usage) → the first MEASURED one
+    assert (c._slot_request_start, c._slot_request_end) == (29000, 29000)
+    L.release_slot_session(c)
+    assert (c._slot_request_calls, c._slot_request_start, c._slot_request_end) == (0, None, None)
 
 
-async def _followup(agent, llm, st, monkeypatch, *, calls, gate, with_file=True):
-    monkeypatch.delenv(L.CONV_HEAD_FIRST_CALLS_ENV, raising=False)
-    if gate is not None:
-        monkeypatch.setenv(L.CONV_HEAD_FIRST_CALLS_ENV, str(gate))
+def test_a_side_call_never_becomes_the_start():
+    """r2 review MAJOR: the request's first main stream was cut before its usage
+    frame (a loop kill); the next call on the main box was a picture look
+    (1.5k tokens) — it became the start and five 30k calls 'grew' the slot 29k."""
+    c = _bare_client()
+    L.note_head_reference(c, _head())
+    slot_session_context.set("sess-a")
+    _note(c, "r1")                                                    # cut: no usage
+    tok = request_id_context.set("r1")
+    try:
+        L.note_main_slot_prompt(c, _head("look", tools=None, system="Describe the picture."), "vision",
+                                usage=(1500, 80))
+    finally:
+        request_id_context.reset(tok)
+    assert c._slot_request_start is None and c._slot_moved_on is True
+    assert c._slot_request_end == 1500                                # the peak still counts every call
+    for i in range(5):
+        _note(c, "r1", (30000 + 300 * i, 50))
+    assert c._slot_request_start == 30000                             # the conversation's own call
+    assert not L.checkpoint_span_passed(c._slot_request_calls, c._slot_request_start, c._slot_request_end)
+
+
+async def test_a_request_started_from_another_requests_file_measures_its_growth(cwarm, monkeypatch):
+    """r1 review MAJOR: the restore names the request in the slot BEFORE its
+    first call, so a start set only on "a new request's first call" never came
+    — 21 calls and +38k later the gate read (21, None, None)."""
+    agent, llm, st = cwarm
+    await _warm_with_file(agent, st, quiet=True)
+    d = pathlib.Path(H.head_dir())
+    ckey = H.conv_key("id", "sess-b")
+    _store(d, ckey, 41000)
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True,
+                                                     "calls": 3, "start": 30000, "end": 31000, "rid": "req-8"}))
+    _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    tok = request_id_context.set("req-9")
+    try:
+        await agent._slot_switch_before(_turn(st))
+    finally:
+        request_id_context.reset(tok)
+    assert st["restores"][-1] == ckey and llm._slot_request == "req-9"
+    L.note_head_reference(llm, _head())
+    llm._slot_changed_at = 0.0
+    slot_session_context.set("sess-b")
+    for i in range(21):
+        _note(llm, "req-9", (41200 + 1900 * i, 300))
+    assert (llm._slot_request_calls, llm._slot_request_start) == (21, 41200)
+    assert L.checkpoint_span_passed(llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end)
+
+
+async def test_the_stream_hands_its_usage_to_the_record():
+    c = _bare_client()
+    c._main_streams_open = 0
+    L.note_head_reference(c, _head())
+    slot_session_context.set("sess-a")
+
+    async def stream(payload, use_coding):
+        yield 'data: {"choices":[{"delta":{"content":"hi"}}]}'
+        yield 'data: {"choices":[],"usage":{"prompt_tokens":27900,"completion_tokens":12}}'
+        yield "data: [DONE]"
+    c._do_stream_chat_completion = stream
+    tok = request_id_context.set("r1")
+    try:
+        async for _ in c.stream_chat_completion(_head("q")):
+            pass
+    finally:
+        request_id_context.reset(tok)
+    assert (c._slot_request, c._slot_request_start, c._slot_request_end) == ("r1", 27900, 27900)
+
+
+async def test_a_bytes_stream_hands_its_usage_to_the_record():
+    """Some transports yield bytes (the §4KV note on `_do_stream_chat_completion`)."""
+    c = _bare_client()
+    c._main_streams_open = 0
+    L.note_head_reference(c, _head())
+    slot_session_context.set("sess-a")
+
+    async def stream(payload, use_coding):
+        yield b'data: {"choices":[{"delta":{"content":"hi"}}]}'
+        yield b'data: {"choices":[],"usage":{"prompt_tokens":31000,"completion_tokens":3}}'
+    c._do_stream_chat_completion = stream
+    tok = request_id_context.set("r1")
+    try:
+        async for _ in c.stream_chat_completion(_head("q")):
+            pass
+    finally:
+        request_id_context.reset(tok)
+    assert (c._slot_request_start, c._slot_request_end) == (31000, 31000)
+
+
+async def test_a_completion_hands_its_usage_to_the_record():
+    c = _bare_client()
+    L.note_head_reference(c, _head())
+    slot_session_context.set("sess-a")
+
+    async def do(payload, *a, **k):
+        return {"choices": [{"message": {"content": "x"}}], "_ghost_leg": {"served_by": "main"},
+                "usage": {"prompt_tokens": 30000, "completion_tokens": 5}}
+    c._do_chat_completion = do
+    tok = request_id_context.set("r1")
+    try:
+        await c.chat_completion(_head("q"))
+    finally:
+        request_id_context.reset(tok)
+    assert (c._slot_request, c._slot_request_start, c._slot_request_end) == ("r1", 30000, 30000)
+
+
+def test_every_foreground_slot_mark_with_a_result_passes_its_usage():
+    """R1 enumeration: a `note_main_slot_prompt` call that marks a FOREGROUND
+    call which produced a result must pass `usage=` — one that does not leaves
+    the request's growth unmeasured and the gate silently off. Exempt: the
+    outside-call mark (its label is OUTSIDE_CALL_LABEL), background calls, and
+    marks inside an `except` handler (the call raised: no result exists)."""
+    tree = ast.parse(pathlib.Path(L.__file__).read_text())
+    in_except = set()
+    for h in ast.walk(tree):
+        if isinstance(h, ast.ExceptHandler):
+            in_except |= {id(n) for n in ast.walk(h)}
+    measured, unmeasured = 0, []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "note_main_slot_prompt"):
+            continue
+        kws = {k.arg: k.value for k in node.keywords}
+        bg = kws.get("background")
+        outside = any(isinstance(n, ast.Name) and n.id == "OUTSIDE_CALL_LABEL"
+                      for n in ast.walk(kws.get("label", ast.Constant(None))))
+        if (isinstance(bg, ast.Constant) and bg.value is True) or outside or id(node) in in_except:
+            continue
+        if "usage" in kws:
+            measured += 1
+        else:
+            unmeasured.append(node.lineno)
+    assert unmeasured == [], f"llm.py lines {unmeasured} mark a foreground call without usage="
+    assert measured == 2                                       # the completion and the stream
+
+
+async def _followup(agent, llm, st, monkeypatch, *, calls, start=27900, end=65481, with_file=True):
     await _warm_with_file(agent, st, quiet=True)
     d = pathlib.Path(H.head_dir())
     ckey = H.conv_key("id", "sess-a")
@@ -506,6 +698,7 @@ async def _followup(agent, llm, st, monkeypatch, *, calls, gate, with_file=True)
     _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=42000)
     _conv_env(agent, llm, st, monkeypatch)
     llm._slot_request, llm._slot_request_calls = "req-1", calls
+    llm._slot_request_start, llm._slot_request_end = start, end
     tok = request_id_context.set("req-2")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -514,36 +707,31 @@ async def _followup(agent, llm, st, monkeypatch, *, calls, gate, with_file=True)
     return ckey
 
 
-async def test_off_by_default_a_follow_up_resumes_from_the_slot(cwarm, monkeypatch):
+@pytest.mark.parametrize("calls,start,end,restored", [
+    (21, 27900, 65481, True), (31, 27000, 30000, False), (5, 27000, 90000, False), (21, None, None, False)])
+async def test_past_the_span_the_head_comes_back_first(cwarm, monkeypatch, calls, start, end, restored):
     agent, llm, st = cwarm
-    await _followup(agent, llm, st, monkeypatch, calls=40, gate=None)
-    assert st["order"] == [] and llm._slot_session == "sess-a"
-
-
-@pytest.mark.parametrize("calls,restored", [(4, False), (5, True), (12, True)])
-async def test_past_the_gate_the_head_comes_back_first(cwarm, monkeypatch, calls, restored):
-    agent, llm, st = cwarm
-    ckey = await _followup(agent, llm, st, monkeypatch, calls=calls, gate=5)
+    ckey = await _followup(agent, llm, st, monkeypatch, calls=calls, start=start, end=end)
     if not restored:
         assert st["order"] == [] and llm._slot_session == "sess-a"
         return
     assert st["order"] == ["restore"] and ckey not in st["restores"]      # the head, never the older file
     assert st["restores"] == [agent._head_plan_last["key"]]
     assert llm._slot_session is None                                       # the request's own call re-takes it
-    assert any(f"this conversation's next request (its last made {calls} calls" in m
-               and "re-reads its part past the head" in m for m in st["lines"])
+    assert any(f"this conversation's next request (its last made {calls} calls and grew the slot "
+               f"{end - start:,} tokens" in m and "re-reads its part past the head" in m for m in st["lines"])
     assert st["conv_saves"] == []                                          # nothing to save: the slot IS it
 
 
 async def test_the_gate_counts_only_a_new_request(cwarm, monkeypatch):
     """The same request's later calls never trigger it."""
     agent, llm, st = cwarm
-    monkeypatch.setenv(L.CONV_HEAD_FIRST_CALLS_ENV, "3")
     await _warm_with_file(agent, st, quiet=True)
     st["order"].clear()
     _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=42000)
     _conv_env(agent, llm, st, monkeypatch)
-    llm._slot_request, llm._slot_request_calls = "req-1", 9
+    llm._slot_request, llm._slot_request_calls = "req-1", 21
+    llm._slot_request_start, llm._slot_request_end = 27900, 67025
     tok = request_id_context.set("req-1")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -561,12 +749,8 @@ def test_the_call_count_never_outlives_its_request():
     c = _bare_client()
     L.note_head_reference(c, _head())
     slot_session_context.set("sess-a")
-    tok = request_id_context.set("r1")
-    try:
-        for _ in range(9):
-            L.note_main_slot_prompt(c, _head("q"), "stream")
-    finally:
-        request_id_context.reset(tok)
+    for _ in range(9):
+        _note(c, "r1", (27900, 10))
     assert c._slot_request_calls == 9
     L.release_slot_session(c)
     assert c._slot_request_calls == 0
@@ -578,43 +762,111 @@ async def test_a_restored_conversation_starts_its_count_afresh(cwarm, monkeypatc
     d = pathlib.Path(H.head_dir())
     ckey = H.conv_key("id", "sess-b")
     _store(d, ckey, 41000)
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True,
+                                                     "calls": 4, "start": 30000, "end": 31000, "rid": "req-8"}))
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
-    llm._slot_request_calls = 9
+    llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end = 9, 27000, 60000
     tok = request_id_context.set("req-9")
     try:
         await agent._slot_switch_before(_turn(st))
     finally:
         request_id_context.reset(tok)
-    assert st["restores"][-1] == ckey and llm._slot_request_calls == 0
+    assert st["restores"][-1] == ckey
+    assert (llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end) == (0, None, None)
 
 
-async def test_a_save_records_the_requests_call_count(cwarm, monkeypatch):
+async def test_its_own_file_carries_the_requests_count_and_growth_on(cwarm, monkeypatch):
+    """§4SO, req 6c7ee05f: 20 calls, a picture look saved the conversation, its
+    restore reset the count to 0 — the follow-up's gate would have read 1 call."""
+    agent, llm, st = cwarm
+    await _warm_with_file(agent, st, quiet=True)
+    d = pathlib.Path(H.head_dir())
+    ckey = H.conv_key("id", "sess-a")
+    _store(d, ckey, 65282)
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 65282, "kind": H.CONV, "head_in_slot": True,
+                                                     "calls": 20, "start": 27900, "end": 65282,
+                                                     "rid": "req-a"}))
+    st["restores"].clear()
+    _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=1421)
+    _conv_env(agent, llm, st, monkeypatch)
+    agent._side_call_rid = "req-a"
+    llm._head_displaced = llm._slot_moved_on = True
+    llm._slot_request = "req-a"
+    tok = request_id_context.set("req-a")
+    try:
+        await agent._slot_switch_before(_turn(st))
+    finally:
+        request_id_context.reset(tok)
+    assert st["restores"] == [ckey]
+    assert (llm._slot_request, llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end) == \
+        ("req-a", 20, 27900, 65282)
+    _note(llm, "req-a", (65481, 1544))                     # Turn 21 (the final reply)
+    assert (llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end) == (21, 27900, 65481)
+    assert L.checkpoint_span_passed(llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end)
+
+
+async def _own_file_restore(agent, llm, st, monkeypatch, *, rid, meta):
+    await _warm_with_file(agent, st, quiet=True)
+    d = pathlib.Path(H.head_dir())
+    ckey = H.conv_key("id", "sess-a")
+    _store(d, ckey, 65282)
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 65282, "kind": H.CONV, "head_in_slot": True,
+                                                     **meta}))
+    st["restores"].clear()
+    _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=1421)
+    _conv_env(agent, llm, st, monkeypatch)
+    agent._side_call_rid = rid
+    llm._head_displaced = llm._slot_moved_on = True
+    llm._slot_request = rid
+    tok = request_id_context.set(rid)
+    try:
+        await agent._slot_switch_before(_turn(st))
+    finally:
+        request_id_context.reset(tok)
+    return ckey
+
+
+async def test_a_keyless_request_never_carries_a_keyless_files_counts(cwarm, monkeypatch):
+    """An empty request id matches an empty saved one — that is no request."""
+    agent, llm, st = cwarm
+    await _own_file_restore(agent, llm, st, monkeypatch, rid="",
+                            meta={"calls": 21, "start": 27900, "end": 65282, "rid": ""})
+    assert (llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end) == (0, None, None)
+
+
+async def test_an_unreadable_saved_count_restores_with_none(cwarm, monkeypatch):
+    agent, llm, st = cwarm
+    ckey = await _own_file_restore(agent, llm, st, monkeypatch, rid="req-a",
+                                   meta={"calls": "junk", "start": "x", "end": 65282, "rid": "req-a"})
+    assert st["restores"] == [ckey]                                   # the restore itself went through
+    assert (llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end) == (0, None, 65282)
+
+
+async def test_a_save_records_the_requests_call_count_and_growth(cwarm, monkeypatch):
     agent, llm, st = cwarm
     await _warm_with_file(agent, st, quiet=True)
     _switch_env(agent, llm, st, monkeypatch, slot=40000)
     _conv_env(agent, llm, st, monkeypatch)
-    llm._slot_request_calls = 7
+    llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end = 7, 28000, 40000
     assert await agent._conv_save(llm, "x") is True
-    assert st["extras"][-1]["calls"] == 7
+    assert {k: st["extras"][-1][k] for k in ("calls", "start", "end")} == {"calls": 7, "start": 28000, "end": 40000}
 
 
-@pytest.mark.parametrize("calls,gate,restored", [(9, 0, True), (4, 5, True), (5, 5, False), (12, 5, False),
-                                                 (None, 5, True), ("junk", 5, True)])
-async def test_a_file_saved_after_a_long_request_is_left_for_the_head(cwarm, monkeypatch, calls, gate, restored):
+@pytest.mark.parametrize("meta,restored", [
+    ({"calls": 21, "start": 27900, "end": 67025}, False),
+    ({"calls": 31, "start": 27000, "end": 30000}, True),
+    ({"calls": 4, "start": 27000, "end": 90000}, True),
+    ({"calls": 21}, True), ({}, True), ({"calls": "junk", "start": "x", "end": 9}, True)])
+async def test_a_file_saved_after_a_long_request_is_left_for_the_head(cwarm, monkeypatch, meta, restored):
     """Review MAJOR: the file holds the previous request's last 12 checkpoints
     exactly as the slot did — the same gate applies to a restore."""
     agent, llm, st = cwarm
-    monkeypatch.delenv(L.CONV_HEAD_FIRST_CALLS_ENV, raising=False)
-    if gate:
-        monkeypatch.setenv(L.CONV_HEAD_FIRST_CALLS_ENV, str(gate))
     await _warm_with_file(agent, st, quiet=True)
     d = pathlib.Path(H.head_dir())
     ckey = H.conv_key("id", "sess-b")
     _store(d, ckey, 41000)
-    meta = {"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True}
-    if calls is not None:
-        meta["calls"] = calls
-    (d / f"head-{ckey}.json").write_text(json.dumps(meta))
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True,
+                                                     **meta}))
     st["restores"].clear(); st["lines"].clear()
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     await agent._slot_switch_before(_turn(st))
@@ -622,7 +874,8 @@ async def test_a_file_saved_after_a_long_request_is_left_for_the_head(cwarm, mon
         assert st["restores"] == [ckey]
     else:
         assert st["restores"] == [agent._head_plan_last["key"]]
-        assert any(f"not restored — its last request made {calls} calls" in m for m in st["lines"])
+        assert any("not restored — its last request made 21 calls and grew the slot 39,125 tokens" in m
+                   for m in st["lines"])
         assert [i for _t, m, i in st["logged"] if "its last request made" in m] == [Icons.CONV_LEFT]
 
 
@@ -805,13 +1058,13 @@ async def test_the_file_gate_exempts_the_request_that_saved_it(cwarm, monkeypatc
     """r2 MAJOR: a request past the gate saves its state before a picture look;
     its own next call extends that prompt whole — no checkpoint is needed."""
     agent, llm, st = cwarm
-    monkeypatch.setenv(L.CONV_HEAD_FIRST_CALLS_ENV, "5")
     await _warm_with_file(agent, st, quiet=True)
     d = pathlib.Path(H.head_dir())
     ckey = H.conv_key("id", "sess-a")
     _store(d, ckey, 41000)
     (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True,
-                                                     "calls": 7, "rid": "req-a"}))
+                                                     "calls": 21, "start": 27900, "end": 67025,
+                                                     "rid": "req-a"}))
     st["restores"].clear()
     _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=41400)
     _conv_env(agent, llm, st, monkeypatch)
@@ -826,7 +1079,8 @@ async def test_the_file_gate_exempts_the_request_that_saved_it(cwarm, monkeypatc
     assert st["restores"] == [ckey]                        # its own file, gate or not
     # another request of the conversation: gated
     (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True,
-                                                     "calls": 7, "rid": "req-a"}))
+                                                     "calls": 21, "start": 27900, "end": 67025,
+                                                     "rid": "req-a"}))
     st["restores"].clear(); agent._switch_done = {}
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-a", slot=30000)
     tok = request_id_context.set("req-b")

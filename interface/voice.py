@@ -1,5 +1,15 @@
-"""Local voice loop for the web interface — STT on the Gemma 4 audio node,
-TTS via the local macOS speech synthesiser.
+"""Local voice loop for the web interface — STT on nova (whisper.cpp's
+``whisper-server`` when ``GHOST_STT_URL`` is set, else the Gemma 4 audio
+node), TTS via the local macOS speech synthesiser.
+
+**§4SL (2026-10-31): Whisper replaces Gemma for speech.** Measured on nova
+with this module's exact Gemma request (FLEURS read speech, 16-bit WAV):
+Greek WER 60.8 % / CER 40.9 % on Gemma — 30 of 100 clips came back in Latin
+transliteration — against 12.2 % / 4.6 % on Whisper large-v3 q5_0 with tuned
+Silero VAD (nova's com.local.whisper-server), English 6.6 % vs 5.2 %, median
+9.1 s vs 3.4 s per clip. With
+``GHOST_STT_URL`` set the Gemma path is not consulted at all (no fallback:
+at 60 % Greek WER a fallback would hand the agent wrong words).
 
 **Why this module exists.** The interface has shipped a complete push-to-talk
 UI since 2026-07 (mic button, MediaRecorder, full touch lifecycle) whose two
@@ -43,6 +53,7 @@ import io
 import logging
 import os
 import shutil
+import re
 import tempfile
 import wave
 from pathlib import Path
@@ -56,6 +67,11 @@ logger = logging.getLogger(__name__)
 # stranded the previous voice backend. utun/tailnet is exempt.
 AUDIO_NODE_URL = os.environ.get("GHOST_AUDIO_NODE_URL", "http://100.83.184.117:8088")
 AUDIO_NODE_MODEL = os.environ.get("GHOST_AUDIO_NODE_MODEL", "gemma")
+# §4SL: whisper.cpp `whisper-server` base URL (nova, tailnet ip, port 8090).
+# Empty = the Gemma path above. STT_LANGUAGE goes to whisper as `language`:
+# "auto" detects per clip (~0.8 s on nova); "el"/"en" skips detection.
+STT_URL = os.environ.get("GHOST_STT_URL", "").strip().rstrip("/")
+STT_LANGUAGE = os.environ.get("GHOST_STT_LANGUAGE", "").strip() or "auto"
 
 def _env_num(name: str, default, cast=float):
     """Env override that cannot crash the process at IMPORT. See the twin in
@@ -82,9 +98,9 @@ def _env_num(name: str, default, cast=float):
     return val
 
 
-# Per-slot context on nova is `--ctx-size 131072 / -np 4` = 32,768 tokens, and
-# audio costs a measured 25.0 tok/s, so ~21 min is the hard ceiling. 15 min
-# leaves room for the prompt and the transcript itself. Push-to-talk clips are
+# Gemma path: per-slot context on nova is `--ctx-size 65536 / -np 4` = 16,384
+# tokens since §4RR, and audio costs a measured 25.0 tok/s, so ~10 min is the
+# hard ceiling there (Whisper has none). Push-to-talk clips are
 # seconds long; this bound exists so a stray large upload fails fast and
 # legibly instead of wedging a slot.
 STT_MAX_SECONDS = _env_num("GHOST_STT_MAX_SECONDS", 900.0)
@@ -359,8 +375,12 @@ async def _transcribe(raw: bytes, *, client) -> str:
         raise VoiceError(
             f"Audio is {duration / 60:.1f} min; the limit is "
             f"{STT_MAX_SECONDS / 60:.0f} min per request "
-            f"(raise GHOST_STT_MAX_SECONDS, but nova's per-slot context caps "
-            f"a single request near 21 min of audio).", 413)
+            + ("(raise GHOST_STT_MAX_SECONDS)." if STT_URL else
+               "(raise GHOST_STT_MAX_SECONDS, but nova's per-slot context caps "
+               "a single request near 10 min of audio)."), 413)
+
+    if STT_URL:
+        return await _transcribe_whisper(wav, duration, client=client)
 
     resp = await client.post(f"{AUDIO_NODE_URL}/v1/chat/completions",
                              json=_audio_message_payload(wav), timeout=STT_TIMEOUT_S)
@@ -390,6 +410,41 @@ async def _transcribe(raw: bytes, *, client) -> str:
     if text.lower().startswith(_NO_SPEECH_SENTINEL):
         return ""
     logger.info("STT: %.1fs audio -> %d chars", duration, len(text))
+    return text
+
+
+#: whisper's own non-speech tags ([BLANK_AUDIO], (music), [Μουσική]…); a reply
+#: with no word outside them ("[BLANK_AUDIO]", "♪", " .") is silence. Twin of
+#: `audio_ingest.whisper_reply_is_silence` (this process cannot import ghost_agent).
+_WHISPER_TAG = re.compile(r"[\[(][^\])]{0,40}[\])]")
+
+
+async def _transcribe_whisper(wav: bytes, duration: float, *, client) -> str:
+    """§4SL: one clip through whisper.cpp's ``/inference`` (multipart).
+
+    The server answers ``{"text": …}``; a failure arrives either as a non-200
+    or as a 200 carrying ``{"error": …}`` — both are a VoiceError, never "".
+    Segment line breaks are joined with spaces: the agent receives what was
+    said, as one message, exactly as the Gemma path delivered it."""
+    resp = await client.post(
+        f"{STT_URL}/inference",
+        files={"file": ("clip.wav", wav, "audio/wav")},
+        data={"response_format": "json", "temperature": "0.0", "language": STT_LANGUAGE},
+        timeout=STT_TIMEOUT_S)
+    if resp.status_code != 200:
+        raise VoiceError(f"Whisper server returned HTTP {resp.status_code}: {(resp.text or '')[:200]}", 502)
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise VoiceError(f"Malformed response from the whisper server: {exc}", 502) from exc
+    if not isinstance(data, dict):
+        raise VoiceError("Malformed response from the whisper server: not a JSON object", 502)
+    if data.get("error"):
+        raise VoiceError(f"Whisper server error: {str(data['error'])[:200]}", 502)
+    text = " ".join(str(data.get("text") or "").split())
+    if not re.search(r"\w", _WHISPER_TAG.sub(" ", text)):
+        return ""
+    logger.info("STT (whisper): %.1fs audio -> %d chars", duration, len(text))
     return text
 
 

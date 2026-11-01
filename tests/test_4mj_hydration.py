@@ -95,7 +95,7 @@ def test_a_chain_contained_in_a_longer_chain_is_not_returned_twice(tmp_path):
                      {"subject": "ouroboros", "predicate": "REPRESENTS", "object": "recursion"}])
     out = gm.get_neighborhood(["ouroboros"], 15, fuzzy=False)
     assert any("Designs" in l.title() or "DESIGNS" in l for l in out)
-    assert not any(l.startswith("- (Ouroboros) -[REPRESENTS]->") for l in out), out
+    assert not any(l.lower().startswith("- (ouroboros) -[represents]->") for l in out), out   # §4SN: shown as stored
 
 
 @pytest.mark.parametrize("q,intent", [
@@ -117,17 +117,17 @@ def test_the_intent_classifier_reads_how_and_punctuation(q, intent):
 
 @pytest.mark.asyncio
 async def test_a_turns_stash_survives_an_overlapping_turns_hydration():
-    """Fails where the single stash slot was taken by a second turn's
-    hydration before the first turn's reader got to it: each turn keeps
-    its own entry in `_hydration_by_turn`."""
+    """The stash belongs to the newest hydrating turn (the per-turn
+    `_hydration_by_turn` map had no reader and was removed, retrieval review
+    2026-10-31)."""
     bus = MemoryBus()
     bus._fetch_all_tiers = AsyncMock(return_value=[[{"source": "graph", "text": "- (A) -[R]-> (B)"}]])
     bus._log_hydration = lambda *a, **k: None
     bus._credit_surfaced = lambda s: None
     await bus.hydrate_context("first question about A", turn_id="t1")
     await bus.hydrate_context("second question about A", turn_id="t2")
-    assert "t1" in bus._hydration_by_turn and "t2" in bus._hydration_by_turn
-    assert bus._hydration_by_turn["t1"]["survivors"] and bus.last_hydration["turn_id"] == "t2"
+    assert bus.last_hydration["turn_id"] == "t2" and bus.last_hydration["survivors"]
+    assert not hasattr(bus, "_hydration_by_turn")
 
 
 def test_the_active_session_is_excluded_before_the_limit(tmp_path):

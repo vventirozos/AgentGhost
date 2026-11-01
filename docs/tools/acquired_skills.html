@@ -159,6 +159,39 @@ way you'd call any built-in tool.</code></pre>
     <li><strong>Document names:</strong> <code>memory._match_library_name</code> (query, outline, transcript) — an exact name wins; a shortened name used only when ONE document fits; several fits are an error that lists them ("q3" had silently picked q3.md over q3.txt).</li>
     <li><strong>Dead-end refusals end the tool phase</strong> (<code>agent._DEAD_END_REFUSALS</code>: <code>not_owner_write</code>, <code>confirm_dead_end</code>, <code>forget_not_confirmed</code>, <code>reset_not_confirmed</code>): a refusal that cannot change within the request — a probe/background write to the skill stores, a confirm in the preview's own turn — sets <code>force_final_response</code>, so the model replies instead of retrying (it retried 3-8× despite "STOP" in the text).</li>
   </ul>
+  <h2 id="news-headlines">The <code>news_headlines</code> skill, rewritten <span class="tag">2026-10-31</span></h2>
+  <p>The owner's daily "tell me the news" (47 runs, no failures) used ONE feed, Naftemporiki, a business paper. That's why the briefing leaned on markets. Descriptions came back as raw HTML cut mid-tag, and links carried <code>utm_*</code> tracking. The skill was rewritten (operator: "make it richer"). It is still stdlib only and still runs in the sandbox, where all egress goes through Tor.</p>
+  <ul>
+    <li><strong>Sources.</strong> 18 keyless RSS/Atom feeds are fetched in parallel, about 5 s in all:
+    <ul>
+      <li>11 Greek: ERT, Naftemporiki, in.gr, Proto Thema, CNN Greece, SKAI, To Vima, iefimerida, EfSyn, OT.gr and Greek Reporter (in English);</li>
+      <li>7 world: BBC, Guardian, Al Jazeera, DW, Euronews, France 24 and NPR.</li>
+    </ul>
+    Kathimerini (410), ekathimerini (403) and keeptalkinggreece (broken XML) failed from the sandbox and were left out.</li>
+    <li><strong>One story, once.</strong> Items are linked when their titles share at least two content words and the rare words they share cover at least 0.4 of the smaller item. Words are weighted by inverse document frequency over the whole pool, using 5-letter stems with accents folded. Linked items join into one story (union-find). Measured on a live pool of 560 items: the Poland court crisis was told 9 ways and became one story with 9 outlets, and no false merges were found.</li>
+    <li><strong>Ranking.</strong> A story ranks by the number of outlets that carry it (<code>also_reported_by</code>), then by recency. Routine daily items (name days, horoscopes, lottery draws) go to the back.</li>
+    <li><strong>Mix.</strong> The default briefing is about 2/3 Greece and 1/3 world. No outlet gets more than ¼ of the list, and no topic more than ⅓. These caps are preferences: a final pass fills the count without them.</li>
+    <li><strong>Scope and topic.</strong> Scope is what a story is about, not who published it. A Greek outlet's report from Warsaw is world news when its section says so, or when the title leads with a foreign place or leader ("ΗΠΑ: …", "Λαβρόφ: …"). A merged story takes the majority scope. Topic keywords match at the start of a word, so "transport" is not sports.</li>
+    <li><strong>Each headline</strong> carries:
+    <ul>
+      <li>title, source, scope, language and topic;</li>
+      <li>the time in Athens and the age ("3 h ago");</li>
+      <li>a clean summary (no HTML, no "The post … appeared first on" trailer) and a link without tracking parameters.</li>
+    </ul></li>
+    <li><strong>Arguments</strong> are all optional: <code>count</code>, <code>region</code>, <code>topic</code>, <code>query</code>, <code>hours</code>, <code>sources</code>. The registry validator checks only JSON types, so the skill itself turns an unknown region, topic or source into a <code>notes</code> entry, never an error: three failures retire a skill. A query or topic filters whole stories after clustering. A filtered pool would skew the word weights, because every item of a "Πολωνία" query shares "Πολωνία".</li>
+    <li><strong>Failure</strong> (§4LS) is reported per feed:
+    <ul>
+      <li>a dead feed is listed in <code>sources_failed</code> while the rest answer;</li>
+      <li>only "every feed failed" exits non-zero.</li>
+    </ul></li>
+  </ul>
+  <p>Installed through <code>AcquiredSkillManager.save_skill</code>, with the agent idle (usage count kept, hash updated). The old file and registry are in <code>system/code_backups/20261031-news-headlines/</code>. The new description and schema are part of the tools block, so the head is re-prefilled once. The vector embedding still holds the old description under the right name. That is harmless below 25 skills, where every skill is advertised.</p>
+  <p>Pins: <code>tests/test_skill_news_headlines.py</code> (15 tests, offline fixtures). It loads the installed skill; set <code>GHOST_NEWS_SKILL</code> to test another copy. The fixtures carry a backdrop of unrelated stories, because word weights over a 6-item pool merge everything. Mutants: 10 out of 10 killed.</p>
+  <p>Known gaps:</p>
+  <ul>
+    <li>A story told in Greek and in English stays two stories: titles in different languages share no words.</li>
+    <li>Follow-ups to one story (an injury, the coach's comment, the player's message) can stay separate.</li>
+  </ul>
 </main>
 </body>
 </html>
