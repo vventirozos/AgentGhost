@@ -82,7 +82,7 @@ def test_the_briefing_says_how_many_tasks_are_open_when_it_shows_only_some(tmp_p
     for t in ids[:5]:
         store.update_task(t, status="NEEDS_USER")
     b = build_project_briefing(store, pid)
-    assert "OPEN TASKS (12: 7 PENDING, 5 NEEDS_USER):" in b
+    assert "OPEN TASKS (12: 7 PENDING, 5 WAITING(owner)):" in b      # §4SU Phase 3
     assert all(f"[{t}]" in b for t in ids)
     assert b.count("x" * 100) == 8 + 1                  # 8 in full + NEXT TASK; the rest short
     assert "action=task_list" not in b

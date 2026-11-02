@@ -155,10 +155,13 @@ def test_plan_rehydrates_entire_tree(store):
 
 def test_plan_update_status_pause_then_resume(plan, store):
     r = plan.add_task("root")
+    # §4SU Phase 3: a paused task is stored WAITING on the owner; READY is PENDING
     plan.update_status(r, TaskStatus.PAUSED)
-    assert store.get_task(r)["status"] == "PAUSED"
+    t = store.get_task(r)
+    assert (t["status"], t["wait_on"], t["wait_code"]) == ("NEEDS_USER", "owner", "paused")
     plan.update_status(r, TaskStatus.READY)
-    assert store.get_task(r)["status"] == "READY"
+    t = store.get_task(r)
+    assert (t["status"], t["wait_on"], t["wait_code"]) == ("PENDING", "", "")
 
 
 def test_plan_respects_postconditions_through_cascade(plan):

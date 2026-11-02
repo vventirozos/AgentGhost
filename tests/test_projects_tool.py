@@ -295,7 +295,7 @@ async def test_exit_clears_current_and_scratchpad(context):
 async def test_list_returns_all_projects_with_current(context):
     p1 = _parse(await tool_manage_projects(context, action="create", title="A"))
     p2 = _parse(await tool_manage_projects(context, action="create", title="B"))
-    res = _parse(await tool_manage_projects(context, action="list"))
+    res = _parse(await tool_manage_projects(context, action="list", metadata={"verbose": True}))
     titles = {p["title"] for p in res["projects"]}
     assert titles == {"A", "B"}
     assert res["current"] == p2["created"]
@@ -309,7 +309,7 @@ async def test_list_display_block_leads_with_ids(context):
     # a note directing the model to always show the ids.
     p1 = _parse(await tool_manage_projects(context, action="create", title="A"))
     p2 = _parse(await tool_manage_projects(context, action="create", title="B"))
-    res = _parse(await tool_manage_projects(context, action="list"))
+    res = _parse(await tool_manage_projects(context, action="list", metadata={"verbose": True}))
     display = res["display"]
     for pid in (p1["created"], p2["created"]):
         assert pid in display
@@ -325,7 +325,7 @@ async def test_list_display_block_leads_with_ids(context):
 
 
 async def test_list_display_empty_store(context):
-    res = _parse(await tool_manage_projects(context, action="list"))
+    res = _parse(await tool_manage_projects(context, action="list", metadata={"verbose": True}))
     assert res["projects"] == []
     assert res["display"] == "(no projects)"
 
@@ -335,7 +335,7 @@ async def test_list_filters_by_status(context):
     _parse(await tool_manage_projects(context, action="create", title="B"))
     # Archive A (still exists, just not ACTIVE)
     await tool_manage_projects(context, action="archive", project_id=a["created"])
-    res = _parse(await tool_manage_projects(context, action="list",
+    res = _parse(await tool_manage_projects(context, action="list", metadata={"verbose": True},
                                             status_filter="ACTIVE"))
     assert all(p["id"] != a["created"] for p in res["projects"])
 
@@ -529,7 +529,7 @@ async def test_tool_description_prefers_decompose_for_lists(context):
     desc = MANAGE_PROJECTS_TOOL_DEF["function"]["description"]
     assert "2+ tasks" in desc or "2+ task" in desc
     assert "task_decompose" in desc
-    assert "Added" in desc and "Done" in desc
+    assert "not N task_add" in desc   # §4SU Phase 4 wording
 
 
 async def test_task_update_marks_done(context):
@@ -955,7 +955,9 @@ async def test_task_list_returns_slim_rows_by_default(context):
     assert "metadata_json" not in sample
     assert "created_at" not in sample
     # Useful columns ARE in the slim row
-    assert "id" in sample and "description" in sample and "status" in sample
+    # §4SU Phase 3: the five-state view replaces the stored status
+    assert "id" in sample and "description" in sample and sample["state"] == "PENDING"
+    assert "status" not in sample
 
 
 async def test_task_list_verbose_returns_full_rows(context):

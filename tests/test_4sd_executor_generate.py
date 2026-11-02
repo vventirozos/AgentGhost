@@ -747,6 +747,9 @@ def test_the_advancer_puts_an_out_of_time_task_back_to_ready():
     calls = []
     store = SimpleNamespace(
         update_task=lambda tid, **kw: calls.append(("update", tid, kw)),
+        # §4SU Phase 3 r2: the claim is released through the store (a claimed
+        # hold goes back to the hold, anything else to PENDING)
+        release_claim=lambda tid, **kw: calls.append(("update", tid, {"status": "PENDING", **kw})),
         log_event=lambda *a, **k: calls.append(("event", a[2])),
     )
     plan = SimpleNamespace(update_status=lambda *a, **k: calls.append(("status", a, k)))
@@ -758,7 +761,7 @@ def test_the_advancer_puts_an_out_of_time_task_back_to_ready():
         res = PA._finalize_coding(SimpleNamespace(), store, plan, "p1", nxt,
                                   CE.CodingResult(False, "out of time: …", files=["a.js"], out_of_time=True),
                                   time.time())
-    assert ("update", "t1") == calls[0][:2] and calls[0][2]["status"] == "READY"
+    assert ("update", "t1") == calls[0][:2] and calls[0][2]["status"] == "PENDING"
     assert not any(c[0] == "status" for c in calls)
     assert "back to READY" in res.summary
 
@@ -885,7 +888,7 @@ def test_an_owner_batch_stops_at_an_out_of_time_task(tmp_path):
     res = asyncio.run(PA.advance_many(ctx, pid, max_tasks=None, owner_requested=True, tool_runner=runner,
                                       llm_classifier=cls, coding_executor=builder, stop_on_fail=False))
     assert len(calls) == 1 and res.stop_reason == "out_of_time"
-    assert res.advanced[-1]["status"] == "READY"
+    assert res.advanced[-1]["status"] == "PENDING"
 
 
 async def test_two_empty_rounds_after_a_cut_never_end_the_file():

@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     depth INTEGER NOT NULL DEFAULT 0,
     position INTEGER NOT NULL DEFAULT 0,
     closed_req_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',  -- §4SU Phase 2: declared task kind (core/task_kind.py); '' = undeclared
+    wait_on TEXT NOT NULL DEFAULT '',   -- §4SU Phase 3 (core/task_wait.py): owner | owner_turn | dependency
+    wait_code TEXT NOT NULL DEFAULT '',
+    wait_why TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -318,6 +322,12 @@ class ProjectStore:
                 # last closed this task DONE — the join key for retroactive
                 # calibration negatives when the task is later reopened.
                 ("closed_req_id", "TEXT NOT NULL DEFAULT ''"),
+                # §4SU Phase 2: the task's declared kind ('' = undeclared)
+                ("kind", "TEXT NOT NULL DEFAULT ''"),
+                # §4SU Phase 3: why a task waits, as fields (core/task_wait.py)
+                ("wait_on", "TEXT NOT NULL DEFAULT ''"),
+                ("wait_code", "TEXT NOT NULL DEFAULT ''"),
+                ("wait_why", "TEXT NOT NULL DEFAULT ''"),
             ],
         }
         for table, columns in wanted.items():
@@ -339,6 +349,65 @@ class ProjectStore:
                         logger.warning(
                             "migration: could not add %s.%s: %s", table, name, e
                         )
+        self._migrate_task_states(conn)
+
+    def _has_wait_cols(self) -> bool:
+        """§4SU Phase 3: the wait columns exist (cached once true)."""
+        if getattr(self, "_wait_cols_ok", False):
+            return True
+        try:
+            with self._lock, self._connect() as conn:
+                ok = "wait_on" in {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        except sqlite3.Error:
+            ok = False
+        if ok:
+            self._wait_cols_ok = True
+        return ok
+
+    @staticmethod
+    def _migrate_task_states(conn: sqlite3.Connection) -> None:
+        """§4SU Phase 3, one-off and idempotent: READY / task PAUSED fold
+        into PENDING; a waiting row with no wait fields gets them from its
+        old text mark (task_wait.wait_from_marks — the marks' only reader)."""
+        from ..core.task_wait import wait_from_marks, fold_status
+        try:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            if "wait_on" not in cols:
+                return
+            conn.execute("UPDATE tasks SET status = 'PENDING' WHERE status = 'READY'")
+            rows = conn.execute(
+                "SELECT id, status, result_summary, postconditions_json FROM tasks "
+                "WHERE status IN ('NEEDS_USER', 'BLOCKED', 'PAUSED') AND wait_on = ''").fetchall()
+            from ..core.planning import _human_gate_reason
+            for r in rows:
+                on, code, why = wait_from_marks(r["status"], r["result_summary"])
+                # r2: a held row later parked at its HUMAN_GATE kept the hold's
+                # text (the park keeps a non-empty summary) — the gate wins
+                if fold_status(r["status"]) == "NEEDS_USER" and on == "owner_turn":
+                    try:
+                        _pc = json.loads(r["postconditions_json"] or "[]")
+                    except (TypeError, ValueError):
+                        _pc = []
+                    _g = _human_gate_reason(_pc)
+                    if _g:
+                        on, code, why = "owner", "human_gate", str(_g)[:300]
+                # r6: an old BLOCKED row is the cascade's block only when a child
+                # failed and no reason of its own was written; otherwise it is
+                # the model's own block, never lifted automatically
+                if fold_status(r["status"]) == "BLOCKED":
+                    _fr = conn.execute("SELECT failure_reason FROM tasks WHERE id = ?", (r["id"],)).fetchone()
+                    _kid_failed = conn.execute(
+                        "SELECT 1 FROM tasks WHERE parent_id = ? AND status IN ('FAILED', 'BLOCKED') LIMIT 1",
+                        (r["id"],)).fetchone()
+                    _own = str((_fr[0] if _fr else "") or "") not in ("", "All ANY-dependency children failed")
+                    if not _kid_failed or _own:
+                        code = "blocked"
+                conn.execute("UPDATE tasks SET status = ?, wait_on = ?, wait_code = ?, wait_why = ? "
+                             "WHERE id = ?", (fold_status(r["status"]), on, code, why, r["id"]))
+            if rows:
+                logger.info("migration §4SU Phase 3: %d waiting task(s) given wait fields", len(rows))
+        except sqlite3.Error as e:  # pragma: no cover
+            logger.warning("migration §4SU Phase 3 skipped: %s", e)
 
     # ------------------------------------------------------------------ projects
 
@@ -726,9 +795,17 @@ class ProjectStore:
                  constraints: Optional[List[str]] = None,
                  depends_on: Optional[List[str]] = None,
                  estimated_cost: float = 0.0,
-                 position: Optional[int] = None) -> str:
+                 position: Optional[int] = None,
+                 kind: str = "") -> str:
         if not description or not description.strip():
             raise ValueError("description must be non-empty")
+        from ..core.task_kind import normalize_kind
+        kind = normalize_kind(kind)          # §4SU Phase 2 (ValueError on an unknown kind)
+        from ..core.task_wait import fold_status, WAITING_STATUSES, default_wait
+        _raw_status = status                         # §4SU Phase 3: READY → PENDING,
+        status = fold_status(status) or "PENDING"    # PAUSED → NEEDS_USER (owner, paused)
+        _won, _wcode = default_wait(_raw_status) if status in WAITING_STATUSES else ("", "")
+        _wcols = self._has_wait_cols()
         project_id = _canon_id(project_id)
         parent_id = _canon_id(parent_id) or None
         task_id = _new_id()
@@ -761,13 +838,16 @@ class ProjectStore:
                 "dependency_type, alternatives_json, postconditions_json, "
                 "constraints_json, depends_on_json, "
                 "result_summary, failure_reason, revision_count, actual_tool_used, "
-                "estimated_cost, actual_cost, depth, position, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "estimated_cost, actual_cost, depth, position, kind, "
+                + ("wait_on, wait_code, " if _wcols else "") +
+                "created_at, updated_at) "
+                "VALUES (" + ",".join("?" * (23 if _wcols else 21)) + ")",
                 (task_id, project_id, parent_id, description.strip(),
                  status.upper(), dependency_type.upper(),
                  json.dumps(alternatives or []), json.dumps(postconditions or []),
                  json.dumps(constraints or []), json.dumps(depends_on_canon),
-                 "", "", 0, None, estimated_cost, 0.0, depth, position, now, now),
+                 "", "", 0, None, estimated_cost, 0.0, depth, position, kind,
+                 *((_won, _wcode) if _wcols else ()), now, now),
             )
             # REOPEN a finished project when new work is added (2026-07-11).
             #
@@ -860,9 +940,41 @@ class ProjectStore:
         allowed = {"description", "status", "dependency_type", "alternatives",
                    "postconditions", "constraints", "depends_on", "result_summary",
                    "failure_reason", "actual_tool_used",
-                   "estimated_cost", "actual_cost", "parent_id", "position"}
+                   "estimated_cost", "actual_cost", "parent_id", "position", "kind",
+                   "wait_on", "wait_code", "wait_why"}
         sets = []
         values: List[Any] = []
+        if "status" in fields:
+            # §4SU Phase 3: READY / task PAUSED fold into PENDING; leaving a
+            # waiting status clears the wait fields (every writer); entering
+            # one with no wait_on keeps the row's own, else the safe default
+            from ..core.task_wait import fold_status, WAITING_STATUSES, default_wait, WAIT_ON, PAUSED_WAIT
+            _raw_st = str(fields["status"]).strip().upper()
+            _st = fold_status(fields["status"])
+            fields = {**fields, "status": _st}
+            if _raw_st == "PAUSED" and not fields.get("wait_on"):
+                fields.update(wait_on=PAUSED_WAIT[0], wait_code=PAUSED_WAIT[1],
+                              wait_why=fields.get("wait_why") or PAUSED_WAIT[2])
+            if _st not in WAITING_STATUSES:
+                fields.update(wait_on="", wait_code="", wait_why="")
+            elif not fields.get("wait_on"):
+                # r1 MAJOR: a status write with no wait_on gets the safe
+                # default — never the row's earlier wait (a hold survived a
+                # re-park, a BLOCKED kept a human-gate code)
+                _on, _code = default_wait(_raw_st)
+                fields.update(wait_on=_on, wait_code=fields.get("wait_code") or _code,
+                              wait_why=fields.get("wait_why") or str(fields.get("result_summary") or "")[:300])
+        if not self._has_wait_cols():
+            # r1 MINOR: a failed column migration (a locked DB) must not
+            # break every task write ("no such column: wait_on")
+            fields = {k: v for k, v in fields.items() if not k.startswith("wait_")}
+        if fields.get("wait_on"):
+            from ..core.task_wait import WAIT_ON
+            if fields["wait_on"] not in WAIT_ON:
+                raise ValueError(f"unknown wait_on {fields['wait_on']!r}")
+        if "kind" in fields:
+            from ..core.task_kind import normalize_kind
+            fields = {**fields, "kind": normalize_kind(fields["kind"])}   # §4SU Phase 2
         for key, val in fields.items():
             if key not in allowed:
                 raise ValueError(f"unknown task field: {key}")
@@ -952,9 +1064,13 @@ class ProjectStore:
             # auto-undone. Same txn as the task UPDATE, guarded on the
             # observed status, so a concurrent transition makes it a no-op.
             reopened_from = None
+            # §4SU Phase 0 (audit D): a RELEASED CLAIM (IN_PROGRESS → open:
+            # a step stopped, deferred or crashed) is not a revival — it
+            # un-paused a project the owner had just paused
             if (row and cur.rowcount > 0 and "status" in fields
                     and str(fields["status"]).upper()
-                    in ("PENDING", "READY", "IN_PROGRESS")):
+                    in ("PENDING", "READY", "IN_PROGRESS")
+                    and prev_task_status != "IN_PROGRESS"):
                 prow = conn.execute(
                     "SELECT status FROM projects WHERE id = ?",
                     (row["project_id"],),
@@ -987,9 +1103,20 @@ class ProjectStore:
                 )
             conn.commit()
             updated = cur.rowcount > 0
+        if (updated and row and new_status is not None and new_status != "IN_PROGRESS"):
+            # §4SU Phase 3 r3/r4: an open claim ends with any status write
+            # other than the claim itself, whoever writes it — also when the
+            # claim write had failed and the task never left its hold (an old
+            # claim must never come back later with its old summary)
+            try:
+                if self.claimed_hold(row["project_id"], task_id) is not None:
+                    self.log_event(row["project_id"], task_id, "hold_claim_ended", {})
+            except Exception:  # noqa: BLE001
+                logger.warning("hold claim end not logged for %s", task_id, exc_info=True)
         if updated and row:
             self.log_event(row["project_id"], task_id, "task_updated",
-                           {"fields": list(fields.keys())})
+                           {"fields": [k for k in fields.keys()          # §4SU Phase 3: the wait
+                                       if not k.startswith("wait_")]})   # columns follow status
             if reopened_from:
                 self.log_event(row["project_id"], task_id, "project_reopened",
                                {"reason": f"task re-opened on a {reopened_from} project",
@@ -1104,7 +1231,7 @@ class ProjectStore:
             self._fire_project_done(project_id)
 
     def reset_orphaned_in_progress(self, older_than_seconds: float = 900.0) -> int:
-        """Reset stale IN_PROGRESS tasks back to READY. Returns the count.
+        """Reset stale IN_PROGRESS tasks back to PENDING (a claimed hold: back to its hold). Returns the count.
 
         The advancer commits a leaf's IN_PROGRESS claim before several
         awaits; a crash or deploy-kill (plain SIGTERM) between claim and
@@ -1118,20 +1245,51 @@ class ProjectStore:
         project event per reset.
         """
         cutoff = _now() - max(0.0, float(older_than_seconds))
+        # §4SU Phase 3 r3: a hold the owner's run had claimed goes back to the
+        # hold FIRST (through update_task: its project rolls up too); a failed
+        # restore leaves the row IN_PROGRESS — never PENDING, which an
+        # unattended tick would run — and the next boot tries again
+        restored = 0
+        with self._lock, self._connect() as conn:
+            stale = [dict(r) for r in conn.execute(
+                "SELECT id, project_id, result_summary FROM tasks "
+                "WHERE status = 'IN_PROGRESS' AND updated_at < ?", (cutoff,)).fetchall()]
+        keep_ids = set()
+        for r in stale:
+            try:
+                hold = self.claimed_hold(r["project_id"], r["id"])
+            except Exception:  # noqa: BLE001
+                logger.warning("orphaned task %s: claim unreadable — left IN_PROGRESS", r["id"], exc_info=True)
+                keep_ids.add(r["id"])
+                continue
+            if not hold:
+                continue
+            keep_ids.add(r["id"])
+            try:
+                self.update_task(r["id"], status="NEEDS_USER", wait_on="owner_turn",
+                                 wait_code=str(hold.get("wait_code") or "held"),
+                                 wait_why=str(hold.get("wait_why") or ""),
+                                 result_summary=str(hold.get("summary") or r.get("result_summary") or ""))
+                self.log_event(r["project_id"], r["id"], "task_reset_orphaned",
+                               {"from": "IN_PROGRESS", "to": "NEEDS_USER",
+                                "older_than_seconds": float(older_than_seconds)})
+                restored += 1
+            except Exception:  # noqa: BLE001
+                logger.warning("orphaned hold %s not restored — left IN_PROGRESS", r["id"], exc_info=True)
         reset: List[sqlite3.Row] = []
         with self._lock, self._connect() as conn:
             conn.isolation_level = None
             conn.execute("BEGIN IMMEDIATE")
             try:
-                rows = conn.execute(
+                rows = [r for r in conn.execute(
                     "SELECT id, project_id FROM tasks "
                     "WHERE status = 'IN_PROGRESS' AND updated_at < ?",
                     (cutoff,),
-                ).fetchall()
+                ).fetchall() if r["id"] not in keep_ids]
                 if rows:
                     now = _now()
                     conn.executemany(
-                        "UPDATE tasks SET status = 'READY', updated_at = ? "
+                        "UPDATE tasks SET status = 'PENDING', updated_at = ? "     # §4SU Phase 3: READY folded
                         "WHERE id = ? AND status = 'IN_PROGRESS'",
                         [(now, r["id"]) for r in rows],
                     )
@@ -1145,9 +1303,9 @@ class ProjectStore:
                 raise
         for r in reset:
             self.log_event(r["project_id"], r["id"], "task_reset_orphaned",
-                           {"from": "IN_PROGRESS", "to": "READY",
+                           {"from": "IN_PROGRESS", "to": "PENDING",
                             "older_than_seconds": float(older_than_seconds)})
-        return len(reset)
+        return len(reset) + restored
 
     def delete_task(self, task_id: str) -> bool:
         """Delete a task and its descendants (via FK cascade on parent_id=NULL
@@ -2207,6 +2365,59 @@ class ProjectStore:
     #: SQLite, so an unclamped caller (the tool passes limit through
     #: verbatim) could dump the entire event log.
     EVENTS_MAX_LIMIT = 500
+
+    def claimed_hold(self, project_id: str, task_id: str) -> Optional[Dict[str, Any]]:
+        """§4SU Phase 3 r2: the hold the owner's run claimed for this task and
+        has not finished with (``hold_claimed`` newer than ``hold_claim_ended``)
+        — its payload {wait_on, wait_code, wait_why, summary}, else None."""
+        ev = self.latest_task_event(project_id, task_id, ("hold_claimed", "hold_claim_ended"))
+        return ev["payload"] if ev and ev.get("type") == "hold_claimed" else None
+
+    def release_claim(self, task_id: str, **fields) -> str:
+        """§4SU Phase 3 r2 (review: the owner's run claimed a hold, was stopped
+        or timed out, and the release wrote PENDING — the next unattended tick
+        rebuilt it): give a claimed task back. A task claimed from a HOLD goes
+        back to that hold; any other goes to PENDING. Only while it is still
+        IN_PROGRESS. Returns the status written ("" when nothing was)."""
+        row = self.get_task(task_id)
+        if not row or str(row.get("status") or "").upper() != "IN_PROGRESS":
+            return ""
+        fields.pop("status", None)
+        for _k in ("wait_on", "wait_code", "wait_why"):
+            fields.pop(_k, None)
+        hold = self.claimed_hold(row["project_id"], task_id)
+        if hold:
+            _summary = fields.pop("result_summary", None)
+            self.update_task(task_id, status="NEEDS_USER", wait_on="owner_turn",
+                             wait_code=str(hold.get("wait_code") or "held"),
+                             wait_why=str(hold.get("wait_why") or ""),
+                             result_summary=str(hold.get("summary") or _summary or row.get("result_summary") or ""),
+                             **fields)                  # (update_task ends the claim)
+            return "NEEDS_USER"
+        self.update_task(task_id, status="PENDING", **fields)
+        return "PENDING"
+
+    def latest_task_event(self, project_id: str, task_id: str,
+                          event_types) -> Optional[Dict[str, Any]]:
+        """§4SU Phase 0: the newest event of one of ``event_types`` for ONE
+        task — exact in SQL (a newest-N window lost a human-gate park on a
+        busy project, and every later owner yes re-parked it)."""
+        types = [str(t) for t in (event_types or [])]
+        if not types:
+            return None
+        with self._lock, self._connect() as conn:
+            r = conn.execute(
+                "SELECT * FROM project_events WHERE project_id = ? AND task_id = ? AND type IN ("
+                + ",".join("?" * len(types)) + ") ORDER BY id DESC LIMIT 1",
+                (_canon_id(project_id), _canon_id(task_id), *types)).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d.pop("payload_json") or "{}")
+        except Exception:  # noqa: BLE001
+            d["payload"] = {}
+        return d
 
     def list_events(self, project_id: str, limit: int = 50,
                     event_type: Optional[str] = None, since_id: Optional[int] = None,

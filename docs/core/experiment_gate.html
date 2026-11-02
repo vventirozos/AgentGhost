@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.experiment_gate — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="coding_executor.html">coding_executor</a>
+    <a href="project_safety.html">project_safety</a>
+    <a class="current" href="experiment_gate.html">experiment_gate</a>
+    <a href="probe_transcripts.html">probe_transcripts</a>
+    <a href="../tools/probe_model.html">tools.probe_model</a>
+    <a href="workspace_cleanup.html">workspace_cleanup</a>
+    <a href="../memory/projects.html">memory.projects</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / experiment_gate.py</h1>
+  <p class="subtitle">&sect;4ST (2026-11-02): a task that writes up a model run may close DONE only when a <a href="../tools/probe_model.html">probe_model</a> transcript kept for the project backs it. The gate is judged on the bytes that ran, not on the task's words.</p>
+
+  <h2 id="why">Why it exists</h2>
+  <p>In request b45ec99f (2026-11-01), three "Run Experiment &hellip; probe_model runs &hellip;" tasks were built by the coding executor. It <em>wrote</em> the transcripts and the scores itself, and all three closed DONE. The &sect;4QA hold that should have stopped them is decided on words (does the goal or the task name a model?). Three review rounds of &sect;4SS showed those words flip-flop: one version held ordinary work, the next missed real experiments.</p>
+  <p><code>probe_model</code> keeps a byte copy of every transcript it saves <em>outside</em> the sandbox (<a href="probe_transcripts.html">core.probe_transcripts</a>). Nothing else can make one: not the coding executor, and not a file write. So "did a model really answer?" has a mechanical answer.</p>
+
+  <h2 id="trigger">When a close is checked</h2>
+  <p><code>unrun_experiment_check(store, project_id, description, files=(), result_text="")</code> returns <code>(problem, claimed_files)</code>. It applies when either:</p>
+  <ul>
+    <li><strong>the words say so:</strong> <code>project_advancer.is_model_experiment</code> (the &sect;4QA/&sect;4SS detector) is true for the task; or</li>
+    <li><strong>the output looks like model output:</strong> a prose file the close delivers (<code>.md .txt .rst .html .htm .tex</code>) has a <code>Model response/answer/output:</code> label, or has a heading naming transcripts (<code>## Transcripts</code>) or a <code>Transcript:</code> label <em>and</em> names a model or <code>probe_model</code>. The fake b45ec99f files had all of these. Review r1 found that without the model condition, meeting, interview, podcast and court transcripts counted. Without the prose-only rule, a <code>.py</code> comment (<code># load the transcripts</code>), a typed field or a YAML key counted, and the build's source was quarantined. The bare word <code>probe_model</code> is <em>not</em> a shape, because a protocol that only plans the runs names it too. This half catches a task the detector misses, such as "repeat the ladder on the worker node; scoring via results/analyze.py", once it writes transcripts.</li>
+  </ul>
+  <p>The files read are only the close's <em>outputs</em>:</p>
+  <ul>
+    <li>the files passed in (<code>deliverables</code>, the build's files, the research brief);</li>
+    <li>the file the description declares (<code>&rarr; results/x.md</code>);</li>
+    <li>project files the close's <code>result</code> names.</li>
+  </ul>
+  <p>Files the description names are <em>not</em> read. They are usually inputs: in the replay, "Compile the PDF from research/protocol.md" was refused because the protocol it reads has a worked "Model output:" example. For citations, text files (<code>.md .txt .rst .csv .tsv .json .html .htm .tex .yaml .yml</code>) are read, at most 512&nbsp;KB each and 24 files. A path never leaves the workspace: a link inside it is read like the file it points to, and a link leading out is not read. <code>simulated/</code> is never searched.</p>
+
+  <h2 id="backing">What backs a close</h2>
+  <p>A checked close stands when any of these holds (<code>probe_transcripts.recorded</code> and <code>cites</code>):</p>
+  <ul>
+    <li>a delivered file <em>is</em> a kept transcript (<code>probe_model(save_to=…)</code>), byte for byte. A fake written over a kept transcript's path does not count (r1);</li>
+    <li>the <code>result</code> text or a delivered file cites a kept transcript, by its saved path or file name;</li>
+    <li>one hop: a project file the deliverable or the result names cites one (an analysis citing <code>results/exp1.md</code>, which cites the run transcript).</li>
+  </ul>
+  <p><strong>Known limit:</strong> citing a <em>different</em> real run of the same project passes. The gate proves that a model ran in this project, not that this write-up came from that run. Closing this gap would mean judging which run a write-up "belongs to", which is a judgment on words.</p>
+  <p>Otherwise the problem text says why it was checked, how many transcripts are kept, and what to do: run the prompts with <code>probe_model(save_to="results/&lt;new&gt;.md")</code>, write the results from that transcript, and name its path. If the check itself fails, the gate returns no problem, logs a WARNING (production drops debug lines), and the other close gates still apply.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <ul>
+    <li><strong>Owner's <code>task_update status=done</code></strong> (<a href="../tools/projects.html">tools.projects</a>): not on a re-close of a task already DONE. The <em>stored</em> description is judged, and a rewrite's declared file is read too. A refused task is listed in <code>refused</code> with gate <code>model_run</code> (before &sect;4SU Phase 4: <code>unrun_experiments</code>), and the call is REJECTED when nothing else was updated. A false trigger (a protocol that only describes transcripts, a survey of published chatbot studies) can pass <code>override={"model_run": "&lt;why&gt;"}</code> (the old <code>not_model_data</code> keyword is still accepted, no longer in the schema) of at least 12 characters (<code>MIN_WAIVER_CHARS</code>), in a call that closes <em>one</em> task (<code>task_id</code>). In a bulk close the waiver applies to no task (r1: one sentence waived three fabricated runs). The reason is appended to the task's result as <code>[not model data: …]</code>. Only if the task really reaches DONE does the payload list it in <code>experiment_gate_waived</code> and the work log record "experiment gate waived". A waived close that a later gate refuses or demotes records no waiver.</li>
+    <li><strong>Advancer build</strong> (<code>_experiment_gate_build</code>, run in a worker thread just before <code>_finalize_coding</code>): a build cannot run a model. The build is failed with the problem as its reason, its transcript-claiming files are quarantined and dropped from its file list, and the log shows a <em>Model Run Gate</em> warning.</li>
+    <li><strong>Advancer research / self-analysis close</strong> (worker thread): the brief and the result are checked the same way. Owner-run, the task goes FAILED with the reason. Unattended, it is held NEEDS_USER ("not closed unattended"). Nothing is moved on this path (r1: a moved brief left the declared file missing, so no later close could pass, not even a waiver).</li>
+  </ul>
+
+  <h2 id="4su-p2">A declared kind replaces the words (&sect;4SU Phase 2, 2026-11-02)</h2>
+  <p><code>unrun_experiment_problem(..., kind=)</code>: a task declared <code>model_run</code> is an experiment whatever its words ("it is declared a model_run task"); any other kind, or none, is judged by its words as before (review r1: a kind that switched the words off let a retype skip this gate), and a file it delivers that reads like model output is still refused (the shape check). See <a href="task_kind.html">core.task_kind</a>.</p>
+
+  <h2 id="quarantine">Quarantine</h2>
+  <p><code>quarantine(store, project_id, rels)</code> moves each file to <code>simulated/&lt;rel&gt;</code>, with a <code>.N</code> suffix on the file name (never on a folder) if that path is taken, so no later task reads a written-up run as data. Nothing is deleted (the &sect;4QA-c precedent). Only files the close itself <em>delivered</em> and that <em>claim to hold</em> transcripts move (a transcript heading or <code>Transcript:</code> label). A file the result only names, or the description only declares, is judged but never moved (r1: the owner's input file named in a result went to <code>simulated/</code>). A protocol whose one worked example is labelled "Model output:" is refused at close, but it stays where later tasks read it. A quarantine never follows a link, never leaves the workspace, and never moves a file already under <code>simulated/</code>.</p>
+
+  <h2 id="tests">Tests</h2>
+  <p><code>tests/test_4st_experiment_gate.py</code> covers the trigger, backing, waiver, build, research and quarantine paths, including the b45ec99f shapes. Battery: <code>scripts/mutate_4st.py</code> (coverage-parallel, with no-op and known-bad controls).</p>
+</main>
+</body>
+</html>

@@ -374,8 +374,8 @@ class TestEveryDeclarationIsTheRightOne:
         from ghost_agent.tools.projects import _err, _ok
 
         held = _ok({"updated": [], "count": 0,
-                    "gated_constraints": ["c1"],
-                    "agent_instruction_constraints": "Held 2 task(s)"})
+                    "refused": [{"task_id": "c1", "gate": "evidence"}],
+                    "agent_instruction_refused": "Held 2 task(s)"})
         assert held.status is OutcomeStatus.REJECTED, (
             "a task_update that landed NOTHING is declared a success, and a "
             "declared ok settles the corpus label")

@@ -117,6 +117,17 @@ class TaskNode:
     depends_on: List[str] = field(default_factory=list)
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
+    # §4SU Phase 2: the DECLARED kind (core/task_kind.py; "" = undeclared,
+    # routed by the wording classifiers as before)
+    kind: str = ""
+    # §4SU Phase 3: why a waiting (NEEDS_USER / BLOCKED) task waits — fields,
+    # not text marks (core/task_wait.py); empty for any other status
+    wait_on: str = ""
+    wait_code: str = ""
+    wait_why: str = ""
+
+    def set_wait(self, on: str, code: str, why: str = "") -> None:
+        self.wait_on, self.wait_code, self.wait_why = on, code, str(why or "")[:300]
 
     def to_dict(self):
         d = asdict(self)
@@ -164,13 +175,31 @@ class TaskTree:
 
     def update_status(self, task_id: str, status: TaskStatus, result: str = "",
                       failure_reason: str = "", actual_tool: str = "",
-                      human_approved: bool = False):
+                      human_approved: bool = False, postconditions_waived: bool = False,
+                      wait=None):
+        """``postconditions_waived`` (§4SU Phase 1): the close's checker
+        (core.task_close) already judged the postconditions and the waiver
+        was recorded — the textual demotion below is not re-applied.
+        ``wait`` (§4SU Phase 3): (wait_on, wait_code, wait_why) for a
+        waiting status; see core/task_wait.py."""
         if task_id in self.nodes:
             node = self.nodes[task_id]
             prior_status = node.status
+            prior_code = node.wait_code
             node.status = status
+            # §4SU Phase 3 r1 MAJOR: every status write starts from NO wait —
+            # only this writer's own ``wait=`` sets one (else settle_waits'
+            # safe default). A kept wait turned the model's park "the owner
+            # must approve the wording" into a HOLD the owner's run ran.
+            node.set_wait(*(wait if wait and status in (TaskStatus.NEEDS_USER, TaskStatus.BLOCKED)
+                            else ("", "", "")))
             if result:
                 node.result_summary = result
+            elif status == TaskStatus.DONE and (prior_code.startswith("rollup")
+                                                or str(node.result_summary or "").startswith("not closed:")):
+                # §4SU Phase 1 r2 M2: a roll-up refusal's text is not a DONE
+                # record (a grandparent's roll-up read it as evidence)
+                node.result_summary = ""
             if failure_reason:
                 node.failure_reason = failure_reason
             if actual_tool:
@@ -187,10 +216,13 @@ class TaskTree:
                 # DONE, or an explicit human_approved=True, is the
                 # approval and proceeds to the normal postcondition gate.
                 gate_reason = _human_gate_reason(node.postconditions)
+                # §4SU Phase 0 (audit A): approval is EXPLICIT only — a close
+                # of a task already parked NEEDS_USER is no longer approval
+                # (a second identical close in the same turn passed the gate)
                 if (gate_reason is not None and not human_approved
-                        and prior_status not in (TaskStatus.NEEDS_USER,
-                                                 TaskStatus.DONE)):
+                        and prior_status != TaskStatus.DONE):
                     node.status = TaskStatus.NEEDS_USER
+                    node.set_wait("owner", "human_gate", gate_reason)
                     if not node.result_summary:
                         node.result_summary = f"human gate: {gate_reason}"
                     return
@@ -201,7 +233,7 @@ class TaskTree:
                 # approach. Keeping this inline keeps the contract local:
                 # `update_status(DONE)` is the one place completion is
                 # declared, so it's also the one place we gate.
-                unsat = self._check_postconditions(node)
+                unsat = [] if postconditions_waived else self._check_postconditions(node)
                 if unsat:
                     node.status = TaskStatus.FAILED
                     node.failure_reason = (
@@ -217,9 +249,30 @@ class TaskTree:
                 # it as an open failure. Cleared only AFTER the gates above
                 # pass, so a demoted DONE keeps its real reason.
                 node.failure_reason = ""
+                # r4 (older gap): a FAILED child closed DONE directly also
+                # lifts the block it caused — the parent stayed BLOCKED and
+                # its other children were never handed out
+                self._check_parent_unblock(node.parent_id)
                 self._check_parent_completion(node.parent_id)
             elif status in [TaskStatus.FAILED, TaskStatus.BLOCKED]:
                 self._check_parent_failure(node.parent_id)
+            elif status in (TaskStatus.PENDING, TaskStatus.READY):
+                # §4SU Phase 0 (audit C): a revived child unblocks the parent
+                # it had blocked — nothing ever did, so the project sat ACTIVE
+                # with open work next_ready_leaf never handed out
+                self._check_parent_unblock(node.parent_id)
+                # §4SU Phase 3 r3: a parent the owner released (a paused or
+                # asked phase) whose children closed or failed meanwhile is
+                # judged now — the waits skipped it, and nothing else would
+                # (it is not a leaf: it sat PENDING forever)
+                # r4: only a RELEASED wait — a DONE parent reopened by the
+                # model or the owner must stay open (it re-closed at once and
+                # its dependants ran), and a cascade block lifted here must not
+                # spend an alternative
+                if node.children and prior_status in (TaskStatus.NEEDS_USER, TaskStatus.PAUSED):
+                    self._check_parent_completion(node.id)
+                    if node.status == status:
+                        self._check_parent_failure(node.id)
 
     def _check_postconditions(self, node: TaskNode) -> List[str]:
         """Return the list of unsatisfied postconditions for `node`.
@@ -359,6 +412,109 @@ class TaskTree:
                 and self.nodes[d].status != TaskStatus.DONE
                 and not _under(d) and not self.depends_back(d, node_id)]
 
+    def settle_waits(self) -> None:
+        """§4SU Phase 3: a node that is not waiting carries no wait; a
+        waiting node set by a path that named none gets the safe default
+        (``owner`` / ``dependency`` — never a hold)."""
+        from .task_wait import default_wait
+        for n in self.nodes.values():
+            if n.status in (TaskStatus.NEEDS_USER, TaskStatus.BLOCKED):
+                if not n.wait_on:
+                    n.set_wait(*default_wait(n.status.value), n.result_summary)
+            elif n.wait_on or n.wait_code or n.wait_why:
+                n.set_wait("", "", "")
+
+    def _park_gated(self, parent) -> bool:
+        """§4SU r1 M1: a roll-up never closes a HUMAN_GATE parent — it parks
+        NEEDS_USER (the owner approves it like any gated task); the project
+        then cannot roll DONE (and sweep) past the owner."""
+        reason = _human_gate_reason(parent.postconditions)
+        if reason is None:
+            return False
+        # (§4SU Phase 3 r1: a PAUSED phase is now NEEDS_USER too — any wait
+        # that is not this gate is re-parked AS the gate, so it is logged)
+        if parent.status != TaskStatus.NEEDS_USER or parent.wait_code != "human_gate":
+            parent.status = TaskStatus.NEEDS_USER
+            # r2 minor: the gate's own text (a BEST parent copied the child's
+            # summary first, which then read as close evidence)
+            parent.result_summary = f"human gate: {reason}"
+            parent.set_wait("owner", "human_gate", reason)
+            # r2 M1: recorded so ProjectPlan logs the park (the owner's later
+            # yes needs it; the digest reports it)
+            if not hasattr(self, "rollup_parked"):
+                self.rollup_parked = []
+            self.rollup_parked.append(parent.id)
+        return True
+
+    def _rollup_held(self, parent, result_text: str = "") -> bool:
+        """§4SU Phase 1: the roll-up closes a parent through the same close
+        check as every path. A HUMAN_GATE parks it (Phase 0); a refusal of
+        the check ProjectPlan installs (``close_checker`` — the declared
+        file, a model run with no transcript (§4ST: the roll-up bypass), the
+        postconditions, judged against what the children reported) makes it
+        wait for the owner (NEEDS_USER, "not closed: …"), recorded like a park."""
+        if parent.status == TaskStatus.DONE:
+            # r1 M2: a parent already DONE (the owner's click over a gate, a
+            # waiver, an approval) is never re-judged by a later child close
+            return False
+        if self._park_gated(parent):
+            return True
+        chk = getattr(self, "close_checker", None)
+        if chk is None:
+            return False
+        try:
+            why = chk(parent, result_text)
+        except Exception:  # noqa: BLE001
+            import logging as _lg
+            _lg.getLogger("GhostAgent").warning("roll-up close check failed (the roll-up stands)", exc_info=True)
+            return False
+        if not why:
+            return False
+        new_summary = f"not closed: {why}"[:2000]
+        _gate = str(why).split(":", 1)[0].strip().lower().replace(" ", "_") if ":" in str(why) else ""
+        # r3 D2: a parent refused again for a DIFFERENT reason is re-stated
+        # and re-logged (the owner was still told the file was missing);
+        # a NEEDS_USER park of another kind is left alone
+        if (parent.status != TaskStatus.NEEDS_USER
+                or (parent.wait_code.startswith("rollup")
+                    and parent.result_summary != new_summary)):
+            parent.status = TaskStatus.NEEDS_USER
+            parent.set_wait("owner", f"rollup_{_gate}" if _gate else "rollup", why)
+            parent.result_summary = new_summary
+            if not hasattr(self, "rollup_parked"):
+                self.rollup_parked = []
+            self.rollup_parked.append(parent.id)
+        return True
+
+    def _done_children_text(self, parent) -> str:
+        """The done children's results — only text the system did not write
+        (r2 M2: a hold or refusal quotes the postcondition it refused)."""
+        try:
+            from ..tools.projects import _stored_evidence
+            return " ".join(_stored_evidence(self.nodes[c].result_summary) for c in parent.children
+                            if c in self.nodes and self.nodes[c].status == TaskStatus.DONE)[:4000]
+        except Exception:  # noqa: BLE001 — r3 L3: never escape after a status was set
+            import logging as _lg
+            _lg.getLogger("GhostAgent").warning("roll-up evidence text failed (judged on none)", exc_info=True)
+            return ""
+
+    @staticmethod
+    def _evidence_of(text) -> str:
+        try:
+            from ..tools.projects import _stored_evidence
+            return _stored_evidence(text)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _owner_own_wait(parent) -> bool:
+        """§4SU r2–r4: a parent waiting for the owner for ITS OWN reason
+        (paused, asked, review…) — not a park the system makes and re-judges
+        (a roll-up refusal, a human-gate park, a parent that carries a gate)."""
+        return (parent.status == TaskStatus.NEEDS_USER and parent.wait_code != "human_gate"
+                and not parent.wait_code.startswith("rollup")
+                and _human_gate_reason(parent.postconditions) is None)
+
     def _check_parent_completion(self, parent_id: str, visited: set = None):
         if visited is None: visited = set()
         if not parent_id or parent_id not in self.nodes or parent_id in visited: return
@@ -366,6 +522,12 @@ class TaskTree:
 
         parent = self.nodes[parent_id]
         if not parent.children: return
+        # §4SU Phase 3 r2: a parent that waits for the owner for its own
+        # reason (paused, asked, review…) is not closed by its children — only
+        # a roll-up refusal or a human-gate park is re-judged here
+        # (a gated one goes on: its roll-up parks it as the gate, r1)
+        if self._owner_own_wait(parent):
+            return
 
         child_statuses = [
             self.nodes[cid].status for cid in parent.children
@@ -379,17 +541,27 @@ class TaskTree:
             # True can't mark a parent DONE with zero real children
             # completed (which then cascades up to the root).
             if child_statuses and all(s == TaskStatus.DONE for s in child_statuses):
+                if self._rollup_held(parent, self._done_children_text(parent)):
+                    return
+                if (parent.wait_code.startswith("rollup")
+                        or str(parent.result_summary or "").startswith("not closed:")):
+                    # r1 D2: an earlier refusal's text is not the DONE record
+                    # (r5: also after the park was replaced by a cascade block)
+                    parent.result_summary = self._done_children_text(parent)[:2000]
                 parent.status = TaskStatus.DONE
                 # Same rule as the direct DONE path in update_status: a node
                 # that reaches DONE has no CURRENT failure. A revived child
                 # closing DONE promotes a once-FAILED parent here, and the
                 # stale reason would otherwise survive on the DONE row.
                 parent.failure_reason = ""
+                self._check_parent_unblock(parent.parent_id)   # r7: a roll-up close lifts the block above too
                 self._check_parent_completion(parent.parent_id, visited)
 
         elif parent.dependency_type == DependencyType.ANY:
             # First successful child satisfies the parent (OR-branch)
             if any(s == TaskStatus.DONE for s in child_statuses):
+                if self._rollup_held(parent, self._done_children_text(parent)):
+                    return
                 parent.status = TaskStatus.DONE
                 parent.failure_reason = ""
                 # Collect the winning child's result
@@ -399,6 +571,7 @@ class TaskTree:
                         parent.result_summary = child.result_summary
                         parent.actual_tool_used = child.actual_tool_used
                         break
+                self._check_parent_unblock(parent.parent_id)   # r7: a roll-up close lifts the block above too
                 self._check_parent_completion(parent.parent_id, visited)
 
         elif parent.dependency_type == DependencyType.BEST:
@@ -414,7 +587,17 @@ class TaskTree:
                 ]
                 if done_children:
                     # Pick the child with the longest result (heuristic for quality)
-                    best = max(done_children, key=lambda c: len(c.result_summary))
+                    # r4 M1: by the length of what the system did not write —
+                    # a longer hold / gate text hid a real sibling's result
+                    best = max(done_children, key=lambda c: (len(self._evidence_of(c.result_summary)),
+                                                             len(c.result_summary or "")))
+                    # r3 M1: judged on the best child's text only when the
+                    # system did not write it (as the ALL / ANY branches)
+                    if self._rollup_held(parent, self._evidence_of(best.result_summary)):
+                        # r3: park BEFORE copying — on a re-roll of a parked
+                        # parent the child's prose replaced the gate text and
+                        # read as close evidence
+                        return
                     parent.result_summary = best.result_summary
                     parent.actual_tool_used = best.actual_tool_used
                     parent.status = TaskStatus.DONE
@@ -422,7 +605,36 @@ class TaskTree:
                 else:
                     parent.status = TaskStatus.FAILED
                     parent.failure_reason = "All BEST-dependency children failed"
+                self._check_parent_unblock(parent.parent_id)   # r7: a roll-up close lifts the block above too
                 self._check_parent_completion(parent.parent_id, visited)
+
+    def _check_parent_unblock(self, parent_id: str, visited: set = None):
+        """The reverse of the failure cascade: a BLOCKED parent whose children
+        no longer block it (by its dependency type) is open again, and so on
+        up the tree."""
+        if visited is None:
+            visited = set()
+        if not parent_id or parent_id not in self.nodes or parent_id in visited:
+            return
+        visited.add(parent_id)
+        parent = self.nodes[parent_id]
+        # r5: only the cascade's own block (code child_failed) — a parent the
+        # model blocked was reopened when any child closed DONE
+        if parent.status != TaskStatus.BLOCKED or parent.wait_code != "child_failed":
+            return
+        # (r6: the code is the proof — the r1 failure_reason test also kept a
+        # cascade block whose parent had an old, unrelated reason, forever)
+        failed = {TaskStatus.FAILED, TaskStatus.BLOCKED}
+        child_statuses = [self.nodes[c].status for c in parent.children if c in self.nodes]
+        if parent.dependency_type == DependencyType.ANY:
+            still = bool(child_statuses) and all(st in failed for st in child_statuses)
+        else:
+            still = any(st in failed for st in child_statuses)
+        if still:
+            return
+        parent.status = TaskStatus.PENDING
+        parent.failure_reason = ""
+        self._check_parent_unblock(parent.parent_id, visited)
 
     def _check_parent_failure(self, parent_id: str, visited: set = None):
         if visited is None: visited = set()
@@ -432,6 +644,17 @@ class TaskTree:
         parent = self.nodes[parent_id]
 
         if parent.status in [TaskStatus.DONE, TaskStatus.FAILED]:
+            return
+        # §4SU Phase 3 r2: a parent waiting for the owner keeps that wait — the
+        # cascade's BLOCKED (dependency/child_failed) was later unblocked to
+        # PENDING, and a paused or asked phase then ran with no release
+        # r4: only its OWN wait — a gate or roll-up park over a failed child
+        # must block (it was approvable with a FAILED child under it)
+        if self._owner_own_wait(parent):
+            return
+        # r6: a parent blocked for its OWN reason keeps it — re-coded by the
+        # cascade, the block was later lifted with the reason lost
+        if parent.status == TaskStatus.BLOCKED and parent.wait_code != "child_failed":
             return
 
         child_statuses = [
@@ -460,7 +683,7 @@ class TaskTree:
                         _cand, parent.id,
                     )
                 if alt_id is not None:
-                    self.nodes[alt_id].status = TaskStatus.READY
+                    self.nodes[alt_id].status = TaskStatus.PENDING   # §4SU Phase 3: READY folded
                     # Unlink the failed child(ren) the alternative
                     # supersedes. Leaving them in the rollup makes an
                     # ALL parent unsatisfiable: `all(s == DONE)` can
@@ -491,6 +714,7 @@ class TaskTree:
                         self.nodes[alt_id].parent_id = parent_id
                     return  # Don't block — alternative is being tried
                 parent.status = TaskStatus.BLOCKED
+                parent.set_wait("dependency", "child_failed", "a subtask failed")   # §4SU Phase 3 r1
                 self._check_parent_failure(parent.parent_id, visited)
 
         elif parent.dependency_type == DependencyType.ANY:
@@ -499,6 +723,7 @@ class TaskTree:
             # are all dangling.
             if child_statuses and all(s in failed_statuses for s in child_statuses):
                 parent.status = TaskStatus.BLOCKED
+                parent.set_wait("dependency", "child_failed", "a subtask failed")   # §4SU Phase 3 r1
                 parent.failure_reason = "All ANY-dependency children failed"
                 self._check_parent_failure(parent.parent_id, visited)
             # Otherwise, some children are still running — don't block yet
@@ -566,7 +791,8 @@ class TaskTree:
             "PAUSED": "⏸", "NEEDS_USER": "🙋",
         }.get(node.status.value, "➖")
         
-        lines.append(f"{indent}{icon} [{node.id}] {node.description} ({node.status.value})")
+        _k = f"<{node.kind}> " if getattr(node, "kind", "") else ""     # §4SU Phase 2: the declared kind
+        lines.append(f"{indent}{icon} [{node.id}] {_k}{node.description} ({node.status.value})")
         for child_id in node.children:
             self._render_node(child_id, depth + 1, lines, visited)
 
@@ -806,6 +1032,37 @@ class ProjectPlan:
         self.project_id = project_id
         self.tree = TaskTree()
         self._hydrate()
+        # §4SU Phase 1: the roll-up runs the one close check (TaskTree._rollup_held)
+        self.tree.close_checker = self._rollup_close_check
+
+    def _rollup_close_check(self, parent, result_text: str) -> str:
+        """The refusal reason for closing ``parent`` by roll-up, or ""."""
+        from .task_close import check_close
+        v = check_close(self.store, self.project_id, self.tree, parent.id, actor="rollup",
+                        result=result_text, skip={"dependencies", "evidence"})
+        if not v.ok:
+            return f"{v.first.gate}: {v.first.reason}"
+        # operator 11-02 ("wait for the owner"): the constraint AUDIT is an
+        # LLM judgement the roll-up does not run. A parent with constraints
+        # and files of its own that the audit would read waits instead of
+        # closing unaudited — the model's own close (which audits) or the
+        # owner's click closes it. A fileless parent has nothing to audit.
+        try:
+            cons = [str(c) for c in (parent.constraints or [])]
+            meta = (self.store.get_project(self.project_id) or {}).get("metadata") or {}
+            cons += [str(c) for c in (meta.get("constraints") or [])]
+            if cons:
+                from .task_deliverable import declared_deliverable
+                from ..tools.projects import _files_for_task
+                decl = declared_deliverable(parent.description or "")
+                if _files_for_task(self.store, self.project_id, parent.id, [decl] if decl else []):
+                    return ("constraints: its files have not been audited against "
+                            + "; ".join(cons[:3])[:200]
+                            + " — close it with task_update (that runs the audit) or by the owner's click")
+        except Exception:  # noqa: BLE001 — the mechanical check above stands
+            import logging as _lg
+            _lg.getLogger("GhostAgent").warning("roll-up constraint hold skipped", exc_info=True)
+        return ""
 
     # ------------------------------------------------------------------ hydrate
 
@@ -815,7 +1072,8 @@ class ProjectPlan:
             return
         for row in rows:
             try:
-                status = TaskStatus[row["status"]]
+                from .task_wait import fold_status
+                status = TaskStatus[fold_status(row["status"])]   # §4SU Phase 3: READY/PAUSED → PENDING
             except KeyError:
                 status = TaskStatus.PENDING
             try:
@@ -840,6 +1098,10 @@ class ProjectPlan:
                 depends_on=_coerce_str_list(row.get("depends_on")),
                 estimated_cost=float(row["estimated_cost"] or 0.0),
                 actual_cost=float(row["actual_cost"] or 0.0),
+                kind=str(row.get("kind") or ""),
+                wait_on=str(row.get("wait_on") or ""),
+                wait_code=str(row.get("wait_code") or ""),
+                wait_why=str(row.get("wait_why") or ""),
             )
             self.tree.nodes[node.id] = node
             if node.parent_id is None and self.tree.root_id is None:
@@ -860,7 +1122,9 @@ class ProjectPlan:
                  postconditions: Optional[List[str]] = None,
                  constraints: Optional[List[str]] = None,
                  depends_on: Optional[List[str]] = None,
-                 estimated_cost: float = 0.0) -> str:
+                 estimated_cost: float = 0.0, kind: str = "") -> str:
+        from .task_kind import normalize_kind
+        kind = normalize_kind(kind)
         task_id = self.store.add_task(
             self.project_id, description, parent_id=parent_id,
             status=status.value, dependency_type=dependency_type.value,
@@ -868,6 +1132,7 @@ class ProjectPlan:
             constraints=constraints,
             depends_on=depends_on,
             estimated_cost=estimated_cost,
+            kind=kind,
         )
         node = TaskNode(
             id=task_id, description=description, status=status,
@@ -878,6 +1143,7 @@ class ProjectPlan:
             constraints=list(constraints or []),
             depends_on=list(depends_on or []),
             estimated_cost=estimated_cost,
+            kind=kind,
         )
         self.tree.nodes[task_id] = node
         if parent_id and parent_id in self.tree.nodes:
@@ -888,7 +1154,8 @@ class ProjectPlan:
 
     def update_status(self, task_id: str, status: TaskStatus,
                       result: str = "", failure_reason: str = "",
-                      actual_tool: str = "", human_approved: bool = False):
+                      actual_tool: str = "", human_approved: bool = False,
+                      postconditions_waived: bool = False, wait=None):
         """Cascade through the in-memory tree, then persist every node
         whose state changed as a side effect.
 
@@ -903,13 +1170,39 @@ class ProjectPlan:
         def _snapshot(n: "TaskNode"):
             return (n.status, n.result_summary, n.failure_reason,
                     n.actual_tool_used, n.parent_id,
-                    tuple(n.alternatives), tuple(n.depends_on))
+                    tuple(n.alternatives), tuple(n.depends_on),
+                    n.wait_on, n.wait_code, n.wait_why)
 
         before = {tid: _snapshot(n) for tid, n in self.tree.nodes.items()}
+        self.tree.rollup_parked = []
         self.tree.update_status(task_id, status, result=result,
                                 failure_reason=failure_reason,
                                 actual_tool=actual_tool,
-                                human_approved=human_approved)
+                                human_approved=human_approved,
+                                postconditions_waived=postconditions_waived,
+                                wait=wait)
+        self._persist_changes(before, _snapshot)
+
+    @staticmethod
+    def _snap(n: "TaskNode"):
+        return (n.status, n.result_summary, n.failure_reason,
+                n.actual_tool_used, n.parent_id,
+                tuple(n.alternatives), tuple(n.depends_on),
+                n.wait_on, n.wait_code, n.wait_why)
+
+    def recheck_parents(self, parent_ids) -> None:
+        """§4SU Phase 4 r1 (replan): re-run the roll-up of parents whose open
+        children were removed — a parent left with only DONE children was
+        never closed (no child close fires it) and stayed PENDING forever."""
+        before = {tid: self._snap(n) for tid, n in self.tree.nodes.items()}
+        self.tree.rollup_parked = []
+        for pid in parent_ids or []:
+            if pid in self.tree.nodes:
+                self.tree._check_parent_completion(pid)
+        self._persist_changes(before, self._snap)
+
+    def _persist_changes(self, before, _snapshot) -> None:
+        self.tree.settle_waits()
         for tid, node in self.tree.nodes.items():
             prev = before.get(tid)
             current = _snapshot(node)
@@ -923,11 +1216,32 @@ class ProjectPlan:
                     parent_id=node.parent_id,
                     alternatives=node.alternatives,
                     depends_on=node.depends_on,
+                    wait_on=node.wait_on, wait_code=node.wait_code, wait_why=node.wait_why,
                 )
+        # §4SU r2 M1: a gated parent the roll-up parked is put to the owner
+        # like any gated task — the event the owner's later yes is checked
+        # against, and the digest's record of it
+        for _pid_parked in list(getattr(self.tree, "rollup_parked", []) or []):
+            try:
+                from ..utils.logging import request_id_context
+                _n = self.tree.nodes.get(_pid_parked)
+                _gr = _human_gate_reason(_n.postconditions) if _n else None
+                if _gr is not None:
+                    self.store.log_event(self.project_id, _pid_parked, "human_gate_triggered",
+                                         {"reason": _gr, "via": "roll-up", "req": str(request_id_context.get() or "")})
+                else:
+                    # §4SU Phase 1: the close check refused the roll-up
+                    self.store.log_event(self.project_id, _pid_parked, "rollup_refused",
+                                         {"reason": str(_n.result_summary or "")[:300] if _n else "",
+                                          "req": str(request_id_context.get() or "")})
+            except Exception:  # noqa: BLE001
+                import logging as _lg
+                _lg.getLogger("GhostAgent").warning("roll-up park not recorded", exc_info=True)
 
     def decompose(self, task_id: str,
                   subtask_descriptions: List[str],
-                  sequential: bool = False) -> List[str]:
+                  sequential: bool = False,
+                  kinds: Optional[List[str]] = None) -> List[str]:
         """Expand a task into ordered subtasks. Returns new task ids.
 
         When ``sequential`` is True each subtask declares a ``depends_on``
@@ -940,12 +1254,14 @@ class ProjectPlan:
             raise ValueError(f"unknown task: {task_id}")
         ids: List[str] = []
         prev_id: Optional[str] = None
-        for desc in subtask_descriptions:
+        kinds = list(kinds or [])
+        for i, desc in enumerate(subtask_descriptions):
             if not desc or not desc.strip():
                 continue
             deps = [prev_id] if (sequential and prev_id) else None
             new_id = self.add_task(desc.strip(), parent_id=task_id,
-                                   depends_on=deps)
+                                   depends_on=deps,
+                                   kind=kinds[i] if i < len(kinds) else "")   # §4SU Phase 2
             ids.append(new_id)
             prev_id = new_id
         return ids

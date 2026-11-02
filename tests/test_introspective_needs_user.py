@@ -120,12 +120,34 @@ class TestAdvanceOnceOverride:
         assert store.list_tasks(pid)[0]["status"] == "NEEDS_USER"
 
 
-class TestSourceWiring:
-    SRC = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
-           / "core" / "project_advancer.py").read_text()
+class TestDeclaredKind:
+    """§4SU Phase 2: a declared kind meets the gate-word floor — an
+    introspective task must not jam on it (this replaces a source-order pin;
+    the order itself is pinned by TestAdvanceOnceOverride)."""
 
-    def test_override_is_before_the_needs_user_branch(self):
-        i_guard = self.SRC.index(
-            'if classification == "needs_user" and is_self_referential(')
-        i_branch = self.SRC.index('if classification == "needs_user":')
-        assert i_guard < i_branch
+    def test_a_declared_introspective_task_does_not_jam(self, store):
+        # unattended it is HELD (§4SU Phase 2 r4: a whole gate word on an
+        # introspective declared task was a brief closed DONE unattended);
+        # the owner's run takes the hold back and runs it — never a park
+        ctx = _ctx()
+        pid = store.create_project("Meta", kind="GENERAL")
+        store.add_task(pid, JAMMED, kind="research")
+        ctx.project_store = store
+        run = lambda owner: asyncio.run(advance_once(
+            ctx, pid, tool_runner=AsyncMock(return_value="web results"),
+            llm_classifier=None, owner_requested=owner))
+        run(False)
+        t = store.list_tasks(pid)[0]
+        assert t["status"] == "NEEDS_USER" and t["result_summary"].endswith("not closed unattended")
+        res = run(True)
+        assert res.classification == "research"
+        assert store.list_tasks(pid)[0]["status"] != "NEEDS_USER"
+
+    def test_a_declared_owner_task_still_waits(self, store):
+        ctx = _ctx()
+        pid = store.create_project("Meta", kind="GENERAL")
+        store.add_task(pid, JAMMED, kind="owner")
+        ctx.project_store = store
+        res = asyncio.run(advance_once(ctx, pid, tool_runner=AsyncMock(return_value="web results"),
+                                       llm_classifier=None))
+        assert store.list_tasks(pid)[0]["status"] == "NEEDS_USER"

@@ -190,9 +190,21 @@ class TestScreenThenConfirm:
 
 class TestOffloadWiring:
     def test_autoadvance_classifier_uses_worker(self):
-        src = (_SRC / "core" / "agent.py").read_text()
-        block = src.split("Classify this task into EXACTLY one word", 1)[1][:600]
-        assert "use_worker=True" in block
+        # §4SR: the idle loop and the tool path use the ONE shared classifier
+        # (the idle wiring is driven through _biological_tick in
+        # test_4sr_gate_words.py); drive it and read the call it makes
+        import asyncio
+        from types import SimpleNamespace
+        from ghost_agent.core.project_advancer import default_llm_classifier
+        seen = {}
+
+        class _LLM:
+            async def chat_completion(self, payload, **kw):
+                seen.update(kw)
+                return {"choices": [{"message": {"content": "research"}}]}
+        clf = default_llm_classifier(SimpleNamespace(llm_client=_LLM(), args=SimpleNamespace(model="m")))
+        assert asyncio.run(clf("Summarize the literature")) == "research"
+        assert seen.get("use_worker") is True and seen.get("off_main_only") is True
 
     def test_smart_memory_already_offloaded(self):
         src = (_SRC / "core" / "agent.py").read_text()

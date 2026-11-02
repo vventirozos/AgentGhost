@@ -4,6 +4,7 @@ closed DONE without their work, numbered search queries, wrong deliverables.
 Each test names the live failure it pins.
 """
 
+from tests._refused import refused_ids, refused_reasons  # §4SU Phase 4
 import asyncio
 import json
 import os
@@ -323,8 +324,8 @@ async def test_done_refused_when_the_declared_file_is_one_folder_off(tmp_path):
     nested.parent.mkdir(parents=True)
     nested.write_text("# Survey\n\nKant, Hofstadter, Dennett, GWT and IIT each describe self-reference.")
     out = await _done(ctx, tid)
-    assert out["undelivered"] == [tid]
-    assert "recursive-thinking-experiment/research/recursive-self-reference.md" in out["agent_instruction_undelivered"]
+    assert refused_ids(out, "undelivered") == [tid]
+    assert "recursive-thinking-experiment/research/recursive-self-reference.md" in refused_reasons(out, "undelivered")
     assert store.get_task(tid)["status"] != "DONE"
 
 
@@ -334,8 +335,8 @@ async def test_done_refused_on_a_hollow_declared_file(tmp_path):
     (ws / "results").mkdir()
     (ws / "results" / "meta-reflection.md").write_text("...")
     out = await _done(ctx, tid)
-    assert out["undelivered"] == [tid]
-    assert "no content" in out["agent_instruction_undelivered"]
+    assert refused_ids(out, "undelivered") == [tid]
+    assert "no content" in refused_reasons(out, "undelivered")
 
 
 async def test_done_accepted_when_the_declared_file_has_content(tmp_path):
@@ -345,7 +346,7 @@ async def test_done_accepted_when_the_declared_file_has_content(tmp_path):
     (ws / "results" / "meta-reflection.md").write_text(
         "# Meta-reflection\n\nObserving the recursion changed it in three measurable ways.")
     out = await _done(ctx, tid)
-    assert "undelivered" not in out
+    assert not refused_ids(out, "undelivered")
     assert store.get_task(tid)["status"] == "DONE"
 
 
@@ -356,14 +357,14 @@ async def test_a_rewritten_description_is_what_the_gate_judges(tmp_path):
     (ws / "theory" / "frameworks.md").write_text(
         "# Frameworks\n\nHofstadter and Dennett both treat the self as a pattern, not a thing.")
     out = await _done(ctx, tid, description="Task 6.2: Compare frameworks → theory/frameworks.md")
-    assert "undelivered" not in out
+    assert not refused_ids(out, "undelivered")
     assert store.get_task(tid)["status"] == "DONE"
 
 
 async def test_a_task_without_a_declared_file_is_unaffected(tmp_path):
     ctx, store, pid, tid, ws = await _project_with(tmp_path, "Add falsification tests")
     out = await _done(ctx, tid)
-    assert "undelivered" not in out
+    assert not refused_ids(out, "undelivered")
     assert store.get_task(tid)["status"] == "DONE"
 
 
@@ -682,7 +683,7 @@ async def test_list_and_get_show_readable_dates(tmp_path):
     ctx.conversation_key = "convA"
     await tool_manage_projects(ctx, action="create", title="Recursion")
     today = _t.strftime("%Y-%m-%d")
-    out = json.loads(await tool_manage_projects(ctx, action="list"))
+    out = json.loads(await tool_manage_projects(ctx, action="list", metadata={"verbose": True}))
     assert out["projects"][0]["created"].startswith(today)
     assert f"(created {today}" in out["display"]
     got = json.loads(await tool_manage_projects(ctx, action="get", project_id=ctx.current_project_id))
@@ -1094,7 +1095,7 @@ async def test_a_description_without_a_path_does_not_skip_the_gate(tmp_path):
     # m8: description="…" (no arrow) bypassed the deliverable gate
     ctx, store, pid, tid, ws = await _project_with(tmp_path, "Write theory → theory/t.md")
     out = await _done(ctx, tid, description="Write theory")
-    assert out["undelivered"] == [tid]
+    assert refused_ids(out, "undelivered") == [tid]
     assert store.get_task(tid)["status"] != "DONE"
 
 
@@ -1443,7 +1444,7 @@ async def test_a_path_less_rewrite_then_done_does_not_skip_the_gate(tmp_path):
     await tool_manage_projects(ctx, action="task_update", task_id=tid, description="Write theory")
     assert store.get_task(tid)["description"] == "Write theory → theory/t.md"
     out = await _done(ctx, tid)
-    assert out["undelivered"] == [tid] and store.get_task(tid)["status"] != "DONE"
+    assert refused_ids(out, "undelivered") == [tid] and store.get_task(tid)["status"] != "DONE"
     # a rewrite naming a NEW path is how a changed plan names its real file
     await tool_manage_projects(ctx, action="task_update", task_id=tid, description="Write theory → theory/u.md")
     assert store.get_task(tid)["description"] == "Write theory → theory/u.md"

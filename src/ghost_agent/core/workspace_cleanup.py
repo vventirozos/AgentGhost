@@ -34,7 +34,10 @@ recovers (keeps + registers) every unregistered **source/document** file
 (``_is_source_like`` — code, markup, docs, config, data-as-text), and
 deletes only debris and unregistered media/binary scratch (screenshots
 being the classic case). Losing a stray kept file is cheap; losing the
-build is not.
+build is not. Rendered documents (``.pdf``, office files, e-books) are
+recovered too, and so is any file the project's goal or a task's
+description/result names (§4SS — a final ``report.pdf`` was swept 40 s
+after the task that wrote it closed without ``deliverables=[...]``).
 
 The sweep is conservative about *where* it operates so a cleanup bug can
 never escape the project's own scratch space:
@@ -55,6 +58,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -62,6 +67,10 @@ from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
 
+
+#: §4ST: refused model-run write-ups (core.experiment_gate.QUARANTINE_DIR) — kept on disk,
+#: never registered as deliverables by a recovery
+_QUARANTINE_DIR = "simulated"
 
 def _project_dir(store, project_id: str) -> Optional[Path]:
     """``<sandbox_root>/projects/<id>/`` — the single source of truth for a
@@ -251,6 +260,128 @@ def _is_data_deliverable(rel: str) -> bool:
     return any(name.endswith(s) for s in _DATA_DELIVERABLE_SUFFIXES)
 
 
+# §4SS (req b45ec99f, 2026-11-01): office/document DELIVERABLES. The project's
+# last task compiled `report.pdf` (+ a copy `report_pdf.pdf`), closed with a
+# `result` but no `deliverables=[...]`, and the DONE sweep deleted both 40 s
+# later — `.pdf` was neither source-like nor a data deliverable, so the
+# partial-keep-set recovery treated the goal's own "final PDF report" as
+# scratch. A rendered document is what a project hands over, never debris.
+_DOCUMENT_DELIVERABLE_SUFFIXES = {
+    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".epub",
+    ".pptx", ".ppt", ".odp", ".key",
+    ".xlsx", ".xls", ".ods", ".pages", ".numbers",
+}
+
+
+def _is_document_deliverable(rel: str) -> bool:
+    """True for a rendered document (PDF / office / e-book) — a deliverable
+    the agent plausibly forgot to register, NOT media scratch."""
+    name = rel.split("/")[-1].lower()
+    dot = name.rfind(".")
+    return dot > 0 and name[dot:] in _DOCUMENT_DELIVERABLE_SUFFIXES
+
+
+def _project_texts(store, project_id: str) -> List[str]:
+    """The project's goal plus every task's description and result summary —
+    where the agent SAYS which files it made. Best-effort: [] on any read
+    failure (the other protections still apply)."""
+    texts: List[str] = []
+    try:
+        proj = store.get_project(project_id) or {}
+        texts.append(str(proj.get("goal") or ""))
+    except Exception:
+        logger.debug("named-file scan: goal unreadable", exc_info=True)
+    try:
+        for t in store.list_tasks(project_id) or []:
+            texts.append(str(t.get("description") or ""))
+            texts.append(str(t.get("result_summary") or ""))
+    except Exception:
+        logger.debug("named-file scan: tasks unreadable", exc_info=True)
+    return texts
+
+
+#: one path-shaped run of text: `results/plot.png`, `/workspace/…/report.pdf`
+_PATH_RUN_RE = re.compile(r"[\w.\-/]+")
+
+
+def _named_tokens(texts) -> tuple:
+    """(names, paths) the texts mention, lowercased, extracted ONCE.
+
+    A run of path characters (letters, digits, ``_ . - /``) is split on
+    ``/``; trailing sentence dots are dropped ("Wrote report.pdf."). Every
+    segment is a NAME, and every trailing chain of segments is a PATH
+    (`/workspace/projects/x/results/plot.png` → `plot.png`,
+    `results/plot.png`, …). A longer token never names a shorter file:
+    "old_report.pdf", "final.report.pdf", "report.pdf.bak" and
+    "report.pdf-old" are their own tokens. §4SS review: a regex per file over
+    the whole text took 9 s for a 10k-file tree and blocked the event loop."""
+    names: Set[str] = set()
+    paths: Set[str] = set()
+    for text in texts:
+        low = _nfc(str(text or "").lower()).replace("\\", "/")     # r2: Windows paths
+        for m in _PATH_RUN_RE.finditer(low):
+            segs = [g.rstrip(".") for g in m.group(0).split("/")]
+            segs = [g for g in segs if g]
+            names.update(segs)
+            # the last _PATH_CHAIN_MAX segments only: r2 — every chain of a
+            # 10k-segment run was 150 MB of strings
+            for k in range(max(0, len(segs) - _PATH_CHAIN_MAX), len(segs)):
+                paths.add("/".join(segs[k:]))
+    return names, paths
+
+
+#: deepest project-relative path a mention can name (§4SS r2)
+_PATH_CHAIN_MAX = 32
+
+
+def _nfc(s: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFC", s)
+
+
+def _named_by_project(store, project_id: str, root: Path) -> Set[str]:
+    """§4SS: workspace files the project's own words name — a task result
+    "Wrote report.pdf (81019 bytes)" or a description "→ results/plot.png".
+
+    A file with an extension is named when the goal, a task description or a
+    task result mentions it as a whole token (case-insensitive,
+    `_named_tokens`): its basename is enough, EXCEPT for media — a nested
+    screenshot-shaped file must be named by its path (`results/plot.png`),
+    because "checked screenshot.png" in a verify step would otherwise keep
+    every screenshot in the tree, the tidy's main target. Names are matched
+    against files that EXIST, so text can only keep, never delete. Debris and
+    symlinks are never kept this way."""
+    names, paths = _named_tokens(_project_texts(store, project_id))
+    found: Set[str] = set()
+    if not names:
+        return found
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        for fname in filenames:
+            fpath = base / fname
+            try:
+                if fpath.is_symlink():
+                    continue
+                rel = fpath.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            # §4SU Phase 0: a .log the project NAMES ("wrote results/train.log")
+            # is its output, not scratch
+            if _is_debris(rel) and not rel.lower().endswith(".log"):
+                continue
+            low = _nfc(rel.lower())
+            name = low.rsplit("/", 1)[-1]
+            dot = name.rfind(".")
+            if dot <= 0:
+                continue                  # "data", "out": ordinary words, not names
+            if name[dot:] in _MEDIA_SUFFIXES:
+                if low in paths:
+                    found.add(rel)
+            elif name in names:
+                found.add(rel)
+    return found
+
+
 def _tidy_is_debris(rel: str) -> bool:
     """Debris rules for the ACTIVE-project tidy.
 
@@ -336,6 +467,8 @@ def _recover_deliverables(store, project_id: str, root: Path,
         tid = None if dry_run else _any_task_id(store, project_id)
         if tid:
             for rel in sorted(keep):
+                if rel.split("/", 1)[0] == _QUARANTINE_DIR:
+                    continue        # §4ST: kept, never promoted to a deliverable
                 try:
                     store.register_file_artifact(tid, rel)
                 except Exception:
@@ -384,13 +517,16 @@ def _recover_unregistered_sources(store, project_id: str, root: Path,
             # (databases, model weights, datasets) — both are plausibly
             # forgotten deliverables. Media scratch (screenshots, renders)
             # is neither and stays deletable.
-            if not (_is_source_like(rel) or _is_data_deliverable(rel)):
+            if not (_is_source_like(rel) or _is_data_deliverable(rel)
+                    or _is_document_deliverable(rel)):
                 continue
             found.add(rel)
     if found:
         tid = None if dry_run else _any_task_id(store, project_id)
         if tid:
             for rel in sorted(found):
+                if rel.split("/", 1)[0] == _QUARANTINE_DIR:
+                    continue        # §4ST: kept, never promoted to a deliverable
                 try:
                     store.register_file_artifact(tid, rel)
                 except Exception:
@@ -462,6 +598,11 @@ def _keep_set(store, project_id: str) -> Optional[Set[str]]:
     return keep
 
 
+#: deleted paths a removal mark keeps (§4SS r2: 64 made a big sweep's later
+#: files read "not created" in the reply's link notice); 16 projects max
+_MARK_MAX_PATHS = 512
+
+
 def _mark_removal(store, project_id, deleted=None, *, dry_run=False) -> None:
     """Record that files under ``project_id`` were REALLY removed just now.
 
@@ -494,14 +635,14 @@ def _mark_removal(store, project_id, deleted=None, *, dry_run=False) -> None:
             return
         rels = (None if deleted is None
                 else [str(d).replace("\\", "/").casefold()
-                      for d in list(deleted)[:64]])
+                      for d in list(deleted)[:_MARK_MAX_PATHS]])
         # ⚠ UNION with a still-fresh earlier mark: a second sweep/tidy of
         # the same project inside the window used to overwrite the first
         # list, un-explaining files the first sweep really deleted.
         prev = marks.get(key)
         if (prev and rels is not None and prev[1] is not None
                 and _t.time() - prev[0] < 900):
-            rels = list(dict.fromkeys(list(prev[1]) + rels))[:128]
+            rels = list(dict.fromkeys(list(prev[1]) + rels))[:2 * _MARK_MAX_PATHS]
         elif prev and prev[1] is None:
             rels = None                       # whole-tree removal absorbs
         marks[key] = (_t.time(), rels)
@@ -574,6 +715,14 @@ def sweep_project_workspace(store, project_id: str, *,
             keep = keep | recovered
             summary["recovered"] = sorted(recovered)
 
+    # §4SS: a file the project's goal or a task's description/result NAMES is
+    # a deliverable by the agent's own account ("Wrote report.pdf (81019
+    # bytes)"), whatever its suffix and whether or not it was registered.
+    named = _named_by_project(store, project_id, root) - set(keep)
+    if named:
+        keep = keep | named
+        summary["kept_named"] = sorted(named)
+
     deleted: List[str] = []
     kept: List[str] = []
     freed = 0
@@ -603,6 +752,9 @@ def sweep_project_workspace(store, project_id: str, *,
                 media_candidates.append(rel)
     referenced = _referenced_media(root, media_candidates)
 
+    import time as _time
+    _trash_stamp = _time.strftime("%Y%m%d")
+    _moved: List[str] = []
     # Pass 1 — delete unregistered files. topdown so we never descend into a
     # dir we're about to drop; followlinks=False so a symlink can't lead the
     # walk out of the project tree.
@@ -632,7 +784,14 @@ def sweep_project_workspace(store, project_id: str, *,
                 freed += size
                 continue
             try:
-                fpath.unlink()
+                # §4SU Phase 0 (audit): MOVED to the host trash, never
+                # unlinked — the sweep's suffix rules still lose real
+                # deliverables (.zip, fonts, audio, weights); a symlink is
+                # scratch and is only unlinked
+                if not fpath.is_symlink() and _to_project_trash(store, project_id, root, fpath, rel, _trash_stamp):
+                    _moved.append(rel)
+                else:
+                    fpath.unlink()
                 deleted.append(rel)
                 freed += size
             except OSError as e:
@@ -678,7 +837,82 @@ def sweep_project_workspace(store, project_id: str, *,
                                           or summary.get("dirs_removed")):
         _mark_removal(store, project_id, summary.get("deleted"),
                       dry_run=dry_run)
+    if not dry_run and summary.get("status") == "ok" and deleted:
+        # §4SU Phase 0 (audit): the DONE sweep leaves a durable record (the
+        # b45ec99f PDF loss needed log forensics) — where each file went
+        try:
+            _tr = project_trash_dir(store)
+            _gone = [r for r in deleted if r not in set(_moved)]
+            store.log_event(project_id, None, "workspace_sweep", {
+                "moved": _moved[:200], "deleted": _gone[:200], "count": len(deleted),
+                "freed_bytes": freed,
+                "trash": str(_tr / _trash_stamp / re.sub(r"[^0-9A-Za-z_-]", "_", str(project_id))) if _tr else ""})
+        except Exception:  # noqa: BLE001
+            logger.warning("workspace sweep: event not recorded", exc_info=True)
+        try:
+            purge_project_trash(store)
+        except Exception:  # noqa: BLE001
+            logger.debug("project trash purge skipped", exc_info=True)
     return summary
+
+
+#: §4SU Phase 0: where the DONE sweep moves files — the HOST system dir
+#: (``<memory_dir>/../project_trash/<YYYYMMDD>/<project>/<rel>``), never the
+#: sandbox; day folders older than this are purged
+PROJECT_TRASH_DIRNAME = "project_trash"
+PROJECT_TRASH_KEEP_DAYS = 30
+
+
+def project_trash_dir(store) -> Optional[Path]:
+    md = getattr(store, "memory_dir", None)
+    return (Path(md).parent / PROJECT_TRASH_DIRNAME) if md else None
+
+
+def _to_project_trash(store, project_id: str, root: Path, fpath: Path, rel: str, stamp: str) -> bool:
+    """Move one regular workspace file to the host project trash; False when
+    it could not be moved (the caller then deletes it, as before)."""
+    trash = project_trash_dir(store)
+    if trash is None:
+        return False
+    try:
+        if not fpath.is_file() or Path(root).resolve() not in fpath.resolve().parents:
+            return False
+        if trash.is_symlink():
+            return False
+        dest = trash / stamp / re.sub(r"[^0-9A-Za-z_-]", "_", str(project_id)) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = dest.with_name(f"{Path(rel).stem}.{n}{Path(rel).suffix}")
+        shutil.move(str(fpath), str(dest))       # r1: a cross-device trash (EXDEV) still moves
+        return True
+    except (OSError, shutil.Error) as e:
+        logger.warning("workspace sweep: could not move %s to the trash (deleted instead): %s", rel, e)
+        return False
+
+
+def purge_project_trash(store, now: Optional[float] = None) -> int:
+    """Delete project-trash day folders older than PROJECT_TRASH_KEEP_DAYS
+    (a symlinked trash or day folder is never followed)."""
+    import shutil
+    import time as _time
+    trash = project_trash_dir(store)
+    if trash is None or trash.is_symlink() or not trash.is_dir():
+        return 0
+    now = _time.time() if now is None else now
+    n = 0
+    for d in trash.iterdir():
+        if d.is_symlink() or not d.is_dir() or not re.fullmatch(r"\d{8}", d.name):
+            continue
+        try:
+            day = _time.mktime(_time.strptime(d.name, "%Y%m%d"))
+        except ValueError:
+            continue
+        if now - day > (PROJECT_TRASH_KEEP_DAYS + 1) * 86400:
+            shutil.rmtree(d, ignore_errors=True)
+            n += 1
+    return n
 
 
 # ── recurring tidy (2026-07-18) ─────────────────────────────────────────
@@ -965,8 +1199,13 @@ def tidy_project_workspace(store, project_id: str, *,
 
     referenced = _referenced_media(root, media_candidates)
     _ref_low_tidy = _lower_keys(referenced)
+    # §4SS: same rule as the DONE sweep — a media file a task names
+    # ("→ results/plot.png") is the task's deliverable, not a screenshot
+    _named_low = (_lower_keys(_named_by_project(store, project_id, root))
+                  if media_candidates else set())
     to_delete = debris + [m for m in media_candidates
-                          if m.lower() not in _ref_low_tidy]
+                          if m.lower() not in _ref_low_tidy
+                          and m.lower() not in _named_low]
 
     deleted: List[str] = []
     freed = 0

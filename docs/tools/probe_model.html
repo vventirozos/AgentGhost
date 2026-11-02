@@ -77,6 +77,9 @@
     <li>Never inside a replay (<code>REPLAY_FORBIDDEN_TOOLS</code>) or as a composed-skill macro step (<code>MACRO_FORBIDDEN_STEP_TOOLS</code>). Sub-agents and coding leaves have allowlists without it.</li>
   </ul>
 
+  <h2 id="gate">The transcript is the proof of the run (&sect;4ST)</h2>
+  <p>Since 2026-11-02, a project task that writes up a model run closes DONE only when its result or a delivered file cites a transcript this tool kept (its <code>save_to</code> path or file name). A build or a research step cannot make one: if one writes "transcripts" itself, the task is not closed, and the written-up run is moved to <code>simulated/</code>. See <a href="../core/experiment_gate.html">core.experiment_gate</a>.</p>
+
   <h2 id="autoadvance">How projects use it</h2>
   <p>In a GENERAL project whose goal names a model (LLM, language model, chatbot, ChatGPT, GPT, Qwen, Llama, Claude…; "the model" alone does not count), autoadvance stops before a task that <em>runs</em>, <em>tests</em>, <em>probes</em>, <em>measures</em>, <em>replicates</em> or <em>repeats</em> something, or that names a control condition, falsification test, cross-model study or ablation. A task that runs a code file (<code>Run recursive_harness.py …</code>) is code, not an experiment. The goal does not have to say a model is run on. That rule was inverted after phrase lists missed "Evaluate Qwen on GSM8K"; a false positive only waits for the turn.</p>
   <p>The batch ends with <code>stop_reason="model_experiment"</code> and the turn decides:</p>

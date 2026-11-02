@@ -103,7 +103,6 @@
     "test_interface_silent_resume.py": 2,
     "test_interface_visualizer.py": 1,
     "test_interface_voice.py": 17,
-    "test_introspective_needs_user.py": 1,
     "test_introspective_no_websearch.py": 3,
     "test_isolation_replay.py": 2,
     "test_job_landing_report_drain.py": 1,
@@ -210,11 +209,11 @@
     "test_web_icon_map_drift.py": 2,
     "test_webui_feedback_client.py": 5,
     "test_webui_splash_and_ios_keyboard.py": 4,
-    "test_worker_offload.py": 4,
+    "test_worker_offload.py": 3,
     "test_worker_thinking_and_prompt_clarity.py": 4,
     "test_worker_warmup.py": 8,
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 888
+  "total_textual": 886
 }

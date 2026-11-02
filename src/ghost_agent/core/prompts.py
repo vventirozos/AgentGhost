@@ -98,18 +98,30 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     from .planning import ProjectPlan, TaskStatus
 
     lines = ["### CURRENT PROJECT"]
+    # §4SU Phase 4 (audit: the pacing rule and "DO NOT create" were shown
+    # on FINISHED projects): a DONE / ARCHIVED project gets one line on how
+    # to reopen it instead; the retrospective below says what was built
+    _finished = str(proj.get("status", "")).upper() in ("DONE", "ARCHIVED")
+    if _finished:
+        _arch = str(proj.get("status", "")).upper() == "ARCHIVED"
+        lines.append(
+            f"*** This project is {'ARCHIVED' if _arch else 'FINISHED'} (id={project_id}): no open work. "
+            "If the user asks for more on it, add it HERE — task_add / task_decompose, or replan for a "
+            "new plan (that reopens it" + ("; resume it first" if _arch else "") + "). Do not create a "
+            "new project for the same topic. ***")
     # Hard directive at the top. Small Qwen models routinely re-call
     # `manage_projects action=create` AND re-interpret the user's
     # original "start a new project" message every few turns — they
     # don't fully trust the conversation-state signal, so we repeat
     # it as loudly as possible on every turn the project is active.
-    lines.append(
-        f"*** A project is ALREADY ACTIVE (id={project_id}). "
-        f"DO NOT call manage_projects action=create — you already did. "
-        f"DO NOT re-read the user's original 'start a new project' "
-        f"message as if it were a fresh instruction; that request has "
-        f"been fulfilled and the work is in flight below. ***"
-    )
+    if not _finished:
+        lines.append(
+            f"*** A project is ALREADY ACTIVE (id={project_id}). "
+            f"DO NOT call manage_projects action=create — you already did. "
+            f"DO NOT re-read the user's original 'start a new project' "
+            f"message as if it were a fresh instruction; that request has "
+            f"been fulfilled and the work is in flight below. ***"
+        )
     lines.append(_files_line(project_id))
     # RELEASED runbook mode (2026-07-25): a released project's briefing is
     # OPERATIONAL, not developmental — lead with the human-attested usage
@@ -154,37 +166,40 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                           + (f" — {d['desc']}" if d.get("desc") else ""))
         return "\n".join(rl)
 
-    lines.append(
-        "*** ONE TASK AT A TIME — HARD RULE: "
-        "Advance this project ONE task per turn — the NEXT TASK shown "
-        "below, and ONLY that one. DO NOT scan ahead and stack several "
-        "tasks' work into a single reply, and DO NOT grind through the "
-        "whole tree in one turn: on a large project that floods the "
-        "context window, which is exactly the failure this rule "
-        "prevents. "
-        "When you have just created or decomposed the plan, STOP and "
-        "present the task list to the user — DO NOT start executing. "
-        "Wait for an explicit go-ahead ('proceed', 'next task', "
-        "'continue') before advancing, and honor any pacing or ordering "
-        "the user asks for. Each go-ahead advances EXACTLY ONE task: do "
-        "its work, close just that id with `manage_projects "
-        "action=task_update task_id=\"<id>\" status=DONE` (plus its "
-        "`deliverables`), report the result, then stop and wait for the "
-        "next direction. "
-        "Before re-reading files to reconstruct state, READ the DESIGN "
-        "LEDGER and DONE SO FAR below — they record what already exists and "
-        "how it works. When you make a durable decision (file layout, a key "
-        "function/API name, a convention) record it in one line via "
-        "`manage_projects action=ledger ledger=\"…\"` (or pass `ledger=\"…\"` "
-        "on the task_update that closes the task) so the next turn inherits "
-        "it instead of re-deriving it. "
-        "BATCH: only if the user explicitly asks for MULTIPLE tasks ('do the "
-        "next 3', 'proceed with all remaining tasks', 'finish the project'), "
-        "DON'T grind them yourself in one turn — call `manage_projects "
-        "action=autoadvance count=<N|\"all\">` to run them as a bounded "
-        "autonomous loop that checkpoints each task and pauses at gates, "
-        "budget, or a failure; then summarize and stop. ***"
-    )
+    if not _finished:
+        lines.append(
+            "*** ONE TASK AT A TIME — HARD RULE: "
+            "Advance this project ONE task per turn — the NEXT TASK shown "
+            "below, and ONLY that one. DO NOT scan ahead and stack several "
+            "tasks' work into a single reply, and DO NOT grind through the "
+            "whole tree in one turn: on a large project that floods the "
+            "context window, which is exactly the failure this rule "
+            "prevents. "
+            "When you have just created or decomposed the plan, STOP and "
+            "present the task list to the user — DO NOT start executing. "
+            "Wait for an explicit go-ahead ('proceed', 'next task', "
+            "'continue') before advancing, and honor any pacing or ordering "
+            "the user asks for. Each go-ahead advances EXACTLY ONE task: do "
+            "its work, close just that id with `manage_projects "
+            "action=task_update task_id=\"<id>\" status=DONE` (plus its "
+            "`deliverables`), report the result, then stop and wait for the "
+            "next direction. "
+            "Before re-reading files to reconstruct state, READ the DESIGN "
+            "LEDGER and DONE SO FAR below — they record what already exists and "
+            "how it works. When you make a durable decision (file layout, a key "
+            "function/API name, a convention) record it in one line via "
+            "`manage_projects action=ledger ledger=\"…\"` (or pass `ledger=\"…\"` "
+            "on the task_update that closes the task) so the next turn inherits "
+            "it instead of re-deriving it. "
+            "BATCH: only if the user explicitly asks for MULTIPLE tasks ('do the "
+            "next 3', 'proceed with all remaining tasks', 'finish the project'), "
+            "DON'T grind them yourself in one turn — call `manage_projects "
+            "action=autoadvance count=<N|\"all\">` to run them as a bounded "
+            "autonomous loop that checkpoints each task, skips a FAILED task or one "
+            "that waits on the owner (a gate) and runs the rest, and stops at the "
+            "budget or repeated failures; then summarize and stop. A request to run "
+            "all tasks does not answer a gate — name each waiting task and ask. ***"
+        )
     lines.append(
         f"TITLE: {proj['title']}  ({proj['kind']} · {proj['status']})"
     )
@@ -378,13 +393,13 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             # autopilot only held ("… not closed unattended", project_advancer
             # _HELD_MARK) is the TURN's to run, not a question for the user:
             # it is shown as HELD. A task whose dependencies are open says so.
-            from .project_advancer import _HELD_MARK
+            # §4SU Phase 3: the five-state view (core/task_wait.py) — the
+            # wait FIELD, not the summary text; a hold is WAITING(owner_turn)
+            from .task_wait import view_state
 
             def _label(n) -> str:
-                if (n.status == TaskStatus.NEEDS_USER
-                        and str(n.result_summary or "").endswith(_HELD_MARK)):
-                    return "HELD"
-                return n.status.value
+                v = view_state(n)
+                return f"WAITING({v['on']})" if v["state"] == "WAITING" else v["state"]
 
             def _waits(n) -> int:
                 # the same rule as task_update's gate and the picker
@@ -404,15 +419,16 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             lines.append(f"OPEN TASKS ({len(open_nodes)}: {_counts})" + (
                 ":" if _shown == len(open_nodes) else
                 f" — {_shown} listed; for the rest call manage_projects action=task_list:"))
-            if "HELD" in _by:
-                lines.append("  (HELD = the autopilot does not run it unattended; it is done in a "
-                             "turn like this one, e.g. a model experiment with probe_model — it "
-                             "is not waiting for the user's input)")
+            if "WAITING(owner_turn)" in _by:
+                lines.append("  (WAITING(owner_turn) = the autopilot does not run it unattended; it is "
+                             "done in a turn like this one, e.g. a model experiment with probe_model — "
+                             "it is not waiting for the user's input)")
             for i, n in enumerate(open_nodes[:_shown]):
                 desc = (n.description or "")[:110 if i < max_open_tasks else 60]
                 _w = _waits(n)
                 _tag = _label(n) + (f" · waits on {_w} unfinished task(s)" if _w else "")
-                lines.append(f"  - [{n.id}] {desc}  ({_tag})")
+                _kd = f"<{n.kind}> " if getattr(n, "kind", "") else ""    # §4SU Phase 2
+                lines.append(f"  - [{n.id}] {_kd}{desc}  ({_tag})")
 
         # STUCK TASKS — FAILED/BLOCKED tasks WITH their failure reasons.
         # These were invisible before 2026-07-18: the OPEN filter above
@@ -430,7 +446,9 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                 desc = (n.description or "")[:90]
                 why = " ".join((n.failure_reason or "").split())[:120]
                 why = f" — {why}" if why else ""
-                lines.append(f"  - [{n.id}] {desc}  ({n.status.value}){why}")
+                why = why or (f" — {n.wait_why[:120]}" if n.wait_why else "")
+                _st3 = "WAITING(dependency)" if n.status == TaskStatus.BLOCKED else n.status.value
+                lines.append(f"  - [{n.id}] {desc}  ({_st3}){why}")
 
     # DONE SO FAR — recently-completed tasks plus the one-line result the
     # agent recorded on completion. This is "what's already built and how",

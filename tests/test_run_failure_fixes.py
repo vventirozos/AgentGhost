@@ -12,6 +12,7 @@
      files into the project dir instead of the sandbox root).
 """
 
+from tests._refused import refused_ids, refused_reasons  # §4SU Phase 4
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
@@ -273,8 +274,8 @@ async def test_done_gate_blocks_visual_task_without_evidence(context, store):
     pid, tid = await _new_task(context, store, "Render the Three.js game scene")
     out = json.loads(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE"))
-    assert out.get("gated_unverified") == [tid]
-    assert "RENDER_CHECK" in out["agent_instruction"]
+    assert refused_ids(out, "gated_unverified") == [tid]
+    assert "RENDER_CHECK" in refused_reasons(out, "gated_unverified")
     # NOT marked done
     assert store.get_task(tid)["status"] != "DONE"
 
@@ -284,7 +285,7 @@ async def test_done_gate_allows_visual_task_with_result(context, store):
     out = json.loads(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE",
         result="browser screenshot RENDER_CHECK=HAS_CONTENT, terrain visible"))
-    assert "gated_unverified" not in out
+    assert not refused_ids(out, "gated_unverified")
     assert store.get_task(tid)["status"] == "DONE"
 
 
@@ -295,7 +296,7 @@ async def test_done_gate_cleared_by_result_summary_alias(context, store):
     out = json.loads(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE",
         result_summary="rendered + screenshotted, terrain visible"))
-    assert "gated_unverified" not in out
+    assert not refused_ids(out, "gated_unverified")
     assert store.get_task(tid)["status"] == "DONE"
 
 
@@ -307,7 +308,7 @@ async def test_done_gate_does_not_fire_on_philosophy_task(context, store):
         "being constructed (validate claim #4)")
     out = json.loads(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE"))
-    assert "gated_unverified" not in out
+    assert not refused_ids(out, "gated_unverified")
     assert store.get_task(tid)["status"] == "DONE"
 
 
@@ -315,7 +316,7 @@ async def test_done_gate_ignores_nonvisual_task(context, store):
     pid, tid = await _new_task(context, store, "Write the config parser")
     out = json.loads(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE"))
-    assert "gated_unverified" not in out
+    assert not refused_ids(out, "gated_unverified")
     assert store.get_task(tid)["status"] == "DONE"
 
 

@@ -51,6 +51,11 @@ atexit.register(shutil.rmtree, _LIVE_ISOLATION_DIR, ignore_errors=True)
 for _live_var, _live_default in (
         ("GHOST_SLACK_REPLY_INDEX", ""),
         ("GHOST_SLACKBOT_LOG", ""),
+        # the Slack bot's maintenance switch (2026-11-01): the operator's live
+        # file must never put the suite's bot into maintenance, and a test
+        # that turns it on must never put the LIVE bot into it
+        ("GHOST_SLACK_MAINTENANCE_FILE",
+         os.path.join(_LIVE_ISOLATION_DIR, "slack_maintenance")),
         ("GHOST_PUSH_SUBS_FILE",
          os.path.join(_LIVE_ISOLATION_DIR, "push_subs.json")),
         ("GHOST_VAPID_FILE",

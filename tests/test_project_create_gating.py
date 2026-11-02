@@ -43,12 +43,12 @@ def test_system_prompt_single_file_is_one_shot():
 
 def test_tool_description_has_create_gating():
     desc = MANAGE_PROJECTS_TOOL_DEF["function"]["description"]
-    assert "GATING for `create`" in desc
+    # §4SU Phase 4 (shorter description): the two legitimate triggers and
+    # the single-file exclusion survive.
+    assert "CREATE only when the user explicitly asks" in desc
     assert "SINGLE-FILE" in desc
-    # The two legitimate triggers and the single-file exclusion.
-    assert "EXPLICITLY asks" in desc
-    assert "MULTIPLE files/modules" in desc
-    assert "do NOT create a project for it" in desc
+    assert "MULTIPLE files AND multiple turns" in desc
+    assert "no project" in desc
 
 
 def test_tool_description_disqualifies_past_projects():

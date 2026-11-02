@@ -43,7 +43,7 @@ def bot():
 def _setup(bot, monkeypatch):
     monkeypatch.setattr(bot, "OWNER_ID", OWNER)
     monkeypatch.setattr(bot, "BOT_USER_ID", BOT)
-    monkeypatch.setattr(bot, "MAINTENANCE_MODE", False)
+    monkeypatch.setattr(bot, "MAINTENANCE_FILE", "")
     monkeypatch.setattr(bot, "OPEN_CHANNEL", True)
     monkeypatch.setattr(bot, "_is_open_surface", lambda ch: True)
     bot._SEEN_MESSAGES.clear()

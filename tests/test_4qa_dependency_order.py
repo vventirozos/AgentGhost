@@ -3,6 +3,7 @@ autopilot's picker. M2: an owner turn could close the report while every
 experiment it rests on was open. m3: a chain held behind a BLOCKED/PAUSED
 task was reported "project done". m6: the briefing counted parents twice and
 showed tasks held for the turn as questions for the user."""
+from tests._refused import refused_ids, refused_reasons  # §4SU Phase 4
 import json
 from types import SimpleNamespace
 
@@ -43,8 +44,8 @@ async def test_a_task_cannot_close_while_its_dependency_is_open(tmp_path):
     ctx, store, pid, exp, report = await _project(tmp_path)
     store.update_task(exp, status="NEEDS_USER")
     out = await _done(ctx, report)
-    assert out["waiting_on_dependencies"] == [report]
-    assert f"{exp} (NEEDS_USER)" in out["agent_instruction_waiting"]
+    assert refused_ids(out, "waiting_on_dependencies") == [report]
+    assert f"{exp} (NEEDS_USER)" in refused_reasons(out, "waiting_on_dependencies")
     assert store.get_task(report)["status"] == "PENDING"
 
 
@@ -52,7 +53,7 @@ async def test_a_task_cannot_close_while_its_dependency_is_open(tmp_path):
 async def test_closing_the_dependency_in_the_same_call_is_allowed(tmp_path, dependent_first):
     ctx, store, pid, exp, report = await _project(tmp_path)
     out = await (_done(ctx, report, exp) if dependent_first else _done(ctx, exp, report))
-    assert "waiting_on_dependencies" not in out
+    assert not refused_ids(out, "waiting_on_dependencies")
     assert {store.get_task(t)["status"] for t in (exp, report)} == {"DONE"}
 
 
@@ -60,16 +61,16 @@ async def test_a_dependency_cycle_never_holds_a_close(tmp_path):
     ctx, store, pid, exp, report = await _project(tmp_path)
     store.update_task(exp, depends_on=[report])          # exp ⇄ report
     out = await _done(ctx, report)
-    assert "waiting_on_dependencies" not in out
+    assert not refused_ids(out, "waiting_on_dependencies")
     assert store.get_task(report)["status"] == "DONE"
 
 
 def test_the_held_close_is_a_rejection_not_a_success():
     # §4LP: a payload that reports its own refusal with nothing updated is REJECTED
     from ghost_agent.tools.projects import _ok
-    out = _ok({"updated": [], "count": 0, "waiting_on_dependencies": ["abc"]})
+    out = _ok({"updated": [], "count": 0, "refused": [{"task_id": "abc", "gate": "dependencies"}]})
     assert out.status.value == "rejected" if hasattr(out.status, "value") else out.status == "rejected"
-    assert _ok({"updated": [], "count": 0, "undelivered": ["abc"]}).reason_code == \
+    assert _ok({"updated": [], "count": 0, "refused": [{"task_id": "abc", "gate": "deliverable"}]}).reason_code == \
         "task_update_held_by_constraint"
 
 
@@ -78,14 +79,16 @@ def test_the_briefing_marks_waiting_and_held_tasks_and_counts_leaves(tmp_path):
     pid = store.create_project("Recursion", goal="g")
     exp = store.add_task(pid, "Task 3.1: Run Layer 0")
     store.update_task(exp, status="NEEDS_USER",
-                      result_summary="model experiment? — in your turn, probe_model — not closed unattended")
+                      result_summary="model experiment? — in your turn, probe_model — not closed unattended",
+                      wait_on="owner_turn")
     ask = store.add_task(pid, "Pick the human subjects")
     store.update_task(ask, status="NEEDS_USER", result_summary="which people?")
     parent = store.add_task(pid, "Phase 5: analysis")
     store.add_task(pid, "Task 5.1: compare layers", parent_id=parent, depends_on=[exp])
     b = build_project_briefing(store, pid)
-    assert "OPEN TASKS (3: " in b and "1 HELD" in b and "1 NEEDS_USER" in b and "1 PENDING" in b
-    assert "(HELD)" in b and "not waiting for the user's input" in b
+    # §4SU Phase 3: the five-state view
+    assert "OPEN TASKS (3: " in b and "1 WAITING(owner_turn)" in b and "1 WAITING(owner)" in b and "1 PENDING" in b
+    assert "(WAITING(owner_turn))" in b and "not waiting for the user's input" in b
     assert "(PENDING · waits on 1 unfinished task(s))" in b
     assert f"[{parent}]" not in b.split("OPEN TASKS")[1].split("STUCK")[0]
 
@@ -113,7 +116,7 @@ async def test_a_refused_dependency_in_the_same_call_still_holds_its_dependent(t
     ctx, store, pid, exp, report = await _project(tmp_path)
     store.update_task(exp, description="Run the control condition → results/control.md")
     out = await _done(ctx, report, exp)
-    assert out["undelivered"] == [exp] and out["waiting_on_dependencies"] == [report]
+    assert refused_ids(out, "undelivered") == [exp] and refused_ids(out, "waiting_on_dependencies") == [report]
     assert store.get_task(report)["status"] == "PENDING"
 
 
@@ -295,5 +298,5 @@ async def test_a_bulk_close_closes_a_dependency_phases_steps_first(tmp_path):
     c1 = store.add_task(pid, "Step", parent_id=ph)
     rep = store.add_task(pid, "Report", depends_on=[ph])
     out = await _done(ctx, rep, c1)
-    assert "waiting_on_dependencies" not in out
+    assert not refused_ids(out, "waiting_on_dependencies")
     assert {store.get_task(t)["status"] for t in (ph, c1, rep)} == {"DONE"}

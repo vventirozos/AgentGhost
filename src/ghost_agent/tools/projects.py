@@ -78,6 +78,8 @@ _ACTIONS = {
     "promote_from_context",
     # self-advancing loop
     "autoadvance",
+    # §4SU Phase 4: a new plan that keeps the finished work and the research
+    "replan",
     # auto-research
     "research", "research_list",
 }
@@ -293,10 +295,9 @@ def _ok(payload: Any) -> "ToolOutcome":
         # §4LP: EVERY refusal kind, not just the constraint hold — the
         # visual-artifact gate, the live re-check, the constraint audit and
         # unknown task ids also came back `ok` with `updated: []`
-        _held = any(payload.get(k) for k in (
-            "gated_constraints", "agent_instruction_constraints", "gated_unverified",
-            "still_failing", "constraint_violations", "missing",
-            "undelivered", "waiting_on_dependencies"))
+        # §4SU Phase 4: every gate refusal now lands in `refused` (the legacy
+        # per-gate keys were removed)
+        _held = any(payload.get(k) for k in ("refused", "missing"))
         _nothing = (payload.get("updated") == []
                     or payload.get("count") == 0)
         if _held and _nothing:
@@ -1496,11 +1497,18 @@ _ADVANCE_STOP_BLURB = {
     "completed_with_failures": "Advanced every task it could; some FAILED and "
                                "were skipped (listed below) — retry those.",
     "count_reached": "Advanced the requested number of tasks; more remain.",
+    # §4SR r3: the tool's own wording for an unattended needs_user stop where
+    # only holds wait (never a batch stop reason)
+    "held_unattended": "Stopped: the task(s) in held_tasks were held because this run is "
+                       "unattended; any other open task waits on another task or on the "
+                       "owner's own run (see task_list).",
     "hard_cap": "Hit the safety cap mid-run — call autoadvance again to continue.",
     "repeated_failures": "Stopped: several tasks failed in a row — likely a "
                          "systemic problem (e.g. a broken foundation). Fix it, "
                          "then re-run autoadvance.",
-    "needs_user": "Paused: a task needs your input/decision before continuing.",
+    "needs_user": "Stopped: nothing else can run — the task(s) in needs_user_tasks "
+                  "wait for the owner (a decision, approval or publish only they can "
+                  "give); autoadvance does not run them.",
     "budget_or_inactive": "Paused: the project's step budget is exhausted "
                           "(the owner raises it with action=budget) or it is not ACTIVE.",
     "deadline": "Stopped before the next task: this request's time is nearly up and "
@@ -1522,14 +1530,16 @@ _ADVANCE_STOP_BLURB = {
                    "Tell the user.",
     "step_crashed": "Stopped: the build step crashed before it could finish (the task "
                     "is open again, ready to retry) — tell the user what failed.",
-    "autopilot_off": "Not run: autopilot is off for this project, and only the owner's "
-                     "own turn turns it on — a scheduled or background run cannot.",
+    "autopilot_off": "Not run: autopilot is off for this project. Only the owner turns it on "
+                     "(action=autopilot enabled=true in their own turn) — a scheduled or background "
+                     "run cannot.",
     "autopilot_paused": "Stopped: the unattended safety gates paused this project "
                         "(no progress, a check-in, or its runtime budget) — tell the "
                         "user why; only their own turn resumes it.",
     "failed": "Stopped: a task FAILED — review it before continuing.",
-    "model_experiment": "Paused before a task that may RUN something on a model — if its data are "
-                        "model answers they must be real ones, which autoadvance cannot produce.",
+    "model_experiment": "A task may RUN something on a model — the batch went past it (and ran what "
+                        "does not wait on it). If its data are model answers they must be real ones, "
+                        "which autoadvance cannot produce.",
     "no_store": "Project store unavailable.",
 }
 
@@ -1539,6 +1549,19 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     done = sum(1 for a in batch.advanced if (a.get("status") or "") == "DONE")
     failed = sum(1 for a in batch.advanced if (a.get("status") or "") == "FAILED")
     tail = f", {failed} FAILED" if failed else ""
+    # §4SR r2 #3: a gate tick is not one of the tasks run
+    # r4 #5: one unit per number — D and "held after running" are among the
+    # N that ran; gates and "held before running" are extra ticks
+    _nr = set(getattr(batch, "not_run", None) or [])
+    _held = list(getattr(batch, "held", None) or [])
+    _ng = len(getattr(batch, "gated", None) or [])
+    _nha = sum(1 for h in _held if h not in _nr)
+    _nhb = len(_held) - _nha
+    tail += f", {_nha} held for the owner's own run" if _nha else ""
+    gated = ((f"; {_ng} more left waiting at a gate" if _ng else "")
+             + (f"; {_nhb} more held before running" if _nhb else ""))
+    ran = getattr(batch, "ran", None)
+    ran = batch.count if ran is None else ran
     failed_ids = [a.get("task_id") for a in batch.advanced
                   if (a.get("status") or "") == "FAILED" and a.get("task_id")]
     fail_list = (" Failed task ids: " + ", ".join(failed_ids) + ".") if failed_ids else ""
@@ -1557,33 +1580,58 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
         "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "out_of_time",
         "in_progress", "open_but_waiting")
     if batch.stop_reason == "model_experiment":
-        _exp = next((a for a in reversed(batch.advanced) if a.get("task_id")), {})
+        # §4SU Phase 5: the batch carries on past an experiment — name IT,
+        # not the last task that ran
+        _exp = next((a for a in batch.advanced if a.get("task_id")
+                     and str(a.get("summary") or "").startswith("model experiment")),
+                    next((a for a in reversed(batch.advanced) if a.get("task_id")), {}))
         return (
-            f"Autonomous batch ran {batch.count - 1} task(s) ({done} DONE{tail}). {blurb} "
+            # §4SR r8: the experiment is in not_run (so not in `ran`); a
+            # duck-typed batch with no `ran` still counts it in `count`
+            f"Autonomous batch ran {ran if getattr(batch, 'ran', None) is not None else ran - 1} "
+            f"task(s) ({done} DONE{tail}{gated}). {blurb} "
             f"Task {_exp.get('task_id')} — {str(_exp.get('summary') or '')[len('model experiment: '):]} — "
             "do it NOW in this turn. First decide what its data are. If they are a language "
             "model's ANSWERS (prompts put to a model, a control condition, a cross-model run), "
             "run the prompts with probe_model (save_to a new results/… .md file, so the system "
-            "records the raw answers), then write the task's results file FROM that transcript — "
-            "quote the answers word for word, never write a model response yourself. If they are NOT (facts from "
+            "records the raw answers), then write the task's results file FROM that transcript and name "
+            "the transcript's path in it — the close is refused when nothing the task delivers cites a "
+            "kept transcript (§4ST). Quote the answers word for word, never write a model response "
+            "yourself. If they are NOT (facts from "
             "published sources, a measurement of something else, a build), do it the normal way — "
             "web_search / read / write the file — and never ask a model for facts it should look "
-            "up. Close it with task_update status=done, then call autoadvance again for the rest. "
+            "up, and close it with override={\"model_run\": \"<why>\"}. Close it with task_update status=done, then call autoadvance again for the rest. "
             "If an experiment cannot be run as asked (e.g. it needs other models or people), "
             "say so and mark the task with what was really done; do not simulate data. "
             f"{no_reload}"
         )
+    if batch.stop_reason == "needs_user":
+        # §4SR: req 4609b359 read the generic text below as "do not re-run
+        # autoadvance", wondered for 70 s whether "proceed with all tasks"
+        # answered the gate, then promised "say continue and I resume from
+        # Task 1" — which autoadvance never does for a waiting task
+        return (
+            f"Autonomous batch ran {ran} task(s) ({done} DONE{tail}{gated}). "
+            f"{blurb}{fail_list} STOP now: tell the user EXACTLY which tasks "
+            f"completed, which did not, and what each waiting task asks of them. "
+            f"A request to run all tasks is NOT the answer to a gate — ask about "
+            f"each waiting task by name. When the user answers, do that task "
+            f"yourself in that turn and close it with task_update (setting it back "
+            f"to pending may gate it again), then call autoadvance for whatever is "
+            f"still open. {no_reload}"
+        )
     if stopped_early:
         return (
-            f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
+            f"Autonomous batch ran {ran} task(s) ({done} DONE{tail}{gated}). "
             f"{blurb}{fail_list} STOP now: tell the user EXACTLY which tasks "
             f"completed and which did not, and ask how to proceed (retry the "
-            f"failed task(s), refine them, or take over). Do NOT keep building "
-            f"the project yourself this turn — re-running autoadvance after a "
-            f"fix continues from where it stopped. {no_reload}"
+            f"failed task(s), refine them, or take over). Do NOT keep building the "
+            f"project yourself in this turn; in the turn where the user has "
+            f"answered (or the fix is in), calling autoadvance again is how to "
+            f"continue — it picks up from where this run stopped. {no_reload}"
         )
     return (
-        f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
+        f"Autonomous batch ran {ran} task(s) ({done} DONE{tail}{gated}). "
         f"{blurb}{fail_list} Summarize for the user what was built (and any "
         f"failed tasks they may want to retry) and STOP — wait for their next "
         f"direction. {no_reload}"
@@ -1640,6 +1688,62 @@ def _resolve_project_ref(store, project_id: Optional[str],
             f"Pass a specific project_id — candidates: {listing}"
         )
     return None, None
+
+
+def _is_subtask_object(obj) -> bool:
+    """A parsed JSON value shaped like a subtask object (r4: one rule for a
+    bare object and a list item)."""
+    return isinstance(obj, dict) and any(k in obj for k in ("description", "task", "title",
+                                                             "kind", "task_kind", "deliverable"))
+
+
+def _split_declared_subtasks(value):
+    """§4SU Phase 2: ``subtasks`` items may be objects
+    ``{"description", "kind", "deliverable"}``. Returns (the value with each
+    object turned into its description — ``→ deliverable`` appended — and
+    {description: kind}). Strings pass through (undeclared). Raises
+    ValueError on an unknown kind or an object with no description."""
+    from ..core.task_kind import normalize_kind, with_deliverable
+    raw = value
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:                                       # r3: one object, not in a list —
+            _one = json.loads(raw)                 # r4: only when it IS one ("{name} for
+        except ValueError:                         # the {site}" is text)
+            _one = None
+        if _is_subtask_object(_one):
+            raw = [_one]
+    if isinstance(raw, str) and re.match(r"\s*\[\s*\{", raw):    # r2: "[draft] write {name}" is text
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            # r1 MINOR: an unreadable list of objects became ONE task of JSON text
+            raise ValueError("`subtasks` looks like a JSON list of objects but does not parse — "
+                             "pass a list of {description, kind, deliverable} objects")
+    if not isinstance(raw, list):
+        return value, {}
+    out: List[Any] = []
+    kinds: Dict[str, str] = {}
+    for item in raw:
+        if isinstance(item, str) and item.strip().startswith("{") and item.strip().endswith("}"):
+            try:                                      # r1 MINOR: one object per string
+                _obj = json.loads(item)
+                if _is_subtask_object(_obj):
+                    item = _obj    # (r2 NIT: other JSON text stays text; r3: a subtask-shaped one
+                                   #  is judged as the dict form is — no description is refused)
+            except ValueError:
+                pass
+        if isinstance(item, dict):
+            desc = str(item.get("description") or item.get("task") or item.get("title") or "").strip()
+            if not desc:
+                raise ValueError(f"a subtask object needs a description: {str(item)[:120]}")
+            desc = with_deliverable(desc, item.get("deliverable"))
+            k = normalize_kind(item.get("kind") or item.get("task_kind"))
+            if k:
+                kinds.setdefault(desc, k)
+            out.append(desc)
+        else:
+            out.append(item)
+    return out, kinds
 
 
 def _coerce_str_list(value) -> Optional[List[str]]:
@@ -1713,7 +1817,7 @@ def _coerce_str_list(value) -> Optional[List[str]]:
 
 _TASK_LIST_SLIM_FIELDS = (
     "id", "parent_id", "description", "status", "depth", "position",
-    "result_summary",
+    "result_summary", "kind",
 )
 
 
@@ -1959,6 +2063,153 @@ def _create_not_requested(context) -> str:
     return ("NOT created: the request did not ask for a project. Do the task directly in this "
             "conversation now — answer, run, or build what was asked. Offer a project only if the work "
             "clearly needs one, and create it when the owner says so.")
+
+
+def _stored_evidence(summary) -> str:
+    """§4SU Phase 0 (audit 2): a task's stored result is close evidence only
+    when the SYSTEM did not write it — a hold ("… not closed unattended"), a
+    gate park ("human gate: …"), a review flag or a model-experiment hold
+    closed a visual / constrained task DONE with no result at all."""
+    text = str(summary or "").strip()
+    if not text:
+        return ""
+    from ..core.project_advancer import _HELD_MARK, MODEL_EXPERIMENT_PREFIX
+    low = text.lower()
+    # §4SU Phase 1 r1 M1: a roll-up refusal ("not closed: …") quotes the
+    # very postcondition it refused — it is the system's text, not evidence
+    if (_HELD_MARK in low or low.startswith("human gate:") or low.startswith("not closed:")
+            or low == "flagged for human review"
+            or low.startswith(MODEL_EXPERIMENT_PREFIX.lower())):
+        return ""
+    return text
+
+
+def _current_request_id() -> str:
+    try:
+        from ..utils.logging import request_id_context
+        return str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+#: §4SU r3/r4 (operator 11-02: "name it", then "task id only"): chat approval
+#: of a human gate is an approval word plus the TASK ID, never a plain yes (r3:
+#: "go ahead, tell me the weather" released an overnight deploy gate) and never
+#: title words (r4: the model could rename a gated task to match whatever the
+#: owner typed, and "server"/"production" named unrelated gates)
+_APPROVE_WORD_RE = re.compile(r"(?<!\w)(?:approve[sd]?|approving|lgtm|sign(?:ed)?\s+off|"
+                              r"εγκριν\w*|εγκρινα|εγκεκριμεν\w*)(?!\w)", re.IGNORECASE)
+_DELETE_WORD_RE = re.compile(r"(?<!\w)(?:delete[sd]?|remove[sd]?|σβησ\w*|διεγραψ\w*|διαγραψ\w*)(?!\w)",
+                             re.IGNORECASE)
+#: anywhere in the message — a release that holds back, asks or sets a
+#: condition is no release (r4: "I haven't approved…", "Δεν εγκρίνω…",
+#: "should I approve…?", "approve … only if the tests pass")
+_HOLD_BACK_RE = re.compile(r"(?:(?<!\w)(?:do|does|did|ca|can|wo|is|are|was|were|have|has|had|should|"
+                           r"would|could|must|need|ai)n'?t(?!\w)|[?;;？¿]|(?<!\w)(?:not|no|never|wait|hold(?:\s+(?:on|off))?|stop|"
+                           r"cancel|but|except|unless|if|once|yet|later|tomorrow|first|when|whenever|after|"
+                           r"until|till|before|only|provided|assuming|"
+                           r"οχι|δεν|μη|μην|ουτε|περιμενε|σταματα|αλλα|εκτος|αν|εαν|αυριο|πρωτα|οταν|μολις|"
+                           r"αφου|μετα|πριν|μονο)(?!\w))", re.IGNORECASE)
+_TASK_REF_RE = re.compile(r"(?<![0-9a-z])[0-9a-f]{6,32}(?![0-9a-z])")
+#: r5: the id directly after ITS verb ("approve 3f2a9c", "εγκρίνω το 3f2a9c",
+#: "approved: task #3f2a9c") — "approve A, leave B parked" named B too
+_AFTER_VERB_RE = re.compile(r"[\s:,\-–—]*(?:(?:the|task|id|το|την|task\s+id)\s+)*[#\"'“«(]?"
+                            r"([0-9a-f]{6,32})(?![0-9a-z])")
+
+
+def _gate_text(msg) -> str:
+    from ..memory.profile import _fold
+    return _fold(str(msg or "")).replace("\u2019", "'").replace("\u2018", "'").replace("\u02bc", "'")
+
+
+def _owner_message_now(context) -> str:
+    """r5: the owner's message of THIS request as provenance recorded it (the
+    context's ``last_user_content`` outlives its turn); "" when none."""
+    try:
+        from ..utils.provenance import user_message
+        return str(user_message() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _gate_park_payload(reason: str) -> dict:
+    """A park event's payload: the reason and this request's id. (r5 residual,
+    documented: a Retry re-sends an earlier message as a NEW request; a hash
+    of the parking message was tried and dropped — the owner typing the same
+    "delete <id>" again could then never release it.)"""
+    return {"reason": str(reason)[:200], "req": _current_request_id()}
+
+
+def _message_names_task(msg: str, task: dict, rivals, verbs=()) -> bool:
+    """The owner's message names THIS task, and only it: every id-like token
+    that is a prefix (6+ characters, a whole word) of a task of the project
+    points at this one task, and the id follows its verb directly."""
+    tid = str(task.get("id") or "").lower()
+    if not tid:
+        return False
+    ask = _gate_text(msg)
+    ids = [str(r.get("id") or "").lower() for r in rivals] + [tid]
+    named = set()
+    for ref in _TASK_REF_RE.findall(ask):
+        named |= {i for i in ids if i.startswith(ref)}
+    if named != {tid}:                        # another task, or an ambiguous prefix
+        return False
+    for v in verbs:
+        for m in v.finditer(ask):
+            mm = _AFTER_VERB_RE.match(ask, m.end())
+            if mm and tid.startswith(mm.group(1)):
+                return True
+    return False
+
+
+def _owner_names_release(context, task: dict, rivals, verbs=(_APPROVE_WORD_RE,)) -> bool:
+    """§4SU r3–r5 (operator): the owner's OWN message of this request releases
+    THIS gate — the verb (an approval word; for a delete, a delete word)
+    directly followed by the task's id, no other task named, and nothing held
+    back anywhere in it. A message the owner queued mid-turn (§4RZ) that holds
+    back withdraws it."""
+    try:
+        ask = _gate_text(_owner_message_now(context))
+        if not ask.strip() or _HOLD_BACK_RE.search(ask):
+            return False
+        if not _message_names_task(ask, task, rivals, verbs):
+            return False
+        try:
+            from ..utils.provenance import added_user_messages
+            if any(_HOLD_BACK_RE.search(_gate_text(later)) for later in (added_user_messages() or [])):
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _owner_released(store, project_id: str, tid: str, context, verbs=(_APPROVE_WORD_RE,)) -> bool:
+    """§4SU Phase 0: the OWNER, in their own turn, releases THIS task's gate by
+    name, and the gate was put to them by an EARLIER request (its newest
+    ``human_gate_parked`` / ``human_gate_triggered`` event carries that
+    request's id). Never raises (False)."""
+    try:
+        if not _owner_turn_now():
+            return False
+        task = store.get_task(tid) or {}
+        rivals = store.list_tasks(project_id) or []
+        if not _owner_names_release(context, task, rivals, verbs):
+            return False
+        ev = store.latest_task_event(project_id, tid, ("human_gate_parked", "human_gate_triggered"))
+        if ev is None:
+            return False
+        return str((ev.get("payload") or {}).get("req") or "") != _current_request_id()
+    except Exception:  # noqa: BLE001
+        logger.warning("human gate approval check failed (not approved)", exc_info=True)
+        return False
+
+
+def _human_gate_approved(store, project_id: str, tid: str, status_now, context=None) -> bool:
+    """A parked HUMAN_GATE task's close is the owner's approval (see
+    `_owner_released`)."""
+    return status_now == TaskStatus.NEEDS_USER and _owner_released(store, project_id, tid, context)
 
 
 def _owner_turn_now() -> bool:
@@ -2694,7 +2945,10 @@ async def tool_manage_projects(
     sequential: bool = False,
     result: str = "",
     failure_reason: str = "",
+    not_model_data: str = "",
+    override: Optional[Dict[str, str]] = None,
     subtasks: Optional[List[str]] = None,
+    task_kind: str = "",
     # artifacts
     artifact_kind: str = "",
     payload: str = "",
@@ -2755,6 +3009,14 @@ async def tool_manage_projects(
     # Coerce list-typed params at the boundary so every action below
     # sees real lists. The `is None` checks downstream still work
     # because _coerce_str_list returns None when the input is None.
+    # §4SU Phase 2: object subtasks carry a declared kind + deliverable
+    try:
+        subtasks, _subtask_kinds = _split_declared_subtasks(subtasks)
+        from ..core.task_kind import normalize_kind as _norm_kind
+        _task_kind_given = bool(str(task_kind or "").strip())   # "none" clears a kind
+        task_kind = _norm_kind(task_kind)
+    except ValueError as _ke:
+        return _err(str(_ke))
     subtasks = _coerce_str_list(subtasks)
     alternatives = _coerce_str_list(alternatives)
     postconditions = _coerce_str_list(postconditions)
@@ -3034,7 +3296,7 @@ async def tool_manage_projects(
                         f"call that was already refused. You are in a "
                         f"LOOP. The project '{title}' EXISTS at id "
                         f"{existing['id']}. Your next tool call MUST be "
-                        f"one of: task_next (find next work), task_list "
+                        f"one of: task_list "
                         f"(see progress), task_update (mark a task "
                         f"DONE/FAILED), or a plain user-facing final "
                         f"message. It MUST NOT be manage_projects with "
@@ -3152,7 +3414,8 @@ async def tool_manage_projects(
                         continue
                     deps = [prev_id] if (sequential and prev_id) else None
                     tid = plan.add_task(desc.strip(), depends_on=deps,
-                                        constraints=req_constraints or None)
+                                        constraints=req_constraints or None,
+                                        kind=_subtask_kinds.get(desc.strip(), ""))
                     created_task_ids.append(tid)
                     pairs.append((tid, desc.strip()))
                     prev_id = tid
@@ -3178,7 +3441,9 @@ async def tool_manage_projects(
                     "task_decompose — make EACH task own a file or a bounded "
                     "function you can build and verify on its own (e.g. one "
                     "file per feature behind a thin shell), NOT N tasks that "
-                    "all edit the same file. Then STOP and present the plan. "
+                    "all edit the same file. Give each task as an object "
+                    "{description, kind, deliverable} (kind: build | write | "
+                    "research | model_run | owner). Then STOP and present the plan. "
                     "DO NOT begin executing tasks now — advance ONE task at a "
                     "time, and only when the user directs you (e.g. 'proceed to "
                     "next task'). As you work, record durable facts (file "
@@ -3214,7 +3479,8 @@ async def tool_manage_projects(
                     store.update_project(pid, metadata={"probe_created": True})   # merges (§4LZ C2)
                 except Exception:  # noqa: BLE001
                     pass
-            return _ok({"created": pid,
+            return _ok({"awaits_go_ahead": True,      # §4SU Phase 4: a plan for the user — the turn ends
+                        "created": pid,               # here (FIRST key: read from a truncated result)
                         "tasks_created": created_task_ids,
                         "workspace": f"projects/{pid}",
                         "constraints": req_constraints,
@@ -3247,8 +3513,13 @@ async def tool_manage_projects(
                 + ("   <- ACTIVE" if p.get("id") == current else "")
                 for p in projs
             ]
+            # §4SU Phase 4: display lines only (the full rows hit the 4k result
+            # cap in 46/46 owner list calls — "show all projects" was answered
+            # from a truncated list); `metadata={"verbose": true}` keeps them
+            _out = {} if not bool((metadata or {}).get("verbose")) else {"projects": projs}
             return _ok({
-                "projects": projs,
+                **_out,
+                "count": len(projs),
                 "current": current,
                 "display": "\n".join(lines) or "(no projects)",
                 "note": (
@@ -3382,6 +3653,19 @@ async def tool_manage_projects(
                     if _other:
                         store.update_project(project_id, **_other)
                     return await tool_manage_projects_for_model(context, action="archive", project_id=project_id)
+                if str(status).upper() == "DONE":
+                    # §4SU r3: a project DONE fires the sweep and retires the
+                    # constraints — never past an open task's human gate
+                    from ..core.planning import _human_gate_reason as _hgr
+                    _open_gated = [t for t in (store.list_tasks(project_id) or [])
+                                   if str(t.get("status") or "").upper() != "DONE"
+                                   and _hgr(t.get("postconditions") or []) is not None]
+                    if _open_gated:
+                        return _err("NOT updated: the project cannot be set DONE while "
+                                    + "; ".join(f"task {t['id']} waits for the owner's approval "
+                                                f"({_hgr(t.get('postconditions') or [])})"
+                                                for t in _open_gated[:3])
+                                    + ". Ask the owner and stop.")
                 fields["status"] = status
             if kind:
                 fields["kind"] = kind
@@ -3480,6 +3764,21 @@ async def tool_manage_projects(
             # rmtree under a running service left orphaned processes +
             # registry entries (review H6). Hard delete also purges their
             # writable state dirs ("no files left behind").
+            # §4SU r4: a hard delete removes every task — an open human gate
+            # goes only with the owner's own "delete <task id>" for it
+            from ..core.planning import _human_gate_reason as _hgr
+            _held_g = [t for t in (store.list_tasks(rid) or [])
+                       if str(t.get("status") or "").upper() != "DONE"
+                       and _hgr(t.get("postconditions") or []) is not None
+                       and not _owner_released(store, rid, t["id"], context, verbs=(_DELETE_WORD_RE,))]
+            if _held_g:
+                for t in _held_g:
+                    store.log_event(rid, t["id"], "human_gate_parked",
+                                    _gate_park_payload(f"project delete requested: {_hgr(t.get('postconditions') or [])}"))
+                return _err("NOT deleted: " + "; ".join(
+                    f"task {t['id']} waits for the owner's approval ({_hgr(t.get('postconditions') or [])})"
+                    for t in _held_g[:3]) + ". Ask the owner now and stop. The project goes only when the "
+                    "owner's next message names each such task by id: \"delete <task id>\".")
             _stop_project_services(context, rid, purge_state=True)
             _gone = store.get_project(rid) or {}
             ok = store.delete_project(rid, hard=True)
@@ -3664,8 +3963,9 @@ async def tool_manage_projects(
 
         if act == "autopilot":
             # §4LQ: the idle loop advances a project only with autopilot on.
-            # The owner's own `autoadvance` turns it on; this reports it or
-            # turns it on/off. Not from a probe or a background turn.
+            # §4SU Phase 5: the ONLY way autopilot turns on (autoadvance no
+            # longer does); this reports it or turns it on/off. Not from a
+            # probe or a background turn.
             # a NAMED project, never the current one by default (review N1:
             # the title was ignored and the current project went on autopilot)
             if project_id or title:
@@ -3742,6 +4042,7 @@ async def tool_manage_projects(
                 alternatives=alternatives, postconditions=postconditions,
                 constraints=constraints,
                 depends_on=depends_on,
+                kind=task_kind,
             )
             _link_task_in_graph(context, project_id, tid, description)
             return _ok({
@@ -3773,7 +4074,10 @@ async def tool_manage_projects(
 
             if status:
                 try:
-                    st_enum = TaskStatus[str(status).upper()]
+                    # §4SU Phase 4: the five-state names the model sees
+                    _su = {"WAITING": "NEEDS_USER", "RUNNING": "IN_PROGRESS"}.get(
+                        str(status).strip().upper(), str(status).strip().upper())
+                    st_enum = TaskStatus[_su]
                 except KeyError:
                     return _err(f"bad status: {status}")
             else:
@@ -3811,6 +4115,20 @@ async def tool_manage_projects(
             _quote_pending: List[tuple] = []
             waiting: List[str] = []
             waiting_reasons: List[str] = []
+            unrun: List[str] = []
+            unrun_reasons: List[str] = []
+            # §4SU Phase 1: every refusal, one shape {task_id, gate, reason, fix}
+            refused: List[Dict[str, str]] = []
+            overrides_used: List[Dict[str, str]] = []
+            if isinstance(override, str):
+                try:
+                    override = json.loads(override or "null")
+                except ValueError:
+                    override = None
+            waived: List[str] = []
+            # §4SU Phase 0: a close the plan DEMOTED (postconditions) or PARKED
+            # (human gate) is reported — it used to read as plain success
+            not_closed: List[Dict[str, str]] = []
             try:
                 _ws_for_gate = store.ensure_workspace(project_id)
             except Exception:
@@ -3834,6 +4152,8 @@ async def tool_manage_projects(
                     missing.append(tid)
                     continue
                 _done_before = plan.tree.nodes[tid].status == TaskStatus.DONE
+                _waive_note = ""
+                _post_waiver = ""
                 _quote_desc = None
                 # Stale-evidence invalidation (2026-08-01): closing a FAILED
                 # task whose recorded failure is a MECHANICAL check (a parse/
@@ -3854,71 +4174,82 @@ async def tool_manage_projects(
                     if _verdict is False:
                         still_failing.append(tid)
                         still_failing_reasons.append(_detail)
+                        refused.append({"task_id": tid, "gate": "recheck", "reason": str(_detail)[:400],
+                                        "fix": "the failure it recorded still holds on the file as it is now — fix it, then close"})
                         continue
                     if _verdict is True:
                         live_evidence = _detail
-                # §4QA declared-deliverable gate: "Task 1.1: … → research/x.md"
-                # promised a file. DONE with it missing (written one folder
-                # deeper) or hollow ("...", 3 bytes) was accepted live. A
-                # rewrite of the description in THIS call is what is judged —
-                # that is how a changed plan names the file it really made.
-                if st_enum == TaskStatus.DONE:
-                    from ..core.task_deliverable import declared_deliverable, deliverable_problem
-                    # …but only when it names a file: a rewrite WITHOUT the
-                    # arrow dropped the promise and skipped the gate (m8)
-                    _desc_for_gate = (description if description and len(target_ids) == 1
-                                      and declared_deliverable(description)
-                                      else plan.tree.nodes[tid].description)
-                    _undelivered = deliverable_problem(_ws_for_gate, _desc_for_gate)
-                    if _undelivered:
-                        undelivered.append(tid)
-                        undelivered_reasons.append(f"{tid}: {_undelivered}")
-                        continue
-                    _quote_desc = _desc_for_gate
-                    # §4QA-d review: `depends_on` held only the autopilot's
-                    # picker — an owner turn could close the report while
-                    # every experiment it rests on was still open. One that
-                    # itself waits on this task (a cycle) is not held. (r20:
-                    # a dependency in this same call counted as met even when
-                    # its own close was refused — the order above replaces that.)
-                    _unmet = _unmet_dependencies(plan, tid)
-                    if _unmet:
-                        waiting.append(tid)
-                        waiting_reasons.append(
-                            f"{tid} waits on " + ", ".join(
-                                f"{d} ({plan.tree.nodes[d].status.value})" for d in _unmet[:8]))
-                        continue
-                # DONE-gate: a visual/runnable-artifact task cannot be marked
-                # DONE with NO verification evidence. The model must either
-                # pass a `result` (what it actually observed rendered) or go
-                # verify first — the browser screenshot now carries an
-                # objective RENDER_CHECK it can cite. 'Written' is not 'works'.
-                if (st_enum == TaskStatus.DONE
-                        and not (result or "").strip()
-                        and not (plan.tree.nodes[tid].result_summary or "").strip()
-                        and _is_visual_artifact_task(plan.tree.nodes[tid].description)):
-                    gated.append(tid)
-                    continue
-                # Constraint DONE-gate: same evidence requirement when the
-                # task or project carries explicit user constraints. The
-                # gate is deliberately evidence-based, not judgement-based —
-                # judging WHETHER the evidence honors the constraints is the
-                # verifier's job (it receives the constraints in context).
-                # A passing live re-check counts as evidence: it is exactly
-                # the "go verify first" this gate demands, already done.
                 task_constraints = [
                     str(c) for c in
                     (plan.tree.nodes[tid].constraints or [])
                 ] + proj_constraints
-                if (st_enum == TaskStatus.DONE and task_constraints
-                        and not (result or "").strip()
-                        and not live_evidence
-                        and not (plan.tree.nodes[tid].result_summary or "").strip()):
-                    gated_constraints.append(tid)
-                    for c in task_constraints:
-                        if c not in active_constraints:
-                            active_constraints.append(c)
-                    continue
+                # §4SU Phase 1: the mechanical gates are ONE check
+                # (core.task_close.check_close) in a fixed order —
+                # dependencies → declared file → model run (§4ST) → evidence
+                # → postconditions — the same check every close path runs.
+                # Its first refusal refuses this task; the legacy keys below
+                # are derived from it (operator 11-02: kept until Phase 4).
+                if st_enum == TaskStatus.DONE:
+                    from ..core.task_deliverable import declared_deliverable
+                    from ..core.task_close import check_close
+                    # a rewrite of the description in THIS call is what the
+                    # declared-file gate judges (that is how a changed plan
+                    # names the file it really made) — only when it names a
+                    # file: a rewrite WITHOUT the arrow kept the promise (m8)
+                    _desc_for_gate = (description if description and len(target_ids) == 1
+                                      and declared_deliverable(description)
+                                      else plan.tree.nodes[tid].description)
+                    _quote_desc = _desc_for_gate
+                    # the STORED words are judged for a model run (a rewrite
+                    # could drop them); the rewrite's declared file is read
+                    _gate_files = list(deliverables or [])
+                    if _desc_for_gate != plan.tree.nodes[tid].description:
+                        _gate_files.append(declared_deliverable(_desc_for_gate) or "")
+                    _over = dict(override) if isinstance(override, dict) else {}
+                    if str(not_model_data or "").strip():
+                        _over.setdefault("model_run", str(not_model_data))
+                    _verdict = await asyncio.to_thread(
+                        check_close, store, project_id, plan.tree, tid, actor="model",
+                        result=str(result or ""), description=_desc_for_gate, files=_gate_files,
+                        live_evidence=live_evidence, constraints=task_constraints, override=_over,
+                        # not on a re-close of a task already DONE (§4ST)
+                        skip=({"model_run"} if _done_before else set()),
+                        single_task=len(set(target_ids)) == 1)
+                    if not _verdict.ok:
+                        _r = _verdict.first
+                        _rd = _r.as_dict(tid)
+                        if _done_before:
+                            # r5/r7: a refused RE-close of a task already DONE
+                            # (by an earlier call, or by a child's roll-up in
+                            # this one) changes nothing — said so, in `refused`
+                            # only: the old keys read "held at non-DONE"
+                            _rd["reason"] = (_rd["reason"] + " (the task stays DONE: this re-close "
+                                             "changed nothing)")[:500]
+                            refused.append(_rd)
+                            continue
+                        refused.append(_rd)
+                        if _r.gate == "deliverable":
+                            undelivered.append(tid)
+                            undelivered_reasons.append(f"{tid}: {_r.reason}")
+                        elif _r.gate == "dependencies":
+                            waiting.append(tid)
+                            waiting_reasons.append(_r.reason)
+                        elif _r.gate == "model_run":
+                            unrun.append(tid)
+                            unrun_reasons.append(f"{tid}: {_r.reason}")
+                        elif _r.gate == "evidence" and _r.sub == "visual":
+                            gated.append(tid)
+                        elif _r.gate == "evidence":
+                            gated_constraints.append(tid)
+                            for c in task_constraints:
+                                if c not in active_constraints:
+                                    active_constraints.append(c)
+                        elif _r.gate == "postconditions":
+                            not_closed.append({"task_id": tid, "status": plan.tree.nodes[tid].status.value,
+                                               "why": _r.reason[:300]})
+                        continue
+                    _waive_note = _verdict.waived.get("model_run", "")[:300]
+                    _post_waiver = _verdict.waived.get("postconditions", "")
                 # Constraint JUDGMENT gate (2026-07-08): the evidence gate
                 # above only checks that result text EXISTS — the chess
                 # session showed the model happily supplies evidence prose
@@ -3928,9 +4259,23 @@ async def tool_manage_projects(
                 # per task_update call; refusal carries the evidence. Escape
                 # hatch for a user-approved exception: result text starting
                 # with "CONSTRAINT-OVERRIDE:". Fails open on infra errors.
-                if (st_enum == TaskStatus.DONE and task_constraints
-                        and not str(result or "").lstrip().upper()
-                                .startswith("CONSTRAINT-OVERRIDE:")):
+                _c_over = ""
+                if isinstance(override, dict) and str(override.get("constraints") or "").strip():
+                    _c_over = " ".join(str(override["constraints"]).split())[:300]
+                elif str(result or "").lstrip().upper().startswith("CONSTRAINT-OVERRIDE:"):
+                    _c_over = str(result).lstrip()[len("CONSTRAINT-OVERRIDE:"):].strip()[:300] or "CONSTRAINT-OVERRIDE"
+                # r1 L4: a constraints override is recorded only when it
+                # stood in for an audit that would have run (the task has files)
+                # r9 M1: the task's own declared file counts as its file — as
+                # the roll-up's constraint hold reads it (planning.py)
+                _audit_rels = list(deliverables or [])
+                if st_enum == TaskStatus.DONE:
+                    _decl_a = declared_deliverable(_desc_for_gate)
+                    if _decl_a and _decl_a not in _audit_rels:
+                        _audit_rels.append(_decl_a)
+                _c_over_used = bool(st_enum == TaskStatus.DONE and _c_over and task_constraints
+                                    and _files_for_task(store, project_id, tid, _audit_rels))
+                if (st_enum == TaskStatus.DONE and task_constraints and not _c_over):
                     # Audit ONLY the files THIS task produced.
                     #
                     # This used to pass the project-wide file collector from
@@ -3957,7 +4302,7 @@ async def tool_manage_projects(
                     # still applies, and auditing someone else's artifact is
                     # exactly the bug.
                     _task_files = _files_for_task(store, project_id, tid,
-                                                  deliverables)
+                                                  _audit_rels)
                     # Audit THIS task's own files. Cache by the file set so a
                     # bulk close with identical file sets still costs one
                     # audit, but a sibling with DIFFERENT files is judged on
@@ -3981,11 +4326,24 @@ async def tool_manage_projects(
                     # tasks skip the judgment gate (the evidence gate above
                     # still applies), per the _files_for_task contract.
                     if (_task_files and _task_audit is not None
+                            and not _task_audit[0] and _done_before):
+                        # r8: a refused RE-close of a task already DONE — as the check's (r5/r7)
+                        refused.append({"task_id": tid, "gate": "constraints",
+                                        "reason": (str((_task_audit[1] if len(_task_audit) > 1 else "")
+                                                       or "the files break a constraint")[:400]
+                                                   + " (the task stays DONE: this re-close changed nothing)"),
+                                        "fix": "fix the files so they honour the constraints"})
+                        continue
+                    if (_task_files and _task_audit is not None
                             and not _task_audit[0]):
                         judged_violations.append(tid)
                         _reason = _task_audit[1] if len(_task_audit) > 1 else ""
                         if _reason:
                             judged_violation_reasons.append(_reason)
+                        refused.append({"task_id": tid, "gate": "constraints",
+                                        "reason": str(_reason or "the files break a constraint")[:400],
+                                        "fix": "fix the files so they honour the constraints — or, only with the "
+                                               "user's approval, override={\"constraints\": \"<why>\"}"})
                         continue
                 # Register deliverables BEFORE flipping the task to DONE.
                 # update_status can roll the whole project to DONE on this
@@ -3994,7 +4352,12 @@ async def tool_manage_projects(
                 # would already be gone. Accept both the explicit
                 # `deliverables=[...]` list and a legacy `artifact_kind=file`
                 # + `payload` pair; dedup is handled by the store.
+                _reg_before = None
                 if st_enum == TaskStatus.DONE:
+                    try:
+                        _reg_before = set(store.list_deliverables(project_id))
+                    except Exception:  # noqa: BLE001
+                        _reg_before = None
                     keep_paths = list(deliverables or [])
                     if artifact_kind == "file" and (payload or "").strip():
                         keep_paths.append(payload)
@@ -4010,19 +4373,90 @@ async def tool_manage_projects(
                         except Exception:
                             logger.debug("deliverable registration skipped: %s",
                                          rel, exc_info=True)
-                    # Durable fact recorded at completion time → design ledger,
-                    # so the next turn inherits it instead of re-deriving it.
-                    if (ledger or "").strip() and project_id:
+                if st_enum is not None:
+                    # A passing live re-check doubles as the result when the
+                    # model supplied none — it is real, current evidence.
+                    _res_text = (result or live_evidence)
+                    if _waive_note:
+                        _res_text = f"{str(_res_text or '').strip()} [not model data: {_waive_note}]".strip()
+                    # §4SU Phase 0 (audit A): a HUMAN_GATE is approved only
+                    # explicitly — the OWNER's turn closing a task an EARLIER
+                    # request parked. A second identical close in the same
+                    # turn used to count as the owner's approval.
+                    _approved = (st_enum == TaskStatus.DONE
+                                 and _human_gate_approved(store, project_id, tid,
+                                                          plan.tree.nodes[tid].status, context))
+                    # ON the loop (r2: a worker thread opened a cancel point
+                    # between the write and its records below; the roll-up's
+                    # close check measured ~30 ms on a 3,000-file workspace)
+                    plan.update_status(tid, st_enum, result=_res_text,
+                                       failure_reason=failure_reason,
+                                       human_approved=_approved,
+                                       postconditions_waived=bool(_post_waiver))
+                    _after = plan.tree.nodes[tid].status
+                    if _after == TaskStatus.DONE and not_closed:
+                        # r7: an entry a child's roll-up wrote for THIS task
+                        # earlier in the call is stale once it really closed
+                        not_closed[:] = [n for n in not_closed if n["task_id"] != tid]
+                    # §4SU Phase 1: a waiver is never silent — once the task
+                    # really closed, each gate it went over is in the ledger
+                    # and the events (the owner reads both)
+                    if st_enum == TaskStatus.DONE and _after == TaskStatus.DONE and not _done_before:
+                        for _g, _why_w in (("model_run", _waive_note), ("postconditions", _post_waiver),
+                                           ("constraints", _c_over if _c_over_used else "")):
+                            if not _why_w:
+                                continue
+                            overrides_used.append({"task_id": tid, "gate": _g, "reason": _why_w})
+                            try:
+                                store.log_event(project_id, tid, "close_override",
+                                                {"gate": _g, "reason": _why_w, "actor": "model",
+                                                 "req": _current_request_id()})
+                                store.append_ledger(project_id, f"OVERRIDE {_g} on task {tid} (by the agent): {_why_w}")
+                            except Exception:  # noqa: BLE001
+                                logger.warning("close override not recorded", exc_info=True)
+                    for _rp in list(getattr(plan.tree, "rollup_parked", []) or []):
+                        # r2 M1: a parent this close rolled into a gate park
+                        not_closed.append({"task_id": _rp, "status": "NEEDS_USER",
+                                           "why": str(plan.tree.nodes[_rp].result_summary or "")[:300],
+                                           "waiting": plan.tree.nodes[_rp].wait_code})   # §4SU Phase 3
+                    if st_enum == TaskStatus.DONE and _after != TaskStatus.DONE:
+                        from ..core.planning import _human_gate_reason as _hgr
+                        _gr = _hgr(plan.tree.nodes[tid].postconditions)
+                        _why_not = (f"human gate: {_gr}" if _after == TaskStatus.NEEDS_USER and _gr
+                                    else (plan.tree.nodes[tid].failure_reason
+                                          or plan.tree.nodes[tid].result_summary or ""))
+                        not_closed.append({"task_id": tid, "status": _after.value,
+                                           "why": str(_why_not)[:300],
+                                           "waiting": plan.tree.nodes[tid].wait_code})        # §4SU Phase 3
+                        if _after == TaskStatus.NEEDS_USER:
+                            store.log_event(project_id, tid, "human_gate_parked",
+                                            _gate_park_payload(_why_not))
+                        # files registered for a close that FAILED are not the
+                        # project's deliverables (audit B); a gate PARK keeps
+                        # them (r1 M2: the owner's approval close carries no
+                        # deliverables, and the DONE sweep then trashed them)
+                        if _reg_before is not None and _after == TaskStatus.FAILED:
+                            try:
+                                for _rel in set(store.list_deliverables(project_id)) - _reg_before:
+                                    store.unregister_file(project_id, _rel)
+                            except Exception:  # noqa: BLE001
+                                logger.warning("task_update: deliverables of a refused close kept",
+                                               exc_info=True)
+                    elif st_enum == TaskStatus.DONE and (ledger or "").strip() and project_id:
+                        # Durable fact recorded at completion → design ledger,
+                        # only once the task really closed (audit B)
                         try:
                             store.append_ledger(project_id, ledger.strip())
                         except Exception:
                             logger.debug("ledger append skipped", exc_info=True)
-                if st_enum is not None:
-                    # A passing live re-check doubles as the result when the
-                    # model supplied none — it is real, current evidence.
-                    plan.update_status(tid, st_enum,
-                                       result=(result or live_evidence),
-                                       failure_reason=failure_reason)
+                    if _waive_note and plan.tree.nodes[tid].status == TaskStatus.DONE:
+                        waived.append(tid)
+                        try:
+                            store.add_work_log(project_id, request=f"task_update {tid} DONE",
+                                               outcome="experiment gate waived",
+                                               note=f"not model data: {_waive_note}")
+                        except Exception:  # noqa: BLE001
+                            logger.debug("waiver work_log skipped", exc_info=True)
                 # §4QA-e: a write-up citing a probe transcript should quote it
                 # word for word — ADVISORY (operator 2026-10-19): noted only
                 # once the task really closed DONE past every gate (r32), and
@@ -4058,9 +4492,16 @@ async def tool_manage_projects(
                 if alternatives is not None:
                     extras["alternatives"] = alternatives
                 if postconditions is not None:
-                    extras["postconditions"] = postconditions
+                    # §4SU r1 C1: a HUMAN_GATE is the owner's — a rewrite
+                    # cannot drop it (dropping it closed the gate in one turn)
+                    from ..core.planning import _human_gate_reason as _hgr
+                    _kept_gates = [str(p) for p in (plan.tree.nodes[tid].postconditions or [])
+                                   if _hgr([p]) is not None and str(p) not in [str(x) for x in postconditions]]
+                    extras["postconditions"] = list(postconditions) + _kept_gates
                 if constraints is not None:
                     extras["constraints"] = constraints
+                if _task_kind_given:
+                    extras["kind"] = task_kind          # §4SU Phase 2
                 if extras:
                     store.update_task(tid, **extras)
                 updated.append({k: store.get_task(tid).get(k)
@@ -4124,34 +4565,37 @@ async def tool_manage_projects(
                     "task. To mark it complete, re-call task_update with "
                     "BOTH status=done AND the task id(s)."
                 )
-            if still_failing:
-                payload["still_failing"] = still_failing
-                payload["agent_instruction_still_failing"] = (
-                    f"REFUSED to mark {len(still_failing)} task(s) DONE: the "
-                    "recorded failure was re-checked LIVE against the current "
-                    "file(s) and it STILL fails. Current diagnostic(s): "
-                    + " | ".join(still_failing_reasons)
-                    + " Fix the file first, then re-call task_update with "
-                    "status=done."
-                )
-            if waiting:
-                payload["waiting_on_dependencies"] = waiting
-                payload["agent_instruction_waiting"] = (
-                    f"REFUSED to mark {len(waiting)} task(s) DONE: they depend on tasks that "
-                    "are not DONE yet. " + " | ".join(waiting_reasons)
-                    + " Do those first (their results are this task's input), then re-call "
-                    "task_update with status=done.")
-            if undelivered:
-                payload["undelivered"] = undelivered
-                payload["agent_instruction_undelivered"] = (
-                    f"REFUSED to mark {len(undelivered)} task(s) DONE: the task names "
-                    "the file it delivers (after the →) and that file is missing or "
-                    "empty. " + " | ".join(undelivered_reasons)
-                    + " Produce the file at that path, then re-call task_update with "
-                    "status=done. If the plan changed, pass a `description` that ends "
-                    "with → <the path you actually produced> (a description without a "
-                    "path keeps the original promise)."
-                )
+            if waived:
+                payload["experiment_gate_waived"] = waived
+            if refused:
+                # §4SU Phase 1: the one list and its one instruction (Phase 4:
+                # the legacy keys — undelivered, waiting_on_dependencies,
+                # unrun_experiments, still_failing, constraint_violations,
+                # gated_constraints, gated_unverified — are gone, operator 11-02)
+                from ..core.task_close import instruction_for
+                payload["refused"] = refused
+                payload["agent_instruction_refused"] = instruction_for(refused)
+            if overrides_used:
+                payload["overrides"] = overrides_used
+            if not_closed:
+                # r4 L1: one entry per task, its LAST state (a bulk close re-judges a parent per child)
+                not_closed = list({n["task_id"]: n for n in not_closed}.values())
+                payload["not_closed"] = not_closed
+                # r4 M2: a gate park is a human gate; a roll-up refusal is not — it is fixed, not approved
+                # §4SU Phase 3: the wait field, not the "human gate:" text
+                _parked = [n["task_id"] for n in not_closed if n.get("waiting") == "human_gate"]
+                _other = len(_parked) < len(not_closed)
+                payload["agent_instruction_not_closed"] = (
+                    f"{len(not_closed)} task(s) did NOT close DONE: "
+                    + " | ".join(f"{n['task_id']} → {n['status']}: {n['why'][:160]}" for n in not_closed)
+                    + (". A human-gated task (\"human gate:\") closes only when the OWNER approves it BY NAME in a "
+                       "later message: ask them now to reply \"approve <task id>\" with the id shown here. "
+                       "A plain yes does not approve it. Do not call task_update again for a gated task in this turn."
+                       if _parked else "")
+                    + ((" For every other task listed" if _parked else ".")
+                       + (": fix what the reason names, then close it again." if _parked
+                          else " Fix what the reason names, then close it again.")
+                       if _other else ""))
             if misquoted:
                 payload["quote_warnings"] = misquoted
                 payload["agent_instruction_quote_check"] = (
@@ -4162,62 +4606,91 @@ async def tool_manage_projects(
                     + (f" (+{len(misquoted_reasons) - 3} more task(s))" if len(misquoted_reasons) > 3 else "")
                     + " Fix those quotes in that file now (copy the words, or drop the quote marks and "
                     "say it as your own summary); the owner sees this in the project ledger.")
-            if judged_violations:
-                payload["constraint_violations"] = judged_violations
-                payload["agent_instruction_violation"] = (
-                    f"REFUSED to mark {len(judged_violations)} task(s) DONE: "
-                    "an audit of the project files found a violation of the "
-                    "user's stated constraints. "
-                    + ("; ".join(dict.fromkeys(judged_violation_reasons))
-                       if judged_violation_reasons else "")
-                    + " Fix the deliverable so it actually honors the "
-                    "constraint, then re-call task_update with status=done "
-                    "and a `result`. Only if the USER has explicitly "
-                    "approved this exception, re-call with status=done and "
-                    "a `result` beginning with 'CONSTRAINT-OVERRIDE:' and "
-                    "their reason."
-                )
-            if gated_constraints:
-                payload["gated_constraints"] = gated_constraints
-                payload["constraints"] = active_constraints
-                payload["agent_instruction_constraints"] = (
-                    f"Held {len(gated_constraints)} task(s) at non-DONE: the "
-                    f"user attached EXPLICIT CONSTRAINTS and you provided no "
-                    f"result evidence. Re-read the deliverable, confirm each "
-                    f"constraint holds, then re-call task_update with "
-                    f"status=done AND a `result` that states — per constraint "
-                    f"— HOW the work honors it (a result without status=done "
-                    f"records evidence but does NOT close the task). "
-                    f"Constraints: "
-                    + " | ".join(active_constraints)
-                    + ". If the deliverable violates one (e.g. it contains a "
-                    f"coded stand-in for something the user said YOU must do "
-                    f"at runtime), FIX THE DELIVERABLE FIRST — do not word "
-                    f"the result around the violation."
-                )
-            if gated:
-                payload["gated_unverified"] = gated
-                payload["agent_instruction"] = (
-                    f"Held {len(gated)} task(s) at non-DONE pending verification "
-                    f"evidence: {gated}. Two ways to clear the gate:\n"
-                    f"  • If the task BUILDS A VISUAL/RUNNABLE artifact (a game, "
-                    f"page, canvas, chart): VERIFY it first — browser "
-                    f"operation='screenshot' (click_center=true for a game), "
-                    f"check the RENDER_CHECK / PRE_INTERACTION lines — then "
-                    f"re-call task_update with status=done AND a `result` "
-                    f"describing what you saw.\n"
-                    f"  • If the task is NOT visual (a text / research / markdown "
-                    f"/ analysis task — this gate can misfire on wording): just "
-                    f"re-call task_update with status=done and a one-line `result` "
-                    f"describing what you produced. That counts as evidence and "
-                    f"clears the gate immediately. (Pass BOTH `status=done` and "
-                    f"`result=...` — a result without status does not close the "
-                    f"task.)\n"
-                    f"  • Also pass `deliverables=[...]` with the files the user "
-                    f"should keep — everything else in the project workspace is "
-                    f"deleted when the project finishes."
-                )
             return _ok(payload)
+
+        _replanned = None
+        _replan = None
+        if act == "replan":
+            # §4SU Phase 4 (audit: the same topic deleted and re-created 7×):
+            # a new plan for the SAME project — DONE tasks, their files and
+            # the research stay; every open task with no finished work under
+            # it goes; the new subtasks are laid down as task_decompose does.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            if not subtasks:
+                return _err("subtasks (the NEW plan, a list) is required for action=replan — nothing changed")
+            if task_id and task_id != project_id:
+                # r3: a replan is the WHOLE project's open plan; a task_id was
+                # silently ignored and every open task went
+                return _err("NOT replanned: replan replaces the whole project's open plan and takes no "
+                            "task_id. To re-plan one task, task_decompose it with task_id. Nothing changed.")
+            _rg = _released_guard(store, project_id)
+            if _rg:
+                return _err(_rg)
+            # r1 m2: an archived project's new tasks would never run
+            if str((store.get_project(project_id) or {}).get("status") or "").upper() == "ARCHIVED":
+                return _err("NOT replanned: the project is ARCHIVED — resume it first. Nothing changed.")
+            # the decompose's own refusals, judged BEFORE anything is deleted —
+            # a refusal after the delete would lose the old plan for nothing
+            _new = [d for d in subtasks if d and str(d).strip()]
+            if not _new:
+                return _err("NOT replanned: every subtask is blank. Nothing changed.")
+            _rp = store.get_project(project_id) or {}
+            if len(_new) > 1 and _is_cohesive_single_file(_rp.get("title"), _rp.get("goal")):
+                return _err("NOT replanned: this is a SINGLE-FILE deliverable — do not split it into "
+                            "tasks; build the whole file in one turn. Nothing changed.")
+            from ..core.planning import _human_gate_reason as _hgr
+            _all = store.list_tasks(project_id) or []
+            _kids: Dict[str, List[str]] = {}
+            for _t in _all:
+                _kids.setdefault(_t.get("parent_id") or "", []).append(_t["id"])
+            _by = {t["id"]: t for t in _all}
+
+            def _has_done(tid, _seen=None):
+                _seen = _seen or set()
+                if tid in _seen:
+                    return False
+                _seen.add(tid)
+                return any(str(_by[c].get("status") or "").upper() == "DONE" or _has_done(c, _seen)
+                           for c in _kids.get(tid, []) if c in _by)
+
+            _drop = [t for t in _all if str(t.get("status") or "").upper() != "DONE" and not _has_done(t["id"])]
+            # r1 m3: a task the model left IN_PROGRESS is not running — only a
+            # recent claim (the boot reaper's 900 s) holds the replan back
+            _now_ts = time.time()
+            _running = [t["id"] for t in _drop if str(t.get("status") or "").upper() == "IN_PROGRESS"
+                        and _now_ts - float(t.get("updated_at") or 0) < 900]
+            # r3: an unattended step runs up to 45 min without touching the
+            # row — while one is live, its claimed task counts as running
+            if not _running and any(str(t.get("status") or "").upper() == "IN_PROGRESS" for t in _drop):
+                from ..core.project_advancer import unattended_step_live
+                if unattended_step_live(store, project_id):
+                    _running = [t["id"] for t in _drop if str(t.get("status") or "").upper() == "IN_PROGRESS"]
+            if _running:
+                return _err(f"NOT replanned: task(s) {', '.join(_running[:3])} are running now — "
+                            "wait for the step to finish, then replan. Nothing changed.")
+            _gated = [t for t in _drop if _hgr(t.get("postconditions") or []) is not None
+                      and not _owner_released(store, project_id, t["id"], context, verbs=(_DELETE_WORD_RE,))]
+            if _gated:
+                for _t in _gated:
+                    store.log_event(project_id, _t["id"], "human_gate_parked",
+                                    _gate_park_payload(f"replan requested: {_hgr(_t.get('postconditions') or [])}"))
+                return _err("NOT replanned: " + "; ".join(
+                    f"task {_t['id']} waits for the owner's approval ({_hgr(_t.get('postconditions') or [])})"
+                    for _t in _gated[:3]) + ". Ask the owner and stop: it is removed only when their next "
+                    "message names it by id: \"delete <task id>\". Nothing changed.")
+            _drop_ids = {t["id"] for t in _drop}
+            # r1 C1/C2/M1/m1: the old open tasks are deleted only AFTER the new
+            # plan is laid down (task_decompose below) — deleting first rolled
+            # the project up to DONE mid-replan (the workspace sweep ran, the
+            # owner's constraints were retired), and any later refusal or
+            # error lost the old plan for nothing
+            _replan = {"drop_roots": [t["id"] for t in _drop if (t.get("parent_id") or "") not in _drop_ids],
+                       "drop_ids": _drop_ids,
+                       "kept_parents": sorted({t.get("parent_id") for t in _drop
+                                               if t.get("parent_id") and t.get("parent_id") not in _drop_ids}),
+                       "kept": sum(1 for t in _all if str(t.get("status") or "").upper() == "DONE")}
+            act, task_id = "task_decompose", None          # the new plan, laid down as a decompose
 
         if act == "task_decompose":
             if not project_id:
@@ -4260,8 +4733,14 @@ async def tool_manage_projects(
                             "(write it directly with file_system); keep it as a "
                             "single task."),
                     })
-                subtasks, dropped_dupes = _filter_duplicate_subtasks(
-                    store, project_id, subtasks)
+                if _replan is not None:
+                    # replan: the new plan IS the plan — no dedupe against the
+                    # open tasks it replaces (r1 M1: the dedupe ran against
+                    # them and could drop the whole new plan)
+                    dropped_dupes = []
+                else:
+                    subtasks, dropped_dupes = _filter_duplicate_subtasks(
+                        store, project_id, subtasks)
                 if not subtasks:
                     return _ok({"created": [], "parent_id": None,
                                 "dropped_duplicates": dropped_dupes,
@@ -4275,7 +4754,9 @@ async def tool_manage_projects(
             try:
                 if target_id:
                     ids = plan.decompose(target_id, subtasks,
-                                         sequential=sequential)
+                                         sequential=sequential,
+                                         kinds=[_subtask_kinds.get(str(d or "").strip(), "")
+                                                for d in subtasks])
                     # decompose drops blank descriptions, so the non-blank
                     # (stripped) subtasks align 1:1 with the returned ids.
                     # zip-ing against the RAW subtasks shifted the pairing
@@ -4291,11 +4772,21 @@ async def tool_manage_projects(
                         if not desc or not desc.strip():
                             continue
                         deps = [prev_id] if (sequential and prev_id) else None
-                        tid = plan.add_task(desc.strip(), depends_on=deps)
+                        tid = plan.add_task(desc.strip(), depends_on=deps,
+                                            kind=_subtask_kinds.get(desc.strip(), ""))
                         ids.append(tid)
                         pairs.append((tid, desc.strip()))
                         prev_id = tid
             except ValueError as e:
+                if _replan is not None:
+                    # r3: a half-laid new plan beside the intact old one would
+                    # be duplicated by the next replan — take it back
+                    for _nid in ids:
+                        try:
+                            store.delete_task(_nid)
+                        except Exception:  # noqa: BLE001
+                            logger.warning("replan: partial task %s not removed", _nid, exc_info=True)
+                    return _err(f"NOT replanned: {e}. Nothing changed.")
                 return _err(str(e))
             # Stamp explicit constraints onto every subtask created in this
             # call — both the ones passed by the model and the ones the
@@ -4316,6 +4807,33 @@ async def tool_manage_projects(
                                      exc_info=True)
             for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
+            if _replan is not None and ids:
+                # the new plan is down — now the old open tasks go (a subtree
+                # with its root); the project has open work throughout, so it
+                # never rolls up to DONE mid-replan
+                for _rid in _replan["drop_roots"]:
+                    try:
+                        store.delete_task(_rid)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("replan: old task %s not deleted", _rid, exc_info=True)
+                # r1 M2: a kept parent whose open children went is re-judged
+                if _replan["kept_parents"]:
+                    try:
+                        ProjectPlan(store, project_id).recheck_parents(_replan["kept_parents"])
+                    except Exception:  # noqa: BLE001
+                        logger.warning("replan: kept parents not re-checked", exc_info=True)
+                store.log_event(project_id, None, "project_replanned",
+                                {"removed": sorted(_replan["drop_ids"])[:50],
+                                 "removed_count": len(_replan["drop_ids"]),
+                                 "kept_done": _replan["kept"], "added": len(ids)})
+                try:
+                    store.append_ledger(project_id, f"REPLANNED: {len(_replan['drop_ids'])} open task(s) "
+                                                    f"replaced by {len(ids)}, {_replan['kept']} done task(s) kept")
+                except Exception:  # noqa: BLE001
+                    logger.debug("replan ledger line skipped", exc_info=True)
+                _replanned = {"removed_open_tasks": len(_replan["drop_ids"]), "kept_done_tasks": _replan["kept"]}
+            elif _replan is not None:
+                return _err("NOT replanned: no new task was created. Nothing changed.")
             # Persisted-vs-planned transparency (2026-08-01): the model plans
             # N tasks, presents N to the user, but only len(ids) exist. A
             # silent drop here left the agent operating on PHANTOM tasks for
@@ -4335,7 +4853,8 @@ async def tool_manage_projects(
                         "ONLY the tasks in `tasks` to the user."
                     ),
                 }
-            return _ok({"created": ids,
+            return _ok({"awaits_go_ahead": True,      # §4SU Phase 4: a plan for the user — the turn ends
+                        "created": ids,               # here (FIRST key: read from a truncated result)
                         **_dropped_note,
                         # id+description pairs (2026-07-25, req f59a793d):
                         # bare ids made this output unverifiable — the
@@ -4346,10 +4865,12 @@ async def tool_manage_projects(
                         # later turns reference tasks without a task_list
                         # round-trip. `created` keeps its shape (bare ids)
                         # for existing consumers.
-                        "tasks": [{"id": tid, "description": desc}
+                        "tasks": [{"id": tid, "description": desc,
+                                   "kind": (plan.tree.nodes[tid].kind if tid in plan.tree.nodes else "")}
                                   for tid, desc in pairs],
                         "parent_id": target_id,
                         "sequential": bool(sequential),
+                        **({"replanned": _replanned} if _replanned else {}),
                         "constraints": decompose_constraints,
                         "agent_instruction": (
                             f"Plan created with {len(ids)} task(s). STOP here: "
@@ -4398,7 +4919,15 @@ async def tool_manage_projects(
         if act == "task_list":
             if not project_id:
                 return _no_active_project(store)
-            tasks = store.list_tasks(project_id, status_filter=status_filter)
+            # §4SU Phase 3: the five-state view — a filter of WAITING / RUNNING
+            # (or the stored names) and a `state` per task instead of `status`
+            from ..core.task_wait import view_label, view_state
+            _vf = str(status_filter or "").strip().upper()
+            if _vf in ("WAITING", "RUNNING"):
+                tasks = [t for t in store.list_tasks(project_id) if view_state(t)["state"] == _vf]
+            else:
+                tasks = store.list_tasks(project_id, status_filter=(
+                    {"READY": "PENDING"}.get(_vf, status_filter) if status_filter else status_filter))
             # Slim down by default: a 50-task project with full rows
             # easily clears 100KB and triggers context offloading,
             # which the LLM then reads as "something was wrong".
@@ -4406,7 +4935,8 @@ async def tool_manage_projects(
             verbose = bool((metadata or {}).get("verbose"))
             if not verbose:
                 tasks = [
-                    {k: t.get(k) for k in _TASK_LIST_SLIM_FIELDS if k in t}
+                    {**{k: t.get(k) for k in _TASK_LIST_SLIM_FIELDS if k in t and k != "status"},
+                     "state": view_label(t)}
                     for t in tasks
                 ]
             return _ok({"tasks": tasks, "count": len(tasks)})
@@ -5033,6 +5563,31 @@ async def tool_manage_projects(
             _rg = _released_guard(store, _t.get("project_id"))
             if _rg:
                 return _err(_rg)
+            from ..core.planning import _human_gate_reason as _hgr
+            # §4SU r1 C1 / r2 C1-C2: deleting a task removes its whole SUBTREE;
+            # every open HUMAN_GATE in it needs the owner's release — the same
+            # rule as approving it (put to them by an earlier request, their yes now)
+            _pid_t = _t.get("project_id")
+            _all = store.list_tasks(_pid_t) or []
+            _sub, _frontier = {task_id}, [task_id]
+            while _frontier:
+                _cur = _frontier.pop()
+                for _c in _all:
+                    if _c.get("parent_id") == _cur and _c["id"] not in _sub:
+                        _sub.add(_c["id"]); _frontier.append(_c["id"])
+            _gated = [_c for _c in _all if _c["id"] in _sub
+                      and str(_c.get("status") or "").upper() != "DONE"
+                      and _hgr(_c.get("postconditions") or []) is not None]
+            _held = [_c for _c in _gated if not _owner_released(
+                store, _pid_t, _c["id"], context, verbs=(_DELETE_WORD_RE,))]
+            if _held:
+                for _c in _held:
+                    store.log_event(_pid_t, _c["id"], "human_gate_parked",
+                                    _gate_park_payload(f"delete requested: {_hgr(_c.get('postconditions') or [])}"))
+                return _err("NOT deleted: " + "; ".join(
+                    f"task {_c['id']} waits for the owner's approval ({_hgr(_c.get('postconditions') or [])})"
+                    for _c in _held[:3]) + ". Ask the owner now and stop. It goes only when the owner's next message "
+                    "names it by id: \"delete <task id>\" (a plain yes does not).")
             if not store.delete_task(task_id):
                 return _err(f"delete failed for task {task_id}")
             store.log_event(_t.get("project_id"), task_id, "task_deleted",
@@ -5257,16 +5812,25 @@ async def tool_manage_projects(
                                 f"(started {_live} ago; a step is capped at 45 min) — wait for it to finish, "
                                 f"then advance; nothing was started")
                 try:
-                    from ..core.project_advancer import resume_autopilot_metadata
+                    # §4SU Phase 5 (operator 11-02): autopilot is an explicit
+                    # opt-in (action=autopilot enabled=true). The owner's batch
+                    # no longer turns it on (§4MR: one "do the next task" after
+                    # "stop all" restarted unattended work overnight); an ON
+                    # autopilot gets its gates reset, as the owner looked (§4MQ)
                     _prev = (store.get_project(project_id) or {}).get("metadata") or {}
-                    store.update_project(project_id, metadata=resume_autopilot_metadata())   # merges (§4LZ C2); §4MQ: resets the gates
-                    # §4MR: say so — after "stop all" one "do the next task"
-                    # silently restarted unattended work overnight
-                    if not _prev.get("autopilot"):
-                        _why = ((_prev.get("autopilot_paused") or {}).get("reason") or "")
-                        _autopilot_note = ("autopilot is now ON for this project: the idle loop will continue it "
-                                           "between your turns" + (f" (it had paused: {_why})" if _why else "")
-                                           + " — tell the user, and that 'stop autopilot' turns it off")
+                    if _prev.get("autopilot"):
+                        from ..core.project_advancer import resume_autopilot_metadata, _bump_meta
+
+                        def _reset_if_on(m):
+                            # r1: atomic — a "stop all" between the read and the
+                            # write must not be overwritten back to ON
+                            if m.get("autopilot"):
+                                m.update(resume_autopilot_metadata())
+                            return m
+                        _bump_meta(store, project_id, _reset_if_on)
+                    else:
+                        _autopilot_note = ("autopilot stays OFF: only this batch runs. To let the idle loop continue "
+                                           "the project between turns, the user asks for it (action=autopilot enabled=true)")
                 except Exception:  # noqa: BLE001
                     pass
             from ..workspace import pinned_event_project as _pin_evt
@@ -5288,29 +5852,97 @@ async def tool_manage_projects(
             _adv_payload: Dict[str, Any] = {
                 "advanced": batch.advanced,
                 "count": batch.count,
+                "gated": len(getattr(batch, "gated", None) or []),   # §4SR: of count, skipped at a gate
+                "ran": getattr(batch, "ran", batch.count),             # §4SR r4: entries that ran (per entry)
                 "requested": ("all" if max_tasks is None else max_tasks),
                 "stop_reason": batch.stop_reason,
                 "agent_instruction": _advance_batch_instruction(batch, max_tasks),
             }
             if _autopilot_note:
                 _adv_payload["autopilot"] = _autopilot_note
-            if batch.stop_reason == "needs_user":
-                # name what waits, or the model cannot tell the owner (§4LQ F5)
-                try:
-                    _adv_payload["needs_user_tasks"] = [
-                        {"task_id": t["id"], "description": str(t.get("description") or "")[:160],
-                         "result": str(t.get("result_summary") or "")[:200]}
-                        for t in store.list_tasks(project_id)
-                        if str(t.get("status") or "").upper() == "NEEDS_USER"][:10]
-                except Exception:  # noqa: BLE001
-                    logger.debug("needs_user task list skipped", exc_info=True)
+            # §4SU Phase 5: the batch went past model experiment(s) and then
+            # stopped for another reason (a failure) — they still wait for
+            # this turn's probe_model run
+            _exps = [e for e in (getattr(batch, "experiments", None) or [])]
+            if _exps and (batch.stop_reason != "model_experiment" or len(_exps) > 1):
+                _adv_payload["model_experiments"] = _exps[:10]
+                if batch.stop_reason != "model_experiment":
+                    _adv_payload["agent_instruction"] += (
+                        f" Also waiting: model experiment task(s) {', '.join(_exps[:5])} — the batch "
+                        "went past them. Each runs with probe_model as its task says (in this turn only "
+                        "if there is time), closed citing the transcript.")
+                else:
+                    _adv_payload["agent_instruction"] += (
+                        f" The batch went past {len(_exps)} model experiments: {', '.join(_exps[:5])} — "
+                        "the same applies to each.")
+            # name what waits, or the model cannot tell the owner (§4LQ F5) —
+            # on EVERY stop (§4SR): a batch that went past a gate can end as
+            # completed_with_failures, deadline, count_reached… Two kinds
+            # (r1 M3/m1): a GATE waits for the owner's answer; a HOLD
+            # ("not closed unattended": a check, a model experiment) is
+            # picked up by the owner's own autoadvance — asking the user
+            # about it contradicts "do it NOW" on a model_experiment stop.
+            try:
+                _rows = [t for t in store.list_tasks(project_id)
+                         if str(t.get("status") or "").upper() == "NEEDS_USER"]
+
+                def _row(t):
+                    _r = str(t.get("result_summary") or "")
+                    # r3 m6: a hold's reason sits at the END ("— needs a real
+                    # check — not closed unattended"); keep the tail
+                    _r = _r if len(_r) <= 200 else _r[:110] + " … " + _r[-85:]
+                    return {"task_id": t["id"], "description": str(t.get("description") or "")[:160],
+                            "result": _r}
+                # §4SU Phase 3: a hold is wait_on == owner_turn (the field)
+                _gates = [_row(t) for t in _rows if t.get("wait_on") != "owner_turn"][:10]
+                _holds = [_row(t) for t in _rows if t.get("wait_on") == "owner_turn"][:10]
+                if _gates:
+                    _adv_payload["needs_user_tasks"] = _gates
+                    if batch.stop_reason != "needs_user":
+                        _adv_payload["agent_instruction"] += (
+                            " Also waiting on the owner: the task(s) in needs_user_tasks — "
+                            "name them and ask; a request to run all tasks is not their "
+                            "answer.")
+                elif batch.stop_reason == "needs_user":
+                    # only holds wait: nothing for the user to answer. The
+                    # base text is rebuilt, not dropped (tally, no_reload).
+                    from dataclasses import replace as _dc_replace
+                    if _by_owner:
+                        # r2 #2: in the owner's own run a held task is
+                        # pickable, so one still open waits on another task
+                        _adv_payload["agent_instruction"] = _advance_batch_instruction(
+                            _dc_replace(batch, stop_reason="open_but_waiting"), max_tasks) + (
+                            " The open task(s) in held_tasks were held for the owner's own "
+                            "run (see each result): the owner's autoadvance picks one up "
+                            "once nothing it depends on is still open.")
+                    else:
+                        # r3 MAJOR: unattended, they were held BECAUSE no owner
+                        # was there — nothing waits on anything
+                        _adv_payload["agent_instruction"] = _advance_batch_instruction(
+                            _dc_replace(batch, stop_reason="held_unattended"), max_tasks) + (
+                            " They wait for the owner's own run (see each result) — the "
+                            "owner's autoadvance runs them.")
+                if _holds:
+                    _adv_payload["held_tasks"] = _holds
+                    if batch.stop_reason != "model_experiment" and (
+                            batch.stop_reason != "needs_user" or _gates):
+                        _adv_payload["agent_instruction"] += (
+                            " Held for the owner's own run (not a question for the user): "
+                            "the task(s) in held_tasks — the owner's autoadvance picks "
+                            "them up.")
+            except Exception:  # noqa: BLE001
+                logger.debug("needs_user task list skipped", exc_info=True)
             # A failure-shaped stop names the LEDGER's failed tasks, not just
             # this batch's: on an already-FAILED project the batch advanced
             # nothing, so the model otherwise has no ids/reasons to act on
             # (2026-08-01: "project done" was relayed over a FAILED ledger).
+            # §4SR r7: a count/cap stop keeps its reason with a FAILED task
+            # in the batch — still failure-shaped
             if batch.stop_reason in ("project_failed",
                                      "completed_with_failures", "failed",
-                                     "repeated_failures"):
+                                     "repeated_failures") or any(
+                    str(a.get("status", "")).upper() == "FAILED"
+                    for a in (batch.advanced or [])):
                 try:
                     _adv_payload["failed_tasks"] = [
                         {"id": t["id"],
@@ -5342,10 +5974,12 @@ async def tool_manage_projects(
                 # that stopped on a failed project with `advanced == []`
                 # landed nothing, and PARTIAL would tell the model "PART OF
                 # THIS LANDED" over an empty list.
-                _mk = _TO.partial if batch.count else _TO.failed
+                # §4SR r8: `count` includes gate ticks — what RAN decides
+                _ran = getattr(batch, "ran", batch.count)
+                _mk = _TO.partial if _ran else _TO.failed
                 return _mk(
                     _json.dumps(_adv_payload, default=str),
-                    world_changed=bool(batch.count),
+                    world_changed=bool(_ran),
                     reason_code=f"autoadvance_{batch.stop_reason}")
             return _ok(_adv_payload)
 
@@ -5418,7 +6052,8 @@ async def tool_manage_projects(
             root = plan.add_task(root_desc)
             _link_task_in_graph(context, pid, root, root_desc)
             if subtasks:
-                ids = plan.decompose(root, subtasks)
+                ids = plan.decompose(root, subtasks,
+                                     kinds=[_subtask_kinds.get(str(d or "").strip(), "") for d in subtasks])
                 # Pair against the non-blank (stripped) subtasks — decompose
                 # drops blanks, so zip-ing the raw list would misalign.
                 non_blank = [d.strip() for d in subtasks if d and d.strip()]
@@ -5441,112 +6076,104 @@ async def tool_manage_projects(
 
 # ------------------------------------------------------------------ tool def
 
+#: §4SU Phase 4: the actions the MODEL sees (the schema enum). The rest stay
+#: callable (API, tests, an old habit) — none of them is named by a system
+#: message the model reads (every one that is, is here).
+_VISIBLE_ACTIONS = (
+    "create", "switch", "status", "get", "list", "update", "archive", "resume", "delete",
+    "replan", "task_decompose", "task_add", "task_update", "task_delete", "task_list",
+    "autoadvance", "autopilot", "budget", "ledger", "config", "describe_file",
+    "unregister_file", "artifact_list", "research", "release", "create_version",
+    "constraint_retire", "promote_from_context",
+)
+
 MANAGE_PROJECTS_TOOL_DEF = {
     "type": "function",
     "function": {
         "name": "manage_projects",
-        # §4SI (2026-10-30, operator: "let's shrink it"): 13,951 → ~7.4k chars. The
-        # rules kept are the ones that decide behaviour (when to create, pacing,
-        # DONE honesty, the user's yes before release/unrelease/delete, archive vs
-        # delete); per-action detail is one phrase.
+        # §4SU Phase 4 (audit: 8.7k chars, 40 actions, 17 never used, 41
+        # params, 15 never passed): the rules that decide behaviour, one phrase
+        # per action, and only the visible actions' parameters.
         "description": (
-            "Long-term projects (coding or general) with task trees that survive across sessions. "
-            "GATING for `create`: only when the user EXPLICITLY asks to start/track a project, or the "
-            "deliverable spans MULTIPLE files/modules AND needs MULTIPLE turns. A SINGLE-FILE deliverable "
-            "(even a large one — a one-file browser OS, game, script) is a one-shot: write it with "
-            "file_system, do NOT create a project for it. Past similar projects in memory are NOT a reason "
-            "to create one. Never create twice for one effort — if DYNAMIC SYSTEM STATE shows a CURRENT "
-            "PROJECT, work on it. "
-            "PACING: after create/decompose, present the plan and STOP; advance ONE task per user go-ahead. "
-            "A task is DONE only when its work is really complete (task_add makes PENDING tasks — 'Added' "
-            "does NOT mean 'Done'). "
-            "release, unrelease and delete first return a PREVIEW + confirm_token: ask the user, repeat "
-            "with the token only after they say yes. delete erases the project AND its files for good — "
-            "prefer archive (reversible) unless the user clearly means erase. autopilot and budget only "
-            "on the user's request. "
-            "Actions: create · switch · resume · exit · status · get · list · update · archive · delete · "
-            "clone (project_id = the SOURCE id, title = the NEW name; copies its files, settings and constraints, no "
-            "lineage) · promote_from_context (only after the "
-            "user accepted turning this chat into a project) · task_decompose (subtasks=[…]; with task_id "
-            "= break that task down; use it for any LIST of 2+ tasks) · task_add (ONE task) · task_next · "
+            "Long-term projects (coding or general): a task tree that survives across sessions. "
+            "CREATE only when the user explicitly asks to start/track a project, or the work spans "
+            "MULTIPLE files AND multiple turns — a SINGLE-FILE deliverable (even a large one) is written "
+            "with file_system, no project. Past similar projects in memory are NOT a reason to create one. Never create twice: if a CURRENT PROJECT is shown, work on it "
+            "(replan for a new plan of the same project). "
+            "PACING: after create / task_decompose / replan, present the plan and STOP; one task per "
+            "go-ahead; autoadvance count=N only when the user asks for several. "
+            "A task is DONE only when its work is really complete; a refused close comes back in "
+            "`refused` with the fix. "
+            "release and delete return a PREVIEW + confirm_token: ask the user, repeat with the token only "
+            "after their yes. Prefer archive (reversible) to delete. autopilot and budget only on the "
+            "user's request. "
+            "Actions: create · switch · status · get · list · update · archive · resume · delete · "
+            "replan (subtasks = the NEW plan; keeps done tasks, their files and the research) · "
+            "task_decompose (subtasks=[…]; task_id = break that task down; ANY list of 2+ tasks goes here in ONE call, not N task_add) · task_add (one task) · "
             "task_update (task_ids=[…] for many) · task_delete · task_list · autoadvance (count) · "
-            "autopilot (enabled) · budget (metadata={steps_cap, runtime_cap_hours, checkpoint_every}) · "
-            "ledger · config · constraint_retire (a requirement the user dropped or that is met) · research (topic/topics; omit both to derive from the "
-            "goal) · research_list · artifact_add · artifact_list · describe_file (call when you create "
-            "or work out a file) · file_history (check BEFORE re-reading a large file to see what changed) · "
-            "unregister_file · cleanup (debris only, on request) · search (which project did X) · "
-            "set_dependency · release (DONE→RELEASED, only when the USER confirms it works; pass "
-            "directions) · create_version (change a RELEASED project: forks v(n+1); description = the "
-            "requested change) · unrelease · "
-            "verify_release (does a released app still run) · event_log."
+            "autopilot (enabled) · budget · ledger · config · describe_file (when you create or work out a "
+            "file) · unregister_file · artifact_list · research (topic/topics) · release (DONE→RELEASED "
+            "when the USER confirms it works; directions) · create_version (change a RELEASED project) · "
+            "constraint_retire · promote_from_context (after the user accepted the offer)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": sorted(_ACTIONS)},
-                "title": {"type": "string", "description": "Project title (create, clone, promote_from_context)."},
+                "action": {"type": "string", "enum": list(_VISIBLE_ACTIONS)},
+                "title": {"type": "string"},
                 "kind": {"type": "string", "enum": ["CODING", "GENERAL"]},
-                "goal": {"type": "string", "description": "One-sentence goal."},
-                "metadata": {"type": "object", "description": "Free-form project metadata; budget's caps."},
-                "project_id": {"type": "string", "description": "Target project (omit = current; 'all' for autopilot off)."},
-                "task_id": {"type": "string", "description": "ONE bare task id, e.g. 'eed65da9a1e4' (never a bracketed list)."},
-                "task_ids": {"type": "array", "items": {"type": "string"},
-                             "description": "Several task ids (batch task_update), as a JSON array."},
-                "parent_id": {"type": "string", "description": "Parent task id for a subtask."},
+                "goal": {"type": "string"},
+                "metadata": {"type": "object", "description": "update: project fields; budget: its caps."},
+                "project_id": {"type": "string", "description": "Omit for the current project."},
+                "task_id": {"type": "string", "description": "ONE bare task id."},
+                "task_ids": {"type": "array", "items": {"type": "string"}},
+                "parent_id": {"type": "string"},
                 "description": {"type": "string",
-                                "description": "Task description; for describe_file the one-line 'what this file does' (required)."},
-                "status": {"type": "string",
-                           "enum": ["PENDING", "READY", "IN_PROGRESS", "DONE",
-                                    "FAILED", "BLOCKED", "PAUSED", "NEEDS_USER"]},
-                "dependency_type": {"type": "string", "enum": ["ALL", "ANY", "BEST"]},
-                "alternatives": {"type": "array", "items": {"type": "string"}},
+                                "description": "Task description; describe_file: what the file does."},
+                "status": {"type": "string", "enum": ["PENDING", "DONE", "FAILED", "WAITING"],
+                           "description": "task_update (WAITING = for the user)."},
                 "postconditions": {"type": "array", "items": {"type": "string"}},
                 "constraints": {"type": "array", "items": {"type": "string"},
-                                "description": "The user's explicit requirements/prohibitions, quoted near-verbatim "
-                                               "(incl. what YOU must do); they gate DONE."},
+                                "description": "The user's explicit requirements, near-verbatim; they gate DONE."},
                 "depends_on": {"type": "array", "items": {"type": "string"},
-                               "description": "task_add: sibling task ids that must be DONE first; set_dependency: projects."},
-                "sequential": {"type": "boolean", "description": "task_decompose: run the subtasks in order."},
-                "topic": {"type": "string", "description": "research: one topic (saved as research/<slug>.md)."},
-                "topics": {"type": "array", "items": {"type": "string"}, "description": "research: several topics."},
-                "max_topics": {"type": "integer", "description": "research: cap on derived topics (default 5)."},
-                "result": {"type": "string", "description": "task_update DONE: short result summary."},
+                               "description": "task_add: task ids that must be DONE first."},
+                "sequential": {"type": "boolean"},
+                "topic": {"type": "string"},
+                "topics": {"type": "array", "items": {"type": "string"}},
+                "result": {"type": "string", "description": "task_update DONE: what was done / shown."},
+                "override": {"type": "object", "additionalProperties": {"type": "string"},
+                             "description": "task_update DONE: {gate: reason} for a refused gate that may be "
+                                            "waived (model_run, postconditions, constraints); recorded."},
                 "failure_reason": {"type": "string"},
-                "subtasks": {"type": "array", "items": {"type": "string"},
-                             "description": "Ordered task descriptions; each owns one file or a bounded module "
-                                            "you can build and verify alone (do not split one file into N tasks)."},
-                "artifact_kind": {"type": "string", "enum": ["file", "url", "note", "tool_call"]},
-                "payload": {"type": "string",
-                            "description": "artifact_add: the body/path; constraint_retire: the constraint's text, "
-                                           "index or 'all'."},
+                "subtasks": {"type": "array",
+                             "items": {"anyOf": [
+                                 {"type": "string"},
+                                 {"type": "object", "properties": {
+                                     "description": {"type": "string"},
+                                     "kind": {"type": "string", "enum": ["build", "write", "research", "model_run", "owner"]},
+                                     "deliverable": {"type": "string"}},
+                                  "required": ["description"]}]},
+                             "description": "Ordered tasks, each one file or a bounded module (never split the same file into N tasks). Objects "
+                                            "{description, kind, deliverable}: kind = build | write (a document) | "
+                                            "research | model_run (a model must answer: probe_model) | owner (only "
+                                            "the user can); deliverable = the file it produces."},
+                "task_kind": {"type": "string", "enum": ["build", "write", "research", "model_run", "owner", "none"]},
+                "payload": {"type": "string", "description": "constraint_retire: the constraint, its index or 'all'."},
                 "deliverables": {"type": "array", "items": {"type": "string"},
-                                 "description": "task_update DONE: project-relative paths to KEEP — every other file "
-                                                "in the workspace is deleted when the project finishes."},
+                                 "description": "task_update DONE: files to KEEP when the project finishes."},
                 "status_filter": {"type": "string"},
-                "limit": {"type": "integer"},
-                "event_type": {"type": "string"},
-                "context_summary": {"type": "string", "description": "promote_from_context: snapshot of the chat."},
-                "confirm_token": {"type": "string",
-                                  "description": "release/unrelease/delete: the preview's token — only after the user's yes."},
-                "enabled": {"type": "boolean", "description": "autopilot: true/false; omit to report."},
-                "count": {"type": "string",
-                          "description": "autoadvance: '3' or 'all' — ONLY for an explicit multi-task ask; a single "
-                                         "'proceed' you do yourself as one full turn."},
+                "context_summary": {"type": "string", "description": "promote_from_context: the chat's gist."},
+                "confirm_token": {"type": "string", "description": "release/delete: only after the user's yes."},
+                "enabled": {"type": "boolean"},
+                "count": {"type": "string", "description": "autoadvance: '3' or 'all'."},
                 "ledger": {"type": "string",
-                           "description": "ledger: one durable fact (layout, API name, convention), shown in the briefing "
-                                          "every turn; omit to read. Also accepted on task_update DONE."},
-                "config_key": {"type": "string",
-                               "description": "config: one durable setting (env var, port, version); omit key+value "
-                                              "to read, empty value deletes."},
-                "config_value": {"type": "string", "description": "config: the value."},
-                "file_path": {"type": "string",
-                              "description": "describe_file/file_history/unregister_file: project-relative path "
-                                             "(unregister after a rename/delete)."},
-                "file_role": {"type": "string", "description": "describe_file: role tag, e.g. 'entrypoint'."},
-                "query": {"type": "string", "description": "search: what to find across all projects."},
+                           "description": "One durable fact (layout, API name), shown in the briefing every turn; omit to read."},
+                "config_key": {"type": "string"},
+                "config_value": {"type": "string"},
+                "file_path": {"type": "string"},
+                "file_role": {"type": "string"},
                 "directions": {"type": "string",
-                               "description": "release (required): the user's runbook, second person, ≥2 sentences; "
-                                              "the tool adds the verified commands/ports."},
+                               "description": "release: the user's runbook, second person, ≥2 sentences."},
             },
             "required": ["action"],
         },

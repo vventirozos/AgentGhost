@@ -263,7 +263,7 @@ def test_all_parent_completes_via_alternative():
 
     tree.update_status(a, TaskStatus.FAILED, failure_reason="boom")
     assert tree.nodes[parent].status not in (TaskStatus.BLOCKED, TaskStatus.FAILED)
-    assert tree.nodes[alt].status == TaskStatus.READY
+    assert tree.nodes[alt].status == TaskStatus.PENDING
 
     tree.update_status(alt, TaskStatus.DONE, result="fallback worked")
     assert tree.nodes[parent].status == TaskStatus.DONE

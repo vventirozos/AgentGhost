@@ -80,7 +80,7 @@ class TestPlanningEvals:
         tree.nodes[root].alternatives = [fallback]
         tree.update_status(primary, TaskStatus.DONE, result="HTTP 500 Server Error")
         assert tree.nodes[primary].status == TaskStatus.FAILED
-        assert tree.nodes[fallback].status == TaskStatus.READY
+        assert tree.nodes[fallback].status == TaskStatus.PENDING
 
 
 # ──────────────────────────────────────────────────── THINKING BUDGET

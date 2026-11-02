@@ -160,7 +160,162 @@ AUTH_HEADERS = {"X-Ghost-Key": GHOST_API_KEY} if GHOST_API_KEY else {}
 DEFAULT_AGENT_LOG = "/Users/vasilis/Data/AI/Logs/ghost-agent.log"
 LOG_FILE_PATH = os.environ.get("GHOST_AGENT_LOG", DEFAULT_AGENT_LOG)
 
-MAINTENANCE_MODE = False
+# ---------------------------------------------------------------------------
+# Maintenance mode (2026-11-01, operator). The state is ONE FILE: while it
+# exists, nothing is sent to the agent — mentions, DMs (the owner's too),
+# file uploads, reaction feedback — and each message gets the maintenance
+# reply instead. Its text (if any) IS the reply. Read on every event, so
+# `touch` / `rm` take effect at once, with no restart, and survive restarts.
+# The owner toggles it from a DM too (`maintenance on|off|status`, answered
+# here, never sent to the agent). The notification poller keeps running.
+# Explicitly EMPTY path disables the mode entirely (it can never turn on).
+# ---------------------------------------------------------------------------
+MAINTENANCE_FILE = os.environ.get(
+    "GHOST_SLACK_MAINTENANCE_FILE",
+    "/Users/vasilis/Data/AI/Logs/ghost-slack-maintenance")
+MAINTENANCE_DEFAULT_TEXT = ("🔧 The agent is down for maintenance — "
+                            "please try again later.")
+_MAINTENANCE_TEXT_MAX = 1500
+
+
+def maintenance_text() -> str | None:
+    """The maintenance reply while maintenance is ON, else None.
+
+    ON = the file exists. An empty file gives the default text. A file that
+    exists but cannot be read (permissions, a directory) still means ON —
+    the operator asked for maintenance; failing open would send traffic to
+    an agent that may be down."""
+    if not MAINTENANCE_FILE:
+        return None
+    try:
+        with open(MAINTENANCE_FILE, encoding="utf-8", errors="replace") as fh:
+            body = fh.read(_MAINTENANCE_TEXT_MAX).strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.warning("maintenance file %s exists but is unreadable (%s) — "
+                       "maintenance stays ON", MAINTENANCE_FILE, e)
+        return MAINTENANCE_DEFAULT_TEXT
+    return body or MAINTENANCE_DEFAULT_TEXT
+
+
+def set_maintenance(on: bool, text: str = "") -> None:
+    """Turn maintenance on (writing ``text`` as the reply, atomically) or off.
+    Raises OSError when the file cannot be written/removed, or when the mode
+    is disabled (empty path) — the caller tells the owner."""
+    if not MAINTENANCE_FILE:
+        raise OSError("maintenance mode is disabled (GHOST_SLACK_MAINTENANCE_FILE is empty)")
+    if not on:
+        try:
+            os.remove(MAINTENANCE_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    d = os.path.dirname(MAINTENANCE_FILE) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = f"{MAINTENANCE_FILE}.tmp-{os.getpid()}"
+    try:
+        # errors="replace": a lone surrogate in Slack text must not raise
+        # past the OSError handling below (r2)
+        with open(tmp, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(str(text or "").strip()[:_MAINTENANCE_TEXT_MAX])
+        os.replace(tmp, MAINTENANCE_FILE)
+    except OSError:
+        try:                     # r1: a failed write left its temp file behind
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# `maintenance on`, `maintenance on: <reply text>`, `maintenance on - <reply
+# text>`, `maintenance off`, `maintenance status` — the WHOLE message, ONE line,
+# case-insensitive. The text after "on" needs a colon, or a dash with spaces
+# or tabs on BOTH sides, so an ordinary request that starts with the word is
+# never taken as the command: "maintenance on my car is due…", (r1 MAJOR)
+# "maintenance on-call rota…", and (r2) a multi-line note headed
+# "maintenance on" with a "- item" list under it. Only `status` takes a "?"
+# ("maintenance on?" is a question, not an order). Trailing "." / "!" and a
+# Slack *bold* / `code` / _italic_ wrapping of the whole message are fine.
+# r2 MAJOR: the regex this replaces backtracked cubically on a long run of
+# spaces (51 s at 4k chars, blocking the event loop) — plain string steps now.
+_MAINTENANCE_SPACE = " \t"
+
+
+def parse_maintenance_command(text: str):
+    """(verb, reply text) for an owner maintenance command, else None."""
+    t = str(text or "").strip()
+    # r3: only a SINGLE wrap — the character must not occur inside
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "*_`" and t[0] not in t[1:-1]:
+        t = t[1:-1].strip()
+    # r3: splitlines also catches \u2028, \x0b, \x85 …, not only \n / \r
+    if len(t.splitlines()) != 1 or not t.lower().startswith("maintenance"):
+        return None
+    rest = t[len("maintenance"):]
+    if not rest[:1] or rest[0] not in _MAINTENANCE_SPACE:
+        return None
+    rest = rest.lstrip(_MAINTENANCE_SPACE)
+    low = rest.lower()
+    if low.rstrip(".!") == "off":
+        return "off", ""
+    if low.rstrip(".!?") == "status":
+        return "status", ""
+    if not low.startswith("on"):
+        return None
+    after = rest[2:]
+    if after.rstrip(".!") == "":
+        return "on", ""
+    lead = after.lstrip(_MAINTENANCE_SPACE)
+    # r3: the colon right after "on" — "maintenance on :)" is a smiley
+    if after.startswith(":"):
+        return "on", after[1:].strip(_MAINTENANCE_SPACE)
+    if (after[0] in _MAINTENANCE_SPACE and lead[:1] in ("-", "—", "–")
+            and lead[1:2] and lead[1] in _MAINTENANCE_SPACE):
+        # never empty: t was stripped, so a non-space follows that space
+        return "on", lead[1:].strip(_MAINTENANCE_SPACE)
+    return None
+
+
+def _maintenance_reply(text: str) -> str:
+    """The operator's text as Slack shows it: escaped, so it can never ping
+    a channel or a person (`<!channel>`, `<@U…>`)."""
+    return _slack_escape(text)
+
+
+def apply_maintenance_flag(value) -> None:
+    """The `--maintenance on|off` start flag: writes / removes the file.
+    Omitted (None) leaves the file exactly as it is — a restart must never
+    end (or start) a maintenance the operator set."""
+    if not value:
+        return
+    try:
+        set_maintenance(value == "on")
+    except OSError as e:
+        logger.error("--maintenance %s failed: %s", value, e)
+
+
+async def handle_maintenance_command(cmd, say, thread_ts=None) -> None:
+    """Answer an owner maintenance command here — it never reaches the agent."""
+    verb, text = cmd
+    try:
+        if verb == "on":
+            set_maintenance(True, text)
+            msg = ("🔧 Maintenance mode is ON — nothing reaches the agent; everyone "
+                   "(you too) gets: " + _maintenance_reply(maintenance_text() or "")
+                   + "\nSend `maintenance off` to end it.")
+            logger.info("maintenance ON (owner DM)%s", f" — {text[:80]!r}" if text else "")
+        elif verb == "off":
+            set_maintenance(False)
+            msg = "✅ Maintenance mode is OFF — messages go to the agent again."
+            logger.info("maintenance OFF (owner DM)")
+        else:
+            cur = maintenance_text()
+            msg = (("🔧 Maintenance mode is ON. Reply: " + _maintenance_reply(cur))
+                   if cur else "✅ Maintenance mode is OFF.")
+    except OSError as e:
+        logger.error("maintenance %s failed: %s", verb, e)
+        msg = f"⚠️ Could not turn maintenance {verb}: {_slack_escape(e)}"
+    await say(text=msg, thread_ts=thread_ts)
 
 
 def _env_flag(name: str, default: str) -> bool:
@@ -1470,9 +1625,10 @@ async def handle_mention(event, say, body=None):
         return
 
     thread_ts = event.get("thread_ts") or event.get("ts")
-    if MAINTENANCE_MODE:
-        await say(text="The agent is currently down for maintenance.",
-                  thread_ts=thread_ts)
+    _maint = maintenance_text()
+    if _maint:
+        logger.info("maintenance: mention from %s not sent to the agent", event.get("user"))
+        await say(text=_maintenance_reply(_maint), thread_ts=thread_ts)
         return
 
     user_text = slack_to_plain(re.sub(r"<@.*?>", "", event.get("text", ""))).strip()
@@ -1521,9 +1677,17 @@ async def handle_direct_message(event, say, body=None):
         return
 
     thread_ts = event.get("thread_ts")
-    if MAINTENANCE_MODE:
-        await say(text="The agent is currently down for maintenance.",
-                  thread_ts=thread_ts)
+    # the owner's maintenance commands are answered here, never sent to the
+    # agent — and they must work WHILE maintenance is on (or it could not be
+    # turned off from Slack)
+    _cmd = parse_maintenance_command(user_text) if not event.get("files") else None
+    if _cmd:
+        await handle_maintenance_command(_cmd, say, thread_ts)
+        return
+    _maint = maintenance_text()
+    if _maint:
+        logger.info("maintenance: DM not sent to the agent")
+        await say(text=_maintenance_reply(_maint), thread_ts=thread_ts)
         return
 
     fetch_ts = thread_ts or event.get("ts")
@@ -1590,6 +1754,12 @@ async def handle_reaction(event, say=None):
             logger.info(
                 "ignored %s reaction from non-party user=%s on req %s",
                 signal, reactor, entry.get("req_id"))
+            return
+        if maintenance_text():
+            # nothing reaches the agent in maintenance; reactions are not
+            # replayed, so the label is dropped — said in the log
+            logger.warning("maintenance: %s reaction by %s on req %s NOT sent to the agent "
+                           "(label dropped)", signal, reactor, entry.get("req_id"))
             return
         payload = build_feedback_payload(
             entry, signal, reactor, OWNER_ID,
@@ -1826,20 +1996,22 @@ async def notification_poller(channel: str):
 
 
 async def main():
-    global LOG_FILE_PATH, MAINTENANCE_MODE, OWNER_ID, OPEN_CHANNEL, \
-        _poller_task
+    global LOG_FILE_PATH, OWNER_ID, OPEN_CHANNEL, _poller_task
     parser = argparse.ArgumentParser(description="Ghost Agent Slack Bot (owner-locked)")
     parser.add_argument("--log-file", type=str, default=LOG_FILE_PATH,
                         help="Agent pretty-log stream to tail for live status "
                              "(env GHOST_AGENT_LOG)")
     parser.add_argument("--maintenance", type=str, choices=["on", "off"],
-                        default="off", help="Enable or disable maintenance mode")
+                        default=None,
+                        help="Turn maintenance mode on/off at startup (writes/removes "
+                             "the maintenance file; omitted = leave it as it is)")
     args = parser.parse_args()
 
     LOG_FILE_PATH = args.log_file
-    if args.maintenance == "on":
-        MAINTENANCE_MODE = True
-        logger.info("Maintenance mode ENABLED. The bot will not process queries.")
+    apply_maintenance_flag(args.maintenance)
+    if maintenance_text():
+        logger.info("Maintenance mode is ON (%s exists) — nothing is sent to the agent; "
+                    "DM `maintenance off` or remove the file to end it", MAINTENANCE_FILE)
 
     # Fail-closed owner lock: refuse to start unlocked.
     OWNER_ID = await resolve_owner_id()

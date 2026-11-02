@@ -152,13 +152,32 @@ def run_ids(ids, timeout=1500):
 # ── parallel trees ───────────────────────────────────────────────────────────
 #: what a tree must carry (memory: battery-tree-must-carry-every-pinned-dir — a missing dir a pin
 #: reads killed the no-op control and every mutant with it); `.env` is NEVER copied (Slack tokens)
-TREE_ITEMS = ["src", "tests", "scripts", "interface", "docs", "pytest.ini", "requirements.txt"]
+#: §4SP: + sandbox (tests read sandbox/Dockerfile — its absence killed the no-op on whole-file
+#: selections), bin, README.md (test_docs_site)
+TREE_ITEMS = ["src", "tests", "scripts", "interface", "docs", "sandbox", "bin", "README.md",
+              "pytest.ini", "requirements.txt",
+              "PROJECT_JOURNAL.md"]   # §4ST: test_cognitive_redesign_doc reads it — killed the no-op
+#: §4ST: tests of the REAL install (ROOT/../bin/ghost → this repo); a tree can never satisfy them,
+#: so a file-level selection carrying them killed every no-op control
+TREE_DESELECT = ["tests/test_ghost_cli.py::TestLocation::test_bin_symlink_points_into_repo"]
 
 
 def make_trees(n, log=print):
     """n fresh copies of the working tree under .battery_cov/tree-<i>. The real src/ is never
     mutated, so editing it while a battery runs is safe (the battery judges the snapshot)."""
     trees = []
+    # §4SP: tests read the launcher and CLI at ROOT/../bin (test_4sd_no_ceiling_budget); from a
+    # tree that is CACHE/bin — a symlink to the REAL ../bin (writable: no test may write there; the
+    # current readers only read/grep). A broken or wrong link is replaced; two batteries starting
+    # together may race on creating it (r3).
+    _bin, _real_bin = os.path.join(CACHE, "bin"), os.path.join(os.path.dirname(ROOT), "bin")
+    if os.path.isdir(_real_bin) and os.path.realpath(_bin) != os.path.realpath(_real_bin):
+        try:
+            if os.path.islink(_bin):
+                os.remove(_bin)
+            os.symlink(_real_bin, _bin)
+        except FileExistsError:
+            pass
     for i in range(n):
         t = os.path.join(CACHE, f"tree-{i}")
         os.makedirs(t, exist_ok=True)
@@ -183,7 +202,8 @@ def run_in_tree(tree, targets, *, xdist_over=60, timeout=1500):
     par = ["-n", "2", "--dist", "loadfile"] if len(targets) > xdist_over else []
     try:
         r = subprocess.run([PY, "-m", "pytest", f"@{argf}", "-q", "--no-header", "-p", "no:cacheprovider",
-                            "-x", *par], capture_output=True, text=True, env=_tree_env(), cwd=tree, timeout=timeout)
+                            "-x", *par, *[f"--deselect={d}" for d in TREE_DESELECT]],
+                           capture_output=True, text=True, env=_tree_env(), cwd=tree, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 1, "TIMEOUT (a mutant wedged the run — counted as killed)"
     finally:
@@ -194,7 +214,9 @@ def run_in_tree(tree, targets, *, xdist_over=60, timeout=1500):
     tail = (r.stdout.strip().splitlines() or ["?"])[-1]
     if r.returncode in (4, 5):
         return 99, f"HARNESS: pytest exit {r.returncode} — {tail}"
-    return r.returncode, tail
+    # §4ST: name the first failing test (a dying no-op control was undiagnosable)
+    _first = next((ln for ln in r.stdout.splitlines() if ln.startswith(("FAILED ", "ERROR "))), "")
+    return r.returncode, (f"{tail} | {_first[:160]}" if _first else tail)
 
 
 def run_parallel(batch, originals, select, *, workers=6, log=print):

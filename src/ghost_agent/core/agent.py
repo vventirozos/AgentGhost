@@ -9808,6 +9808,56 @@ _ACTION_PROMISE_RE = re.compile(
 )
 
 
+def _awaits_new_message_confirm(rows) -> bool:
+    """True when the request's LATEST tool row is a refusal that tells the
+    model to ask the user to confirm in a new message (§4SP, req a62cf750).
+    The trailing-promise guard then lets a "reply yes and I'll do it" ending
+    stand: its "DO it NOW" only re-sent the refused call.
+
+    Review r1 MAJOR: matching ANY row of the request silenced the guard for
+    the rest of it after one early refusal, and `untrusted_content` also
+    covers the usual owner-fact refusal (remember/update_profile: "they will
+    say so"), which asks for no new message. So: the latest row only, and
+    one of the refusal's own instructions (``provenance.NEW_MESSAGE_ASKS`` —
+    the system's text, not the model's; r2: the mid-turn owner-fact refusal
+    asks for a resend in a new message and counts)."""
+    from ..utils.provenance import NEW_MESSAGE_ASKS
+    try:
+        last = (rows or [])[-1]
+        content = last.get("content")
+    except (IndexError, AttributeError, TypeError):
+        return False
+    text = str(content)
+    if (getattr(content, "reason_code", None) == "untrusted_content"
+            and any(ask in text for ask in NEW_MESSAGE_ASKS)):
+        return True
+    return _awaits_owner_go_ahead(last)
+
+
+def _awaits_owner_go_ahead(row) -> bool:
+    """§4SU Phase 4 (audit: 7 of 11 project delete previews looped; every
+    create paid 60–80 s for "say proceed and I'll start"): the latest row is a
+    manage_projects result that hands the decision to the user — a
+    release/unrelease/delete PREVIEW (``confirmation_needed``), its "already
+    previewed — STOP" refusal, or a plan just presented (``awaits_go_ahead``:
+    create / task_decompose). "Reply yes and I'll …" is then the right ending.
+    The keys are the tool's own output, not the model's text."""
+    try:
+        if str(row.get("name") or "") != "manage_projects":
+            return False
+        content = row.get("content")
+    except AttributeError:
+        return False
+    if getattr(content, "reason_code", None) == "confirm_dead_end":
+        return True
+    raw = str(getattr(content, "text", None) or content or "").lstrip()
+    if raw.startswith("OK:"):
+        raw = raw[3:].lstrip()
+    # the FIRST key of the payload (a long create result is truncated before
+    # it is stored; a key quoted inside a field is escaped, never first)
+    return raw.startswith(('{"confirmation_needed": true', '{"awaits_go_ahead": true'))
+
+
 def _ends_with_action_promise(text) -> str:
     """Return the final sentence of ``text`` when it promises imminent
     action, else "". Only the LAST sentence counts — promises earlier in a
@@ -10262,14 +10312,75 @@ def _salvage_vision_args(block: str) -> dict:
     return out if out.get("target") else {}
 
 
-def _drop_missing_download_links(text, sandbox_root) -> tuple:
+def _fresh_removal_marks(context) -> Optional[dict]:
+    """{project id (casefolded): deleted rels (casefolded) | None = whole
+    tree} for workspace removals within `_REMOVAL_MARK_FRESH_WINDOW_S` —
+    `workspace_cleanup._mark_removal`'s record. None when there is none or
+    it is unreadable. Never raises."""
+    try:
+        marks = getattr(getattr(context, "project_store", None),
+                        "recent_workspace_removals", None)
+        if not isinstance(marks, dict):
+            return None
+        return {k: v[1] for k, v in marks.items()
+                if (time.time() - float(v[0])) < _REMOVAL_MARK_FRESH_WINDOW_S}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _link_was_swept(name, swept) -> bool:
+    """§4SS: was the file a `/api/download/projects/<pid>/<rel>` link names
+    removed by a fresh workspace sweep of that project? Only an exact rel on
+    the deleted list counts: a whole-tree mark (None) is the owner's project
+    DELETE, not the cleanup, and says nothing about whether this file ever
+    existed (review). Never raises."""
+    if not swept or not isinstance(name, str):
+        return False
+    try:
+        from urllib.parse import unquote as _uq
+        for raw in (name, name.split("|", 1)[0].rstrip(".,;:!?`*'\"")):
+            r = _uq(raw.split("?", 1)[0].split("#", 1)[0]).lstrip("/")
+            parts = r.split("/", 2)
+            if len(parts) < 3 or parts[0] != "projects":
+                continue
+            key = parts[1].casefold()
+            if key not in swept:
+                continue
+            rels = swept[key]
+            if rels is not None and parts[2].casefold() in rels:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _streamed_missing_link_note(missing, swept) -> str:
+    """The note after a STREAMED reply whose links point to missing files
+    (§4ME F1 — a delivered link cannot be taken back). §4SS: a file a fresh
+    project sweep removed was created; say so instead of "NOT created"."""
+    gone = [n for n in missing if _link_was_swept(n, swept)]
+    never = [n for n in missing if n not in gone]
+    note = ""
+    if never:
+        note += ("\n\n⚠️ The link(s) above to " + ", ".join(f"`{n}`" for n in never[:3])
+                 + " point to file(s) that do not exist — they were NOT created.")
+    if gone:
+        note += ("\n\n⚠️ The link(s) above to " + ", ".join(f"`{n}`" for n in gone[:3])
+                 + " no longer work — the project's cleanup deleted the file(s) "
+                   "after they were created.")
+    return note
+
+
+def _drop_missing_download_links(text, sandbox_root, swept=None) -> tuple:
     """(text, dropped names): every `/api/download/<rel>` link (markdown
     image, markdown link or bare path) whose file does not exist — not at
     `<rel>` under the sandbox, and (lenient) no file of that NAME anywhere in
     it — is replaced with a plain notice. A live reply (08-21, req 654f4b01)
     embedded `![generated image](/api/download/gen_d7f2a1b3.png)` and
     described it, in a turn that generated nothing (§4LM). Lenient by
-    design: a real file is never unlinked. Never raises."""
+    design: a real file is never unlinked. `swept` (`_fresh_removal_marks`)
+    turns the notice for a file a project sweep just removed into "removed
+    by the cleanup" instead of "not created" (§4SS). Never raises."""
     if not isinstance(text, str) or "/api/download/" not in text or sandbox_root is None:
         return text, []
     try:
@@ -10342,6 +10453,12 @@ def _drop_missing_download_links(text, sandbox_root) -> tuple:
         dropped.append(name)
         # a bare path's match can swallow the `)` that closes the sentence
         tail = ")" if (m.group(1) is None and m.group(0).endswith(")")) else ""
+        if _link_was_swept(name, swept):
+            # §4SS: req b45ec99f's reply said "[no such file: report.pdf — it
+            # was not created] (81 KB)" — the file WAS created; the DONE
+            # sweep removed it 40 s later. Say what really happened.
+            return (f"[file removed: {os.path.basename(name)} — the project's "
+                    f"cleanup deleted it after it was created]{tail}")
         return f"[no such file: {os.path.basename(name)} — it was not created]{tail}"
     try:
         out = _DOWNLOAD_LINK_RE.sub(_sub, text)
@@ -13917,40 +14034,14 @@ class GhostAgent:
                                 return f"ERROR: tool {name} unavailable"
                             return await handler(**targs)
 
-                        async def _aa_classify(description):
-                            # LLM router for autonomous tasks. The keyword
-                            # bucket classifier (project_advancer.classify_task)
-                            # mislabels anything without an exact keyword —
-                            # "Design the schema" has none, so it defaulted to
-                            # research/web_search. Ask the model for the bucket
-                            # and fall back to the heuristic on any failure.
-                            from .project_advancer import classify_task as _kw
-                            try:
-                                # One-word bucket classification: the cheapest
-                                # possible LLM call, with a keyword fallback
-                                # right below if it fails. Offloaded to the
-                                # worker pool (2026-07-11) so it never occupies
-                                # the single 35B slot; falls back to the main
-                                # node when no worker node is configured.
-                                _r = await ctx.llm_client.chat_completion({
-                                    "model": getattr(ctx.args, 'model', 'default'),
-                                    "messages": [{"role": "user", "content": (
-                                        "Classify this task into EXACTLY one word: "
-                                        "'coding' (writes/runs code), 'research' "
-                                        "(reads/searches/summarizes), or 'needs_user' "
-                                        "(requires a human decision/approval/publish). "
-                                        "Output ONLY the one word.\n\nTASK: "
-                                        + str(description)[:500])}],
-                                    "temperature": 0.0, "max_tokens": 8, "stream": False,
-                                }, use_worker=True, is_background=True, off_main_only=True, timeout=30.0, task_label="classifier")  # §4O A-MAJOR-2
-                                out = ((_r or {}).get("choices", [{}])[0]
-                                       .get("message", {}).get("content", "") or "").strip().lower()
-                                for label in ("needs_user", "coding", "research"):
-                                    if label in out:
-                                        return label
-                            except Exception as _ce:
-                                _idle_phase_failed(self, _idle_ran, "autoadvance", _ce)
-                            return _kw(description)
+                        # §4SR: the ONE classifier the tool path uses too
+                        # (worker, thinking off, keyword fallback) — this
+                        # inline copy had drifted from it in everything but
+                        # the prompt words
+                        from .project_advancer import default_llm_classifier as _dlc
+                        _aa_classify = _dlc(
+                            ctx, background=True,
+                            on_error=lambda _ce: _idle_phase_failed(self, _idle_ran, "autoadvance", _ce))
 
                         async def _aa_code_gen(description):
                             _r = await ctx.llm_client.chat_completion({
@@ -18580,17 +18671,7 @@ class GhostAgent:
                 # failure. Per-project dict, carrying the deleted list —
                 # see workspace_cleanup._mark_removal for the four ways the
                 # single-tuple version failed.
-                _swept = None
-                try:
-                    _marks = getattr(getattr(self.context, "project_store",
-                                             None),
-                                     "recent_workspace_removals", None)
-                    if isinstance(_marks, dict):
-                        _swept = {k: v[1] for k, v in _marks.items()
-                                  if (time.time() - float(v[0]))
-                                  < _REMOVAL_MARK_FRESH_WINDOW_S}
-                except Exception:
-                    _swept = None
+                _swept = _fresh_removal_marks(self.context)
                 _fa = self._verify_file_artifacts(
                     _to_check, _host_dir, soft=_soft, extra_roots=_extra,
                     file_claims=set(_claimed), report=_rep,
@@ -26774,7 +26855,8 @@ class GhostAgent:
             _foreign_note = _foreign_image_note(final_ai_content, tools_run_this_turn,
                                                 getattr(self.context, "sandbox_dir", None))
             final_ai_content, _dl_missing = _drop_missing_download_links(
-                final_ai_content, getattr(self.context, "sandbox_dir", None))
+                final_ai_content, getattr(self.context, "sandbox_dir", None),
+                swept=_fresh_removal_marks(self.context))
             if _foreign_note:
                 # before the verifier gate: the judge reads it too
                 final_ai_content = (final_ai_content or "").rstrip() + _foreign_note
@@ -29675,12 +29757,18 @@ class GhostAgent:
                 # continuation above steers the same shape, and two
                 # directives that disagree ("answer from what you know" /
                 # "state it was NOT done") cost a fourth generation (review).
+                # §4SP (req a62cf750): a write REFUSED with "ask the user to
+                # confirm in a new message" makes "Reply yes and I'll create
+                # it" the correct last sentence — a designed stop, not a broken
+                # promise. The steer ordered "DO it NOW", the model re-sent the
+                # 6k-char create_skill, the same guard refused it (+146 s).
                 if (clean_ui and not pending_promise_steer_fired
                         and _work_nudge_used is not True
                         and not force_final_response
                         and not is_final_generation
                         and not force_stop
-                        and has_run_tools):
+                        and has_run_tools
+                        and not _awaits_new_message_confirm(tools_run_this_turn)):
                     _last_sentence = _ends_with_action_promise(clean_ui)
                     if _last_sentence:
                         pending_promise_steer_fired = True
@@ -34724,7 +34812,8 @@ class GhostAgent:
                 # image that was never generated (§4ME F1) — the non-stream
                 # finalize drops such links; this answer is about to stream
                 _ff_retry_text, _ff_missing = _drop_missing_download_links(
-                    _ff_retry_text, getattr(self.context, "sandbox_dir", None))
+                    _ff_retry_text, getattr(self.context, "sandbox_dir", None),
+                    swept=_fresh_removal_marks(self.context))
                 if _ff_missing:
                     pretty_log("Missing File Link", "the forced-final retry linked file(s) that do not exist: "
                                + ", ".join(_ff_missing[:3]), level="WARNING", icon=Icons.WARN)
@@ -34780,8 +34869,8 @@ class GhostAgent:
                     _, _st_missing = _drop_missing_download_links(
                         full_content or "", getattr(self.context, "sandbox_dir", None))
                     if _st_missing:
-                        _miss_note = ("\n\n⚠️ The link(s) above to " + ", ".join(f"`{n}`" for n in _st_missing[:3])
-                                      + " point to file(s) that do not exist — they were NOT created.")
+                        _miss_note = _streamed_missing_link_note(
+                            _st_missing, _fresh_removal_marks(self.context))
                         yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _miss_note}, 'finish_reason': None}]})}\n\n".encode('utf-8')
                         full_content = (full_content or "") + _miss_note
                         if locals().get("_stream_effective_content"):          # §4OH reader M1: the record sees it too

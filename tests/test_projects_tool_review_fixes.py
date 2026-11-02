@@ -17,6 +17,7 @@ Covers:
   - a case-mangled parent_id is canonicalized (sibling-duplicate guard)
 """
 
+from tests._refused import refused_ids, refused_reasons  # §4SU Phase 4
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
@@ -126,8 +127,8 @@ async def test_gate_recovery_loop_closes_with_result_then_done(context):
     #    the status=done re-pass.
     g = _parse(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE"))
-    assert g["gated_unverified"] == [tid]
-    assert "status=done" in g["agent_instruction"]
+    assert refused_ids(g, "gated_unverified") == [tid]
+    assert "status=done" in g["agent_instruction_refused"]
 
     # 2) result-only call persists the evidence.
     _parse(await tool_manage_projects(
@@ -188,11 +189,11 @@ async def test_bulk_fileless_sibling_not_refused_on_first_tasks_audit(
         result="both parts complete per the constraint"))
 
     # A (audited, violating) is refused; fileless B goes DONE.
-    assert res["constraint_violations"] == [a]
+    assert refused_ids(res, "constraint_violations") == [a]
     assert store.get_task(a)["status"] != "DONE"
     assert store.get_task(b)["status"] == "DONE"
     # The violation recovery text also names the status=done re-pass.
-    assert "status=done" in res["agent_instruction_violation"]
+    assert "status=done" in res["agent_instruction_refused"]
 
 
 # ------------------------------------------- reconcile fails CLOSED
@@ -369,8 +370,8 @@ async def test_bulk_violating_sibling_with_different_files_is_audited(
         context, action="task_update", task_ids=[clean, dirty], status="DONE",
         result="both parts done"))
 
-    assert res.get("constraint_violations") == [dirty]
+    assert refused_ids(res, "constraint_violations") == [dirty]
     assert store.get_task(clean)["status"] == "DONE"
     assert store.get_task(dirty)["status"] != "DONE"
     # The refusal message carries the DIRTY task's own audit reason.
-    assert "forbidden approach" in res["agent_instruction_violation"]
+    assert "forbidden approach" in refused_reasons(res, "constraint_violations")

@@ -122,14 +122,17 @@ def test_human_gate_echoed_text_does_not_satisfy_gate():
     assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
 
 
-def test_human_gate_second_close_is_the_approval():
+def test_human_gate_second_close_is_not_the_approval():
+    # §4SU Phase 0 (audit A): a second identical close in the same turn was
+    # counted as the owner's approval — only human_approved=True approves
     tree = TaskTree()
     tid = tree.add_task("deploy",
                         postconditions=["HUMAN_GATE: cto approval"])
     tree.update_status(tid, TaskStatus.DONE, result="deployed")
     assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
-    # The user was asked; the close path being taken again is the approval.
     tree.update_status(tid, TaskStatus.DONE, result="deployed")
+    assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
+    tree.update_status(tid, TaskStatus.DONE, result="deployed", human_approved=True)
     assert tree.nodes[tid].status == TaskStatus.DONE
 
 
@@ -195,7 +198,7 @@ def test_dangling_then_valid_alternative_resolves_the_valid_one():
     tree.nodes[root].alternatives = ["ghost-id", alt]
     tree.update_status(c1, TaskStatus.FAILED, failure_reason="boom")
     assert tree.nodes[root].status != TaskStatus.BLOCKED
-    assert tree.nodes[alt].status == TaskStatus.READY
+    assert tree.nodes[alt].status == TaskStatus.PENDING
     assert alt in tree.nodes[root].children
     assert tree.nodes[alt].parent_id == root
     assert tree.nodes[root].alternatives == []  # dangling id consumed too

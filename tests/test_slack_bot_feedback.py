@@ -116,7 +116,7 @@ def _load_bot_module(name):
 def _owner(bot, monkeypatch):
     monkeypatch.setattr(bot, "OWNER_ID", OWNER)
     monkeypatch.setattr(bot, "BOT_USER_ID", BOT)
-    monkeypatch.setattr(bot, "MAINTENANCE_MODE", False)
+    monkeypatch.setattr(bot, "MAINTENANCE_FILE", "")
     # Each test starts with an empty reply index.
     bot._REPLY_INDEX.clear()
 

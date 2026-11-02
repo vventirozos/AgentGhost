@@ -94,12 +94,21 @@ async def test_a_postcondition_demotion_is_a_failed_step_not_a_completed_one(tmp
         return CodingResult(True, "wrote hello.py", files=["hello.py"], verified=True)
     res = await PA.advance_once(_ctx(store), pid, tool_runner=AsyncMock(return_value=""), coding_executor=exe,
                                 owner_requested=False)
-    st = store.get_task(tid)["status"]
-    if st == "DONE":
-        pytest.skip("this planner does not evaluate the postcondition here")
-    assert st == "FAILED" and "postcondition" in res.summary
+    # §4SU Phase 1: the one close check refuses BEFORE the close — unattended
+    # that is a hold for the owner (kind = the gate), never "completed"
+    t = store.get_task(tid)
+    assert t["status"] == "NEEDS_USER" and "not shown by the result" in t["result_summary"]
     types = [e["type"] for e in store.list_events(pid, limit=20)]
-    assert "autoadvance_step_failed" in types and "autoadvance_step" not in types
+    assert "autoadvance_step" not in types
+    ev = store.latest_task_event(pid, tid, ("autoadvance_needs_user",))
+    assert ev["payload"]["hold"] == "refused_postconditions"
+    # the owner's own run FAILS it with the reason
+    store2 = _store(tmp_path / "o")
+    pid2 = store2.create_project("Post App", kind="CODING")
+    tid2 = ProjectPlan(store2, pid2).add_task("Implement hello.py", postconditions=["exit_code == 0"])
+    res2 = await PA.advance_once(_ctx(store2), pid2, tool_runner=AsyncMock(return_value=""), coding_executor=exe,
+                                 owner_requested=True)
+    assert store2.get_task(tid2)["status"] == "FAILED"
 
 
 def test_a_timed_out_attempts_files_are_carried(tmp_path):
@@ -408,7 +417,7 @@ async def test_a_deferral_is_reopened_and_not_scored(tmp_path, monkeypatch):
         raise BackgroundDeferred("deferred")
     res = await PA.advance_once(_ctx(store), pid, tool_runner=AsyncMock(return_value=""), coding_executor=exe,
                                 owner_requested=False)
-    assert res.classification == "deferred" and store.get_task(tid)["status"] == "READY"
+    assert res.classification == "deferred" and store.get_task(tid)["status"] == "PENDING"
     for _ in range(3):
         await PA.advance_unattended(_ctx(store), pid, tool_runner=AsyncMock(return_value=""), coding_executor=exe)
     meta = store.get_project(pid)["metadata"]

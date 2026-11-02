@@ -3,6 +3,7 @@ store column round-trip + migration, plan hydration, tool capture at
 create/decompose, the constraint DONE-gate on task_update, briefing
 render, and the agent's verifier constraint note."""
 
+from tests._refused import refused_ids, refused_reasons  # §4SU Phase 4
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
@@ -160,8 +161,8 @@ class TestConstraintDoneGate:
         res = json.loads(await tool_manage_projects(
             context, action="task_update", project_id=pid,
             task_id=tid, status="DONE"))
-        assert res["gated_constraints"] == [tid]
-        assert "don't use pandas" in res["agent_instruction_constraints"]
+        assert refused_ids(res, "gated_constraints") == [tid]
+        assert "don't use pandas" in res["agent_instruction_refused"]
         assert store.get_task(tid)["status"] != "DONE"
 
     async def test_done_with_evidence_passes(self, context, store):
@@ -172,7 +173,7 @@ class TestConstraintDoneGate:
             context, action="task_update", project_id=pid,
             task_id=tid, status="DONE",
             result="loader written with csv stdlib only — no pandas import"))
-        assert not res.get("gated_constraints")
+        assert not refused_ids(res, "gated_constraints")
         assert store.get_task(tid)["status"] == "DONE"
 
     async def test_task_level_constraints_gate_too(self, context, store):
@@ -182,7 +183,7 @@ class TestConstraintDoneGate:
         res = json.loads(await tool_manage_projects(
             context, action="task_update", project_id=pid,
             task_id=tid, status="DONE"))
-        assert res["gated_constraints"] == [tid]
+        assert refused_ids(res, "gated_constraints") == [tid]
 
     async def test_unconstrained_task_not_gated(self, context, store):
         pid = store.create_project("P")
@@ -190,7 +191,7 @@ class TestConstraintDoneGate:
         res = json.loads(await tool_manage_projects(
             context, action="task_update", project_id=pid,
             task_id=tid, status="DONE"))
-        assert not res.get("gated_constraints")
+        assert not refused_ids(res, "gated_constraints")
         assert store.get_task(tid)["status"] == "DONE"
 
 

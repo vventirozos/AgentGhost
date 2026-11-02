@@ -91,6 +91,7 @@ class TaskCreate(BaseModel):
     dependency_type: str = "ALL"
     alternatives: Optional[List[str]] = None
     postconditions: Optional[List[str]] = None
+    kind: str = ""                     # §4SU Phase 2: declared task kind (core/task_kind.py)
 
 
 class TaskUpdate(BaseModel):
@@ -100,6 +101,7 @@ class TaskUpdate(BaseModel):
     failure_reason: Optional[str] = None
     alternatives: Optional[List[str]] = None
     postconditions: Optional[List[str]] = None
+    kind: Optional[str] = None         # §4SU Phase 2 ("" clears it)
 
 
 def _store(request: Request):
@@ -300,6 +302,13 @@ async def advance_project(pid: str, request: Request):
     pid = _canon_id(pid)
     if not store.get_project(pid):
         raise HTTPException(404, "project not found")
+    # §4SU Phase 0 (audit): the same rule as the tool's autoadvance (§4PG
+    # R1-1) — never build beside a live unattended step in this workspace
+    from ..core.project_advancer import unattended_step_live
+    _live = unattended_step_live(store, pid)
+    if _live:
+        raise HTTPException(409, f"an unattended autopilot step is running on this project "
+                                 f"(started {_live} ago) — wait for it to finish; nothing was started")
     # Build the SAME project-pinned tool runner the manage_projects
     # autoadvance action uses. advance_once without one runs the degraded
     # classify-only path, which marks a research leaf DONE having done
@@ -401,6 +410,7 @@ async def add_task(pid: str, body: TaskCreate, request: Request):
             dependency_type=body.dependency_type,
             alternatives=body.alternatives,
             postconditions=body.postconditions,
+            kind=body.kind,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -411,6 +421,7 @@ async def add_task(pid: str, body: TaskCreate, request: Request):
 async def update_task(pid: str, tid: str, body: TaskUpdate, request: Request):
     store = _store(request)
     pid = _canon_id(pid)
+    tid = _canon_id(tid)          # §4SU Phase 1: a mixed-case id was a silent 200 no-op
     existing = store.get_task(tid)
     if not existing or existing["project_id"] != pid:
         raise HTTPException(404, "task not found in this project")
@@ -423,26 +434,82 @@ async def update_task(pid: str, tid: str, body: TaskUpdate, request: Request):
             st = TaskStatus[str(fields["status"]).upper()]
         except KeyError:
             raise HTTPException(400, f"bad status: {fields['status']}")
-        plan = ProjectPlan(store, pid)
-        # Off-loop: the DONE cascade can complete the project and fire the
-        # workspace cleanup sweep (sync filesystem walk) from the store hook.
-        await asyncio.to_thread(
-            plan.update_status,
-            tid, st,
-            result=fields.get("result_summary", "") or "",
-            failure_reason=fields.get("failure_reason", "") or "",
-        )
-        # Non-status fields still need direct persistence
+        # §4SU Phase 1: the other fields land FIRST — the close is judged on
+        # the task as the owner just edited it (it was judged on the old
+        # postconditions, then they were overwritten)
         leftover = {k: v for k, v in fields.items()
                     if k not in {"status", "result_summary", "failure_reason"}}
         if leftover:
-            store.update_task(tid, **leftover)
+            try:
+                store.update_task(tid, **leftover)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        plan = ProjectPlan(store, pid)
+        _result = fields.get("result_summary", "") or ""
+        _over: list = []
+        _was_done = existing.get("status") == "DONE"       # r1 L1: a re-click records nothing again
+        if st == TaskStatus.DONE and not _was_done:
+            # §4SU Phase 1 (operator 11-02: "close, record why"): the owner's
+            # click runs the same close check as every path and always
+            # closes; each gate it went over is recorded as the owner's override
+            from ..core.task_close import check_close
+            # r1 L2: the task's and the project's constraints, as the model's path
+            _cons = [str(c) for c in (getattr(plan.tree.nodes.get(tid), "constraints", None) or [])]
+            try:
+                _cons += [str(c) for c in (((store.get_project(pid) or {}).get("metadata") or {})
+                                           .get("constraints") or [])]
+            except Exception:  # noqa: BLE001
+                pass
+            _v = await asyncio.to_thread(check_close, store, pid, plan.tree, tid, actor="owner",
+                                         result=_result, constraints=_cons)
+            _over = list(_v.overridden)
+            if existing.get("wait_code") == "rollup_constraints":
+                # r9 L1: the roll-up held it for the constraint audit — the
+                # click goes over that audit, recorded like the other gates
+                # (§4SU Phase 3: the wait field, not the summary text)
+                from ..core.task_close import Refusal
+                _cw = str(existing.get("wait_why") or "")
+                _over.append(Refusal("constraints", _cw.split(":", 1)[1].strip() if ":" in _cw else _cw))
+        def _close_and_record():
+            plan.update_status(
+                tid, st,
+                result=_result,
+                failure_reason=fields.get("failure_reason", "") or "",
+                # §4SU Phase 0: the owner's own click in the web console IS the
+                # explicit human-gate approval (the agent's closes are not)
+                human_approved=True,
+                # r2 M1: a re-click (or a result edit) of a task already DONE is
+                # the owner's close too — never demoted to FAILED
+                postconditions_waived=_was_done or any(r.gate == "postconditions" for r in _over),
+            )
+            if _over and (store.get_task(tid) or {}).get("status") == "DONE":
+                for r in _over:
+                    try:
+                        store.log_event(pid, tid, "close_override",
+                                        {"gate": r.gate, "reason": r.reason[:300], "actor": "owner"})
+                        store.append_ledger(pid, f"OVERRIDE {r.gate} on task {tid} (by the owner, web console): "
+                                                 f"{r.reason[:200]}")
+                    except Exception:  # noqa: BLE001
+                        logger.warning("owner close override not recorded", exc_info=True)
+        # Off-loop: the DONE cascade can complete the project and fire the
+        # workspace cleanup sweep (sync filesystem walk) from the store hook.
+        # r3 L2: the close AND its override records in ONE thread — a cancel
+        # at this await cannot separate them (the thread runs to its end)
+        await asyncio.to_thread(_close_and_record)
+        _parked = [p for p in (getattr(plan.tree, "rollup_parked", []) or []) if p != tid]
     else:
         try:
             store.update_task(tid, **fields)
         except ValueError as e:
             raise HTTPException(400, str(e))
-    return store.get_task(tid)
+        _parked = []
+    out = dict(store.get_task(tid) or {})
+    if _parked:
+        # r2 L1: a parent this click parked (gate) or refused (close check)
+        out["not_closed"] = [{"task_id": p, "status": "NEEDS_USER",
+                              "why": str((store.get_task(p) or {}).get("result_summary") or "")[:300]}
+                             for p in _parked]
+    return out
 
 
 @projects_router.delete("/{pid}/tasks/{tid}", status_code=204)

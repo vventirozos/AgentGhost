@@ -230,9 +230,14 @@ def test_the_project_advancers_foreground_calls_take_the_side_path():
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "chat_completion"]
     assert len(calls) == 3
+    def _true(v):
+        return isinstance(v, ast.Constant) and v.value is True
     for c in calls:
         kws = {k.arg: k.value for k in c.keywords}
-        assert isinstance(kws.get("side_main"), ast.Constant) and kws["side_main"].value is True
+        # §4SR: or never reaches the main slot at all (the classifier: worker
+        # pool, off_main_only — a failed worker raises instead of falling back)
+        assert _true(kws.get("side_main")) or (
+            _true(kws.get("use_worker")) and _true(kws.get("off_main_only")))
         assert isinstance(kws.get("task_label"), ast.Constant) and kws["task_label"].value
 
 

@@ -31,9 +31,9 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ..utils.logging import Icons, pretty_log
 from ..tools.file_system import read_text_nofollow, walk_nofollow  # §4GJ: symlink-safe walk/read over a model-writable tree
@@ -110,6 +110,10 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
         # fed to the build separately as read-only context via
         # `_gather_research_briefs`.
         if "research" in parts[:-1] or parts[-1].startswith("."):
+            return False
+        # §4ST r2: a quarantined write-up of a run that never happened is
+        # never a build's input (it was fed back as results/exp1.md's data)
+        if parts[0] == _QUARANTINE_DIR:
             return False
         # §4QA-d review: with a named file the walk no longer stops at 12,
         # so vendored trees (node_modules/*/package.json) would fill the
@@ -211,7 +215,8 @@ def _gather_research_briefs(store, project_id: str, *, max_briefs: int = 4,
     try:
         for dirpath, files, _dfd in walk_nofollow(base):
             rel_dir = Path(dirpath).relative_to(base).as_posix()
-            if "research" not in [p for p in rel_dir.split("/") if p]:
+            _segs = [p for p in rel_dir.split("/") if p]
+            if "research" not in _segs or _segs[0] == _QUARANTINE_DIR:     # §4ST r2
                 continue
             for fn in sorted(files):
                 if not fn.lower().endswith(".md") or fn.lower() == "index.md":
@@ -352,6 +357,110 @@ _NEEDS_USER_KEYWORDS = {
     "delete production", "drop database",
 }
 
+# §4SR: a gate word counts only as a WHOLE word. The bare substring test
+# gated "…self-confirmation…" (req 4609b359: a research task, 0 of 10 run)
+# and would gate "transcendental" (send), "unpublished" (publish). The base
+# form — the imperative a gate is written in ("Approve the plan", "Publish
+# the notes", "Re-approve …") — gates on its own. Every other form
+# ("Wait for user approval", "Owner decides", "the user's confirmation
+# token", "published papers") is ambiguous on the words: it gates only when
+# a classifier says so too (``gate_form`` + ``settle_gate``). Three review
+# rounds of role-word rules (r1–r4) each traded one set of false gates for
+# another ("the customer's approval workflow", "rows approved by user 5"),
+# so the words decide only the unambiguous case.
+def _alts(words) -> str:
+    # a phrase matches across any run of whitespace ("sign  off", r3 n2)
+    return "|".join(re.escape(w).replace(r"\ ", r"\s+")
+                    for w in sorted(words, key=len, reverse=True))
+
+
+def _whole_words(words, prefixes=("re", "pre"), strict=True) -> str:
+    pre = "".join(f"|(?<=\\b{p}-)" for p in prefixes)
+    if not strict:
+        # r10: the classifier's call (gate_form) — a word and hyphen boundary
+        # only; every identifier rule below would also overrule a classifier
+        # that saw a real gate ("Confirm(y/n) before deploying")
+        # r11: the right side only needs a word boundary ("approval-gated",
+        # "owner-approved" stand with the classifier); the left keeps the
+        # hyphen so "self-confirmation" never does
+        return r"(?:(?<![\w-])" + pre + r")(?:" + _alts(words) + r")(?!\w)"
+    # no letter/digit/hyphen on either side (a listed prefix excepted), and
+    # not an identifier: "publish.py", "confirm(" (r2 #6), "socket.send",
+    # "/api/publish", "`confirm`" (r3 m1)
+    # r8: a dot ends the gate only after a word or a closing bracket/quote
+    # ("socket.send", "1.approve", "client().send", "items[0].publish", r9);
+    # "Then...approve the plan" is a sentence. r9 NIT: a backslash path
+    # ("scripts\\send"), a sigil ("@approve", "$send") and a setting
+    # ("confirm=False") are identifiers too.
+    return (r"(?:(?<![\w/`\\@$-])(?<![\w)\]'\"]\.)" + pre + r")(?:" + _alts(words)
+            + r")(?![\w`\\-])(?!\.\w)(?!\()(?!/)(?![^\S\n]*=(?![=>]))")
+
+
+_NEEDS_USER_KEYWORDS = _NEEDS_USER_KEYWORDS | {"sign-off", "authorise"}
+_NEEDS_USER_RE = re.compile(_whole_words(_NEEDS_USER_KEYWORDS))
+_GATE_FORMS = {
+    "decides", "decided", "deciding", "decision",
+    "approves", "approved", "approving", "approval",
+    "chooses", "choosing", "chose", "chosen",
+    "confirms", "confirmed", "confirming", "confirmation",
+    "authorizes", "authorized", "authorizing", "authorization",
+    "authorises", "authorised", "authorising", "authorisation",
+    "publishes", "published", "publishing",
+    "announces", "announced", "announcing", "announcement",
+    "sends", "sending", "sent", "signs off", "signed off", "signing off", "sign-offs",
+    # r5: plural nouns and the "pick one" forms
+    "approvals", "decisions", "confirmations", "authorizations", "authorisations",
+    "announcements", "picks one", "picked one", "picking one", "choice", "choices",
+}
+_GATE_FORMS_RE = re.compile(_whole_words(_GATE_FORMS))
+# r10: gate_form's looser twin (any form, base words included)
+_GATE_LOOSE_RE = re.compile(_whole_words(_GATE_FORMS | _NEEDS_USER_KEYWORDS, strict=False))
+
+def needs_user_gate(description) -> bool:
+    """True when the task names a human gate on the words alone: a whole
+    gate word in its base form. The deterministic authority for
+    ``needs_user`` — see ``settle_gate`` for the one case a classifier may
+    add (another form of a gate word)."""
+    return bool(_NEEDS_USER_RE.search(_norm(description)))
+
+
+_NORM_MAP = str.maketrans({"\u2010": "-", "\u2011": "-", "\u00ad": None,
+                           # r6 NIT: zero-width characters are invisible too
+                           "\u200b": None, "\u200c": None, "\u200d": None,
+                           "\u2060": None, "\ufeff": None,
+                           # r7 NIT: minus-sign look-alikes ("sign−off")
+                           "\u2212": "-", "\ufe63": "-", "\uff0d": "-"})
+# "Review/approve the PR" is two actions, "api/send" and "docs/publish" a
+# path: a lone chain of words joined by slashes (no slash, word or dot-word on
+# either end) is spaced out only when EVERY part is an action (r4 #2 lost the
+# gate; r5 #1 the paths; r6 #2 "review/approve." and "review/approve/merge").
+# Any other slash next to a gate word is the classifier's call (gate_form).
+_SLASH_PAIR_RE = re.compile(r"(?<![/\w.])[a-z]+(?:/[a-z]+)+(?![/\w])(?!\.\w)")
+_PAIR_VERBS = frozenset(w for w in _NEEDS_USER_KEYWORDS if w.isalpha()) | {
+    "review", "test", "check", "verify", "reject", "merge", "accept", "deny",
+    "edit", "sign", "draft", "revise", "validate", "decline", "veto", "defer"}
+
+
+def _pair(m) -> str:
+    parts = m.group(0).split("/")
+    return " / ".join(parts) if all(p in _PAIR_VERBS for p in parts) else m.group(0)
+
+
+def _norm(description) -> str:
+    # unicode hyphens are the ASCII one ("sign‑off", r4 NIT); a soft hyphen
+    # is invisible inside a word ("self\u00adconfirm", r5 NIT)
+    d = str(description or "").lower().translate(_NORM_MAP)
+    return _SLASH_PAIR_RE.sub(_pair, d)
+
+
+def gate_form(description) -> bool:
+    """A gate word in another form ("approval", "decides", "pre-approved"),
+    or any gate word next to a slash ("Publish/deploy", "approval/sign-off",
+    r6 #1) — a gate only if a classifier also says so."""
+    # the loose regex has no slash rule (r10: the "/"→space step went dead)
+    return bool(_GATE_LOOSE_RE.search(_norm(description)))
+
+
 # An explicit source/artifact filename the task must PRODUCE (e.g.
 # "analyze_results.py", "results/report.md"). Paired with a build verb this is
 # an unambiguous coding leaf and must outrank a research verb in the same
@@ -410,9 +519,8 @@ def classify_task(description: str, default: str = "research") -> str:
     if not description:
         return default
     lower = description.lower()
-    for kw in _NEEDS_USER_KEYWORDS:
-        if kw in lower:
-            return "needs_user"
+    if needs_user_gate(lower):
+        return "needs_user"
     # Strong coding signal: a concrete filename to PRODUCE + a build verb. This
     # beats the research check below so a build leaf whose description also
     # contains a research verb ("analyze", "summarize") is still BUILT, not
@@ -427,6 +535,24 @@ def classify_task(description: str, default: str = "research") -> str:
         if kw in lower:
             return "coding"
     return default
+
+
+def settle_gate(description, classification, default: str = "research") -> str:
+    """§4SR: the classification an advance acts on. :func:`needs_user_gate`
+    → ``needs_user``, whatever a classifier said ("Approve the plan" →
+    research is overruled). A classifier's ``needs_user`` stands only for a
+    task with a gate word in another form (:func:`gate_form`: "Wait for user
+    approval", "after the client has approved" — r2 MAJOR); for a task with
+    no gate word at all it is overruled (Nova gated "Write final
+    comprehensive report", 4 of 42 real tasks)."""
+    if needs_user_gate(description):
+        return "needs_user"
+    cls = str(classification or "").strip().lower()
+    if cls == "needs_user" and gate_form(description):
+        return "needs_user"
+    if cls in ("coding", "research"):
+        return cls
+    return classify_task(description, default=default)
 
 
 # §4QA: a leaf that CHANGES or PRODUCES project work is not research, whatever
@@ -494,8 +620,12 @@ def _route_project_work(description, classification: str, curated=None) -> str:
 # Now any experiment-shaped task in a model project is held; a false positive
 # ("Test the chatbot replies" in "Build an LLM chatbot") only waits for the
 # owner's turn, where probe_model or a normal build both remain available.
+#: §4ST: where a refused model-run write-up is moved (experiment_gate.QUARANTINE_DIR)
+_QUARANTINE_DIR = "simulated"
+
 _MODEL_NAMES = (r"llms?|language\s+models?|ai\s+(?:model|system|agent)s?|"
-                r"chatbots?|chatgpt|gpt(?:-\w+)?|qwen\w*|llama\w*|claude")
+                r"chatbots?|chatgpt|gpt(?:-\w+)?|qwen\w*|llama\w*|claude|"
+                r"gemma\w*|deepseek\w*")
 _MODEL_GOAL_RE = re.compile(
     r"\b(?:" + _MODEL_NAMES + r"|introspection\s+loops?)\b", re.IGNORECASE)
 _EXPERIMENT_VERB_RE = re.compile(
@@ -504,15 +634,51 @@ _EXPERIMENT_VERB_RE = re.compile(
 _EXPERIMENT_NOUN_RE = re.compile(
     r"\b(?:control\s+conditions?|falsification\s+tests?|cross-model|ablations?)\b", re.IGNORECASE)
 _CODE_FILE_RE = re.compile(r"\b[\w./-]+\.(?:py|js|mjs|ts|sh|ipynb|r|jl)\b", re.IGNORECASE)
+# §4SS (req b45ec99f, 2026-11-01): the PROJECT's tasks can say it is a model
+# project when its goal does not. Goal "experimentally test the theory that
+# 3-layer recursive thinking culminates in self-affirming self-awareness"
+# names no model, so "Run Experiment 1 (layer ladder): probe_model runs of the
+# L1, L2, L3 prompts…" and "repeat the L1–L3 ladder on the worker node (second
+# model)" went to the coding executor, which WROTE the transcripts. Now the
+# goal or the task naming a model, or ANY task of the project naming
+# probe_model — the planner's own word for "a model answers here" — makes it a
+# model project (then r5 holds every experiment-shaped task). Review r1: a
+# bare "model" held "Test the data model" in ordinary GENERAL projects. Review
+# r2: a sibling's model NAME ("Research how competitors use ChatGPT", DONE
+# long ago) held every Test/Measure task of an onboarding project for good —
+# so siblings count only through probe_model.
+_PROBE_RE = re.compile(r"\bprobe_model\b", re.IGNORECASE)
 
 
-def is_model_experiment(description, goal) -> bool:
-    """True when the task's data would be a model's answers (see above)."""
+def _names_a_model(text) -> bool:
+    text = str(text or "")
+    return bool(_MODEL_GOAL_RE.search(text) or _PROBE_RE.search(text))
+
+
+def is_model_experiment(description, goal, project_texts=()) -> bool:
+    """True when the task's data would be a model's answers (see above).
+    ``project_texts``: the project's other task descriptions (§4SS)."""
     topic = task_topic(description)
-    goal = str(goal or "")
-    if not _MODEL_GOAL_RE.search(goal) or _CODE_FILE_RE.search(topic):
+    # a task that itself says a model answers is no code run because a
+    # scoring script is named beside it ("…, then score them with score.py";
+    # r2: "Run the L1-L3 prompts on Gemma and score each with score.py")
+    # r3: a model name INSIDE a file name ("chatbot.py", "llama_loader.py")
+    # is no model subject
+    if _CODE_FILE_RE.search(topic) and not _names_a_model(_CODE_FILE_RE.sub(" ", topic)):
+        return False
+    if not (_names_a_model(goal) or _names_a_model(topic)
+            or any(_PROBE_RE.search(str(t or "")) for t in (project_texts or ()))):
         return False
     return bool(_EXPERIMENT_VERB_RE.search(topic) or _EXPERIMENT_NOUN_RE.search(topic))
+
+
+def _project_task_texts(store, project_id) -> List[str]:
+    """Every task description of the project (§4SS); [] when unreadable."""
+    try:
+        return [str(t.get("description") or "") for t in (store.list_tasks(project_id) or [])]
+    except Exception:  # noqa: BLE001
+        logger.debug("project task texts unreadable", exc_info=True)
+        return []
 
 
 #: AdvanceResult.summary prefix for a leaf left to the owner's turn (§4QA)
@@ -650,6 +816,105 @@ def _research_output_usable(output) -> bool:
     return not _UNUSABLE_RESEARCH_RE.search(text[:600])
 
 
+#: §4SU Phase 5: the kind of each hold, recorded in its
+#: ``autoadvance_needs_user`` event — what the owner's run re-CHECKS (the
+#: work already happened) rather than re-runs
+HOLD_KINDS_RECHECKED = frozenset({"unverified_build", "undelivered", "unrun_experiment"})
+
+
+def _hold_kind_of(why: str) -> str:
+    """The kind of a hold `_unattended_close` made (its own fixed notes)."""
+    w = str(why or "")
+    if w.startswith("built but no verification command ran"):
+        return "unverified_build"
+    if w.startswith("needs a real check"):
+        return "verify_task"
+    if w.startswith("the research did not land"):
+        return "research_missed"
+    return ""
+
+
+async def _recheck_held(context, store, plan, project_id, nxt, held_summary):
+    """The owner's run closes a held task DONE when what was held is now in
+    order (see `HOLD_KINDS_RECHECKED`), else None (the caller runs it). Only
+    the task as it was held: a description rewritten since, a human gate or
+    a postcondition the held result does not show sends it down the normal
+    path (review r1). Never raises (None)."""
+    from .planning import TaskStatus
+    try:
+        ev = store.latest_task_event(project_id, nxt.id, ("autoadvance_needs_user",))
+        pl = (ev or {}).get("payload") or {}
+        kind = str(pl.get("hold") or "")
+        if kind not in HOLD_KINDS_RECHECKED:
+            return None
+        if str(pl.get("description") or "") != str(nxt.description or ""):
+            return None                       # r1 MAJOR: the task changed since the hold
+        from .project_safety import enforce_human_gate
+        if enforce_human_gate(store.get_task(nxt.id) or {}):
+            return None                       # r1: the gate path parks it and logs the park
+        ws = Path(store.ensure_workspace(project_id)).resolve()
+        files = [str(f) for f in (pl.get("files") or []) if f]
+        if not files:
+            files = [str(a.get("payload") or "").strip() for a in (store.list_artifacts(task_id=nxt.id) or [])
+                     if str(a.get("kind") or "") == "file"]
+            files = [f for f in files if f]
+        if kind == "unverified_build" and not files:
+            return None
+        for rel in files:
+            p = (ws / rel)
+            try:
+                p.resolve().relative_to(ws)   # r1: confined to the workspace
+            except ValueError:
+                return None
+            if not p.is_file() or p.is_symlink() or p.stat().st_size == 0:
+                return None
+        from .task_deliverable import deliverable_problem, declared_deliverable
+        if deliverable_problem(str(ws), nxt.description):
+            return None
+        reason = str(pl.get("reason") or "")
+        result = held_summary[: -len(" — " + reason)] if reason and held_summary.endswith(" — " + reason) else held_summary
+        from .experiment_gate import unrun_experiment_problem
+        if await asyncio.to_thread(unrun_experiment_problem, store, project_id, nxt.description,
+                                   files=files, result_text=result,
+                                   kind=str(getattr(nxt, "kind", "") or "")):
+            return None
+        note = f"{result} — re-checked in the owner's run ({kind.replace('_', ' ')} hold): files on disk, not rebuilt"
+        _node = plan.tree.nodes.get(nxt.id)
+        if _node is not None:
+            import copy as _copy
+            _probe = _copy.copy(_node)
+            _probe.result_summary = note
+            if plan.tree._check_postconditions(_probe):
+                return None                   # r1: an unmet postcondition reruns, never FAILs here
+        _decl = declared_deliverable(nxt.description) or ""
+        for rel in dict.fromkeys(files + ([_decl] if _decl else [])):
+            try:                              # r1: kept by the DONE sweep
+                store.register_file_artifact(nxt.id, rel, description=_short_summary(result)[:180])
+            except Exception:  # noqa: BLE001
+                logger.debug("re-check: artifact register skipped", exc_info=True)
+        plan.update_status(nxt.id, TaskStatus.DONE, result=note[:2000], actual_tool="recheck")
+    except Exception:  # noqa: BLE001
+        logger.warning("held-task re-check skipped (the task runs instead)", exc_info=True)
+        return None
+    # the close is written: from here on a failure must not run the task again (r1)
+    _node = plan.tree.nodes.get(nxt.id)
+    _final = _node.status if _node is not None else TaskStatus.DONE
+    _ok = _final == TaskStatus.DONE
+    try:
+        store.log_event(project_id, nxt.id, "autoadvance_step" if _ok else "autoadvance_step_failed",
+                        {"tool": "recheck", "classification": "recheck", "hold": kind, "files": files[:8],
+                         "owner_requested": True})
+        _work_log_step(store, project_id, nxt, outcome="completed" if _ok else "had_failures",
+                       files=files, tools={"recheck": 1}, note=note[:280])
+        pretty_log("Autoadvance", f"re-checked held task {nxt.id} ({kind}) — "
+                   + ("closed without a rebuild" if _ok else f"close ended {_final.value}"), icon=Icons.OK)
+    except Exception:  # noqa: BLE001
+        logger.warning("re-check record skipped", exc_info=True)
+    return AdvanceResult(True, nxt.id, "recheck",
+                         (f"re-checked ({kind} hold): {_short_summary(result)}" if _ok
+                          else f"re-checked ({kind} hold) but the close ended {_final.value}"), None)
+
+
 def _unattended_close(owner_requested: bool, description: str,
                       evidence_ok: bool = True, unverified_build: bool = False):
     """(status, note) for closing a leaf (§4LP, operator: "go with your
@@ -694,6 +959,30 @@ async def _note_misquotes_if_done(store, plan, project_id, nxt) -> None:
 OUT_OF_TIME_PREFIX = "code build ran out of time (task back to READY)"
 
 
+def _experiment_gate_build(store, project_id, nxt, cres):
+    """§4ST for a build: the CodingResult, failed when the task is a model
+    experiment that cites no kept probe transcript. Never raises."""
+    try:
+        from .experiment_gate import unrun_experiment_check, quarantine
+        _problem, _shaped = unrun_experiment_check(
+            store, project_id, nxt.description, files=list(cres.files or []),
+            result_text=str(cres.summary or ""), kind=str(getattr(nxt, "kind", "") or ""))
+        if not _problem:
+            return cres
+        _moved = quarantine(store, project_id, _shaped)
+        pretty_log("Model Run Gate", f"build of {nxt.id} wrote up a model run that never happened (no probe transcript)"
+                   + (f" — moved {', '.join(_moved[:3])}" if _moved else ""),
+                   icon=Icons.WARN, level="WARNING")
+        import dataclasses as _dc
+        return _dc.replace(cres, ok=False, files=[f for f in (cres.files or []) if f not in _shaped],
+                           summary=(f"{_problem}"
+                                    + (f" (the written-up run was moved to {', '.join(_moved[:3])})" if _moved else "")
+                                    + f" — the build reported: {_short_summary(cres.summary or '')}"))
+    except Exception:  # noqa: BLE001
+        logger.warning("model run gate (build) skipped — the build's close stands", exc_info=True)
+        return cres
+
+
 def _finalize_coding(context, store, plan, project_id, nxt, cres,
                      tick_started_at, owner_requested: bool = False) -> AdvanceResult:
     """Persist the outcome of a real coding build (CodingResult) for one leaf.
@@ -707,15 +996,21 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
     from .planning import TaskStatus
     from .project_safety import record_runtime
 
+    _refusal = None
     if cres.ok:
-        # §4QA: the build passed, but the task promised a file (→ path) — a
-        # build that left it missing or hollow did not do the task
-        from .task_deliverable import deliverable_problem
-        try:
-            _undelivered = deliverable_problem(store.ensure_workspace(project_id), nxt.description)
-        except Exception:  # noqa: BLE001 — the build's own verdict stands
-            _undelivered = None
-        if _undelivered:
+        # §4SU Phase 1: the one close check (core.task_close) — the declared
+        # file (§4QA: a build that left it missing or hollow did not do the
+        # task) and the postconditions, judged BEFORE the close. The model-run
+        # gate already ran on the build (it quarantines, `_experiment_gate_build`);
+        # the picker held dependencies; the build is its own evidence. The
+        # owner's run FAILS on a refusal, an unattended one HOLDS for the owner.
+        from .task_close import check_close
+        _v = check_close(store, project_id, plan.tree, nxt.id,
+                         actor="advancer_owner" if owner_requested else "advancer_unattended",
+                         result=str(cres.summary or ""), files=list(cres.files or []),
+                         skip={"dependencies", "model_run", "evidence"})
+        if not _v.ok:
+            _refusal = _v.first
             # the files it DID write stay the project's (the end-of-project
             # cleanup deletes unregistered ones)
             for rel in (cres.files or []):
@@ -723,9 +1018,10 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                     store.register_file_artifact(nxt.id, rel, description=_short_summary(cres.summary or "")[:180])
                 except Exception:  # noqa: BLE001
                     logger.debug("artifact register skipped", exc_info=True)
-            import dataclasses as _dc
-            cres = _dc.replace(cres, ok=False,
-                               summary=f"{_undelivered} (the build reported: {_short_summary(cres.summary or '')})")
+            if owner_requested:
+                import dataclasses as _dc
+                cres = _dc.replace(cres, ok=False,
+                                   summary=f"{_refusal.reason} (the build reported: {_short_summary(cres.summary or '')})")
 
     if cres.ok:
         # Per-file manifest seed (2026-07-24): the build's summary (or the
@@ -745,9 +1041,16 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                 logger.debug("ledger append skipped", exc_info=True)
         _st, _why = _unattended_close(owner_requested, nxt.description,
                                       unverified_build=not bool(getattr(cres, "verified", False)))
+        _hold = _hold_kind_of(_why)
+        if _refusal is not None:
+            from .task_close import hold_kind
+            _st, _why, _hold = (TaskStatus.NEEDS_USER, f"{_refusal.reason} — {_HELD_MARK}",
+                                hold_kind(_refusal.gate))
         plan.update_status(nxt.id, _st,
                            result=(f"{cres.summary} — {_why}" if _why else cres.summary),
-                           actual_tool="code_executor")
+                           actual_tool="code_executor",
+                           wait=(("owner_turn", _hold or "held", _why)        # §4SU Phase 3
+                                 if _st == TaskStatus.NEEDS_USER else None))
         _increment_budget(store, project_id)
         _tick_secs = max(0.0, time.time() - tick_started_at)
         record_runtime(store, project_id, seconds=_tick_secs, tool_calls=1)
@@ -780,7 +1083,7 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
         if _why:
             store.log_event(project_id, nxt.id, "autoadvance_needs_user",
                             {"description": nxt.description, "reason": _why,
-                             "files": list(cres.files or [])[:8]})
+                             "files": list(cres.files or [])[:8], "hold": _hold})
             _record_needs_user_activity(context, project_id, nxt.description,
                                         "autoadvance_needs_user")
         else:
@@ -804,7 +1107,7 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
         # completed on disk for the next step to build on; FAILED is never
         # retried unattended
         try:
-            store.update_task(nxt.id, status="READY", failure_reason=f"code_executor: {cres.summary}"[:300])
+            store.release_claim(nxt.id, failure_reason=f"code_executor: {cres.summary}"[:300])   # §4SU Phase 3 r2
         except Exception:  # noqa: BLE001
             logger.debug("out-of-time leaf not reset", exc_info=True)
         _increment_budget(store, project_id)
@@ -1025,7 +1328,7 @@ def _reopen_stopped(store, project_id, claimed) -> None:
     for tid in claimed or []:
         if store is not None and _task_status(store, project_id, tid) == "IN_PROGRESS":
             try:
-                store.update_task(tid, status="READY", failure_reason="stopped mid-step")
+                store.release_claim(tid, failure_reason="stopped mid-step")   # §4SU Phase 3 r2: a claimed hold comes back
             except Exception:  # noqa: BLE001
                 logger.debug("stopped leaf not reset", exc_info=True)
 
@@ -1051,6 +1354,7 @@ async def _advance_once_body(
     coding_executor: Optional[Callable[..., Awaitable[Any]]] = None,
     owner_requested: bool = False,
     claim_sink: Optional[list] = None,
+    exclude_ids: Optional[set] = None,
 ) -> AdvanceResult:
     """Run a single autoadvance tick for ``project_id``.
 
@@ -1098,7 +1402,7 @@ async def _advance_once_body(
     _owner_may_take_back = (
         owner_requested and proj["status"] == "NEEDS_USER"
         and any(str(_t.get("status") or "").upper() == "NEEDS_USER"
-                and str(_t.get("result_summary") or "").endswith(_HELD_MARK)
+                and _t.get("wait_on") == "owner_turn"        # §4SU Phase 3: the field, not the text
                 for _t in (store.list_tasks(project_id) or [])))
     if proj["status"] != "ACTIVE" and not _owner_may_take_back:
         return AdvanceResult(True, None, "blocked",
@@ -1181,17 +1485,36 @@ async def _advance_once_body(
         # in memory only: a held task counts as PENDING for this one pick
         _held = ([n for n in plan.tree.nodes.values()
                   if n.status == TaskStatus.NEEDS_USER
-                  and str(n.result_summary or "").endswith(_HELD_MARK)]
+                  and n.wait_on == "owner_turn"]                # §4SU Phase 3
                  if owner_requested else [])
         for _n in _held:
             _n.status = TaskStatus.PENDING
+        # §4SU Phase 5: a batch passes ``exclude_ids`` (tasks it already
+        # stopped at, e.g. a model experiment) so the pick moves on to the
+        # independent work; a task depending on them is still not ready
+        _base_skip = None if owner_requested else _is_unrequested_task
+        _ex = set(exclude_ids or ())
         nxt = plan.next_ready_leaf(
-            skip=None if owner_requested else _is_unrequested_task)
+            skip=(_base_skip if not _ex else
+                  (lambda n: n.id in _ex or bool(_base_skip and _base_skip(n)))))
         for _n in _held:
             if _n is not nxt:
                 _n.status = TaskStatus.NEEDS_USER
         _nxt_held_summary = str(nxt.result_summary or "") if nxt is not None and nxt in _held else ""
+        # §4SU Phase 3: the hold's wait fields, restored if the hold stands
+        _nxt_held_wait = ((nxt.wait_on or "owner_turn", nxt.wait_code or "held", nxt.wait_why)
+                          if nxt is not None and nxt in _held else None)
         if nxt:
+            if _nxt_held_wait is not None:
+                # §4SU Phase 3 r2: the claim clears the hold's fields; a run
+                # that is stopped, times out or crashes gives it back
+                # (ProjectStore.release_claim; the boot reaper too). Logged
+                # BEFORE the claim (r3): a kill between the two writes left an
+                # unclaimed IN_PROGRESS row the reaper sent to PENDING. The
+                # claim ends when the task leaves IN_PROGRESS (update_task).
+                store.log_event(project_id, nxt.id, "hold_claimed",
+                                {"wait_on": _nxt_held_wait[0], "wait_code": _nxt_held_wait[1],
+                                 "wait_why": _nxt_held_wait[2], "summary": _nxt_held_summary[:2000]})
             plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
             if claim_sink is not None:
                 claim_sink.append(nxt.id)
@@ -1202,6 +1525,16 @@ async def _advance_once_body(
         _stamp_autoadvanced(store, project_id)
         return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
 
+    # §4SU Phase 5 (operator 11-02): a task an unattended run HELD after the
+    # work happened (a build nobody verified, a declared file missing, a
+    # model run with no transcript) is re-CHECKED by the owner's run — the
+    # files on disk, the declared file, the §4ST transcript — not rebuilt
+    # from scratch. A check that fails runs the task as before.
+    if _nxt_held_summary:
+        _rc = await _recheck_held(context, store, plan, project_id, nxt, _nxt_held_summary)
+        if _rc is not None:
+            return _rc
+
     # Classification. In a CODING project, TRUST the deterministic keyword
     # classifier (default=coding) and SKIP the LLM — the small model reliably
     # mislabels a build leaf like "File Explorer app" / "Snake game" as
@@ -1211,7 +1544,43 @@ async def _advance_once_body(
     # GENERAL project consults the LLM classifier.
     _proj_kind = (proj.get("kind") or "GENERAL").upper()
     _default_bucket = "coding" if _proj_kind == "CODING" else "research"
-    if _proj_kind == "CODING" or llm_classifier is None:
+    # §4SU Phase 2: a DECLARED kind decides the route — none of the wording
+    # classifiers below run for it (they stay the default for an undeclared
+    # task). The whole-word gate words stay a safety floor for every kind.
+    from .task_kind import ROUTE_LABEL
+    _declared = str(getattr(nxt, "kind", "") or "")
+    if _declared not in ROUTE_LABEL:
+        _declared = ""
+    if _declared:
+        classification = ROUTE_LABEL[_declared]
+        _whole = classification != "needs_user" and needs_user_gate(nxt.description)
+        if _whole and (owner_requested or not is_self_referential(nxt.description)):
+            pretty_log("Autoadvance", f"declared {_declared}, but the gate words say needs_user — "
+                       f"{task_topic(nxt.description)[:60]}", icon=Icons.BRAIN_PLAN)
+            classification = "needs_user"
+        elif classification != "needs_user" and not owner_requested and (_whole or gate_form(nxt.description)):
+            # r1 MAJOR 3: no classifier runs for a declared task, so a gate word
+            # in another form ("approval", "has approved") holds it UNATTENDED.
+            # r2 MAJOR: as a park it jammed "Build the approval form" for good
+            # (even the owner's run re-parked it) — it is a HOLD the owner's own
+            # run takes back and runs (the owner is there to decide).
+            # r3 MAJOR: no introspective exemption here (a hold never jams);
+            # r4 MAJOR: an introspective task with a WHOLE gate word too — the
+            # exemption sent "Publish my self-analysis to the blog" to a brief
+            # that closed DONE unattended, nothing published
+            _why = (f"a gate word — the owner's run decides: "
+                    f"{task_topic(nxt.description)[:80]} — {_HELD_MARK}")
+            pretty_log("Autoadvance", f"declared {_declared}, held for the owner (gate word) — "
+                       f"{task_topic(nxt.description)[:60]}", icon=Icons.BRAIN_PLAN)
+            _stamp_autoadvanced(store, project_id)
+            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_why,
+                               wait=("owner_turn", "gate_form", _why))
+            store.log_event(project_id, nxt.id, "autoadvance_needs_user",
+                            {"description": nxt.description, "reason": _why, "hold": "gate_form"})
+            _record_needs_user_activity(context, project_id, nxt.description,
+                                        "autoadvance_needs_user")
+            return AdvanceResult(True, nxt.id, "needs_user", _why)
+    elif _proj_kind == "CODING" or llm_classifier is None:
         classification = classify_task(nxt.description, default=_default_bucket)
     else:
         try:
@@ -1219,14 +1588,24 @@ async def _advance_once_body(
         except Exception:
             classification = classify_task(nxt.description, default=_default_bucket)
     classification = (classification or _default_bucket).lower()
+    _settled = (classification if _declared
+                else settle_gate(nxt.description, classification, default=_default_bucket))
+    if _settled != classification:
+        pretty_log("Autoadvance", f"classifier said {classification}, the gate words say "
+                   f"{_settled} — {task_topic(nxt.description)[:60]}", icon=Icons.BRAIN_PLAN)
+        classification = _settled
     from .project_research import is_generated_brief
-    classification = _route_project_work(
-        nxt.description, classification,
-        curated=lambda rel: not is_generated_brief(store, project_id, rel))
+    if not _declared or (_declared == "research" and declared_deliverable(nxt.description)):
+        # (declared research that promises a file the brief writer cannot
+        # write — a path outside research/, a curated file — is built: that
+        # part of the router is decided by the declared file, not wording)
+        classification = _route_project_work(
+            nxt.description, classification,
+            curated=lambda rel: not is_generated_brief(store, project_id, rel))
     # An INTROSPECTIVE task can never need a human DECISION (2026-07-12).
     #
-    # `_NEEDS_USER_KEYWORDS` matches bare substrings like "choose"/"decide", so
-    # a task ABOUT decision-making is mistaken for a task REQUIRING a decision.
+    # A gate word (§4SR: now whole words, not substrings) like "choose"/"decide"
+    # still fires on a task ABOUT decision-making, not one REQUIRING a decision.
     # Observed live: "Illusion of Agency: Evaluate whether I truly 'choose'
     # responses or merely predict them. Analyze decision-making as
     # probabilistic sampling vs deterministic selection." → the word "choose"
@@ -1241,7 +1620,8 @@ async def _advance_once_body(
     # agent is the only possible source. An EXPLICIT `[HUMAN_GATE: …]`
     # postcondition still wins: `enforce_human_gate` is checked separately,
     # below, and is untouched by this.
-    if classification == "needs_user" and is_self_referential(nxt.description):
+    if (classification == "needs_user" and _declared != "owner"
+            and is_self_referential(nxt.description)):
         pretty_log(
             "Autoadvance",
             f"introspective task was classified needs_user (keyword "
@@ -1249,16 +1629,29 @@ async def _advance_once_body(
             f"{str(nxt.description)[:60]}…",
             icon=Icons.SELF_STATE,
         )
-        classification = _route_project_work(          # r9: a promised file still routes
-            nxt.description, "research",
-            curated=lambda rel: not is_generated_brief(store, project_id, rel))
+        if _declared == "model_run":
+            # §4SU Phase 2: a declared model run stays one (held below)
+            classification = "model_run"
+        else:
+            # (r1 MAJOR 1: a declared build/write went back to the executor —
+            # "Publish my self-analysis to the blog" built unattended; it takes
+            # the undeclared route: a brief, or a promised file)
+            classification = _route_project_work(      # r9: a promised file still routes
+                nxt.description, "research",
+                curated=lambda rel: not is_generated_brief(store, project_id, rel))
 
     # (after the override above — r10: a needs_user introspective experiment
     # skipped the hold and the self-analysis wrote its "responses")
     # (no self-referential exemption — r9: "Run Layer 3 … self-awareness"
     # took the self-analysis path, which wrote the "responses" itself)
-    if (_proj_kind != "CODING" and classification in ("research", "coding")
-            and is_model_experiment(nxt.description, proj.get("goal"))):
+    if (classification == "model_run"
+            or (_proj_kind != "CODING" and classification in ("research", "coding")
+                and is_model_experiment(nxt.description, proj.get("goal"),
+                                        _project_task_texts(store, project_id)))):
+        # (§4SU Phase 2: a DECLARED model_run holds in every project kind —
+        # the audit's "a CODING project skips the experiment hold"; another
+        # declared kind is still held by the words — r1 MAJOR 2: a kind may
+        # ADD the hold, never remove it, or a retype skipped the §4ST gate)
         # §4QA: run in the turn with probe_model, never written up unrun
         _stamp_autoadvanced(store, project_id)
         if not owner_requested:
@@ -1267,15 +1660,17 @@ async def _advance_once_body(
             # again every tick and the autopilot paused on "no progress"
             _why = (f"{MODEL_EXPERIMENT_PREFIX}? — its data may be a model's answers: in your turn, "
                     f"probe_model if so, the normal way if not — {_HELD_MARK}")
-            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_why)
+            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_why,
+                               wait=("owner_turn", "model_experiment", _why))
             store.log_event(project_id, nxt.id, "autoadvance_needs_user",
-                            {"description": nxt.description, "reason": _why})
+                            {"description": nxt.description, "reason": _why, "hold": "model_experiment"})
             _record_needs_user_activity(context, project_id, nxt.description,
                                         "autoadvance_needs_user")
             return AdvanceResult(True, nxt.id, "needs_user", _why)
         if nxt in _held:
             # the owner's turn runs it — but until it does, the hold stands
-            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_nxt_held_summary)
+            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_nxt_held_summary,
+                               wait=_nxt_held_wait)
         else:
             plan.update_status(nxt.id, TaskStatus.PENDING)
         store.log_event(project_id, nxt.id, "autoadvance_skipped",
@@ -1285,7 +1680,8 @@ async def _advance_once_body(
 
     if classification == "needs_user":
         plan.update_status(nxt.id, TaskStatus.NEEDS_USER,
-                           result="flagged for human review")
+                           result="flagged for human review",
+                           wait=("owner", "review", task_topic(nxt.description)[:200]))
         store.log_event(project_id, nxt.id, "autoadvance_needs_user",
                         {"description": nxt.description})
         _record_needs_user_activity(context, project_id, nxt.description,
@@ -1302,9 +1698,10 @@ async def _advance_once_body(
     _gate_reason = enforce_human_gate(store.get_task(nxt.id) or {})
     if _gate_reason:
         plan.update_status(nxt.id, TaskStatus.NEEDS_USER,
-                           result=f"human gate: {_gate_reason}")
+                           result=f"human gate: {_gate_reason}",
+                           wait=("owner", "human_gate", _gate_reason))
         store.log_event(project_id, nxt.id, "human_gate_triggered",
-                        {"reason": _gate_reason})
+                        {"reason": _gate_reason, "req": _request_id_now()})
         _record_needs_user_activity(context, project_id, nxt.description,
                                     "human_gate_triggered")
         _increment_budget(store, project_id)
@@ -1389,14 +1786,14 @@ async def _advance_once_body(
                 # §4PG r3 (R2-3): the owner is back — the leaf is reopened
                 # and the tick is neither a failure nor "no progress"
                 try:
-                    store.update_task(nxt.id, status="READY", failure_reason="deferred for the owner's request")
+                    store.release_claim(nxt.id, failure_reason="deferred for the owner's request")
                 except Exception:  # noqa: BLE001
                     logger.debug("deferred leaf not reset", exc_info=True)
                 return AdvanceResult(True, nxt.id, "deferred",
                                      f"deferred: the owner's request took the slot — '{nxt.id}' reopened")
             try:
-                store.update_task(nxt.id, status="READY",
-                                  failure_reason=f"coding executor crashed: {type(e).__name__}")
+                store.release_claim(nxt.id,
+                                    failure_reason=f"coding executor crashed: {type(e).__name__}")
             except Exception:  # noqa: BLE001
                 logger.debug("crashed leaf not reset", exc_info=True)
             return AdvanceResult(
@@ -1404,6 +1801,12 @@ async def _advance_once_body(
                 f"coding executor crashed on '{nxt.id}' "
                 f"({type(e).__name__}: {e}) — leaf left open rather than "
                 f"closed by the weaker fallback path")
+        if cres is not None and cres.ok:
+            # §4ST: a build cannot run a model — a "run" it wrote up is not
+            # data. Its transcript-claiming files go to simulated/ (nothing
+            # deleted) and the task does not close. In a worker thread (r1
+            # M3: workspace walk + kept-transcript hashing took 1.7–30 s)
+            cres = await asyncio.to_thread(_experiment_gate_build, store, project_id, nxt, cres)
         if cres is not None:
             _res = _finalize_coding(context, store, plan, project_id, nxt,
                                     cres, _tick_started_at,
@@ -1525,7 +1928,7 @@ async def _advance_once_body(
         # completion (observed via the runner-less HTTP /advance route).
         # Release the claim so a properly wired tick can take it, and report
         # the tick as blocked without charging a step.
-        plan.update_status(nxt.id, TaskStatus.PENDING)
+        store.release_claim(nxt.id)            # §4SU Phase 3 r2: a claimed hold comes back
         _stamp_autoadvanced(store, project_id)
         store.log_event(project_id, nxt.id, "autoadvance_skipped",
                         {"reason": "no tool runner",
@@ -1547,9 +1950,10 @@ async def _advance_once_body(
         plan.update_status(
             nxt.id, TaskStatus.NEEDS_USER,
             result=f"human gate: {gate_reason}",
+            wait=("owner", "human_gate", gate_reason),
         )
         store.log_event(project_id, nxt.id, "human_gate_triggered",
-                        {"reason": gate_reason, "tool": tool_name})
+                        {"reason": gate_reason, "tool": tool_name, "req": _request_id_now()})
         _record_needs_user_activity(context, project_id, nxt.description,
                                     "human_gate_triggered")
         _increment_budget(store, project_id)
@@ -1600,28 +2004,43 @@ async def _advance_once_body(
             logger.debug("auto-research persist skipped", exc_info=True)
 
     _fail_reason = ""
+    _hold = ""
+    _refused_gate = ""
     _st, _why = _unattended_close(
         owner_requested, nxt.description,
         evidence_ok=not (classification == "research" and tool_name == "web_search"
                          and (not research_path or not _research_output_usable(output))))   # §4PG (R3-4)
     if _st == TaskStatus.DONE:
-        # §4QA (fresh-eye M3): this path closed DONE with the task's declared
-        # file missing — a brief under another name, or a theory/x.md never
-        # written. Unattended it is held for the owner; owner-run it FAILS
-        # with the reason (r2 MAJOR-3: a hold is re-picked first by every
-        # owner advance — the same search, the same miss, forever)
+        # §4SU Phase 1: the one close check (core.task_close) — the declared
+        # file (§4QA fresh-eye M3: a brief under another name, a theory/x.md
+        # never written), the model run (§4ST: research / self-analysis cannot
+        # run a model either — r9) and the postconditions, BEFORE the close.
+        # Owner-run: FAILED with the reason (r2 MAJOR-3: a hold is re-picked
+        # first by every owner advance — the same search, the same miss,
+        # forever). Unattended: held for the owner. Nothing is moved here (r1
+        # M2: a moved brief left the declared file missing for good).
         try:
-            from .task_deliverable import deliverable_problem
-            _undelivered = deliverable_problem(store.ensure_workspace(project_id), nxt.description)
+            from .task_close import check_close, hold_kind
+            _v = await asyncio.to_thread(
+                check_close, store, project_id, plan.tree, nxt.id,
+                actor="advancer_owner" if owner_requested else "advancer_unattended",
+                result=str(result_summary or ""), files=[research_path] if research_path else [],
+                skip={"dependencies", "evidence"})
         except Exception:  # noqa: BLE001 — the close stands
-            _undelivered = None
-        if _undelivered and owner_requested:
-            _st, _fail_reason = TaskStatus.FAILED, _undelivered
-        elif _undelivered:
-            _st, _why = TaskStatus.NEEDS_USER, f"{_undelivered} — {_HELD_MARK}"
+            logger.warning("close check (research) skipped", exc_info=True)
+            _v = None
+        if _v is not None and not _v.ok:
+            _r = _v.first
+            _refused_gate = _r.gate if _r.gate != "postconditions" else ""
+            if owner_requested:
+                _st, _fail_reason = TaskStatus.FAILED, _r.reason
+            else:
+                _st, _why, _hold = TaskStatus.NEEDS_USER, f"{_r.reason} — {_HELD_MARK}", hold_kind(_r.gate)
     plan.update_status(nxt.id, _st,
                        result=(f"{result_summary} — {_why}" if _why else result_summary),
-                       failure_reason=_fail_reason, actual_tool=tool_name)
+                       failure_reason=_fail_reason, actual_tool=tool_name,
+                       wait=(("owner_turn", _hold or _hold_kind_of(_why) or "held", _why)   # §4SU Phase 3
+                             if _st == TaskStatus.NEEDS_USER else None))
     # update_status(DONE) silently DEMOTES the leaf to FAILED when a
     # postcondition isn't satisfied (planning.py). Read the resulting
     # status so the event log / work_log / dream digest record what
@@ -1653,6 +2072,10 @@ async def _advance_once_body(
     if _held:
         step_payload["description"] = nxt.description
         step_payload["reason"] = _why
+        step_payload["hold"] = _hold or _hold_kind_of(_why)
+        step_payload["files"] = [research_path] if research_path else []
+    elif not _step_ok and _refused_gate:
+        step_payload["refused_gate"] = _refused_gate          # r1 L3: not a postcondition
     elif not _step_ok:
         step_payload["postcondition_failed"] = True
     # §4LP: the "While you were away … on my own" digest counts only steps
@@ -1752,10 +2175,22 @@ class AdvanceManyResult:
     stop_reason: str          # project_done · count_reached · needs_user ·
                               # budget_or_inactive · failed · hard_cap · no_store
     requested: Optional[int]  # count asked for; None == "all"
+    gated: list = field(default_factory=list)   # §4SR: ids skipped at a gate (never ran)
+    held: list = field(default_factory=list)    # §4SR r3: ids held for the owner's own run
+    not_run: list = field(default_factory=list)  # gated + held before running
+    experiments: list = field(default_factory=list)  # §4SU Phase 5: model experiments gone past
 
     @property
     def count(self) -> int:
         return len(self.advanced)
+
+    @property
+    def ran(self) -> int:
+        """Ticks that ran a task — one of the tasks asked for. A gate tick or
+        a hold made before running is not; a task that ran and was then held
+        is (r3 MAJOR). Counted per entry: a task gated twice ran 0 (r3 m5)."""
+        skip = set(self.not_run)
+        return sum(1 for a in self.advanced if a.get("task_id") not in skip)
 
 
 def classify_advance_intent(text: str) -> Dict[str, Any]:
@@ -1788,34 +2223,60 @@ def classify_advance_intent(text: str) -> Dict[str, Any]:
     return {"mode": "one", "count": 1}
 
 
-def default_llm_classifier(context):
+#: §4SR: the one prompt both classifier paths send (the tool path's copy and
+#: the idle loop's copy had drifted apart in everything but the words)
+CLASSIFY_PROMPT = (
+    "Classify this task into EXACTLY one word: 'coding' (writes/runs code), "
+    "'research' (reads/searches/summarizes), or 'needs_user' (requires a human "
+    "decision/approval/publish). Output ONLY the one word.\n\nTASK: ")
+
+
+def default_llm_classifier(context, *, background: bool = False, on_error=None):
     """An LLM-backed task classifier from ``context.llm_client`` (or None →
-    callers fall back to the keyword heuristic). Mirrors the idle
-    autoadvancer so the tool path and idle path classify identically."""
+    callers fall back to the keyword heuristic). The tool path, the API route
+    and the idle autoadvancer all use THIS one, so they classify identically.
+
+    §4SR: it runs on the worker pool with thinking OFF and never on the main
+    slot (``off_main_only``). The tool path used to send it to the main model
+    with thinking on and ``max_tokens: 8`` — the reasoning ate the 8 tokens,
+    ``content`` came back empty (replayed live: finish_reason ``length``), so
+    every owner advance fell back to the keywords after saving and restoring
+    the owner's conversation around a call that could not answer. No worker
+    (or it fails) → the keyword bucket. The answer is logged with the label
+    it gave; ``settle_gate`` (advance_once) has the last word on needs_user."""
     llm = getattr(context, "llm_client", None)
     if llm is None:
         return None
     model = getattr(getattr(context, "args", None), "model", "default")
 
     async def _classify(description: str) -> str:
+        out = ""
         try:
             r = await llm.chat_completion({
                 "model": model,
-                "messages": [{"role": "user", "content": (
-                    "Classify this task into EXACTLY one word: 'coding' "
-                    "(writes/runs code), 'research' (reads/searches/"
-                    "summarizes), or 'needs_user' (requires a human "
-                    "decision/approval/publish). Output ONLY the one word."
-                    "\n\nTASK: " + str(description)[:500])}],
+                "messages": [{"role": "user", "content": CLASSIFY_PROMPT + str(description)[:500]}],
                 "temperature": 0.0, "max_tokens": 8, "stream": False,
-            }, side_main=True, task_label="project-classify")     # §4SD: the owner's conversation saved first
+                "chat_template_kwargs": {"enable_thinking": False},
+            }, use_worker=True, is_background=background, off_main_only=True,
+                require_healthy=True, timeout=10.0, task_label="project-classify")
             out = ((r or {}).get("choices", [{}])[0]
                    .get("message", {}).get("content", "") or "").strip().lower()
-            for label in ("needs_user", "coding", "research"):
-                if label in out:
-                    return label
-        except Exception as e:  # pragma: no cover - network/LLM variance
-            logger.debug("advance classify failed: %s", e)
+            found = [lb for lb in ("needs_user", "coding", "research") if lb in out]
+            if len(found) == 1:          # two labels is no answer (r1: order decided it)
+                logger.info("project classify — %s (worker said %r): %s",
+                            found[0], out[:40], str(description)[:80])
+                return found[0]
+        except Exception as e:  # noqa: BLE001 - network/LLM variance
+            logger.info("project classify — worker failed (%s), keyword bucket: %s",
+                        type(e).__name__, str(description)[:80])
+            if on_error is not None:
+                try:
+                    on_error(e)
+                except Exception:  # noqa: BLE001
+                    logger.debug("classifier on_error hook failed", exc_info=True)
+            return classify_task(description)
+        logger.info("project classify — no label in %r, keyword bucket: %s",
+                    out[:40], str(description)[:80])
         return classify_task(description)
 
     return _classify
@@ -2026,7 +2487,7 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
         # r2 C1/C2: a paused (or never opted-in) project is not advanced by a
         # background run — only the owner's own turn turns autopilot on
         return AdvanceResult(True, None, "blocked",
-                             "autopilot is off — only the owner's own turn turns it on")
+                             "autopilot is off — only the owner's action=autopilot enabled=true turns it on")
     _mine = {"boot": _BOOT_ID, "ts": time.time(), "id": os.urandom(4).hex()}
     _claim = {"lost": False, "busy": False}
 
@@ -2110,7 +2571,7 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
             for _tid in claimed:
                 if _task_status(store, project_id, _tid) == "IN_PROGRESS":
                     try:
-                        store.update_task(_tid, status="READY",
+                        store.update_task(_tid, status="PENDING",
                                           failure_reason="unattended step ended without closing it")
                     except Exception:  # noqa: BLE001
                         logger.debug("left-claimed leaf not reset", exc_info=True)
@@ -2126,6 +2587,8 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
         _bump_meta(store, project_id, _leave)
     # only a step that WORKED on a task (or was aborted) is scored; a tick
     # that claimed nothing is not a step
+    if res.task_id is None and res.classification == "idle":
+        _pause_if_stuck(context, store, project_id)
     if not (res.task_id or res.classification in ("timeout", "error")) or res.classification == "deferred":
         return res                     # §4PG r3: a deferral is not a step
     score = _step_score(store, project_id, res.task_id)
@@ -2155,6 +2618,80 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
     return res
 
 
+def _request_id_now() -> str:
+    """§4SU Phase 0: the request that parked a human gate (the owner's
+    approval must come from a LATER request)."""
+    try:
+        from ..utils.logging import request_id_context
+        return str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _pause_if_stuck(context, store, project_id) -> None:
+    """§4SU Phase 0 (audit): nothing could be handed out, yet open work
+    remains and none is running, and EVERY open leaf is held by a FAILED task
+    (through its ``depends_on`` chain or a BLOCKED ancestor). The idle tick
+    was never scored, so autopilot ticked on such a project forever and told
+    no one. Pause it and name the failed task(s). A leaf waiting on the
+    owner, or one that could still run, is not "stuck" (r1). Never raises."""
+    try:
+        tasks = store.list_tasks(project_id) or []
+        st = lambda t: str(t.get("status") or "").upper()      # noqa: E731
+        if any(st(t) == "IN_PROGRESS" for t in tasks):
+            return
+        by_id = {t["id"]: t for t in tasks}
+        failed_ids = {t["id"] for t in tasks if st(t) == "FAILED"}
+        if not failed_ids:
+            return
+        parents = {t.get("parent_id") for t in tasks if t.get("parent_id")}
+        open_leaves = [t for t in tasks if st(t) in ("PENDING", "READY") and t["id"] not in parents]
+
+        def _under(i, anc) -> bool:
+            seen, p = set(), by_id.get(i, {}).get("parent_id")
+            while p and p not in seen:
+                if p == anc:
+                    return True
+                seen.add(p)
+                p = by_id.get(p, {}).get("parent_id")
+            return False
+
+        def _held(t, seen) -> set:
+            """The FAILED tasks ``t`` waits on (r2: one helper, one signature —
+            a rebound lambda crashed every chain longer than one link)."""
+            out = set()
+            p, anc_seen = t.get("parent_id"), set()
+            while p and p in by_id and p not in anc_seen:          # a BLOCKED ancestor
+                anc_seen.add(p)
+                if st(by_id[p]) == "BLOCKED":
+                    out |= {i for i in failed_ids if _under(i, p)}
+                    break
+                p = by_id[p].get("parent_id")
+            for d in (t.get("depends_on") or []):                  # the depends_on chain
+                if d in seen:
+                    continue
+                seen.add(d)
+                if d in failed_ids:
+                    out.add(d)
+                elif d in by_id and st(by_id[d]) in ("PENDING", "READY", "BLOCKED"):
+                    out |= _held(by_id[d], seen)
+            return out
+        culprits = set()
+        for t in open_leaves:
+            h = _held(t, set())
+            if not h:
+                return                 # this leaf could still run, or waits on the owner
+            culprits |= h
+        if not culprits:
+            return
+        names = "; ".join(f"{i} ({task_topic(by_id[i].get('description') or '')[:60]})" for i in sorted(culprits)[:3])
+        pause_autopilot(context, project_id, "stuck",
+                        f"{len(open_leaves)} open task(s) can't run — they wait on failed work: {names}. "
+                        "Retry or replan the failed task(s), then resume autopilot.")
+    except Exception:  # noqa: BLE001
+        logger.warning("stuck-project check failed", exc_info=True)
+
+
 def unattended_step_live(store, project_id) -> str:
     """§4PG (R1-1): "N min" when a step of THIS process is running on the
     project (a fresh same-boot `step_in_flight`), else "". The owner's own
@@ -2180,7 +2717,7 @@ def _after_abort(store, project_id, claimed, t0, kind, why) -> AdvanceResult:
         return AdvanceResult(True, tid, "finished", f"finished before the abort ({why})")
     if tid:
         try:
-            store.update_task(tid, status="READY", failure_reason=f"unattended {why}")
+            store.update_task(tid, status="PENDING", failure_reason=f"unattended {why}")
         except Exception:  # noqa: BLE001
             logger.debug("aborted leaf not reset", exc_info=True)
     _increment_budget(store, project_id)
@@ -2249,7 +2786,14 @@ async def advance_many(
         problem (e.g. a broken shell every app builds on). Every failure is
         recorded and reported.
 
-    Also stops at: count reached · project done (no ready leaf) · a human gate ·
+    Gates (§4SR): ``stop_on_fail=True`` stops at a task that needs the
+    owner; ``stop_on_fail=False`` leaves it NEEDS_USER, carries on with the
+    rest; a gate tick is not one of the ``max_tasks``. The batch ends
+    ``needs_user`` only when nothing else can run (no ready leaf, or the
+    project rolled up to NEEDS_USER) and nothing FAILED; a count/cap stop
+    keeps its reason. A task gated twice in one batch stops it.
+
+    Also stops at: count reached · project done (no ready leaf) ·
     budget exhausted · the hard iteration cap. Returns what advanced and why.
     """
     store = getattr(context, "project_store", None)
@@ -2259,10 +2803,20 @@ async def advance_many(
 
     def _final_reason(default: str) -> str:
         """When the loop ends naturally, report completion-with-failures
-        distinctly from a clean completion."""
+        distinctly from a clean completion. (§4SR: a count/cap stop past a
+        gate keeps its own reason — more may still run; the tool lists the
+        waiting tasks on every stop.)"""
         if any(a.get("status") == "FAILED" for a in advanced):
             return "completed_with_failures"
         return default
+
+    def _ledger_failed() -> bool:
+        try:
+            return any(str(t.get("status", "")).upper() == "FAILED"
+                       for t in store.list_tasks(project_id))
+        except Exception:  # noqa: BLE001
+            logger.debug("ledger FAILED scan skipped", exc_info=True)
+            return False
 
     # Iteration ceiling: the smaller of the requested count and the hard
     # cap; "all" (None) runs to the hard cap (budget/stop-conditions end it
@@ -2270,10 +2824,44 @@ async def advance_many(
     limit = hard_cap if max_tasks is None else max(1, min(int(max_tasks), hard_cap))
     stop_reason = "count_reached"
     consecutive_fails = 0
+    _gated: list = []            # §4SR: tasks this batch went past at a gate
+    _held: list = []             # §4SR r3: tasks held for the owner's own run
+    _not_run: set = set()        # gated or held BEFORE running — not one of the N
+    _experiments: list = []      # §4SU Phase 5: model experiments the batch went past
+
+    def _note(res, status) -> None:
+        """Book a tick that stopped the batch: a gate / pre-run hold, or a
+        task that ran and was held (r4 NIT: the paused and safe-mode branches
+        dropped the ran-then-held one)."""
+        if not _skip_tick(res) and status == "NEEDS_USER" and res.task_id:
+            _held.append(res.task_id)
+
+    def _skip_tick(res) -> bool:
+        """Record a tick that did not run its task: a gate (needs_user), or a
+        hold made before running (an unattended model experiment, summary
+        ending _HELD_MARK). True when it was one."""
+        if (res.classification or "").lower() != "needs_user" or not res.task_id:
+            return False
+        try:                     # §4SU Phase 3: the task's wait field, not the summary text
+            _row = store.get_task(res.task_id)
+        except Exception:  # noqa: BLE001
+            _row = None
+        _is_hold = (_row.get("wait_on") == "owner_turn" if _row
+                    else str(res.summary or "").endswith(_HELD_MARK))   # (no row: the result's own note)
+        (_held if _is_hold else _gated).append(res.task_id)
+        _not_run.add(res.task_id)
+        return True
 
     _batch_t0 = time.time()
     _longest_step = 0.0
-    for _ in range(limit):
+    _ticks = 0                   # §4SR: steps that count toward ``limit`` (not gates)
+    for _ in range(limit + hard_cap):    # + gates, each task at most once (backstop)
+        if _ticks >= limit:
+            # r6 #4: more may still run — a FAILED task in the batch is in
+            # `advanced`, not a reason to say "every task it could"
+            stop_reason = ("hard_cap" if max_tasks is None or int(max_tasks) > hard_cap
+                           else "count_reached")      # r7: a count above the cap stops AT it
+            break
         # §4MQ: a batch inside a request stops BEFORE a step that would end
         # inside the report reserve — "finish the project" ran up to 40
         # builds in one tool call and nothing checked the clock
@@ -2284,7 +2872,8 @@ async def advance_many(
         _kw = dict(tool_runner=tool_runner, llm_classifier=llm_classifier,
                    code_generator=code_generator, coding_executor=coding_executor)
         if owner_requested:
-            res = await advance_once(context, project_id, owner_requested=True, **_kw)
+            res = await advance_once(context, project_id, owner_requested=True,
+                                     exclude_ids=set(_experiments), **_kw)
         else:
             # a scheduled task's, sub-agent's or probe's batch runs under
             # the unattended gates (§4MQ) — and stops when they pause
@@ -2297,6 +2886,7 @@ async def advance_many(
                 advanced.append({"task_id": res.task_id, "classification": res.classification,
                                  "status": (store.get_task(res.task_id) or {}).get("status"),
                                  "summary": res.summary})
+                _note(res, advanced[-1]["status"])   # r3 n3: a gate here did not run
             break
         cls = (res.classification or "").lower()
         if cls == "idle":
@@ -2336,7 +2926,14 @@ async def advance_many(
             advanced.append({"task_id": res.task_id, "classification": res.classification,
                              "status": (store.get_task(res.task_id) or {}).get("status"),
                              "summary": res.summary})
-            stop_reason = "model_experiment"      # §4QA: the turn runs it with probe_model
+            _not_run.add(res.task_id)             # §4SR r8: held, not run — not in `ran`
+            # §4SU Phase 5 (operator 11-02): the turn runs it with probe_model
+            # (§4QA) — but the batch first goes on with the tasks that do not
+            # wait on it; the stop is reported as model_experiment at the end
+            _experiments.append(res.task_id)
+            if owner_requested and len(_experiments) <= hard_cap:
+                continue
+            stop_reason = "model_experiment"
             break
         if res.task_id and res.summary.startswith(OUT_OF_TIME_PREFIX):
             advanced.append({"task_id": res.task_id, "classification": res.classification,
@@ -2368,6 +2965,14 @@ async def advance_many(
                                if any(a.get("status") == "FAILED"
                                       for a in advanced)
                                else "project_failed")
+            elif pstatus == "NEEDS_USER" and res.summary.startswith("project is "):
+                # §4SR: the project rolled up to NEEDS_USER — what is left
+                # waits on the owner; not a budget stop. A FAILED task from an
+                # earlier run still outranks it (r1 M1: it was hidden). Only
+                # the "not ACTIVE" refusal: a budget, rail or dependency stop
+                # on a NEEDS_USER project is still that stop (r4 MAJOR).
+                stop_reason = _final_reason(
+                    "project_failed" if _ledger_failed() else "needs_user")
             else:
                 stop_reason = "budget_or_inactive"
             break
@@ -2382,8 +2987,22 @@ async def advance_many(
             "summary": res.summary,
         })
         if cls == "needs_user" or status == "NEEDS_USER":
-            stop_reason = "needs_user"
-            break
+            # §4SR: the batch that skips a FAILED task (stop_on_fail=False)
+            # skips a gated one too — the gate is the owner's, the other tasks
+            # are not (req 4609b359 stopped 0 of 10 on task 1, nine
+            # independent tasks behind it). The safe mode still stops; a task
+            # gated twice in one batch (re-picked) stops it, never loops.
+            if stop_on_fail or res.task_id in _not_run:
+                if stop_on_fail:
+                    _note(res, status)
+                stop_reason = "needs_user"
+                break
+            if _skip_tick(res):
+                continue         # never ran: not one of the N asked for (r1 M2)
+            # r3 MAJOR: it RAN and was then held (an unattended close —
+            # "not closed unattended"): a hold, and one of the N
+            _held.append(res.task_id)
+        _ticks += 1
         if status == "FAILED":
             consecutive_fails += 1
             if stop_on_fail:
@@ -2396,10 +3015,21 @@ async def advance_many(
         else:
             consecutive_fails = 0
     else:
-        stop_reason = _final_reason(
-            "hard_cap" if max_tasks is None else "count_reached")
+        # r7: a cap stop keeps its reason (r6 #4); r8: the range can run out
+        # on the very tick that reached the count
+        stop_reason = ("count_reached" if _ticks >= limit and max_tasks is not None
+                       and int(max_tasks) <= hard_cap else "hard_cap")
 
-    return AdvanceManyResult(advanced, stop_reason, max_tasks)
+    # §4SU Phase 5: the batch went past model experiment(s) and carried on;
+    # once it stops for a reason that is not a failure, the experiment is
+    # what the turn must do next — report that stop (its instruction says
+    # "do it NOW … then call autoadvance again for the rest")
+    if _experiments and stop_reason in ("count_reached", "hard_cap", "project_done", "open_but_waiting"):
+        # r1: a deadline, a gate waiting on the owner or a step in progress
+        # keeps its stop; the experiments are listed beside it
+        stop_reason = "model_experiment"
+    return AdvanceManyResult(advanced, stop_reason, max_tasks,
+                             list(_gated), list(_held), sorted(_not_run), list(_experiments))
 
 
 def _looks_like_failure(output: str) -> bool:

@@ -119,8 +119,9 @@ async def test_status_of_a_named_project_reports_it_without_switching(context, s
 
 def test_a_task_update_that_landed_nothing_is_rejected():
     from ghost_agent.tools.projects import _ok
-    for key in ("missing", "still_failing", "constraint_violations", "gated_unverified"):
-        assert _ok({"updated": [], "count": 0, key: ["t1"]}).is_failure
+    # §4SU Phase 4: every gate refusal is in `refused`; `missing` = unknown ids
+    for key, val in (("missing", ["t1"]), ("refused", [{"task_id": "t1", "gate": "recheck"}])):
+        assert _ok({"updated": [], "count": 0, key: val}).is_failure
     assert not _ok({"updated": [{"id": "t1"}], "count": 1}).is_failure
 
 
@@ -356,7 +357,9 @@ async def test_only_the_owners_autoadvance_opts_in_and_counts_as_asked(context, 
             await tool_manage_projects(context, action="autoadvance", project_id=pid)
     finally:
         request_id_context.reset(tok)
-    assert (store.get_project(a).get("metadata") or {}).get("autopilot")
+    # §4SU Phase 5 (operator 11-02): the owner's batch counts as asked, but
+    # autopilot is an explicit opt-in — no advance turns it on
+    assert not (store.get_project(a).get("metadata") or {}).get("autopilot")
     assert not any((store.get_project(p).get("metadata") or {}).get("autopilot") for p in others)
     assert seen == [True, False, False, False]
 
@@ -620,7 +623,7 @@ async def test_one_owner_step_takes_back_exactly_the_task_it_runs(store):
     v1 = store.add_task(pid, "Verify the login flow")
     v2 = store.add_task(pid, "Verify the signup flow")
     for t in (v1, v2):
-        store.update_task(t, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}")
+        store.update_task(t, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}", wait_on="owner_turn")
     ctx = SimpleNamespace(project_store=store, workspace_model=None, current_project_id=None)
 
     async def runner(name, args):
@@ -641,7 +644,7 @@ async def test_a_batch_that_stops_on_held_tasks_says_they_need_the_owner(store):
     pid = store.create_project("App", metadata={"autopilot": True})
     store.update_project(pid, status="ACTIVE")
     v = store.add_task(pid, "Verify the full pipeline")
-    store.update_task(v, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}")
+    store.update_task(v, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}", wait_on="owner_turn")
     store.add_task(pid, "Ship the release notes", depends_on=[v])    # open, but waits on the held task
     store.update_project(pid, status="ACTIVE")
     ctx = SimpleNamespace(project_store=store, workspace_model=None, current_project_id=None)
@@ -657,7 +660,7 @@ async def test_a_batch_that_stops_on_held_tasks_says_they_need_the_owner(store):
 def _held(store, pid, desc, **kw):
     from ghost_agent.core.project_advancer import _HELD_MARK
     t = store.add_task(pid, desc, **kw)
-    store.update_task(t, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}")
+    store.update_task(t, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}", wait_on="owner_turn")
     return t
 
 
@@ -705,7 +708,8 @@ async def test_a_held_task_under_a_paused_phase_stays_put(store):
         return "### 1. Fixture notes\nThe fixture loads three sample rows.\n[Source: https://example.org/a]"
     res = await advance_once(ctx, pid, tool_runner=runner, owner_requested=True)
     assert res.task_id != v and store.get_task(v)["status"] == "NEEDS_USER"
-    assert store.get_task(phase)["status"] == "PAUSED"
+    # §4SU Phase 3: a paused phase is stored WAITING on the owner (not taken back)
+    assert store.get_task(phase)["status"] == "NEEDS_USER" and store.get_task(phase)["wait_code"] == "paused"
 
 
 async def test_a_needs_user_stop_names_the_waiting_tasks(context, store, monkeypatch):
@@ -717,7 +721,10 @@ async def test_a_needs_user_stop_names_the_waiting_tasks(context, store, monkeyp
         return PA.AdvanceManyResult([], "needs_user", None)
     monkeypatch.setattr(PA, "advance_many", fake_many)
     res = json.loads(await tool_manage_projects(context, action="autoadvance", project_id=pid))
-    assert [x["task_id"] for x in res["needs_user_tasks"]] == [t]
+    # §4SR: a HOLD is named in held_tasks (the owner's own run picks it up);
+    # needs_user_tasks is for gates the owner must answer
+    assert [x["task_id"] for x in res["held_tasks"]] == [t]
+    assert "needs_user_tasks" not in res
 
 
 # ── the check rule errs toward holding (§4LQ, after four review rounds) ──

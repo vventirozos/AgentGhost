@@ -58,6 +58,29 @@
     </tbody>
   </table></div>
 
+  <h2 id="4su">&sect;4SU Phase 0 (2026-11-02)</h2>
+  <ul>
+    <li><code>PATCH /{pid}/tasks/{tid}</code> with <code>status=DONE</code> is the owner's own click, so it passes <code>human_approved=True</code>: it closes a <code>HUMAN_GATE:</code> task directly. The agent's own closes need a later owner request (see <a href="../tools/projects.html#4su">tools.projects</a>).</li>
+    <li><code>POST /{pid}/advance</code> answers 409 while an unattended autopilot step is running on the project, the same rule as the tool's <code>autoadvance</code> (&sect;4PG R1-1). It used to build in the same workspace beside it.</li>
+  </ul>
+
+  <h2 id="4su-p1">&sect;4SU Phase 1 (2026-11-02)</h2>
+  <ul>
+    <li>The task id is canonicalised (a mixed-case id was a silent 200 no-op).</li>
+    <li>The fields other than status land <em>before</em> the status, so the close is judged on the task as the owner just edited it.</li>
+    <li>A DONE click runs <a href="../core/task_close.html">check_close</a> with <code>actor="owner"</code>. It always closes (operator 11-02: "close, record why"); each gate it went over is logged as a <code>close_override</code> event (<code>actor: owner</code>) and an <code>OVERRIDE &lt;gate&gt; on task &lt;id&gt; (by the owner, web console)</code> ledger line. An overridden postcondition gate is not demoted to FAILED after. The check gets the task's and the project's constraints, so a constraints-evidence gate is recorded too; a re-click (or a result edit) on a task already DONE records nothing again and is never demoted to FAILED by a postcondition. The status write and the override records run in one worker thread, so a cancel cannot separate them (r3). The response carries <code>not_closed</code> [{task_id, status, why}] for any parent the click parked or the roll-up refused.</li>
+  </ul>
+
+  <h2 id="4su-p3">&sect;4SU Phase 3 (2026-11-02)</h2>
+  <ul>
+    <li>The owner's DONE click over a constraint hold is recognised by <code>wait_code == "rollup_constraints"</code>, not by the summary text, and the recorded reason comes from <code>wait_why</code> (<a href="../core/task_wait.html">core.task_wait</a>). Task rows carry <code>wait_on</code> / <code>wait_code</code> / <code>wait_why</code>; the status names are unchanged.</li>
+  </ul>
+
+  <h2 id="4su-p2">&sect;4SU Phase 2 (2026-11-02)</h2>
+  <ul>
+    <li><code>POST /{pid}/tasks</code> takes <code>kind</code> and <code>PATCH /{pid}/tasks/{tid}</code> takes <code>kind</code> (see <a href="../core/task_kind.html">core.task_kind</a>); an unknown kind is a 4xx.</li>
+  </ul>
+
   <h2>Route hardening (2026-07-20)</h2>
   <ul>
     <li><b><code>/advance</code> builds a real, project-pinned tool runner — or refuses.</b> The route used to call <code>advance_once</code> with no runner, i.e. the degraded classify-only path, which marked a research leaf DONE having done nothing — theatrical completion on a network-reachable authed route. It now builds the SAME registry-backed runner the <code>manage_projects autoadvance</code> action uses: tools constructed from <code>pinned_project_context</code> (file writes resolve to <code>projects/&lt;pid&gt;/</code>), the run wrapped in <code>pinned_event_project</code> (workspace events stamp the advanced project, not whatever the chat side has active), plus the LLM classifier / code generator and the real coding executor. When no runner can be built the route returns <b>503</b> instead of failing open. The Slack <code>advance</code> command's async path (<code>interface/slack_project_commands.py · advance_async</code>) got the identical treatment — same pinned runner and <code>pinned_event_project</code> wrap, refusing with a <q>tool runner unavailable</q> warning reply (a chat surface has no status code). Covered by <code>tests/test_slack_project_commands.py</code>.</li>

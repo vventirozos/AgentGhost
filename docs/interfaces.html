@@ -137,6 +137,19 @@
   <p><strong>Reactions are covered on purpose.</strong> A 👍/👎 on a bot reply writes a human outcome label on that turn. Only the owner's turns are replayed by the learning loop, so today a member's label is recorded and changes nothing; the ban still covers reactions so a banned user can't write into that record while appearing ignored.</p>
   <p>The owner is exempt unconditionally — a mistyped ID in that variable cannot lock you out of your own bot. To find someone's ID: their Slack profile → <strong>⋮</strong> → <em>Copy member ID</em>.</p>
 
+  <h3 id="maintenance">Maintenance mode</h3>
+  <p>While maintenance is on, the bot sends <em>nothing</em> to the agent: mentions, DMs (yours too), file uploads and 👍/👎 labels all stop at the bot. Every message it would have answered gets one maintenance reply in its thread instead. People it ignores (strangers, shadow-banned users) still get silence. Notifications from the agent keep flowing to you.</p>
+  <p>The switch is one file, <code>~/Data/AI/Logs/ghost-slack-maintenance</code> (<code>GHOST_SLACK_MAINTENANCE_FILE</code>). The bot checks it on every message, so a change takes effect at once, with no restart, and survives restarts. Whatever the file says is the reply; an empty file gives "🔧 The agent is down for maintenance — please try again later."</p>
+  <pre class="shell">echo "Upgrading the model, back at 20:00" &gt; ~/Data/AI/Logs/ghost-slack-maintenance   # on
+rm ~/Data/AI/Logs/ghost-slack-maintenance                                          # off</pre>
+  <p>From Slack, DM the bot (owner only; the bot answers these itself, and they work while maintenance is on):</p>
+  <ul>
+    <li><code>maintenance on</code> — on, with the default reply; <code>maintenance on: back at 20:00</code> — on, with your text (the colon, or a dash with spaces on both sides, is needed, so "maintenance on my car is due…" or "maintenance on-call rota…" is still an ordinary request)</li>
+    <li><code>maintenance off</code></li>
+    <li><code>maintenance status</code></li>
+  </ul>
+  <p>The command must be the whole message, without an attachment (trailing <code>.!?</code> and <code>*bold*</code> / <code>`code`</code> wrapping are fine). A file that exists but cannot be read still counts as on. The reply text is escaped, so it can never ping <code>@channel</code> or a person. The old <code>--maintenance on|off</code> start flag now writes or removes the same file; left out, the file stays as it is. Each blocked message is logged at INFO; a dropped 👍/👎 is logged at WARNING (reactions are not replayed).</p>
+
   <h3>One message, one answer</h3>
   <p>Slack sometimes delivers the same message to the bot twice &mdash; it re-sends an event when it doesn't see the bot's acknowledgement in time, and a message with a file attached has also arrived twice in the same instant. On 2026-10-19 a member's "dress this lady &hellip; as a witch" with a photo was answered twice: two full turns, two pictures. The bot now remembers each message it has acted on (channel + message timestamp) for 10 minutes and drops a repeat before downloading anything or calling the agent. The memory is in-process, so a repeat that arrives across a bot restart still gets through.</p>
   <p>Each mention or DM that passes the bot's access check writes one line to the info log &mdash; <code>mention event channel=&hellip; ts=&hellip; thread_ts=&hellip; user=&hellip; event_id=&hellip; event_time=&hellip; files=N</code> &mdash; and a repeat then adds <code>duplicate event dropped &hellip;</code>, saying whether it carried the <em>same</em> event id (Slack re-sending one event) or a <em>new</em> one (Slack sending a second event for the message).</p>

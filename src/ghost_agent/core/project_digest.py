@@ -26,7 +26,8 @@ logger = logging.getLogger("GhostAgent")
 
 # Event types written by core.project_advancer.advance_once.
 _ADVANCE_EVENTS = ("autoadvance_step",)
-_NEEDS_USER_EVENTS = ("autoadvance_needs_user", "human_gate_triggered")
+# §4SU Phase 1 r1 M3: a parent the close check refused at roll-up waits for the owner too
+_NEEDS_USER_EVENTS = ("autoadvance_needs_user", "human_gate_triggered", "rollup_refused")
 # Written by ProjectStore._maybe_rollup_project_status when task updates
 # settle the whole project's status.
 _ROLLUP_EVENTS = ("project_auto_rollup",)
@@ -99,6 +100,7 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
             continue
         candidates.extend(projs if cap is None else projs[:cap])
     touched = set()
+    _nu_seen: set = set()
     finished_pids = set()
     for p in candidates:
         pid = p.get("id")
@@ -169,15 +171,26 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
                     phrase = etype.replace("_", " ")
                 res.milestones.append(f"[{title}] {phrase}")
             else:  # needs-user
-                touched.add(pid)
+                # §4SU Phase 1 r4 L2: one row per task (a re-stated roll-up
+                # refusal logs again; it is still one task waiting)
+                _tk = (pid, ev.get("task_id"))
+                if ev.get("task_id") and _tk in _nu_seen:
+                    continue
+                _nu_seen.add(_tk)
                 payload = ev.get("payload") or {}
                 desc = str(payload.get("description") or "")
-                if not desc and ev.get("task_id"):
+                if ev.get("task_id"):
+                    # §4SU Phase 1 r7: a task that has since closed DONE no
+                    # longer waits for the owner
                     try:
-                        t = store.get_task(ev["task_id"]) or {}
-                        desc = str(t.get("description") or "")
+                        _t_now = store.get_task(ev["task_id"]) or {}
                     except Exception:
-                        desc = ""
+                        _t_now = {}
+                    if _t_now.get("status") == "DONE":
+                        continue
+                    if not desc:
+                        desc = str(_t_now.get("description") or "")
+                touched.add(pid)                 # r8: after the skip — a hidden row touches nothing
                 res.needs_user.append((title, (desc or "(task)")[:80]))
     res.projects_touched = len(touched)
     return res

@@ -143,7 +143,7 @@ def test_alternative_consumption_is_durable(store):
     plan2 = ProjectPlan(store, pid)
     alt_node = plan2.tree.nodes[alt]
     assert alt_node.parent_id == parent          # reparented + persisted
-    assert alt_node.status == TaskStatus.READY    # promoted + persisted
+    assert alt_node.status == TaskStatus.PENDING    # promoted + persisted
     assert alt in plan2.tree.nodes[parent].children
     assert plan2.tree.nodes[parent].alternatives == []  # consumed + persisted
 

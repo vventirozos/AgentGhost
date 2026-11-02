@@ -79,7 +79,7 @@ def _fresh_dedup(bot):
 def _owner(bot, monkeypatch):
     monkeypatch.setattr(bot, "OWNER_ID", OWNER)
     monkeypatch.setattr(bot, "BOT_USER_ID", BOT)
-    monkeypatch.setattr(bot, "MAINTENANCE_MODE", False)
+    monkeypatch.setattr(bot, "MAINTENANCE_FILE", "")
 
 
 # ══════════════════════════════════════════════════════════════════════

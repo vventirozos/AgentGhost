@@ -61,7 +61,7 @@ def _step(store, pid, *, done: bool, delay: float = 0.0):
         if delay:
             await asyncio.sleep(delay)
         open_ = [t for t in store.list_tasks(project_id)
-                 if str(t["status"]).upper() in ("PENDING", "READY")]
+                 if str(t["status"]).upper() in ("PENDING", "PENDING")]
         if not open_:
             return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
         t = open_[0]
@@ -126,7 +126,7 @@ async def test_a_step_past_its_wall_cap_is_stopped_charged_and_its_task_reopened
     res = await advance_unattended(ctx, pid, step_timeout_s=0.2)
     assert time.monotonic() - t0 < 5
     assert res.classification == "timeout"
-    assert store.get_task(tids[0])["status"] == "READY"
+    assert store.get_task(tids[0])["status"] == "PENDING"
     m = _meta(store, pid)
     assert m["steps_used"] == 1 and m["no_progress_streak"] == 1 and not m.get("step_in_flight")
 
@@ -168,7 +168,7 @@ async def test_an_owner_batch_stops_before_a_step_that_would_cross_the_deadline(
 
     async def slow_owner_step(context, project_id, owner_requested=False, **kw):
         await asyncio.sleep(0.05)
-        open_ = [t for t in store.list_tasks(project_id) if str(t["status"]).upper() in ("PENDING", "READY")]
+        open_ = [t for t in store.list_tasks(project_id) if str(t["status"]).upper() in ("PENDING", "PENDING")]
         if not open_:
             return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
         store.update_task(open_[0]["id"], status="DONE")
@@ -337,7 +337,7 @@ async def test_a_timeout_reopens_only_its_own_leaf(store, ctx, notes, monkeypatc
         await asyncio.sleep(30)
     monkeypatch.setattr(PA, "advance_once", hang)
     await advance_unattended(ctx, pid, step_timeout_s=0.1)
-    assert store.get_task(tids[0])["status"] == "READY"
+    assert store.get_task(tids[0])["status"] == "PENDING"
     assert store.get_task(tids[1])["status"] == "IN_PROGRESS"
 
 
@@ -389,7 +389,7 @@ async def test_a_step_that_raises_is_charged_and_its_leaf_reopened(store, ctx, n
     monkeypatch.setattr(PA, "advance_once", boom)
     res = await advance_unattended(ctx, pid)
     m = _meta(store, pid)
-    assert res.classification == "error" and store.get_task(tids[0])["status"] == "READY"
+    assert res.classification == "error" and store.get_task(tids[0])["status"] == "PENDING"
     assert m["steps_used"] == 1 and m["no_progress_streak"] == 1 and not m.get("step_in_flight")
 
 
@@ -486,7 +486,7 @@ async def test_a_real_timeout_reopens_the_leaf_the_real_claim_reported(store, ct
     async def hang(name, args):
         await asyncio.sleep(5)
     res = await advance_unattended(ctx, pid, tool_runner=hang, step_timeout_s=0.2)
-    assert res.task_id == tid and store.get_task(tid)["status"] == "READY"
+    assert res.task_id == tid and store.get_task(tid)["status"] == "PENDING"
 
 
 async def test_a_crashed_build_reopens_its_task_and_three_crashes_pause(store, ctx, notes):
@@ -494,7 +494,7 @@ async def test_a_crashed_build_reopens_its_task_and_three_crashes_pause(store, c
     could retry it, the gate scored nothing, the owner's batch said done."""
     pid, tids = _coding_project(store, ["Build the login page", "Build the signup page"])
     await advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=_executor(raise_=True))
-    assert store.get_task(tids[0])["status"] == "READY"
+    assert store.get_task(tids[0])["status"] == "PENDING"
     for _ in range(2):
         await advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=_executor(raise_=True))
     m = _meta(store, pid)
@@ -550,9 +550,10 @@ async def test_a_batch_refused_by_a_running_step_does_not_blame_the_budget(store
     assert b.stop_reason == "busy"
 
 
-async def test_the_owners_autoadvance_says_when_it_turns_autopilot_back_on(store, ctx, notes, monkeypatch):
+async def test_the_owners_autoadvance_leaves_a_stopped_autopilot_off(store, ctx, notes, monkeypatch):
     """§4MR m1: after "stop all", one "do the next task" restarted overnight
-    work without a word (the turn-on itself is the §4LQ decision)."""
+    work. §4SU Phase 5 (operator 11-02): it no longer turns autopilot on at
+    all, and says so."""
     pid, _ = _autopilot_project(store)
     store.update_project(pid, metadata={"autopilot": False, "autopilot_paused": {"reason": "check-in"}})
 
@@ -564,7 +565,25 @@ async def test_the_owners_autoadvance_says_when_it_turns_autopilot_back_on(store
         out = json.loads(await tool_manage_projects(ctx, action="autoadvance", project_id=pid, count="1"))
     finally:
         request_id_context.reset(tok)
-    assert "autopilot is now ON" in out["autopilot"] and "check-in" in out["autopilot"]
+    assert "autopilot stays OFF" in out["autopilot"] and "enabled=true" in out["autopilot"]
+    m = store.get_project(pid)["metadata"]
+    assert m["autopilot"] is False and m["autopilot_paused"]["reason"] == "check-in"
+
+
+async def test_the_owners_autoadvance_resets_an_on_autopilot_s_gates(store, ctx, notes, monkeypatch):
+    pid, _ = _autopilot_project(store)
+    store.update_project(pid, metadata={"autopilot": True, "no_progress_streak": 3})
+
+    async def one(context, project_id, owner_requested=False, **kw):
+        return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
+    monkeypatch.setattr(PA, "advance_once", one)
+    tok = request_id_context.set("req-owner")
+    try:
+        out = json.loads(await tool_manage_projects(ctx, action="autoadvance", project_id=pid, count="1"))
+    finally:
+        request_id_context.reset(tok)
+    m = store.get_project(pid)["metadata"]
+    assert m["autopilot"] is True and m["no_progress_streak"] == 0 and "autopilot" not in out
 
 
 def test_a_pause_appears_in_the_while_you_were_away_digest(store, ctx, notes):
@@ -595,7 +614,7 @@ async def test_the_crash_path_itself_reopens_its_task(store, ctx, notes):
     pid, tids = _coding_project(store, ["Build the login page"])
     res = await PA.advance_once(ctx, pid, owner_requested=True, tool_runner=_runner,
                                 coding_executor=_executor(raise_=True))
-    assert res.summary.startswith("coding executor crashed") and store.get_task(tids[0])["status"] == "READY"
+    assert res.summary.startswith("coding executor crashed") and store.get_task(tids[0])["status"] == "PENDING"
 
 
 async def test_a_step_that_returns_with_its_leaf_still_claimed_gets_it_reopened(store, ctx, notes, monkeypatch):
@@ -608,7 +627,7 @@ async def test_a_step_that_returns_with_its_leaf_still_claimed_gets_it_reopened(
         return AdvanceResult(True, tids[0], "blocked", "stopped without closing it")
     monkeypatch.setattr(PA, "advance_once", stops_open)
     await advance_unattended(ctx, pid)
-    assert store.get_task(tids[0])["status"] == "READY" and _meta(store, pid)["no_progress_streak"] == 1
+    assert store.get_task(tids[0])["status"] == "PENDING" and _meta(store, pid)["no_progress_streak"] == 1
 
 
 async def test_a_stop_mid_build_reopens_its_task(store, ctx, notes):
@@ -622,7 +641,7 @@ async def test_a_stop_mid_build_reopens_its_task(store, ctx, notes):
     with pytest.raises(asyncio.CancelledError):
         await PA.advance_once(ctx, pid, owner_requested=True, tool_runner=_runner, coding_executor=_stopped)
     t = store.get_task(tids[0])
-    assert t["status"] == "READY" and t.get("failure_reason") == "stopped mid-step"
+    assert t["status"] == "PENDING" and t.get("failure_reason") == "stopped mid-step"
 
 
 async def test_a_stop_in_any_await_after_the_claim_reopens_it(store, ctx, notes):
@@ -636,7 +655,7 @@ async def test_a_stop_in_any_await_after_the_claim_reopens_it(store, ctx, notes)
         raise asyncio.CancelledError()
     with pytest.raises(asyncio.CancelledError):
         await PA.advance_once(ctx, pid, owner_requested=True, tool_runner=stopped)
-    assert store.get_task(tid)["status"] == "READY"
+    assert store.get_task(tid)["status"] == "PENDING"
 
 
 async def test_an_unattended_timeout_mid_build_is_still_charged_as_a_timeout(store, ctx, notes):
@@ -648,7 +667,7 @@ async def test_an_unattended_timeout_mid_build_is_still_charged_as_a_timeout(sto
         await asyncio.sleep(5)
     res = await advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=slow, step_timeout_s=0.3)
     assert res.classification == "timeout"
-    assert store.get_task(tids[0])["status"] == "READY"
+    assert store.get_task(tids[0])["status"] == "PENDING"
     assert _meta(store, pid)["steps_used"] == 1
 
 
@@ -676,7 +695,7 @@ async def test_an_unattended_step_stopped_from_outside_reopens_and_is_charged(st
     t.cancel()
     with pytest.raises(asyncio.CancelledError):
         await t
-    assert store.get_task(tids[0])["status"] == "READY"
+    assert store.get_task(tids[0])["status"] == "PENDING"
     assert _meta(store, pid)["steps_used"] == 1
 
     assert _meta(store, pid)["unattended_runtime_seconds"] >= 0.4          # r5 m3: its time is booked

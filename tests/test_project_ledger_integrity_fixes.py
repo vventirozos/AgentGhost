@@ -20,6 +20,7 @@ and a false completion report:
 Each test names the defect it pins down.
 """
 
+from tests._refused import refused_ids, refused_reasons  # §4SU Phase 4
 import json
 import os
 import sys
@@ -259,8 +260,8 @@ async def test_done_refused_when_file_still_broken(context):
         context, action="task_update", task_id=tid, status="done",
         result="I fixed it, trust me"))
     assert out["count"] == 0
-    assert out["still_failing"] == [tid]
-    assert "STILL fails" in out["agent_instruction_still_failing"]
+    assert refused_ids(out, "still_failing") == [tid]
+    assert "STILL fails" in refused_reasons(out, "still_failing")
     assert store.get_task(tid)["status"] == "FAILED"
     assert store.get_project(pid)["status"] == "FAILED"
 

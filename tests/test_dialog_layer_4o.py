@@ -110,8 +110,11 @@ def test_background_worker_consumers_use_off_main_only():
     mem = (REPO / "src" / "ghost_agent" / "tools" / "memory.py").read_text()
     assert mem.count("off_main_only=True") >= 2      # both smart-memory paths
     ag = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
-    # ("self-eval" was the belief-revision judge, removed in §4KZ)
-    for label in ('"classifier"', '"memory extract"'):
+    # ("self-eval" was the belief-revision judge, removed in §4KZ; the idle
+    # "classifier" became the shared default_llm_classifier in §4SR, pinned
+    # by behaviour in test_4sr_gate_words.py: its kwargs, and an idle tick
+    # through _biological_tick — off_main_only on both)
+    for label in ('"memory extract"',):
         i = ag.index(f'task_label={label}')
         assert "off_main_only=True" in ag[i - 200:i], label
     # perfect-it: off-main only for the idle (background) variant

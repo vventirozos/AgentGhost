@@ -264,6 +264,20 @@
   no version/parent lineage, so <code>list_children</code> and the fork machinery ignore clones. Deliverables
   re-registered on the seed task (keep-set). Tests: <code>tests/test_projects_cross_features.py</code>.</p>
 
+  <h2 id="4su-p3">Wait columns (&sect;4SU Phase 3, 2026-11-02)</h2>
+  <p><code>tasks.wait_on</code>, <code>wait_code</code> and <code>wait_why</code> (TEXT, default ''). See <a href="../core/task_wait.html">core.task_wait</a>.</p>
+  <ul>
+    <li><code>_migrate</code> adds the columns. <code>_migrate_task_states</code> folds READY into PENDING and fills in waits from the old text marks (idempotent).</li>
+    <li><code>add_task</code> folds the status and sets the default wait.</li>
+    <li><code>update_task</code> folds the status (PAUSED &rarr; NEEDS_USER owner/paused) and clears the wait fields on a non-waiting status. A waiting status with no <code>wait_on</code> gets <code>default_wait</code>, never the row's earlier wait. <code>wait_on</code> outside owner / owner_turn / dependency raises.</li>
+    <li>If the columns are missing (<code>_has_wait_cols()</code> false), the <code>wait_*</code> fields are dropped instead of failing the write.</li>
+    <li>The <code>task_updated</code> event does not list the wait columns.</li>
+    <li><code>reset_orphaned_in_progress</code> writes PENDING.</li>
+  </ul>
+
+  <h2 id="4su-p2">Task kind column (&sect;4SU Phase 2, 2026-11-02)</h2>
+  <p><code>tasks.kind TEXT NOT NULL DEFAULT ''</code>, added by <code>_migrate</code> on an old database. <code>add_task(..., kind="")</code> and <code>update_task(tid, kind=)</code> normalise it with <a href="../core/task_kind.html">core.task_kind.normalize_kind</a>; an unknown kind raises <code>ValueError</code>.</p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>
@@ -292,6 +306,7 @@
     <li><code>get_ledger(project_id) -&gt; str</code> / <code>append_ledger(project_id, line) -&gt; str</code> / <code>set_ledger(project_id, text) -&gt; str</code> — the project's durable, compact working memory (file layout, key APIs, conventions) stored in metadata and surfaced in the <a href="../core/prompts.html">briefing</a> every turn. <code>append_ledger</code> collapses whitespace, dedups an identical trailing line, and bounds to <code>LEDGER_MAX_LINES</code> (30) / <code>LEDGER_MAX_CHARS</code> (2400). The read-modify-write is atomic across processes (single <code>BEGIN IMMEDIATE</code> transaction — see <em>Atomic metadata read-modify-write</em> above) and logs no <code>project_updated</code> event, so frequent appends stay lost-update-safe without spamming the event log.</li>
     <li><code>log_event(project_id, task_id, event_type, payload) -&gt; int</code></li>
     <li><code>list_events(project_id, limit, event_type)</code></li>
+    <li><code>latest_task_event(project_id, task_id, event_types)</code> — the newest event of one of the given types for one task, exact in SQL (&sect;4SU Phase 0: the human-gate approval check read a newest-N window, so on a busy project the park fell out of it and every later owner yes re-parked)</li>
   </ul>
 
   <h3>Config slot (durable settings) <span class="badge">feature 1B</span></h3>

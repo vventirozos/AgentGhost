@@ -286,6 +286,8 @@
 
   <h2 id="4pi">KNOWLEDGE rule — summarising a transcript <span class="tag">2026-10-15 &sect;4PI</span></h2>
   <p>The rule routed every question about one document to <code>query</code>; the ordered <code>transcript</code> route lived only in the tool description, so "summarise this video" on a two-hour talk was written from eight chunk hits or the ingest preview, and a live probe's summary added world knowledge the transcript never said. The rule now reads: to summarise a transcribed recording or video, read it IN ORDER with <code>transcript</code>, paging until <code>[end of transcript]</code>; never from <code>query</code> hits, the preview, or what the model knows about the video; world knowledge, if added, is labelled as the model's; stopping early is stated with the part read.</p>
+  <h2 id="4su-p3">Project briefing: five states and finished projects (&sect;4SU Phases 3&ndash;4, 2026-11-02)</h2>
+  <p><code>build_project_briefing</code> labels OPEN TASKS with <a href="task_wait.html">task_wait.view_state</a>: <code>PENDING</code>, <code>RUNNING</code>, <code>WAITING(owner)</code>, <code>WAITING(owner_turn)</code> (with a note that the autopilot does not run it unattended) and <code>WAITING(dependency)</code>, never the stored NEEDS_USER / IN_PROGRESS names. A DONE or ARCHIVED project gets one line instead: "This project is FINISHED/ARCHIVED &hellip; add it HERE (task_add / task_decompose, or replan; resume it first if archived). Do not create a new project for the same topic". This replaces the ALREADY ACTIVE banner and the ONE TASK AT A TIME pacing rule. Adding a task reopens a DONE project (<code>ProjectStore.add_task</code>).</p>
 </main>
 </body>
 </html>

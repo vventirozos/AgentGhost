@@ -128,7 +128,7 @@ class TestAlternatives:
         tree.update_status(primary_id, TaskStatus.FAILED, failure_reason="Not a CSV")
         # Parent should NOT be blocked — alternative should be activated
         assert tree.nodes[parent_id].status != TaskStatus.BLOCKED
-        assert tree.nodes[fallback_id].status == TaskStatus.READY
+        assert tree.nodes[fallback_id].status == TaskStatus.PENDING
 
 
 class TestLoadFromJsonExtended:
@@ -270,4 +270,4 @@ class TestPostconditionEnforcement:
 
         tree.update_status(failing, TaskStatus.DONE, result="500 Internal")
         assert tree.nodes[failing].status == TaskStatus.FAILED
-        assert tree.nodes[alt].status == TaskStatus.READY
+        assert tree.nodes[alt].status == TaskStatus.PENDING

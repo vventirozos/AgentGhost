@@ -85,5 +85,6 @@ class TestTaskUpdateJudgmentGateWiring:
         assert "CONSTRAINT-OVERRIDE:" in src
         assert "judged_violations" in src
         # The refusal payload instructs fix-first, override only with
-        # explicit user approval.
-        assert "agent_instruction_violation" in src
+        # explicit user approval (§4SU Phase 4: one `refused` list + its
+        # instruction; behaviour pinned in test_projects_tool_review_fixes)
+        assert "agent_instruction_refused" in src

@@ -334,19 +334,11 @@ class TestTheProducersRoundFiveMigrated:
                        for k in ("_promoted_result", "_format_error"))]
         assert not bad, f"a status is concatenated away at {bad}"
 
-    def test_a_zero_advance_batch_is_not_PARTIAL(self):
-        import ghost_agent.tools.projects as P
-
-        # §4GJ: was the exact source line as a string. The AST asks the
-        # question instead: the constructor is CHOSEN by the advance count,
-        # partial on the truthy arm and failed on the falsy one.
-        picks = [n for n in ast.walk(ast.parse(inspect.getsource(P)))
-                 if isinstance(n, ast.IfExp)
-                 and "partial" in ast.unparse(n.body)
-                 and "failed" in ast.unparse(n.orelse)]
-        assert any("count" in ast.unparse(n.test) for n in picks), (
-            "a batch that advanced NOTHING still tells the model "
-            '"PART OF THIS LANDED" over an empty list')
+    # test_a_zero_advance_batch_is_not_PARTIAL (an AST pin on `count`) moved
+    # to behaviour in §4SR r8, when the choice became what RAN (a gate tick is
+    # in `count`): tests/test_4sr_gate_words.py::
+    # test_a_zero_advance_batch_is_failed_not_partial and
+    # test_a_gate_only_batch_on_a_failed_ledger_is_failed_not_partial.
 
     def test_a_refusal_gets_no_path_hint(self):
         """`_FALLBACK_HINTS["file_system"]` matches a bare "not found", so a

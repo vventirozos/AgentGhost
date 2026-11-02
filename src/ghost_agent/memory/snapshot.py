@@ -40,7 +40,7 @@ KEEP = 7
 #: holds MODEL-written sandbox files kept 7 days with their modes (§4NY): one
 #: chmod 000 file there failed every snapshot for a week (review r6)
 _SKIP_DIRS = {"eval", "bench", "tokenizer", "llm_recordings", "backups", "head_saves",
-              "scratch_trash", "__pycache__"}
+              "scratch_trash", "project_trash", "__pycache__"}   # §4SU: swept project files
 _SKIP_FILES = {"ghost-agent.log", "ghost-agent.log.1"}
 _SQLITE_SUFFIXES = (".db", ".sqlite3")
 

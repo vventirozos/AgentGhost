@@ -446,13 +446,13 @@ def test_reaper_resets_stale_in_progress(store):
         conn.commit()
     count = store.reset_orphaned_in_progress(older_than_seconds=600)
     assert count == 1
-    assert store.get_task(stale)["status"] == "READY"
+    assert store.get_task(stale)["status"] == "PENDING"   # §4SU Phase 3: READY folded
     assert store.get_task(fresh)["status"] == "IN_PROGRESS"
     assert store.get_task(open_task)["status"] == "PENDING"
     evs = store.list_events(pid, event_type="task_reset_orphaned")
     assert len(evs) == 1
     assert evs[0]["task_id"] == stale
-    assert evs[0]["payload"]["to"] == "READY"
+    assert evs[0]["payload"]["to"] == "PENDING"
 
 
 def test_reaper_safe_on_empty_store(store):
