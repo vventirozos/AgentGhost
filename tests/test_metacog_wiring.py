@@ -5,10 +5,9 @@ off.
 Scope:
   - MetacogBundle constructor + from_args contract
   - GhostContext.metacog field defaults to None (back-compat)
-  - tools/registry passes the bundle into execute + postgres_admin
+  - tools/registry passes the bundle into execute
   - tool_execute rejects deny-listed shell when bundle is wired
-  - tool_postgres_admin rejects unguarded DELETE/DROP when bundle is wired
-  - both tools execute normally when bundle is absent (legacy path)
+  - execute runs normally when bundle is absent (legacy path)
   - the shutdown summary counts validator blocks; removed host flags still parse (§4PT)
 """
 
@@ -101,7 +100,7 @@ class TestMetacogBundleConstruction:
 
 @pytest.mark.parametrize("tool,expected", [
     ("execute", "shell"),
-    ("postgres_admin", "sql"),
+    ("database", "sql"),
     ("web_search", "fetch"),
     ("file_system", "fs"),
     ("skill_memory", "memory"),
@@ -222,73 +221,6 @@ async def test_tool_execute_runs_denylisted_when_bundle_absent(tmp_path):
 # Validators integration — database.py
 # ──────────────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
-async def test_tool_postgres_admin_blocks_unguarded_delete_when_enabled():
-    """The SQL validator should reject `DELETE FROM x` BEFORE psycopg2
-    is even reached. We monkey-patch `_get_connection` to fail loudly
-    if it's called — the test only passes if the validator short-circuits."""
-    from ghost_agent.tools import database as db_module
-
-    bundle = MagicMock()
-    bundle.enabled = True
-
-    def boom(*args, **kwargs):
-        raise AssertionError("DB connection must NOT be reached")
-
-    with patch.object(db_module, "_get_connection", boom):
-        out = await db_module.tool_postgres_admin(
-            action="query",
-            connection_string="postgresql://x",
-            query="DELETE FROM users",
-            _metacog_bundle=bundle,
-        )
-    assert "SYSTEM BLOCK" in out
-    assert "DELETE" in out or "WHERE" in out
-
-
-@pytest.mark.asyncio
-async def test_tool_postgres_admin_blocks_drop_when_enabled():
-    from ghost_agent.tools import database as db_module
-    bundle = MagicMock()
-    bundle.enabled = True
-
-    def boom(*args, **kwargs):
-        raise AssertionError("DB connection must NOT be reached")
-
-    with patch.object(db_module, "_get_connection", boom):
-        out = await db_module.tool_postgres_admin(
-            action="query",
-            connection_string="postgresql://x",
-            query="DROP TABLE customers",
-            _metacog_bundle=bundle,
-        )
-    assert "SYSTEM BLOCK" in out
-
-
-@pytest.mark.asyncio
-async def test_tool_postgres_admin_skips_validator_on_schema_action():
-    """The `schema` action uses hand-crafted SQL that never sees user
-    content — the validator must not run on those calls (it would be
-    a waste, but also the canned SQL contains `information_schema`
-    which the validator's parens balance check might not love)."""
-    from ghost_agent.tools import database as db_module
-    bundle = MagicMock()
-    bundle.enabled = True
-
-    # Force psycopg2 import failure so the call short-circuits cleanly.
-    # The point is to verify the validator is NOT called — we don't
-    # care about the actual DB path here.
-    with patch.object(db_module, "_get_connection",
-                      MagicMock(side_effect=ImportError("no psycopg2"))):
-        out = await db_module.tool_postgres_admin(
-            action="schema",
-            connection_string="postgresql://x",
-            _metacog_bundle=bundle,
-        )
-    # Should fall through to the actual schema path (which fails on
-    # the missing import), NOT a validator block.
-    assert "SYSTEM BLOCK" not in out
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Registry integration
@@ -310,13 +242,12 @@ async def test_registry_injects_bundle_into_execute_lambda(tmp_path):
     ctx.args = MagicMock()
     ctx.args.max_context = 1024
     ctx.args.anonymous = True
-    ctx.args.default_db = "postgresql://x"
     sentinel = object()
     ctx.metacog = sentinel
 
     tools = get_available_tools(ctx)
     assert "execute" in tools
-    assert "postgres_admin" in tools
+    assert "postgres_admin" not in tools          # §4SX E: removed
 
     # Calling with no command surfaces the standard "must provide"
     # error — what matters is that no TypeError is raised on the

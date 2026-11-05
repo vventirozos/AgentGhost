@@ -57,7 +57,8 @@ _DAEMON_BLOCK_MSG = (
     "processes survive the exec and hold their port INVISIBLY: the "
     "service registry cannot see, stop, or report them (this exact "
     "leak caused the port-8102 incident). Start it as a SUPERVISED "
-    "service instead: manage_services action='start' name='<name>' "
+    "service instead: run action='start' lifetime='server' "
+    "where='workspace' name='<name>' "
     "command='<the same command without the & and without setsid/"
     "nohup>' — a free port is assigned automatically (exported as "
     "$PORT), logs are captured, and it keeps running across turns. "
@@ -738,7 +739,7 @@ async def _run_in_sandbox(sandbox_manager, cmd_str, *, timeout=_EXEC_TIMEOUT_S,
         identity=identity, **kwargs)
 
 
-def _promotion_banner(job: dict, ran_s: int) -> str:
+def _promotion_banner(job: dict, ran_s: int, run_name: str = "") -> str:
     """The message that turns a timeout into a promotion.
 
     It has one job beyond informing: FORECLOSING THE RETRY. The retry is what
@@ -779,11 +780,18 @@ def _promotion_banner(job: dict, ran_s: int) -> str:
         head = (f"▎ Still running at {ran_s}s — promoted to background job "
                 f"{jid}. Do NOT re-run this command — it was NOT killed and "
                 f"is still working.")
+    if run_name:
+        # §4SX D5: the promoted job is a `job` run named after its id
+        how = (f"▎ Poll it with run(action='status', name='{run_name}'); read its full "
+               f"result with run(action='collect', name='{run_name}') once it "
+               f"finishes. Stop it with run(action='stop', name='{run_name}').\n")
+    else:
+        how = (f"▎ Poll it with jobs(action='status', job_id='{jid}'); read its full "
+               f"result with jobs(action='collect', job_id='{jid}') once it "
+               f"finishes. Cancel it with jobs(action='cancel', job_id='{jid}').\n")
     return (
         f"{head}\n"
-        f"▎ Poll it with jobs(action='status', job_id='{jid}'); read its full "
-        f"result with jobs(action='collect', job_id='{jid}') once it "
-        f"finishes. Cancel it with jobs(action='cancel', job_id='{jid}').\n"
+        f"{how}"
         f"▎ It keeps running in the sandbox (up to {ttl_min} more minutes, "
         f"then it is reaped) and survives this turn; its live output is in "
         f"'{job.get('log')}' (file_system operation='read').\n"
@@ -861,7 +869,7 @@ def _append_note(res, note: str):
     return _shared(res, note)
 
 
-def _promoted_result(job: dict, ran_s: int, output: str) -> "ToolOutcome":
+def _promoted_result(job: dict, ran_s: int, output: str, run_name: str = "") -> "ToolOutcome":
     """Tool result for a promoted command. EXIT CODE 0 on purpose: the turn
     loop scores a non-zero `execute` exit as a FAILURE and a transient
     strike, and a legitimately-long task is not a failure — miscounting it
@@ -889,7 +897,7 @@ def _promoted_result(job: dict, ran_s: int, output: str) -> "ToolOutcome":
         f"--- COMMAND RESULT --- {PROMOTED_RESULT_MARKER}\n"
         f"EXIT CODE: 0 ({_state} "
         f"{job.get('id')}, NOT finished)\n"
-        f"STDOUT/STDERR:\n{_promotion_banner(job, ran_s)}\n"
+        f"STDOUT/STDERR:\n{_promotion_banner(job, ran_s, run_name)}\n"
         f"--- output so far ---\n{body or '(nothing printed yet)'}",
         reason_code="promoted_to_background_job",
     )
@@ -1822,7 +1830,9 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             _record_promoted_command(workspace_model, command, _dt, promoted_job)
             _register_promoted_job(kwargs.get("job_registry"), promoted_job,
                                    command)
-            return _promoted_result(promoted_job, int(_dt), output)
+            from .runs import record_promoted_job
+            return _promoted_result(promoted_job, int(_dt), output,
+                                    record_promoted_job(kwargs.get("run_context"), promoted_job))
 
         # Match-style commands (grep family, pgrep) exit 1 to mean "no
         # matches" — a perfectly successful query with an empty result, not a
@@ -1990,7 +2000,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     if ext == "py":
         forbidden_modules = [
             "knowledge_base", "system_utility", "manage_tasks",
-            "postgres_admin", "web_search", "fact_check", "deep_research",
+            "web_search", "fact_check", "deep_research",
             "vision_analysis",
             "learn_skill", "update_profile", "browser",
         ]
@@ -2379,8 +2389,10 @@ if has_error:
             # promotion (`if command:`) kept its status and this one did not,
             # so the same event had two different verdicts depending on which
             # argument the model used.
+            from .runs import record_promoted_job
             return _append_note(
-                _promoted_result(promoted_job, int(_dt), output), _probe_note)
+                _promoted_result(promoted_job, int(_dt), output,
+                                 record_promoted_job(kwargs.get("run_context"), promoted_job)), _probe_note)
 
         exit_code, output = _adopt_exit(exit_code, output)          # §4PH (R2-3)
         diagnostic_info = ""

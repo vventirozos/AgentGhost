@@ -51,7 +51,8 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                            suppress_next_task: bool = False,
                            graph_memory=None,
                            request_text: str = "",
-                           services=None) -> str:
+                           services=None,
+                           running=None) -> str:
     """Render a compact project-scope briefing for the system prompt.
 
     The briefing is appended to DYNAMIC SYSTEM STATE when a project is
@@ -141,7 +142,7 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             f"GOAL: {(proj.get('goal') or '').strip()}",
             "*** This project is RELEASED: human-tested and IMMUTABLE. "
             "To RUN/USE it: follow the directions below (start the listed "
-            "services via manage_services if they are not running — the "
+            "services with `run start` if they are not running — the "
             "commands were verified at release). For ANY change request: "
             "do NOT edit these files — when the USER asks for a change, fork a development copy with "
             "`manage_projects action=create_version` and work there; this "
@@ -233,10 +234,37 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     # names + leased ports the model must NOT re-invent. Registry facts
     # only — liveness is deliberately unprobed here (probing costs docker
     # execs every turn); `stale` marks entries whose container died.
+    # §4SX D5: RUNNING — the project's runs (state as last checked, and when) and lab machines, from local
+    # records only; a workspace server run IS a service, so it is listed here and not again under SERVICES
+    _run_keys = {str(r.get("service_key")) for r in (running or []) if r.get("service_key")}
+    # review: the container-generation STALE mark (§4LR M1) stays on a run-backed server's RUNNING line
+    _stale_keys = {str(s.get("key")) for s in (services or []) if s.get("stale") and s.get("key")}
+    services = [s for s in (services or []) if str(s.get("key") or "") not in _run_keys]
+    if running:
+        import time as _time
+        lines.append("RUNNING (this project's runs and lab machines — the state each had when last checked; "
+                     "`run status` / `lab list` check now):")
+        for r in running:
+            if r.get("kind") == "lab":
+                _b = f"  - lab {r.get('name')}" + (f" · {r['place']}" if r.get("place") else "")
+                if r.get("label"):
+                    _b += f" · {str(r['label'])[:40]}"
+                if r.get("state"):
+                    _b += f" · {r['state']}"
+            else:
+                _b = f"  - run {r.get('name')} · {r.get('lifetime')} · {r.get('place')}"
+                if r.get("port"):
+                    _b += f" · port {r['port']}"
+                _b += f" · {r.get('state')}"
+                if r.get("service_key") and str(r["service_key"]) in _stale_keys:
+                    _b += " · STALE (died with old sandbox — `run restart` it on demand)"
+                if r.get("at"):
+                    _b += " (checked " + _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(float(r["at"]))) + ")"
+            lines.append(_b)
     if services:
         lines.append("SERVICES (this project's registered services — ports "
                      "are LEASED to them; check liveness / start / stop via "
-                     "manage_services, never guess ports):")
+                     "`run`, never guess ports):")
         for s in services:
             _b = f"  - {s.get('name')}"
             if s.get("port") is not None:
@@ -942,7 +970,7 @@ Profile (variable naming + env assumptions only):
 - ANTI-LOOP: Previous attempt failed? DO NOT submit the exact same code again — change the approach.
 - PLOTTING & IMAGES: If you generate/save a plot, show it in your final response with `![Image](/api/download/filename.ext)`. Use the raw filename for `vision_analysis`. NEVER `plt.show()`.
 - UI/APP VERIFICATION: when checking a page/app YOU built, do NOT eyeball a `describe_picture` caption. Question about STATE (positions, scores, geometry) → browser interact `{"action":"evaluate","js":"..."}` reads the app's variables exactly. Question about LOOKS (rendering, colors, layout) → `vision_analysis(action="verify_ui", target="shot.png", prompt="<the ONE specific question>")` returns a JSON verdict {answer, confidence, evidence, details}. A generic caption routinely omits the one detail your decision hinges on.
-- DATABASES: `postgres_admin` runs SQL directly. Do NOT hallucinate URIs — omit `connection_string` to use the default internal DB. For complex data processing, you can still use `execute` with `psycopg2`/`sqlalchemy`.
+- DATABASES: there is no local database server. To run SQL on a real PostgreSQL or MySQL, create a disposable machine with the `lab` tool (when it is available) and run it there with `lab exec`; never invent a connection URI. Plain data work runs in `execute` (sqlite3, pandas).
 """
 
 # ---------------------------------------------------------------------------

@@ -363,7 +363,7 @@ async def smoke_gate(tool_runner, written: List[str]) -> Optional[str]:
         _sv = str(getattr(_st, "value", _st))
         if _sv == "unresolved":
             return ("smoke test did not finish — it is still running as a "
-                    "background job; re-check with jobs(action='status') "
+                    "background job; re-check with run(action='status') "
                     "before treating this build as good")
         if _sv != "ok":
             return (f"smoke test could not run ({_sv}): "
@@ -384,7 +384,7 @@ async def smoke_gate(tool_runner, written: List[str]) -> Optional[str]:
     if is_promoted_result(text):
         return ("smoke test did not finish — it outran its execution budget "
                 "and is still running as a background job; re-check it with "
-                "jobs(action='status') before treating this build as good")
+                "run(action='status') before treating this build as good")
     m = re.search(r"SMOKE_RESULT (\{.*\})", text)
     if not m:
         # Couldn't find our marker — the sandbox mangled the run; fail open

@@ -364,22 +364,6 @@ async def test_after_outside_content_the_uploads_folder_stays(owner_turn, tmp_pa
     assert _rejected(out) and (tmp_path / "uploads").exists()
 
 
-async def test_a_page_cannot_unlock_drop(owner_turn, monkeypatch):
-    from ghost_agent.tools import validators
-    seen = {}
-    real = validators.validate_sql
-
-    def spy(q, confirm=False):
-        seen["confirm"] = confirm
-        return real(q, confirm=confirm)
-    monkeypatch.setattr(validators, "validate_sql", spy)
-    from ghost_agent.tools.database import tool_postgres_admin
-    owner_turn.read()
-    await tool_postgres_admin(action="query", query="DROP TABLE users", confirm="true",
-                              connection_string="postgresql://u@127.0.0.1:1/db")
-    assert seen.get("confirm") is False
-
-
 # ── Class 4: the owner's identifiers do not leave after outside content ──
 
 class _PM:

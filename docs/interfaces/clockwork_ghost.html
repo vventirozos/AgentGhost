@@ -43,7 +43,7 @@
       <tr><td><code>POST /api/workspace/save · /load</code></td><td>State zip.</td></tr>
       <tr><td><code>POST $STT_SERVER_URL</code> → <code>https://eva:8080/api/stt</code></td><td>multipart audio upload (<code>arecord</code> writes 16&nbsp;kHz mono WAV — already the wanted format). Needs <code>X-Ghost-Key</code>.</td></tr>
       <tr><td><code>POST $TTS_SERVER_URL</code> → <code>https://eva:8080/api/tts</code></td><td>JSON text → <code>audio/wav</code>, piped to <code>aplay -q -</code>. Needs <code>X-Ghost-Key</code>.</td></tr>
-      <tr><td><code>GET /api/download/{image_path}</code></td><td>Fetch agent-generated images.</td></tr>
+      <tr><td><code>GET /api/download/{image_path}</code></td><td>Fetch agent-generated images. Sends <code>X-Ghost-Session</code> (§4SX B0) so a bare name resolves under this session's focused project.</td></tr>
       <tr><td><code>WS wss://eva:8080/ws?key=…</code></td><td>The interface's log broadcast — the
         only source of the waiting bubble's <a href="#turn-status">turn-status caption</a>.
         Read-only, reconnecting, never fatal.</td></tr>

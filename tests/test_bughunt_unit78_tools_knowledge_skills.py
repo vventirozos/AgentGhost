@@ -206,27 +206,6 @@ class TestScratchpad:
 # Unit 7 — database connection guard
 # ══════════════════════════════════════════════════════════════════════
 
-from ghost_agent.tools.database import tool_postgres_admin
-
-
-class TestDatabaseConnectionGuard:
-    async def test_same_host_different_db_is_refused(self):
-        out = await tool_postgres_admin(
-            action="query", query="SELECT 1",
-            default_uri="postgresql://ghost@127.0.0.1:5432/agent",
-            connection_string="postgresql://ghost@127.0.0.1:5432/otherdb",
-        )
-        assert out.startswith("Error")
-        assert "only the configured database" in out
-
-    async def test_same_host_different_port_is_refused(self):
-        out = await tool_postgres_admin(
-            action="query", query="SELECT 1",
-            default_uri="postgresql://ghost@127.0.0.1:5432/agent",
-            connection_string="postgresql://ghost@127.0.0.1:5433/agent",
-        )
-        assert out.startswith("Error")
-
 
 # ══════════════════════════════════════════════════════════════════════
 # Unit 7 — report_pdf

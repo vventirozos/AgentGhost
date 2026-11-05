@@ -2111,13 +2111,15 @@ async def workspace_load_proxy(file: UploadFile = File(...)):
         return _upstream_failure("Workspace load proxy error", e)
 
 @app.post("/api/upload", dependencies=[Depends(verify_interface_key)])
-async def upload_proxy(file: UploadFile = File(...)):
-    """Proxies file upload to the Ghost Agent."""
+async def upload_proxy(file: UploadFile = File(...), session_id: str = ""):
+    """Proxies file upload to the Ghost Agent. §4SX B0: the session id is
+    forwarded so the upload lands in THAT conversation's focused project."""
     try:
         body = await _read_capped_upload(file)
         client = _get_http_client()
         response = await client.post(
             "http://localhost:8000/api/upload",
+            params={"session_id": session_id[:200]} if session_id else None,
             files={"file": (file.filename, body, file.content_type)},
             headers={"X-Ghost-Key": GHOST_API_KEY},
             timeout=_proxy_timeout(120.0),
@@ -2130,8 +2132,11 @@ async def upload_proxy(file: UploadFile = File(...)):
         return _upstream_failure("Upload proxy error", e)
 
 @app.get("/api/download/{filename:path}", dependencies=[Depends(verify_interface_key)])
-async def download_proxy(filename: str):
-    """Proxies file download from the Ghost Agent."""
+async def download_proxy(filename: str, request: Request, session_id: str = ""):
+    """Proxies file download from the Ghost Agent. §4SX B0: the session (query
+    or ``X-Ghost-Session``) is forwarded so a bare name resolves under THAT
+    conversation's focused project."""
+    _sid = (session_id or request.headers.get("X-Ghost-Session") or "")[:200]
     # Reject path traversal upfront. The route matcher uses `:path` so it
     # would accept `..` segments. The downstream API also validates, but
     # we should fail fast.
@@ -2149,7 +2154,8 @@ async def download_proxy(filename: str):
             # subdirectory paths working.
             req = client.build_request(
                 "GET", f"http://localhost:8000/api/download/{quote(filename)}",
-                headers={"X-Ghost-Key": GHOST_API_KEY},
+                headers={"X-Ghost-Key": GHOST_API_KEY,
+                         **({"X-Ghost-Session": _sid} if _sid else {})},
                 timeout=_proxy_timeout(120.0),
             )
             resp = await client.send(req, stream=True)

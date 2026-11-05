@@ -26,7 +26,7 @@ PINS = ["tests/test_4qa_project_task_integrity.py", "tests/test_introspective_no
 def _tests():
     pat = (r"project_advancer\|project_research\|task_deliverable\|coding_executor\|tools.projects\|"
            r"tool_manage_projects\|file_system\|episodes\|link_grounding\|probe_model\|isolation\|"
-           r"composed_skills\|reconcile_conversation\|_build_memory_arc\|unopened_citation\|finalize_stream")
+           r"composed_skills\|begin_request_focus\|_build_memory_arc\|unopened_citation\|finalize_stream")
     out = subprocess.run(["grep", "-l", pat] + sorted(glob.glob(os.path.join(ROOT, "tests", "test_*.py"))),
                          capture_output=True, text=True).stdout.split()
     return sorted({os.path.relpath(t, ROOT) for t in out} | set(PINS))
@@ -34,12 +34,9 @@ def _tests():
 
 MUT = [
     ("CONTROL no-op (must SURVIVE)", TD, "def task_topic(description) -> str:", "# ctl\ndef task_topic(description) -> str:"),
-    ("CONTROL known-bad (must DIE): no gate at task close", PJ,
-     "                    if _undelivered:\n                        undelivered.append(tid)",
-     "                    if False:\n                        undelivered.append(tid)"),
+    ('CONTROL known-bad (must DIE): no gate at task close', 'src/ghost_agent/core/task_close.py', '        "deliverable": lambda: gate_deliverable(ws, judged_desc),', '        "deliverable": lambda: None,'),
     # #1 self-analysis self-stall
-    ("M1 self-analysis background again", PA, 'is_background=_idle_invocation(context), task_label="project-self-analysis")',
-     'is_background=True, task_label="project-self-analysis")'),
+    ('M1 self-analysis background again', 'src/ghost_agent/core/project_advancer.py', 'is_background=_idle_invocation(context), task_label="project-self-analysis",', 'is_background=True, task_label="project-self-analysis",'),
     # #5 routing / topic / slug
     ("M2 raw description searched", PA, 'tool_args = {"query": task_topic(nxt.description)[:200]}', 'tool_args = {"query": nxt.description[:200]}'),
     ("M3 raw description as brief topic", PA, "context, project_id, task_topic(nxt.description), output, task_id=nxt.id,",
@@ -58,12 +55,12 @@ MUT = [
      "return bool(_INTROSPECT_RE.search(d)) and not _HUMAN_SUBJECT_RE.search(d)", "return bool(_INTROSPECT_RE.search(d))"),
     ("M11 build closes without the declared file", PA, "        if _undelivered:\n            import dataclasses as _dc",
      "        if False:\n            import dataclasses as _dc"),
-    ("M12 experiments built", PA, '            and is_model_experiment(nxt.description, proj.get("goal"))):', "            and False):"),
+    ('M12 experiments built', 'src/ghost_agent/core/project_advancer.py', '                and is_model_experiment(nxt.description, proj.get("goal"),\n                                        _project_task_texts(store, project_id)))):', '                and False)):'),
     ("M13 a code-file run is an experiment", PA,
      'if not _MODEL_GOAL_RE.search(str(goal or "")) or _CODE_FILE_RE.search(topic):', 'if not _MODEL_GOAL_RE.search(str(goal or "")):'),
     ("M14 any goal makes experiments", PA,
      'if not _MODEL_GOAL_RE.search(str(goal or "")) or _CODE_FILE_RE.search(topic):', "if _CODE_FILE_RE.search(topic):"),
-    ("M15 experiment stop reported as budget", PA, 'stop_reason = "model_experiment"      # §4QA', 'stop_reason = "budget_or_inactive"      # §4QA'),
+    ('M15 experiment stop reported as budget', 'src/ghost_agent/core/project_advancer.py', '            stop_reason = "model_experiment"\n            break', '            stop_reason = "budget_or_inactive"\n            break'),
     ("M16 'on your own' is one task", PA, '    if _INTENT_AUTONOMOUS.search(t):\n        return {"mode": "all", "count": None}',
      '    if False:\n        return {"mode": "all", "count": None}'),
     ("M17 autonomous needs no continue verb", PA,
@@ -97,21 +94,6 @@ MUT = [
     ("M40 rewritten description ignored", PJ,
      "_desc_for_gate = (description if description and len(target_ids) == 1\n                                      else plan.tree.nodes[tid].description)",
      "_desc_for_gate = plan.tree.nodes[tid].description"),
-    ("M41 guests do not own", PJ, "                               or conv_key in project_guests(sp, bound_pid))",
-     "                               or False)"),
-    ("M42 reference rewrites the owner (old)", PJ, "                _add_project_guest(sp, bound_pid, conv_key)",
-     '                _sp_set(sp, _CURRENT_CONV_SENTINEL, conv_key or "", namespace=None)'),
-    ("M43 a new binding keeps old guests", PJ,
-     "                # a new binding starts with no guests (§4QA)\n                sp.delete(_CURRENT_GUESTS_SENTINEL)",
-     "                # a new binding starts with no guests (§4QA)\n                pass"),
-    ("M44 guest cap 80", PJ, "_MAX_GUESTS = 8", "_MAX_GUESTS = 80"),
-    ("M45 guests not tied to the pid", PJ, "    if gpid != pid:\n        return []", "    if False:\n        return []"),
-    ("M46 guest exit deletes the owner's binding", PJ,
-     "            if (_sp is not None and _conv and _sp.get(_CURRENT_CONV_SENTINEL) != _conv",
-     "            if (False and _conv and _sp.get(_CURRENT_CONV_SENTINEL) != _conv"),
-    ("M47 scope clear drops guests", PJ,
-     "_BINDING_SENTINELS = (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL, _CURRENT_GUESTS_SENTINEL,\n",
-     "_BINDING_SENTINELS = (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL,\n"),
     ("M48 list without dates", PJ, "projs = [_with_dates(p) for p in store.list_projects(status_filter=status_filter)]",
      "projs = store.list_projects(status_filter=status_filter)"),
     ("M49 get raw epoch", PJ, '"created": _iso_date(_p.get("created_at")),', '"created": _p.get("created_at"),'),
@@ -127,7 +109,6 @@ MUT = [
     ("M62 a root FILE triggers it", FS, "        if not root_dir.is_dir() or root_dir.is_symlink():", "        if root_dir.is_symlink():"),
     ("M63 refused outside a project", FS, "    if not project_download_prefix(sandbox_dir):\n        return None\n    try:\n        if path.exists():",
      "    if False:\n        return None\n    try:\n        if path.exists():"),
-    ("M64 guest conversation not resolved for writes", FS, "        if conv in project_guests(sp, bound_pid):", "        if False:"),
     # agent
     ("M70 one-task note is the generic note", AG,
      '    if task_closed:\n        return _scrub_fallback_message("", True)\n    from .reply_smoothing import UNPARSED_TOOL_CALL_NOTE',
@@ -174,8 +155,7 @@ STALE = {"M6", "M7", "M11", "M13", "M14", "M16", "M17", "M18", "M40", "M60", "M6
 MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE] + [
     ("M6 declared path not a reason", PA, "    if declared or _PROJECT_WORK_RE.search(topic):", "    if _PROJECT_WORK_RE.search(topic):"),
     ("M7 edit verbs not a reason", PA, "    if declared or _PROJECT_WORK_RE.search(topic):", "    if declared:"),
-    ("M11 build closes without the declared file", PA, "        if _undelivered:\n            # the files it DID write",
-     "        if False:\n            # the files it DID write"),
+    ('M11 build closes without the declared file', 'src/ghost_agent/core/project_advancer.py', '        if _refusal is not None:\n            from .task_close import hold_kind', '        if False:\n            from .task_close import hold_kind'),
     ("M13 a code-file run is an experiment", PA,
      "    if (not _MODEL_GOAL_RE.search(goal) or not _GOAL_RUN_RE.search(goal)\n            or _CODE_FILE_RE.search(topic)):",
      "    if (not _MODEL_GOAL_RE.search(goal) or not _GOAL_RUN_RE.search(goal)):"),
@@ -223,10 +203,8 @@ MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE] + [
     ("M77b a dropped write hidden by the stop", AG,
      "_tc_quiet = bool(_proj_task_closed_this_req) and not _dropped_write_paths(tool_calls)",
      "_tc_quiet = bool(_proj_task_closed_this_req)"),
-    ("M78 arc keeps loop rows", AG, '        if role == "USER" and (_base + _j > _anchor if _anchor >= 0 else',
-     '        if False and (_base + _j > _anchor if _anchor >= 0 else'),
-    ("M78b arc judges by wording", AG, '        if role == "USER" and (_base + _j > _anchor if _anchor >= 0 else',
-     '        if role == "USER" and (bool(_LOOP_USER_ROW_RE.match(str(m.get("content", "")))) if True else'),
+    ('M78 arc keeps loop rows', 'src/ghost_agent/core/agent.py', '        if role == "USER" and (m.get("_queued") or (\n                _base + _j > _anchor', '        if False and (m.get("_queued") or (\n                _base + _j > _anchor'),
+    ('M78b arc judges by wording', 'src/ghost_agent/core/agent.py', '                _base + _j > _anchor if _anchor >= 0 else\n', '                bool(_LOOP_USER_ROW_RE.match(str(m.get("content", "")))) if True else\n'),
     ("M78c non-stream arc has no anchor", AG, "tools_run=tools_run_this_turn, user_text=last_user_content)", "tools_run=tools_run_this_turn)"),
     ("M78d stream arc has no anchor", AG, "tools_run=stream_tools_snapshot, user_text=last_user_content)", "tools_run=stream_tools_snapshot)"),
     ("M85 no search URLs", LG, '        if not isinstance(t, dict) or t.get("name") not in _SEARCH_LIST_TOOLS:', "        if True:"),
@@ -256,10 +234,6 @@ MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE] + [
      '    if declared and declared.startswith("research/"):\n        return classification',
      '    if False:\n        return classification'),
     ("N11 'Update:' is an edit", PA, r'    r"(?!\s*:|\s+(?:on|in|of|about|patterns?)\b)", re.IGNORECASE)', '    r"", re.IGNORECASE)'),
-    ("N13 a guest switch takes the project", PJ,
-     '            elif _guest_of_bound(sp, project_id, getattr(context, "conversation_key", None)):',
-     "            elif False:"),
-    ("N14 a probe becomes a guest", PJ, "        if referenced and conv_key and not _probe_turn_now():", "        if referenced and conv_key:"),
     ("N15 gate-failed files unregistered", PA,
      '                    store.register_file_artifact(nxt.id, rel, description=_short_summary(cres.summary or "")[:180])',
      "                    pass"),
@@ -285,8 +259,7 @@ STALE3 = {"M4", "N9", "N10", "N11"}
 MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE3] + [
     ("M4 declared research name ignored", PA,
      "                slug=research_brief_slug(declared_deliverable(nxt.description)))", "                slug=None)"),
-    ("N9 research closes without its file", PA, "        elif _undelivered:\n            _st, _why = TaskStatus.NEEDS_USER",
-     "        elif False:\n            _st, _why = TaskStatus.NEEDS_USER"),
+    ('N9 research closes without its file', 'src/ghost_agent/core/project_advancer.py', '        if _v is not None and not _v.ok:\n            _r = _v.first\n            _refused_gate', '        if False:\n            _r = _v.first\n            _refused_gate'),
     ("N10 a research/ deliverable is built", PA,
      "    if declared and research_brief_slug(declared) and not _PROJECT_WORK_RE.search(topic):",
      "    if False:"),
@@ -301,7 +274,7 @@ MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE3] + [
     ("R2b narration before the close is the stop", AG,
      "    for text in (str(this_turn_text or \"\"), str(accumulated or \"\")):",
      "    for text in (str(this_turn_text or \"\"),):"),
-    ("R3 owner research miss is held", PA, "        if _undelivered and owner_requested:", "        if False:"),
+    ('R3 owner research miss is held', 'src/ghost_agent/core/project_advancer.py', '            if owner_requested:\n                _st, _fail_reason = TaskStatus.FAILED, _r.reason', '            if False:\n                _st, _fail_reason = TaskStatus.FAILED, _r.reason'),
     ("R3b nested research path researched", PR,
      '    if not (d.startswith(RESEARCH_SUBDIR + "/") and d.count("/") == 1 and d.endswith(".md")):',
      '    if not d.startswith(RESEARCH_SUBDIR + "/"):'),
@@ -401,16 +374,11 @@ MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE6] + [
 # r6 (fresh-eye round 5 fixes): the experiment rule inverted, brief ownership by hash, the language gate
 STALE7 = {"M13", "M14", "M14b", "R6", "M5", "N10", "R4", "R4c", "R4d", "R8b", "R11", "R12", "R13", "R14"}
 MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE7] + [
-    ("M13 a code-file run is an experiment", PA,
-     "    if not _MODEL_GOAL_RE.search(goal) or _CODE_FILE_RE.search(topic):",
-     "    if not _MODEL_GOAL_RE.search(goal):"),
-    ("M14 any goal makes experiments", PA,
-     "    if not _MODEL_GOAL_RE.search(goal) or _CODE_FILE_RE.search(topic):",
-     "    if _CODE_FILE_RE.search(topic):"),
+    ('M13 a code-file run is an experiment', 'src/ghost_agent/core/project_advancer.py', '    if _CODE_FILE_RE.search(topic) and not _names_a_model(_CODE_FILE_RE.sub(" ", topic)):\n        return False', '    if False:\n        return False'),
+    ('M14 any goal makes experiments', 'src/ghost_agent/core/project_advancer.py', '    if not (_names_a_model(goal) or _names_a_model(topic)\n', '    if False and (_names_a_model(goal) or _names_a_model(topic)\n'),
     ("M14b 'the model' is a model", PA, r'''_MODEL_NAMES = (r"llms?|language\s+models?|''',
      r'''_MODEL_NAMES = (r"llms?|the\s+model|language\s+models?|'''),
-    ("M5 no build routing", PA, "    classification = _route_project_work(\n        nxt.description, classification,\n",
-     "    classification = classification or _route_project_work(\n        nxt.description, classification,\n"),
+    ('M5 no build routing', 'src/ghost_agent/core/project_advancer.py', '        classification = _route_project_work(\n            nxt.description, classification,\n', '        classification = classification or _route_project_work(\n            nxt.description, classification,\n'),
     ("N10 a research/ deliverable is built", PA,
      "    if declared and research_brief_slug(declared) and not (curated and curated(declared)):", "    if False:"),
     ("R4 a curated research file is overwritten", PA,
@@ -505,15 +473,8 @@ MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE10] + [
 TC = "src/ghost_agent/core/turn_state_check.py"
 STALE12 = {"M43", "R4d"}
 MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE12] + [
-    ("M43 a new binding keeps old guests", PJ,
-     "                if _was_bound != project_id:\n                    sp.delete(_CURRENT_GUESTS_SENTINEL)",
-     "                if _was_bound != project_id:\n                    pass"),
-    ("R4d autoadvance routes without the ownership check", PA,
-     "        nxt.description, classification,\n        curated=lambda rel: not is_generated_brief(store, project_id, rel))",
-     "        nxt.description, classification,\n        curated=None)"),
-    ("S6b the needs_user override skips routing", PA,
-     '        classification = _route_project_work(          # r9: a promised file still routes',
-     '        classification = "research" or _route_project_work('),
+    ('R4d autoadvance routes without the ownership check', 'src/ghost_agent/core/project_advancer.py', '            nxt.description, classification,\n            curated=lambda rel: not is_generated_brief(store, project_id, rel))', '            nxt.description, classification,\n            curated=None)'),
+    ('S6b the needs_user override skips routing', 'src/ghost_agent/core/project_advancer.py', '            classification = _route_project_work(      # r9: a promised file still routes', '            classification = "research" or _route_project_work('),
     ("S1 the cut call is left open", AG,
      "                            full_content = _qa_close(full_content)\n", ""),
     ("S1b close_open_calls closes nothing", RS,
@@ -533,12 +494,7 @@ MUT = [m for m in MUT if m[0].split(" ")[0] not in STALE12] + [
     ("S6 self-analysis ignores its promised file", PA,
      "        if declared:\n            pretty_log(\"Autoadvance\", f\"self-analysis → build",
      "        if False:\n            pretty_log(\"Autoadvance\", f\"self-analysis → build"),
-    ("S7 self-referential experiments exempt", PA,
-     '    if (_proj_kind != "CODING" and classification in ("research", "coding")\n            and is_model_experiment(',
-     '    if (_proj_kind != "CODING" and classification in ("research", "coding")\n            and not is_self_referential(nxt.description) and is_model_experiment('),
-    ("S8 owner re-switch drops guests", PJ,
-     "                if _was_bound != project_id:\n                    sp.delete(_CURRENT_GUESTS_SENTINEL)",
-     "                if True:\n                    sp.delete(_CURRENT_GUESTS_SENTINEL)"),
+    ('S7 self-referential experiments exempt', 'src/ghost_agent/core/project_advancer.py', '            or (_proj_kind != "CODING" and classification in ("research", "coding")\n                and is_model_experiment(', '            or (_proj_kind != "CODING" and classification in ("research", "coding")\n                and not is_self_referential(nxt.description) and is_model_experiment('),
     ("S9 project prefix kept", TD, '    p = _PROJECT_PREFIX_RE.sub("", p, count=1)\n', ""),
     ("S10 transcript names the main model", PM,
      '    meta = {"model": (_served[0] if _served else model), "node": node,',
@@ -607,61 +563,9 @@ MUT = MUT + [
 ]
 
 MUT = MUT + [
-    ("G1 a guest's switch elsewhere takes the owner's binding", PJ,
-     "            elif _guest_leaving_owner(sp, project_id, getattr(context, \"conversation_key\", None)):",
-     "            elif False:"),
-    ("G2 the guest stays a guest of the owner's project", PJ,
-     "                _drop_project_guest(sp, _owner_pid, context.conversation_key)\n", ""),
-    ("G3 the model is never told the binding is request-only", PJ,
-     "        res = append_note(res, \"\\n\" + _bn)\n", ""),
-    ("G4 leaving a request-only project deletes the owner's binding", PJ,
-     "                    and _sp.get(_CURRENT_CONV_SENTINEL) not in (None, \"\", _conv)):",
-     "                    and False):"),
-    ("G5 any guest counts, not only the bound project's", PJ,
-     "            and (conv_key in project_guests(sp, bound_pid) or conv_key in project_held(sp, bound_pid)))",
-     "            and True)"),
-    ("H1 a guest leaving is not held", PJ,
-     "                _add_held(sp, _owner_pid, context.conversation_key)\n", ""),
-    ("H2 a held conversation counts as free", PJ,
-     "            and (conv_key in project_guests(sp, bound_pid) or conv_key in project_held(sp, bound_pid)))",
-     "            and (conv_key in project_guests(sp, bound_pid)))"),
-    ("H3 a guest's exit is not held", PJ,
-     "                _add_held(_sp, prev, _conv)\n", ""),
-    ("H4 a guest pushed out by the cap goes free", PJ,
-     "        _add_held(sp, pid, _evicted)", "        pass"),
-    ("H5 rejoining never ends the hold", PJ,
-     "    held = [c for c in project_held(sp, pid) if c != conv_key]\n    if held != project_held(sp, pid):",
-     "    held = [c for c in project_held(sp, pid) if c != conv_key]\n    if False:"),
-    ("H6 a new binding keeps the old holds", PJ,
-     "                    sp.delete(_CURRENT_HELD_SENTINEL)\n        except Exception:\n            pass\n        # Keep the default",
-     "                    pass\n        except Exception:\n            pass\n        # Keep the default"),
-    ("H7 the owner's reconcile drops a request-only project's keys", PJ,
-     "                _snapshot_scratchpad(context, cur)\n            context.current_project_id = bound_pid",
-     "                pass\n            context.current_project_id = bound_pid"),
-    ("H8 exiting a request-only project drops its keys", PJ,
-     "                _park_current_project(context, prev, f\"Project '{prev}' (request-only) exited\")",
-     "                context.current_project_id = None; _set_scratchpad_scope(_sp, None)"),
-    ("H10 a scope clear drops the holds", PJ,
-     "_BINDING_SENTINELS = (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL, _CURRENT_GUESTS_SENTINEL,\n                      _CURRENT_HELD_SENTINEL)",
-     "_BINDING_SENTINELS = (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL, _CURRENT_GUESTS_SENTINEL)"),
-    ("H9 the console reports a held switch as done", "src/ghost_agent/api/projects_routes.py",
-     "    if sp is not None and _guest_leaving_owner(sp, pid, conv):", "    if False:"),
-    ("I1 the guest and held lists expire under a live binding", PJ,
-     "        sp.get(_CURRENT_GUESTS_SENTINEL)\n        sp.get(_CURRENT_HELD_SENTINEL)\n", "        pass\n"),
-    ("J1 the held list is capped again", PJ,
-     "    held = held + [conv_key]\n", "    held = (held + [conv_key])[-32:]\n"),
-    ("K1 closing a request-only project deletes the owner's binding", PJ,
-     "                if not _probe_turn_now() and not _binding_is_anothers(sp, prev, context):",
-     "                if not _probe_turn_now():"),
-    ("K2 a binding on another project counts as this conversation's", PJ,
-     "    return (bool(bound_pid) and bound_pid != closing_pid\n            and bool(bound_conv) and bound_conv != conv)",
-     "    return (bool(bound_pid) and bound_pid != closing_pid)"),
     ("L1 the open-task header hides the total", "src/ghost_agent/core/prompts.py",
      "            lines.append(f\"OPEN TASKS ({len(open_nodes)}: {_counts})\" + (",
      "            lines.append(f\"OPEN TASKS ({_shown}: {_counts})\" + ("),
-    ("I2 a guest's exit leaves its keys readable", PJ,
-     "                _park_current_project(context, prev, f\"Guest left project '{prev}'\")",
-     "                context.current_project_id = None; _set_scratchpad_scope(_sp, None)"),
     # §4QA-d: edits beyond the 12-file snapshot, the named-file snapshot, the full open list, the order
     ("Q1 edits to an unsnapshotted file are not read", CE,
      "    if isinstance(edits, list) and edits and path not in snap:", "    if False:"),
@@ -697,20 +601,17 @@ MUT = MUT + [
     ("Q13 an unreadable file past the snapshot is overwritten blind", CE,
      "        elif (lerr != \"missing\" and str(lerr or \"\").lstrip().lower().startswith(",
      "        elif (False and str(lerr or \"\").lstrip().lower().startswith("),
-    ("Q14 task_update ignores depends_on", PJ,
-     "                    _unmet = _unmet_dependencies(plan, tid)", "                    _unmet = []"),
+    ('Q14 task_update ignores depends_on', 'src/ghost_agent/core/task_close.py', '        "dependencies": lambda: gate_dependencies(tree, task_id),', '        "dependencies": lambda: None,'),
     ("Q15 a refused dependency in the same call still counts as closed", PJ,
      "                target_ids = _dependencies_first(plan, target_ids)", "                target_ids = list(reversed(target_ids))"),
     ("Q16 a dependency cycle holds the close", "src/ghost_agent/core/planning.py",
      "                and not _under(d) and not self.depends_back(d, node_id)]",
      "                and not _under(d)]"),
-    ("Q17 a held close reads as success", PJ,
-     "            \"undelivered\", \"waiting_on_dependencies\"))", "            \"undelivered\"))"),
+    ('Q17 a held close reads as success', 'src/ghost_agent/tools/projects.py', '            if refused:\n                # §4SU Phase 1: the one list', '            if False:\n                # §4SU Phase 1: the one list'),
     ("Q18 the briefing counts parents", "src/ghost_agent/core/prompts.py",
      "                      and not any(plan.tree.nodes[c].status in open_statuses\n",
      "                      and not any(True\n"),
-    ("Q19 held tasks read as questions for the user", "src/ghost_agent/core/prompts.py",
-     "                    return \"HELD\"\n", "                    return n.status.value\n"),
+    ('Q19 held tasks read as questions for the user', 'src/ghost_agent/core/prompts.py', '                return f"WAITING({v[\'on\']})" if v["state"] == "WAITING" else v["state"]', '                return v["state"]'),
     ("Q20 waiting tasks are not marked", "src/ghost_agent/core/prompts.py",
      "                _tag = _label(n) + (f\" · waits on {_w} unfinished task(s)\" if _w else \"\")",
      "                _tag = _label(n)"),
@@ -738,9 +639,6 @@ MUT = MUT + [
     ("Q30 basename matches crowd out the exact path", PA,
      "        chosen = set((_exact + _base)[:max_named_extra])",
      "        chosen = set([r for r in _cand if r in _exact or r in _base][:max_named_extra])"),
-    ("Q31 the held marker is a stale copy", "src/ghost_agent/core/prompts.py",
-     "                        and str(n.result_summary or \"\").endswith(_HELD_MARK)):",
-     "                        and str(n.result_summary or \"\").endswith(\"not run unattended\")):"),
     ("Q37 a big root file blocks a new project file", CE,
      "              and not await _is_root_fallback(tool_runner, path)):", "              and True):"),
     ("Q38 edits to a big project file are refused", CE,
@@ -902,9 +800,7 @@ MUT = MUT + [
     ('T61 table cells are not split', 'src/ghost_agent/core/probe_transcripts.py',
      '        cells = line.strip().strip("|").split("|")\n',
      '        cells = [line]\n'),
-    ('T63 a verbatim span shields its whole line', 'src/ghost_agent/core/probe_transcripts.py',
-     '            if sp and len([w for w in _words(_DQ_RE.sub(" ", c)) if w not in _STOPWORDS]) < MIN_CONTENT_WORDS:\n',
-     '            if sp:\n'),
+    ('T63 a verbatim span shields its whole line', 'src/ghost_agent/core/probe_transcripts.py', '            if sp and len([w for w in _words(_writer_words(c)) if w not in _STOPWORDS]) < MIN_CONTENT_WORDS:\n', '            if sp:\n'),
     ('T76 a long quote is one unit', 'src/ghost_agent/core/probe_transcripts.py',
      '_LONG_UNIT = 60\n',
      '_LONG_UNIT = 100000\n'),
@@ -1070,53 +966,45 @@ def _fast_tests(mutated_file, pins):
 
 
 def main():
+    # 2026-11-04: ported from the in-place two-tier runner (it wrote mutants
+    # into the LIVE src/ for hours — a restart mid-run loads a mutant) to the
+    # coverage-parallel battery (trees outside the repo; src never written)
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import battery_cov as BC
     args = sys.argv[1:] or ["all"]
+    workers = 6
+    if args[0].startswith("-j"):
+        workers = int(args[0][2:]); args = args[1:] or ["all"]
     if args[0] == "check":
-        bad = 0
-        for label, f, old, _new in MUT:
-            n = open(os.path.join(ROOT, f)).read().count(old)
-            if n != 1:
-                bad += 1
-                print(f"ANCHOR {n}  {label}")
-        print(f"{len(MUT)} mutants, {bad} bad anchors")
-        return
-    if args[0] == "rerun":
-        want = set(args[1:])
-        batch = [m for m in MUT if m[0].split(" ")[0] in want or m[0].startswith("CONTROL")]
-    else:
-        batch = MUT
-    full = _tests(); files = sorted({m[1] for m in batch}); backups = {f: f + ".4qa.bak" for f in files}
-    for f, b in backups.items():
-        shutil.copy2(os.path.join(ROOT, f), os.path.join(ROOT, b))
+        srcs = sorted({m[1] for m in MUT})
+        originals = {f: open(os.path.join(ROOT, f)).read() for f in srcs}
+        bad = [(lab, originals[f].count(old)) for lab, f, old, new in MUT if originals[f].count(old) != 1]
+        print("anchors:", "OK" if not bad else bad); sys.exit(1 if bad else 0)
+    batch = [m for m in MUT if m[0].split(" ")[0] in set(args[1:]) or m[0].startswith("CONTROL")] if args[0] == "rerun" else MUT
+    full = _tests()
+    srcs = sorted({m[1] for m in MUT})
+    originals = {f: open(os.path.join(ROOT, f)).read() for f in srcs}
+    bad = [lab for lab, f, old, new in batch if originals[f].count(old) != 1]
+    if bad:
+        print("ANCHOR NOT UNIQUE/FOUND:", bad); sys.exit(2)
+    cov = BC.build_map(srcs, full, log=lambda m: print(m, flush=True))
+    sel = {lab: BC.tests_for(cov, f, old, originals[f]) for lab, f, old, new in batch}
+    union = sorted({i for v in sel.values() if v for i in v})
 
-    def restore(*_):
-        for f, b in backups.items():
-            shutil.copy2(os.path.join(ROOT, b), os.path.join(ROOT, f))
-        subprocess.run(["find", os.path.join(ROOT, "src"), "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"], capture_output=True)
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *a: (restore(), sys.exit(130)))
-    killed = survived = 0
-    print(f"{len(full)} test files in the full selection; {len(batch)} mutants; two-tier", flush=True)
-    try:
-        for label, f, old, new in batch:
-            restore(); path = os.path.join(ROOT, f); src = open(path).read()
-            if src.count(old) != 1:
-                print(f"SKIP   {label}: anchor count {src.count(old)}", flush=True); continue
-            open(path, "w").write(src.replace(old, new))
-            if subprocess.run([PY, "-m", "py_compile", path], capture_output=True).returncode != 0:
-                print(f"NOCOMP {label}", flush=True); continue
-            fast = _fast_tests(f, PINS) if not label.startswith("CONTROL no-op") else full
-            rc, tail = run_tests(fast); tier = f"fast {len(fast)} files"
-            if rc == 0 and fast is not full:
-                rc, tail = run_tests(full); tier += " → full"
-            status = "SURVIVED" if rc == 0 else "KILLED"; killed += rc != 0; survived += rc == 0
-            print(f"{status:8} {label} — [{tier}] {tail}", flush=True)
-    finally:
-        restore()
-        ok = all(filecmp.cmp(os.path.join(ROOT, f), os.path.join(ROOT, b), shallow=False) for f, b in backups.items())
-        for b in backups.values():
-            os.remove(os.path.join(ROOT, b))
-        print(f"RESTORED identical={ok} killed={killed} survived={survived}", flush=True)
+    def select(label, f, old):
+        if label.startswith("CONTROL no-op"):
+            return union, f"cov {len(union)} tests (all covering)"
+        ids = sel.get(label)
+        return (sorted(set(ids) | set(PINS)), f"cov {len(ids)} tests + pins") if ids else (PINS, "fallback pins")
+    print(f"{len(full)} test files; {len(batch)} mutants; {len(union)} covering tests; {workers} trees", flush=True)
+    res = BC.run_parallel(batch, originals, select, workers=workers, log=lambda m: print(m, flush=True))
+    by = {}
+    for _, st, _, _ in res:
+        by[st] = by.get(st, 0) + 1
+    print("SUMMARY " + " ".join(f"{k.lower()}={v}" for k, v in sorted(by.items())), flush=True)
+    for lab, st, tier, tail in res:
+        if st != "KILLED":
+            print(f"  {st:8} {lab} — [{tier}] {tail}", flush=True)
 
 
 if __name__ == "__main__":

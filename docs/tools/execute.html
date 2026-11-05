@@ -85,7 +85,7 @@
     returns THAT job rather than starting a second copy — see
     <a href="../sandbox/jobs.html">sandbox.jobs</a>.</li>
     <li><strong>The retry is foreclosed in words</strong> — "Do NOT re-run this
-    command", the job id, how to poll (<code>jobs(action='status', job_id=…)</code>),
+    command", the job id, how to poll (since &sect;4SX D5 <code>run(action='status', name='job-…')</code>: the promoted job is recorded as a <code>job</code> run named after its id by <code>runs.record_promoted_job</code>; with no run row, the old <code>jobs(action='status', job_id=…)</code> wording),
     how to read the live log, how to cancel, and an explicit instruction to
     finish the turn and report rather than wait. The retry is the expensive
     half of the original failure, so this line is the fix, not politeness.</li>
@@ -207,7 +207,7 @@
   <ul>
     <li>Validates extension: only <code>.py</code>, <code>.sh</code>, <code>.js</code>.</li>
     <li>Syntax check via <a href="../cli_reference.html#utils"><code>sanitize_code()</code></a>.</li>
-    <li><strong>Forbidden module guard</strong>: rejects imports of native tool modules (<code>knowledge_base</code>, <code>execute</code>, <code>postgres_admin</code>, …).</li>
+    <li><strong>Forbidden module guard</strong>: rejects imports of native tool modules (<code>knowledge_base</code>, <code>execute</code>, <code>web_search</code>, …).</li>
     <li><strong>HTML guard</strong>: HTML/CSS detected in a <code>.py</code> file → redirect user to <a href="file_system.html"><code>file_system</code></a>.</li>
     <li>"Stubbornness" guard: skip rewriting an unchanged file.</li>
   </ul>
@@ -242,7 +242,7 @@ STDOUT/STDERR:
   <ul>
     <li>Forbidden imports — regex rejection in Python source.</li>
     <li>HTML/CSS guard — detects and rejects.</li>
-    <li>SQL injection — out of scope (<a href="database.html">database tool</a> uses parameterised queries).</li>
+    <li>SQL — out of scope: there is no local database (SQL runs on a lab machine, &sect;4SX E).</li>
     <li>Inline script handling — auto-converts substantive <code>-c</code> usage to a base64-transported file run; hard-blocks only unsafe/skill-wrap shapes.</li>
     <li>Output truncation — head + tail capping.</li>
   </ul>
@@ -297,7 +297,7 @@ STDOUT/STDERR:
   BOTH signals fire — a detach (background <code>&amp;</code>, not <code>&amp;&amp;</code>/
   <code>2&gt;&amp;1</code>/<code>&amp;&gt;</code>; or <code>setsid</code>) AND a server-ish
   command (<code>http.server</code>, <code>server.py</code>, uvicorn/gunicorn/flask run/node
-  server.js/npm start/php -S/<code>--port N</code>…) — steering to <code>manage_services</code>,
+  server.js/npm start/php -S/<code>--port N</code>…) — steering to <code>run start lifetime=server</code> (&sect;4SX D5; was <code>manage_services</code>),
   which assigns a free port ($PORT), captures logs, and keeps the process supervised. Foreground
   servers (die with the exec timeout) and non-server background jobs pass untouched. See
   <a href="../sandbox/services.html">sandbox/services</a> for the lease/ownership redesign this

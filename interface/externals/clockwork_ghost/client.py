@@ -2289,6 +2289,9 @@ class MainWindow(QWidget):
     async def _download_and_show_image(self, image_path):
         url = f"{AGENT_BASE}{image_path}"
         headers = {"X-Ghost-Key": GHOST_API_KEY}
+        # §4SX B0: a bare name resolves under THIS session's focused project
+        if getattr(self, "session_id", None):
+            headers["X-Ghost-Session"] = str(self.session_id)
         # A failed fetch used to be a print() nobody saw: the reply said an
         # image was attached and tapping it did nothing.
         try:

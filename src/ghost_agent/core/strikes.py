@@ -95,6 +95,34 @@ _ERROR_LINE_RE = re.compile(
 #: on 9,119 corpus results: 96/1,750 successful searches, 324/761 loaded
 #: pages and 450/1,399 file reads yielded an "error line".
 PROGRAM_OUTPUT_TOOLS = frozenset({"execute", "jobs"})
+#: §4SX B: only a `lab` EXEC result is program output (its header names the
+#: lab/member and the exit); `logs`, `status`, `http`, `spec` return CONTENT —
+#: a Postgres log's "ERROR: relation x does not exist" is its subject (review
+#: MAJOR 2, the §4KT class)
+_LAB_EXEC_HEAD_RE = re.compile(r"^\[lab_[0-9a-f]{8}/[a-z][a-z0-9-]{0,30} (?:exit=|TIMED OUT|no exit code)")
+#: §4SX D5: only a `run collect` result is program output (its head names the run and the exit, then the
+#: EXIT CODE line); `logs` / `status` / `url` return CONTENT — a server log's "ERROR" is its subject
+_RUN_COLLECT_HEAD_RE = re.compile(r"^\[run [a-z][a-z0-9-]{0,30} (?!logs\b|app\b)[^\]\n]*\]\s*\nEXIT CODE: ")
+
+
+def is_program_output(tool, output="") -> bool:
+    """Is this result a program's output (scanned for failure words)?"""
+    if tool is None:
+        return True
+    t = str(tool)
+    if t in PROGRAM_OUTPUT_TOOLS:
+        return True
+    if t == "run":
+        _o = "\n".join(ln for ln in str(output or "").splitlines() if not ln.strip().startswith(_FAILURE_BANNER))
+        return bool(_RUN_COLLECT_HEAD_RE.match(_o.strip()))
+    if t != "lab":
+        return False
+    for ln in str(output or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(_FAILURE_BANNER):
+            continue
+        return bool(_LAB_EXEC_HEAD_RE.match(ln))
+    return False
 #: The turn loop's own mark on a result its failure gate rejected
 #: (`[FAILURE BANNER] <label>\n<result>`): the LABEL is the loop's reading
 #: of the head, the failure itself is in the result under it.
@@ -234,7 +262,7 @@ def error_line(output: str, *, tool: "str | None" = None) -> str:
     _st = getattr(output, "status", None)
     _sv = getattr(_st, "value", _st)
     declared = _sv is not None and str(_sv) not in ("ok", "unresolved")
-    content = tool is not None and str(tool) not in PROGRAM_OUTPUT_TOOLS
+    content = not is_program_output(tool, output)
     if declared or bannered:
         if content:
             named = (_content_failure_head(body, declared=True)
@@ -443,6 +471,10 @@ READWRITE_LOOP_TOOLS = frozenset({
     # would bar the one call that answers the question.
     "knowledge_base",
     "update_profile",
+    # §4SX B: `lab status` polls a starting lab, then `exec` uses it
+    "lab",
+    # §4SX D5: `run status` / `logs` poll a starting server, then the work uses it
+    "run",
 })
 
 #: Hard-stop threshold for a no-progress loop on a READWRITE_LOOP_TOOLS

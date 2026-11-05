@@ -29,9 +29,6 @@ FALLBACK_CHAINS = {
     "execute": [
         ("file_system", "Read the file first with file_system to check for syntax errors before re-executing."),
     ],
-    "postgres_admin": [
-        ("execute", "If the database connection failed, try executing SQL via a Python script with execute."),
-    ],
     # vision_analysis: NO chain (§4LM). "Read it as text with file_system"
     # sent the model to a binary-file refusal that points back at vision, and
     # contradicted the failure's own advice ("Do NOT retry"); each vision

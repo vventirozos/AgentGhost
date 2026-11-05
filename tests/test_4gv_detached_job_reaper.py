@@ -119,7 +119,16 @@ def test_THIS_FILES_OWN_SPAWNS_ARE_IN_THE_SESSION_REGISTRY(tmp_path):
     row = _spawn_recorded(tmp_path, registry, "session-registry-probe")
     try:
         after = JOB_REGISTRY.read_text()
-        assert str(row["pid"]) in after and str(row["pid"]) not in before, (
+        # exact pids, not substrings (§4SX-C: after a long run pid 1234 matched a row's 41234)
+        def _pids(text):
+            out = set()
+            for line in text.splitlines():
+                try:
+                    out.add(int(json.loads(line).get("pid")))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            return out
+        assert int(row["pid"]) in _pids(after) and int(row["pid"]) not in _pids(before), (
             "a spawn this file made is invisible to the session reaper — a "
             "test that dies before its cleanup leaks it permanently")
     finally:

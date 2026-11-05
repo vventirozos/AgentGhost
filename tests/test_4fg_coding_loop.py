@@ -190,7 +190,7 @@ def test_leaf_context_keeps_the_project_and_wraps_memory_read_only():
     # produced nine sandbox escapes and every one came from the git tool.
     # Asserted as the EXACT set, not a superset: the pin exists to catch a
     # tool silently entering the leaf — which is how `git` got here.
-    assert iso._subagent_allowed_tools == frozenset({"file_system", "execute"})
+    assert iso._subagent_allowed_tools == frozenset({"file_system", "execute", "lab", "run"})   # §4SX D4 + D5
     assert base.args.perfect_it is True          # the live args are untouched
 
 

@@ -414,9 +414,9 @@ async def test_continuity_blocks_ride_in_tail_not_system_slot(monkeypatch):
     wm.build_wakeup_prefix = MagicMock(return_value=MARKER)
     agent.context.workspace_model = wm
     agent.context.current_project_id = "p-continuity"
-    # keep the bound project: the conversation reconcile would clear it here
+    # keep the bound project: the request's focus load would clear it here
     import ghost_agent.tools.projects as _pj
-    monkeypatch.setattr(_pj, "reconcile_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(_pj, "begin_request_focus", lambda *a, **k: None)
 
     cap = {"system": [], "last_user": []}
     call_n = {"n": 0}

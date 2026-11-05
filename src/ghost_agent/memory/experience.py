@@ -361,7 +361,8 @@ def _int(v) -> int:
 
 _SYSTEM_COMMAND_RE = re.compile(
     r"^\s*(?:show|list|learn|forget|dismiss|keep|confirm|replace)\b[^\n]{0,60}\b(?:rules?|tests?)\b"
-    r"|^\s*(?:show|list)\s+(?:me\s+)?(?:all\s+|my\s+)?(?:proposed|candidate)\s+rules?", re.IGNORECASE)
+    r"|^\s*(?:show|list)\s+(?:me\s+)?(?:all\s+|my\s+)?(?:proposed|candidate)\s+rules?"
+    r"|^\s*/?mirror\s*[.!?]*\s*$", re.IGNORECASE)   # §4SV
 
 
 def is_system_command(request: str) -> bool:

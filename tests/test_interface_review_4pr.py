@@ -237,13 +237,20 @@ function _safeImageBlobType(t) { return t; }
 const URL = { createObjectURL: () => 'blob:' + (++fetches) };
 class Blob { constructor(a, o) { this.type = o.type; } }
 async function fetch() { fetches += 0; await new Promise(r => setTimeout(r, 5)); return { ok: true, blob: async () => ({ type: 'image/png' }) }; }
-""" + extract_js_function(app, "_toAuthedBlobUrl") + "\n" + extract_js_function(app, "_fetchAuthedBlobUrl"))
+const window = { __ghostSessionId: 's1' };
+""" + extract_js_function(app, "_authedBlobKey") + "\n"
+           + extract_js_function(app, "_toAuthedBlobUrl") + "\n" + extract_js_function(app, "_fetchAuthedBlobUrl"))
     out = eval_js(src, """await (async () => {
         const [a, b] = await Promise.all([_toAuthedBlobUrl('/api/download/x.png'), _toAuthedBlobUrl('/api/download/x.png')]);
         const c = await _toAuthedBlobUrl('/api/download/x.png');
-        return { a, b, c, made: fetches, inflight: _authedBlobInflight.size };
+        const made1 = fetches;
+        // §4SX B0 r3: another session's bare x.png may be another project's file
+        window.__ghostSessionId = 's2';
+        const [d, e] = await Promise.all([_toAuthedBlobUrl('/api/download/x.png'), _toAuthedBlobUrl('/api/download/x.png')]);
+        return { a, b, c, d, e, made1, made: fetches, inflight: _authedBlobInflight.size };
     })()""")
-    assert out["a"] == out["b"] == out["c"] and out["made"] == 1 and out["inflight"] == 0
+    assert out["a"] == out["b"] == out["c"] and out["made1"] == 1 and out["inflight"] == 0
+    assert out["d"] == out["e"] != out["a"] and out["made"] == 2
 
 
 def test_the_recovery_stands_down_without_touching_a_live_turn():

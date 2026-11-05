@@ -144,7 +144,9 @@
     (multipart, <code>X-Ghost-Key</code>) — the old path wrote directly into a
     locally-mounted sandbox dir, which required the bot to share a filesystem
     (and exact path) with the agent; the API enforces its own containment and
-    project scoping. Slack filenames are <code>basename()</code>d as
+    project scoping (§4SX B0: the upload sends <code>X-Ghost-Session</code> =
+    <code>_slack_session_id(thread, user)</code>, the same id as the chat payload's
+    <code>session_id</code>, so it lands in the thread's focused project). Slack filenames are <code>basename()</code>d as
     defense-in-depth (attacker-controlled metadata).</li>
     <li>POST to <code>$GHOST_API_URL</code>. <strong>No <code>model</code>
     field</strong> — the agent 404s any mismatched name (the old pinned model

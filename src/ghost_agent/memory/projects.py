@@ -142,6 +142,19 @@ CREATE TABLE IF NOT EXISTS deleted_projects (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deleted_projects_ts ON deleted_projects(deleted_at);
+
+-- §4SX B0: each conversation's focus project (at most one per conversation;
+-- many conversations may focus the same project). Keyed by the request's
+-- conversation key (``session:<id>`` / ``slack:<...>``).
+CREATE TABLE IF NOT EXISTS conversation_focus (
+    conversation_key TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    bound_at REAL NOT NULL,
+    last_used_at REAL NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_focus_project ON conversation_focus(project_id);
 """
 
 
@@ -464,6 +477,87 @@ class ProjectStore:
             ).fetchone()
             return self._row_to_project(row) if row else None
 
+    # ------------------------------------------------ conversation focus (§4SX B0)
+
+    #: a focus row unused this long is pruned (UNIFIED_DESIGN §10.3)
+    FOCUS_IDLE_PRUNE_S = 30 * 86400
+
+    def get_focus(self, conversation_key: str) -> Optional[str]:
+        """The project this conversation focuses, or None. Refreshes the row's
+        ``last_used_at``. A row whose project is gone is dropped. An archive
+        clears every row on the project when it happens; a LATER explicit
+        switch to an archived project is the owner's choice and is kept
+        (review r1: dropping it on read made the switch vanish next turn)."""
+        key = str(conversation_key or "")
+        if not key:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT f.project_id, p.status FROM conversation_focus f "
+                "LEFT JOIN projects p ON p.id = f.project_id "
+                "WHERE f.conversation_key = ?", (key,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] is None:
+                conn.execute("DELETE FROM conversation_focus WHERE conversation_key = ?", (key,))
+                conn.commit()
+                return None
+            conn.execute("UPDATE conversation_focus SET last_used_at = ? WHERE conversation_key = ?",
+                         (_now(), key))
+            conn.commit()
+            return row["project_id"]
+
+    def set_focus(self, conversation_key: str, project_id: str) -> bool:
+        """Point THIS conversation's focus at ``project_id`` (no other
+        conversation's row changes). False when the key is empty or the
+        project does not exist. Prunes rows idle longer than
+        ``FOCUS_IDLE_PRUNE_S``."""
+        key = str(conversation_key or "")
+        pid = _canon_id(project_id)
+        if not key or not pid:
+            return False
+        now = _now()
+        with self._lock, self._connect() as conn:
+            if conn.execute("SELECT 1 FROM projects WHERE id = ?", (pid,)).fetchone() is None:
+                return False
+            conn.execute(
+                "INSERT INTO conversation_focus(conversation_key, project_id, bound_at, last_used_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_key) DO UPDATE SET "
+                "project_id = excluded.project_id, bound_at = excluded.bound_at, "
+                "last_used_at = excluded.last_used_at", (key, pid, now, now))
+            conn.execute("DELETE FROM conversation_focus WHERE last_used_at < ?",
+                         (now - self.FOCUS_IDLE_PRUNE_S,))
+            conn.commit()
+        return True
+
+    def clear_focus(self, conversation_key: str) -> None:
+        key = str(conversation_key or "")
+        if not key:
+            return
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM conversation_focus WHERE conversation_key = ?", (key,))
+            conn.commit()
+
+    def clear_focus_for_project(self, project_id: str) -> int:
+        """Drop every conversation's focus on ``project_id`` (archive/delete)."""
+        pid = _canon_id(project_id)
+        if not pid:
+            return 0
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM conversation_focus WHERE project_id = ?", (pid,))
+            conn.commit()
+            return cur.rowcount or 0
+
+    def focus_rows(self, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            if project_id:
+                rows = conn.execute("SELECT * FROM conversation_focus WHERE project_id = ? "
+                                    "ORDER BY last_used_at DESC", (_canon_id(project_id),)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM conversation_focus "
+                                    "ORDER BY last_used_at DESC").fetchall()
+            return [dict(r) for r in rows]
+
     def update_project(self, project_id: str, metadata_replace: bool = False,
                        **fields) -> bool:
         """Update project fields. ``metadata`` is MERGED (shallow) into the
@@ -545,6 +639,13 @@ class ProjectStore:
                 raise
         if updated:
             self.log_event(project_id, None, "project_updated", {"fields": list(fields.keys())})
+            if status_norm == ProjectStatus.ARCHIVED.value:
+                # §4SX B0: an archived project is nobody's focus (every route
+                # that archives — the tool, PATCH status — passes here)
+                try:
+                    self.clear_focus_for_project(project_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("focus clear on archive skipped", exc_info=True)
             if (status_norm == ProjectStatus.DONE.value
                     and (prev_status or "").upper() != ProjectStatus.DONE.value):
                 # Constraint lifecycle (2026-08-01, req 56221fad post-mortem):

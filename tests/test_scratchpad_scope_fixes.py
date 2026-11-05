@@ -4,9 +4,9 @@ THE BUG (verified against the live prod DB, which was down to its 2 sentinel
 rows): the scratchpad is one flat namespace shared by every conversation,
 project and background job in the process, and `tools/projects.py`
 `_hydrate_scratchpad` deleted EVERY key that wasn't `proj::`-prefixed or a
-sentinel. `_park_current_project` calls it at REQUEST START (via
-`reconcile_conversation`) for any conversation that doesn't own the bound
-project — so conversation B saying "hi" durably destroyed conversation A's
+sentinel. It ran at REQUEST START for any conversation that didn't own the
+bound project (§4SX B0: a request start now loads that conversation's focus
+row, `begin_request_focus`, and the same scope rules apply) — so conversation B saying "hi" durably destroyed conversation A's
 in-flight `delegate_to_swarm` results:
 
     A: activate project P, delegate_to_swarm(output_key="api_summary")
@@ -42,9 +42,9 @@ from ghost_agent.memory.projects import ProjectStore
 from ghost_agent.memory.scratchpad import Scratchpad
 from ghost_agent.tools.projects import (
     conversation_fingerprint,
-    reconcile_conversation,
     tool_manage_projects,
 )
+from tests.focus_helpers import scope_reset, start_request  # noqa: F401 (§4SX B0: a request start)
 
 
 @pytest.fixture
@@ -85,12 +85,12 @@ def _dispatch_swarm_task(sp, output_key, task_id="swarm-deadbeef"):
 async def test_foreign_conversation_park_keeps_inflight_job_keys(context):
     """A non-owning conversation's request start must not delete a
     background job's output_key or its `_swarm_task_id::` marker."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
     _dispatch_swarm_task(context.scratchpad, "api_summary")
 
     # Conversation B's request starts → project P is parked.
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.current_project_id is None
     assert context.scratchpad.get("_swarm_task_id::api_summary") == "swarm-deadbeef"
 
@@ -98,13 +98,13 @@ async def test_foreign_conversation_park_keeps_inflight_job_keys(context):
     context.scratchpad.set("api_summary", "THE RESULT")
 
     # More foreign traffic must not eat it either.
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.scratchpad.get("api_summary") == "THE RESULT"
 
     # ...and the owner coming back still resolves it — this is exactly what
     # the job registry's result_resolver (`scratchpad.get(output_key)`) does
     # for jobs(action='collect').
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     assert context.scratchpad.get("api_summary") == "THE RESULT"
 
 
@@ -112,12 +112,12 @@ async def test_result_written_while_project_active_survives_park(context):
     """Hardest ordering: the worker lands its result while the dispatching
     project is still active, so the entry is tagged with THAT project's
     scope. Parking the project must still spare it."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
     _dispatch_swarm_task(context.scratchpad, "k")
     context.scratchpad.set("k", "THE RESULT")
 
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.scratchpad.get("k") == "THE RESULT"
     assert context.scratchpad.get("_swarm_task_id::k") == "swarm-deadbeef"
 
@@ -132,11 +132,11 @@ async def test_job_registry_output_key_protected_without_marker(context):
     reg.register("swarm", "summarise", output_key="api_summary",
                  swarm_id="swarm-1")
 
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
     context.scratchpad.set("api_summary", "THE RESULT")  # marker gone
 
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.scratchpad.get("api_summary") == "THE RESULT"
 
 
@@ -144,13 +144,13 @@ async def test_job_keys_not_filed_into_project_event_log(context, store):
     """Job keys are process-wide, so they must not be snapshotted into a
     project's event log — that is how a worker's result ended up recorded
     against whatever project happened to be live."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     pid = await _create(context)
     _dispatch_swarm_task(context.scratchpad, "k")
     context.scratchpad.set("k", "THE RESULT")
     context.scratchpad.set("note", "real project state")
 
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
 
     evs = store.list_events(pid, event_type="scratchpad_snapshot")
     assert evs
@@ -163,14 +163,14 @@ async def test_job_keys_not_filed_into_project_event_log(context, store):
 async def test_free_chat_keys_survive_a_foreign_park(context):
     """Keys owned by no project (global scope) belong to whoever wrote them;
     a foreign conversation's park is not allowed to collect them."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
-    reconcile_conversation(context, CONV_B)      # B is in free chat
+    start_request(context, CONV_B)      # B is in free chat
     context.scratchpad.set("b_note", "B's own note")
 
-    reconcile_conversation(context, CONV_B)      # B's next request start
+    start_request(context, CONV_B)      # B's next request start
     assert context.scratchpad.get("b_note") == "B's own note"
-    reconcile_conversation(context, CONV_A)      # owner resumes P
+    start_request(context, CONV_A)      # owner resumes P
     assert context.scratchpad.get("b_note") == "B's own note"
 
 
@@ -179,20 +179,20 @@ async def test_free_chat_keys_survive_a_foreign_park(context):
 async def test_parked_project_keys_hidden_then_restored(context):
     """The legitimate intent: a foreign conversation must not see the
     project's scratchpad state, and the owner gets it back."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
     context.scratchpad.set("design_notes", "P-only state")
 
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.scratchpad.get("design_notes") is None
 
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     assert context.scratchpad.get("design_notes") == "P-only state"
 
 
 async def test_switching_projects_isolates_their_keys(context):
     """Per-project isolation across an explicit switch."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     pid_a = await _create(context, "Alpha")
     context.scratchpad.set("alpha_key", "A state")
 
@@ -209,34 +209,36 @@ async def test_switching_projects_isolates_their_keys(context):
     assert context.scratchpad.get("alpha_key") is None
 
 
-async def test_sentinels_are_scope_free(context):
-    """The activation sentinels must never carry a project scope — a scope
-    clear would take them with it, and `reconcile_conversation` reads a
-    missing sentinel as 'no binding' (fail-closed park)."""
-    reconcile_conversation(context, CONV_A)
+async def test_the_focus_lives_in_the_store_not_the_scratchpad(context):
+    """§4SX B0: a switch writes THIS conversation's focus row, never a
+    scratchpad key (the old global sentinels are gone), and another
+    conversation's request start leaves that row alone."""
+    start_request(context, CONV_A)
     pid = await _create(context)
     sp = context.scratchpad
-    assert sp.namespace_of("__current_project__") is None
-    assert sp.namespace_of("__current_project_conv__") is None
+    assert sp.get("__current_project__") is None
+    assert sp.get("__current_project_conv__") is None
+    assert context.project_store.get_focus(CONV_A) == pid
 
-    reconcile_conversation(context, CONV_B)
-    assert sp.get("__current_project__") == pid
-    assert sp.get("__current_project_conv__") == CONV_A
+    start_request(context, CONV_B)
+    assert context.current_project_id is None
+    assert context.project_store.get_focus(CONV_A) == pid
+    assert context.project_store.get_focus(CONV_B) is None
 
 
 async def test_proj_prefixed_keys_survive_switch(context):
     """The `proj::` convention keys are preserved as before."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
     context.scratchpad.set("proj::something", "convention key")
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.scratchpad.get("proj::something") == "convention key"
 
 
 async def test_park_without_a_snapshot_does_not_delete(context, monkeypatch):
     """If the snapshot that makes parking reversible cannot be written, the
     keys must be kept rather than dropped — nothing could restore them."""
-    reconcile_conversation(context, CONV_A)
+    start_request(context, CONV_A)
     await _create(context)
     context.scratchpad.set("unsaved", "state")
 
@@ -244,7 +246,7 @@ async def test_park_without_a_snapshot_does_not_delete(context, monkeypatch):
         raise RuntimeError("event log down")
 
     monkeypatch.setattr(context.project_store, "log_event", boom)
-    reconcile_conversation(context, CONV_B)
+    start_request(context, CONV_B)
     assert context.current_project_id is None          # still deactivated
     assert context.scratchpad.get("unsaved") == "state"
 

@@ -146,6 +146,8 @@ def _sync_sandbox_jobs(reg, context) -> None:
     for sid, entry in entries.items():
         if sid in mirrored or entry.get("state") != sbx_jobs.STATE_RUNNING:
             continue
+        if entry.get("started_via"):
+            continue        # §4SX C (design r1 H2): a `run` job — `run` reports it, not `jobs`
         job = reg.register(
             SANDBOX_KIND,
             str(entry.get("label") or entry.get("command") or "")[:200],

@@ -1097,13 +1097,13 @@ async def test_the_gated_front_door_captures_and_threads_the_global(
     assert seen.get("explicit_project_id") == "pid-at-spawn"
 
 
-async def test_a_stomped_global_is_healed_from_the_conversation_binding(
+async def test_a_same_turn_close_is_healed_from_the_close_record(
         tmp_path, monkeypatch):
-    """⚠ A global cleared mid-request by a concurrent reconcile used to be
-    healed inside project_scoped_sandbox at resolve time; committing a
-    captured None straight to the raw root would regress that. The capture
-    heals through `_conversation_bound_project` while conversation_key is
-    still this turn's own."""
+    """⚠ A project closed in the same turn leaves the request's scope empty;
+    committing a captured None straight to the raw root would refute the
+    files the turn wrote under it. The capture heals from the close record
+    (conversation key, pid) while the key is still this turn's own (§4SX B0:
+    the old global-binding heal is gone with the global binding)."""
     from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
     seen = {}
 
@@ -1113,15 +1113,14 @@ async def test_a_stomped_global_is_healed_from_the_conversation_binding(
 
     monkeypatch.setattr(
         "ghost_agent.tools.file_system.project_scoped_sandbox", _spy)
-    monkeypatch.setattr(
-        "ghost_agent.tools.file_system._conversation_bound_project",
-        lambda ctx: "healed-pid")
     agent = _verdict_agent(VerifyResult(
         verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
     agent._execute_web_artifact = AsyncMock(return_value=None)
     agent._critic_gate_timeout = lambda: float("inf")
     agent._critic_async_enabled = lambda: False
-    agent.context.current_project_id = None       # stomped
+    agent.context.current_project_id = None       # closed this turn
+    agent.context.conversation_key = "session:s1"
+    agent.context.last_closed_project = ("session:s1", "healed-pid")
     agent.context.args = None
     (tmp_path / "a.md").write_text("x")
     await agent._compute_verifier_verdict_gated(

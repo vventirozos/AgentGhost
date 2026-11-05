@@ -321,3 +321,66 @@ def test_a_non_image_upload_adds_nothing(bot, monkeypatch):
         {"ts": "3.0", "user": OWNER, "text": "ok"}]}])
     msgs = _run(bot.build_thread_context("C1", "1.0", "3.0", requester=OWNER, current_text="ok"))
     assert [m for m in msgs if m["role"] == "assistant"][-1]["content"] == "Done."
+
+
+def test_a_threads_earlier_attachment_uploads_under_the_threads_session(bot, monkeypatch):
+    """§4SX B0 review r2: Slack uploads carried no session, so an owner's
+    attachment in a thread focused on a project landed at the sandbox root.
+    The upload's session must be the SAME string as the chat payload's."""
+    _thread(bot, monkeypatch, [{"ok": True, "messages": [
+        {"ts": "1.0", "user": OWNER, "text": "here", "files": [{"id": "F1", "name": "a.csv"}]},
+        {"ts": "2.0", "user": BOT, "text": "ok"}]}])
+    sid = bot._slack_session_id("1.0", OWNER)
+    _run(bot.build_thread_context("C1", "1.0", "3.0", requester=OWNER, current_text="go", session_id=sid))
+    assert bot.upload_file_to_agent.await_args.kwargs.get("session_id") == sid == f"slack:1.0:{OWNER}"
+
+
+@pytest.mark.parametrize("handler,event", [
+    ("handle_direct_message", {"channel_type": "im", "channel": "D1", "ts": "5.0", "text": "hi"}),
+    ("handle_direct_message", {"channel_type": "im", "channel": "D1", "ts": "6.0", "thread_ts": "4.0", "text": "hi"}),
+    ("handle_mention", {"channel": "C1", "ts": "7.0", "text": "<@UBOTBOT12> hi"}),
+    ("handle_mention", {"channel": "C1", "ts": "8.0", "thread_ts": "3.0", "text": "<@UBOTBOT12> hi"}),
+])
+def test_history_uploads_and_the_chat_use_one_session_string(bot, monkeypatch, handler, event):
+    """Review r3: the handlers compute the history-upload session and
+    `_process_message` computes the chat's; a DM fetches by ts but chats by
+    thread_ts — both strings must still be the same."""
+    monkeypatch.setattr(bot, "OWNER_ID", OWNER)
+    monkeypatch.setattr(bot, "OPEN_CHANNEL", True)
+    monkeypatch.setattr(bot, "claim_message", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(bot, "get_bot_user_id", AsyncMock(return_value=BOT))
+    seen = {}
+
+    async def _btc(*a, **kw):
+        seen["history"] = kw.get("session_id")
+        return [{"role": "user", "content": "hi"}]
+
+    async def _pm(messages, say, thread_ts=None, files=None, requester=None, **kw):
+        seen["chat"] = bot._slack_session_id(thread_ts, requester)
+    monkeypatch.setattr(bot, "build_thread_context", _btc)
+    monkeypatch.setattr(bot, "_process_message", _pm)
+    _run(getattr(bot, handler)({**event, "user": OWNER}, AsyncMock(), body={"event_id": event["ts"]}))
+    assert seen.get("history") and seen["history"] == seen.get("chat")
+
+
+def test_the_upload_request_carries_the_session_header(bot, monkeypatch):
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        content = b"x"
+        def raise_for_status(self): pass
+        def json(self): return {"filename": "a.csv"}
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, headers=None): return _Resp()
+        async def post(self, url, headers=None, files=None, **k):
+            sent.update(headers or {}); return _Resp()
+    monkeypatch.setattr(bot.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(bot, "_UPLOADED_FILE_IDS", {}, raising=False)
+    _run(bot.upload_file_to_agent({"id": "F9", "name": "a.csv", "url_private_download": "https://files.slack.com/x",
+                                   "size": 1}, uploader=OWNER, session_id="slack:1.0:" + OWNER))
+    assert sent.get("X-Ghost-Session") == "slack:1.0:" + OWNER

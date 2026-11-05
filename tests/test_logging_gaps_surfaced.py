@@ -5,7 +5,6 @@ Each test captures the module's pretty_log and asserts the new line fires.
 the Tier-1 PrettyLogHandler and are covered in test_logging_framework.py.)
 """
 
-import sys
 import threading
 
 import pytest
@@ -59,21 +58,6 @@ async def test_auth_reject_logs(monkeypatch):
     with pytest.raises(HTTPException):
         await routes.verify_api_key(req, api_key="wrong-key")
     assert _titled(calls, "Auth Rejected")
-
-
-@pytest.mark.asyncio
-async def test_postgres_error_logs(monkeypatch):
-    from ghost_agent.tools import database as db
-    calls = _capture(monkeypatch, db)
-    fake = MagicMock()
-    fake.connect.side_effect = Exception("connection refused")
-    monkeypatch.setitem(sys.modules, "psycopg2", fake)
-    monkeypatch.setitem(sys.modules, "psycopg2.extras", MagicMock())
-    monkeypatch.setitem(sys.modules, "tabulate", MagicMock())
-    db._evict_connection("postgres://err-test")
-    await db.tool_postgres_admin("query", "postgres://err-test", "SELECT 1")
-    db._evict_connection("postgres://err-test")
-    assert _titled(calls, "Postgres Error")
 
 
 def test_sandbox_exec_failure_logs(monkeypatch):

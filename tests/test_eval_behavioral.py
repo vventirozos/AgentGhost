@@ -43,9 +43,6 @@ class FakeCtx:
     def sandbox_read(self, rel):
         return self._files.get(rel)
 
-    async def db_scalar(self, q):
-        return self._db
-
     def trajectory_metrics(self, prompt):
         return dict(self._metrics)
 
@@ -139,13 +136,12 @@ class TestBehavioralSuite:
         assert all(callable(t.verify) for t in tasks)
         ids = {t.task_id for t in tasks}
         for expected in ("beh:code_exec_output", "beh:file_roundtrip",
-                         "beh:memory_roundtrip", "beh:tool_chain_compute_save",
-                         "beh:db_grounded_query"):
+                         "beh:memory_roundtrip", "beh:tool_chain_compute_save"):
             assert expected in ids
 
     def test_every_task_exercises_a_tool_by_design(self):
         # The whole point: unlike `capability`, every behavioral prompt asks for
         # a real side-effect (file / memory / DB), so a 0-tool-call answer fails.
         prompts = " ".join(t.prompt.lower() for t in load_behavioral_suite())
-        for surface in ("python", "file", "remember", "sql", "workspace"):
+        for surface in ("python", "file", "remember", "workspace"):
             assert surface in prompts

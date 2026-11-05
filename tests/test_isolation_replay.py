@@ -707,8 +707,6 @@ class _FakeAgent:
                                 for t in TOOL_DEFINITIONS}
 
 
-
-
 async def test_containment_denies_the_union_of_both_precedents():
     """The replay list is applied to the workload with the largest blast
     radius. (Its sibling precedents — core.subagent's FORBIDDEN_TOOLS and
@@ -787,19 +785,21 @@ async def test_job_registry_is_detached():
 
 
 async def test_capability_args_are_cleared():
-    """Three argparse fields are capabilities, not settings:
-    `default_db` is a live Postgres URI `postgres_admin` falls back to
-    (and its SQL validator fails OPEN on its own exception), and the two
-    notify targets are what a push transport is built from."""
+    """Three argparse fields are capabilities, not settings: the two notify
+    targets are what a push transport is built from, and `labs_host` reaches
+    real machines (§4SX E: `default_db` went with postgres_admin)."""
     ctx = _live_context()
-    ctx.args.default_db = "postgresql://ghost@127.0.0.1:5432/agent"
     ctx.args.notify_webhook = "https://hooks.example/abc"
     ctx.args.notify_ntfy = "https://ntfy.sh/ghost"
+    ctx.args.labs_host = "127.0.0.1:8700"      # §4SX B: real machines
     async with isolated_replay_context(ctx, with_sandbox=False) as run:
-        assert run.context.args.default_db is None
         assert run.context.args.notify_webhook is None
         assert run.context.args.notify_ntfy is None
-    assert ctx.args.default_db == "postgresql://ghost@127.0.0.1:5432/agent"
+        assert run.context.args.labs_host is None
+        from ghost_agent.tools.labs import labs_configured
+        assert not labs_configured(run.context)
+    assert ctx.args.labs_host == "127.0.0.1:8700"
+    assert ctx.args.notify_ntfy == "https://ntfy.sh/ghost"
 
 
 async def test_shared_lru_rings_are_rebound():

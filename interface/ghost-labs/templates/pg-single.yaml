@@ -1,0 +1,6 @@
+name: pg-single
+description: One PostgreSQL 18 server (superuser postgres / lab), no internet
+egress: none
+members:
+  - {name: pg1, image: "ghost-lab/pg:18", mem_mb: 768, cpus: 1.0}
+readiness: {member: pg1, cmd: "pg_isready -h localhost", timeout_s: 90}

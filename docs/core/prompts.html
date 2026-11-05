@@ -196,6 +196,7 @@
     stable conversation id, so a project bound to one conversation got parked
     for later turns whose first-message fingerprint differed — the agent then
     spun (<code>manage_projects get</code> ×3 → loop breaker → scrub fallback).
+    <em>(Removed by &sect;4SX B0, decision B2: nothing is activated by wording; a message naming another project gets one <code>PROJECT NAMED</code> line instead.)</em>
     <code>tools.projects.reconcile_conversation</code> now keeps/activates a
     project when THIS request's user message names it by title or id
     (<code>_message_references_project</code>), overriding the mismatch.</li>

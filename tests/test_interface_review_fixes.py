@@ -16,6 +16,7 @@ Covers the four bugs + improvements from the code review:
  11. tts returns locally-synthesised WAV audio (was: Pi content-type passthrough).
  12. /ws evicts the socket on ANY exit path.
 """
+from types import SimpleNamespace
 import asyncio
 import json
 import os
@@ -444,7 +445,7 @@ async def test_download_filename_is_url_quoted():
     fake_client.send = AsyncMock(return_value=fake_resp)
 
     with patch.object(server, "_get_http_client", return_value=fake_client):
-        resp = await server.download_proxy("report?v=2.pdf")
+        resp = await server.download_proxy("report?v=2.pdf", SimpleNamespace(headers={}))
         async for _ in resp.body_iterator:
             pass
 

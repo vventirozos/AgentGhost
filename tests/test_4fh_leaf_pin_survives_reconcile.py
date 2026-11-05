@@ -1,9 +1,10 @@
 """§4FH C1 pins: a coding leaf's project pin survives the turn, and a leaf
 that changed nothing inside the project workspace cannot be DONE.
 
-The defect: `handle_chat` runs `reconcile_conversation` first; the leaf's
-prompt has no conversation binding, so the reconciler parked the pinned
-project and every leaf wrote at the sandbox ROOT — six theatrical DONEs.
+The defect: `handle_chat` ran the conversation reconciler first; the leaf's
+prompt had no conversation binding, so it parked the pinned project and
+every leaf wrote at the sandbox ROOT — six theatrical DONEs. §4SX B0: the
+leaf passes its own request scope (the pin) instead.
 """
 import asyncio
 from types import SimpleNamespace
@@ -22,23 +23,36 @@ def _base(pid=None):
                            scratchpad=None)
 
 
-def test_reconciler_leaves_a_pinned_leaf_alone(monkeypatch):
-    """Executed through the real `reconcile_conversation`. World where it
-    fails: the reconciler parks the pin (current_project_id → None) because
-    the leaf's fingerprint has no binding."""
-    parked = []
+def test_the_leaf_turn_runs_under_its_pinned_scope(monkeypatch):
+    """§4SX B0 (r2 #7): run_leaf_turn hands handle_chat a pre-built scope
+    holding the pin — no conversation, never a focus row — and the request
+    start keeps it. World where it fails: the leaf turn starts with no
+    project and writes at the sandbox root."""
+    from ghost_agent.core import agent as agent_mod
+    seen = {}
 
-    def _park(context, cur, why):
-        parked.append(cur); context.current_project_id = None
-    monkeypatch.setattr(tp, "_reconcile_conversation",
-                        lambda ctx, key: _park(ctx, ctx.current_project_id, "no binding"))
-    iso = cl.build_leaf_context(_base(), leaf_id="L", project_id="p42")
-    tp.reconcile_conversation(iso, "some-conv-key")
-    assert iso.current_project_id == "p42" and parked == []
-    # a normal (non-leaf) context still reconciles
-    plain = _base(pid="p42")
-    tp.reconcile_conversation(plain, "some-conv-key")
-    assert plain.current_project_id is None and parked == ["p42"]
+    class FakeAgent:
+        def __init__(self, iso):
+            self.iso = iso; self.available_tools = {"file_system": 1}
+            self.disabled_tools = set(); self.max_turns_override = None
+
+        async def handle_chat(self, body, background_tasks=None, request_id=None, scope=None):
+            seen["scope"] = scope
+            from ghost_agent.core.request_scope import install, reset
+            scope.context = self.iso
+            tok = install(scope)
+            try:
+                tp.begin_request_focus(self.iso)
+                seen["during"] = self.iso.current_project_id
+            finally:
+                reset(tok)
+            return "ok", None, None
+    monkeypatch.setattr(agent_mod, "GhostAgent", FakeAgent)
+    asyncio.run(cl.run_leaf_turn(_base(), leaf_id="L", prompt="p", is_background=False,
+                                 project_id="p42"))
+    sc = seen["scope"]
+    assert sc.project_id == "p42" and sc.persist is False and sc.conversation_key == ""
+    assert seen["during"] == "p42"
 
 
 def test_run_leaf_turn_fails_closed_when_the_pin_is_lost(monkeypatch):
@@ -52,8 +66,8 @@ def test_run_leaf_turn_fails_closed_when_the_pin_is_lost(monkeypatch):
             self.iso = iso; self.available_tools = {"file_system": 1, "execute": 1, "browser": 1}
             self.disabled_tools = set(); self.max_turns_override = None
 
-        async def handle_chat(self, body, background_tasks=None, request_id=None):
-            self.iso.current_project_id = None          # the reconciler's effect
+        async def handle_chat(self, body, background_tasks=None, request_id=None, scope=None):
+            scope.project_id = None                     # anything moving the pin
             return "VERIFY: none\nSUMMARY: done", None, None
     monkeypatch.setattr(agent_mod, "GhostAgent", FakeAgent)
     with pytest.raises(RuntimeError, match="lost its project pin"):
@@ -76,7 +90,7 @@ def test_run_leaf_turn_routes_calls_through_the_background_lane(monkeypatch):
             self.iso = iso; self.available_tools = {"file_system": 1, "execute": 1}
             self.disabled_tools = set(); self.max_turns_override = None
 
-        async def handle_chat(self, body, background_tasks=None, request_id=None):
+        async def handle_chat(self, body, background_tasks=None, request_id=None, scope=None):
             await self.iso.llm_client.chat_completion({}, x=1)
             return "ok", None, None
     monkeypatch.setattr(agent_mod, "GhostAgent", FakeAgent)

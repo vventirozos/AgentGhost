@@ -1871,7 +1871,7 @@ def _regrade_echo(audit: List["AuditFigure"], entities: List["AuditEntity"], rep
 #: earlier reply). Kept here so the binder and the objection tier share it.
 # §4LH: + fact_check — its output is the main model's own verdict on the
 # claim, not a source; counted as one it vouched for the claim's entities
-SOURCE_EXCLUDED_TOOLS = frozenset({"execute", "recall", "fact_check"})
+SOURCE_EXCLUDED_TOOLS = frozenset({"execute", "recall", "fact_check", "lab", "run"})   # §4SX D5: run = program output
 
 
 def _source_tool(name: str) -> bool:

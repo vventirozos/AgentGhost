@@ -215,6 +215,11 @@ class CodingResult:
     #: §4SD: the leaf's time ran out (not the build) — the advancer puts the
     #: task back to READY as for a timed-out step, not FAILED
     out_of_time: bool = False
+    #: §4SX D4: the build could not get a lab (``core.lab_waits``: labs_down / lab_capacity) — the advancer
+    #: puts the task back to PENDING with a hold that lifts when the labs host has room, not FAILED
+    lab_wait: str = ""
+    #: the MB the refused lab create needed (a capacity hold lifts only when that much is free)
+    lab_needed_mb: int = 0
 
 
 def _short(text: str, n: int = 180) -> str:

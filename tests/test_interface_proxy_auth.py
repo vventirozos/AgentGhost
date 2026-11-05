@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi import Request, UploadFile
+from types import SimpleNamespace
 import interface.server as server
 from interface.server import chat_proxy, upload_proxy, download_proxy
 # ⚠ THE KEY IS READ FROM THE MODULE AT ASSERT TIME, never bound by value at
@@ -137,7 +138,7 @@ async def test_download_proxy_adds_auth_header():
     mock_client.send = AsyncMock(return_value=mock_response)
 
     with patch.object(server_mod, "_get_http_client", return_value=mock_client):
-        response = await download_proxy("test.jpg")
+        response = await download_proxy("test.jpg", SimpleNamespace(headers={}))
 
         if hasattr(response, "body_iterator"):
             async for _ in response.body_iterator:
@@ -215,3 +216,28 @@ def test_this_file_does_not_FREEZE_the_key_at_import():
         "this module binds GHOST_API_KEY by value at import; it will "
         "silently disagree with `interface.server` after any reload or "
         "environment change. Read `server.GHOST_API_KEY` at assert time.")
+
+
+@pytest.mark.asyncio
+async def test_download_proxy_forwards_the_session():
+    """§4SX B0 review r2: no client path carried a session to a download, so a
+    bare link in a focused conversation 404'd when two projects held the name."""
+    import interface.server as server_mod
+    from interface.server import download_proxy
+    mock_client = MagicMock()
+    resp = MagicMock(); resp.raise_for_status = MagicMock(); resp.headers = {}
+
+    async def _ai(*a, **k):
+        yield b"d"
+    resp.aiter_bytes = MagicMock(side_effect=_ai); resp.aclose = AsyncMock()
+    mock_client.build_request.return_value = MagicMock()
+    mock_client.send = AsyncMock(return_value=resp)
+    with patch.object(server_mod, "_get_http_client", return_value=mock_client):
+        r = await download_proxy("plot.png", SimpleNamespace(headers={"X-Ghost-Session": "w-1"}))
+        async for _ in r.body_iterator:
+            pass
+        r = await download_proxy("plot.png", SimpleNamespace(headers={}), session_id="w-2")
+        async for _ in r.body_iterator:
+            pass
+    sent = [c.kwargs["headers"].get("X-Ghost-Session") for c in mock_client.build_request.call_args_list]
+    assert sent == ["w-1", "w-2"]

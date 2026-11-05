@@ -115,13 +115,12 @@ async def _score_config(base_url: str, api_key: str, model: str, suite_name: str
     if suite_name == "behavioral":
         # Grounded runner + a context pointed at THIS agent's GHOST_HOME (so it
         # verifies the isolated agent's own sandbox / trajectory, not the
-        # driver's). The DB is external (shared), so it works per-config too.
+        # driver's).
         from ghost_agent.eval import EvalContext, agent_behavioral_runner
         gh = Path(ghost_home) if ghost_home else None
         ctx = EvalContext(
             base_url=base_url, model=model, api_key=api_key,
             ghost_home=gh, sandbox_dir=(gh / "sandbox" if gh else None),
-            default_db=os.getenv("GHOST_DEFAULT_DB") or "postgresql://ghost@127.0.0.1:5432/agent",
             timeout_s=timeout)
         runner = agent_behavioral_runner()
     else:

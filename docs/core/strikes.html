@@ -125,7 +125,9 @@
     signature accepts Playwright's bare <code>Error</code> class &mdash; only when no named class such as <code>ValueError</code> follows
     (R5: a bare label before the class would otherwise split the &sect;4IE harness shape), and with the runner's parenthesised
     <code>(Error):</code> folded to <code>Error:</code>. <code>PROGRAM_OUTPUT_TOOLS</code> (<code>execute</code>, <code>jobs</code>) &mdash; and
-    an unnamed caller &mdash; keep the scan, last failure line wins. Any other tool returns content and fails only by what it
+    an unnamed caller, and (&sect;4SX B, <code>is_program_output</code>) a <code>lab</code> <em>exec</em> result, recognised by its
+    <code>[lab_…/member exit=…]</code> header &mdash; keep the scan, last failure line wins. The lab's other actions
+    (logs, status, http) return content. Any other tool returns content and fails only by what it
     declares: a status, the banner, a failure head (<code>tool_failure.result_is_failure</code> &mdash; the turn loop's own
     vocabulary, not a third one) or a browser <code>STATUS: ERROR/BLOCKED</code>. The exception-name alternative is now case-sensitive: <code>ValueError</code>
     and <code>error:</code> match, "terror" does not. After the change the success-shaped false positives are 0 and the execute

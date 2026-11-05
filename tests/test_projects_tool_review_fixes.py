@@ -33,8 +33,8 @@ from ghost_agent.memory.scratchpad import Scratchpad
 from ghost_agent.tools.projects import (
     tool_manage_projects,
     conversation_fingerprint,
-    reconcile_conversation,
 )
+from tests.focus_helpers import scope_reset, start_request  # noqa: F401
 
 
 @pytest.fixture
@@ -204,39 +204,41 @@ CONV_B = conversation_fingerprint(
     [{"role": "user", "content": "unrelated postgres question"}])
 
 
-async def test_reconcile_missing_sentinel_parks_stale_project(context):
-    """LRU eviction of the binding sentinels must not leave the previous
-    conversation's project active for the next request (fail CLOSED)."""
-    reconcile_conversation(context, CONV_A)
+async def test_a_conversation_without_focus_starts_with_no_project(context):
+    """§4SX B0: the previous request's project never carries into another
+    conversation — its request starts from ITS row (none here)."""
+    start_request(context, CONV_A)
     pid = await _create(context, title="PetAI")
-    # Simulate the 50-entry/24h scratchpad eviction of both sentinels.
-    context.scratchpad.delete("__current_project__")
-    context.scratchpad.delete("__current_project_conv__")
-    context.current_project_id = pid          # stale process-global
-    context.last_user_content = "what's the weather like"
-
-    reconcile_conversation(context, CONV_B)
-    assert context.current_project_id is None
-
-
-async def test_reconcile_missing_sentinel_keeps_explicitly_named_project(context):
-    reconcile_conversation(context, CONV_A)
-    pid = await _create(context, title="PetAI")
-    context.scratchpad.delete("__current_project__")
-    context.scratchpad.delete("__current_project_conv__")
-    context.current_project_id = pid
-    context.last_user_content = "proceed with task 3 of the PetAI project"
-
-    reconcile_conversation(context, CONV_B)
-    # Escape hatch: named → stays active AND is re-bound for this request.
     assert context.current_project_id == pid
-    assert context.scratchpad.get("__current_project__") == pid
-    assert context.scratchpad.get("__current_project_conv__") == CONV_B
+    context.last_user_content = "what's the weather like"
+    start_request(context, CONV_B)
+    assert context.current_project_id is None
+    start_request(context, CONV_A)
+    assert context.current_project_id == pid
 
 
-async def test_reconcile_no_sentinel_no_current_is_noop(context):
+async def test_naming_a_project_activates_nothing_and_hints(context):
+    """§4SX B0 (B2): no implicit activation by wording — the briefing gets a
+    one-line hint and the model switches with one call."""
+    from ghost_agent.tools.projects import project_name_hint
+    start_request(context, CONV_A)
+    pid = await _create(context, title="PetAI")
+    start_request(context, CONV_B)
+    msg = "proceed with task 3 of the PetAI project"
+    context.last_user_content = msg
+    assert context.current_project_id is None
+    hint = project_name_hint(context, msg)
+    assert pid in hint and "switch" in hint
+    assert context.project_store.get_focus(CONV_B) is None
+    # by id prefix too, and never for the project already in focus
+    assert pid in project_name_hint(context, f"look at {pid[:8]} please")
+    start_request(context, CONV_A)
+    assert project_name_hint(context, msg) == ""
+
+
+async def test_a_request_start_with_no_row_and_no_project_is_a_noop(context):
     context.last_user_content = ""
-    reconcile_conversation(context, CONV_B)   # must not raise
+    start_request(context, CONV_B)   # must not raise
     assert context.current_project_id is None
 
 

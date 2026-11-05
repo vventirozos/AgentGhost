@@ -181,7 +181,7 @@ Value := str                      # LEGACY — as_of unknown
     <code>OUTBOUND_TOOLS</code> says which arguments of which tool leave: every argument of web_search, deep_research,
     darkweb_search, darkweb_research, fact_check and browser; <code>location</code>/<code>city</code>/<code>query</code>
     of system_utility (the geocoder); only URLs for file_system, knowledge_base and vision_analysis (their local paths and
-    the owner's own text never leave). Not covered by design: <code>execute</code>. Descriptions are prompt-only — as
+    the owner's own text never leave); for <code>execute</code> and (&sect;4SX B) <code>lab</code>, only URL literals inside the code (<code>"url_literals"</code>: the code is the owner's own, but the machine it runs on has Tor egress). Descriptions are prompt-only — as
     egress terms their first clause rewrote unrelated queries ("brown hair dye").</li>
     <li><strong>Weather</strong> geocodes a LOCALITY: the location/city field, else a home/residence/address value with
     its street, number and postcode removed ("Kifisias 10, Marousi" → Marousi).</li>

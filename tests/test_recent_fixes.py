@@ -6,7 +6,6 @@ from pathlib import Path
 from ghost_agent.tools.system import tool_get_weather
 from ghost_agent.tools.memory import tool_knowledge_base
 from ghost_agent.tools.file_system import tool_file_system, tool_download_file
-from ghost_agent.tools.database import tool_postgres_admin
 from ghost_agent.tools.execute import tool_execute
 from ghost_agent.tools.tasks import tool_schedule_task
 
@@ -47,29 +46,6 @@ async def test_download_file_size_limit():
         assert "Error: File is too large" in res
         assert "50MB" in res
 
-@pytest.mark.asyncio
-async def test_database_statement_timeout():
-    mock_psycopg = MagicMock()
-    with patch.dict("sys.modules", {"psycopg2": mock_psycopg, "psycopg2.extras": MagicMock(), "tabulate": MagicMock()}):
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
-        mock_psycopg.connect.return_value = mock_conn
-        
-        # Action 'query'
-        res = await tool_postgres_admin("query", "uri", "SELECT 1")
-        
-        # Verify execute was called with SET statement_timeout — now
-        # PARAMETERIZED (int-clamped) instead of f-string-interpolated.
-        # The session reset (`DISCARD ALL`) runs first, so locate the SET
-        # rather than assuming it is call 0.
-        calls = mock_cur.execute.call_args_list
-        stmts = [c[0][0] for c in calls]
-        assert "DISCARD ALL" in stmts, "session state must be reset per call"
-        _i = stmts.index("SET statement_timeout = %s")
-        assert calls[_i][0][1] == (15000,)
-        # The timeout is applied BEFORE the query runs.
-        assert any("SELECT 1" in s for s in stmts[_i + 1:])
 
 @pytest.mark.asyncio
 async def test_execute_stubbornness_large_file():

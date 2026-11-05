@@ -981,6 +981,7 @@ class Icons:
     MEM_REINFORCE = "💪"  # an existing memory/skill strengthened or merged (NOT 🔄 RETRY)
     USER_ID      = "👤"
     SELF_STATE   = "🪞"   # selfhood state / mood transition
+    MIRROR       = "🎭"   # §4SV: the Mirror — the daily I-sentence and the owner's `mirror` command
     DREAM        = "🌙"   # REM / dream consolidation cycle (NOT 💤 — that's SYSTEM_SHUT)
     SKIP         = "⏩"   # a step/cycle deliberately skipped
     ACTIVITY     = "📡"   # autonomous-activity ledger / background digest surfaced
@@ -1056,6 +1057,10 @@ class Icons:
     # --- IDE: Dream (§4CM) ---
     GEPA_AUTONOMY    = "🚜"   # §4DC/§4DF autonomous GEPA loop (supply watch / live judge / optimizer launcher / epoch swap)
     DREAM_REPLAY     = "🌀"   # replay of a recorded episode (isolation)
+    # --- labs (§4SX B): machines on the labs host ---
+    LAB_CREATE       = "🏭"   # a lab was created (origin, owner, template)
+    LAB_DESTROY      = "🪓"   # a lab was destroyed
+    LAB_EXEC         = "📟"   # a command ran on a lab member
 
 
 def effort_icon(level: str) -> str:

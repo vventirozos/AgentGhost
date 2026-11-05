@@ -331,6 +331,9 @@ def is_unresolved_tool_result(result) -> bool:
     if ("still running in the background" in _t
             and "were NOT cancelled" in _t):
         return True
+    if run_text_unresolved(result):        # §4SX D5 review r9: a stored `run` row (or an alias's) with no verdict
+        # (r10: the OUTCOME is passed — a declared OK whose text merely reads like a run head is not unresolved)
+        return True
     try:
         from ..sandbox.jobs import is_promoted_result
     except Exception:  # noqa: BLE001 — heuristics must never hard-fail
@@ -379,6 +382,89 @@ def browser_result_status(result) -> "str | None":
     return m.group(1).lower() if m else None
 
 
+#: the head of a `run collect` result: ``[run NAME STATE …]`` then OUR ``EXIT CODE: N|none`` line
+# review r8 minor 2: never a `[run x logs]` / `[run x app …]` head whose first log line reads "EXIT CODE: 1"
+_RUN_COLLECT_RE = re.compile(r"\[run [a-z][a-z0-9-]{0,30} (?!logs\b|app\b)([a-z_]+)[^\]\n]*\]\s*\nEXIT CODE: (-?\d+|none)\b")
+
+
+def _without_banner_lines(result) -> str:
+    """The result without the turn loop's failure-banner lines (review r5: a stored `[FAILURE BANNER] RUN ERROR: …`
+    row read as not failed — the head checks ran before the banner was skipped)."""
+    from ..core.strikes import _FAILURE_BANNER
+    return "\n".join(ln for ln in str(result or "").splitlines()
+                     if not ln.strip().startswith(_FAILURE_BANNER)).strip()
+
+
+def run_text_unresolved(result) -> bool:
+    """review r9: a stored `run` row with no verdict — `runs._headed` heads every UNRESOLVED result
+    `RUN UNRESOLVED`; a collect keeps its own head, unresolved when it exited with no recorded code. A live
+    outcome answers by its status."""
+    _st = getattr(result, "status", None)
+    if _st is not None and getattr(result, "declared", False):
+        return str(getattr(_st, "value", _st)) == "unresolved"
+    h = _without_banner_lines(result)
+    if h.startswith("RUN UNRESOLVED"):
+        return True
+    m = _RUN_COLLECT_RE.match(h)
+    return bool(m and m.group(1) == "exited" and m.group(2) == "none")
+
+
+def _run_result_failed(result: str) -> bool:
+    """§4SX D5: a `run` result failed — its own refusal/error head, or a collected job that exited non-zero.
+    A log's "ERROR" line is content (strikes.is_program_output: only collect is program output)."""
+    _st = getattr(result, "status", None)
+    if _st is not None and getattr(result, "declared", False):
+        # the tool's own verdict first (a live ToolOutcome); the prose below is for stored rows
+        return str(getattr(_st, "value", _st)) not in ("ok", "unresolved")
+    h = _without_banner_lines(result)
+    # review r7: `runs._headed` gives every FAILED/REJECTED `run` result this head and no other result it (an
+    # UNRESOLVED one reads `RUN UNRESOLVED`); a collect is decided by its own head below. `RUN: not started` /
+    # `Error:` are rows stored before that rule
+    if h.startswith(("RUN ERROR", "RUN: not started", "Error:")):
+        return True
+    # review r2: OUR two head lines decide, the same as the live verdict (OK only for `exited` with exit 0) — never
+    # a later `EXIT CODE: 3` the program printed, and an expired/stopped/lost job is a failure here too. Only a
+    # collect has that head: a log / status / url result is content (strikes.is_program_output agrees)
+    m = _RUN_COLLECT_RE.match(h)
+    if m is None:
+        return False
+    state, code = m.group(1), m.group(2)
+    if state != "exited":
+        return True
+    return code not in ("0", "none")    # "none" (exit unknown): unresolved, not failed
+
+
+def _lab_result_failed(result: str) -> bool:
+    """§4SX B (review r2 MAJOR C): a stored `lab` row. Its own prefix is the
+    only failure head (`LAB ERROR (…)`; `no_answer` is unresolved, not a
+    verdict); an EXEC result is decided by its exit line or TIMED OUT header;
+    every other action returns content — a log's "ERROR: relation …" and a
+    page's traceback are its subject."""
+    _st = getattr(result, "status", None)
+    if _st is not None and getattr(result, "declared", False):
+        # the tool's own verdict first (a live ToolOutcome); the prose below is
+        # for stored rows, which are plain text
+        return str(getattr(_st, "value", _st)) not in ("ok", "unresolved")
+    h = str(result or "").strip()
+    if h.startswith("LAB ERROR ("):
+        return not h.startswith("LAB ERROR (no_answer)")
+    # the two non-exec failure shapes (r3 minor 8): a create that did not come
+    # up, an http probe with no answer yet
+    if re.search(r"\nThe lab is \w+: read `lab logs`", h) or re.match(r"^\[lab_[0-9a-f]{8}/[^\]]+\] no answer yet:", h):
+        return True
+    from ..core.strikes import is_program_output
+    if not is_program_output("lab", result):
+        return False
+    first = h.splitlines()[0] if h else ""
+    if " no exit code" in first:
+        return False        # unresolved, as live (r4 minor 3: stdout's "EXIT CODE: 1" is not the exit)
+    if " TIMED OUT" in first:
+        return True
+    from ..tools.tool_failure import exec_exit_code as _eec
+    c = _eec(result)
+    return c is not None and c != 0
+
+
 def _looks_like_tool_error(result: str, tool_name: str = "") -> bool:
     """Cheap text detector for "this tool call failed" — the FALLBACK when the
     structured ``ToolCall.error`` flag isn't set (legacy trajectories).
@@ -419,6 +505,13 @@ def _looks_like_tool_error(result: str, tool_name: str = "") -> bool:
         # evidence, not a failure (the evidence gate agrees); the live loop
         # still books it from the declared status
         return _bs not in ("ok", "partial")
+    if str(tool_name or "").strip().lower() == "lab":
+        return _lab_result_failed(result)
+    _tn = str(tool_name or "").strip().lower()
+    if _tn == "run" or (_tn in ("jobs", "manage_services")
+                        and _without_banner_lines(result).startswith(("[run ", "RUN ", "RUN:", "RUNS", "No runs here"))):
+        # review r3: a `run` result that came through an old-name alias is stored under that name
+        return _run_result_failed(result)
     if str(tool_name or "").strip().lower() in _CONTENT_TOOLS:
         from ..tools.tool_failure import result_is_failure
         _h = result.strip()

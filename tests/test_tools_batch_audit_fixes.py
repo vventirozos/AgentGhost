@@ -23,88 +23,6 @@ pytestmark = pytest.mark.asyncio
 
 # ============================================================ database
 
-async def test_hostaddr_query_param_redirect_is_refused():
-    from ghost_agent.tools.database import tool_postgres_admin
-    default = "postgresql://db.internal:5432/prod"
-    # netloc identical to default, but ?hostaddr= redirects the real TCP target.
-    supplied = "postgresql://db.internal:5432/prod?hostaddr=10.0.0.99"
-    out = await tool_postgres_admin("query", connection_string=supplied,
-                                    query="SELECT 1", default_uri=default)
-    assert out.startswith("Error")
-    assert "refused" in out
-
-
-async def test_host_query_param_redirect_is_refused():
-    from ghost_agent.tools.database import tool_postgres_admin
-    default = "postgresql://db.internal:5432/prod"
-    supplied = "postgresql://db.internal:5432/prod?host=evil.example"
-    out = await tool_postgres_admin("query", connection_string=supplied,
-                                    query="SELECT 1", default_uri=default)
-    assert out.startswith("Error") and "refused" in out
-
-
-async def test_matching_default_still_allowed():
-    from ghost_agent.tools.database import tool_postgres_admin
-    default = "postgresql://db.internal:5432/prod"
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_cursor.description = True
-    mock_cursor.fetchmany.return_value = [{"x": 1}]
-    with patch("psycopg2.connect", return_value=mock_conn), \
-         patch("tabulate.tabulate", return_value="| x |"):
-        out = await tool_postgres_admin(
-            "query", connection_string=default, query="SELECT 1",
-            default_uri=default)
-    assert "POSTGRES RESULT" in out
-
-
-async def test_confirm_false_string_does_not_authorize_drop():
-    from ghost_agent.tools.database import tool_postgres_admin
-    # confirm="false" must be treated as NOT confirmed (bool("false") is True).
-    out = await tool_postgres_admin(
-        "query", connection_string="postgresql://h/db",
-        query="DROP TABLE users", confirm="false")
-    assert "SYSTEM BLOCK" in out  # rejected by the destructive-statement guard
-
-
-async def test_confirm_true_string_authorizes_drop():
-    from ghost_agent.tools.database import tool_postgres_admin
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_cursor.description = None
-    with patch("psycopg2.connect", return_value=mock_conn), \
-         patch("tabulate.tabulate", return_value=""):
-        out = await tool_postgres_admin(
-            "query", connection_string="postgresql://h/db",
-            query="DROP TABLE users", confirm="true")
-    assert "SYSTEM BLOCK" not in out  # allowed through the guard
-
-
-async def test_nonnumeric_port_in_supplied_uri_is_formatted_error():
-    from ghost_agent.tools.database import tool_postgres_admin
-    out = await tool_postgres_admin(
-        "query", connection_string="postgresql://h:notaport/db",
-        query="SELECT 1", default_uri="postgresql://h:5432/db")
-    # A formatted tool error, not an uncaught ValueError out of the tool.
-    assert isinstance(out, str)
-    assert out.startswith("Error")
-
-
-async def test_schema_output_is_row_capped():
-    from ghost_agent.tools.database import tool_postgres_admin
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    big = [{"table_name": f"t{i}", "column_name": "c", "data_type": "int"}
-           for i in range(1001)]
-    mock_cursor.fetchmany.return_value = big
-    with patch("psycopg2.connect", return_value=mock_conn), \
-         patch("tabulate.tabulate", return_value="rows"):
-        out = await tool_postgres_admin("schema", "postgresql://h/db")
-    assert "schema truncated" in out
-
 
 # ============================================================ report_pdf
 
@@ -153,7 +71,6 @@ async def test_image_success_reports_the_size_the_node_rendered(tmp_path):
     assert "SUCCESS" in out
     assert "Rendered at 736x416" in out          # what the node did
     assert "1920x1080" in out                    # and what was asked, so the model can say so
-
 
 
 async def test_image_writes_when_sandbox_dir_absent(tmp_path):

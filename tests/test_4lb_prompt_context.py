@@ -266,7 +266,7 @@ def _bind_project(monkeypatch, ctx, P):
     import ghost_agent.tools.projects as TP
     ctx.project_store = MagicMock()
     ctx.current_project_id = "p1"
-    monkeypatch.setattr(TP, "reconcile_conversation", lambda *a, **k: None)   # keep the binding
+    monkeypatch.setattr(TP, "begin_request_focus", lambda *a, **k: None)   # keep the binding
     monkeypatch.setattr(P, "build_project_briefing", lambda *a, **k: "MARK-BRIEFING owner project journal")
     from ghost_agent.workspace import WorkspaceModel
     ws = MagicMock(spec=WorkspaceModel)

@@ -102,7 +102,7 @@ def _save_task_store(tasks: dict) -> bool:
 
 def _persist_task(job_id: str, task_name: str, prompt: str,
                   cron_expression: str, kind: str = "task",
-                  check_command: str = None) -> bool:
+                  check_command: str = None, owner: str = "") -> bool:
     tasks = _load_task_store()
     rec = {
         "task_name": task_name,
@@ -110,6 +110,8 @@ def _persist_task(job_id: str, task_name: str, prompt: str,
         "cron_expression": cron_expression,
         "created_at": time.time(),
     }
+    if owner:
+        rec["owner"] = owner              # §4SX D4: "project:<id>" — listed with the project, removed with it
     if kind == "watch":
         # A watch carries its condition command + the edge-trigger state so
         # a restart doesn't re-fire a condition that was already true.
@@ -425,7 +427,8 @@ def should_defer_scheduled_task(llm_client) -> bool:
     cur = getattr(llm_client, "foreground_requests", 0)
     return isinstance(cur, int) and cur > 0
 
-async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, scheduler, memory_system):
+async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, scheduler, memory_system,
+                             owner: str = ""):
     pretty_log("Task Schedule", f"Name: {task_name} | Expr: {cron_expression}", icon=Icons.BRAIN_PLAN)
     if not scheduler:
         return "Error: Background task scheduling is disabled or not available in this context."
@@ -443,7 +446,7 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
         # ever holds tasks that were actually schedulable. Survives agent
         # restarts (the jobstore itself is in-memory); best-effort like the
         # memory note below.
-        _saved = _persist_task(job_id, task_name, prompt, cron_expression)
+        _saved = _persist_task(job_id, task_name, prompt, cron_expression, owner=owner)
 
         # The job is already scheduled at this point. A failure to write the
         # bookkeeping memory entry must NOT be reported as a scheduling
@@ -470,14 +473,15 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
                 f"PARTIAL: Task '{task_name}' is scheduled for THIS session (ID: {job_id}) but could NOT "
                 f"be saved — it will be lost at the next restart. Tell the user.",
                 reason_code="task_not_persisted")
-        return f"SUCCESS: Task '{task_name}' scheduled (ID: {job_id})."
+        return (f"SUCCESS: Task '{task_name}' scheduled (ID: {job_id})."
+                + (f" It belongs to {owner}: listed with it, removed when it is deleted." if owner else ""))
     except Exception as e:
         pretty_log("Schedule Error", str(e), level="ERROR", icon=Icons.FAIL)
         return f"ERROR: {e}"
 
 async def tool_watch_condition(task_name: str, check_command: str,
                                reaction_prompt: str, interval_secs,
-                               scheduler, memory_system):
+                               scheduler, memory_system, owner: str = ""):
     """Register a reactive WATCH: poll ``check_command`` every
     ``interval_secs``; when it first SUCCEEDS (exit 0 — shell ``if``
     semantics), fire ``reaction_prompt`` as a background agent turn with the
@@ -504,7 +508,7 @@ async def tool_watch_condition(task_name: str, check_command: str,
         if err:
             return err
         _saved = _persist_task(job_id, task_name, reaction_prompt, cron,
-                               kind="watch", check_command=check_command)
+                               kind="watch", check_command=check_command, owner=owner)
         if memory_system:
             try:
                 from ..utils.helpers import get_utc_timestamp as _uts
@@ -591,6 +595,7 @@ async def tool_list_tasks(scheduler):
     # The scheduler runs on UTC — say so, or a "Next Run: 06:00" reads as
     # local time and the operator concludes the task fired 3 hours late.
     lines = ["ACTIVE SCHEDULED TASKS (times in UTC):"]
+    _owners = {k: str(v.get("owner") or "") for k, v in _load_task_store().items() if isinstance(v, dict)}
     for job in visible_jobs:
         # Convert explicitly: next_run_time carries the TRIGGER's zone, and
         # printing a local-zone datetime under a "times in UTC" header
@@ -602,7 +607,8 @@ async def tool_list_tasks(scheduler):
                 _nrt = _nrt.astimezone(_tz.utc)
         except Exception:  # noqa: BLE001
             pass
-        lines.append(f"- ID: {job.id} | Name: {job.name} | Next Run: {_nrt}")
+        _own = _owners.get(str(job.id).split("__")[0], "")
+        lines.append(f"- ID: {job.id} | Name: {job.name} | Next Run: {_nrt}" + (f" | {_own}" if _own else ""))
     return "\n".join(lines)
 
 #: §4LD bounds: a task fires a full LLM turn holding the agent's one slot
@@ -665,7 +671,7 @@ def _schedule_refusal(action, scheduler, task_name, cron_expression, interval_se
     return None
 
 
-async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, check_command: str = None, interval_secs=None, **kwargs):
+async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, check_command: str = None, interval_secs=None, project_owned=None, _ctx_project_id=None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     # Normalise like the sibling tools (self_state, introspect, uncertainty):
@@ -681,16 +687,24 @@ async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=No
         if _why:
             return _why
 
+    # §4SX D4: project_owned=true → the task belongs to the request's project (the system's id, never the model's)
+    _owner = ""
+    if action in ("create", "watch") and str(project_owned).strip().lower() in ("true", "1", "yes"):
+        if not (isinstance(_ctx_project_id, str) and _ctx_project_id):
+            return ("Error: project_owned=true needs a project in focus — open the project first, or schedule "
+                    "the task without project_owned.")
+        _owner = f"project:{_ctx_project_id}"
     if action == "create":
         if not (task_name and cron_expression and prompt):
                 return "Error: 'create' requires task_name, cron_expression, and prompt."
-        return await tool_schedule_task(task_name, prompt, cron_expression, scheduler, memory_system)
+        return await tool_schedule_task(task_name, prompt, cron_expression, scheduler, memory_system, owner=_owner)
     elif action == "watch":
         if not (task_name and check_command and prompt and interval_secs):
             return ("Error: 'watch' requires task_name, check_command (a shell condition that "
                     "exits 0 when the thing to react to is TRUE), prompt (the reaction), and "
                     "interval_secs.")
-        return await tool_watch_condition(task_name, check_command, prompt, interval_secs, scheduler, memory_system)
+        return await tool_watch_condition(task_name, check_command, prompt, interval_secs, scheduler, memory_system,
+                                          owner=_owner)
     elif action == "list":
         return await tool_list_tasks(scheduler)
     elif action == "stop":
@@ -700,3 +714,28 @@ async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=No
         return await tool_stop_all_tasks(scheduler)
     else:
         return f"Error: Unknown action '{action}'"
+
+# ------------------------------------------------------------------ §4SX D4: schedules a project owns
+
+def project_schedules(project_id: str, *, strict: bool = False) -> list:
+    """The persisted tasks/watches owned by ``project:<project_id>``: [{id, name, kind, cron}]. ``strict``
+    raises when the store could not be read (a teardown must not read "none")."""
+    owner = f"project:{project_id}"
+    tasks = _load_task_store()
+    if strict and _STORE_STATE["unreadable"]:
+        raise RuntimeError("the scheduled-task store could not be read")
+    return [{"id": k, "name": str(v.get("task_name") or k), "kind": str(v.get("kind") or "task"),
+             "cron": str(v.get("cron_expression") or "")}
+            for k, v in tasks.items() if isinstance(v, dict) and v.get("owner") == owner]
+
+
+def remove_project_schedule(scheduler, job_id: str) -> bool:
+    """Stop one project-owned task (and its pending one-shot runs) and drop it from the store. True when the
+    store no longer holds it."""
+    for jid in (job_id, f"{job_id}__catchup", f"{job_id}__retry"):
+        try:
+            if scheduler is not None and scheduler.get_job(jid) is not None:
+                scheduler.remove_job(jid)
+        except Exception:  # noqa: BLE001 — not scheduled in this session
+            pass
+    return _unpersist_task(job_id)

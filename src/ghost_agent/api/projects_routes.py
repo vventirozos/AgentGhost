@@ -116,29 +116,36 @@ def _context(request: Request):
     return get_agent(request).context
 
 
-def _set_current_or_held(ctx, pid: str) -> None:
-    """``_set_current`` for the console routes. The shared context still
-    carries the last chat's conversation key; when that chat is held off the
-    owner's binding (§4QA), the switch would last no request at all — refuse
-    it (409) BEFORE anything changes (r15 MAJOR-2: refusing after the switch
-    had already re-scoped the context and evicted that chat's guest seat)."""
-    from ..tools.projects import _CURRENT_SENTINEL, _guest_leaving_owner, _set_current
-    sp = getattr(ctx, "scratchpad", None)
-    conv = getattr(ctx, "conversation_key", None)
-    if sp is not None and _guest_leaving_owner(sp, pid, conv):
-        raise HTTPException(409, f"not switched: another conversation owns the active project "
-                                 f"binding ({sp.get(_CURRENT_SENTINEL)}); switch from that chat")
-    _set_current(ctx, pid)
+async def _session_key(request: Request, session_id: Optional[str], required: bool) -> str:
+    """§4SX B0 (r1 #1): the console routes act on ONE conversation's focus,
+    named by its ``session_id`` (query, or a JSON body field) — never on the
+    shared context, which carries whichever chat ran last."""
+    from ..core.request_scope import conversation_key_for_session
+    sid = session_id
+    if not sid:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                sid = body.get("session_id")
+        except Exception:  # noqa: BLE001 — no / non-JSON body
+            sid = None
+    key = conversation_key_for_session(sid if isinstance(sid, str) else "")
+    if required and not key:
+        raise HTTPException(400, "session_id is required: the switch applies to that conversation only")
+    return key
 
 
 # --------------------------------------------------------------------- projects
 
 @projects_router.get("")
-async def list_projects(request: Request, status: Optional[str] = None):
+async def list_projects(request: Request, status: Optional[str] = None,
+                        session_id: Optional[str] = None):
     store = _store(request)
+    key = await _session_key(request, session_id, required=False)
     return {
         "projects": store.list_projects(status_filter=status),
-        "current": getattr(_context(request), "current_project_id", None),
+        # §4SX B0: per conversation — None without a session_id
+        "current": store.get_focus(key) if key else None,
     }
 
 
@@ -214,6 +221,18 @@ async def update_project(pid: str, body: ProjectUpdate, request: Request):
         raise HTTPException(400, "no fields to update")
     if "metadata" in fields:
         fields["metadata"] = _guarded_metadata(fields["metadata"])      # §4PG (R3-2)
+    if str(fields.get("status") or "").upper() == "ARCHIVED":
+        # §4SX D2 (review r1 M4): archiving here used to skip the teardown — its runs/labs kept running
+        proj = store.get_project(pid)
+        if not proj:
+            raise HTTPException(404, "project not found")
+        origin = _request_origin(request)
+        if origin == "probe" and not (proj.get("metadata") or {}).get("probe_created"):
+            raise HTTPException(403, "a probe deletes or archives only a project it created")
+        archiving = True
+    else:
+        archiving = False
+    td = None
     try:
         # Off-loop: a status=DONE transition fires the workspace cleanup
         # sweep (sync filesystem walk) inline from the store hook.
@@ -222,74 +241,92 @@ async def update_project(pid: str, body: ProjectUpdate, request: Request):
         raise HTTPException(400, str(e))
     if not ok:
         raise HTTPException(404, "project not found")
-    return store.get_project(pid)
+    if archiving:
+        # after the update validated (review r3 m6: a 400 used to come after the runs/labs were stopped)
+        from ..tools.projects import _teardown_project
+        td = await _teardown_project(_context(request), pid, hard=False, origin=origin)
+    out = store.get_project(pid)
+    if td is not None and isinstance(out, dict):
+        from ..tools.projects import _teardown_summary
+        # review r2 #7: what archive left up (production) or could not stop
+        out = dict(out, teardown=_teardown_summary(td), kept_up=td["kept_up"], live_left=td["live_left"])
+    return out
 
 
 @projects_router.delete("/{pid}", status_code=204)
 async def delete_project(pid: str, request: Request, hard: bool = False):
     store = _store(request)
     pid = _canon_id(pid)
-    if not store.get_project(pid):
+    proj = store.get_project(pid)
+    if not proj:
         raise HTTPException(404, "project not found")
-    # Stop the project's services FIRST, as the tool path does (§4LZ C3:
-    # the API deleted/archived the project and left its services running,
-    # registry rows pointing at a project that no longer existed). A hard
-    # delete also purges their state dirs.
-    try:
-        from ..tools.projects import _stop_project_services
-        await asyncio.to_thread(_stop_project_services, _context(request), pid, hard)
-    except Exception:  # noqa: BLE001 — the delete itself must still run
-        import logging as _lg
-        _lg.getLogger("GhostAgent").warning("service stop before project delete failed", exc_info=True)
+    ctx = _context(request)
+    # §4SX D2: the SAME teardown as the tool (runs, services, jobs, labs), with the caller's origin passed
+    # explicitly (review r1 H1: this route has no request scope, so labs would see `autopilot`); a probe
+    # changes only a probe's own project
+    origin = _request_origin(request)
+    if origin == "probe" and not (proj.get("metadata") or {}).get("probe_created"):
+        raise HTTPException(403, "a probe deletes or archives only a project it created")
+    from ..tools.projects import _teardown_project, _teardown_summary
+    td = await _teardown_project(ctx, pid, hard=hard, origin=origin)
+    if hard and td["live_left"]:
+        return JSONResponse({"error": "not deleted: still running", "live_left": td["live_left"],
+                             "teardown": _teardown_summary(td)}, status_code=409)
+    _left = None if hard or not (td["live_left"] or td["kept_up"] or td["failed"]) else {
+        "archived": True, "teardown": _teardown_summary(td), "kept_up": td["kept_up"], "live_left": td["live_left"]}
     # Off-loop: a hard delete rmtree's the project workspace (sync
     # filesystem work that must not block the process-wide event loop).
-    _title = (store.get_project(pid) or {}).get("title", "")
+    _title = proj.get("title", "")
     ok = await asyncio.to_thread(store.delete_project, pid, hard=hard)
     if not ok:
         raise HTTPException(404, "project not found")
-    ctx = _context(request)
     if hard:
         # The tool path's graph leg (2cb40b10): edges naming a deleted
-        # project kept steering the model to rebuild it.
-        from ..tools.projects import _unlink_project_in_graph
+        # project kept steering the model to rebuild it. §4SX D2: and the
+        # tool's episode + changelog legs, which this route skipped.
+        from ..tools.projects import (_forget_project_episodes, _remove_project_changelog,
+                                      _unlink_project_in_graph)
         await asyncio.to_thread(_unlink_project_in_graph, ctx, pid, _title)
-    # Route through the tool-side helper: a raw attribute write left the
-    # conversation sentinel + workspace_model pointer naming the deleted id,
-    # so reconcile reactivated the deleted project and the sandbox recreated
-    # projects/<deleted-id>/. §4NW: it also clears a PERSISTED binding when
-    # the live pointer is elsewhere (after a restart it was None).
+        await asyncio.to_thread(_forget_project_episodes, ctx, pid, _title)
+        await asyncio.to_thread(_remove_project_changelog, ctx, pid)
+    # Route through the tool-side helper: it clears every conversation's
+    # focus on the project and the workspace_model pointer (§4NW / §4SX B0).
     from ..tools.projects import forget_project_pointer
     forget_project_pointer(ctx, pid)
     # 204 No Content MUST have an empty body (RFC 9110). JSONResponse(204,
     # content=None) serialized a 4-byte `null`, which strict HTTP/2 clients
     # and proxies reject.
+    if _left is not None:
+        return JSONResponse(_left, status_code=200)      # review r3 #2: a soft delete that left things up says so
     return Response(status_code=204)
 
 
 @projects_router.post("/{pid}/switch")
-async def switch_project(pid: str, request: Request):
+async def switch_project(pid: str, request: Request, session_id: Optional[str] = None):
     store = _store(request)
     pid = _canon_id(pid)
+    key = await _session_key(request, session_id, required=True)
     proj = store.get_project(pid)
     if not proj:
         raise HTTPException(404, "project not found")
-    # Route through the tool-side setter: a raw attribute write skipped the
-    # conversation sentinel + workspace_model pointer + scratchpad
-    # snapshot/hydrate, so the next chat turn's reconcile silently undid
-    # the switch (or, with no binding, the activation leaked globally).
-    _set_current_or_held(_context(request), pid)
-    return {"switched_to": pid,
+    # §4SX B0: that conversation's focus row; its next request loads it (and
+    # hydrates the project's scratchpad then). No other conversation changes.
+    if not store.set_focus(key, pid):
+        raise HTTPException(404, "project not found")
+    return {"switched_to": pid, "session_id": key,
             "briefing": build_project_briefing(store, pid)}
 
 
 @projects_router.post("/{pid}/resume")
-async def resume_project(pid: str, request: Request):
+async def resume_project(pid: str, request: Request, session_id: Optional[str] = None):
     store = _store(request)
     pid = _canon_id(pid)
+    key = await _session_key(request, session_id, required=True)
     proj = store.get_project(pid)
     if not proj:
         raise HTTPException(404, "project not found")
-    _set_current_or_held(_context(request), pid)
+    if not store.set_focus(key, pid):
+        raise HTTPException(404, "project not found")
     store.log_event(pid, None, "project_resumed", {})
     return {"project": proj,
             "briefing": build_project_briefing(store, pid)}

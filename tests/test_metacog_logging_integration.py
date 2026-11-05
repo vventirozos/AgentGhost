@@ -131,32 +131,6 @@ async def test_shell_validator_block_emits_structured_log(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sql_validator_block_emits_structured_log():
-    from ghost_agent.tools import database as db_module
-    bundle = MagicMock()
-    bundle.enabled = True
-
-    def boom(*args, **kwargs):
-        raise AssertionError("must not connect")
-
-    with patch.object(db_module, "_get_connection", boom):
-        with patch("ghost_agent.utils.logging.pretty_log") as pl:
-            await db_module.tool_postgres_admin(
-                action="query",
-                connection_string="postgresql://x",
-                query="DELETE FROM users",
-                _metacog_bundle=bundle,
-            )
-    valid_calls = [c for c in pl.call_args_list
-                   if c.args and c.args[0] == "Metacog Valid"]
-    assert len(valid_calls) == 1
-    content = valid_calls[0].args[1]
-    assert "verdict=block" in content
-    assert "tool=sql" in content
-    assert "action=query" in content
-
-
-@pytest.mark.asyncio
 async def test_a_real_bundle_counts_a_shell_block_into_the_summary(tmp_path):
     """§4PT: the counter the summary reports, through the real tool and
     the real bundle (the tests above use a MagicMock bundle)."""

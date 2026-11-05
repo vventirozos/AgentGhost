@@ -84,7 +84,20 @@ def build_map(src_files, test_files, log=print):
 _DEF_RE = re.compile(r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)|^\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)")
 
 
+def _argfile_safe(node_id):
+    """A coverage context whose parametrize id holds a REAL newline/CR/tab splits into broken
+    lines in the @argfile and pytest collects nothing (exit 5, 11-04: the no-op control went
+    HARNESS) — run the whole test function instead."""
+    # (the coverage map also holds such ids already CUT at the newline: "…[browser" with no "]")
+    broken = any(c in node_id for c in "\n\r\t") or ("[" in node_id and not node_id.endswith("]"))
+    return node_id.split("[", 1)[0] if broken else node_id
+
+
 def tests_for(cov_map, src_file, old_text, src_text):
+    return (lambda r: sorted({_argfile_safe(i) for i in r}) if r else r)(_tests_for(cov_map, src_file, old_text, src_text))
+
+
+def _tests_for(cov_map, src_file, old_text, src_text):
     """Node ids that execute the anchor's lines; None when it cannot be resolved (module-level code
     whose name is used nowhere measurable) — the caller falls back to its file-level set."""
     at = src_text.index(old_text)
@@ -244,7 +257,11 @@ def run_parallel(batch, originals, select, *, workers=6, log=print):
                 return label, "SKIP", "", f"anchor count {src.count(old)}"
             with open(path, "w") as fh:
                 fh.write(src.replace(old, new))
-            if subprocess.run([PY, "-m", "py_compile", path], capture_output=True, env=_tree_env()).returncode != 0:
+            # only a Python source can be compile-checked (a .js/.html mutant is
+            # judged by its tests alone — it read NOCOMP and was never run)
+            _is_py = f.endswith(".py") or src.startswith("#!") and "python" in src.split("\n", 1)[0]
+            if _is_py and subprocess.run([PY, "-m", "py_compile", path], capture_output=True,
+                                         env=_tree_env()).returncode != 0:
                 return label, "NOCOMP", "", ""
             targets, tier = select(label, f, old)
             rc, tail = run_in_tree(tree, targets)

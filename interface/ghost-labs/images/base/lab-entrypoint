@@ -1,0 +1,14 @@
+#!/bin/bash
+# PID 1 is Docker's init (containers run with init=true). Services are ordinary
+# background processes the agent may stop and start without killing the container.
+# a container restart keeps /run (it is not a tmpfs here): stale pid files would point at
+# reused pids, so the app and job state of the previous run is cleared
+rm -f /run/ghost/app.pid; rm -rf /run/ghost-exec
+mkdir -p /var/log/lab/jobs /etc/lab/start.d /run/ghost-exec
+if command -v cron >/dev/null 2>&1; then cron 2>/dev/null || true; fi
+for s in /etc/lab/start.d/*.sh; do
+  [ -e "$s" ] || continue
+  n=$(basename "$s" .sh)
+  nohup bash "$s" >>"/var/log/lab/$n.log" 2>&1 &
+done
+exec sleep infinity

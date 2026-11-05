@@ -900,7 +900,8 @@ def _defuse_markup(text: str) -> str:
 async def build_thread_context(channel_id: str, thread_ts: str,
                                current_event_ts: str,
                                requester: str | None = None,
-                               current_text: str | None = None) -> list:
+                               current_text: str | None = None,
+                               session_id: str | None = None) -> list:
     """LLM message history for a thread — AUTHORIZED messages only.
 
     The filter is part of the authorization boundary, not a convenience.
@@ -1038,7 +1039,8 @@ async def build_thread_context(channel_id: str, thread_ts: str,
                         file_notes.append("[An earlier attachment by someone else is not "
                                           "available in this conversation.]")
                         continue
-                    filename = await upload_file_to_agent(f, uploader=msg.get("user"))
+                    filename = await upload_file_to_agent(f, uploader=msg.get("user"),
+                                                          session_id=session_id)
                     if filename:
                         file_notes.append(_file_note(
                             filename, member=_member_turn,
@@ -1207,7 +1209,15 @@ if _MAX_UPLOAD_BYTES <= 0:
     _MAX_UPLOAD_BYTES = float("inf")
 
 
-async def upload_file_to_agent(file_info: dict, uploader: str | None = None) -> str | None:
+def _slack_session_id(thread_ts: str | None, requester: str | None) -> str:
+    """The conversation id the agent keys a thread's focus on (§4SX B0): the
+    chat payload's ``session_id`` and an upload's ``X-Ghost-Session`` must be
+    the SAME string, or the upload misses the thread's focused project."""
+    return f"slack:{thread_ts or 'dm'}:{requester or ''}"
+
+
+async def upload_file_to_agent(file_info: dict, uploader: str | None = None,
+                               session_id: str | None = None) -> str | None:
     """Fetch a Slack attachment and hand it to the agent via /api/upload.
 
     The old path wrote directly into a locally-mounted sandbox dir, which
@@ -1243,7 +1253,9 @@ async def upload_file_to_agent(file_info: dict, uploader: str | None = None) -> 
                 # name and never overwrites the owner's files (agent §4KJ R6)
                 headers={**AUTH_HEADERS,
                          "X-Ghost-Requester": requester_role_header(uploader, OWNER_ID),
-                         "X-Ghost-Member": member_id_header(uploader, OWNER_ID)},   # §4QG: whose
+                         "X-Ghost-Member": member_id_header(uploader, OWNER_ID),   # §4QG: whose
+                         # §4SX B0: lands in this thread's focused project
+                         **({"X-Ghost-Session": session_id} if session_id else {})},
                 files={"file": (filename, resp.content)},
             )
             if up.status_code == 200:
@@ -1395,7 +1407,8 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
 
     try:
         for file_info in (event_files or []):
-            filename = await upload_file_to_agent(file_info, uploader=requester)
+            filename = await upload_file_to_agent(file_info, uploader=requester,
+                                                  session_id=_slack_session_id(thread_ts, requester))
             if filename:
                 note = _file_note(filename, member=bool(requester and requester != OWNER_ID))
             else:
@@ -1436,7 +1449,7 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
             # STATE OF WORK across the turns of one thread / DM (the owner's
             # only; members' state is never persisted server-side)
             payload = {"messages": messages, "stream": False,
-                       "session_id": f"slack:{thread_ts or 'dm'}:{requester or ''}"}
+                       "session_id": _slack_session_id(thread_ts, requester)}
             headers = {**AUTH_HEADERS, "X-Request-ID": request_id,
                        # Who is asking: the agent withholds the owner's
                        # profile, autobiography and smart memory from a
@@ -1492,7 +1505,9 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
                         f"{GHOST_API_BASE}/api/download/{img_name}",
                         headers={**AUTH_HEADERS,
                                  "X-Ghost-Requester": requester_role_header(requester, OWNER_ID),
-                                 "X-Ghost-Member": member_id_header(requester, OWNER_ID)},   # §4QG: only theirs
+                                 "X-Ghost-Member": member_id_header(requester, OWNER_ID),   # §4QG: only theirs
+                                 # §4SX B0: a bare name resolves under this thread's focused project
+                                 "X-Ghost-Session": _slack_session_id(thread_ts, requester)},
                     )
                     if dl.status_code == 200:
                         uploaded.append((safe_name, dl.content))
@@ -1634,7 +1649,7 @@ async def handle_mention(event, say, body=None):
     user_text = slack_to_plain(re.sub(r"<@.*?>", "", event.get("text", ""))).strip()
     messages = await build_thread_context(
         event.get("channel"), thread_ts, event.get("ts"), requester=event.get("user"),
-        current_text=user_text)
+        current_text=user_text, session_id=_slack_session_id(thread_ts, event.get("user")))
     # Guard on "no USER content at all", not just an empty list (R4: a
     # rebuilt thread of assistant-only entries let a bare "@Ghost" ship a
     # request with zero user messages).
@@ -1693,7 +1708,7 @@ async def handle_direct_message(event, say, body=None):
     fetch_ts = thread_ts or event.get("ts")
     messages = await build_thread_context(
         event.get("channel"), fetch_ts, event.get("ts"), requester=event.get("user"),
-        current_text=user_text)
+        current_text=user_text, session_id=_slack_session_id(thread_ts, event.get("user")))
     if not messages:
         messages = [{"role": "user", "content": user_text}]
 

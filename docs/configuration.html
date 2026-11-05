@@ -191,6 +191,9 @@
     <dt>--principle-gate</dt>
     <dd>Off in production. When on: after each answer, checks it against the operating principles Ghost has written for itself and appends a note if it contradicts one. Never blocks — annotates. One extra model call per turn.</dd>
 
+    <dt>--labs-host<br>--labs-key-file</dt>
+    <dd>The labs host (<code>host:port</code>, env <code>GHOST_LABS_HOST</code>) and the file holding its API key (env <code>GHOST_LABS_KEY_FILE</code>, default <code>~/Data/AI/.ghost_labs_key</code>, mode 0600). With both, the <code>lab</code> tool is available; without them it is hidden. See <a href="tools/labs.html">tools / labs</a>.</dd>
+
     <dt>--notify-webhook<br>--notify-ntfy</dt>
     <dd>Where to push notifications when something needs you. A LAN or tailnet target is reached directly; a public one only over Tor, and skipped if Tor is down.</dd>
   </dl>

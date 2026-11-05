@@ -319,3 +319,19 @@ async def test_a_members_reply_never_links_an_owner_file(monkeypatch, tmp_path):
                                             FakeBgTasks(), request_id="web-1", requester_role="member",
                                             requester_member="U2")
     assert "/api/download/owner.png" not in content, content
+
+
+def test_the_reply_image_download_sends_the_threads_session():
+    """§4SX B0 review r4 (AST, like the pin above): the reply-image download
+    in `_process_message` carries `X-Ghost-Session:
+    _slack_session_id(thread_ts, requester)` — the chat payload's string —
+    or a bare image name in the thread's focused project 404s."""
+    tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_process_message")
+    hits = []
+    for d in (n for n in ast.walk(fn) if isinstance(n, ast.Dict)):
+        kv = {k.value: v for k, v in zip(d.keys, d.values) if isinstance(k, ast.Constant)}
+        s = kv.get("X-Ghost-Session")
+        if "X-Ghost-Requester" in kv and isinstance(s, ast.Call) and getattr(s.func, "id", "") == "_slack_session_id":
+            hits.append([getattr(a, "id", "") for a in s.args])
+    assert hits == [["thread_ts", "requester"]], hits

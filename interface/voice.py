@@ -185,6 +185,42 @@ class _voice_slot:
 # (en_US, stock everywhere), "Sandy (English (UK))", "Karen" (en_AU),
 # "Moira" (en_IE). List them with `say -v '?'`.
 TTS_VOICE = os.environ.get("GHOST_TTS_VOICE", "Ava (Premium)")
+# Greek text (2026-11-02, operator): Ava cannot read Greek script, so a Greek
+# reply was spoken by an English voice. "Melina" (el_GR) ships with macOS.
+# Empty = off. The choice is per /api/tts chunk (usually one sentence).
+#
+# The rule counts WORDS, not letters, after dropping URLs (review: app.js
+# leaves a link's URL in the text, so "Πηγή: Καθημερινή https://www.kathimerini.gr/…"
+# was 14 Greek of 74 letters → Ava, the very failure this fixes). It leans
+# Greek on purpose: Melina reading an English word is accented, Ava reading
+# Greek is unintelligible. Greek voice when the chunk has ≥ 2 Greek words, or
+# its Greek words are ≥ 30 % of its words. A Greek word has ≥ 2 Greek letters,
+# so μ, σ², Ω and ΔG in an English formula are not Greek words.
+# Stateless on purpose (review r2: a "keep the previous voice" memory was
+# shared by every client and reply).
+TTS_VOICE_EL = os.environ.get("GHOST_TTS_VOICE_EL", "Melina").strip()
+GREEK_WORD_SHARE = 0.3
+_URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_TOKEN = re.compile(r"\w+")
+
+
+def _greek_letters(w: str) -> int:
+    return sum(1 for ch in w if ch.isalpha() and ("\u0370" <= ch <= "\u03ff" or "\u1f00" <= ch <= "\u1fff"))
+
+
+def tts_voice_for(text: str) -> str:
+    """The `say` voice for one chunk (see the rule above)."""
+    if not TTS_VOICE_EL:
+        return TTS_VOICE
+    # a word = a token with ≥ 2 real letters ("σ²" is one letter + a superscript)
+    words = [w for w in _TOKEN.findall(_URL.sub(" ", text or ""))
+             if sum(ch.isalpha() for ch in w) >= 2]
+    greek = sum(1 for w in words if _greek_letters(w) >= 2)
+    if greek >= 2 or (greek and greek >= GREEK_WORD_SHARE * len(words)):
+        return TTS_VOICE_EL
+    return TTS_VOICE
+
+
 TTS_RATE = os.environ.get("GHOST_TTS_RATE", "")  # words/min; "" = voice default
 # app.js already splits replies into chunks and queues them, so a single
 # request is a sentence or two. The cap stops a pathological chunk from
@@ -472,8 +508,9 @@ async def _synthesize(text: str) -> bytes:
         base = ["say", "-f", str(txt), "-o", str(out), "--data-format=LEI16@22050"]
         if TTS_RATE:
             base[1:1] = ["-r", TTS_RATE]
+        chosen = tts_voice_for(text)
         try:
-            await _run_binary([*base[:1], "-v", TTS_VOICE, *base[1:]],
+            await _run_binary([*base[:1], "-v", chosen, *base[1:]],
                               timeout=TTS_TIMEOUT_S)
         except VoiceError as e:
             # An unknown/uninstalled voice name made `say` exit non-zero, which
@@ -490,7 +527,7 @@ async def _synthesize(text: str) -> bytes:
             if getattr(e, "status", None) != 502:
                 raise
             logger.warning("TTS voice %r unavailable — falling back to the "
-                           "system default. Check `say -v '?'`.", TTS_VOICE)
+                           "system default. Check `say -v '?'`.", chosen)
             await _run_binary(base, timeout=TTS_TIMEOUT_S)
         if not out.exists() or out.stat().st_size == 0:
             raise VoiceError("Speech synthesis produced no audio.", 502)

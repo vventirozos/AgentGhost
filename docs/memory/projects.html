@@ -316,6 +316,15 @@
 
   <p>No automatic eviction; archiving via <code>status='ARCHIVED'</code> preserves history. Hard delete cascades via FK ON DELETE CASCADE.</p>
 
+  <h2 id="conversation-focus">Conversation focus table (2026-11-04 &sect;4SX B0)</h2>
+  <ul>
+    <li><code>conversation_focus(conversation_key PK, project_id → projects ON DELETE CASCADE, bound_at, last_used_at)</code>: one focus per conversation.</li>
+    <li><code>get_focus(key)</code>: the focused project id or None, and refreshes <code>last_used_at</code>. A row whose project row is gone is dropped. An ARCHIVED project is <em>kept</em>: the archive clears rows when it happens, and a later explicit switch to an archived project is the owner's choice.</li>
+    <li><code>set_focus(key, pid)</code>: upsert after an existence check. Rows idle for 30 days (<code>FOCUS_IDLE_PRUNE_S</code>) are pruned on write. <code>clear_focus(key)</code>, <code>clear_focus_for_project(pid)</code>, <code>focus_rows(pid=None)</code>.</li>
+    <li><code>update_project(status=ARCHIVED)</code> clears every row on the project.</li>
+  </ul>
+  <p>The tool side is described in <a href="../tools/projects.html#4sx-b0">tools/projects &sect;4SX B0</a>.</p>
+
   <h2>Constraints column + deletion tombstones (2026-07-02)</h2>
   <ul>
     <li><b><code>tasks.constraints_json</code></b> — explicit user constraints a task must honor (verbatim clauses like <em>"don't come up with some random AI"</em>). Unlike <code>postconditions</code> (which describe the success state), constraints are standing prohibitions/requirements: re-rendered into the briefing every turn, replayed to the verifier, and gating <code>task_update → DONE</code> (see <a href="../tools/projects.html">tools.projects</a>). Additive migration in <code>_migrate</code>; plumbed through <code>add_task</code> / <code>update_task</code> / <code>_row_to_task</code> / <code>TaskNode</code> / <code>ProjectPlan</code>. Project-level constraints live in <code>metadata.constraints</code> (no schema change).</li>

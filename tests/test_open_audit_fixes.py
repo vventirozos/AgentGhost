@@ -190,19 +190,6 @@ def test_interface_download_rejects_path_traversal():
 # =====================================================================
 
 
-def test_postgres_activity_query_has_limit():
-    import inspect
-    from ghost_agent.tools import database
-    src = inspect.getsource(database.tool_postgres_admin)
-    # Find the activity branch
-    activity_idx = src.find('action == "activity"')
-    assert activity_idx != -1
-    # Use a wider window so the doc comments don't push the SQL past the cap.
-    activity_block = src[activity_idx:activity_idx + 1500]
-    assert "LIMIT 50" in activity_block
-    assert "ORDER BY duration_sec DESC" in activity_block
-
-
 # =====================================================================
 # HIGH-6 — agent.py XML reconstruction uses json.dumps for complex args
 # =====================================================================

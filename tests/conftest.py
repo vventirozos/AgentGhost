@@ -987,12 +987,10 @@ def _restore_contents(v, contents):
 #: their contents would make the module disagree with the world it tracks:
 #:   * search._ddgs_patch_state — a one-time patch applied to the ddgs LIBRARY
 #:     (restored → "patch NOT applied" warnings: the library stays patched);
-#:   * database._connection_pool / _conn_locks — open connections and their locks;
 #:   * routes._STORE_INFLIGHT —
 #:     references that keep running asyncio tasks alive.
 _LIVE_STATE_CONTAINERS = frozenset({
     "tools.search._ddgs_patch_state",
-    "tools.database._connection_pool", "tools.database._conn_locks",
     "core.project_advancer._project_locks",
     "api.routes._STORE_INFLIGHT", "utils.logging._BG_TASKS",
 })

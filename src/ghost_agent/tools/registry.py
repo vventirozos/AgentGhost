@@ -1,17 +1,16 @@
 from typing import Dict, Any, List, Callable
 from .search import tool_search, tool_deep_research, tool_fact_check
 from .darkweb_search import tool_darkweb_search, tool_darkweb_research
-from .database import tool_postgres_admin
+from .labs import tool_lab
 from .file_system import tool_file_system
 from .tasks import tool_manage_tasks
 from .system import tool_system_utility
 from .memory import tool_knowledge_base, tool_recall, tool_unified_forget, tool_update_profile, tool_learn_skill, tool_scratchpad
 from .execute import tool_execute
 from .browser import tool_browser
-from .sandbox_services import (
-    tool_manage_services, MANAGE_SERVICES_TOOL_DEFINITION,
-)
-from .delegate import tool_jobs, JOBS_TOOL_DEFINITION
+# §4SX D5: tool_manage_services / tool_jobs and their definitions are no longer advertised — `run` replaced them
+# (the old names dispatch to tools/runs.py aliases); the modules stay (the supervisors are the run adapters)
+from .runs import RUN_TOOL_DEFINITION as _RUN_TOOL_DEFINITION, tool_run, manage_services_alias, jobs_alias
 from .probe_model import tool_probe_model, PROBE_MODEL_TOOL_DEFINITION  # §4QA
 from .notify_tool import (
     tool_notify_operator, NOTIFY_OPERATOR_TOOL_DEFINITION,
@@ -661,7 +660,7 @@ TOOL_DEFINITIONS = [
     },
     {"type": "function", "function": {"name": "knowledge_base", "description": "THIS IS YOUR TRANSCRIBER, and your document memory. action='transcribe' (an alias of 'ingest_document') takes an EXISTING audio or video file in your sandbox — .mp4 .mov .mkv .webm .mp3 .wav .m4a .flac .ogg — OR A YOUTUBE LINK passed as filename (fetched over Tor for you: captions when the video has them, otherwise its audio; NEVER download YouTube yourself) and transcribes it on your private audio node (no internet egress), returning the opening of the transcript and indexing every passage with its timestamp range so answers can cite the moment. ONE CALL, no pipeline: knowledge_base(action='transcribe', filename='talk.mp4'). You therefore NEVER write, install, or plan a transcription step — no Whisper, no ffmpeg, no speech-to-text library, no transcribe.py — and never a separate script to save the result: this tool IS both of those steps. The same action imports EXISTING files (ingest_document): text, PDF, and web HTML URLs. Other actions: transcript (the ORDERED, timestamped text of a transcribed recording or video, paged with offset — the route for 'summarise the whole talk' or 'give me the transcript'), query (ask a question against ONE ingested document), outline (its STRUCTURE — parts, chapters, sections, and HOW MANY of each), insert_fact, expand, forget (preview, then confirm), list_docs, reset_all (preview, then confirm), keep (a YouTube transcript is TEMPORARY — removed after a few days — unless the user asks to keep it; then call keep with its filename). ⚠ A question about a document's SHAPE — 'how many chapters', 'what are the parts', 'list the sections', 'what does chapter 7 cover' — is action='outline', NOT query: semantic search returns passages, and no wording retrieves a count. NEVER use to compose or save prose the user just asked you to write — answer the user directly instead. ⚠ AN INGESTED DOCUMENT IS NOT A FILE YOU CAN OPEN. Ingest stores the extracted TEXT in memory, not the file: the original lives wherever the user put it, usually outside your sandbox and often deleted since. So NEVER search for it (`find`, `ls`), never install a PDF library, never write a script to parse it — those all fail. These actions ARE your access to it: query for its prose, outline for its structure, list_docs for what you hold. Do NOT write Python scripts to read PDFs or ingest files.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["transcribe", "ingest_document", "query", "outline", "transcript", "insert_fact", "expand", "forget", "list_docs", "reset_all", "keep"], "description": "'transcribe' and 'ingest_document' are the SAME action: transcribe is the name to reach for when you have an audio/video file, ingest_document when you have a text/PDF/URL."}, "filename": {"type": "string", "description": "REQUIRED for transcribe/ingest_document (for action='forget' the parameter is 'target', not this one): an EXISTING local filename in the sandbox — 'talk.mp4', 'notes.pdf', 'plan.txt' — or a web HTML URL, or a YOUTUBE video URL (youtube.com/watch, youtu.be, shorts — pass it AS-IS; it is fetched over Tor and transcribed for you, so never download YouTube with execute or yt-dlp). NOT raw prose, NOT a title, NOT a PDF URL. REQUIRED for query (which ingested document to ask)."}, "target": {"type": "string", "description": "REQUIRED for action='forget' (the preview step): WHAT to erase — a topic, an entity, a person's name, or a filename (e.g. target='project atlas', target='mortimer', target='notes.txt', target=\"Anna's birthday\"). forget is TWO STEPS and the first deletes NOTHING: it returns a numbered list of what would be removed (files, documents, facts, profile fields, graph facts, episodes — plus related items kept unless picked) and a confirmation token. Show the list to the user and wait for their answer; then, in THAT later turn, call knowledge_base(action='forget', confirm='<token>', items='all') or items='1,3'. On disk only a file whose name matches EXACTLY (or but for the extension) is proposed for deletion; files that merely contain the word are listed under 'also found'. A path relative to the sandbox is accepted. Must be at least 3 characters."}, "confirm": {"type": "string", "description": "The token from a forget or reset_all PREVIEW. Pass it only after the USER has answered the preview with a yes in a later message — the same turn is refused."}, "items": {"type": "string", "description": "With confirm for action='forget': 'all' (the default list) or the item numbers to delete, e.g. '1,3' or '2-5' — numbers may come from the 'also found' group too."}, "question": {"type": "string", "description": "REQUIRED for action='query': the question to answer from that ONE document. Returns the best-matching passages WITH their section breadcrumbs. Better than `recall` for one large document. Call it repeatedly with different wording to drill down — but only while the passages are RELEVANT: if they come back unrelated, the answer is not in this document's prose (a structural question needs action='outline'), and re-wording the same search is the loop that wastes a whole turn budget."}, "language": {"type": "string", "description": "Optional for transcribe of a YouTube link: preferred caption language code ('en', 'el'). Default: the video's own language (manual subtitles first, then the original-language automatic track — never a machine translation)."}, "offset": {"type": "integer", "description": "Optional for action='transcript': character offset to continue from (the previous page tells you the next offset). Default 0."}, "max_chars": {"type": "integer", "description": "Optional for action='transcript': page size in characters (default 12000, max 60000)."}, "depth": {"type": "integer", "description": "Optional for action='outline': how many outline levels to print (default 2 = parts and chapters). The per-level COUNTS are always complete regardless of depth."}, "fact": {"type": "string", "description": "REQUIRED for insert_fact only: a single discrete fact to memorize (e.g. 'The user lives in Athens'). Do NOT use for ingest_document — pass a filename via 'filename' instead."}, "ref": {"type": "string", "description": "REQUIRED for action='expand': an evidence handle from a recall hit's EVIDENCE REFS line (e.g. 'ep:12' for the full episode record, 'session:<id>' for a stored conversation). Expands an abstraction back to its raw source."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "recall", "description": "Search the vector database for facts and answers from past conversations and general memory. ALSO the right tool when a question names a project or topic that manage_projects doesn't track ('when does project X ship?') — facts about it often live here even when no tracked project exists. For a question about ONE specific INGESTED DOCUMENT (e.g. a manual or PDF), prefer knowledge_base(action='query', filename=..., question=...) — it searches only that document and returns more, better-scoped passages. Hits may carry EVIDENCE REFS (e.g. 'ep:12') — expand one via knowledge_base(action='expand', ref=...). WARNING: This retrieves semantic chunks; use file_system operation='search' if you need an exact line match.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The specific question or search query."}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "execute", "description": "Run Python, Node.js, or Shell code — scripts, tests, shell commands — and the way to CHECK code you wrote: run the file (or its tests) and read the result before you say it works. Use it for any math, counting or data crunching too, never arithmetic in your head. DO NOT use this to simply create/write web files (HTML/CSS) or data files (use file_system write instead!). DO NOT use this to download files, scrape the web, or manage memory. WARNING: Native tools CANNOT be imported in Python. ALWAYS print results. To run an already existing file, you can omit the 'content' parameter. The sandbox has its OWN pid namespace and loopback: you CANNOT kill, restart, or reach a process the USER runs on their machine — if they run it, ask them to restart it. A command that runs past the 600s budget while still making progress is NOT killed — it is detached as a background job and the result says so; when that happens, NEVER re-run it, just finish your turn and check `jobs` later.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Optional. A direct bash command to run immediately (e.g., 'ls -la' or 'cat file.csv'). If provided, filename and content are ignored."}, "filename": {"type": "string", "description": "Optional. The name of the file to execute. If omitted but 'content' is provided, an ephemeral script will be generated and run automatically."}, "content": {"type": "string", "description": "The code to execute. Omit this if you just want to run an existing file."}, "args": {"type": "array", "items": {"type": "string"}, "description": "Optional command line arguments to safely pass to the script."}, "stateful": {"type": "boolean", "description": "If true, Python variables/dataframes/models are saved and automatically loaded into memory for your next execution. Acts like a Jupyter Notebook cell."}}, "required": []}}},
+    {"type": "function", "function": {"name": "execute", "description": "Run Python, Node.js, or Shell code — scripts, tests, shell commands — and the way to CHECK code you wrote: run the file (or its tests) and read the result before you say it works. Use it for any math, counting or data crunching too, never arithmetic in your head. DO NOT use this to simply create/write web files (HTML/CSS) or data files (use file_system write instead!). DO NOT use this to download files, scrape the web, or manage memory. WARNING: Native tools CANNOT be imported in Python. ALWAYS print results. To run an already existing file, you can omit the 'content' parameter. The sandbox has its OWN pid namespace and loopback: you CANNOT kill, restart, or reach a process the USER runs on their machine — if they run it, ask them to restart it. A command that runs past the 600s budget while still making progress is NOT killed — it is detached as a background job and the result says so; when that happens, NEVER re-run it, just finish your turn and read it later with `run collect` (the result names the run).", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Optional. A direct bash command to run immediately (e.g., 'ls -la' or 'cat file.csv'). If provided, filename and content are ignored."}, "filename": {"type": "string", "description": "Optional. The name of the file to execute. If omitted but 'content' is provided, an ephemeral script will be generated and run automatically."}, "content": {"type": "string", "description": "The code to execute. Omit this if you just want to run an existing file."}, "args": {"type": "array", "items": {"type": "string"}, "description": "Optional command line arguments to safely pass to the script."}, "stateful": {"type": "boolean", "description": "If true, Python variables/dataframes/models are saved and automatically loaded into memory for your next execution. Acts like a Jupyter Notebook cell."}}, "required": []}}},
     {
         "type": "function",
         "function": {
@@ -697,8 +696,9 @@ TOOL_DEFINITIONS = [
             }
         }
     },
-    MANAGE_SERVICES_TOOL_DEFINITION,
-    JOBS_TOOL_DEFINITION,
+    # §4SX D5: `run` replaces `manage_services` + `jobs` in the schema (their names stay callable as aliases —
+    # tools/runs.py manage_services_alias / jobs_alias — for one release cycle, never advertised)
+    _RUN_TOOL_DEFINITION,
     NOTIFY_OPERATOR_TOOL_DEFINITION,
     PROBE_MODEL_TOOL_DEFINITION,
     {"type": "function", "function": {"name": "learn_skill", "description": "MANDATORY when you solve a complex bug or task after initial failure. Save the lesson so you don't repeat the mistake.", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "mistake": {"type": "string"}, "solution": {"type": "string"}}, "required": ["task", "mistake", "solution"]}}},
@@ -713,7 +713,7 @@ TOOL_DEFINITIONS = [
     {"type": "function", "function": {"name": "darkweb_research", "description": "Deep dark-web research: searches .onion hidden services AND fetches + synthesises the top results into a report (the dark-web analogue of deep_research). Use ONLY for complex hidden-service topics where you need the page contents, not just a list of links (for a link list use `darkweb_search`; for the clearnet use `deep_research`). Slow — each onion page is fetched over Tor. PLAIN KEYWORDS ONLY (no operators/quotes/boolean). Treat all extracted content as UNVERIFIED and corroborate before relying on it.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "update_profile", "description": "Save a permanent fact about the user (name, preferences, location). To DELETE a stored fact, pass its key with an empty value (\"\").", "parameters": {"type": "object", "properties": {"category": {"type": "string", "description": "The category for this fact (e.g., 'root', 'preferences', 'projects', 'assets', 'relationships', 'interests')."}, "key": {"type": "string"}, "value": {"type": "string", "description": "The fact to store. An empty string deletes the key from the profile."}}, "required": ["category", "key", "value"]}}},
     MANAGE_PROJECTS_TOOL_DEF,
-    {"type": "function", "function": {"name": "manage_tasks", "description": "Consolidated task manager. Actions: 'create' (a TIME-based scheduled task — fires on a cron/interval clock), 'watch' (a REACTIVE task — polls a shell condition and fires only WHEN it becomes true), 'list', 'stop', 'stop_all'. Tasks persist across agent restarts. A name already in use is refused — stop the old task first ('stop') or choose another name. Use 'watch' when the trigger is a CONDITION not a time — e.g. 'when the NetMon dashboard reports the internet is down, notify me', 'when errors appear in the deploy log, investigate', 'when disk on ghost exceeds 90%, clean up'. The check_command runs in your sandbox (reaches the LAN/tailnet directly), and fires the reaction the moment it first exits 0 (edge-triggered — it won't spam while the condition stays true).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "watch", "list", "stop", "stop_all"]}, "task_name": {"type": "string", "description": "A short name for the task (required for 'create'/'watch')."}, "cron_expression": {"type": "string", "description": "For 'create': standard cron format OR 'interval:seconds' (e.g., 'interval:60'). Day of week: 0 or 7 = Sunday, 1-5 = Monday-Friday. NOTE: cron times are UTC and do NOT follow daylight saving — convert a local time first (09:00 Athens = '0 6 * * *' in summer, '0 7 * * *' in winter)."}, "prompt": {"type": "string", "description": "The instruction the background agent runs — for 'create' when the clock fires, for 'watch' when the condition becomes true (required for both)."}, "check_command": {"type": "string", "description": "For 'watch': a shell command that EXITS 0 when the thing to react to is TRUE (shell 'if' semantics), e.g. \"grep -q ' ERROR ' /path/app.log\", \"! curl -sf https://host/health\", \"[ $(some-metric) -gt 90 ]\". Runs in the sandbox."}, "interval_secs": {"type": "integer", "description": "For 'watch': how often (seconds, >=60) to poll the check_command."}, "task_identifier": {"type": "string", "description": "The ID of the task to kill (required for 'stop')."}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "manage_tasks", "description": "Consolidated task manager. Actions: 'create' (a TIME-based scheduled task — fires on a cron/interval clock), 'watch' (a REACTIVE task — polls a shell condition and fires only WHEN it becomes true), 'list', 'stop', 'stop_all'. Tasks persist across agent restarts. A name already in use is refused — stop the old task first ('stop') or choose another name. Use 'watch' when the trigger is a CONDITION not a time — e.g. 'when the NetMon dashboard reports the internet is down, notify me', 'when errors appear in the deploy log, investigate', 'when disk on ghost exceeds 90%, clean up'. The check_command runs in your sandbox (reaches the LAN/tailnet directly), and fires the reaction the moment it first exits 0 (edge-triggered — it won't spam while the condition stays true).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "watch", "list", "stop", "stop_all"]}, "task_name": {"type": "string", "description": "A short name for the task (required for 'create'/'watch')."}, "cron_expression": {"type": "string", "description": "For 'create': standard cron format OR 'interval:seconds' (e.g., 'interval:60'). Day of week: 0 or 7 = Sunday, 1-5 = Monday-Friday. NOTE: cron times are UTC and do NOT follow daylight saving — convert a local time first (09:00 Athens = '0 6 * * *' in summer, '0 7 * * *' in winter)."}, "prompt": {"type": "string", "description": "The instruction the background agent runs — for 'create' when the clock fires, for 'watch' when the condition becomes true (required for both)."}, "check_command": {"type": "string", "description": "For 'watch': a shell command that EXITS 0 when the thing to react to is TRUE (shell 'if' semantics), e.g. \"grep -q ' ERROR ' /path/app.log\", \"! curl -sf https://host/health\", \"[ $(some-metric) -gt 90 ]\". Runs in the sandbox."}, "interval_secs": {"type": "integer", "description": "For 'watch': how often (seconds, >=60) to poll the check_command."}, "task_identifier": {"type": "string", "description": "The ID of the task to kill (required for 'stop')."}, "project_owned": {"type": "boolean", "description": "For 'create'/'watch': true makes the task part of the project in focus — it is listed with the project's inventory and removed when the project is deleted. Default false (the task is the user's own)."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "list_lessons", "description": "Show LESSONS the agent has learned (mistakes-and-fixes the agent has internalized). Use this EVERY TIME the user asks 'what have you learned today / this week / so far' or asks to see the LESSON playbook / your lessons / what mistakes you've fixed. Do NOT call this for 'show me your skills' — that means the agent's TOOLS / custom skills and routes to `manage_skills`. Do NOT answer from memory — always call this tool so the list is authoritative. These are NOT the owner's rules (### OWNER RULES, candidate/proposed rules): no tool lists or changes those.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "enum": ["today", "week", "all", "self_play_only"], "description": "Time / source filter. 'today' = since local midnight. 'week' = last 7 days. 'all' = every lesson on file. 'self_play_only' = only lessons whose source is self-play, no time filter. Default: 'today'."}, "limit": {"type": "integer", "description": "Max lessons to return (1-100). Default 20."}}, "required": []}}},
     {"type": "function", "function": {"name": "replan", "description": "Call this tool if your current strategy is failing or if you need to pause and rethink. It forces a fresh planning step.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Why are you replanning?"}}, "required": ["reason"]}}},
     {"type": "function", "function": {"name": "abort_attempt", "description": "ESCAPE HATCH. Call this ONLY when you have proven the current task cannot be completed as specified — e.g. you have demonstrated that the validator / test has a structural bug (like `''.split('\\n')` comparing to `len(exp)==0`), the spec is internally contradictory, or a mandatory file the task depends on was never provided and cannot be generated. Do NOT call this for normal retries, for tasks you simply don't know how to solve, or to escape a hard problem — use `replan` for those. After this tool runs, the turn loop exits and the outer simulation stops retrying.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Concrete, specific proof that the task is unwinnable. Name the exact line of the broken validator, the contradictory spec clauses, or the missing dependency. Vague reasons ('too hard', 'keeps failing') are not valid."}}, "required": ["reason"]}}},
@@ -728,40 +728,6 @@ TOOL_DEFINITIONS = [
                     "action": {"type": "string", "enum": ["set", "get", "list", "delete", "clear"]},
                     "key": {"type": "string", "description": "The name of the variable/note (required for set/get/delete)."},
                     "value": {"type": "string", "description": "The text/data to associate with the key (required for action='set'). Can be any string — a value, a JSON blob, an ID, etc."}
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "postgres_admin",
-            "description": "MANDATORY for executing SQL queries, fetching schemas, running EXPLAIN ANALYZE, and checking active queries in a PostgreSQL database. WARNING: DO NOT use this tool if the user merely asks you to 'examine', 'explain', 'describe', or 'review' a SQL query. Only use this if explicitly instructed to run, execute, or test the query against a live database.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["query", "schema", "explain_analyze", "activity"],
-                        "description": "What to do: 'query' (run sql), 'schema' (dump public schema), 'explain_analyze' (run EXPLAIN ANALYZE), 'activity' (check pg_stat_activity)."
-                    },
-                    "connection_string": {
-                        "type": "string",
-                        "description": "Optional. The PostgreSQL connection URI. Leave empty to automatically connect to the internal default database."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "The SQL query to execute. Required for 'query' and 'explain_analyze'."
-                    },
-                    "table_name": {
-                        "type": "string",
-                        "description": "Optional table name to filter the 'schema' action."
-                    },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "Set true to authorise a destructive DROP/TRUNCATE statement (the pre-execution validator blocks these unless confirmed). Default false."
-                    }
                 },
                 "required": ["action"]
             }
@@ -884,6 +850,12 @@ TOOL_DEFINITIONS.append({
         },
     },
 })
+
+# §4SX Phase B: disposable machines on the labs host. Advertised only when
+# the agent is configured for one (`--labs-host` + a readable key file —
+# `labs.labs_configured`); a host that is down keeps it listed (UNIFIED §11).
+from .labs import LAB_TOOL_DEFINITION as _LAB_TOOL_DEFINITION  # noqa: E402
+TOOL_DEFINITIONS.append(_LAB_TOOL_DEFINITION)
 
 TOOL_DEFINITIONS.append({
     "type": "function",
@@ -1034,13 +1006,13 @@ def _intent_filter(tools: list, query: str | None, *, drop_unconfigured: set | N
     """Trim tools that require explicit configuration the agent doesn't have.
 
     Previously we aggressively dropped image_generation, vision_analysis, and
-    postgres_admin based on string heuristics over the user query — that
+    SQL tools based on string heuristics over the user query — that
     backfired when the user's question only obliquely referenced the tool
     (e.g. "what's in this screenshot?" wouldn't match "image|picture", so
     vision_analysis was hidden). The new policy is permissive: keep every
     tool advertised UNLESS the caller passes an explicit `drop_unconfigured`
     set listing tools that are dropped because they require configuration
-    that isn't present (e.g. `postgres_admin` without a configured DB URI).
+    that isn't present (e.g. `lab` without a configured labs host).
     """
     if not tools:
         return tools
@@ -1342,10 +1314,9 @@ def get_active_tool_definitions(context, query: str = None, *,
     # doesn't have. We no longer prune image/vision/SQL tools based on
     # intent heuristics — too many false negatives.
     unconfigured: set = set()
-    if context is not None:
-        default_db = getattr(getattr(context, "args", None), "default_db", None)
-        if not default_db:
-            unconfigured.add("postgres_admin")
+    from .labs import labs_configured
+    if not labs_configured(context):
+        unconfigured.add("lab")
     active_tools = _intent_filter(active_tools, query,
                                   drop_unconfigured=unconfigured)
     # ⚠ DISABLED TOOLS COME OUT BEFORE SERVING, not after. Every caller
@@ -1465,6 +1436,13 @@ def get_available_tools(context):
         # is pinned to /workspace), so they opt out; everything else runs
         # from /workspace/projects/<id> with its host dir scoped to match.
         from ..core.jobs import get_job_registry
+        # §4SX B (UNIFIED §12 8a): the workspace cannot reach the labs host —
+        # a command naming it is refused before it runs; one naming a lab id
+        # runs, and its result says where that lab really is
+        from .labs import lab_reach_refusal, with_lab_id_note
+        _refused = lab_reach_refusal(context, kwargs, "execute")
+        if _refused is not None:
+            return _refused
         host_dir, workdir = _proj_ws(stateful=bool(kwargs.get("stateful")))
         if workdir is None and getattr(context, "_subagent_allowed_tools", None):
             # §4NS: a sub-agent's file_system is confined to delegated/<job>,
@@ -1477,7 +1455,7 @@ def get_available_tools(context):
                 workdir = "/workspace/" + _rel.as_posix() if str(_rel) != "." else None
             except Exception:  # noqa: BLE001
                 pass
-        return await tool_execute(
+        return with_lab_id_note(kwargs, await tool_execute(
             sandbox_dir=host_dir,
             container_workdir=workdir,
             sandbox_manager=await _live_sandbox_manager(),
@@ -1489,8 +1467,9 @@ def get_available_tools(context):
             # rather than killed (sandbox/jobs.py); the registry is what makes
             # it visible to the existing `jobs` tool.
             job_registry=get_job_registry(context),
+            run_context=context,          # §4SX D5: a promoted job is recorded as a `job` run
             **kwargs,
-        )
+        ))
 
     async def _run_browser(**kwargs):
         # Unpack the project-scoped pair from ONE _proj_ws() call. Calling it
@@ -1498,6 +1477,10 @@ def get_available_tools(context):
         # different current_project_id per call if a concurrent conversation
         # cleared it mid-request — desyncing the host dir from the container
         # workdir, exactly what the single-call unpack prevents.
+        from .labs import lab_reach_refusal
+        _refused = lab_reach_refusal(context, kwargs, "browser")   # §4SX B 8a
+        if _refused is not None:
+            return _refused
         host_dir, workdir = _proj_ws()
         # Loopback ports of supervised sandbox services (manage_services) are
         # admitted through the browser SSRF guard so the agent can drive an
@@ -1539,11 +1522,10 @@ def get_available_tools(context):
         # project_id: the bound project OWNS services started during it —
         # lifecycle coupling, scoped names, and the briefing all key on it
         # (2026-07-30, §4G port-lease redesign).
-        "manage_services": lambda **kwargs: tool_manage_services(
-            sandbox_manager=context.sandbox_manager,
-            project_id=getattr(context, "current_project_id", None),
-            **kwargs),
-        "jobs": lambda **kwargs: tool_jobs(context=context, **kwargs),
+        # §4SX D5: the old names are aliases mapped onto `run` (not advertised; one release cycle)
+        "manage_services": lambda **kwargs: manage_services_alias(context=context, **kwargs),
+        "jobs": lambda **kwargs: jobs_alias(context=context, **kwargs),
+        "run": lambda **kwargs: tool_run(context=context, **kwargs),
         "notify_operator": lambda **kwargs: tool_notify_operator(context=context, **kwargs),
         "probe_model": lambda **kwargs: tool_probe_model(context=context, **kwargs),
         "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), project_store=getattr(context, "project_store", None), skill_memory=getattr(context, "skill_memory", None), owner_agent=getattr(context, "agent", None), **kwargs),
@@ -1566,12 +1548,14 @@ def get_available_tools(context):
         "darkweb_research": lambda **kwargs: tool_darkweb_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "update_profile": lambda **kwargs: tool_update_profile(profile_memory=context.profile_memory, memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "scratchpad": lambda **kwargs: tool_scratchpad(scratchpad=context.scratchpad, **kwargs),
-        "manage_tasks": lambda **kwargs: tool_manage_tasks(scheduler=context.scheduler, memory_system=context.memory_system, **kwargs),
+        "manage_tasks": lambda **kwargs: tool_manage_tasks(scheduler=context.scheduler, memory_system=context.memory_system,
+                                                           **{k: v for k, v in kwargs.items() if k != "_ctx_project_id"},
+                                                           _ctx_project_id=getattr(context, "current_project_id", None)),
         "manage_projects": lambda **kwargs: tool_manage_projects_for_model(context, **kwargs),
         "list_lessons": lambda **kwargs: tool_list_lessons(context=context, **kwargs),
         "replan": _replan,
         "abort_attempt": _abort_attempt,
-        "postgres_admin": lambda **kwargs: tool_postgres_admin(default_uri=getattr(context.args, 'default_db', 'postgresql://ghost@127.0.0.1:5432/agent'), _metacog_bundle=getattr(context, "metacog", None), **kwargs),
+        "lab": lambda **kwargs: tool_lab(context=context, **kwargs),
         "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
         "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
         "manage_composed_skills": lambda **kwargs: tool_manage_composed_skills(

@@ -563,29 +563,31 @@ async def test_budget_by_title_acts_on_the_named_project_not_the_current_one(tmp
     assert "7" in json.dumps(other_meta) or '"steps_cap": 7' in str(out), (out, other_meta)
 
 
-def test_a_probe_turn_never_rewrites_the_owners_binding_sentinel():
-    """P3: a probe's switch/create overwrote the one global sentinel pair and
-    parked the owner's project on their next turn."""
-    from ghost_agent.memory.scratchpad import Scratchpad
+@pytest.mark.parametrize("target", ["bbbbbbbbbbbb", None])
+def test_a_probe_never_touches_the_owners_focus(tmp_path, target):
+    """§4PE P3 / r3 (§4SX B0 form): a probe's switch / create / exit lasts its
+    own request — even with the owner's session id, the probe's scope never
+    writes the owner's conversation focus row."""
+    from types import SimpleNamespace as _NS
+    from ghost_agent.core import request_scope as RS
+    from ghost_agent.core.agent import GhostAgent
+    from ghost_agent.memory.projects import ProjectStore
     from ghost_agent.tools import projects as PJ
-    sp = Scratchpad()
-    ctx = SimpleNamespace(current_project_id=None, scratchpad=sp, workspace_model=None,
-                          conversation_key="convOwner", project_store=None)
-    tok = request_id_context.set("web-300")
+    store = ProjectStore(tmp_path / "mem")
+    a = store.create_project("owner's")
+    store.create_project("probe's")
+    store.set_focus("session:s1", a)
+    ctx = _NS(current_project_id=a, scratchpad=None, workspace_model=None,
+              conversation_key="session:s1", project_store=store)
+    sc = GhostAgent._build_request_scope(_NS(context=ctx), {"session_id": "s1"}, "probe-77", "probe")
+    assert sc.origin == "probe" and sc.persist is False
+    tok = RS.install(sc)
     try:
-        PJ._set_current(ctx, "aaaaaaaaaaaa")
+        PJ._set_current(ctx, target)
+        assert ctx.current_project_id == target                # the probe's own request sees it
     finally:
-        request_id_context.reset(tok)
-    assert sp.get(PJ._CURRENT_SENTINEL) == "aaaaaaaaaaaa" and sp.get(PJ._CURRENT_CONV_SENTINEL) == "convOwner"
-    ctx2 = SimpleNamespace(current_project_id=None, scratchpad=sp, workspace_model=None,
-                           conversation_key="convProbe", project_store=None)
-    tok = request_id_context.set("probe-77")
-    try:
-        PJ._set_current(ctx2, "bbbbbbbbbbbb")
-    finally:
-        request_id_context.reset(tok)
-    assert ctx2.current_project_id == "bbbbbbbbbbbb"                       # the probe's own request sees it
-    assert sp.get(PJ._CURRENT_SENTINEL) == "aaaaaaaaaaaa" and sp.get(PJ._CURRENT_CONV_SENTINEL) == "convOwner"
+        RS.reset(tok)
+    assert store.get_focus("session:s1") == a
 
 
 def test_briefing_events_are_previewed_never_spliced_whole():
@@ -757,28 +759,6 @@ async def test_a_selection_reply_never_runs_the_whole_list_through_a_bare_forget
         _end(t)
     assert not a.exists() and b.exists(), out2
 
-
-def test_a_probe_close_never_deletes_the_owners_binding():
-    """r3 MAJOR: P3 covered the set branch; the probe's exit/delete path still
-    deleted the owner's sentinel pair."""
-    from ghost_agent.memory.scratchpad import Scratchpad
-    from ghost_agent.tools import projects as PJ
-    sp = Scratchpad()
-    ctx = SimpleNamespace(current_project_id=None, scratchpad=sp, workspace_model=None,
-                          conversation_key="convOwner", project_store=None)
-    tok = request_id_context.set("web-310")
-    try:
-        PJ._set_current(ctx, "aaaaaaaaaaaa")
-    finally:
-        request_id_context.reset(tok)
-    ctx2 = SimpleNamespace(current_project_id="bbbbbbbbbbbb", scratchpad=sp, workspace_model=None,
-                           conversation_key="convProbe", project_store=None)
-    tok = request_id_context.set("probe-78")
-    try:
-        PJ._set_current(ctx2, None)
-    finally:
-        request_id_context.reset(tok)
-    assert sp.get(PJ._CURRENT_SENTINEL) == "aaaaaaaaaaaa" and sp.get(PJ._CURRENT_CONV_SENTINEL) == "convOwner"
 
 
 async def test_untrack_takes_the_spelling_track_echoes_and_files_shows_it(tmp_path):

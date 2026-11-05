@@ -1,0 +1,18 @@
+[Unit]
+Description=ghost-labs port forwarder %i
+After=network-online.target tailscaled.service
+PartOf=ghost-labs-forwarders.target
+
+[Service]
+EnvironmentFile=/etc/ghost-labs/fwd/%i.env
+ExecStart=/usr/bin/socat TCP-LISTEN:${PORT},bind=${BIND},reuseaddr,fork,max-children=64 TCP:${TARGET},connect-timeout=10
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

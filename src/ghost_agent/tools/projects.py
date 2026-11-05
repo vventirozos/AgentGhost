@@ -398,34 +398,12 @@ def _no_active_project(store) -> str:
 
 
 _PROJECT_KEY_PREFIX = "proj::"
-_CURRENT_SENTINEL = "__current_project__"
-# Conversation that owns the current project activation. Written next to
-# `__current_project__` by `_set_current` and compared by
-# `reconcile_conversation` at every request start. Without this binding,
-# `context.current_project_id` was process-global STICKY state: a project
-# activated in one chat silently captured every other conversation's file
-# writes into `<sandbox>/projects/<id>/` (observed in production — an SQL
-# snippet request landed `migration.sql` inside an unrelated project's
-# workspace).
-_CURRENT_CONV_SENTINEL = "__current_project_conv__"
-# §4QA: GUEST conversations of the bound project, stored as "<pid>|<conv>,<conv>".
-# A conversation that names the project ("show me the results of 448d5afa86f0")
-# keeps it for its follow-ups ("add this picture to the project") WITHOUT taking
-# it from its owner — the reference used to rewrite the owner sentinel, and the
-# creating conversation found its own project "belongs to another conversation".
-_CURRENT_GUESTS_SENTINEL = "__current_project_guests__"
-_MAX_GUESTS = 8
-# §4QA (operator 2026-10-18: "a guest can't take the binding from the owner"):
-# conversations that LEFT the bound project as guests, "<pid>|<conv>,<conv>".
-# While that binding lasts, any project they open is for one request at a
-# time — dropping them from the guests alone let their next switch take the
-# binding (r14 MAJOR-1/2). Cleared with the guests when the binding changes.
-# Never capped: a conversation evicted from it would be free again and its
-# next switch would take the binding (r16 MAJOR); one binding's list is short.
-_CURRENT_HELD_SENTINEL = "__current_project_held__"
-#: Every scope-free binding key — a scope clear or a switch must spare them all.
-_BINDING_SENTINELS = (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL, _CURRENT_GUESTS_SENTINEL,
-                      _CURRENT_HELD_SENTINEL)
+#: §4SX B0: the ONE global binding slot of the old design (four scratchpad
+#: keys). The focus is a per-conversation row in the project store now
+#: (``conversation_focus``); these keys are only deleted, once, at startup
+#: (:func:`drop_legacy_binding`, operator decision B4: drop, no mapping).
+_LEGACY_BINDING_KEYS = ("__current_project__", "__current_project_conv__",
+                        "__current_project_guests__", "__current_project_held__")
 
 # Marker key written by tools/swarm.py at dispatch: `_swarm_task_id::<output_key>`
 # → task id. Its existence means a detached worker still owns `<output_key>`
@@ -504,7 +482,7 @@ def _background_job_keys(context, scratchpad) -> set:
 def _protected_scratchpad_keys(context, scratchpad) -> set:
     """Every key a project switch must leave alone: the activation sentinels,
     the `proj::`-namespaced convention keys, and background-job keys."""
-    protected = set(_BINDING_SENTINELS)
+    protected: set = set()
     protected.update(
         k for k in _scratchpad_keys(scratchpad)
         if k.startswith(_PROJECT_KEY_PREFIX)
@@ -563,12 +541,10 @@ def _iter_scratchpad_items(scratchpad, project_id: Optional[str] = None,
         if scoped is not None:
             return [(k, data[k]) for k in scoped
                     if k in data and k not in spared
-                    and not k.startswith(_PROJECT_KEY_PREFIX)
-                    and k not in _BINDING_SENTINELS]
+                    and not k.startswith(_PROJECT_KEY_PREFIX)]
         return [
             (k, v) for k, v in data.items()
             if not str(k).startswith(_PROJECT_KEY_PREFIX)
-            and k not in _BINDING_SENTINELS
             and k not in spared
         ]
     except Exception:
@@ -587,9 +563,21 @@ def _snapshot_scratchpad(context, project_id: Optional[str]) -> bool:
     sp = getattr(context, "scratchpad", None)
     items = _iter_scratchpad_items(
         sp, project_id, _protected_scratchpad_keys(context, sp))
-    if not items:
-        return True
     store = _resolve_store(context)
+    if not items:
+        # §4SX B0 review r1: an emptied project must not keep its older
+        # snapshot as the latest, or the next hydrate brings back keys the
+        # owner deleted. Record the emptiness — only when the latest snapshot
+        # still holds keys (no event per idle alternation).
+        if store is None:
+            return True
+        try:
+            last = store.list_events(project_id, limit=1, event_type="scratchpad_snapshot")
+            if last and ((last[0].get("payload") or {}).get("keys") or {}):
+                store.log_event(project_id, None, "scratchpad_snapshot", {"keys": {}})
+        except Exception:  # noqa: BLE001
+            logger.debug("empty scratchpad snapshot skipped", exc_info=True)
+        return True
     if store is None:
         return False
     try:
@@ -606,15 +594,15 @@ def _clear_other_project_scopes(context, sp, project_id: Optional[str]):
 
     Previously this deleted every key that wasn't `proj::`-prefixed or a
     sentinel — including keys belonging to no project at all. Because
-    `_park_current_project` runs it at REQUEST START for any conversation
-    that doesn't own the bound project, one unrelated chat message wiped the
-    whole scratchpad (verified in prod). Now each entry carries the scope
+    it ran at REQUEST START for any conversation that didn't own the bound
+    project, one unrelated chat message wiped the whole scratchpad (verified
+    in prod). Now each entry carries the scope
     that wrote it, so we clear scope-by-scope and spare:
 
       * the incoming project's own scope (about to be re-hydrated),
       * the global/free-chat scope (owned by nobody — includes results
         written by detached workers),
-      * sentinels, `proj::` keys and in-flight background-job keys
+      * `proj::` keys and in-flight background-job keys
         (`_protected_scratchpad_keys`), even when a stale scope tag says
         otherwise.
     """
@@ -644,7 +632,6 @@ def _clear_other_project_scopes(context, sp, project_id: Optional[str]):
         victims = [
             k for k in list(data.keys())
             if not str(k).startswith(_PROJECT_KEY_PREFIX)
-            and k not in _BINDING_SENTINELS
             and k not in protected
         ]
     except Exception:
@@ -662,8 +649,8 @@ def _hydrate_scratchpad(context, project_id: Optional[str]):
 
     We clear the OTHER projects' scoped keys first so a switch doesn't leak
     state from the previous project, then restore the target's saved keys
-    into the target's scope. Sentinel keys (`__current_project__`,
-    project-namespaced `proj::…`) and background-job keys are preserved.
+    into the target's scope. Project-namespaced `proj::…` keys and
+    background-job keys are preserved.
     """
     sp = getattr(context, "scratchpad", None)
     if sp is None:
@@ -697,13 +684,29 @@ def _hydrate_scratchpad(context, project_id: Optional[str]):
             pass
 
 
+def _focus_writer(context):
+    """(store, conversation_key) when this request may write its
+    conversation's focus row, else (None, "")."""
+    try:
+        from ..core.request_scope import current_scope
+        sc = current_scope(context)
+    except Exception:  # noqa: BLE001
+        sc = None
+    if sc is None or not sc.persist or not sc.conversation_key:
+        return None, ""
+    store = _resolve_store(context)
+    return (store, sc.conversation_key) if store is not None else (None, "")
+
+
 def _set_current(context, project_id: Optional[str]):
-    """Update the runtime + persist to scratchpad so the selection
-    survives process restarts.
+    """Make ``project_id`` (or nothing) this request's project.
 
     Snapshots the outgoing project's scratchpad keys and hydrates the
     incoming project's last snapshot — this is what makes "go back and
-    forth" feel like resuming work instead of starting over.
+    forth" feel like resuming work instead of starting over. §4SX B0: an
+    owner request with a session id also writes THIS conversation's focus
+    row (switch/create/resume set it, exit clears it); no other
+    conversation's focus changes. Every other request is request-only.
     """
     prev = getattr(context, "current_project_id", None)
     if prev and prev != project_id:
@@ -718,108 +721,43 @@ def _set_current(context, project_id: Optional[str]):
             _wm.current_project_id = project_id or ""
         except Exception:
             pass
-    sp = getattr(context, "scratchpad", None)
-    if sp is not None:
+    if project_id is None and prev:
+        # what this conversation closed, for `_captured_project_id`'s heal
+        # (a same-turn close leaves the scope empty; the turn's writes were
+        # under ``prev``)
         try:
-            if project_id is None:
-                # ⚠ record WHAT this conversation is closing, HERE — while
-                # the ownership sentinel is still readable, one line before
-                # it is deleted. This is the only point every genuine close
-                # route (exit, archive, hard delete) passes through; the
-                # first version stamped in `_park_current_project`, whose
-                # only callers are the request-start HYGIENE branches, where
-                # ownership is false by construction — the stamp was
-                # unreachable from every production path and the same-turn-
-                # close false-refute class it closed was silently back
-                # (round-14 convergence lens: "the fix severs what it
-                # feeds"). The verifier's scope heal reads
-                # (conversation_key, pid); only an owned binding stamps.
-                try:
-                    if prev and _conversation_bound_project_pid(
-                            context) == prev:
-                        context.last_closed_project = (
-                            getattr(context, "conversation_key", None), prev)
-                except Exception:
-                    pass
-                if not _probe_turn_now() and not _binding_is_anothers(sp, prev, context):
-                    # §4PE r3: a probe's close never deletes the owner's
-                    # binding; §4QA r17: nor does a held guest's archive /
-                    # delete / exit of its request-only project
-                    sp.delete(_CURRENT_SENTINEL)
-                    sp.delete(_CURRENT_CONV_SENTINEL)
-                    sp.delete(_CURRENT_GUESTS_SENTINEL)
-                    sp.delete(_CURRENT_HELD_SENTINEL)
-            elif _probe_turn_now():
-                # §4PE (P3): a probe's switch/create/resume rewrote the ONE
-                # global sentinel pair, and the owner's next turn parked
-                # their project. The probe keeps its selection for this
-                # request only (context.current_project_id above).
-                pass
-            elif _guest_of_bound(sp, project_id, getattr(context, "conversation_key", None)):
-                # §4QA (fresh-eye M6): another conversation owns this very
-                # project — a switch/resume from here joins it as a GUEST;
-                # rewriting the owner sentinel was the ownership theft again
-                _add_project_guest(sp, project_id, context.conversation_key)
-            elif _guest_leaving_owner(sp, project_id, getattr(context, "conversation_key", None)):
-                # operator 2026-10-18: "a guest can't take the binding from
-                # the owner". A guest's switch/create/resume elsewhere is for
-                # THIS request only: the owner's binding stays, and the guest
-                # leaves the owner's project (or its next turn would land
-                # back in it and write there) and stays HELD while that
-                # binding lasts, so a later switch is request-only too
-                _owner_pid = sp.get(_CURRENT_SENTINEL)
-                _drop_project_guest(sp, _owner_pid, context.conversation_key)
-                _add_held(sp, _owner_pid, context.conversation_key)
-                context._binding_held_note = (
-                    f"NOTE: another conversation owns the active project binding ({_owner_pid}). "
-                    f"{project_id} is active for THIS request only; this conversation has left "
-                    f"{_owner_pid}. While {_owner_pid} stays bound, every project this conversation "
-                    f"opens lasts one request: open {project_id} again "
-                    f"(manage_projects action=switch project_id={project_id}) in each later message "
-                    f"that works on it.")
-            else:
-                # namespace=None: the sentinels belong to no project scope,
-                # so a later scope clear can never take them with it (an
-                # evicted sentinel is what `reconcile_conversation`'s
-                # fail-closed branch treats as "no binding").
-                try:
-                    _was_bound = sp.get(_CURRENT_SENTINEL)
-                except Exception:  # noqa: BLE001
-                    _was_bound = None
-                _sp_set(sp, _CURRENT_SENTINEL, project_id, namespace=None)
-                # Bind the activation to the conversation that asked for it
-                # (set per-request by `reconcile_conversation`). Empty/None
-                # means "unbound" — reconcile treats that as not owned by
-                # ANY conversation, so a stale activation can never leak.
-                _sp_set(sp, _CURRENT_CONV_SENTINEL,
-                        getattr(context, "conversation_key", None) or "",
-                        namespace=None)
-                # a new binding starts with no guests (§4QA); the owner
-                # re-switching to its own project keeps them (r9 MAJOR-2)
-                if _was_bound != project_id:
-                    sp.delete(_CURRENT_GUESTS_SENTINEL)
-                    sp.delete(_CURRENT_HELD_SENTINEL)
-        except Exception:
+            context.last_closed_project = (getattr(context, "conversation_key", None), prev)
+        except Exception:  # noqa: BLE001
             pass
-        # Keep the default write scope in step even when the project is
-        # unchanged (idempotent switch takes neither branch below).
-        _set_scratchpad_scope(sp, project_id)
+    store, conv = _focus_writer(context)
+    if store is not None:
+        try:
+            if project_id:
+                store.set_focus(conv, project_id)
+            else:
+                store.clear_focus(conv)
+        except Exception:  # noqa: BLE001
+            logger.warning("conversation focus write failed", exc_info=True)
+    sp = getattr(context, "scratchpad", None)
+    # Keep the default write scope in step even when the project is
+    # unchanged (an idempotent switch hydrates nothing).
+    _set_scratchpad_scope(sp, project_id)
     if project_id and project_id != prev:
         _hydrate_scratchpad(context, project_id)
     elif project_id is None:
         # Leaving project mode: clear the hydrated keys so free chat
-        # starts fresh. Named sentinels survive.
+        # starts fresh.
         _hydrate_scratchpad(context, None)
 
 
 def conversation_fingerprint(messages) -> str:
-    """Stable identity for a conversation: hash of its FIRST user message.
+    """Hash of a conversation's FIRST user message, or "".
 
-    The chat API ships the full message history on every request and
-    carries no conversation id, so the first user turn — constant for the
-    lifetime of a conversation, different across conversations — is the
-    only stable thing to key on. Returns "" when there is no user message
-    (callers treat "" as "owns nothing").
+    §4SX B0: NOT the conversation's identity any more (that is its
+    ``session_id``, :func:`..core.request_scope.conversation_key_for_session`).
+    Kept as the key for a client that sends no session id (main-slot
+    ownership, late corrections, preview confirms) — such a request never
+    writes a focus row.
     """
     first = next(
         (m.get("content") for m in (messages or [])
@@ -837,34 +775,31 @@ def conversation_fingerprint(messages) -> str:
     return hashlib.sha1(str(first).strip().encode("utf-8", "replace")).hexdigest()
 
 
-def _message_references_project(context, project_id: str) -> bool:
-    """True when THIS request's user message names the given project by id or
-    title. The chat API ships no stable conversation id, so a project bound to
-    one conversation gets parked for every other request whose first-message
-    fingerprint differs — including later turns of the SAME human session once a
-    per-turn 'Context:' preamble changes the first message. When the user
-    explicitly references the project ("proceed with task 3 of the PetAI
-    project"), that intent overrides the fingerprint mismatch. Best-effort;
-    never raises."""
-    msg = str(getattr(context, "last_user_content", "") or "").lower()
-    if not msg:
-        return False
-    pid = str(project_id or "").lower()
-    if pid and (pid in msg or pid[:8] in msg):
-        return True
-    store = getattr(context, "project_store", None)
-    if store is None:
-        return False
+def project_name_hint(context, message: str) -> str:
+    """§4SX B0 (B2): one line when THIS message names another project (its id,
+    8-char id prefix, or whole-word title of 5+ chars — review r1: "API" or
+    "Test" fired on unrelated messages). The model switches
+    with one call if it is working on it; nothing is activated by wording."""
+    msg = str(message or "").lower()
+    store = _resolve_store(context)
+    if not msg or store is None:
+        return ""
+    cur = str(getattr(context, "current_project_id", None) or "")
     try:
-        proj = store.get_project(project_id) or {}
-        title = str(proj.get("title") or "").strip().lower()
-        # Require a reasonably distinctive title (≥3 chars) and a whole-word
-        # match so a generic one-word title can't latch onto stray prose.
-        if len(title) >= 3 and re.search(r"\b" + re.escape(title) + r"\b", msg):
-            return True
-    except Exception:
-        return False
-    return False
+        projects = store.list_projects()
+    except Exception:  # noqa: BLE001
+        return ""
+    for p in projects or []:
+        pid = str(p.get("id") or "").lower()
+        if not pid or pid == cur or str(p.get("status") or "").upper() == "ARCHIVED":
+            continue
+        title = str(p.get("title") or "").strip().lower()
+        if (pid in msg or (len(pid) >= 8 and re.search(r"\b" + re.escape(pid[:8]) + r"\b", msg))
+                or (len(title) >= 5 and re.search(r"\b" + re.escape(title) + r"\b", msg))):
+            return (f"This message names project {p.get('title')!r} (id {pid}); switch to it "
+                    f"(manage_projects action=switch project_id={pid}) if you are working on it — "
+                    "reads of it can pass project_id without a switch.")
+    return ""
 
 
 def _iso_date(ts) -> str:
@@ -896,39 +831,8 @@ def _with_dates(p: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def project_guests(sp, pid) -> List[str]:
-    """Conversation keys that referenced ``pid`` while it was bound (§4QA)."""
-    return _conv_list(sp, _CURRENT_GUESTS_SENTINEL, pid)
 
 
-def project_held(sp, pid) -> List[str]:
-    """Conversation keys that left ``pid`` as guests while it was bound (§4QA)."""
-    return _conv_list(sp, _CURRENT_HELD_SENTINEL, pid)
-
-
-def _conv_list(sp, key, pid) -> List[str]:
-    try:
-        raw = sp.get(key)
-    except Exception:  # noqa: BLE001
-        return []
-    if not isinstance(raw, str) or "|" not in raw or not pid:
-        return []
-    gpid, _, convs = raw.partition("|")
-    if gpid != pid:
-        return []
-    return [c for c in convs.split(",") if c]
-
-
-def _guest_of_bound(sp, project_id, conv_key) -> bool:
-    """True when ``project_id`` is already bound to a DIFFERENT conversation
-    and ``conv_key`` is a real conversation (then it joins as a guest)."""
-    if not conv_key or not project_id:
-        return False
-    try:
-        bound_pid, bound_conv = sp.get(_CURRENT_SENTINEL), sp.get(_CURRENT_CONV_SENTINEL)
-    except Exception:  # noqa: BLE001
-        return False
-    return bound_pid == project_id and bool(bound_conv) and bound_conv != conv_key
 
 
 def _dependencies_first(plan, ids: List[str]) -> List[str]:
@@ -979,291 +883,109 @@ def _unmet_dependencies(plan, tid: str) -> List[str]:
         return []
 
 
-def _binding_is_anothers(sp, closing_pid, context) -> bool:
-    """True when the persisted binding names a project OTHER than the one
-    being closed and belongs to ANOTHER conversation — closing a request-only
-    project must leave it alone (§4QA r17)."""
-    try:
-        bound_pid, bound_conv = sp.get(_CURRENT_SENTINEL), sp.get(_CURRENT_CONV_SENTINEL)
-    except Exception:  # noqa: BLE001
-        return False
-    conv = getattr(context, "conversation_key", None) or ""
-    return (bool(bound_pid) and bound_pid != closing_pid
-            and bool(bound_conv) and bound_conv != conv)
 
 
-def _guest_leaving_owner(sp, project_id, conv_key) -> bool:
-    """True when ``conv_key`` is a GUEST of the bound project, or left it as
-    one (HELD), another conversation owns it, and it is binding a DIFFERENT
-    project (§4QA, operator: a guest can't take the binding from the owner)."""
-    if not conv_key or not project_id:
-        return False
-    try:
-        bound_pid, bound_conv = sp.get(_CURRENT_SENTINEL), sp.get(_CURRENT_CONV_SENTINEL)
-    except Exception:  # noqa: BLE001
-        return False
-    return (bool(bound_pid) and bound_pid != project_id and bool(bound_conv)
-            and bound_conv != conv_key
-            and (conv_key in project_guests(sp, bound_pid) or conv_key in project_held(sp, bound_pid)))
 
 
-def _drop_project_guest(sp, pid: str, conv_key: str) -> None:
-    left = [c for c in project_guests(sp, pid) if c != conv_key]
-    if left:
-        _sp_set(sp, _CURRENT_GUESTS_SENTINEL, f"{pid}|{','.join(left)}", namespace=None)
-    else:
-        sp.delete(_CURRENT_GUESTS_SENTINEL)
 
-
-def _add_held(sp, pid: str, conv_key: str) -> None:
-    held = [c for c in project_held(sp, pid) if c != conv_key]
-    held = held + [conv_key]
-    _sp_set(sp, _CURRENT_HELD_SENTINEL, f"{pid}|{','.join(held)}", namespace=None)
-
-
-def _add_project_guest(sp, pid: str, conv_key: str) -> None:
-    guests = [c for c in project_guests(sp, pid) if c != conv_key]
-    guests = guests + [conv_key]
-    # a guest pushed out by the cap is still not the owner: it is HELD (r14 m4)
-    for _evicted in guests[:-_MAX_GUESTS]:
-        _add_held(sp, pid, _evicted)
-    guests = guests[-_MAX_GUESTS:]
-    _sp_set(sp, _CURRENT_GUESTS_SENTINEL, f"{pid}|{','.join(guests)}", namespace=None)
-    # rejoining the bound project ends the hold
-    held = [c for c in project_held(sp, pid) if c != conv_key]
-    if held != project_held(sp, pid):
-        if held:
-            _sp_set(sp, _CURRENT_HELD_SENTINEL, f"{pid}|{','.join(held)}", namespace=None)
-        else:
-            sp.delete(_CURRENT_HELD_SENTINEL)
-
-
-def _conversation_bound_project_pid(context) -> str:
-    """The pid this conversation's sentinels bind, or "". Thin wrapper so
-    the park-stamp ownership gate and the verifier heal share one notion."""
-    try:
-        from .file_system import _conversation_bound_project
-        return _conversation_bound_project(context) or ""
-    except Exception:
-        return ""
-
-
-def _project_is_gone(context, pid: str) -> bool:
-    """True only when the store answers and has NO row for ``pid`` (an
-    archived project still has its row). A store that cannot answer is not
-    evidence."""
-    store = _resolve_store(context)
-    if store is None:
-        return False
-    try:
-        return store.get_project(pid) is None
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def forget_project_pointer(context, pid: str) -> None:
-    """§4NW: a deleted/archived project stops being anyone's current project
-    — the live one AND the persisted binding (both delete paths cleared only
-    the live pointer, so after a restart the scratchpad still named it)."""
+    """§4NW / §4SX B0: a deleted/archived project stops being anyone's focus —
+    this request's pointer and every conversation's focus row."""
     if getattr(context, "current_project_id", None) == pid:
         _set_current(context, None)
-        return
-    sp = getattr(context, "scratchpad", None)
-    if sp is None:
-        return
+    store = _resolve_store(context)
+    if store is not None:
+        try:
+            store.clear_focus_for_project(pid)
+        except Exception:  # noqa: BLE001
+            logger.debug("focus clear skipped", exc_info=True)
+    _wm = getattr(context, "workspace_model", None)
+    if _wm is not None and getattr(_wm, "current_project_id", "") == pid:
+        try:
+            _wm.current_project_id = ""
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def begin_request_focus(context) -> Optional[str]:
+    """Load this request's project from its conversation's focus row (§4SX B0).
+
+    Called once at request start, inside the turn lock, after the request's
+    scope is installed and BEFORE anything touches the sandbox. Only a
+    persisting scope (owner + session id) reads a row; every other scope
+    starts with no project (members, replays, probes, unattended requests,
+    clients without a session id) unless it was built with one (a leaf).
+    The shared scratchpad follows the request's project: when its live
+    write scope is another project's, that project's keys are snapshotted
+    and the incoming project's last snapshot is hydrated.
+    """
+    from ..core.request_scope import current_scope
+    sc = current_scope(context)
+    if sc is None:
+        return getattr(context, "current_project_id", None)
+    if sc.persist and sc.conversation_key:
+        store = _resolve_store(context)
+        pid = None
+        if store is not None:
+            try:
+                pid = store.get_focus(sc.conversation_key)
+            except Exception:  # noqa: BLE001
+                logger.warning("conversation focus read failed", exc_info=True)
+        sc.project_id = pid if isinstance(pid, str) and pid else None
+    pid = sc.project_id
+    # through the context too: a GhostContext's property writes the same
+    # scope; any other context object holds it as its own attribute
     try:
-        if sp.get(_CURRENT_SENTINEL) == pid:
-            sp.delete(_CURRENT_SENTINEL)
-            sp.delete(_CURRENT_CONV_SENTINEL)
-            sp.delete(_CURRENT_GUESTS_SENTINEL)
-            sp.delete(_CURRENT_HELD_SENTINEL)
-            _wm = getattr(context, "workspace_model", None)
-            if _wm is not None and getattr(_wm, "current_project_id", "") == pid:
-                _wm.current_project_id = ""
+        context.current_project_id = pid
+        context.conversation_key = sc.conversation_key
     except Exception:  # noqa: BLE001
         pass
-
-
-def _park_current_project(context, cur: str, why: str):
-    """Deactivate the process-global active project for THIS request,
-    snapshotting its scratchpad so the owning conversation can resume it."""
-    saved = _snapshot_scratchpad(context, cur)
-    # (No close-stamp here, deliberately. This function's only callers are
-    # the request-start HYGIENE branches, where the conversation owns the
-    # parked project in NEITHER case — a stamp here is either wrong (the
-    # round-13 finding: healing to a project this conversation never
-    # touched) or unreachable (the round-14 finding: an ownership gate that
-    # its own call sites falsify by construction). The live stamp is in
-    # `_set_current(context, None)`, the one point every genuine close
-    # passes through.)
-    context.current_project_id = None
     _wm = getattr(context, "workspace_model", None)
     if _wm is not None:
         try:
-            _wm.current_project_id = ""
-        except Exception:
-            pass
-    if saved:
-        _hydrate_scratchpad(context, None)
-    else:
-        # The snapshot that makes this reversible did not land. Clearing the
-        # project's keys now would destroy state nothing can restore, and
-        # this runs at REQUEST START for conversations that merely happen to
-        # share the process — leaking is recoverable, deleting is not. Leave
-        # the entries tagged with `cur` (the next successful switch clears
-        # them) and only reset the write scope.
-        _set_scratchpad_scope(getattr(context, "scratchpad", None), None)
-        logger.warning(
-            f"Project '{cur}' parked WITHOUT a scratchpad snapshot — its keys "
-            f"are kept in memory rather than dropped (nothing could restore them)")
-    pretty_log("Project Scope", why, icon=Icons.BRAIN_PLAN)
-
-
-def reconcile_conversation(context, conv_key: str):
-    """Scope the active project to the conversation that activated it.
-
-    Thin wrapper around :func:`_reconcile_conversation` that leaves the
-    scratchpad's default write scope matching whatever project this request
-    ended up with — every branch below returns from a different place, and a
-    stale scope would tag this turn's keys with the PREVIOUS request's
-    project (so the next switch clears the wrong set).
-    """
-    # §4FH C1: a coding LEAF runs its own turn loop on an isolated context
-    # whose project is pinned EXPLICITLY (`core/coding_loop.build_leaf_context`
-    # sets `_leaf_pinned_project`). Its prompt has no conversation binding,
-    # so this reconciler parked the pin on every leaf — six leaves wrote
-    # their files at the sandbox ROOT while the workspace diff saw nothing,
-    # and the verify passed via execute's retry-from-root heal: DONE with
-    # zero deliverables. A pinned leaf is not a conversation; leave it alone.
-    _leaf_pin = getattr(context, "_leaf_pinned_project", None)
-    if _leaf_pin:
-        try:
-            context.current_project_id = _leaf_pin
+            _wm.current_project_id = pid or ""
         except Exception:  # noqa: BLE001
             pass
-        _set_scratchpad_scope(getattr(context, "scratchpad", None), _leaf_pin)
-        return
-    try:
-        _reconcile_conversation(context, conv_key)
-    finally:
-        _set_scratchpad_scope(getattr(context, "scratchpad", None),
-                              getattr(context, "current_project_id", None))
-
-
-def _reconcile_conversation(context, conv_key: str):
-    """Scope the active project to the conversation that activated it.
-
-    Called once at request start, BEFORE any sandbox listing or file op.
-    `context.current_project_id` is process-global, so without this a
-    project switched-to in one conversation stayed active for every other
-    conversation hitting the same process — their file writes landed in
-    `<sandbox>/projects/<id>/` and their turns carried that project's
-    scratchpad. Policy:
-
-    * binding's conversation == `conv_key` → (re)activate the bound project
-      for this request (returning to the owning conversation resumes it);
-    * binding belongs to another conversation, is unbound (legacy bare
-      sentinel written before the conv sentinel existed), or `conv_key` is
-      "" → deactivate for this request, PRESERVING the binding so the
-      owning conversation gets it back.
-    """
-    context.conversation_key = conv_key or ""
-    try:
-        from ..utils.logging import conversation_key_context
-        conversation_key_context.set(conv_key or "")
-    except Exception:  # noqa: BLE001
-        pass
     sp = getattr(context, "scratchpad", None)
-    if sp is None:
-        return
-    try:
-        bound_pid = sp.get(_CURRENT_SENTINEL)
-        bound_conv = sp.get(_CURRENT_CONV_SENTINEL)
-    except Exception:
-        return
-    if isinstance(bound_pid, str) and bound_pid and _project_is_gone(context, bound_pid):
-        # §4NW (req 6b3e22a6): a binding to a project that no longer exists
-        # (deleted while another process state held the pointer) survived
-        # every restart and was shown to the model as its current project
-        forget_project_pointer(context, bound_pid)
-        bound_pid = None
-    try:
-        # r15 MAJOR-1: a read refreshes a scratchpad entry's 24 h TTL. The
-        # owner's turns read only the pid/conv pair, so the guest and held
-        # lists expired under a live binding and a held guest's next switch
-        # took it. Every request that reads the binding reads them too.
-        sp.get(_CURRENT_GUESTS_SENTINEL)
-        sp.get(_CURRENT_HELD_SENTINEL)
-    except Exception:  # noqa: BLE001
-        pass
-    cur = getattr(context, "current_project_id", None)
-    if not bound_pid or not isinstance(bound_pid, str):
-        # No valid binding — never set, cleared, or LRU-evicted (the
-        # scratchpad keeps ~50 entries / 24h). Returning here used to fail
-        # OPEN: the process-global `current_project_id` from the PREVIOUS
-        # conversation stayed active for this request, so its file writes
-        # landed in that project's workspace. Fail CLOSED instead: park the
-        # stale project unless this very message names it (same escape
-        # hatch as the fingerprint-mismatch path below).
-        if cur and not _message_references_project(context, cur):
-            _park_current_project(
-                context, cur,
-                f"Project '{cur}' has no conversation binding — "
-                "deactivated for this request")
-        elif cur:
-            # Explicitly referenced → keep it active and re-bind it to this
-            # conversation so sentinel-based scoping fallbacks resolve it.
-            _set_current(context, cur)
-        return
-    owns = bool(conv_key) and (bound_conv == conv_key
-                               or conv_key in project_guests(sp, bound_pid))
-    # Escape hatch: even on a fingerprint mismatch, an explicit user reference
-    # to the project ("the PetAI project") means they want to work on it now —
-    # keep/activate it instead of parking it and forcing a recovery dance that
-    # loops the agent (observed live: request D7 called manage_projects get 3x,
-    # then hit the no-progress loop breaker, then a scrub fallback — all because
-    # the project it was told to advance had just been deactivated).
-    referenced = (not owns) and _message_references_project(context, bound_pid)
-    if owns or referenced:
-        if referenced and conv_key and not _probe_turn_now():   # a probe is never a guest
-            # The referencing conversation becomes a GUEST, so the
-            # `_conversation_bound_project` fallback in `project_scoped_sandbox`
-            # resolves the project for it (without it, file_system / report_pdf
-            # writes fell back to the sandbox ROOT when another reconcile
-            # cleared `current_project_id` mid-request — a report PDF and stray
-            # project dirs at the root, live). §4QA: it used to OVERWRITE the
-            # owner sentinel instead, and the owner lost its own project.
-            try:
-                _add_project_guest(sp, bound_pid, conv_key)
-            except Exception:
-                pass
-        if cur != bound_pid:
-            if cur:
-                # a request-only project (a held guest's, a probe's) left in
-                # the shared context: keep its keys (r14 m1 — the hydrate
-                # below cleared them, and only a park snapshotted)
-                _snapshot_scratchpad(context, cur)
-            context.current_project_id = bound_pid
-            _wm = getattr(context, "workspace_model", None)
-            if _wm is not None:
-                try:
-                    _wm.current_project_id = bound_pid
-                except Exception:
-                    pass
-            _hydrate_scratchpad(context, bound_pid)
+    live = getattr(sp, "active_namespace", None) if sp is not None else None
+    if not isinstance(live, str):
+        live = None
+    if sp is not None and (live or None) != (pid or None):
+        saved = _snapshot_scratchpad(context, live) if live else True
+        if pid or saved:
+            _hydrate_scratchpad(context, pid)
+        else:
+            # the snapshot that makes the clear reversible did not land:
+            # keep the keys (leaking is recoverable, deleting is not) and
+            # only move the write scope
+            _set_scratchpad_scope(sp, None)
+            logger.warning(f"Project '{live}' scope left WITHOUT a scratchpad snapshot — "
+                           "its keys are kept in memory rather than dropped")
+        if live or pid:
             pretty_log("Project Scope",
-                       (f"Conversation owns project '{bound_pid}' — reactivated"
-                        if owns else
-                        f"User referenced project '{bound_pid}' — activated for "
-                        "this request (conversation fingerprint differs)"),
+                       f"conversation focus: {pid or 'none'} (scratchpad scope was {live or 'none'})",
                        icon=Icons.BRAIN_PLAN)
-        return
-    if cur:
-        # Another conversation's project is live — park it for this request.
-        _park_current_project(
-            context, cur,
-            f"Project '{cur}' belongs to another conversation — "
-            "deactivated for this request")
+    else:
+        _set_scratchpad_scope(sp, pid)
+    return pid
+
+
+def drop_legacy_binding(scratchpad) -> int:
+    """Delete the old global binding keys (B4), once, at startup. Returns how
+    many were present."""
+    n = 0
+    if scratchpad is None:
+        return 0
+    for k in _LEGACY_BINDING_KEYS:
+        try:
+            if scratchpad.get(k) is not None:
+                n += 1
+            scratchpad.delete(k)
+        except Exception:  # noqa: BLE001
+            pass
+    return n
 
 
 def _constraint_origin(context) -> str:
@@ -1528,6 +1250,17 @@ _ADVANCE_STOP_BLURB = {
                    "is open again (READY). Any file it finished is on disk, not verified yet; "
                    "a file it had not finished is written again from the start next time. "
                    "Tell the user.",
+    "labs_down": "Stopped: the build needed a lab and the labs host did not answer — the task is open "
+                 "again (PENDING) and the autopilot starts it again by itself once the labs host answers (after "
+                 "a host that took the request and went silent: at least 15 minutes and a free lab slot). "
+                 "Tell the user; nothing failed in the project itself.",
+    "lab_gave_up": "Stopped: the build could not get a lab after several waits for the labs host — the task now "
+                   "WAITS FOR THE USER (it does not start again by itself). Tell the user what the labs host "
+                   "said, and that they can free room on it or retry the task.",
+    "lab_capacity": "Stopped: the build needed a lab and the labs host has no room (too many labs, or not "
+                    "enough memory or disk) — the task is open again (PENDING) and the autopilot starts it "
+                    "again by itself once there is room. Tell the user; destroying a lab they no longer "
+                    "need makes room.",
     "step_crashed": "Stopped: the build step crashed before it could finish (the task "
                     "is open again, ready to retry) — tell the user what failed.",
     "autopilot_off": "Not run: autopilot is off for this project. Only the owner turns it on "
@@ -1578,7 +1311,7 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     stopped_early = batch.stop_reason in (
         "failed", "repeated_failures", "budget_or_inactive", "needs_user",
         "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "out_of_time",
-        "in_progress", "open_but_waiting")
+        "in_progress", "open_but_waiting", "labs_down", "lab_capacity", "lab_gave_up")
     if batch.stop_reason == "model_experiment":
         # §4SU Phase 5: the batch carries on past an experiment — name IT,
         # not the last task that ran
@@ -2330,7 +2063,57 @@ def _lifecycle_would_refuse(store, act, rid, kwargs) -> bool:
 _PREVIEWED_THIS_REQUEST: set = set()
 
 
-def _lifecycle_confirmation(store, act, rid, token):
+def _grew_since_preview(context, act, rid, plan, host_labs=None) -> List[str]:
+    """§4SX D2 (review r1 M8): what a delete would now ALSO stop/destroy that the owner's preview did not list
+    (a lab turned kept since counts: its id gains a ``kept:`` entry — review r2 #3a)."""
+    if act != "delete" or context is None or not isinstance(plan, dict) or "inventory" not in plan:
+        return []
+    if host_labs is None and _labs_host_configured(context) and _project_inventory(context, rid)["labs"]:
+        # the host did not answer this time: whether a lab turned kept is unknown — never covered (review r3 m2)
+        return ["labs (the labs host did not answer, so their kind could not be checked)"]
+    # only what the design asks a new yes for (r1 M8): a kept lab or an `app` run — a new background job or a
+    # disposable lab is what a delete is for, and re-asking on churn loops the owner (review r3 #2)
+    return sorted(i for i in set(_inventory_ids(_project_inventory(context, rid, host_labs)))
+                  - set(plan.get("inventory") or []) if i.startswith(("kept:", "app:", "sched:")))   # D4 r2 #12
+
+
+async def _host_project_labs(context, project_id: str) -> Optional[list]:
+    """The labs host's own list of the project's labs (lifetime + lineage), for the delete preview and its
+    digest; None when no host is configured or it does not answer (the preview then says so)."""
+    try:
+        from .labs import _call, labs_configured
+        if not labs_configured(context):
+            return None
+        owner = f"project:{project_id}"
+        st, body = await _call(context, "GET", "/v1/labs", origin=_teardown_origin(context),
+                               params={"owner": owner})
+        if st != 200 or not isinstance(body, dict):
+            return None
+        mine = [x for x in body.get("labs") or [] if isinstance(x, dict) and str(x.get("owner") or "") == owner]
+    except Exception:  # noqa: BLE001
+        return None
+    # a lab the host has and the local record lacks is recorded now, so a delete that later cannot reach the
+    # host refuses on it instead of reading "no lab on record" (review r3 #1)
+    try:
+        from ..memory.lab_inventory import inventory_for
+        inv = inventory_for(context)
+        known = {str(r.get("lab_id")) for r in (inv.rows(owner, live_only=True) if inv is not None else [])}
+        hid = ""
+        if inv is not None and any(str(h.get("lab_id") or "") not in known for h in mine):
+            from .labs import _host_id
+            hid = await _host_id(context, _teardown_origin(context))
+        for h in mine:
+            lid = str(h.get("lab_id") or "")
+            if inv is not None and lid and lid not in known:
+                inv.record_create(lid, owner=owner, origin=str(h.get("origin") or ""),
+                                  template=str(h.get("template") or ""), label="recorded at a delete preview",
+                                  host_id=hid)
+    except Exception:  # noqa: BLE001
+        pass
+    return mine
+
+
+def _lifecycle_confirmation(store, act, rid, token, context=None, host_labs=None):
     """None when the action may run now on ``rid``; otherwise the preview (no
     token) or the refusal (bad token / not the user / same turn)."""
     import time as _time
@@ -2350,11 +2133,13 @@ def _lifecycle_confirmation(store, act, rid, token):
         # own token then read "the user has not answered yet"
         from .memory import confirmed_earlier_preview
         _tok0, _plan0 = confirmed_earlier_preview(kind, match=lambda p: p.get("project_id") == rid)
-        if _plan0 is not None:
+        if _plan0 is not None and not _grew_since_preview(context, act, rid, _plan0, host_labs):
             pretty_log("Confirm Lookup", f"{act} {rid}: the user's yes answers the earlier preview {_tok0} — "
                        f"running it", icon=Icons.BRAIN_PLAN)
             _drop_plan(_tok0)
             return None
+        if _plan0 is not None:
+            _drop_plan(_tok0)                   # it no longer describes what would go: preview again below
         # one preview per request: the live probe re-previewed eight times in
         # one turn, taking each refusal as a cue to try again (§4LQ)
         _key = (_rid_now, kind, rid)
@@ -2364,14 +2149,24 @@ def _lifecycle_confirmation(store, act, rid, token):
                                 world_changed=False, reason_code="confirm_dead_end")
         if len(_PREVIEWED_THIS_REQUEST) > 256:
             _PREVIEWED_THIS_REQUEST.clear()
-        tok = _store_plan({"kind": kind, "rid": _rid_now,
-                           "ts": _time.time(), "project_id": rid})
+        _plan_new = {"kind": kind, "rid": _rid_now, "ts": _time.time(), "project_id": rid}
+        _also = ""
+        if act == "delete" and context is not None:
+            _inv = _project_inventory(context, rid, host_labs)
+            _plan_new["inventory"] = _inventory_ids(_inv)
+            _txt = _inventory_text(_inv, hard=True)
+            _also = f" It would also stop/destroy: {_txt}." if _txt else ""
+            if host_labs is None and _labs_host_configured(context):
+                _also += (" (The labs host did not answer, so only the labs on local record are listed; the delete "
+                          "itself refuses while it cannot reach them.)")
+        tok = _store_plan(_plan_new)
         _PREVIEWED_THIS_REQUEST.add(_key)
         return _ok({
             "confirmation_needed": True, "action": act, "project": rid,
             "title": proj.get("title"), "confirm_token": tok,
+            **({"would_also_stop": _also.strip()} if _also else {}),
             "agent_instruction": (
-                f"NOT done yet. This would {_CONFIRMED_ACTIONS[act]} ('{proj.get('title')}'). Ask the "
+                f"NOT done yet. This would {_CONFIRMED_ACTIONS[act]} ('{proj.get('title')}').{_also} Ask the "
                 f"user to confirm. ONLY after they say yes, in their next message, call "
                 f"manage_projects action={act} project_id={rid} confirm_token={tok} (or "
                 f"confirm_token=yes if you no longer see the token). Never confirm "
@@ -2393,6 +2188,13 @@ def _lifecycle_confirmation(store, act, rid, token):
                    "plain yes (or do what they asked instead)")
         return _TO.rejected(f"Error: NOT done: {why}. {_stop}", world_changed=False,
                             reason_code="confirm_dead_end")
+    # after the owner's-yes check (review r4 m2: a same-turn token dropped the plan the real yes needed)
+    _grew = _grew_since_preview(context, act, rid, plan, host_labs)
+    if _grew:
+        _drop_plan(token)
+        return _err(f"NOT deleted: since the owner's preview the project gained {', '.join(_grew[:6])} — the "
+                    f"yes does not cover them. Call action={act} again WITHOUT a token for a new preview, and ask "
+                    "the owner again.")
     _drop_plan(token)
     return None
 
@@ -2402,7 +2204,8 @@ def _lifecycle_confirmation(store, act, rid, token):
 #: deleted it with no confirmation). §4QA r8: the brief hashes decide what
 #: the brief writer may overwrite — a forged hash would make it "ours"
 _SYSTEM_METADATA_KEYS = ("probe_created", "autopilot", "research_brief_shas",
-                         "quote_check_tasks")      # §4QA-e r34: the quote check's own count
+                         "quote_check_tasks",
+                         "lab_waits", "lab_waits_rounds")      # §4SX D4 r2 #13: the labs-host holds      # §4QA-e r34: the quote check's own count
 #: §4MQ: the budget and the unattended gates' state — written by the system or
 #: by the owner's `action=budget`, never by the model's `metadata=` (a
 #: background turn could raise its own cap)
@@ -2447,23 +2250,14 @@ async def tool_manage_projects_for_model(context, **kwargs):
             if rerr:
                 return _err(rerr)
             if rid and not _lifecycle_would_refuse(store, act, rid, kwargs):
-                _gate = _lifecycle_confirmation(store, act, rid, token)
+                _hl = await _host_project_labs(context, rid) if act == "delete" else None
+                _gate = _lifecycle_confirmation(store, act, rid, token, context, _hl)
                 if _gate is not None:
                     return _gate
             if rid:
                 kwargs["project_id"] = rid          # act on exactly the project confirmed
                 kwargs.pop("title", None)
-    try:
-        context._binding_held_note = ""
-    except Exception:  # noqa: BLE001
-        pass
-    res = await tool_manage_projects(context, **kwargs)
-    _bn = getattr(context, "_binding_held_note", "")
-    if _bn and isinstance(_bn, str):
-        from .outcome import append_note
-        res = append_note(res, "\n" + _bn)
-        context._binding_held_note = ""
-    return res
+    return await tool_manage_projects(context, **kwargs)
 
 
 def _released_guard(store: ProjectStore, project_id) -> Optional[str]:
@@ -2530,7 +2324,7 @@ def project_services_summary(context, project_id: str) -> list:
     matches the live container — the process died with the old container.
     Liveness beyond that is deliberately NOT probed here (it would cost
     docker execs on every turn); the model verifies via
-    ``manage_services status`` when it matters."""
+    ``run status`` when it matters."""
     entries = _project_service_entries(context, project_id)
     if not entries:
         return []
@@ -2558,6 +2352,7 @@ def project_services_summary(context, project_id: str) -> list:
             stale = stamped.split(":", 1)[0] != _cid
         out.append({
             "name": e.get("name") or e.get("key"),
+            "key": e.get("key"),                 # §4SX D5: the briefing lists a run-backed one under RUNNING
             "port": e.get("port"),
             "command": str(e.get("command") or "")[:80],
             "started_at": e.get("started_at"),
@@ -2580,6 +2375,422 @@ def _probe_tcp(port, attempts: int = 4, delay_s: float = 1.0) -> bool:
             pass
         _time.sleep(delay_s)
     return False
+
+
+# ------------------------------------------------------------------ §4SX Phase D2: the project's inventory
+
+def _labs_host_configured(context) -> bool:
+    try:
+        from .labs import labs_configured
+        return bool(labs_configured(context))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _project_inventory(context, project_id: str, host_labs: Optional[list] = None) -> Dict[str, list]:
+    """What the project owns that keeps running or holds a machine — LOCAL records (no docker exec, no
+    labs-host call; safe for status and the briefing): ``services`` (registry keys), ``runs`` (live run rows),
+    ``labs`` (live lab-inventory rows), ``jobs`` (running sandbox jobs not started by `run`). ``host_labs``
+    (the delete preview's own host read) adds what only the host knows: lifetime/lineage and labs with no
+    local row (review r2 #3)."""
+    owner = f"project:{project_id}"
+    out: Dict[str, list] = {"services": [], "runs": [], "labs": [], "jobs": [], "schedules": []}
+    try:
+        from .tasks import project_schedules
+        out["schedules"] = project_schedules(project_id)          # §4SX D4
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["services"] = [str(e.get("key") or e.get("name") or "") for e in _project_service_entries(context, project_id)]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..memory.run_registry import registry_for
+        reg = registry_for(context)
+        out["runs"] = reg.rows(owner, live_only=True) if reg is not None else []
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..memory.lab_inventory import inventory_for
+        inv = inventory_for(context)
+        out["labs"] = [dict(r) for r in (inv.rows(owner, live_only=True) if inv is not None else [])]
+    except Exception:  # noqa: BLE001
+        pass
+    if host_labs:
+        by_id = {str(r.get("lab_id")): r for r in out["labs"]}
+        for h in host_labs:
+            lid = str(h.get("lab_id") or "")
+            if not lid:
+                continue
+            row = by_id.get(lid)
+            if row is None:
+                row = {"lab_id": lid, "template": h.get("template") or ""}
+                out["labs"].append(row)
+                by_id[lid] = row
+            row["lifetime"] = str(h.get("lifetime") or "")
+            row["lineage"] = str(h.get("lineage") or "")
+    try:
+        from ..sandbox.jobs import get_job_supervisor
+        sup = get_job_supervisor(getattr(context, "sandbox_manager", None))
+        _run_jobs = {str(r.get("backend_ref") or "") for r in out["runs"] if r.get("backend") == "jobs"}
+        if sup is not None:
+            out["jobs"] = [e for e in sup.list_entries()
+                           if str(e.get("project_id") or "") == str(project_id)
+                           and e.get("state") == "running" and not e.get("started_via")
+                           # §4SX D5 review: a promoted execute job is a run row too — listed once, under runs
+                           and str(e.get("id") or "") not in _run_jobs]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _inventory_ids(inv: Dict[str, list]) -> List[str]:
+    """The confirm digest (design r1 M8): one id per thing a confirmed delete will stop or destroy."""
+    ids = [f"svc:{k}" for k in inv.get("services") or []]
+    ids += [f"run:{r.get('run_id')}" for r in inv.get("runs") or []]
+    ids += [f"app:{r.get('run_id')}" for r in inv.get("runs") or [] if r.get("lifetime") == "app"]
+    ids += [f"lab:{r.get('lab_id')}" for r in inv.get("labs") or []]
+    ids += [f"kept:{r.get('lab_id')}" for r in inv.get("labs") or [] if r.get("lifetime") == "kept"]
+    ids += [f"job:{e.get('id')}" for e in inv.get("jobs") or []]
+    ids += [f"sched:{e.get('id')}" for e in inv.get("schedules") or []]
+    return sorted(ids)
+
+
+def _inventory_text(inv: Dict[str, list], *, hard: Optional[bool]) -> str:
+    """One line of names; ``hard`` True/False adds what a delete/archive does to labs, None (status) nothing."""
+    bits = []
+    if inv.get("runs"):
+        bits.append("runs " + ", ".join(f"{r['name']} ({r['lifetime']} @ {r['place']})" for r in inv["runs"][:8]))
+    if inv.get("services"):
+        bits.append("services " + ", ".join(inv["services"][:8]))
+    if inv.get("jobs"):
+        bits.append("background jobs " + ", ".join(str(e.get("id")) for e in inv["jobs"][:8]))
+    if inv.get("schedules"):
+        bits.append("scheduled tasks " + ", ".join(f"{e['name']} ({e['id']})" for e in inv["schedules"][:8])
+                    + ("" if hard is None else " — removed" if hard else " — they keep firing"))
+    if inv.get("labs"):
+        labs = ", ".join(f"{r['lab_id']} ({r.get('template') or '?'}"
+                         + (f", KEPT, lineage {r.get('lineage') or '?'}" if r.get("lifetime") == "kept" else "")
+                         + ")" for r in inv["labs"][:8])
+        bits.append(f"labs {labs}" + ("" if hard is None else
+                                      " — kept ones too, with their data unless another version shares it"
+                                      if hard else " — disposable ones; kept ones stay up"))
+    return "; ".join(bits)
+
+
+def _teardown_origin(context) -> str:
+    """The labs/runs origin of the caller in a request scope (owner / probe / autopilot)."""
+    try:
+        from .labs import _caller
+        origin, _owner, refusal = _caller(context)
+        return "autopilot" if refusal or not origin else origin
+    except Exception:  # noqa: BLE001
+        return "autopilot"
+
+
+def _teardown_refusal(context, proj: Dict[str, Any], act: str) -> str:
+    """review r2 #2: deleting/archiving stops what the project runs — the owner's call. A probe may only touch a
+    project it created; unattended/leaf work never retires a project. No request scope (internal callers, unit
+    use) keeps the old behaviour."""
+    try:
+        from ..core.request_scope import current_scope
+        sc = current_scope(context)
+    except Exception:  # noqa: BLE001
+        sc = None
+    origin = str(getattr(sc, "origin", "") or "") if sc is not None else ""
+    if origin == "probe" and not (proj.get("metadata") or {}).get("probe_created"):
+        return f"a probe may {act} only a project it created — nothing was changed"
+    if origin in ("unattended", "leaf", "member", "replay"):
+        return f"{act} is the owner's decision — not available to {origin} work; nothing was changed"
+    return ""
+
+
+async def _teardown_project(context, project_id: str, *, hard: bool, origin: str) -> Dict[str, list]:
+    """Stop / destroy what the project owns BEFORE its row goes (design D2 + review r1): runs (archive keeps
+    `app` runs — production, H2), services (as before), the project's running sandbox jobs, and its labs
+    (archive: disposable only; delete: kept too, dropping the data only when no other kept lab of the lineage
+    is left, H3). ``origin`` is passed EXPLICITLY (H1: the console route has no request scope). Each step
+    reports; a failure never stops the next one. ``live_left`` = things still running that this could not
+    stop — a delete refuses while it is non-empty (M5: the sandbox being DOWN is not "left running")."""
+    from .outcome import OutcomeStatus
+    owner = f"project:{project_id}"
+    rep: Dict[str, list] = {"stopped": [], "kept_up": [], "failed": [], "live_left": [], "notes": []}
+    # 1. runs
+    try:
+        from ..memory.run_registry import registry_for
+        from . import runs as _runs
+        reg = registry_for(context)
+        try:
+            if reg is None and getattr(context, "memory_dir", None):
+                raise RuntimeError("cannot be opened")               # review r4 m3: unopened is not empty
+            live_runs = reg.rows(owner, live_only=True, strict=True) if reg is not None else []
+        except Exception as e:  # noqa: BLE001 — unread is never "none" (review r3 m2)
+            live_runs = []
+            rep["failed"].append(f"runs: the run registry could not be read ({type(e).__name__})")
+            rep["live_left"].append("runs (the run registry could not be read)")
+        for row in live_runs:
+            label = f"run {row['name']} ({row['lifetime']} @ {row['place']})"
+            if not hard and row["lifetime"] == "app":
+                rep["kept_up"].append(label)
+                continue
+            try:
+                out = await _runs._stop(context, reg, row, origin)
+            except Exception as e:  # noqa: BLE001
+                rep["failed"].append(f"{label}: {type(e).__name__}: {e}")
+                rep["live_left"].append(label)
+                continue
+            if out.status is OutcomeStatus.OK:
+                rep["stopped"].append(label)
+            elif getattr(out, "reason_code", None) == "run_replaced":
+                # another start took the name; that service is the services step's (review r3 m5)
+                rep["notes"].append(f"{label}: replaced by a start outside `run` — the services step stops it")
+            elif getattr(out, "reason_code", None) == "sandbox_unavailable":
+                # the container is down: nothing of it runs (M5) — record that instead of refusing
+                reg.set_state(row["run_id"], "lost", "the sandbox was not running at project teardown")
+                rep["notes"].append(f"{label}: the sandbox is not running — recorded as lost")
+            else:
+                rep["failed"].append(f"{label}: {str(out)[:200]}")
+                rep["live_left"].append(label)
+    except Exception as e:  # noqa: BLE001
+        rep["notes"].append(f"runs: {type(e).__name__}: {e}")
+    # 2. services (the old path, incl. the legacy workdir match)
+    try:
+        n = await asyncio.to_thread(_stop_project_services, context, project_id, hard)
+        if n:
+            rep["stopped"].append(f"{n} service(s)")
+        from ..sandbox.services import get_service_supervisor
+        sup = get_service_supervisor(getattr(context, "sandbox_manager", None))
+        for e in await asyncio.to_thread(_project_service_entries, context, project_id):
+            # a row still there after the stop = its process survived (the supervisor puts it back)
+            try:
+                alive = sup is not None and await asyncio.to_thread(sup._entry_state, e) is not False
+            except Exception:  # noqa: BLE001
+                alive = True                                   # could not tell: never report it gone
+            if alive:
+                rep["live_left"].append(f"service {e.get('key') or e.get('name')}")
+    except Exception as e:  # noqa: BLE001
+        rep["notes"].append(f"services: {type(e).__name__}: {e}")
+    # 3. the project's running background jobs (`execute` promotions)
+    try:
+        from ..sandbox.jobs import get_job_supervisor
+        jsup = get_job_supervisor(getattr(context, "sandbox_manager", None))
+        for e in (await asyncio.to_thread(jsup.list_entries) if jsup is not None else []):
+            if str(e.get("project_id") or "") != str(project_id) or e.get("state") != "running":
+                continue
+            try:
+                ok, msg = await asyncio.to_thread(jsup.cancel, e["id"])
+            except Exception as ex:  # noqa: BLE001 — one job's error never skips the next (review r2 #6)
+                ok, msg = False, f"{type(ex).__name__}: {ex}"
+            if ok:
+                rep["stopped"].append(f"job {e['id']}")
+                continue
+            try:
+                now = await asyncio.to_thread(jsup.get, e["id"])
+            except Exception:  # noqa: BLE001
+                now = e
+            if now is None or (now.get("state") or "") != "running":
+                # it ended or was marked lost (container recreated) before the cancel — nothing runs (r2 #4)
+                rep["notes"].append(f"job {e['id']}: {str(msg)[:160]}")
+            else:
+                rep["failed"].append(f"job {e['id']}: {msg}")
+                rep["live_left"].append(f"job {e['id']}")
+    except Exception as e:  # noqa: BLE001
+        rep["notes"].append(f"jobs: {type(e).__name__}: {e}")
+    # 4. labs
+    try:
+        await _teardown_labs(context, project_id, owner, hard=hard, origin=origin, rep=rep)
+    except Exception as e:  # noqa: BLE001 — an unexpected error leaves the labs counted LIVE (review r2 #6)
+        rep["failed"].append(f"labs: {type(e).__name__}: {e}")
+        try:
+            from ..memory.lab_inventory import inventory_for
+            inv = inventory_for(context)
+            if inv is None:
+                raise RuntimeError("no lab inventory")
+            for r in inv.rows(owner, live_only=True, strict=True):
+                rep["live_left"].append(f"lab {r['lab_id']}")
+        except Exception:  # noqa: BLE001
+            rep["live_left"].append("labs (could not be checked)")
+    # 5. scheduled tasks the project owns (§4SX D4): a delete removes them; an archive keeps them (resume undoes
+    # an archive, and a removed schedule would not come back)
+    try:
+        from .tasks import project_schedules, remove_project_schedule
+        try:
+            scheds = project_schedules(project_id, strict=True)
+        except Exception as e:  # noqa: BLE001 — unread is never "none"
+            scheds = []
+            if hard:
+                rep["failed"].append(f"scheduled tasks: {type(e).__name__}: {e}")
+                rep["live_left"].append("scheduled tasks (the task store could not be read)")
+        for t in scheds:
+            label = f"scheduled task {t['name']} ({t['id']})"
+            if not hard or rep["live_left"]:
+                # review r2 #4: a delete that will be refused (something still runs) keeps the project — and its
+                # schedules: a removed schedule does not come back
+                rep["kept_up" if not hard else "notes"].append(
+                    label if not hard else f"{label}: kept — the delete is refused while something still runs")
+                continue
+            elif await asyncio.to_thread(remove_project_schedule, getattr(context, "scheduler", None), t["id"]):
+                rep["stopped"].append(label)
+            else:
+                rep["failed"].append(f"{label}: the task store could not be updated")
+                rep["live_left"].append(label)
+    except Exception as e:  # noqa: BLE001
+        rep["notes"].append(f"scheduled tasks: {type(e).__name__}: {e}")
+    if hard:
+        # §4SX D3: an `app` run ends only when its kept lab is gone — re-probe them now the labs step ran
+        try:
+            from ..memory.run_registry import registry_for
+            from . import runs as _runs
+            reg = registry_for(context)
+            for row in (reg.rows(owner, live_only=True) if reg is not None else []):
+                if row["backend"] == "labs_app":
+                    await _runs._probed(context, reg, row, origin)
+        except Exception as e:  # noqa: BLE001
+            rep["notes"].append(f"app runs: {type(e).__name__}: {e}")
+    return rep
+
+
+async def _teardown_labs(context, project_id, owner, *, hard, origin, rep) -> None:
+    try:
+        from ..memory.lab_inventory import inventory_for
+        from .labs import LabsNoAnswer, LabsUnreachable, _call, labs_configured
+    except Exception as e:  # noqa: BLE001
+        rep["notes"].append(f"labs: {type(e).__name__}: {e}")
+        return
+    inv = inventory_for(context)
+    if inv is None and getattr(context, "memory_dir", None):
+        raise RuntimeError("the lab inventory cannot be opened")     # review r4 m3 (caller counts it live)
+    local = inv.rows(owner, live_only=True, strict=True) if inv is not None else []
+    if not labs_configured(context):
+        for r in local:
+            rep["live_left"].append(f"lab {r['lab_id']} (no labs host is configured to destroy it)")
+        return
+    try:
+        st, body = await _call(context, "GET", "/v1/labs", origin=origin, params={"owner": owner})
+        if st != 200:
+            raise LabsNoAnswer(f"HTTP {st}")
+        everyone = None
+        mine = [x for x in (body if isinstance(body, dict) else {}).get("labs") or []
+                if isinstance(x, dict) and str(x.get("owner") or "") == owner]
+    except (LabsUnreachable, LabsNoAnswer) as e:
+        for r in local:
+            rep["live_left"].append(f"lab {r['lab_id']} (the labs host did not answer: {e})")
+        if not local:
+            rep["notes"].append(f"labs host did not answer ({e}); no lab of this project is on record")
+        return
+    seen = set()
+    try:
+        from .labs import _host_id
+        host_now = await _host_id(context, origin)
+    except Exception:  # noqa: BLE001
+        host_now = ""
+    # §4SX D3 code r1 #8: the version holding the data (app mounted) goes LAST, so the drop_data it gets as the
+    # lineage's last kept lab lands on the version that has the data
+    mine = sorted(mine, key=lambda x: (str(x.get("lifetime") or "") == "kept", bool(x.get("app_mounted"))))
+    for lab in mine:
+        lid = str(lab.get("lab_id") or "")
+        seen.add(lid)
+        kept = str(lab.get("lifetime") or "") == "kept"
+        if kept and not hard:
+            rep["kept_up"].append(f"kept lab {lid}")
+            continue
+        params = {}
+        if kept:
+            params["include_kept"] = "1"
+            lineage = str(lab.get("lineage") or "")
+            if everyone is None:
+                try:
+                    st2, b2 = await _call(context, "GET", "/v1/labs", origin=origin)
+                    everyone = ([x for x in b2.get("labs") or [] if isinstance(x, dict)]
+                                if st2 == 200 and isinstance(b2, dict) else None)
+                except Exception:  # noqa: BLE001
+                    everyone = None
+            sharing = None if everyone is None else [
+                str(x.get("lab_id")) for x in everyone
+                if str(x.get("lab_id")) != lid and str(x.get("lifetime") or "") == "kept"
+                and lineage and str(x.get("lineage") or "") == lineage]
+            if sharing == []:
+                params["drop_data"] = "1"
+            else:
+                rep["notes"].append(f"kept lab {lid}: its data volume is KEPT — "
+                                    + (f"the lineage {lineage!r} is shared with {', '.join(sharing)}" if sharing
+                                       else "could not check whether another version shares it"))
+        try:
+            st, b = await _call(context, "DELETE", f"/v1/labs/{lid}", origin=origin, params=params, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            rep["failed"].append(f"lab {lid}: {type(e).__name__}: {e}")
+            rep["live_left"].append(f"lab {lid}")
+            continue
+        b = b if isinstance(b, dict) else {}
+        if st == 200 and b.get("leftovers"):
+            # the host destroyed it but could not remove everything (review r3 m4)
+            rep["failed"].append(f"lab {lid}: destroyed with leftovers {str(b.get('leftovers'))[:160]} — the "
+                                 "operator must clear them on the labs host")
+            rep["live_left"].append(f"lab {lid} (leftovers)")
+            if inv is not None:
+                inv.mark_leftovers(lid, ", ".join(map(str, b.get("leftovers"))))   # r5: lab list keeps it
+            continue
+        if st == 200 or (st == 404 and b.get("error") == "unknown_lab"):
+            if params.get("drop_data"):
+                # the host decides: it drops only volumes it backed up (review r2 #8) — say what it did
+                gone = b.get("data_volumes_removed") or []
+                what = (f" with its data ({len(gone)} volume(s), final backup taken)" if gone
+                        else f"; its data was KEPT ({b.get('note') or 'the host removed no data volume'})")
+            else:
+                what = ""
+            rep["stopped"].append(f"{'kept ' if kept else ''}lab {lid} destroyed{what}")
+            if everyone is not None:            # it no longer holds the lineage for the next one (review r2 #1)
+                everyone = [x for x in everyone if str(x.get("lab_id")) != lid]
+            if inv is not None:
+                inv.record_destroy(lid, by=f"project teardown {project_id}")
+        else:
+            rep["failed"].append(f"lab {lid}: HTTP {st} {b.get('error') or ''}".rstrip())
+            rep["live_left"].append(f"lab {lid}")
+    for r in local:
+        lid = str(r["lab_id"])
+        if lid in seen:
+            continue
+        if r.get("host_id") and r["host_id"] != host_now:
+            # made on ANOTHER labs host (or this host's identity is unknown right now): this one cannot
+            # destroy it, and "not listed" is not "gone" (review r3 m1, r4 #2)
+            rep["live_left"].append(f"lab {lid} (made on labs host {r['host_id']}; the configured host is "
+                                    f"{host_now or 'not answering /v1/health'})")
+            continue
+        # not listed: destroyed earlier, or destroyed with leftovers the host still holds — ask it (review r3 #1)
+        try:
+            st, b = await _call(context, "DELETE", f"/v1/labs/{lid}", origin=origin, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            rep["failed"].append(f"lab {lid}: {type(e).__name__}: {e}")
+            rep["live_left"].append(f"lab {lid}")
+            continue
+        b = b if isinstance(b, dict) else {}
+        if st == 200 and b.get("leftovers"):
+            rep["failed"].append(f"lab {lid}: leftovers {str(b.get('leftovers'))[:160]} — the operator must "
+                                 "clear them on the labs host")
+            rep["live_left"].append(f"lab {lid} (leftovers)")
+            if inv is not None:
+                inv.mark_leftovers(lid, ", ".join(map(str, b.get("leftovers"))))
+        elif st == 200 or (st == 404 and b.get("error") == "unknown_lab"):
+            if inv is not None:
+                inv.record_destroy(lid, by="gone (project teardown)")       # the host no longer has it
+        else:
+            rep["failed"].append(f"lab {lid}: HTTP {st} {b.get('error') or ''}".rstrip())
+            rep["live_left"].append(f"lab {lid}")
+
+
+def _teardown_summary(rep: Dict[str, list]) -> str:
+    parts = []
+    if rep.get("stopped"):
+        parts.append("stopped/destroyed: " + "; ".join(rep["stopped"]))
+    if rep.get("kept_up"):
+        parts.append("LEFT RUNNING (production — ask the owner whether to stop them): " + "; ".join(rep["kept_up"]))
+    if rep.get("live_left"):
+        parts.append("STILL RUNNING (could not be stopped): " + "; ".join(rep["live_left"]))   # review r3 #2
+    if rep.get("failed"):
+        parts.append("FAILED: " + "; ".join(rep["failed"]))
+    if rep.get("notes"):
+        parts.append("notes: " + "; ".join(rep["notes"]))
+    return " | ".join(parts)
 
 
 def _stop_project_services(context, project_id: str,
@@ -2615,6 +2826,35 @@ def _stop_project_services(context, project_id: str,
     except Exception:
         return stopped
     return stopped
+
+
+async def _release_app_gate(context, project_id: str) -> Optional[Dict[str, Any]]:
+    """§4SX D3: None when the project has no live `app` run (the services/deliverables rehearsal applies);
+    otherwise {ok, services: [], apps: [...], checks, detail} from probing each app on its serving lab."""
+    try:
+        from ..memory.run_registry import registry_for
+        from . import runs as _runs
+        reg = registry_for(context)
+        rows = [r for r in (reg.rows(f"project:{project_id}", live_only=True) if reg is not None else [])
+                if r["backend"] == "labs_app"]
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return None
+    from .labs import _caller
+    origin = _caller(context)[0] or "autopilot"
+    apps, checks, ok = [], [], True
+    for r in rows:
+        state, note, det = await _runs._probed(context, reg, r, origin)
+        good = state == "running" and str(det.get("app_state") or "") == "up"
+        ok = ok and good
+        apps.append({"name": r["name"], "url": det.get("url") or "", "lab_id": det.get("lab_id") or "",
+                     "lineage": str(r["backend_ref"]).partition("/")[0], "state": det.get("app_state") or state})
+        checks.append(f"app {r['name']}: {det.get('app_state') or state}" + (f" ({note})" if note else "")
+                      + (f" at {det.get('url')}" if det.get("url") else ""))
+    return {"ok": ok, "services": [], "apps": apps, "checks": checks,
+            "detail": "; ".join(checks) + ("" if ok else " — every kept app must be UP to release "
+                                            "(`run status`, `lab deploy`/`lab app op=start`)")}
 
 
 def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[str, Any]:
@@ -2787,7 +3027,9 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
             "release": rel,
             "versions": children,
             "note": ("RELEASED (immutable). To RUN it: follow release.directions "
-                     "(start the listed services via manage_services if down). "
+                     "(start a listed service that is down with `run start name=<name> "
+                     "command=<its command> where=workspace lifetime=server` — the name lowercase, "
+                     "letters/digits/hyphens). "
                      "To CHANGE it: action=create_version. Do not write into "
                      "this workspace."),
         }
@@ -3589,32 +3831,9 @@ async def tool_manage_projects(
                         "briefing": _b})
 
         if act == "exit":
-            prev = (getattr(context, "current_project_id", None)
-                    or _conversation_bound_project_pid(context) or None)
+            prev = getattr(context, "current_project_id", None)
             if not prev:
-                # §4LP: nothing active or bound in THIS conversation —
-                # `_set_current(None)` would delete the binding ANOTHER
-                # conversation owns (its next turn wrote to the sandbox root)
                 return _ok({"exited": None, "note": "no project was active in this conversation"})
-            _sp = getattr(context, "scratchpad", None)
-            _conv = getattr(context, "conversation_key", None) or ""
-            if (_sp is not None and _conv and _sp.get(_CURRENT_CONV_SENTINEL) != _conv
-                    and _conv in project_guests(_sp, prev)):
-                # §4QA: a GUEST leaves; the owner's binding stays, and the
-                # guest is HELD so its next switch cannot take it (r14)
-                _drop_project_guest(_sp, prev, _conv)
-                _add_held(_sp, prev, _conv)
-                # parked like any leave: its keys snapshotted and cleared, not
-                # left readable to the next conversation (r15 m1)
-                _park_current_project(context, prev, f"Guest left project '{prev}'")
-                return _ok({"exited": prev})
-            if (_sp is not None and _conv and _sp.get(_CURRENT_SENTINEL) not in (None, "", prev)
-                    and _sp.get(_CURRENT_CONV_SENTINEL) not in (None, "", _conv)):
-                # §4QA: a project held for THIS request only (a guest's switch
-                # elsewhere) — leaving it never deletes the owner's binding,
-                # and its keys are snapshotted like any park (r14 m1)
-                _park_current_project(context, prev, f"Project '{prev}' (request-only) exited")
-                return _ok({"exited": prev})
             _set_current(context, None)
             return _ok({"exited": prev})
 
@@ -3643,6 +3862,9 @@ async def tool_manage_projects(
                         "action=release (requires the project DONE, usage "
                         "`directions`, and a passing release rehearsal).")
                 if str(status).upper() == "ARCHIVED":
+                    _tr = _teardown_refusal(context, store.get_project(project_id) or {}, "archive")
+                    if _tr:
+                        return _err(_tr)                 # review r3 m6: before the other fields change
                     # §4PF (P6): archiving has side effects (services stopped,
                     # the binding stashed, the pointer forgotten) that a bare
                     # status flip skipped — apply the other fields, then run
@@ -3779,16 +4001,28 @@ async def tool_manage_projects(
                     f"task {t['id']} waits for the owner's approval ({_hgr(t.get('postconditions') or [])})"
                     for t in _held_g[:3]) + ". Ask the owner now and stop. The project goes only when the "
                     "owner's next message names each such task by id: \"delete <task id>\".")
-            _stop_project_services(context, rid, purge_state=True)
+            _tr = _teardown_refusal(context, store.get_project(rid) or {}, "delete")
+            if _tr:
+                return _err(_tr)
+            # §4SX D2: everything the project owns stops first — runs, services, jobs, labs (kept ones too);
+            # the row goes only when nothing it owns is left running (never a row-less orphan)
+            _td = await _teardown_project(context, rid, hard=True, origin=_teardown_origin(context))
+            if _td["live_left"]:
+                return _err(f"NOT deleted: still running — {'; '.join(_td['live_left'][:6])}. "
+                            f"{_teardown_summary(_td)}. The project, its tasks and its files are kept; what is "
+                            "listed as stopped/destroyed above already is. Tell the owner what is left and try "
+                            "again when it can be stopped.")
             _gone = store.get_project(rid) or {}
             ok = store.delete_project(rid, hard=True)
             if not ok:
-                return _err(f"delete failed for {rid} — nothing was removed.")
+                return _err(f"delete failed for {rid} — the record was NOT removed. "
+                            f"{_teardown_summary(_td)}")
             forget_project_pointer(context, rid)
             _unlink_project_in_graph(context, rid, _gone.get("title", ""))
             _forget_project_episodes(context, rid, _gone.get("title", ""))
             _remove_project_changelog(context, rid)
             return _ok({"deleted": True, "project_id": rid, "hard": True,
+                        "teardown": _teardown_summary(_td),
                         "note": "Project, its tasks/artifacts/events, its workspace files, its "
                                 "knowledge-graph edges and the episodes that name it were "
                                 "permanently removed. KEPT (say so if asked — do not claim "
@@ -3812,15 +4046,25 @@ async def tool_manage_projects(
             # Retiring a project retires its services too — archiving a
             # RELEASED project used to leave its rehearsed services running
             # forever (review H6). Resume can restart them per the dossier.
-            _stop_project_services(context, rid)
+            # §4SX D2: archive stops job/server runs, services, jobs and DISPOSABLE labs; `app` runs and kept
+            # labs are production and stay up (review r1 H2) — named so the owner can decide
+            _tr = _teardown_refusal(context, store.get_project(rid) or {}, "archive")
+            if _tr:
+                return _err(_tr)
+            _td = await _teardown_project(context, rid, hard=False, origin=_teardown_origin(context))
             ok = store.delete_project(rid, hard=False)
             if not ok:
-                return _err(f"archive failed for {rid} — nothing was changed.")
+                return _err(f"archive failed for {rid} — the project was NOT archived. {_teardown_summary(_td)}")
             forget_project_pointer(context, rid)
             return _ok({"archived": True, "project_id": rid,
+                        "teardown": _teardown_summary(_td),
                         "note": "Project hidden but kept; use action=resume to "
                                 "bring it back, or action=delete to remove it "
-                                "permanently."})
+                                "permanently."
+                                + (" Its production apps/kept machines are STILL RUNNING — ask the owner "
+                                   "whether to stop them." if _td["kept_up"] else "")
+                                + (" Some of its runs/labs could NOT be stopped and are still running (see "
+                                   "teardown) — tell the owner." if _td["live_left"] else "")})
 
         if act == "resume":
             if not project_id and not title:
@@ -3894,12 +4138,15 @@ async def tool_manage_projects(
                 return _ok({"current": cur, "mode": "project" if cur else "free_chat",
                             "project": rid, "autopilot": _autopilot_on(store, rid),
                             "budget": _budget_view(store, rid),
+                            "inventory": _inventory_text(_project_inventory(context, rid), hard=None) or "nothing running",
                             "briefing": _briefing(store, rid)})
             if not cur:
                 return _ok({"current": None, "mode": "free_chat"})
             return _ok({"current": cur, "mode": "project",
                         "autopilot": _autopilot_on(store, cur),
                         "budget": _budget_view(store, cur),
+                        # §4SX D2: what the project owns that keeps running (local records, no probing)
+                        "inventory": _inventory_text(_project_inventory(context, cur), hard=None) or "nothing running",
                         "briefing": _briefing(store, cur)})
 
         if act == "budget":
@@ -5193,8 +5440,11 @@ async def tool_manage_projects(
                 tidy_project_workspace(store, project_id, min_age_hours=0.0)
             except Exception as e:
                 logger.debug("release tidy skipped: %s", e)
-            # (2) rehearse.
-            reh = _release_rehearsal(context, store, project_id)
+            # (2) rehearse. §4SX D3 (design r1 H5): a project with a kept app is gated on that app being UP on
+            # its serving lab — never on `/rehearse` of the live lab (it stops production)
+            reh = await _release_app_gate(context, project_id)
+            if reh is None:
+                reh = _release_rehearsal(context, store, project_id)
             if not reh.get("ok"):
                 store.log_event(project_id, None, "release_rehearsal_failed",
                                 {"detail": reh.get("detail", "")[:400]})
@@ -5228,7 +5478,8 @@ async def tool_manage_projects(
                 "services": reh.get("services") or [],
                 "urls": [f"http://127.0.0.1:{s['port']}/"
                          for s in (reh.get("services") or [])
-                         if s.get("port")],
+                         if s.get("port")] + [a["url"] for a in (reh.get("apps") or []) if a.get("url")],
+                "apps": reh.get("apps") or [],
                 "deliverables": [
                     {"path": p, "desc": (mf.get(p) or {}).get("desc", "")}
                     for p in store.list_deliverables(project_id)[:30]

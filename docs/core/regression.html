@@ -126,7 +126,7 @@
   <h2>Test runs are probes, held read-only</h2>
   <p>A run is <code>handle_chat</code> with request id <code>probe-rt-&lt;n&gt;-&lt;run&gt;</code>.
   It runs unattended, so it is held read-only at tool dispatch and keeps the
-  owner's project binding exactly like a failure replay:
+  owner's project binding exactly like a failure replay (&sect;4SX B0: a request-only scope that never reads or writes a focus row):
   <code>failure_replay.is_replay_request</code> covers both prefixes
   (<code>UNATTENDED_PREFIXES</code>). The original turn being read-only is not
   enough, because on replay the model may pick any tool (r1, CRIT).

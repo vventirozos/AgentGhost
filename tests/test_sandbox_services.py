@@ -887,9 +887,10 @@ class TestWiring:
     def test_tool_advertised_and_dispatchable(self):
         from ghost_agent.tools.registry import TOOL_DEFINITIONS
         names = [t["function"]["name"] for t in TOOL_DEFINITIONS]
-        assert "manage_services" in names
+        # §4SX D5: `run` is advertised; `manage_services` dispatches to the run alias
+        assert "manage_services" not in names and "run" in names
         src = (_SRC / "tools" / "registry.py").read_text()
-        assert '"manage_services": lambda' in src
+        assert '"manage_services": lambda **kwargs: manage_services_alias' in src
         assert "active_service_ports" in src  # browser allowlist wired
 
     def test_docker_publishes_service_ports_with_conflict_retry(self):

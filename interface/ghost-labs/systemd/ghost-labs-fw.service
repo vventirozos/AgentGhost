@@ -1,0 +1,15 @@
+[Unit]
+Description=ghost-labs host firewall (INPUT DROP for lab networks, raw DROP toward private ranges)
+DefaultDependencies=no
+Before=docker.service tailscaled.service network-pre.target
+Wants=network-pre.target
+# netfilter-persistent's iptables-restore flushes the filter table: run after it (found on reboot, 2026-11-04)
+After=local-fs.target netfilter-persistent.service iptables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/ghost-labs/bin/ghost-labs-fw
+
+[Install]
+WantedBy=multi-user.target

@@ -340,10 +340,12 @@ def parse_args():
     # explicit --api-key ''). A non-loopback bind without an explicit key
     # refuses to boot — see the guard in main().
     parser.add_argument("--api-key", default=os.getenv("GHOST_API_KEY"))
-    parser.add_argument("--default-db", default=os.getenv("GHOST_DEFAULT_DB", "postgresql://ghost@127.0.0.1:5432/agent"), help="Default PostgreSQL URI for the DBA agent")
     parser.add_argument("--smart-memory", type=float, default=0.0)
     parser.add_argument("--anonymous", action="store_true", default=True, help="Always use anonymous search (Tor + DuckDuckGo)")
     parser.add_argument("--mandatory-tor", action=argparse.BooleanOptionalAction, default=_mandatory_tor_env_default(), help="Fail-closed Tor (DEFAULT ON): probe Tor liveness at boot (abort if unreachable) and install a process-wide guard that blocks any DIRECT connection to a public address. Anonymised traffic (via the loopback SOCKS proxy) and loopback/LAN infra are unaffected — only Tor-bypassing public egress is blocked. Makes the README's fail-closed promise real. Also forces HF offline (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE) so the local-only embedder loads from cache without the cleartext model-resolution call the guard would otherwise block — the embedding model must be pre-cached (it is after one normal run; on a cold install boot once with --no-mandatory-tor to download it). Opt out with --no-mandatory-tor or GHOST_MANDATORY_TOR=0.")
+    # §4SX Phase B: the labs host (disposable machines; interface/ghost-labs)
+    parser.add_argument("--labs-host", default=os.getenv("GHOST_LABS_HOST", ""), help="host:port of the ghost-labs service (disposable machines for the `lab` tool). Unset = the tool is hidden. Env fallback: GHOST_LABS_HOST.")
+    parser.add_argument("--labs-key-file", default=os.getenv("GHOST_LABS_KEY_FILE", "~/Data/AI/.ghost_labs_key"), help="file holding the labs API key (0600; never pass the key itself — args are recorded). Env fallback: GHOST_LABS_KEY_FILE.")
     parser.add_argument("--notify-webhook", default=os.getenv("GHOST_NOTIFY_WEBHOOK", ""), help="Outbound push-notification webhook URL — one JSON POST ({title, body, severity, phase, ts}) per notify-severity autonomous event (needs-user project tasks, scheduled-turn conclusions, ...). Loopback/LAN/Tailscale targets connect directly; PUBLIC targets are only ever reached through the Tor SOCKS proxy (fail-closed: skipped when Tor is unavailable). Env fallback: GHOST_NOTIFY_WEBHOOK.")
     parser.add_argument("--notify-ntfy", default=os.getenv("GHOST_NOTIFY_NTFY", ""), help="ntfy topic URL for outbound push (plain-text POST with Title/Priority headers), e.g. http://ghost.lan:8090/ghost-agent. Same egress rules as --notify-webhook. Env fallback: GHOST_NOTIFY_NTFY.")
     parser.add_argument("--no-redact-logs", action="store_true", default=False, help="Disable redaction of the monitored log stream. By default secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.")
@@ -371,12 +373,12 @@ def parse_args():
     parser.add_argument("--self-narrative-cooldown", type=int, default=3600, help="Seconds between idle-time self-narrative consolidations (idle-scheduler job). Default 60 min.")
     parser.add_argument("--no-workspace-model", action="store_true", help="Disable the workspace continuity module (file watcher, scheduled-task ledger, research dedup, command outcomes). When --no-memory is set, this module is also disabled regardless of this flag.")
     parser.add_argument("--workspace-narrative-cooldown", type=int, default=3600, help="Seconds between idle-time workspace narrative consolidations (idle-scheduler job). Default 60 min.")
-    # Metacognition: with the flag on, each shell/SQL validator block is also
+    # Metacognition: with the flag on, each shell validator block is also
     # logged (`metacog valid`) and counted in the shutdown `metacog summary`.
     # The validators themselves always run. (§4PJ removed the confidence
     # score and arbiter; §4PT host telemetry and the replan bridge.) See
     # docs/algorithms/metacognition.html.
-    parser.add_argument("--enable-metacog", action="store_true", help="Log and count pre-execution validator blocks (shell, SQL); the validators run either way.")
+    parser.add_argument("--enable-metacog", action="store_true", help="Log and count pre-execution validator blocks (shell); the validators run either way.")
     # §4PT: host telemetry was removed. Its flags are still ACCEPTED (and
     # ignored) so a launcher that passes them keeps starting.
     for _gone in ("--metacog-cpu-high", "--metacog-mem-high", "--metacog-mem-floor-mb",
@@ -392,7 +394,17 @@ def parse_args():
 
     if args.upstream_url:
         args.upstream_url = args.upstream_url.replace("http:://", "http://").replace("https:://", "https://")
+    _export_labs_key_file(args)
     return args
+
+
+def _export_labs_key_file(args) -> None:
+    """§4SX B (review MAJOR 5): the redactor finds the labs key through
+    GHOST_LABS_KEY_FILE — a key file named only by `--labs-key-file` would be
+    used by the tool and missed by redaction. The resolved path is exported."""
+    kf = getattr(args, "labs_key_file", "")
+    if isinstance(kf, str) and kf.strip():
+        os.environ["GHOST_LABS_KEY_FILE"] = os.path.expanduser(kf.strip())
 
 #: Env var names whose VALUE is a secret. Matched case-insensitively on the
 #: substring, so a future `GHOST_SLACK_TOKEN` is covered without an edit.
@@ -489,6 +501,12 @@ async def _reap_sandbox_jobs(context):
             # jobs, 0 wakes, and the wake loop is what makes promoting at 90s
             # instead of 600s safe.
             changed = await asyncio.to_thread(sup.take_unreported)
+            try:
+                # §4SX D5 review M5: a landed job ends its run row (the briefing's RUNNING block)
+                from .tools.runs import end_landed_job_runs
+                await asyncio.to_thread(end_landed_job_runs, context, changed)
+            except Exception:  # noqa: BLE001
+                pass
             for entry in changed:
                 _line = (
                     f"{entry.get('id')} {entry.get('state')}"
@@ -497,7 +515,7 @@ async def _reap_sandbox_jobs(context):
                     + f" — {str(entry.get('command'))[:70]}")
                 pretty_log(
                     "Sandbox Job",
-                    _line + ". Read it with jobs(action='collect', job_id=…).",
+                    _line + ". Read it with " + _collect_hint(entry, context) + ".",
                     icon=Icons.JOB_PROMOTE)
             # …and into the ACTIVITY LEDGER, so it is answerable later. The
             # operator's live stream is watched, not queried; without this a
@@ -611,6 +629,24 @@ async def _handle_chat_foreground(context, body, request_id: str):
             v.reset(t)
 
 
+def _collect_hint(entry, context=None) -> str:
+    """The tool call that reads a landed job: a `run`-started job is read with
+    `run collect` (§4SX C design r1 H2); a promoted one with `run collect` on
+    the run row named after it (§4SX D5); one with no run row (promoted
+    before the switch) with `jobs collect`, which still answers."""
+    if context is not None and (entry or {}).get("id"):
+        from .tools.runs import run_name_for_job
+        _rn = run_name_for_job(context, str(entry["id"]))
+        if _rn:
+            return f"run(action='collect', name='{_rn}')"
+        if (entry or {}).get("started_via") == "run":
+            # review r4: its run name was reused by a newer job — the job id reaches THIS one
+            return f"jobs(action='collect', job_id='{str(entry['id'])[:40]}')"
+    if (entry or {}).get("started_via") == "run":
+        return f"run(action='collect', name='{str((entry or {}).get('label') or '')[:60]}')"
+    return "jobs(action='collect')"
+
+
 async def _resume_after_job(context, entry) -> bool:
     """Re-engage the model with a finished job's result.
 
@@ -654,7 +690,7 @@ async def _resume_after_job(context, entry) -> bool:
                 "Job Resume Capped",
                 f"{jid}: {_MAX_RESUMES_PER_HOUR} autonomous resumes already "
                 f"this hour — recording it only. Read it with "
-                f"jobs(action='collect').",
+                f"{_collect_hint(entry, context)}.",
                 level="WARNING", icon=Icons.STOP)
             _RESUMED_JOBS.add(jid)
             # §4NS m2: the owner was never told — the output the wake says
@@ -1211,6 +1247,13 @@ async def lifespan(app):
         except Exception:
             logging.getLogger("GhostAgent").debug(
                 "sandbox-job reaper not started", exc_info=True)
+        # §4SX D3: kept apps (production on the labs host) — one owner notice per down period
+        try:
+            from .utils.logging import spawn_bg as _spawn_bg_apps
+            from .tools.runs import watch_kept_apps as _watch_apps
+            _spawn_bg_apps(_watch_apps(context), name="kept-app-watch")
+        except Exception:
+            logging.getLogger("GhostAgent").debug("kept-app watch not started", exc_info=True)
 
     # ProjectStore is intentionally NOT gated by --no-memory. Projects
     # are explicit user-driven structure (titles, tasks, artifacts the
@@ -1292,11 +1335,8 @@ async def lifespan(app):
         pretty_log("Project Store Failed", str(e), level="WARNING", icon=Icons.WARN)
         context.project_store = None
 
-    # NOTE: the scratchpad is persistent in prod (see `main()` — built
-    # with `persist_path=memory_dir / "scratchpad.db"` unless
-    # --no-memory), so the sentinel `__current_project__` written by
-    # `tools.projects._set_current` rehydrates automatically across
-    # restarts.
+    # NOTE: each conversation's focus project is a row in the project store
+    # (`conversation_focus`, §4SX B0), so it survives restarts with the store.
 
     # --no-memory is a user-facing promise that NOTHING will be written to
     # any persistent memory store for this session. The previous version
@@ -1406,6 +1446,21 @@ async def lifespan(app):
     except Exception as e:
         pretty_log("Activity Ledger Failed", f"{type(e).__name__}: {e}",
                    level="WARNING", icon=Icons.WARN)
+
+    # §4SX Phase B: one line naming the labs host, its version and health —
+    # in the background (a down host must not hold the boot for its timeout)
+    try:
+        from .tools.labs import start_labs_boot_line
+        start_labs_boot_line(context)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("labs boot line skipped: %s: %s", type(e).__name__, e)
+    # §4SX Phase C (design C3/C5): the run registry checked against the workspace
+    # supervisors — one line, background, workspace only (labs are never read here)
+    try:
+        from .tools.runs import start_runs_boot_line
+        start_runs_boot_line(context)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("runs boot line skipped: %s: %s", type(e).__name__, e)
 
     # Durable server-side conversations (2026-07-11). History was previously
     # client-carried only (browser localStorage / a Slack thread), so it was
@@ -2057,7 +2112,7 @@ async def lifespan(app):
         from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss, LEVEL_INFO
         context.metacog = MetacogBundle.from_args(context, args)
         if context.metacog is not None:
-            _mc_emit(_mc_ss.BOOT, state="enabled", validators="shell, sql")
+            _mc_emit(_mc_ss.BOOT, state="enabled", validators="shell")
         else:
             _mc_emit(_mc_ss.BOOT, level=LEVEL_INFO, state="disabled",
                      reason="--enable-metacog not set")
@@ -2359,9 +2414,17 @@ def main():
     else:
         # Persistent scratchpad: deploys are a plain `kill` under the
         # launchd KeepAlive supervisor, so without persistence every
-        # deploy silently wiped working state (incl. the
-        # `__current_project__` resume sentinel).
+        # deploy silently wiped working state.
         context.scratchpad = Scratchpad(persist_path=memory_dir / "scratchpad.db")
+        # §4SX B0 (B4): the old global project binding is dropped, not mapped
+        # (each conversation's focus is a project-store row now)
+        try:
+            from .tools.projects import drop_legacy_binding
+            if drop_legacy_binding(context.scratchpad):
+                pretty_log("Project Scope", "old global project binding dropped (B4); "
+                           "conversations start with no focus", icon=Icons.BRAIN_PLAN)
+        except Exception:  # noqa: BLE001
+            logger.warning("legacy binding drop failed", exc_info=True)
         context.journal = MemoryJournal(context.memory_dir)
         context.skill_memory = SkillMemory(memory_dir)
         context.frontier_tracker = FrontierTracker(memory_dir)

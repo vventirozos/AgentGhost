@@ -60,18 +60,30 @@ def test_a_cd_into_another_directory_is_a_different_command():
 
 # ── the state block never names a project that does not exist ────────────── #
 
+from tests.focus_helpers import scope_reset  # noqa: F401,E402  (§4SX B0: no scope leaks between tests)
+
+
 def _ctx(tmp_path, pid_in_store=True):
+    """§4SX B0: the focus is a project-store row now (no scratchpad sentinel)."""
     from ghost_agent.memory.projects import ProjectStore
     from ghost_agent.memory.scratchpad import Scratchpad
     from ghost_agent.tools import projects as tp
     store = ProjectStore(tmp_path / "mem")
-    pid = store.create_project("kept") if pid_in_store else "e6f85dfb94f8"
-    sp = Scratchpad()
-    sp.set(tp._CURRENT_SENTINEL, pid, namespace=None)
-    sp.set(tp._CURRENT_CONV_SENTINEL, "conv-1", namespace=None)
-    ctx = SimpleNamespace(project_store=store, scratchpad=sp, current_project_id=None,
+    pid = store.create_project("kept")
+    store.set_focus("session:conv-1", pid)
+    if not pid_in_store:
+        with store._connect() as conn:          # gone behind the store's back
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("DELETE FROM projects WHERE id = ?", (pid,))
+            conn.commit()
+    ctx = SimpleNamespace(project_store=store, scratchpad=Scratchpad(), current_project_id=None,
                           workspace_model=None, conversation_key="")
     return ctx, pid, tp
+
+
+def _start(ctx, key="session:conv-1"):
+    from tests.focus_helpers import start_request
+    return start_request(ctx, key)
 
 
 def test_a_binding_to_a_deleted_project_is_dropped(tmp_path):
@@ -79,26 +91,29 @@ def test_a_binding_to_a_deleted_project_is_dropped(tmp_path):
     the model read it as its current project (manage_projects: no project
     matches 'e6f85dfb94f8')."""
     ctx, pid, tp = _ctx(tmp_path, pid_in_store=False)
-    tp._reconcile_conversation(ctx, "conv-1")
+    _start(ctx)
     assert ctx.current_project_id is None
-    assert ctx.scratchpad.get(tp._CURRENT_SENTINEL) is None
-    assert ctx.scratchpad.get(tp._CURRENT_CONV_SENTINEL) is None
+    assert ctx.project_store.focus_rows() == []
 
 
 def test_a_binding_to_a_live_project_is_kept(tmp_path):
     ctx, pid, tp = _ctx(tmp_path)
-    tp._reconcile_conversation(ctx, "conv-1")
-    assert ctx.scratchpad.get(tp._CURRENT_SENTINEL) == pid
+    _start(ctx)
+    assert ctx.current_project_id == pid
+    assert ctx.project_store.get_focus("session:conv-1") == pid
 
 
 def test_a_store_that_cannot_answer_drops_nothing(tmp_path):
     ctx, pid, tp = _ctx(tmp_path)
+    real = ctx.project_store
 
     class _Broken:
-        def get_project(self, p):
+        def get_focus(self, k):
             raise RuntimeError("locked")
     ctx.project_store = _Broken()
-    assert tp._project_is_gone(ctx, pid) is False
+    _start(ctx)                                  # never raises; this request is unfocused
+    assert ctx.current_project_id is None
+    assert real.get_focus("session:conv-1") == pid
 
 
 def test_deleting_a_project_clears_a_persisted_binding(tmp_path):
@@ -106,10 +121,10 @@ def test_deleting_a_project_clears_a_persisted_binding(tmp_path):
     was None, so the persisted binding outlived the project."""
     ctx, pid, tp = _ctx(tmp_path)
     tp.forget_project_pointer(ctx, pid)
-    assert ctx.scratchpad.get(tp._CURRENT_SENTINEL) is None
-    other, _pid2, _ = _ctx(tmp_path)
-    tp.forget_project_pointer(other, "some-other-id")         # not the bound one
-    assert other.scratchpad.get(tp._CURRENT_SENTINEL) == _pid2
+    assert ctx.project_store.focus_rows() == []
+    other, pid2, _ = _ctx(tmp_path / "o")
+    tp.forget_project_pointer(other, "some-other-id")         # not the focused one
+    assert other.project_store.get_focus("session:conv-1") == pid2
 
 
 def test_the_runtime_keys_are_not_shown_to_the_model():
@@ -208,7 +223,7 @@ def test_the_screenshot_is_taken_in_the_type_its_name_says(tmp_path):
 
 async def test_the_tool_delete_clears_a_persisted_binding(tmp_path):
     """Fails where `manage_projects delete` cleared only the live pointer —
-    after a restart (live pointer None) the binding outlived the project."""
+    after a restart (live pointer None) the focus row outlived the project."""
     import json as _json
     from ghost_agent.memory.projects import ProjectStore
     from ghost_agent.memory.scratchpad import Scratchpad
@@ -219,10 +234,10 @@ async def test_the_tool_delete_clears_a_persisted_binding(tmp_path):
                           last_user_content="", conversation_key="conv-1")
     pid = _json.loads(await tp.tool_manage_projects(ctx, action="create", title="probe", kind="CODING",
                                                     goal="x"))["created"]
-    ctx.scratchpad.set(tp._CURRENT_SENTINEL, pid, namespace=None)
+    ctx.project_store.set_focus("session:other", pid)
     ctx.current_project_id = None                       # as after a restart
     await tp.tool_manage_projects(ctx, action="delete", project_id=pid)
-    assert ctx.scratchpad.get(tp._CURRENT_SENTINEL) is None
+    assert ctx.project_store.focus_rows() == []
 
 
 def test_the_api_delete_clears_a_persisted_binding(tmp_path):
@@ -231,7 +246,6 @@ def test_the_api_delete_clears_a_persisted_binding(tmp_path):
     from ghost_agent.api.projects_routes import projects_router
     from ghost_agent.memory.projects import ProjectStore
     from ghost_agent.memory.scratchpad import Scratchpad
-    from ghost_agent.tools import projects as tp
     store = ProjectStore(tmp_path / "mem", sandbox_root=tmp_path / "sb")
     sp = Scratchpad(persist_path=tmp_path / "sp.db")
     ctx = SimpleNamespace(args=SimpleNamespace(api_key=""), project_store=store, scratchpad=sp,
@@ -241,9 +255,13 @@ def test_the_api_delete_clears_a_persisted_binding(tmp_path):
     app.include_router(projects_router)
     tc = TestClient(app)
     pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
-    sp.set(tp._CURRENT_SENTINEL, pid, namespace=None)
-    assert tc.delete(f"/api/projects/{pid}?hard=true").status_code in (200, 204)
-    assert sp.get(tp._CURRENT_SENTINEL) is None
+    store.set_focus("session:x", pid)
+    assert tc.delete(f"/api/projects/{pid}").status_code in (200, 204)     # soft (archive)
+    assert store.focus_rows() == []
+    pid2 = tc.post("/api/projects", json={"title": "B"}).json()["id"]
+    store.set_focus("session:x", pid2)
+    assert tc.delete(f"/api/projects/{pid2}?hard=true").status_code in (200, 204)
+    assert store.focus_rows() == []
 
 
 async def test_the_scratchpad_tool_list_hides_the_runtime_keys():

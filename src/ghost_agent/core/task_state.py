@@ -38,7 +38,7 @@ TASK_STATE_MAX_CHARS = 1800
 EVIDENCE_HEAD_CHARS = 300
 EVIDENCE_MAX_CHARS = 6000
 EVIDENCE_TOOLS = ("web_search", "search", "deep_research", "browser", "execute",
-                  "vision_analysis", "knowledge_base", "darkweb")
+                  "vision_analysis", "knowledge_base", "darkweb", "lab", "run")
 
 _REPLY_SECONDS: Dict[str, float] = {}
 _REPLY_SECONDS_MAX = 512
@@ -565,7 +565,9 @@ def evidence_heads(tools_run, *, limit_chars: int = EVIDENCE_MAX_CHARS) -> str:
             continue
         flat = " ".join(content.split())
         # an `execute` output's head is the banner — its TAIL holds the result
-        body = flat[-EVIDENCE_HEAD_CHARS:] if n == "execute" and len(flat) > EVIDENCE_HEAD_CHARS else flat[:EVIDENCE_HEAD_CHARS]
+        from .strikes import is_program_output
+        _tail = n == "execute" or (n in ("lab", "run") and is_program_output(n, raw))   # §4SX B / D5: lab exec, run collect
+        body = flat[-EVIDENCE_HEAD_CHARS:] if _tail and len(flat) > EVIDENCE_HEAD_CHARS else flat[:EVIDENCE_HEAD_CHARS]
         target = _target_of(t)[:100]
         line = f"- `{n}`" + (f" ({target})" if target else "") + f": {body}"
         if used + len(line) > limit_chars:

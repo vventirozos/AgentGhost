@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=17.9';
+import * as matrixGraphFace from './matrix_graph.js?v=18.0';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -67,6 +67,12 @@ function _ownApiUrl(u, prefix = '/api/') {
                 init = init || {};
                 const headers = new Headers(init.headers || (typeof input !== 'string' ? input.headers : undefined) || {});
                 if (!headers.has('X-Ghost-Key')) headers.set('X-Ghost-Key', apiKey);
+                // §4SX B0: a bare download link resolves under THIS
+                // conversation's focused project — the server needs the session
+                if (_ownApiUrl(url, '/api/download/') && !headers.has('X-Ghost-Session')) {
+                    const _sid = window.__ghostSessionId || (typeof storedSessionId === 'function' ? storedSessionId() : '');
+                    if (_sid) headers.set('X-Ghost-Session', String(_sid));
+                }
                 init.headers = headers;
             }
         } catch (e) { /* fall through */ }
@@ -200,6 +206,7 @@ const ICON_CLASS = {
     '🔒': 'accent',   // SHIELD
     '📣': 'accent',   // NOTIFY_OUT
     '🪞': 'accent',   // SELF_STATE
+    '🎭': 'accent',   // MIRROR (§4SV)
     '🎓': 'accent',   // SKILL_GRADUATE
     '👍': 'accent',   // FEEDBACK_POS — human outcome label (/api/feedback)
     '👎': 'accent',   // FEEDBACK_NEG
@@ -220,6 +227,9 @@ const ICON_CLASS = {
     '🧱': 'tool',     // OUTSIDE_LOOK (§4RQ Eva's World look)
     '🎲': 'tool',     // UNCERTAINTY_DIE
     '🧪': 'tool',     // VERIFIER_LAB
+    '🏭': 'tool',     // LAB_CREATE (§4SX B)
+    '🪓': 'tool',     // LAB_DESTROY
+    '📟': 'tool',     // LAB_EXEC
     '📌': 'tool',     // VERDICT_NOTE — §4OK: a verdict is information, not an error
     '📦': 'tool',     // SANDBOX_BOX
     '🏃': 'tool',     // JOB_PROMOTE — long sandbox command detached as a job
@@ -5190,7 +5200,10 @@ async function uploadToSandbox(file, storedName) {
     const formData = new FormData();
     formData.append('file', file, storedName);
     try {
-        const response = await fetch('/api/upload', { method: 'POST', body: formData });
+        // §4SX B0: the upload lands in THIS conversation's focused project
+        const _sid = window.__ghostSessionId || storedSessionId() || '';
+        const response = await fetch('/api/upload' + (_sid ? `?session_id=${encodeURIComponent(_sid)}` : ''),
+                                     { method: 'POST', body: formData });
         if (!response.ok) {
             // The server explains WHY (type not allowed, too large, no
             // filename); pasting only the status threw that away.
@@ -6230,23 +6243,33 @@ function _safeImageBlobType(type) {
 // arrives many times — one fetch in flight per src, and the visualizer
 // auto-opens an image once per turn (it re-opened every frame, resetting a
 // newer preview and undoing the user's close).
+// §4SX B0 review r3: a bare /api/download/<name> resolves under the
+// SESSION's focused project, so the same src in two sessions can be two
+// different files — the cache and the in-flight map are keyed by both.
+function _authedBlobKey(rawSrc) {
+    const sid = window.__ghostSessionId || (typeof storedSessionId === 'function' ? storedSessionId() : '') || '';
+    return `${sid}|${rawSrc}`;
+}
+
 function _toAuthedBlobUrl(rawSrc) {
     if (!rawSrc || !_ownApiUrl(rawSrc, '/api/download/')) return Promise.resolve(rawSrc);
-    if (_authedBlobCache.has(rawSrc)) return _fetchAuthedBlobUrl(rawSrc);
-    if (_authedBlobInflight.has(rawSrc)) return _authedBlobInflight.get(rawSrc);
+    const key = _authedBlobKey(rawSrc);
+    if (_authedBlobCache.has(key)) return _fetchAuthedBlobUrl(rawSrc);
+    if (_authedBlobInflight.has(key)) return _authedBlobInflight.get(key);
     const p = _fetchAuthedBlobUrl(rawSrc);
-    _authedBlobInflight.set(rawSrc, p);
-    const done = () => { _authedBlobInflight.delete(rawSrc); };
+    _authedBlobInflight.set(key, p);
+    const done = () => { _authedBlobInflight.delete(key); };
     p.then(done, done);
     return p;
 }
 
 async function _fetchAuthedBlobUrl(rawSrc) {
-    if (_authedBlobCache.has(rawSrc)) {
+    const key = _authedBlobKey(rawSrc);
+    if (_authedBlobCache.has(key)) {
         // Touch: delete + re-set to mark as most recently used.
-        const cached = _authedBlobCache.get(rawSrc);
-        _authedBlobCache.delete(rawSrc);
-        _authedBlobCache.set(rawSrc, cached);
+        const cached = _authedBlobCache.get(key);
+        _authedBlobCache.delete(key);
+        _authedBlobCache.set(key, cached);
         return cached;
     }
     const res = await fetch(rawSrc);
@@ -6258,7 +6281,7 @@ async function _fetchAuthedBlobUrl(rawSrc) {
     const safeType = _safeImageBlobType(raw.type);
     const blob = safeType === raw.type ? raw : new Blob([raw], { type: safeType });
     const blobUrl = URL.createObjectURL(blob);
-    _authedBlobCache.set(rawSrc, blobUrl);
+    _authedBlobCache.set(key, blobUrl);
     _evictAuthedBlobCache();
     return blobUrl;
 }

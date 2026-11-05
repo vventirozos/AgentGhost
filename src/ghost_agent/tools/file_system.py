@@ -1296,37 +1296,6 @@ def _get_safe_path_inner(sandbox_dir: Path, filename: str, *, allow_root: bool =
     return target_path
 
 
-# Sentinel keys the projects tool uses to bind the active project to the
-# conversation that activated it (kept in sync with tools/projects.py). Read
-# here so file scoping can recover the project when the process-global
-# ``current_project_id`` is transiently cleared by a concurrent conversation.
-_PROJECT_BIND_PID = "__current_project__"
-_PROJECT_BIND_CONV = "__current_project_conv__"
-
-
-def _conversation_bound_project(context) -> str:
-    """The project bound to THIS conversation (via the projects-tool scratchpad
-    sentinels), or "" if none / it belongs to another conversation. Used as a
-    fallback when ``current_project_id`` was cleared mid-request."""
-    sp = getattr(context, "scratchpad", None)
-    conv = getattr(context, "conversation_key", None)
-    if sp is None or not conv:
-        return ""
-    try:
-        bound_pid = sp.get(_PROJECT_BIND_PID)
-        bound_conv = sp.get(_PROJECT_BIND_CONV)
-    except Exception:
-        return ""
-    if isinstance(bound_pid, str) and bound_pid and bound_conv == conv:
-        return bound_pid.strip().lower()
-    # §4QA: a GUEST conversation (it named the project) resolves it too
-    if isinstance(bound_pid, str) and bound_pid:
-        from .projects import project_guests
-        if conv in project_guests(sp, bound_pid):
-            return bound_pid.strip().lower()
-    return ""
-
-
 #: A project id is an opaque generated token (12 hex chars in practice). It
 #: is NOT a path fragment, and it reaches this function straight from a
 #: client query parameter on `/api/upload?project_id=`.
@@ -1370,12 +1339,11 @@ def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=
     since the Jupyter kernel is pinned to ``/workspace``).
 
     ``explicit_project_id`` (when a non-empty string) scopes to THAT project
-    directly, bypassing the process-global ``current_project_id``. The
-    stateless ``/api/upload`` / ``/api/download`` endpoints carry no
-    conversation context, so they read the global — which a concurrent
-    conversation's switch/reconcile can point at the wrong project, landing an
-    upload in another conversation's sandbox. A client that passes its own
-    ``project_id`` gets a race-free scope (the global stays the fallback).
+    directly, bypassing ``current_project_id``. The ``/api/upload`` /
+    ``/api/download`` endpoints run outside any request, where
+    ``current_project_id`` is None (§4SX B0: the focus is per conversation),
+    so they pass the project explicitly — ``?project_id=`` or the focus of
+    the conversation named by ``?session_id=``.
 
     This is the SINGLE SOURCE OF TRUTH for per-project sandbox scoping. Every
     surface that reads or writes the agent's working files routes through it
@@ -1396,14 +1364,8 @@ def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=
         pid = _safe_project_id(explicit_project_id)
     else:
         pid = _safe_project_id(getattr(context, "current_project_id", None))
-    if not pid and not stateful and explicit_project_id is None:
-        # ``current_project_id`` is process-global and can be cleared MID-REQUEST
-        # by a concurrent conversation's reconcile (observed live: a 700s
-        # autoadvance+manual build had its scoping wiped, so the agent's file
-        # writes landed in the sandbox ROOT and it thrashed for minutes). The
-        # per-conversation binding is NOT stomped that way, so re-derive this
-        # conversation's project from it.
-        pid = _safe_project_id(_conversation_bound_project(context))
+    # (§4SX B0: the old fallback to the global binding is gone — the project
+    # is the request's own scope now, which another conversation cannot clear)
     if pid and not stateful and base is not None:
         sub = base / "projects" / pid
         try:

@@ -28,7 +28,7 @@ def test_explicit_project_id_overrides_global(tmp_path):
     assert workdir.endswith("/projects/proj-a")
 
 
-def test_absent_explicit_falls_back_to_global(tmp_path):
+def test_absent_explicit_falls_back_to_the_context_project(tmp_path):
     ctx = _ctx(tmp_path, global_pid="proj-b")
     host, _ = project_scoped_sandbox(ctx)  # no explicit id → global
     assert host.name == "proj-b"
@@ -95,3 +95,55 @@ def test_download_bare_path_uses_explicit_project_id(tmp_path):
                    headers={"X-Ghost-Key": "test-key"})
     assert r.status_code == 200
     assert r.content == b"PNGDATA"
+
+
+# ------------------------------------------------- §4SX B0: the session names it
+
+
+def _app_with_focus(tmp_path):
+    from ghost_agent.memory.projects import ProjectStore
+    sb = tmp_path / "sandbox"
+    sb.mkdir()
+    client, agent = _app(sb)
+    store = ProjectStore(tmp_path / "mem")
+    pid = store.create_project("Upload Target")
+    store.set_focus("session:s-up", pid)
+    agent.context.project_store = store
+    agent.context.current_project_id = None          # outside a request (B0)
+    return client, sb, pid
+
+
+def test_upload_lands_in_the_sessions_focused_project(tmp_path):
+    """World where it fails: after B0 nothing outside a request reads a
+    project, so every upload from a focused conversation lands at the root
+    and the model can't see it in its working set."""
+    client, sb, pid = _app_with_focus(tmp_path)
+    r = client.post("/api/upload?session_id=s-up", headers={"X-Ghost-Key": "test-key"},
+                    files={"file": ("a.txt", b"x", "text/plain")})
+    assert r.status_code == 200
+    assert (sb / "projects" / pid / "a.txt").exists()
+    r = client.post("/api/upload", headers={"X-Ghost-Key": "test-key", "X-Ghost-Session": "s-up"},
+                    files={"file": ("b.txt", b"x", "text/plain")})
+    assert (sb / "projects" / pid / "b.txt").exists()
+
+
+def test_upload_from_another_or_no_session_is_unscoped(tmp_path):
+    client, sb, pid = _app_with_focus(tmp_path)
+    for q in ("?session_id=other", ""):
+        name = f"c{len(q)}.txt"
+        r = client.post(f"/api/upload{q}", headers={"X-Ghost-Key": "test-key"},
+                        files={"file": (name, b"x", "text/plain")})
+        assert r.status_code == 200
+        assert (sb / name).exists() and not (sb / "projects" / pid / name).exists()
+
+
+def test_bare_download_resolves_under_the_sessions_project(tmp_path):
+    client, sb, pid = _app_with_focus(tmp_path)
+    d = sb / "projects" / pid
+    d.mkdir(parents=True)
+    (d / "plot.png").write_bytes(b"P1")
+    (sb / "projects" / "other").mkdir()
+    (sb / "projects" / "other" / "plot.png").write_bytes(b"P2")      # ambiguous by name
+    r = client.get("/api/download/plot.png?session_id=s-up", headers={"X-Ghost-Key": "test-key"})
+    assert r.status_code == 200 and r.content == b"P1"
+

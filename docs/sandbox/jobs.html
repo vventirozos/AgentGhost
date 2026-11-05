@@ -488,6 +488,8 @@ STDOUT/STDERR:
   the session fixture reaps <em>before</em> the first test as well as after the
   last. Battery: <code>scripts/mutate_4gv.py</code> (10 mutants + a no-op and a
   known-bad control, 10/10 killed).</p>
+  <h2 id="4sx-c">A detached start for <code>run</code> <span class="tag">2026-11-04 &sect;4SX Phase C</span></h2>
+  <p><code>start_detached(cmd, workdir, label, project_id)</code> starts a command as a tracked job at once &mdash; no budget wait and no progress test, because the caller asked for a background run (a quiet <code>sleep 600</code> would otherwise die at 124). It reuses the same script, launcher, row, TTL, concurrency cap and re-run guard, and the same "no live process without a row" guard as <code>run()</code>. It returns <code>(entry, "")</code>, the running twin with <code>duplicate: True</code>, or <code>(None, reason)</code>. Its rows carry <code>started_via="run"</code>: <code>tools/delegate._sync_sandbox_jobs</code> does not adopt them into the <code>jobs</code> tool, and the wake's collect hint names <code>run(action='collect', name=…)</code> (<code>main._collect_hint</code>). Every existing path is unchanged. See <a href="../tools/runs.html">tools / runs</a>.</p>
 </main>
 </body>
 </html>

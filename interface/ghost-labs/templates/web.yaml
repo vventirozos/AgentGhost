@@ -1,0 +1,6 @@
+name: web
+description: nginx serving /srv/www on port 80, published on the tailnet, Tor egress
+egress: tor
+members:
+  - {name: web1, image: "ghost-lab/web:1", mem_mb: 512, cpus: 1.0, ports: [80]}
+readiness: {member: web1, cmd: "curl -fsS http://localhost/ >/dev/null", timeout_s: 60}

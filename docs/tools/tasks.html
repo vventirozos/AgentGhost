@@ -111,6 +111,9 @@ had misled the owner yet). Fixed:</p>
 </ul>
 <p>Pins: <code>tests/test_4ns_tasks_and_jobs.py</code>. Known gap: the one-line outcome booking inside the scheduler
 closure is not reachable by a test (its helper is pinned).</p>
+<h2 id="4sx-d4">A task can belong to a project <span class="tag">2026-11-04 &sect;4SX D4</span></h2>
+<p><code>project_owned: true</code> on <code>create</code>/<code>watch</code> stores <code>owner: "project:&lt;id&gt;"</code> on the task's record. The id comes from the system (the registry passes <code>context.current_project_id</code> as <code>_ctx_project_id</code> and drops any value the model sends). With no project in focus, the call is refused. <code>list</code> shows the owner. The project's inventory lists the task (<code>sched:&lt;id&gt;</code> in the confirm digest). A hard <code>delete</code> removes it, together with its pending catch-up/retry runs (<code>remove_project_schedule</code>). An <code>archive</code> keeps it and lists it as still running: resume undoes an archive, and a removed schedule would not come back. A task store that cannot be read blocks a delete, because "unread" is never "none".</p>
+<p><strong>Review r2:</strong> a delete that will be refused (something still runs) keeps the project's schedules, because a removed one does not come back. A schedule created between the delete preview and the "yes" brings the preview back (<code>sched:</code> ids count as growth). Known residual: a task whose save failed (PARTIAL) has no owner record, so it fires until the next restart even if its project is deleted.</p>
 </main>
 </body>
 </html>

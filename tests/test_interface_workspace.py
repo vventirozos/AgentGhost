@@ -91,6 +91,24 @@ def test_chat_payload_binds_session_id():
         "an unbound early turn is still sent with no session id")
 
 
+def test_downloads_carry_the_session_and_images_cache_per_session():
+    """§4SX B0 r2/r3: bare /api/download/ names resolve under the session's
+    focused project, so every download fetch sends X-Ghost-Session and the
+    authed-image cache is keyed by session + src."""
+    js = _read("app.js")
+    i = js.index("function installAuthFetch")
+    wrapper = js[i:i + 1500]
+    assert "_ownApiUrl(url, '/api/download/')" in wrapper and "headers.set('X-Ghost-Session'" in wrapper
+    assert "return `${sid}|${rawSrc}`" in js
+    j = js.index("async function _fetchAuthedBlobUrl")
+    body = js[j:j + 1400]
+    assert "_authedBlobCache.set(key, blobUrl)" in body and "_authedBlobCache.has(rawSrc)" not in body
+    k = js.index("function _toAuthedBlobUrl")
+    to = js[k:js.index("async function _fetchAuthedBlobUrl")]
+    assert "_authedBlobInflight.set(key, p)" in to and "_authedBlobInflight.get(key)" in to
+    assert "Inflight.has(rawSrc)" not in to and "Inflight.get(rawSrc)" not in to   # r4: the in-flight map too
+
+
 def test_ghostcore_bridge_published_before_workspace_import():
     js = _read("app.js")
     bridge_at = js.find("window.GhostCore = {")

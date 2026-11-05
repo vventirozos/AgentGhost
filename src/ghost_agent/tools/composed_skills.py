@@ -244,6 +244,8 @@ def macro_step_inputs(param_template) -> List[str]:
 MACRO_FORBIDDEN_STEP_TOOLS = frozenset({
     "manage_composed_skills", "create_skill", "manage_skills",
     "probe_model",   # §4QA: an experiment is the owner's turn, not a macro step
+    "lab",           # §4SX B: real machines are a turn's own work, not a macro step
+    "run",           # §4SX D5: a process that keeps running is a turn's own work too
 })
 
 

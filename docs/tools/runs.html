@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.runs — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="labs.html">labs</a>
+    <a class="current" href="runs.html">runs</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>tools / runs.py</h1>
+  <p class="subtitle">The <code>run</code> tool: everything that keeps running after a tool call returns, wherever it runs. <span class="tag">2026-11-04 &sect;4SX Phase C</span></p>
+
+  <h2 id="status">Status: advertised since the D5 switch <span class="tag">2026-11-04 &sect;4SX D5</span></h2>
+  <p><strong>Since D5</strong> <code>run</code> is in the model's tool list and <code>manage_services</code> / <code>jobs</code> are not. See <a href="#4sx-d5">the switch</a> below. The Phase C history follows.</p>
+  <p>Phase C builds <code>run</code> next to <code>manage_services</code> and <code>jobs</code>, which are unchanged. It is <strong>not</strong> in the model's tool list and not in the dispatcher (design review r1 M2: a different tool list re-prefills the prompt head). The Phase D switch advertises it, adds aliases, moves <code>execute</code>'s promotion to <code>job</code> runs and removes the old tools. Until then the only entry is the operator route <code>POST /api/operator/run-probe</code> (probe origin only, refused while a user request is live), used for live acceptance. Design: <code>docs/labs/PHASE_C.md</code>.</p>
+
+  <h2 id="actions">Actions</h2>
+  <ul>
+    <li><code>start name command where lifetime [port]</code> &mdash; <code>where</code> is required (<code>workspace</code> or <code>lab_&lt;8 hex&gt;/&lt;member&gt;</code>; no default). <code>lifetime</code> is <code>job</code> (runs once) or <code>server</code> (keeps serving). <code>app</code> is refused until Phase D (kept machines). A start is never a result: the reply says "Still running: this is not a result".</li>
+    <li><code>status [name]</code> &mdash; every live run, or the newest of that name, <strong>probed now</strong> from its backend; the probe is written back to the registry.</li>
+    <li><code>logs name [lines]</code>, <code>collect name</code> (a finished job: output plus <code>EXIT CODE</code>; <code>unresolved</code> while it runs), <code>stop name</code>, <code>restart name</code> (servers only; a job is started again), <code>url name</code>.</li>
+  </ul>
+
+  <h2 id="where">Where a run lives decides who runs it</h2>
+  <div class="scroll"><table>
+    <tr><th>lifetime @ where</th><th>backend</th><th>notes</th></tr>
+    <tr><td>server @ workspace</td><td><code>ServiceSupervisor</code> (<code>sandbox/services.py</code>)</td><td>Same lease, token and loopback rules as <code>manage_services</code>. The services key is <code>&lt;project&gt;:&lt;name&gt;</code>; a conversation owner uses <code>c-&lt;sha1(key)[:12]&gt;</code>, so two conversations never share or replace a service (r1 H3). A live service of that key that <code>run</code> did not start is refused, never replaced.</td></tr>
+    <tr><td>job @ workspace</td><td><code>SandboxJobSupervisor.start_detached</code> (<code>sandbox/jobs.py</code>, new)</td><td>Starts at once (no budget wait, no progress test), same script, TTL (45 min), cap and re-run guard as a promoted job. The row carries <code>started_via="run"</code>: the <code>jobs</code> tool does not adopt it, and its wake names <code>run collect</code> (r1 H1, H2).</td></tr>
+    <tr><td>job / server @ lab</td><td>labs host <code>exec detach</code> &rarr; <code>/jobs/{id}</code></td><td>The command is wrapped in <code>timeout --foreground -k 30 2700</code> (45 min, r1 M4). <code>--foreground</code> keeps it in the job's process group, which the host kills on <code>run stop</code>. Plain <code>timeout</code> makes its own group, so the 11-04 live check found a stopped server still running and holding its port. When the command ends, whether by itself or by the TTL, the labs host ends the rest of the job's group before it writes the exit code (TERM, then KILL 2 s later), so a pipeline or a backgrounded child cannot outlive a job that reads <code>exited</code>. Only a process that left the group on purpose (<code>setsid</code>/<code>setpgid</code>, e.g. nginx or <code>redis --daemonize yes</code>) escapes this. Nothing polls labs in the background: only an explicit <code>status/logs/collect</code> reads them. A run on a destroyed lab is <code>lost (its lab was destroyed)</code>; a host kill is <code>stopped</code>. A lab server has no tailnet address (disposable labs are not exposed): <code>url</code> points at <code>lab http</code>.</td></tr>
+  </table></div>
+
+  <h2 id="registry">The registry (<code>memory/run_registry.py</code>)</h2>
+  <p><code>&lt;memory_dir&gt;/runs.db</code>, never on the sandbox bind mount. A row is a pointer: <code>backend</code> (<code>services | jobs | labs_job</code>) and <code>backend_ref</code> (services key, job id, or <code>lab_id/job_id</code>), plus <code>owner</code> (<code>project:&lt;id&gt;</code> or <code>conversation:&lt;key&gt;</code>), <code>origin</code>, and for a service the start's <code>token</code>. A token that no longer matches means another start reused the name: the run reads <code>replaced</code> and <code>run</code> neither stops nor restarts that service (r1 M3). Ended rows are pruned after 30 days.</p>
+
+  <h2 id="origins">Who may use it</h2>
+  <p>Members and replays are refused (the <code>lab</code> rule). A probe stops or restarts only runs a probe started. Autopilot may start and stop <code>job</code> and <code>server</code> runs; <code>app</code> runs come with Phase D and are owner-only there.</p>
+
+  <h2 id="r1">Code review r1 <span class="tag">2026-11-04</span></h2>
+  <ul>
+    <li>The probe route sets the probe's request id and origin, not only the scope: a job's <code>started_by</code> is read from them, and an empty one woke the model as an owner turn and wrote the owner's activity ledger when the job landed (CRITICAL).</li>
+    <li>Every service call after a start uses the run's full services key, and a run whose row is <code>lost</code> or <code>replaced</code> is never stopped, restarted or read by name: by name the services lookup falls back to another project's service.</li>
+    <li>A restart counts only when the token changed. A start is recorded under a shield and, if the registry did not record it, undone (service stopped, job cancelled, lab job killed) &mdash; never left running untracked. One start at a time per owner and name.</li>
+    <li><code>stop</code> probes first: a run that already ended is reported as it ended, never "stopped". A lab stop is decided by the DELETE answer (a later GET never says <code>killed</code>). A lab job the host no longer knows is <code>lost</code>, so its name can be started again.</li>
+    <li>A legacy unscoped service of that name is never taken over. On a lab, a probe starts runs only on a probe's lab, and another owner's lab is named in the result. A start that raises (a missing project folder) is a failed start, not a crash. The sweeper's landing line names <code>run collect</code> for a run job.</li>
+  </ul>
+
+  <h2 id="r2">Code review r2 <span class="tag">2026-11-04</span></h2>
+  <ul>
+    <li>Every start and restart (workspace server, workspace job, lab start, services restart) runs its backend call &rarr; record &rarr; rollback as one shielded step that catches its own errors: a cancelled turn still records what it started, and no step ends as an unretrieved exception.</li>
+    <li>A restart whose kill did not take leaves the run <code>running</code> and answers FAILED with nothing changed (it used to write <code>failed</code> over a live server, which then nothing in <code>run</code> could stop). A crashed server (<code>exited</code>) can be restarted whether or not a status probed it first. Restarts take the same per-name lock as starts.</li>
+    <li>An unrecorded lab start reports whether its kill was confirmed. A job that ends between the stop's probe and the cancel keeps its real end. A stop whose check gets no answer is <code>unresolved</code>, not <code>stopped</code>.</li>
+    <li><code>collect</code> and <code>logs</code> of a run that already ended use its recorded end (a stopped lab job re-probes as <code>lost</code>; a stopped service has no row) &mdash; the probe only fetches output.</li>
+  </ul>
+
+  <h2 id="r3">Code review r3 <span class="tag">2026-11-04</span></h2>
+  <ul>
+    <li>A job cancel that the supervisor refused ("could not kill … left RUNNING") is a failed stop, not "already running" OK; a check with no answer is <code>unresolved</code>.</li>
+    <li><code>collect</code> of an ended job whose backend no longer has the exit code uses the recorded end (<code>exit N</code>); a check with no answer is <code>unresolved</code>, never a false FAILED.</li>
+    <li>A start or restart runs, with its per-name lock, as one shielded task (<code>_locked</code>): a cancelled turn used to release the lock while the backend step still ran, and a quick second start raced it into two live rows.</li>
+    <li>A restart the registry did not record is stopped again. A lab server restart whose second start fails says the old one was stopped.</li>
+  </ul>
+
+  <h2 id="r4">Code review r4 (MINOR only) <span class="tag">2026-11-04</span></h2>
+  <ul>
+    <li>A <code>run stop</code> is recorded as <code>stopped (stopped by run)</code>, not as a service "stopped outside run".</li>
+    <li>The user's stop is read inside the shielded start: a backend step already sent finishes and is recorded, but nothing starts after the stop (<code>run_stopped_by_user</code>).</li>
+    <li>A restart never rewrites a recorded end; a restart check with no answer is <code>unresolved</code>; a <code>failed</code> server can be restarted. A lab restart of a server that had already ended does not claim it stopped one.</li>
+    <li>Undoing an unrecorded start or restart is verified; if the service survives, the reply says it may still run.</li>
+  </ul>
+
+  <h2 id="reconcile">Reconcile and the boot line <span class="tag">2026-11-04</span></h2>
+  <p><code>reconcile(context)</code> checks the run registry against the workspace supervisors (design C3):</p>
+  <ul>
+    <li>Every live <b>workspace</b> run, of every owner, is probed now and the result written back. If its service or job row has vanished, the run becomes <code>lost</code>. A probe that gets no answer leaves the run as it was.</li>
+    <li>Lab runs are only <b>counted</b>, never read. Reading a lab touches it and keeps a disposable lab alive (design r1 M4).</li>
+    <li>Rows of the old tools are <b>reported, never adopted</b>: services that no run points at (for example a <code>manage_services</code> start), and jobs started by <code>run</code> that no live run points at.</li>
+  </ul>
+  <p>At startup, after the labs line, one <code>Runs</code> line is logged in the background. Example: <code>3 live run(s) · workspace 2 re-probed (1 ended: run_… lost (…)) · lab 1 not probed · 4 service(s) outside run</code>. The line is a WARNING when a run has ended, a run job has no row, or a supervisor could not be read (<code>partial: …</code>). A service whose run ended in an EARLIER pass counts as outside run; one whose run is live, or started during the pass, does not. Nothing is restarted or adopted at boot.</p>
+
+  <h2 id="4sx-d3">App runs <span class="tag">2026-11-04 &sect;4SX D3</span></h2>
+  <p>A kept lab's app shows up as a run with lifetime <code>app</code> (backend <code>labs_app</code>, ref <code>&lt;lineage&gt;/&lt;app&gt;</code>). <code>run</code> cannot make one; you get one from <code>lab keep</code> ("run_app_via_keep"). The lab that serves it is looked up at probe time (<code>_app_serving</code>): the owner's kept labs of that lineage are listed, and the one with the app mounted serves. Staged versions are named in the note.</p>
+  <ul>
+    <li>Host app states map to: up/restarting/starting &rarr; <code>running</code>, stopped &rarr; <code>app_stopped</code>, crashloop &rarr; <code>crashloop</code>. If only a staged version exists, the state is <code>staged</code>. If no kept lab of the lineage exists, the state is <code>lost</code> (the row ends). Silence from the host gives <code>unknown</code> and nothing is written. <code>app_stopped</code>, <code>crashloop</code> and <code>staged</code> are not ended states: the app comes back with <code>run start</code>.</li>
+    <li><code>start</code>/<code>stop</code>/<code>restart</code> are <code>POST /app/{op}</code> on the serving lab. If the app is not up after a start or restart, the result is <code>RUN ERROR (app_not_up)</code>. <code>url</code> and <code>logs</code> (the app's member) read it, and <code>status</code> shows the URL. A probe cannot drive an owner's app run.</li>
+    <li><strong>Down notice</strong> (<code>watch_kept_apps</code>, every 300&nbsp;s, background task "kept-app-watch"): <code>app_down_sweep</code> needs two down polls in a row, and an owner stop is not "down". It sends one notice per sweep that names every app newly down (autonomous activity at NOTIFY, plus the notify rate limit). The notice is marked in the run's <code>meta</code> only when it was recorded, and the mark is cleared when the app is up again, so the next down period notifies again. An unknown answer changes nothing.</li>
+    <li>The registry gained a <code>meta</code> JSON column (migration for old databases, <code>set_meta</code> where None removes a key, <code>meta_of</code>).</li>
+  </ul>
+
+  <h2 id="4sx-d5">The switch <span class="tag">2026-11-04 &sect;4SX D5</span></h2>
+  <ul>
+    <li><strong>Schema.</strong> <code>RUN_TOOL_DEFINITION</code> takes the place of <code>manage_services</code> + <code>jobs</code> in <code>TOOL_DEFINITIONS</code>. The tool list changes once, so one re-prefill per deploy.</li>
+    <li><strong>Aliases.</strong> The old names stay callable but are not advertised, for one release cycle. Each prefixes a one-line hint and keeps the result's status.
+      <ul>
+        <li><code>manage_services_alias</code>: <code>start</code> runs <code>run start where=workspace lifetime=server</code>. A <code>workdir</code> becomes <code>cd &lt;dir&gt; &amp;&amp;</code>, and a name that is not a run name is folded to one, with the fold named in the hint. <code>stop</code>/<code>restart</code>/<code>logs</code>/<code>status</code> map to the same action on <code>run</code>. <code>stop-all</code>/<code>adopt</code> and anything else are refused, naming the <code>run</code> way.</li>
+        <li><code>jobs_alias</code>: <code>status</code> runs <code>run status</code>. <code>collect</code>/<code>cancel &lt;job_id&gt;</code> become <code>collect</code>/<code>stop</code> on the run row of that job. A job with no row (promoted before the switch) is still read by the old jobs tool.</li>
+      </ul></li>
+    <li><strong>Read calls.</strong> <code>READ_ACTIONS</code> (status/logs/url/collect) and <code>is_read_call</code> keep a read open on a status question. A read never resets the failure guard and is never a dropped change.</li>
+    <li><strong>Wired by meaning</strong> (<code>core/agent.py</code> and the sets elsewhere):
+      <ul>
+        <li>mutating world, edit-churn verify, last clean tool, external evidence, work tools, batch wall, drop note, the idempotency guard's mutating set;</li>
+        <li>replay-forbidden, macro-forbidden, egress <code>url_literals</code> + code tools, claim-source excluded, evidence tools (task state and gate), the read-write loop set;</li>
+        <li>provenance (<code>logs</code>/<code>collect</code> count as outside content);</li>
+        <li>program output: only a <code>collect</code> result (head <code>[run NAME STATE exit=N]</code> + an <code>EXIT CODE:</code> line). A log's "ERROR" is content (<code>outcome_heuristics._run_result_failed</code>).</li>
+      </ul></li>
+    <li><strong>Batch order</strong> (<code>_run_call_depends</code>):
+      <ul>
+        <li>a run waits for an earlier <code>execute</code>; an <code>execute</code> waits for an earlier changing run;</li>
+        <li>a run waits for an earlier run of the same name, and a nameless <code>status</code> for any changing run;</li>
+        <li>a run on <code>lab_x/…</code> waits for lab calls on lab_x, and for kept-app lab actions;</li>
+        <li>a lab call on the run's lab, or a kept-app lab action, waits for a changing run.</li>
+      </ul></li>
+    <li><strong>Promotion.</strong> <code>execute</code> gets <code>run_context</code>. <code>record_promoted_job</code> records a promoted command as a <code>job</code> run named after its job id (backend <code>jobs</code>), so the banner and the landed-job hint (<code>main._collect_hint</code>) name <code>run collect name=job-…</code>. With no row (registry down, a member), the banner falls back to the <code>jobs</code> wording, which still answers.</li>
+    <li><strong>Briefing.</strong> <code>project_running_summary</code> lists the project's live runs (the state each had when last probed, with an absolute UTC time) and its live labs from the inventory. It uses local records only: no probe, no docker exec, no host call per turn. <code>build_project_briefing(running=)</code> renders the RUNNING block, and a run-backed service is not listed again under SERVICES.</li>
+    <li><strong>Leaf.</strong> <code>run</code> joins the autopilot leaf's tools. A start inside a leaf carries <code>meta.leaf</code>, and <code>stop_leaf_runs</code> stops those runs when the leaf ends, before its labs are destroyed. Unattended work never starts, stops or restarts a kept app; it may read one.</li>
+    <li><strong>Removed:</strong> the operator route <code>POST /api/operator/run-probe</code>. Live checks drive <code>run</code> through probe-header chat turns.</li>
+  </ul>
+
+  <h2 id="4sx-d5-r1">Review r1 of the switch <span class="tag">2026-11-04 &sect;4SX-r</span></h2>
+  <ul>
+    <li><strong>A leaf's promoted job outlives the leaf.</strong> <code>record_promoted_job</code> writes no leaf tag. A <code>pip install</code> or <code>pytest</code> that an <code>execute</code> inside a leaf detached after 90 s finishes, and its wake carries on. Before this fix, the leaf's end cancelled it.</li>
+    <li><strong>The leaf tag is written in the insert.</strong> <code>RunRegistry.add(meta=)</code> writes it in the same INSERT, and the start sites pass <code>_leaf_meta()</code>, which reads <code>LEAF_ID</code> inside the shielded start. A leaf cancelled mid-start used to leave its server untagged, and a workspace server has no TTL. A restart carries the old row's leaf onto the new row.</li>
+    <li><strong><code>run collect</code> reads a workspace job like the wake does.</strong> It strips the stage-status marker with <code>_take_pipestatus</code> and applies <code>_normalise_exit</code>, so a <code>| head</code> exiting 141 is not a failure. It also calls <code>mark_woken</code>, so a collected job is not reported a second time by its wake.</li>
+    <li><strong>Owner-less turns</strong> (a job's wake, a scheduled task: no project, no conversation): <code>run status</code>, and <code>run collect/stop name=job-…</code>, go to the jobs tool and its own §4NS rule (the owner's turn, the job's starter, or its wake). Anything else is refused, and the refusal says to switch to the project. <code>run_name_for_job(owner=)</code> reads only the caller's rows, so <code>jobs collect</code> falls back to the jobs tool for a job this caller has no row for.</li>
+    <li><strong>The RUNNING block stays current.</strong> <code>end_landed_job_runs</code> ends the run row of a landed job. The reaper calls it on <code>take_unreported</code>, and the summary calls it on a local registry read. The summary shows the twelve newest rows. A run-backed server keeps the container-generation STALE mark (&sect;4LR M1).</li>
+    <li><strong>Smaller fixes.</strong>
+      <ul>
+        <li>A leaf may stop or restart only the runs it started (same <code>meta.leaf</code>). Other unattended work (a scheduled task) still may.</li>
+        <li>A workspace <code>run start</code> runs <code>execute</code>'s guards first: one naming the labs host is refused with <code>lab_host_from_workspace</code>, one probing the agent's own port with <code>run_agent_port</code>.</li>
+        <li><code>manage_services log/tail</code> is read as <code>logs</code>, and <code>jobs list job_id=X</code> as <code>status</code>.</li>
+        <li>A promoted job is listed once in the project inventory (under runs).</li>
+        <li><code>_run_result_failed</code> reads a declared status first, then the anchored <code>exec_exit_code</code>.</li>
+        <li>The <code>execute</code> schema and the release note name <code>run</code>.</li>
+      </ul></li>
+    <li><strong>Kept as is:</strong>
+      <ul>
+        <li>a replay still has no <code>run status</code>, which is safe;</li>
+        <li>the alias name fold can join <code>web_1</code> and <code>web-1</code>;</li>
+        <li>a name-only <code>run stop</code> on a lab run does not wait for a <code>lab exec</code> on that lab in the same batch.</li>
+      </ul></li>
+  </ul>
+
+  <h2 id="4sx-d5-r2">Review r2 <span class="tag">2026-11-04 &sect;4SX-r</span></h2>
+  <ul>
+    <li><strong>A leaf's end waits for its in-flight starts.</strong> <code>_locked</code> registers each start or restart task under the leaf (<code>_LEAF_INFLIGHT</code>). <code>stop_leaf_runs</code> waits up to <code>LEAF_INFLIGHT_WAIT_S</code> (90 s, inside coding_loop's 120 s cleanup bound), then reads the rows. Before this fix, a leaf cancelled mid-start ended before its shielded start recorded the row, so that run stayed up.</li>
+    <li><strong>Only the owner, or the job's starter, marks a collected job delivered</strong> (<code>_delivers</code>: the owner's turn or internal code, or the launch record's <code>started_by</code>). A leaf or a scheduled task that reads the owner's job leaves the wake alone, so the owner's waiting work still carries on.</li>
+    <li><strong>A promoted job carries <code>meta.started_leaf</code>.</strong> The leaf that detached it may stop it. The leaf's end reads <code>leaf</code> only, so it leaves the job running.</li>
+    <li><strong>A restart keeps the old row's leaf</strong>, on the workspace path and the lab path alike.</li>
+    <li><strong>Landed jobs never overwrite an ended row.</strong> <code>end_landed_job_runs</code> writes with <code>set_state(only_live=True)</code>, so a concurrent <code>run stop</code> stays "stopped".</li>
+    <li><strong><code>run_name_for_job</code> finds ended rows too.</strong> The reaper ends a row before it writes the hint.</li>
+    <li><strong>The alias hint follows the result</strong>, so the result's own head stays first for every head reader.</li>
+    <li><strong>The stored verdict matches the live one.</strong> <code>_RUN_COLLECT_RE</code> reads our own two head lines: an expired, stopped or lost job is a failure, and a later <code>EXIT CODE: 3</code> the program printed is ignored.</li>
+    <li><strong>An owner-less <code>run stop name=job-…</code></strong> cancels through the jobs tool, then ends the run row.</li>
+  </ul>
+
+  <h2 id="4sx-d5-r3">Reviews r3 and r4 <span class="tag">2026-11-05 &sect;4SX-r</span></h2>
+  <ul>
+    <li><strong>A reused run name.</strong> <code>run_name_for_job</code> gives a job's name only while that name still resolves to the job's own row. When a newer run has taken the name, <code>jobs collect/status/cancel job_id=&lt;old&gt;</code> acts on the old job's row directly (<code>_old_job_row_op</code>): collect reads the old job, and cancel of an ended job is refused, naming the newer run. In that case the landed-job hint names <code>jobs(… job_id=…)</code>.</li>
+    <li><strong>An exited job with no recorded exit code</strong> is UNRESOLVED (<code>run_exit_unknown</code>) and its head says "judge it by the output". The stored verdict agrees with the live one, and the turn loop does not call it "still running".</li>
+    <li><strong>Leaf cleanup.</strong> The end's wait is now 40 s. A start that lands after the end stops its own row (<code>_LEAF_ENDED</code>, a held task). A leaf's stops run one at a time (<code>_LEAF_STOP_LOCKS</code>), so each row is stopped once.</li>
+    <li><strong>Wake arm.</strong> A wake turn that collects its own job marks it delivered (the same arm as &sect;4NS <code>_mine</code>).</li>
+    <li><strong>Old-name rows.</strong> A <code>jobs</code>/<code>manage_services</code> row that holds a <code>run</code> result (head <code>[run </code>, <code>RUN </code>, <code>No runs here</code>) is graded by the <code>run</code> rule. A stored collect under the failure banner is still read.</li>
+  </ul>
+
+  <h2 id="4sx-d5-r5">Review r5 <span class="tag">2026-11-05 &sect;4SX-r</span></h2>
+  <ul>
+    <li><strong>Exit code not recorded.</strong> In a batch summary, a collect with no recorded exit code goes on its own line: "FINISHED, EXIT CODE NOT RECORDED (not a verdict — judge each by its output)". It is no longer listed under SUCCEEDED, which had told the model not to report it as failed. The turn loop marks the op <code>exit_unknown</code>.</li>
+    <li><strong>Banner before the head.</strong> The stored verdict strips the failure-banner lines before it reads the head. As a result, a stored <code>[FAILURE BANNER] RUN ERROR: …</code> row counts as a failure, including under the <code>jobs</code> alias.</li>
+    <li><strong>Leaf stop lock.</strong> The lock is keyed by (event loop, leaf), so the same leaf id on a second loop never hits a lock bound to another loop.</li>
+    <li><strong>A live job under a reused name.</strong> <code>jobs cancel job_id=&lt;old&gt;</code> stops the old row directly, under the probe and leaf rules <code>run stop</code> applies.</li>
+    <li><strong>SQL hint.</strong> SQL sent to <code>lab</code> (or the old <code>postgres</code>/<code>postgresql</code>/<code>psql</code> names) points to <code>lab exec … cmd="psql -U postgres -v ON_ERROR_STOP=1" stdin="&lt;the SQL&gt;"</code>. It does so only when a labs host is configured. Otherwise the answer says SQL cannot run here.</li>
+  </ul>
+
+  <h2 id="4sx-d5-r6">Review r6 <span class="tag">2026-11-05 &sect;4SX-r</span></h2>
+  <p>Review r6 found no MAJOR issues. Its minor findings were fixed:</p>
+  <ul>
+    <li>A stored <code>run</code> row that holds a refusal passed through from the labs host or the workspace guards counts as a failure, the same as the live verdict. These rows start with <code>LAB ERROR (</code>, <code>SANDBOX EGRESS BLOCKED</code> or <code>Not run: this run call</code>.</li>
+    <li>A <code>RUNS …</code> status listing stored under <code>jobs</code>/<code>manage_services</code> is graded by the <code>run</code> rule.</li>
+    <li>The STILL RUNNING summary now counts an exit-unknown collect as finished.</li>
+  </ul>
+
+  <h2 id="4sx-d5-r7">Review r7: one head rule <span class="tag">2026-11-05 &sect;4SX-r</span></h2>
+  <p>Stored rows are re-graded later from their text alone, and each review round found another result shape that read wrong: a refusal passed through under an old tool name, a failed restart, an UNRESOLVED no-answer. Every <code>run</code> result now goes through one exit point, <code>runs._headed</code>. It runs in <code>tool_run</code> and in the aliases' <code>_with_hint</code>.</p>
+  <ul>
+    <li>A FAILED or REJECTED result always starts with <code>RUN ERROR</code>. If it did not already, <code>RUN ERROR — </code> is put in front of its first line, so that line keeps its reason (review r8: on a line of its own, the head became every failure's error line).</li>
+    <li>A result that is not failed never starts with it. An UNRESOLVED <code>RUN ERROR (no_answer): … may have started</code> becomes <code>RUN UNRESOLVED (no_answer): …</code>.</li>
+    <li>A collect keeps its own head (<code>[run x exited]</code> + <code>EXIT CODE:</code>). Its pattern is pinned equal to the stored grader's.</li>
+  </ul>
+  <p>The stored grader (<code>outcome_heuristics._run_result_failed</code>) reads just that head and the collect head.</p>
+
+  <h2 id="4sx-d5-r8">Review r8 <span class="tag">2026-11-05 &sect;4SX-r</span></h2>
+  <ul>
+    <li>The evidence gate counts an unanswered run as "no answer", never as evidence. This covers <code>RUN UNRESOLVED …</code> and results under the banner.</li>
+    <li>A <code>[run x logs]</code> or <code>[run x app …]</code> result whose first log line reads <code>EXIT CODE: 1</code> is content, not a collect. All three collect patterns agree: the grader, the head rule and strikes.</li>
+    <li>The alias hint keeps every field of the result (<code>declared</code>, <code>call_args</code>, <code>duration_s</code>).</li>
+    <li>Known, kept: <code>jobs</code> rows answered by the old jobs tool (a job with no run row) are graded by the old rule, as before D5.</li>
+  </ul>
+
+  <h2 id="4sx-d5-r9">Review r9 <span class="tag">2026-11-05 &sect;4SX-r</span></h2>
+  <p>Review r9 found no MAJOR issues. Its minor findings were fixed:</p>
+  <ul>
+    <li>The head rule now covers the third state. Every UNRESOLVED <code>run</code> result starts with <code>RUN UNRESOLVED</code>; examples are "stop sent, but the backend did not answer the check" and "no result yet". A collect keeps its own head, and an exited collect with <code>EXIT CODE: none</code> counts as unresolved.</li>
+    <li><code>outcome_heuristics.run_text_unresolved</code> reads that head and the collect head, or the status when a live outcome is passed. It is used by <code>is_unresolved_tool_result</code> (corpus flags, the failure census) and by the evidence gate's <code>run</code> branch, so a stored unanswered run is never booked as a success.</li>
+    <li>The r8 evidence-gate branch for the old tool names was removed. It never ran, because <code>jobs</code>/<code>manage_services</code> are not evidence tools.</li>
+  </ul>
+
+  <h2 id="tests">Tests</h2>
+  <p><code>tests/test_4sx_d5_review.py</code> (D5 review r1) drives each review finding through the real supervisors.</p>
+  <p><code>tests/test_4sx_d5_switch.py</code> (D5): schema and dispatch, every name set, batch order, the aliases, promotion and the banner, the briefing, the leaf's runs, and the kept-app refusal.</p>
+  <p><code>tests/test_4sx_c_run_tool.py</code> drives the real <code>ServiceSupervisor</code> and <code>SandboxJobSupervisor</code> over the fake sandboxes their own test files use, and lab runs through the <code>lab</code> tool's <code>_call</code> seam.</p>
+  <p><code>tests/test_4sx_c_run_battery.py</code> holds the cases the mutation battery (<code>scripts/mutate_4sx_c.py</code>) found unpinned. Its scripted supervisors control tokens, liveness and missing answers exactly. Among the cases: a start that left the old token or a dead process fails; a stop or check with no answer is <code>unresolved</code>; a host kill reads as <code>stopped</code>; an unanswered probe is never written back; the registry stamps an end once and prunes only old ended rows; <code>start_detached</code> kills what it could not record; and the operator route runs under the probe identity.</p>
+</main>
+</body>
+</html>

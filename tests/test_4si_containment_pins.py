@@ -97,7 +97,7 @@ async def test_leaf_turn_hides_and_blocks_everything_but_the_allowlist(monkeypat
             self.available_tools = {"file_system": 1, "execute": 1, "browser": 1, "jobs": 1}
             self.disabled_tools = set(); self.max_turns_override = None
 
-        async def handle_chat(self, body, background_tasks=None, request_id=None):
+        async def handle_chat(self, body, background_tasks=None, request_id=None, scope=None):
             seen["disabled"] = set(self.disabled_tools); seen["avail"] = set(self.available_tools)
             return "ok", None, None
     monkeypatch.setattr(agent_mod, "GhostAgent", FakeAgent)

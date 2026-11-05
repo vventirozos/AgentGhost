@@ -525,3 +525,87 @@ def test_tts_retries_the_default_voice_only_on_a_NONZERO_EXIT():
         assert len(calls) == 1, (
             f"a {status} ({label}) was retried — doubling the wall clock and "
             f"blaming the voice name: {len(calls)} attempts")
+
+
+# ── Greek voice (2026-11-02): Ava cannot read Greek, Melina speaks it ──────
+
+async def _spoken_voice(text):
+    """Run synthesize() and return the -v value `say` was given."""
+    captured = {}
+
+    async def _fake_run(cmd, *, timeout, stdin=None):
+        captured["cmd"] = cmd
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF")
+        return b"", b""
+
+    with patch.object(voice, "_run_binary", _fake_run):
+        await voice.synthesize(text)
+    cmd = captured["cmd"]
+    return cmd[cmd.index("-v") + 1]
+
+
+@pytest.mark.asyncio
+async def test_a_greek_sentence_is_spoken_by_the_greek_voice():
+    assert await _spoken_voice("Σήμερα έχει ελαφριά βροχή, 13–19°C.") == voice.TTS_VOICE_EL
+
+
+@pytest.mark.asyncio
+async def test_an_english_sentence_keeps_the_default_voice():
+    assert await _spoken_voice("Today there is light rain.") == voice.TTS_VOICE
+
+
+@pytest.mark.parametrize("text", [
+    # review r1 MAJOR: app.js leaves a link's URL in the chunk (14/74 Greek letters)
+    "Πηγή: Καθημερινή https://www.kathimerini.gr/economy/563845123/i-openai-lansarei-fthinotero-montelo/",
+    "Δες: https://github.com/ggerganov/llama.cpp/blob/master/docs/build.md",
+    'Kathimerini: "Η OpenAI λανσάρει φθηνότερο μοντέλο τεχνητής νοημοσύνης"',
+    "Καλημέρα!",
+    "In Greek, good morning is καλή μέρα.",   # two Greek words: leans Greek by design
+])
+def test_greek_chunks_go_to_the_greek_voice(text):
+    assert voice.tts_voice_for(text) == voice.TTS_VOICE_EL
+
+
+@pytest.mark.parametrize("text", [
+    "The word for sea in Greek is θάλασσα, and it appears in many place names here.",
+    "Then μ = σ².",                              # one-letter symbols are not words
+    "Ω",
+    "Compute ΔG from ΔH and ΔS at 298 K.",       # review r2 m4: one Greek letter each
+    "2.",                                        # no words → default (stateless)
+    "19°C, 30%",
+])
+def test_english_math_and_wordless_chunks_keep_the_default_voice(text):
+    assert voice.tts_voice_for(text) == voice.TTS_VOICE
+
+
+def test_the_choice_is_stateless():
+    # review r2 m1: one client's Greek list must not turn another's "1." Greek
+    voice.tts_voice_for("Η OpenAI λανσάρει νέο μοντέλο σήμερα.")
+    assert voice.tts_voice_for("1.") == voice.TTS_VOICE
+
+
+def test_extended_greek_polytonic_counts_as_greek():
+    assert voice.tts_voice_for("ἐν ἀρχῇ ἦν ὁ λόγος") == voice.TTS_VOICE_EL
+
+
+def test_empty_greek_voice_switches_the_feature_off():
+    with patch.object(voice, "TTS_VOICE_EL", ""):
+        assert voice.tts_voice_for("Καλημέρα σε όλους") == voice.TTS_VOICE
+
+
+@pytest.mark.asyncio
+async def test_a_failing_greek_voice_falls_back_and_warns_naming_it(caplog):
+    calls = []
+
+    async def _fake_run(cmd, *, timeout, stdin=None):
+        calls.append(cmd)
+        if "-v" in cmd:
+            raise voice.VoiceError("'say' failed", 502)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF-default")
+        return b"", b""
+
+    with caplog.at_level("WARNING"), patch.object(voice, "_run_binary", _fake_run):
+        assert await voice.synthesize("Καλημέρα σε όλους") == b"RIFF-default"
+    assert calls[0][calls[0].index("-v") + 1] == voice.TTS_VOICE_EL
+    assert "-v" not in calls[1]
+    assert repr(voice.TTS_VOICE_EL) in caplog.text

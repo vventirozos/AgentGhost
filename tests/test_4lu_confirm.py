@@ -154,12 +154,22 @@ async def test_a_yes_finds_the_right_project_among_two_previews(tmp_path):
     assert not store.get_project(a) and store.get_project(b)
 
 
-def test_the_request_records_its_conversation():
-    from ghost_agent.tools.projects import reconcile_conversation
-    ctx = SimpleNamespace(scratchpad=None, current_project_id=None)
+async def test_the_request_records_its_conversation():
+    """§4SX B0: handle_chat sets the conversation contextvar from the
+    request's scope (its session id) — the preview → confirm pairing key."""
+    from unittest.mock import AsyncMock
+    from tests.helpers import make_agent, FakeBgTasks
+    agent = make_agent()
+    seen = []
+
+    async def _llm(payload, *a, **kw):
+        seen.append(conversation_key_context.get())
+        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+    agent.context.llm_client.chat_completion = AsyncMock(side_effect=_llm)
     tok = conversation_key_context.set("")
     try:
-        reconcile_conversation(ctx, "convZ")
-        assert conversation_key_context.get() == "convZ"
+        await agent.handle_chat({"messages": [{"role": "user", "content": "hello"}],
+                                 "session_id": "zz9"}, FakeBgTasks(), request_id="web-1")
     finally:
         conversation_key_context.reset(tok)
+    assert seen and seen[0] == "session:zz9"

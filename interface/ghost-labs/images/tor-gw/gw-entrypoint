@@ -1,0 +1,26 @@
+#!/bin/bash
+# The shared Tor gateway (contract v2 §2 + §11.4). Rules go in BEFORE tor starts;
+# they key on the egress interface (found by its subnet), never on lab interface
+# names, which change with connect order. ip_forward is 0 (set by the manager):
+# REDIRECT delivers locally, nothing is ever routed through this container.
+set -euo pipefail
+: "${EGRESS_SUBNET:?}"
+EGRESS_IF=""
+for i in $(seq 1 30); do
+  EGRESS_IF=$(ip -o -4 addr show | awk -v n="${EGRESS_SUBNET%/*}" '{split($4,a,"/"); split(a[1],o,"."); split(n,p,"."); if (o[1]==p[1] && o[2]==p[2] && o[3]==p[3]) print $2}' | head -1)
+  [ -n "$EGRESS_IF" ] && break; sleep 1
+done
+[ -n "$EGRESS_IF" ] || { echo "no egress interface on $EGRESS_SUBNET" >&2; exit 1; }
+iptables -t nat -F PREROUTING
+iptables -t nat -A PREROUTING ! -i "$EGRESS_IF" -p tcp -j REDIRECT --to-ports 9040
+iptables -t nat -A PREROUTING ! -i "$EGRESS_IF" -p udp --dport 53 -j REDIRECT --to-ports 5353
+iptables -P FORWARD DROP
+iptables -F INPUT
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -i "$EGRESS_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -A INPUT ! -i "$EGRESS_IF" -p tcp --dport 9040 -j ACCEPT
+iptables -A INPUT ! -i "$EGRESS_IF" -p udp --dport 5353 -j ACCEPT
+iptables -A INPUT -j DROP
+echo "gateway rules in place (egress $EGRESS_IF)"
+mkdir -p /var/lib/tor && chown -R debian-tor:debian-tor /var/lib/tor && chmod 700 /var/lib/tor
+exec tor -f /etc/tor/torrc

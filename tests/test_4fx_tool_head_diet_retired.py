@@ -56,8 +56,13 @@ def test_the_advertised_head_does_not_depend_on_the_flag(mock_context, monkeypat
 
 def test_the_full_static_set_is_advertised(mock_context, monkeypatch):
     """The diet's whole effect was hiding 25 of the 41 static tools. Every
-    static built-in this context registers is advertised again."""
+    static built-in this context registers is advertised again. (§4SX B:
+    `lab` is advertised only when configured — so this context configures it.)"""
     monkeypatch.setenv(FLAG, "1")
+    key = Path(str(mock_context.memory_dir)) / "labs.key"
+    key.write_text("k" * 64)
+    mock_context.args.labs_host = "127.0.0.1:8700"
+    mock_context.args.labs_key_file = str(key)
     names = {(t.get("function") or {}).get("name")
              for t in R.get_active_tool_definitions(mock_context, None, serve_tuned=False)}
     static = {(t.get("function") or {}).get("name") for t in R.TOOL_DEFINITIONS}

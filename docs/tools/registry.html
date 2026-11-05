@@ -59,12 +59,11 @@
       <tr><td><code>update_profile</code></td><td>memory tools</td><td>Persistent user facts.</td></tr>
       <tr><td><code>manage_projects</code></td><td><a href="projects.html">projects</a></td><td>Project lifecycle + tasks.</td></tr>
       <tr><td><code>manage_tasks</code></td><td><a href="tasks.html">tasks</a></td><td>Cron / interval background jobs.</td></tr>
-      <tr><td><code>jobs</code></td><td><a href="../core/delegation.html">background jobs</a></td><td>Status / collect / cancel for background jobs (a long <code>execute</code> command moved to the background). <code>delegate</code>, <code>delegate_to_swarm</code> and <code>dream_mode</code> were removed 2026-10-30 (&sect;4SI).</td></tr>
+      <tr><td><code>run</code></td><td><a href="runs.html">runs</a></td><td>&sect;4SX D5: everything that keeps running: workspace/lab servers and jobs, kept apps (start/status/logs/stop/restart/collect/url). It replaced <code>manage_services</code> and <code>jobs</code> in the schema. Those names are still dispatched, as aliases mapped onto <code>run</code> (<code>runs.manage_services_alias</code> / <code>jobs_alias</code>), but no longer advertised. <code>delegate</code>, <code>delegate_to_swarm</code> and <code>dream_mode</code> were removed 2026-10-30 (&sect;4SI).</td></tr>
       <tr><td><code>list_lessons</code></td><td>memory tools</td><td>Surface the LESSON playbook (mistakes-and-fixes the agent has internalized). <code>scope ∈ {today, week, all, self_play_only}</code>. Read-only; exempt from the meta-task compliance nudge. NOT for "show me your skills" — that is a TOOL list and routes to <code>manage_skills</code>.</td></tr>
       <tr><td><code>replan</code></td><td>core/agent</td><td>Strategy reset signal.</td></tr>
       <tr><td><code>abort_attempt</code></td><td>core/agent</td><td>Escape hatch for unsolvable tasks.</td></tr>
       <tr><td><code>scratchpad</code></td><td>memory tools</td><td>Short-term KV: set / get / list / delete / clear.</td></tr>
-      <tr><td><code>postgres_admin</code></td><td><a href="database.html">database</a></td><td>SQL exec, schema dump, EXPLAIN ANALYZE, activity.</td></tr>
       <tr><td><code>create_skill</code></td><td><a href="acquired_skills.html">acquired_skills</a></td><td>TDD-validated skill acquisition.</td></tr>
       <tr><td><code>manage_skills</code></td><td>acquired_skills</td><td>List / delete the agent's acquired SKILLS (custom Python tools created via <code>create_skill</code>). This is the routing target for "show me your skills", "list your skills", "what skills do you have". Distinct from <code>list_lessons</code>: a SKILL is a tool, a LESSON is a mistake-and-fix.</td></tr>
       <tr><td><code>manage_composed_skills</code></td><td><a href="composed_skills.html">composed_skills</a></td><td>Define / list / delete named macros that bundle several tool calls into one (e.g. a <code>morning_briefing</code> = weather + headlines + diagnostics + lessons). <code>mode ∈ {parallel, sequential}</code>. A defined macro becomes its own top-level tool.</td></tr>
@@ -88,7 +87,7 @@
     <li>If a <code>query</code> is provided, RAG-retrieve relevant acquired skills via <code>memory_system.collection.query(query_texts=[query], where={"type": "acquired_skill"})</code> and inject only the matches. A failure of that vector query now degrades to <q>advertise all active skills</q> (2026-07-03) instead of aborting the whole block — a transient store hiccup used to hide every acquired skill from the schema while leaving them dispatchable (invisible-but-callable).</li>
     <li>Otherwise inject every <code>active</code>-status acquired skill that doesn't shadow a built-in.</li>
     <li><code>register_composed_skills(active_tools, context)</code> appends macro tools.</li>
-    <li><code>_intent_filter</code> drops tools whose required configuration is missing (e.g. <code>postgres_admin</code> without a DSN).</li>
+    <li><code>_intent_filter</code> drops tools whose required configuration is missing (e.g. <code>lab</code> without a labs host).</li>
   </ol>
 
   <h2>Dispatch &amp; handler binding</h2>

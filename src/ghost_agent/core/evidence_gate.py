@@ -39,6 +39,8 @@ EVIDENCE_TOOLS = frozenset({
     "web_search", "darkweb_search", "deep_research", "darkweb_research",
     "recall", "knowledge_base", "browser", "file_system", "execute",
     "fact_check", "news_headlines", "system_utility",
+    "lab",      # §4SX B
+    "run",      # §4SX D5: a run's logs / collected result
 })
 
 # Shapes, one per tool family. Each regex is the tool's own wording.
@@ -154,6 +156,27 @@ def _empty_reason(name: str, args: Dict[str, Any], content: str,
             return f"{name}: nothing found"
         if _RECALL_WEAK_RE.search(text):
             return f"{name}: best match LOW (unrelated)"
+    if name == "lab":
+        # §4SX B (review r2 minor 6): the lab's own head decides — a log's
+        # "ERROR: relation …" line or an exit-0 run printing ERROR is evidence
+        from ..distill.outcome_heuristics import _lab_result_failed
+        if _lab_result_failed(text):
+            return f"{name}: error"
+        _h = text.strip()
+        if _h.startswith("LAB ERROR (no_answer)") or re.match(r"^\[lab_[0-9a-f]{8}/\S+ no exit code", _h):
+            return f"{name}: no answer"       # r3 minor 5: unresolved is not evidence
+        return None if text.strip() else f"{name}: empty"
+    if name == "run":
+        from ..distill.outcome_heuristics import _run_result_failed, _without_banner_lines, run_text_unresolved
+        if _run_result_failed(text):
+            return f"{name}: error"
+        _h = _without_banner_lines(text)
+        # review r8 M2: `runs._headed` writes an UNRESOLVED result as `RUN UNRESOLVED …` (was `RUN ERROR …`, read
+        # as an error above) — an unanswered run is not evidence either
+        # (r9: the same rule as the stored verdict — every UNRESOLVED shape; the two prose shapes are old rows)
+        if (run_text_unresolved(text) or re.match(r"^\[run [^\]]*\] no result yet", _h) or re.match(r"^\[run [^\]]*\] could not read", _h)):
+            return f"{name}: no answer"       # a job still running is not evidence
+        return None if _h else f"{name}: empty"
     _bs = None
     if name == "browser":
         # §4LN: the browser's own header decides, BEFORE the generic error

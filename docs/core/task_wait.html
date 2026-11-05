@@ -75,6 +75,9 @@
   <h2 id="migration">Migration</h2>
   <p><code>ProjectStore._migrate</code> adds the three columns. <code>_migrate_task_states</code> folds <code>READY</code> rows into <code>PENDING</code>, and gives each NEEDS_USER / BLOCKED / PAUSED row with an empty <code>wait_on</code> the result of <code>wait_from_marks</code> plus its folded status. It is idempotent. If the column add fails (for example, a locked database), <code>_has_wait_cols()</code> is false and task writes drop the <code>wait_*</code> fields instead of failing (review r1).</p>
 
+  <h2 id="4sx-d4">Lab holds are not a wait <span class="tag">2026-11-04 &sect;4SX D4</span></h2>
+  <p>A build that could not get a lab is <em>not</em> a waiting status. It stays PENDING, and the hold lives in the project's metadata (<code>core/lab_waits.py</code>, see <a href="project_advancer.html#4sx-d4">project_advancer</a>). The design's "auto-lifting wait_code" was not used, because a BLOCKED leaf sets off the failure cascade and a NEEDS_USER leaf stops the project's autopilot.</p>
+
   <h2 id="where">Where it is read and written</h2>
   <ul>
     <li><a href="../memory/projects.html#4su-p3">memory.projects</a>: the columns, the migration, and the clear and default rules in <code>add_task</code> / <code>update_task</code>.</li>

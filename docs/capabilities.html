@@ -114,12 +114,12 @@
   <p><strong>Under the hood:</strong> <a href="tools/tasks.html"><code>tasks</code></a> tool persists the schedule → APScheduler fires → agent runs the stored prompt with its full tool surface → posts result back.</p>
   <p><strong>Tools:</strong> <a href="tools/tasks.html"><code>tasks</code></a>, <a href="interfaces/slack_bot.html">Slack bot</a>.</p>
 
-  <h2 id="db">Database administration</h2>
-  <p>The <code>postgres_admin</code> tool wraps SQLAlchemy with a default DSN from <code>$GHOST_DEFAULT_DB</code>. Queries are read-only unless the user explicitly authorises a mutation.</p>
-  <pre><code>&gt; On the analytics DB, show me any table over 1 GB and the top three
-  largest indexes for each.</code></pre>
-  <p><strong>Under the hood:</strong> <a href="tools/database.html"><code>database</code></a> → SQL built from <code>pg_class</code> / <code>pg_stat_user_indexes</code> → returned as a formatted table.</p>
-  <p><strong>Tools:</strong> <a href="tools/database.html"><code>database</code></a>.</p>
+  <h2 id="db">Databases</h2>
+  <p>There is no local database server (&sect;4SX E removed <code>postgres_admin</code>). A real PostgreSQL or MySQL runs on a disposable lab machine, and the SQL runs there.</p>
+  <pre><code>&gt; Spin up a Postgres 18, load this CSV into a table and show me the
+  three largest indexes.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="tools/labs.html"><code>lab</code></a> <code>create</code> (template <code>pg-single</code>) → <code>lab put</code> the file → <code>lab exec</code> <code>psql …</code> → <code>lab destroy</code> when done.</p>
+  <p><strong>Tools:</strong> <a href="tools/labs.html"><code>lab</code></a>.</p>
 
   <h2 id="voice">Voice I/O</h2>
   <p>Push-to-talk in the web interface: the agent answers spoken prompts and streams TTS audio back. Both halves run on infrastructure that is already live and need no extra hardware, API key, or egress — <strong>STT</strong> on nova's Gemma 4 audio node over the tailnet, <strong>TTS</strong> via the local macOS <code>say</code> binary (<code>Ava (Premium)</code>). The former Raspberry-Pi voice server and its <code>$PI_VOICE_URL</code> setting are gone.</p>

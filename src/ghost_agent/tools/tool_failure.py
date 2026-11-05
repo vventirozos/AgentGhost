@@ -546,10 +546,17 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
     running_ops = [o for o in op_outcomes if o.get("unresolved")]
     # §4RZ step 5: stopped by the user — not done, not failed, not running
     stopped_ops = [o for o in op_outcomes if o.get("interrupted")]
-    op_outcomes = [o for o in op_outcomes if not o.get("unresolved") and not o.get("interrupted")]
+    # §4SX D5 review r5: a job that finished with NO recorded exit code is neither — listing it under
+    # SUCCEEDED told the model "do NOT report it as failed" about a build whose output showed the error
+    unknown_ops = [o for o in op_outcomes if o.get("exit_unknown") and not o.get("interrupted")]
+    op_outcomes = [o for o in op_outcomes if not o.get("unresolved") and not o.get("interrupted")
+                   and not o.get("exit_unknown")]
     stopped = ("  STOPPED BY THE USER (not done — do NOT report these as done; run them "
                "again only if the user asks): "
                + "; ".join(str(o.get("tool", "?")) for o in stopped_ops) + "\n") if stopped_ops else ""
+    if unknown_ops:
+        stopped += ("  FINISHED, EXIT CODE NOT RECORDED (not a verdict — judge each by its output): "
+                    + "; ".join(str(o.get("tool", "?")) for o in unknown_ops) + "\n")
     ok_ops = [o for o in op_outcomes if o.get("ok")]
     failed_ops = [o for o in op_outcomes if not o.get("ok")]
     # A turn carrying in-flight work is worth summarising even when the
@@ -558,9 +565,10 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
     # it unreachable in 4 of 5 shapes.
     if running_ops and not (ok_ops and failed_ops):
         _r = "; ".join(str(o.get("tool", "?")) for o in running_ops)
-        _done = "; ".join(str(o.get("tool", "?")) for o in op_outcomes) or "none"
+        # review r6: an exit-unknown collect finished too (its own line below says it has no verdict)
+        _done = "; ".join(str(o.get("tool", "?")) for o in op_outcomes + unknown_ops) or "none"
         return (f"MULTI-STEP OUTCOME — {len(running_ops)} call(s) STILL "
-                f"RUNNING, {len(op_outcomes)} finished.\n"
+                f"RUNNING, {len(op_outcomes) + len(unknown_ops)} finished.\n"
                 f"  STILL RUNNING (no verdict yet — do NOT re-dispatch, and "
                 f"do NOT report these as done): {_r}\n"
                 f"  FINISHED: {_done}\n{stopped}\n")
@@ -626,10 +634,6 @@ _FALLBACK_HINTS = {
     ],
     "deep_research": [
         ("search phase failed", "Try web_search with a keyword-focused version of the query first; deep_research is for synthesising across many pages, not as a first attempt."),
-    ],
-    "postgres_admin": [
-        ("connection_string is required", "No DB URI is configured. Either ask the user for one or skip this tool — do not retry without configuration."),
-        ("statement_timeout", "The query exceeded the timeout. Add a `LIMIT` clause, push filters into the WHERE, or run EXPLAIN ANALYZE first to identify the slow part."),
     ],
     "vision_analysis": [
         # §4LM's remote-404 entry is gone (§4QE): the tool's own 404 result

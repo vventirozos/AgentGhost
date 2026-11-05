@@ -144,19 +144,6 @@ class TestForegroundLockStarvation:
 # #11: DB Connection Pooling
 # ============================================================
 
-class TestDBConnectionPooling:
-    def test_pool_caches_connection(self):
-        from ghost_agent.tools.database import _connection_pool
-        # Pool should be a dict
-        assert isinstance(_connection_pool, dict)
-
-    def test_timeout_is_configurable(self):
-        """Verify the tool accepts timeout_ms parameter."""
-        import inspect
-        from ghost_agent.tools.database import tool_postgres_admin
-        sig = inspect.signature(tool_postgres_admin)
-        assert "timeout_ms" in sig.parameters
-
 
 # ============================================================
 # #16: Streaming Error Recovery

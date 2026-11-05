@@ -50,8 +50,21 @@ _DENIED = {
 }
 
 
+#: §4SX D5: tool names that are also plain English verbs ("you have run 10 searches") — named as a TOOL only in its
+#: call shape (`run`, run action=…, run(…))
+_VERB_NAMES = {"run"}
+
+
 def _tool_names_in(text):
-    return {t for t in _dispatch_table() if re.search(rf"(?<![\w]){re.escape(t)}(?![\w])", text)}
+    out = set()
+    for t in _dispatch_table():
+        if t in _VERB_NAMES:
+            pat = rf"`{re.escape(t)}`|(?<![\w]){re.escape(t)}(?:\s+action\b|\()"
+        else:
+            pat = rf"(?<![\w]){re.escape(t)}(?![\w])"
+        if re.search(pat, text):
+            out.add(t)
+    return out
 
 
 # ── 1. the notice ─────────────────────────────────────────────────────

@@ -137,7 +137,7 @@
     "test_notify_promise.py": 11,
     "test_objection_artifact_gate.py": 1,
     "test_onion_dead_link_and_breaker.py": 3,
-    "test_open_audit_fixes.py": 20,
+    "test_open_audit_fixes.py": 18,
     "test_parse_failure_recovery_fixes.py": 12,
     "test_parser_audit_fixes.py": 2,
     "test_parser_flood_and_leak_fix.py": 39,
@@ -215,5 +215,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 886
+  "total_textual": 884
 }

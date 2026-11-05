@@ -554,6 +554,8 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   and the verdict. Accepted: a new run killed for binding a RESERVED port keeps its (dead) row; its message says it was stopped.</p>
   <p>Pins: <code>tests/test_4sk_webos_request_defects.py</code>; <code>test_sandbox_services.py</code> and <code>test_4ri_request_43fe95a2.py</code> retargeted
   from "told to stop then start" to "replaced".</p>
+  <h2 id="4sx-c">Driven by <code>run</code> too <span class="tag">2026-11-04 &sect;4SX Phase C</span></h2>
+  <p>The <code>run</code> tool's workspace servers are services rows (no second launcher). A conversation owner's key half is <code>c-&lt;sha1(conversation key)[:12]&gt;</code>, which passes the safe project-id check, so two conversations' <code>web</code> never collide and <code>run</code> never takes the bare legacy key. <code>run</code> refuses a live key it did not start and compares the start's <code>token</code> to detect a later <code>manage_services</code> start of the same name. This module is unchanged. See <a href="../tools/runs.html">tools / runs</a>.</p>
 </main>
 </body>
 </html>

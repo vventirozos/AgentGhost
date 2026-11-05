@@ -890,8 +890,11 @@ REPLAY_FORBIDDEN_TOOLS = frozenset({
     # production state outside the fork
     "manage_projects", "manage_services", "manage_tasks", "self_state",
     "update_profile", "learn_skill", "create_skill", "manage_skills",
-    "manage_composed_skills", "postgres_admin", "system_utility",
+    "manage_composed_skills", "system_utility",
     "rotate_secrets", "knowledge_base",
+    # §4SX Phase B: real machines on the labs host; D5: `run` starts/stops real processes there and in the
+    # live workspace
+    "lab", "run",
     # `jobs` reaches the shared registry directly (cancel/collect on the
     # operator's live delegates). The registry itself is detached — this
     # is the belt.
@@ -1221,16 +1224,14 @@ async def isolated_replay_context(
                 if not getattr(iso.args, "native_tools", False):
                     iso.args.native_tools = True
                 # Three args fields are themselves capabilities, not
-                # settings. `default_db` is a live Postgres URI that
-                # `postgres_admin` falls back to — and its SQL validator
-                # permits any WHERE-qualified DELETE/UPDATE and fails OPEN
-                # on its own exception. The two notify targets are what
+                # settings (§4SX E: `default_db` went with postgres_admin).
+                # The two notify targets are what
                 # `utils/notify.py` builds a real push transport from, so
                 # they are inert only for as long as `outbound_notifier`
-                # stays nulled. Clearing them means the tool denylist is
+                # stays nulled; `labs_host` (§4SX B) reaches real machines. Clearing them means the tool denylist is
                 # not the only thing standing between a replay and the
-                # operator's database or phone.
-                for _cap in ("default_db", "notify_webhook", "notify_ntfy"):
+                # operator's machines or phone.
+                for _cap in ("notify_webhook", "notify_ntfy", "labs_host"):
                     try:
                         setattr(iso.args, _cap, None)
                     except Exception:  # noqa: BLE001

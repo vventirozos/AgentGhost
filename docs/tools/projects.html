@@ -341,7 +341,168 @@
   <p>Guards: scoping activates only for a genuine <em>string</em> project id (a <code>MagicMock</code> context attribute can't trigger it); <code>_get_safe_path</code> heals the model's redundant <code>projects/&lt;id&gt;/</code> path prefix so it never double-nests, and <code>_to_container_path</code> un-scopes to the root before translating (the bind mount is at the root). <b>Stateful Jupyter-kernel sessions opt out</b> (<code>stateful=True</code>) and stay at <code>/workspace</code>, since the kernel's connection file is pinned to <code>/workspace/.kernel.json</code>.</p>
   <p><b>Intentionally NOT scoped:</b> <code>create_skill</code>/<code>manage_skills</code> and acquired-skill execution stay at the root because skills are global, cross-project resources (the knowledge base's <em>storage</em> is the global memory system — only its source-file <em>reads</em> are scoped). The <code>browser</code> profile (<code>/workspace/.browser_profile</code>) is deliberately left shared across projects so session/cookie state persists. Self-play runs in its own throwaway sandbox and is explicitly project-less (see <a href="../core/dream.html">dream</a>). Covered by <code>tests/test_project_sandbox_scoping.py</code> and <code>tests/test_dream_synthetic.py</code>.</p>
 
-  <h2>Conversation-scoped activation (2026-06-12)</h2>
+  <h2 id="4sx-b0">Conversation focus: one row per conversation <span class="tag">2026-11-04 &sect;4SX B0</span></h2>
+  <p>Each conversation has its own <strong>focus project</strong>. It is a row in the project store, not a global slot. This replaced
+  the 2026-06-12 binding below and everything grown around it (guests, held conversations, request-only notes, the
+  "this message names the project" escape hatch, the member save/restore and the leaf-pin bypass: about 500 lines).</p>
+  <ul>
+    <li><b>Identity.</b> The conversation key is the client's <code>session_id</code>: <code>session:&lt;id&gt;</code>, or the
+    Slack bot's <code>slack:&lt;…&gt;</code> as-is (<code>core/request_scope.conversation_key_for_session</code>). Web, CLI, Slack and the
+    ClockworkPi client all send one.</li>
+    <li><b>The row.</b> Table <code>conversation_focus(conversation_key PK, project_id, bound_at, last_used_at)</code> in
+    <code>projects.db</code>. It survives restarts and is never evicted. Rows unused for 30 days are pruned on the next write.
+    A conversation has at most one focus. Many conversations may focus the same project. <code>switch</code> / <code>create</code> /
+    <code>resume</code> set <em>this</em> conversation's row, and <code>exit</code> clears it; no other conversation's row changes.
+    <code>archive</code> and <code>delete</code> (tool, <code>PATCH status=ARCHIVED</code>, <code>DELETE</code>) clear every row that
+    points at the project, and a hard delete cascades.</li>
+    <li><b>The request's project is a value.</b> <code>handle_chat</code> builds one <code>RequestScope(conversation_key, project_id,
+    origin, persist)</code> at request start and installs it in a ContextVar. <code>GhostContext.current_project_id</code> and
+    <code>conversation_key</code> are properties over it, so the ~110 readers are unchanged. A task the request creates (a gathered
+    tool call, a late verdict, spawn_bg) shares the scope object, so a switch inside a tool reaches the request. The next request
+    installs a new scope and never sees the old one. The streamed drain re-installs its request's scope. A copy of the context
+    (a leaf, a sub-agent) keeps the value at copy time as its own.</li>
+    <li><b>Who reads and writes a row.</b> Only an owner request that carries a session id (<code>persist=True</code>), and it reads
+    the row inside the turn lock (<code>begin_request_focus</code>). Everyone else gets a <em>request-only</em> scope: they may switch
+    for the request, but nothing is stored. That covers members, failure replays and regression runs (<code>probe-fr-</code>,
+    <code>probe-rt-</code>), probes, unattended requests (<code>sched-</code>/<code>sub-</code>/<code>job-</code> and every non-<code>user</code>
+    population) and a client with no session id (keyed by its first-message hash for previews and late corrections only).</li>
+    <li><b>Leaves.</b> <code>run_leaf_turn</code> passes <code>handle_chat(scope=RequestScope(project_id=pin, origin="leaf"))</code>,
+    and its after-turn check reads that object. <code>_leaf_pinned_project</code> is gone.</li>
+    <li><b>No activation by wording.</b> When a message names another project (id, 8-character id prefix, or whole-word title of 5+
+    characters; review r1: 3–4-character titles like "Test" fired on unrelated messages), the dynamic state gets one <code>PROJECT NAMED</code> line. The model switches with one call, and reads can pass
+    <code>project_id</code> without switching (<code>get</code>, <code>status</code>).</li>
+    <li><b>The shared scratchpad follows the request.</b> When its live write scope is another project's, that project's keys are
+    snapshotted and the incoming project's last snapshot is hydrated. Consecutive turns on the same project hydrate nothing.
+    A failed snapshot keeps the keys rather than dropping them. An emptied project records an empty snapshot (once, when the
+    latest one still held keys), so a key the owner deleted cannot be hydrated back (review r1). The keyspace is flat: the
+    namespace is only a tag, so the swap runs on <em>every</em> request whose project differs from the live scope, not only when
+    a conversation's focus changes (a deviation from UNIFIED_DESIGN §13 #9). A member turn swaps too: that is what hides the
+    owner's project keys from it (moving only the write scope, as before B0, left them readable). A key that left the
+    scratchpad by TTL expiry or the LRU cap counts as gone too: the empty snapshot follows the scratchpad's own rules.</li>
+    <li><b>Archived projects.</b> An archive clears every row on the project when it happens. A later explicit switch to an
+    archived project (console or tool) is kept: the read drops a row only when its project is gone (review r1: dropping archived
+    rows on read made the switch vanish on the next turn).</li>
+    <li><b>Outside a request</b> there is no current project. <code>/api/upload</code> and bare <code>/api/download</code> links resolve
+    the project from <code>?project_id=</code>, or from the focus of the conversation named by <code>?session_id=</code> /
+    <code>X-Ghost-Session</code>. The web client (uploads, and every <code>/api/download/</code> fetch via <code>X-Ghost-Session</code>), its
+    proxies, the CLI (<code>/upload</code>, <code>/download</code>), the ClockworkPi client's image fetch and the Slack bot (uploads
+    and reply-image downloads carry the thread's <code>slack:&lt;thread&gt;:&lt;user&gt;</code>, the same string as its chat
+    <code>session_id</code>) send it. The web client's authed-image cache is keyed by session + src, since the same bare
+    name can be a different file in another session's project (review r3). A file call on a
+    project deleted mid-turn still recreates an orphan <code>projects/&lt;id&gt;/</code> directory: review r2 rejected the r1
+    "work unscoped" fix, because unscoped is the sandbox <em>root</em>, where the turn would overwrite the owner's files.</li>
+    <li><b>A failed scope build</b> installs a request-only scope (review r2), so the request never falls back to the
+    context's process-global slot.</li>
+    <li><b>Migration (B4).</b> At startup <code>drop_legacy_binding</code> deletes the four old <code>__current_project*</code> keys
+    from <code>scratchpad.db</code>, with no mapping. The owner's next message starts unfocused.</li>
+  </ul>
+  <p>Pins: <code>tests/test_project_conversation_scope.py</code> (two sessions, rows, request-only scopes, the property, the scope
+  builder, the legacy drop), <code>tests/test_projects_api.py</code> (console routes), <code>tests/test_4fh_leaf_pin_survives_reconcile.py</code>,
+  <code>tests/test_requester_role.py</code> (members), <code>tests/test_scratchpad_scope_fixes.py</code>.</p>
+
+  <h2 id="4sx-d2">A project owns what it runs: one teardown <span class="tag">2026-11-04 &sect;4SX D2</span></h2>
+  <p>Before D2, <code>delete</code> and <code>archive</code> stopped the project's <em>services</em> only, and the console
+    <code>DELETE /api/projects/{pid}</code> was a second, shorter copy that also skipped the episode and changelog cleanup.
+    Runs (<a href="runs.html"><code>run</code></a>), labs and sandbox jobs of the project were left behind. Now one
+    <code>_teardown_project(context, pid, hard=, origin=)</code> serves the chat tool, <code>DELETE</code> and
+    <code>PATCH status=ARCHIVED</code>.</p>
+  <ul>
+    <li><b>Inventory</b> (<code>_project_inventory</code>): the project's live <code>run</code> rows, its service rows, its running
+      sandbox jobs and its lab inventory rows. It reads local records only and never probes. <code>status</code> shows it as
+      <code>inventory</code>.</li>
+    <li><b>delete</b> stops every run, stops the services, cancels the jobs, and destroys every lab of
+      <code>project:&lt;id&gt;</code> the labs host lists (kept ones with <code>include_kept=1</code>). It sends <code>drop_data=1</code> only when
+      no other kept lab shares the lineage; otherwise the data volume is kept and the result says which lab still uses it.</li>
+    <li><b>archive</b> stops job/server runs and destroys disposable labs. <code>app</code> runs and kept labs are production: they
+      stay up and the note lists them with a question.</li>
+    <li><b>Refusal:</b> the project row is deleted only if nothing LIVE is left that could not be stopped. A run the sandbox cannot
+      reach is recorded <code>lost</code> and does not block. A labs host that is down blocks only when the project has lab rows on
+      record. With none, the delete goes ahead with a note. The tool returns <code>NOT deleted: still running — …</code>;
+      the console returns <code>409 {error, live_left, teardown}</code>.</li>
+    <li><b>Origin:</b> the teardown takes the caller's origin explicitly (the console has no request scope, and the labs default
+      would be <code>autopilot</code>). The console maps it from the <code>X-Ghost-Origin</code> header. A probe may delete or archive only a
+      <code>probe_created</code> project (403 otherwise).</li>
+    <li><b>Preview:</b> the delete preview says <code>It would also stop/destroy: …</code> (<code>would_also_stop</code>) and stores the
+      inventory ids in the plan. A "yes" or token whose project has since gained a <b>kept lab</b> (<code>kept:&lt;id&gt;</code>, including
+      a lab that became kept) or an <b><code>app</code> run</b> (<code>app:&lt;id&gt;</code>) gets a fresh preview (design r1 M8). A new background
+      job, server run or disposable lab does not: a delete exists to remove those, and re-asking on churn would loop the owner.</li>
+    <li>The console hard delete now also runs the graph unlink, <code>_forget_project_episodes</code> and
+      <code>_remove_project_changelog</code>, as the tool does.</li>
+  </ul>
+  <p><b>Code review round 2</b> fixed eight problems:</p>
+  <ol>
+    <li>Two kept versions of one lineage in the same project: the list of other labs now forgets each lab once it is destroyed. The last
+      version therefore sends <code>drop_data</code>.</li>
+    <li>The chat tool had no origin check. Now a probe may delete or archive only a project it created, and
+      <code>unattended</code>/<code>leaf</code> work never may.</li>
+    <li>The delete preview now reads the labs host's own list of the project's labs (<code>_host_project_labs</code>). It
+      names kept labs with their lineage and lists labs the host has but the local record lacks. The digest gains a
+      <code>kept:&lt;id&gt;</code> entry, so a lab that became kept after the preview needs a new yes.</li>
+    <li>A job that ended, or was marked lost when the container was recreated, before the cancel is a note, not a block.</li>
+    <li>The refusal text now says what was already stopped.</li>
+    <li>One raising item no longer skips the next one. An item whose state cannot be read counts as still running.</li>
+    <li>The console <code>PATCH</code> archive returns <code>teardown</code>, <code>kept_up</code> and <code>live_left</code>.</li>
+    <li>"With its data" is reported only when the host's reply lists removed data volumes. Otherwise the host's own note
+      is shown.</li>
+  </ol>
+  <p><b>Code review round 3</b> fixed nine problems:</p>
+  <ul>
+    <li>A lab the host lists for the project but the local record lacks is <b>recorded at the preview</b>. A delete
+      that later cannot reach the host therefore refuses on it, instead of reading "no lab on record".</li>
+    <li>The re-preview rule above was narrowed to kept labs and <code>app</code> runs.</li>
+    <li>A job that was pruned between the list and the cancel is a note.</li>
+    <li>The teardown reads the run registry and the lab inventory with <code>rows(strict=True)</code>. An unreadable store blocks
+      the delete; the default <code>rows()</code> still answers <code>[]</code> on error.</li>
+    <li>A host reply of 200 with <code>leftovers</code> blocks the delete, and the operator clears them on the labs host.</li>
+    <li>A run <code>replaced</code> by a start outside <code>run</code> is a note; the services step stops that service.</li>
+    <li><code>PATCH</code> runs the teardown only after the update validated; a 400 no longer comes after runs were stopped. The
+      tool's <code>update status=ARCHIVED</code> checks the origin before changing any other field.</li>
+  </ul>
+  <p><b>Code review round 4</b> (the round-3 findings) fixed five problems:</p>
+  <ul>
+    <li>Retrying a delete after <code>leftovers</code> no longer reads the lab as gone. A lab the project's record has but the host no longer
+      lists gets one more <code>DELETE</code>, and the labs host now names the leftovers on a repeat delete too
+      (<code>ghost_labs/labs.py</code> <code>destroy</code>). The lab is recorded as destroyed only when that reply is clean.</li>
+    <li>A lab recorded on another labs host (<code>host_id</code> differs from the configured host's <code>/v1/health</code>) blocks the delete,
+      and nothing is sent to the wrong host.</li>
+    <li>The summary now carries <code>STILL RUNNING (could not be stopped)</code>. The archive note says so when anything could
+      not be stopped, and a soft console <code>DELETE</code> that left anything up answers 200 with the report instead of 204.</li>
+    <li>If the host does not answer at the "yes", the earlier preview never covers labs, since a lab may have turned kept.</li>
+    <li>The replaced-run test now runs the services step against a live replacement.</li>
+  </ul>
+  <p><b>Code review round 5</b> (the round-4 findings) fixed six problems:</p>
+  <ul>
+    <li>The labs host finds leftovers by docker label even after its 24&nbsp;h destroyed memory expired, so a retry the next day still
+      names them instead of answering <code>unknown_lab</code>.</li>
+    <li>A lab recorded with a <code>host_id</code> blocks while the configured host's identity is unknown (<code>/v1/health</code> not answering).
+      Labs recorded at the preview carry the host id.</li>
+    <li>The preview reads the host with the same timeout as the teardown.</li>
+    <li>The growth check runs after the owner's-yes check, so a same-turn token no longer drops the plan the owner's real yes needs.</li>
+    <li>A run registry or lab inventory that cannot be opened blocks, the same as one that cannot be read.</li>
+    <li><code>lab destroy</code> that reports leftovers keeps the lab on record (FAILED, <code>lab_leftovers</code>), so a later project delete
+      still sees it.</li>
+  </ul>
+  <p><b>Code review round 6:</b> an ordinary <code>lab list</code> retired a leftover lab's row as "expired", and a project delete then
+    missed it. The lab inventory now has a <code>leftovers</code> column (<code>mark_leftovers</code>, migrated in place). Every destroy that
+    reports leftovers sets it: the <code>lab</code> tool's and the teardown's. <code>lab list</code> shows such a row and never retires it. A
+    <code>lab destroy</code> of it skips the status read, which answers 404 once the host dropped its row, and asks the host with the DELETE
+    itself. A probe may do that only for its own row. The row is retired when the reply is clean. A row made on another labs host is not
+    asked about on the configured one (round 7: that host's 404 said "cleared"). It says where the leftovers are, and
+    <code>lab list</code> names that host.</p>
+  <p><b>Accepted residual:</b> a local lab row with no <code>host_id</code> (its create could not read the host's identity) that the
+    configured host answers <code>unknown_lab</code> for is read as gone, even if it carries a leftovers mark. After a host change,
+    such a lab, or its leftovers, on the old host would be missed. Only labs whose create could not read the host's identity are
+    affected.</p>
+  <p><b>Known residual:</b> "recorded as lost" applies only when the agent has no sandbox manager. When the sandbox
+    container is merely stopped, <code>run stop</code> cannot verify the run. The delete then refuses (fail closed) until the
+    sandbox is up.</p>
+  <p>Not in D2: scheduled tasks have no owner field yet (D4). Pinned by <code>tests/test_4sx_d2_inventory.py</code>.</p>
+
+  <h2 id="4sx-d3">Release with a kept app <span class="tag">2026-11-04 &sect;4SX D3</span></h2>
+  <p>If a project has a live <code>app</code> run, <code>release</code> runs <code>_release_app_gate</code> before the old rehearsal. Every app must be <strong>up</strong> on its serving lab (state running, app state up), or the release is refused with "must be UP". The dossier lists the apps with their URLs and lab ids. No twin rehearsal is started (design review r1 H5). A project without an app gets the old rehearsal. After the labs step, a hard delete re-probes the project's app runs, so an app whose kept lab is gone ends as <code>lost</code>.</p>
+
+  <h2>Conversation-scoped activation (2026-06-12) <span class="tag">replaced by &sect;4SX B0</span></h2>
+  <p><em>History. The fingerprint identity, the scratchpad sentinels and <code>reconcile_conversation</code> described here are gone; see above.</em></p>
   <p><code>context.current_project_id</code> is <strong>process-global</strong>, and before this fix it was also <em>sticky across conversations</em>: a project activated in one chat stayed active for every other conversation hitting the same process, so an unrelated request's file writes silently landed in <code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code> (observed live: a "just give me the SQL" chat's <code>migration.sql</code> was written into a project created days earlier in a different conversation, then several turns were burned explaining and undoing it).</p>
   <p>The activation is now <strong>bound to the conversation that asked for it</strong>:</p>
   <ul>
@@ -493,6 +654,8 @@
   <p>forget, reset_all and manage_projects release/unrelease/delete are two steps: a preview with a token, then the user's confirmation in a LATER turn. The token lives in the preview's tool result, and the chat API / web history carry only reply text — so on the "yes" turn the model no longer had it, and the confirmation failed (found deleting the PostgreSQL manual). Each preview is now stamped with its conversation (<code>conversation_key_context</code>, the hash of the first user message, set by <code>reconcile_conversation</code>), and a confirm whose token is missing, unknown or just <code>'yes'</code> resolves to the newest live preview of that kind in THIS conversation, for the same target (<code>memory._resolve_plan</code>). Who may confirm is unchanged: <code>_confirm_allowed</code> still requires the user, in a later turn; member turns carry no conversation and get no fallback; another conversation's preview is never used. The preview instructions tell the model it may pass <code>'yes'</code>. Pins: <code>tests/test_4lu_confirm.py</code>.</p>
 
   <h2 id="4nw">A binding to a deleted project is dropped <span class="tag">2026-10-12 &sect;4NW</span></h2>
+  <p><em>&sect;4SX B0 form: <code>forget_project_pointer</code> clears every conversation's focus row on the project, and a row
+  whose project is gone or archived is dropped when it is read.</em></p>
   <p>Both delete paths (tool and API) cleared the binding only when the deleted project was the <em>live</em> current
   project. After a restart the live pointer is empty, so the persisted <code>__current_project__</code> outlived its project
   and was shown to the model on every request. Now <code>forget_project_pointer</code> clears the persisted binding too
@@ -528,7 +691,7 @@
   <li><strong>Experiments stop for the turn.</strong> In a GENERAL project whose goal names a model (or any of whose tasks names one, or <code>probe_model</code> &mdash; &sect;4SS), a task that runs, tests, probes, measures, replicates or repeats something (or names a control condition, falsification test, cross-model study or ablation) is not built. That includes an introspective task: since r9 there is no self-analysis exemption, because "Run Layer 3 … self-awareness" took the self-analysis path, which wrote the "responses" itself. The batch stops with <code>model_experiment</code>. The task stays PENDING, or NEEDS_USER if an unattended run already held it. The instruction tells the turn to decide first what the task's data are. A language model's <em>answers</em> (prompts, a control condition, a cross-model run) → run them with <a href="probe_model.html"><code>probe_model</code></a> and write the results from the transcript. Anything else (published facts, a measurement of something else, a build) → the normal way, and never ask a model for facts it should look up. The detector holds any experiment-shaped task in a model project (r6: "Measure market share of LLM vendors" was steered into asking the model). Unattended runs hold it NEEDS_USER for the owner instead.</li>
   <li><strong>Brief ownership travels with the files.</strong> <code>create_version</code> and <code>clone</code> copy <code>research_index</code> and <code>research_brief_shas</code> with the workspace, so a copied, unchanged brief is still the writer's own in the new project. <code>list</code> and the no-active-project reply drop <code>research_brief_shas</code> from the metadata they show the model (<code>_model_view</code>, <code>_MODEL_HIDDEN_META</code>); the map has no cap.</li>
   <li><strong>Self-analysis inside the owner's request is foreground.</strong> <code>_generate_self_analysis</code> hard-coded <code>is_background=True</code>. Live it parked 600&nbsp;s behind its own request (13:04:34 → 13:14:35), then fell back to web search. It now uses <code>_idle_invocation(context)</code>, like the research summariser.</li>
-  <li><strong>A conversation that names a project becomes a guest, not the owner.</strong> The reference used to overwrite the owner sentinel, so after "show me the results of 448d5afa86f0" in a second chat, the creating chat got "belongs to another conversation". Guests (up to 8, in <code>__current_project_guests__</code>, tied to the bound pid) keep the project for their follow-ups. A switch or create clears the guest list. The owner re-switching to (or resuming) its own project keeps the guests; only a binding to a <em>different</em> project clears them (r9: every owner re-switch had dropped them). A guest's <code>exit</code> leaves the owner bound, and a guest's <code>switch</code>/<code>resume</code> to the project it is already a guest of keeps it a guest (it used to rewrite the owner sentinel, the same theft by another route). <strong>A guest can't take the binding from the owner</strong> (operator, 2026-10-18): a guest's <code>switch</code>/<code>create</code>/<code>resume</code> to a <em>different</em> project is for THIS request only (<code>_guest_leaving_owner</code>). The owner's sentinels stay, the guest leaves the owner's project (<code>_drop_project_guest</code>, so its next turn never lands back there) and is <strong>held</strong> (<code>__current_project_held__</code>, "pid|conv,&hellip;", <code>project_held</code>; never capped, because an evicted conversation would be free to take the binding (r16)). While that binding lasts, every project a held conversation opens lasts one request, and the model is told to open it again in each later message. r14: dropping the guest alone let its next switch, the one the note asked for, take the binding, and a second switch in the same request did the same. A guest's <code>exit</code> and a guest pushed out by the 8-guest cap are held too. Rejoining the owner's project (as a guest) ends the hold, and a new binding clears every hold, like the guests. Exiting a request-only project parks it (its keys are snapshotted); the owner's next reconcile snapshots one left in the shared context before hydrating its own. The console's <code>/switch</code> and <code>/resume</code> answer 409 "not switched" when the shared context's last chat is a guest or held (<code>_set_current_or_held</code>). The check runs <em>before</em> anything changes; r15: refusing after the switch had re-scoped the context and evicted that chat's guest seat. Every reconcile reads the guest and held lists along with the binding. A scratchpad read refreshes its 24&nbsp;h TTL, and the owner's turns read only the pid/conv pair, so the lists expired under a live binding (r15). Closing a project never deletes a binding that names a <em>different</em> project owned by another conversation (<code>_binding_is_anothers</code> in <code>_set_current(None)</code>). r17: a held guest that archived or deleted its request-only project went through <code>forget_project_pointer</code>, which wiped the owner's binding and the holds, and its next switch took the binding. A guest's <code>exit</code> parks the project like any leave, so its keys are not left readable to the next conversation. Known and accepted: a guest's advance that switches to a child version counts as leaving, so the guest is held, while the owner keeps the binding. A console switch made while the shared context has no conversation key (after a restart, or right after a member turn) still binds to no conversation; this predates &sect;4QA. A conversation that was never a guest still takes the binding as before. A probe turn never becomes a guest. Every protection site uses one <code>_BINDING_SENTINELS</code> tuple.</li>
+  <li><em>(Replaced by &sect;4SX B0: there are no owners or guests; each conversation has its own focus row.)</em> <strong>A conversation that names a project becomes a guest, not the owner.</strong> The reference used to overwrite the owner sentinel, so after "show me the results of 448d5afa86f0" in a second chat, the creating chat got "belongs to another conversation". Guests (up to 8, in <code>__current_project_guests__</code>, tied to the bound pid) keep the project for their follow-ups. A switch or create clears the guest list. The owner re-switching to (or resuming) its own project keeps the guests; only a binding to a <em>different</em> project clears them (r9: every owner re-switch had dropped them). A guest's <code>exit</code> leaves the owner bound, and a guest's <code>switch</code>/<code>resume</code> to the project it is already a guest of keeps it a guest (it used to rewrite the owner sentinel, the same theft by another route). <strong>A guest can't take the binding from the owner</strong> (operator, 2026-10-18): a guest's <code>switch</code>/<code>create</code>/<code>resume</code> to a <em>different</em> project is for THIS request only (<code>_guest_leaving_owner</code>). The owner's sentinels stay, the guest leaves the owner's project (<code>_drop_project_guest</code>, so its next turn never lands back there) and is <strong>held</strong> (<code>__current_project_held__</code>, "pid|conv,&hellip;", <code>project_held</code>; never capped, because an evicted conversation would be free to take the binding (r16)). While that binding lasts, every project a held conversation opens lasts one request, and the model is told to open it again in each later message. r14: dropping the guest alone let its next switch, the one the note asked for, take the binding, and a second switch in the same request did the same. A guest's <code>exit</code> and a guest pushed out by the 8-guest cap are held too. Rejoining the owner's project (as a guest) ends the hold, and a new binding clears every hold, like the guests. Exiting a request-only project parks it (its keys are snapshotted); the owner's next reconcile snapshots one left in the shared context before hydrating its own. The console's <code>/switch</code> and <code>/resume</code> answer 409 "not switched" when the shared context's last chat is a guest or held (<code>_set_current_or_held</code>). The check runs <em>before</em> anything changes; r15: refusing after the switch had re-scoped the context and evicted that chat's guest seat. Every reconcile reads the guest and held lists along with the binding. A scratchpad read refreshes its 24&nbsp;h TTL, and the owner's turns read only the pid/conv pair, so the lists expired under a live binding (r15). Closing a project never deletes a binding that names a <em>different</em> project owned by another conversation (<code>_binding_is_anothers</code> in <code>_set_current(None)</code>). r17: a held guest that archived or deleted its request-only project went through <code>forget_project_pointer</code>, which wiped the owner's binding and the holds, and its next switch took the binding. A guest's <code>exit</code> parks the project like any leave, so its keys are not left readable to the next conversation. Known and accepted: a guest's advance that switches to a child version counts as leaving, so the guest is held, while the owner keeps the binding. A console switch made while the shared context has no conversation key (after a restart, or right after a member turn) still binds to no conversation; this predates &sect;4QA. A conversation that was never a guest still takes the binding as before. A probe turn never becomes a guest. Every protection site uses one <code>_BINDING_SENTINELS</code> tuple.</li>
   <li><strong>"Proceed … on your own"</strong> (also "autonomously", "by yourself", "without asking") after a continue-verb is a go-ahead for the rest, unless a count or a task number is given, and only when what follows the verb is the project, the plan, the rest or nothing.</li>
   <li><strong>Dates.</strong> <code>list</code> and <code>get</code> carry <code>created</code>/<code>updated</code> as local ISO time, and <code>display</code> shows "(created …)". The raw epoch had been rendered "~2026-04-16" for a project made that morning. <code>artifact_add</code> without <code>task_id</code> now names <code>describe_file</code> (file_path + description).</li>
   <li>Pins: <code>tests/test_4qa_project_task_integrity.py</code>.</li>

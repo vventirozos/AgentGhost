@@ -2,7 +2,7 @@
 
 ``MetacogBundle.from_args`` returns ``None`` when ``--enable-metacog`` is off,
 so call sites read ``if context.metacog: ...``. The pre-execution validators
-(``tools/execute.py`` shell, ``tools/database.py`` SQL) run either way; with
+(``tools/execute.py`` shell; §4SX E removed the SQL one with ``postgres_admin``) run either way; with
 the bundle on, each block is also logged as a ``metacog valid`` line and
 counted, and the shutdown ``metacog summary`` line reports the total.
 
@@ -63,7 +63,6 @@ _TOOL_DOMAIN: dict = {
     "shell": "shell",
     "command": "shell",
     # sql
-    "postgres_admin": "sql",
     "database": "sql",
     "sql": "sql",
     # fetch / web

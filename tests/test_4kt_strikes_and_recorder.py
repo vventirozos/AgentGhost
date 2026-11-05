@@ -253,8 +253,14 @@ def test_a_jobs_result_is_a_programs_output():
 
 def test_program_output_tools_are_registered_tools():
     """R1 review: the set named an `execute_python` no registry has."""
-    from ghost_agent.tools.registry import TOOL_DEFINITIONS
-    names = {d["function"]["name"] for d in TOOL_DEFINITIONS}
+    import ast
+    from pathlib import Path
+    from ghost_agent.tools import registry as REG
+    # advertised OR dispatchable (§4SX D5: `jobs` is an unadvertised alias whose fallback is the old jobs tool)
+    names = {d["function"]["name"] for d in REG.TOOL_DEFINITIONS}
+    tree = ast.parse(Path(REG.__file__).read_text())
+    names |= {k.value for n in ast.walk(tree) if isinstance(n, ast.Dict) for k in n.keys
+              if isinstance(k, ast.Constant)}
     for t in PROGRAM_OUTPUT_TOOLS:
         assert t in names, t
 

@@ -1,0 +1,2 @@
+#!/bin/bash
+cd /opt/ghost-labs && exec /opt/ghost-labs/venv/bin/python -m ghost_labs.cli "$@"

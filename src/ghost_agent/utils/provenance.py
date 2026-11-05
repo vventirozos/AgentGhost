@@ -107,6 +107,18 @@ def is_untrusted_source(tool_name: str, args=None, extra_tools=()) -> bool:
         return bool(_NET_CODE.search(code))
     if name == "jobs":
         return act in _JOB_OUTPUT
+    if name == "run":
+        # §4SX D5: what a run printed (its logs, a job's collected output) may be anything its command fetched —
+        # outside content, like `jobs collect`; status / url are the agent's own records
+        return act in ("logs", "collect")
+    if name == "lab":
+        # §4SX B (review r2 MAJOR D): a lab machine may have Tor egress — a
+        # command that fetches, a member's HTTP answer and a file brought back
+        # from a member are outside content; status/list/logs/spec are the
+        # labs host's own records
+        if act == "exec":
+            return bool(_NET_CODE.search(" ".join(str(a.get(k) or "") for k in ("cmd", "stdin"))))
+        return act in ("http", "get")
     if name in extra_tools or name in _OPAQUE:     # skills and macros: opaque output
         return True
     return False

@@ -433,6 +433,8 @@ IDLE_SCHEDULER_JOBS = (
     ("selfhood-narrative", "self narrative", _self_model_on),
     ("stale-questions", "stale open questions", _self_model_on),
     ("workspace-narrative", "workspace narrative", _workspace_model_on),
+    ("mirror", "mirror (one I-sentence a day)",
+     lambda args, ctx: getattr(ctx, "llm_client", None) is not None),
     ("failure-replay", "failure replay + regression suite (when an owner failure "
                   "or a due test exists)",
      lambda args, ctx: True),
@@ -462,6 +464,7 @@ IDLE_JOB_PURPOSE = {
     "selfhood-narrative": "rewrites the agent's running diary",
     "stale-questions": "lists its open questions older than 3 days",
     "workspace-narrative": "rewrites the running summary of the workspace",
+    "mirror": "rewrites its one-sentence self-description from yesterday's plus one of your replies",
     "failure-replay": "replays one of your past failures or runs your regression tests",
 }
 
@@ -594,6 +597,17 @@ def _call_mutated_world(fname: str, t_args: dict, is_mutating: bool) -> bool:
     if fname == "execute":
         return looks_mutating_command(
             str(t_args.get("command") or t_args.get("cmd") or ""))
+    if fname == "lab":
+        # §4SX B (review r2 MAJOR E): a successful create / exec / member op /
+        # put / get / extend / destroy changes the lab — a recorded failure
+        # ("connection refused" while the app booted) no longer holds
+        if str((t_args or {}).get("action") or "").strip().lower() == "exec":
+            # like `execute` (r3 minor 2): a `cat` / `select` does not reset it
+            return looks_mutating_command(str((t_args or {}).get("cmd") or ""))
+        return not _lab_is_read_call(t_args)
+    if fname == "run":
+        # §4SX D5: start / stop / restart change what runs; status / logs / url / collect read
+        return not _run_is_read_call(t_args)
     if fname == "manage_composed_skills":
         # ONLY the named `action` param: the tool reads no `operation`/`op`
         # alias, so honouring one here would let `operation='delete'` (which
@@ -763,6 +777,8 @@ _EDIT_CHURN_STEER_AFTER = 3
 _EDIT_CHURN_MAX_STEERS = 2
 _EDIT_CHURN_VERIFY_TOOLS = frozenset({
     "execute", "browser", "manage_services", "managed_services",
+    "lab",      # §4SX B: a run on a lab machine verifies too
+    "run",      # §4SX D5: a server's logs / url / a job's collect verify (manage_services' successor)
 })
 
 # ── Meta-task ("checklist") nudge intent detection (§4BE, 2026-08-13) ──
@@ -1666,7 +1682,7 @@ def evidence_digest(tools_run, *, ask: str = "") -> str:
                 order.append(key)
             errors[key] += 1
         elif str(t.get("name") or "") in ("execute", "browser", "web_search", "search",
-                                          "deep_research", "vision_analysis"):
+                                          "deep_research", "vision_analysis", "lab", "run"):
             last_clean = t
     if order:
         top = sorted(order, key=lambda k: -errors[k])[:5]
@@ -2447,8 +2463,10 @@ _EXTERNAL_EVIDENCE_TOOLS = frozenset({
     # support for the claim they were the source of
     "darkweb_research", "fact_check",
     "browser", "web_search", "darkweb_search", "deep_research", "execute",
+    "lab",      # §4SX B: program output from a lab machine
+    "run",      # §4SX D5: a run's logs / collected output are program output
     "vision_analysis", "news_headlines", "query_document", "knowledge_base",
-    "database", "postgres_admin", "recall", "system_utility",
+    "database", "recall", "system_utility",
 })
 
 
@@ -4036,9 +4054,35 @@ _WORK_VERB_RE = re.compile(
 #: tools that START work — refused on a status question while work is live.
 #: Reading stays open (file_system, jobs status/log, manage_tasks list,
 #: manage_projects, workspace, introspect).
+def _lab_is_read_call(args) -> bool:
+    """§4SX B: a `lab` call that only reads (status/list/logs/...) — open on a
+    status question while work is live (review MAJOR 6)."""
+    try:
+        from ..tools.labs import is_read_call
+        return is_read_call(args)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _run_is_read_call(args) -> bool:
+    """§4SX D5: a `run` call that only reads (status/logs/url/collect)."""
+    try:
+        from ..tools.runs import is_read_call
+        return is_read_call(args)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _starts_new_work(name, args) -> bool:
+    """§4MF: would this call start new work? (refused on a status question
+    while work is live). A lab / run READ does not (§4SX B review MAJOR 6; D5)."""
+    return name in _WORK_TOOLS and not ((name == "lab" and _lab_is_read_call(args))
+                                        or (name == "run" and _run_is_read_call(args)))
+
+
 _WORK_TOOLS = frozenset({"execute", "browser", "web_search", "deep_research", "darkweb_search",
                          "darkweb_research", "image_generation", "deploy", "manage_services",
-                         "create_skill", "probe_model"})
+                         "create_skill", "probe_model", "lab", "run"})
 
 
 def status_only_refusal_text() -> str:
@@ -6998,10 +7042,158 @@ def declared_wait_s(fname: str, t_args) -> float:
         return 0.0
 
 
+def _batch_call_depends(name: str, args: dict, prev_name: str, prev_args: dict) -> bool:
+    """§4SX B (review r2 B, redone after r3): must this `execute` / `lab` call
+    of a batch wait for an EARLIER one? Pure; the dispatcher builds the waits.
+
+    * execute after execute — yes (§4LO: one kernel, shared files);
+    * execute after `lab get` — yes (the get brings the file it reads);
+    * execute after `lab put` too (r5 M1: `put app.tgz`, then a rebuild
+      `tar czf app.tgz` raced the put's read of it);
+    * `lab put` / `lab get` after execute — yes (`tar czf app.tgz`, then
+      `put app.tgz`: reversed, the put sent the PREVIOUS build with an OK
+      result; `rm -rf out/`, then `get → out/x`);
+    * put/get after put/get — yes, across labs (r4 MAJOR 1: `get A dump.sql`,
+      `put B dump.sql` raced and restored a stale dump);
+    * lab after lab — the same lab yes (`put run.sh`, `exec bash run.sh`;
+      `exec`, `destroy`); two different labs run side by side (r3 M3); a
+      `list` waits for any earlier changing lab call; a `create` waits only
+      for an earlier `destroy` (r5 M2: "destroy pg16, create pg18" was
+      refused for room the destroy was freeing — and so also for whatever
+      that destroy waited on); two creates run side by side (r6), and no call that
+      names a lab waits for it (r4 MAJOR 2: none can name the lab it makes —
+      an exec on another lab no longer waits out a 300 s readiness poll).
+    Every call stays in the concurrent phase, under the batch's stop (r3 M1:
+    in the sequential file phase a running exec could not be cut)."""
+    a = args if isinstance(args, dict) else {}
+    pa = prev_args if isinstance(prev_args, dict) else {}
+    act = str(a.get("action") or "").strip().lower()
+    pact = str(pa.get("action") or "").strip().lower()
+    if name == "run" or prev_name == "run":
+        return _run_call_depends(name, a, act, prev_name, pa, pact)
+    if name == "execute":
+        return prev_name == "execute" or (prev_name == "lab" and pact in ("put", "get", "deploy"))   # D3 code r1 #13
+    if name != "lab":
+        return False
+    if prev_name == "execute":
+        return act in ("put", "get", "deploy")       # §4SX D3: deploy tars the workspace folder execute built
+    if prev_name != "lab":
+        return False
+    if act in ("put", "get") and pact in ("put", "get"):
+        return True                      # workspace files move in written order, across labs too
+    lid, plid = str(a.get("lab_id") or "").strip(), str(pa.get("lab_id") or "").strip()
+    if lid and plid:
+        return lid == plid
+    # no lab id on one side: a `list` reports what the earlier changes left;
+    # a `create` follows an earlier `destroy` (the room it frees, r5 M2) but
+    # not another create (r6: it waited out the first one's readiness poll);
+    # nothing that names a lab waits for it — none can name the lab it makes
+    if act == "list":
+        return not _lab_is_read_call(pa)
+    if act == "create":
+        return pact == "destroy"
+    return False
+
+
+_RUN_LAB_RE = re.compile(r"^\s*(lab_[0-9a-f]{8})/")
+#: lab actions that change which version of a kept app serves (a `run` on that app follows / precedes them)
+_LAB_APP_ACTIONS = frozenset({"keep", "deploy", "rehearse", "switch", "rollback", "restore", "destroy"})
+
+
+def _run_call_depends(name, a, act, prev_name, pa, pact) -> bool:
+    """§4SX D5: the `run` side of `_batch_call_depends`.
+
+    * run after execute — yes (the server/job runs what execute just built);
+    * execute after a changing run — yes (`run start api`, then `curl $URL`);
+    * run after run — the same name (start, then logs), or a nameless `status`
+      after any changing run;
+    * run on ``lab_x/…`` after a lab call on lab_x; a run after a lab
+      keep/deploy/switch/rollback/restore (the app it names);
+    * lab after a changing run — on the run's lab (`run start` there, then
+      `lab exec`/`destroy`), or a kept-app lab action after any changing run
+      (`run stop shop`, then `lab switch`)."""
+    from ..tools.runs import is_read_call as _rd
+    if name == "run":
+        if prev_name == "execute":
+            return True
+        if prev_name == "lab":
+            m = _RUN_LAB_RE.match(str(a.get("where") or ""))
+            plid = str(pa.get("lab_id") or "").strip()
+            return bool(m and plid and m.group(1) == plid) or pact in _LAB_APP_ACTIONS
+        if prev_name == "run":
+            n, pn = str(a.get("name") or "").strip(), str(pa.get("name") or "").strip()
+            return bool(n and n == pn) or (not n and not _rd(pa)) or (not pn and not _rd(a))
+        return False
+    # prev_name == "run"
+    if _rd(pa):
+        return False
+    if name == "execute":
+        return True
+    if name == "lab":
+        m = _RUN_LAB_RE.match(str(pa.get("where") or ""))
+        lid = str(a.get("lab_id") or "").strip()
+        return bool(m and lid and m.group(1) == lid) or act in _LAB_APP_ACTIONS
+    return False
+
+
+async def _after_deps(deps, coro, my_done):
+    """Run ``coro`` once every event in ``deps`` is set; set ``my_done`` however
+    it ends. Cancelled while waiting → the unstarted ``coro`` is closed."""
+    try:
+        for _d in deps:
+            try:
+                await _d.wait()
+            except asyncio.CancelledError:
+                _close_unstarted(coro)
+                raise
+        return await coro
+    finally:
+        my_done.set()
+
+
+def _wire_batch_waits(exec_coros, tool_call_metadata):
+    """§4SX B: the batch's `execute` / `lab` calls (still in the concurrent,
+    stoppable phase) each wait for the EARLIER calls they depend on
+    (`_batch_call_depends`). ``exec_coros`` is ``[(meta_index, coro)]``;
+    ``tool_call_metadata[i]`` holds the tool name at 0 and its args at 9.
+    Independent calls are left exactly as they were. Returns the new list."""
+    out = list(exec_coros)
+    seq = [(k, tool_call_metadata[i][0],
+            tool_call_metadata[i][9] if len(tool_call_metadata[i]) > 9 else {})
+           for k, (i, _) in enumerate(out)
+           if tool_call_metadata[i][0] in ("execute", "lab", "run")]
+    dep_of = {k: [pk for (pk, pn, pa) in seq[:j] if _batch_call_depends(nm, ar, pn, pa)]
+              for j, (k, nm, ar) in enumerate(seq)}
+    waited = {pk for v in dep_of.values() for pk in v}
+    evs = {k: asyncio.Event() for k in waited}
+    for k, _nm, _ar in seq:
+        if not dep_of[k] and k not in waited:
+            continue
+        i, t = out[k]
+        out[k] = (i, _after_deps([evs[pk] for pk in dep_of[k]], t, evs.get(k) or asyncio.Event()))
+    return out
+
+
+def _shield_exit_banner(fname, full, shown):
+    """Context shield: an exit line the truncation buried is re-injected at the
+    top, so "EXIT CODE: 1" always reaches the model. `execute` by its banner;
+    a `lab` exec through the one anchored reader (§4SX B r2 G)."""
+    if fname == "execute":
+        m = re.search(r"EXIT CODE:\s*(\d+)", full)
+        if m and "EXIT CODE:" not in shown:
+            return f"[FAILURE BANNER] EXIT CODE: {m.group(1)}\n" + shown
+    elif fname == "lab":
+        from ..tools.tool_failure import exec_exit_code as _eec
+        code = _eec(full)
+        if code is not None and _eec(shown) is None:
+            return f"[FAILURE BANNER] EXIT CODE: {code}\n" + shown
+    return shown
+
+
 #: §4OG-5 (f): the tools whose batch can run long enough to eat the reserve
 _BATCH_WALL_TOOLS = frozenset({"browser", "deep_research", "darkweb_search", "darkweb_research",
                                "execute", "web_search", "image_generation", "vision_analysis",
-                               "fact_check", "probe_model"})                    # §4PD; §4QA
+                               "fact_check", "probe_model", "lab", "run"})      # §4PD; §4QA; §4SX B; D5
 
 
 def wait_crosses_deadline(wait_s: float, remaining_s, floor_s: float) -> bool:
@@ -9564,6 +9756,53 @@ async def _gather_stoppable(items, stop) -> list:
 
 
 class GhostContext:
+    # §4SX B0: the project and conversation of the REQUEST in flight, read
+    # through the request's scope (core/request_scope.py), never shared
+    # process state. Outside a request (idle loops, startup, a context copy)
+    # they are plain per-object values.
+    @property
+    def current_project_id(self):
+        from .request_scope import current_scope
+        s = current_scope(self)
+        if s is not None:
+            return s.project_id
+        return self.__dict__.get("_project_fallback")
+
+    @current_project_id.setter
+    def current_project_id(self, value):
+        from .request_scope import current_scope
+        s = current_scope(self)
+        if s is not None:
+            s.project_id = value or None
+        else:
+            self.__dict__["_project_fallback"] = value or None
+
+    @property
+    def conversation_key(self):
+        from .request_scope import current_scope
+        s = current_scope(self)
+        if s is not None:
+            return s.conversation_key
+        return self.__dict__.get("_conversation_fallback", "")
+
+    @conversation_key.setter
+    def conversation_key(self, value):
+        from .request_scope import current_scope
+        s = current_scope(self)
+        if s is not None:
+            s.conversation_key = value or ""
+        else:
+            self.__dict__["_conversation_fallback"] = value or ""
+
+    def __copy__(self):
+        # a copy (leaf / sub-agent / pinned context) keeps the values in
+        # force NOW as its own; the request's scope never follows it
+        new = type(self).__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        new.__dict__["_project_fallback"] = self.current_project_id
+        new.__dict__["_conversation_fallback"] = self.conversation_key
+        return new
+
     def __init__(self, args, sandbox_dir, memory_dir, tor_proxy):
         self.args = args
         self.sandbox_dir = sandbox_dir
@@ -9586,7 +9825,7 @@ class GhostContext:
         # construct; `current_project_id` tracks which project the agent
         # is currently scoped to (None == free chat / one-shot mode).
         self.project_store = None
-        self.current_project_id = None
+        self.current_project_id = None          # property: the request scope's (§4SX B0)
         # Stage-1 self-improvement wiring. Populated by main.py during
         # lifespan when the corresponding features are enabled; left as
         # None otherwise so deployments without the trajectory pipeline
@@ -9692,7 +9931,7 @@ def _launched_background_jobs(tools_run) -> list:
     ids = []
     for t in tools_run or []:
         if isinstance(t, dict) and str(t.get("name") or "") in (
-                "execute", "jobs", "file_system"):
+                "execute", "jobs", "run", "file_system"):
             for jid in _JOB_ID_RE.findall(str(t.get("content") or "")):
                 if jid not in ids:
                     ids.append(jid)
@@ -9878,6 +10117,7 @@ def _ends_with_action_promise(text) -> str:
 #: design). Used for the honesty note when force_final_response eats a call.
 _MUTATING_TOOLS_FOR_DROP_NOTE = frozenset({
     "file_system", "execute", "manage_services", "manage_projects", "database",
+    "lab", "run",
 })
 
 
@@ -9908,6 +10148,17 @@ def _dropped_mutation_note(dropped_names, paths=(), landed=(), creating=(),
                    if str(n) in _MUTATING_TOOLS_FOR_DROP_NOTE})
     if not muts:
         return ""
+    if {"lab", "run"} & set(muts) and "file_system" not in muts:
+        # §4SX B (review r2 MAJOR F; r3): a lab action was dropped and no file
+        # write was. The file wording ("nothing … created was actually
+        # written") denied the lab this turn DID create.
+        # r5 M3: what DID land is named, never disclaimed (§4KC)
+        _landed = [str(x) for x in (landed or []) if str(x).strip()]
+        _kept = (f" The file change(s) to {', '.join(f'`{x}`' for x in _landed[:5])} DID land."
+                 if _landed else "")
+        return (f"\n\n{_DROPPED_NOTE_HEAD} {', '.join(muts)} action(s) could run — the remaining step(s) "
+                "were not run. Only the results shown above happened; anything described as "
+                f"done after them was not done.{_kept} Ask me to continue to apply it.")
     done_all = [str(x) for x in (landed or []) if str(x).strip()]
     done_keys = {_fs_norm(x) for x in done_all}
     # A dropped path that ALSO landed this turn is not "missing": the
@@ -11586,6 +11837,9 @@ def _dropped_mutating_names(tool_calls) -> list:
         try:
             fn = (tc or {}).get("function") or {}
             name = str(fn.get("name") or "?")
+            if (name == "lab" and _lab_is_read_call(fn.get("arguments"))) or \
+                    (name == "run" and _run_is_read_call(fn.get("arguments"))):
+                continue                    # §4SX B (r2 F) / D5: a dropped READ changed nothing
             if name != "file_system":
                 out.append(name)
                 continue
@@ -12123,7 +12377,6 @@ class GhostAgent:
         #: `system/member_files.json`.
         self._member_generated_files = None
         #: §4KJ: the owner's (project, conversation key) while a member turn runs.
-        self._member_saved_scope = None
         #: §4KJ: conversation fingerprint → last time a turn ran real tools.
         self._tool_convs = {}
         #: §4KD: conversation fingerprint -> monotonic-ish wall time of the
@@ -12216,6 +12469,16 @@ class GhostAgent:
         sorted, so the member's prompt bytes are stable across turns."""
         return sorted((set(getattr(self, "available_tools", None) or {})
                        | set(_MEMBER_STEER_KNOWN_TOOLS)) - set(_MEMBER_ALLOWED_TOOLS))
+
+    def _project_running_brief(self, project_id) -> Optional[list]:
+        """§4SX D5: the briefing's RUNNING block (tools/runs.project_running_summary). None on any failure."""
+        if not project_id:
+            return None
+        try:
+            from ..tools.runs import project_running_summary
+            return project_running_summary(self.context, project_id) or None
+        except Exception:  # noqa: BLE001 — briefing must never break a turn
+            return None
 
     def _project_services_brief(self, project_id) -> Optional[list]:
         """Registry-only service facts for the project briefing's SERVICES
@@ -12975,9 +13238,11 @@ class GhostAgent:
         "systemutility": "system_utility",
         "system-utility": "system_utility",
         "system": "system_utility",
-        "postgresadmin": "postgres_admin",
-        "postgres-admin": "postgres_admin",
-        "postgres": "postgres_admin",
+        # §4SX E: postgres_admin is gone — a model reaching for "postgres" now means a lab machine
+        "postgresadmin": "lab",      # matched normalised: also postgres_admin / postgres-admin
+        "postgres": "lab",
+        "postgresql": "lab",
+        "psql": "lab",
         "listlessons": "list_lessons",
         "list-lessons": "list_lessons",
         "whathaveyoulearned": "list_lessons",
@@ -13189,6 +13454,7 @@ class GhostAgent:
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
     _STALE_QUESTIONS_COOLDOWN = 7200  # 2 h between stale open-question surfacings (phase 2.8b)
+    _MIRROR_TRY_COOLDOWN = 3600       # §4SV: 1 h between mirror attempts (the diary itself allows one row a day)
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     # §4LF (operator, 2026-10-04): the self-play slot (failure replay +
@@ -13420,6 +13686,41 @@ class GhostAgent:
         _spawn_bg(_run(), name="supervised-self-play-slot")
         return True
 
+    async def _mirror_phase(self, ctx, ran: list, notes: dict) -> None:
+        """§4SV idle phase 2.8c: at most one try an hour, one diary row a day.
+        Never raises (a failure is booked on the Idle Cycle line)."""
+        if not hasattr(self, '_last_mirror_try_at'):
+            self._last_mirror_try_at = datetime.datetime.min
+        if (datetime.datetime.now() - self._last_mirror_try_at).total_seconds() \
+                < self._bio_cooldown(self._MIRROR_TRY_COOLDOWN):
+            return
+        self._last_mirror_try_at = datetime.datetime.now()
+        try:
+            from ..selfhood import mirror as _mirror
+            home = _mirror.home_from_memory_dir(getattr(ctx, 'memory_dir', None))
+            if home is None:
+                return
+            if await asyncio.to_thread(_mirror.looked_today, home):
+                return
+            from .llm import BackgroundDeferred as _BgDeferred
+            try:
+                note = await _mirror.look(home, getattr(ctx, 'llm_client', None),
+                                          model=str(getattr(getattr(ctx, 'args', None), 'model', '') or ''))
+            except _BgDeferred:
+                # review r2 m1: a request started — a guard, not a failure (§4PM);
+                # the next tick in this idle window tries again
+                self._last_mirror_try_at = datetime.datetime.min
+                ran.append("mirror")
+                notes["mirror"] = "deferred — a request started; tries again on the next idle tick"
+                logger.info("mirror: deferred — a request started")
+                return
+            ran.append("mirror")
+            notes["mirror"] = note
+            if note.startswith(("new I-sentence", "unchanged")):
+                pretty_log("Mirror", note, icon=Icons.MIRROR)
+        except Exception as e:  # noqa: BLE001 — a real failure: booked, retried in an hour (same window)
+            _idle_phase_failed(self, ran, "mirror", e)
+
     async def _owner_rule_note(self, body) -> str:
         """The state-block note for an owner's rule command, or "" (§4MX r3,
         see `failure_replay.owner_rule_command`). Never raises."""
@@ -13430,6 +13731,16 @@ class GhostAgent:
             msgs = body.get("messages") if isinstance(body, dict) else None
             last = next((m for m in reversed(msgs or []) if isinstance(m, dict) and m.get("role") == "user"), None)
             text = _message_text(last.get("content")) if last else ""
+            from ..selfhood.mirror import is_mirror_command, mirror_banner, home_from_memory_dir
+            if is_mirror_command(text):          # §4SV: the Mirror's diary, shown by the system
+                home = home_from_memory_dir(getattr(self.context, "memory_dir", None))
+                if home is None:
+                    return ""
+                from .failure_replay import _rn
+                note = _rn("The system showed the owner the Mirror diary.",
+                          await asyncio.to_thread(mirror_banner, home))
+                pretty_log("Owner Command", _owner_command_line("mirror", text, note), icon=Icons.MIRROR)
+                return note
             from .failure_replay import is_rule_command, owner_rule_command, rule_command_hint
             from .regression import is_test_command, owner_test_command
             if not (is_rule_command(text) or is_test_command(text)):
@@ -13659,6 +13970,8 @@ class GhostAgent:
             self._last_workspace_narrative_at = datetime.datetime.min
         if not hasattr(self, '_last_stale_questions_at'):
             self._last_stale_questions_at = datetime.datetime.min
+        if not hasattr(self, '_last_mirror_try_at'):
+            self._last_mirror_try_at = datetime.datetime.min
         if not hasattr(self, '_last_workspace_tidy_at'):
             self._last_workspace_tidy_at = datetime.datetime.min
         if not hasattr(self, '_last_autoadvance_at'):
@@ -14202,6 +14515,16 @@ class GhostAgent:
                         _idle_phase_failed(self, _idle_ran, "stale-questions", e)
                     finally:
                         self._last_stale_questions_at = datetime.datetime.now()
+
+        # Phase 2.8c (§4SV): the Mirror — a toy strange loop. Once a day the
+        # main model rewrites the agent's one-sentence self-description from
+        # yesterday's sentence plus one of the owner's replies. INERT: the
+        # sentence reaches no prompt; only the owner's `mirror` command shows
+        # it. The MAIN model at background priority (operator: the model that
+        # wrote the replies reads them); the conversation is saved first
+        # (§4RV). Listed on the Idle Cycle line only when it looked.
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
+            await self._mirror_phase(ctx, _idle_ran, _idle_notes)
 
         # Phase 2.9: Workspace Narrative Consolidation (15-60 min idle).
         # Mirrors phase 2.8 but for the world-model. Re-renders the
@@ -17421,18 +17744,11 @@ class GhostAgent:
         ⚠ THE ONLY sanctioned way to capture scope for anything that may
         outlive the semaphore. Four sites grew four copies of the same
         ten-line heal within one round — the drift risk this feature's
-        whole history warns about — so the heal lives once: the global,
-        else `_conversation_bound_project` (valid only while
-        conversation_key is still this turn's own), else None = unscoped.
+        whole history warns about — so the heal lives once: the request's
+        project (§4SX B0: its own scope), else the project this conversation
+        closed this turn, else None = unscoped.
         """
         pid = getattr(self.context, "current_project_id", None)
-        if pid:
-            return pid
-        try:
-            from ..tools.file_system import _conversation_bound_project
-            pid = _conversation_bound_project(self.context) or None
-        except Exception:
-            pid = None
         if pid:
             return pid
         # ⚠ third fallback: the project this CONVERSATION most recently
@@ -19876,7 +20192,20 @@ class GhostAgent:
         an unrelated one on the shared singleton agent. Returns ``""`` when
         it can't be computed — treated downstream as "don't surface",
         i.e. fail safe (drop) rather than risk cross-posting.
+
+        §4SX B0 (r2 #19): a request with a session id is keyed by that
+        conversation key instead — a per-turn preamble no longer changes it.
         """
+        try:
+            from .request_scope import current_scope as _cs
+            _sc = _cs(self.context)
+            _ck = str(getattr(_sc, "conversation_key", "") or "")
+            if _ck.startswith(("session:", "slack:")):
+                import hashlib
+                _role = ("member:" if requester_is_member() else "") + ("public:" if reply_is_public() else "")
+                return hashlib.sha1((_role + _ck).encode("utf-8", "ignore")).hexdigest()[:16]
+        except Exception:  # noqa: BLE001
+            pass
         try:
             first_user = next(
                 (m.get("content") for m in messages
@@ -23146,7 +23475,8 @@ class GhostAgent:
                 # §4MF: a STATUS question while work is live is answered from
                 # the current state — a call that starts new work is refused
                 _so = getattr(self.context, "_status_only_req", None)
-                if _cname in _WORK_TOOLS and _so and _so == str(request_id_context.get() or ""):
+                if (_so and _so == str(request_id_context.get() or "")
+                        and _starts_new_work(_cname, tool["function"].get("arguments"))):
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
                                "content": _TO.rejected(      # §4SB: names a mid-turn instruction
                                    status_only_refusal_text(),
@@ -23412,6 +23742,7 @@ class GhostAgent:
                     # the new file. Keep the two op lists identical; the
                     # test asserts it.
                     is_sandbox_mutation = _cname in ["execute", "image_generation"] or \
+                                          (_cname == "lab" and str(t_args.get("action") or "").strip().lower() == "get") or \
                                           (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"])
 
                     if is_sandbox_mutation:
@@ -23492,6 +23823,8 @@ class GhostAgent:
                 # ...and on the HEALED TOOL NAME (`_cname`, resolved once at
                 # the top of this block), for the same reason.
                 is_mutating = _cname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
+                              (_cname == "lab" and not _lab_is_read_call(t_args)) or \
+                              (_cname == "run" and not _run_is_read_call(t_args)) or \
                               (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
                               (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
                               (_cname == "manage_composed_skills" and str(t_args.get("action") or "").strip().lower() in ["define", "approve", "delete"])
@@ -24108,7 +24441,7 @@ class GhostAgent:
                         return await coro
                     finally:
                         my_done.set()
-                for _ordered_tool in ("browser", "execute"):
+                for _ordered_tool in ("browser",):
                     _br_idx = [k for k, (i, _) in enumerate(exec_coros)
                                if tool_call_metadata[i][0] == _ordered_tool]
                     if len(_br_idx) < 2:
@@ -24119,6 +24452,10 @@ class GhostAgent:
                         i, t = exec_coros[k]
                         exec_coros[k] = (i, _in_order(_prev_ev, t, _ev))
                         _prev_ev = _ev
+
+                # `execute` and `lab` (§4LO, §4SX B): written order where one
+                # call depends on another, side by side where it does not
+                exec_coros = _wire_batch_waits(exec_coros, tool_call_metadata)
 
                 if exec_coros:
                     # Producer→consumer ordering inside the batch (2026-07-31,
@@ -24443,7 +24780,13 @@ class GhostAgent:
                         # running" instead of "SUCCEEDED"
                         "unresolved": (_outcome.status
                                        is _OutcomeStatus.UNRESOLVED
-                                       and not _intr),
+                                       and not _intr
+                                       # §4SX D5 review r4: a job that EXITED with no recorded
+                                       # code is not "still running" — its own bucket below
+                                       and getattr(_outcome, "reason_code", None)
+                                       != "run_exit_unknown"),
+                        # review r5: neither SUCCEEDED nor FAILED — finished, exit unknown
+                        "exit_unknown": getattr(_outcome, "reason_code", None) == "run_exit_unknown",
                         # 140 chars cut the useful half off an argument
                         # error: the missing-parameter messages carry a
                         # worked call at the END, and in any turn that mixed
@@ -24769,7 +25112,7 @@ class GhostAgent:
                             _churn["steers"] = 0
 
                     shield_limit = max(16000, int(char_budget * 0.1))
-                    if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base", "postgres_admin"]:
+                    if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base"]:
                         # Use a DISTINCT variable, not `payload`: the
                         # outer `payload` is reused later (e.g. the
                         # Perfect-It optimization call), and rebinding
@@ -24833,10 +25176,7 @@ class GhostAgent:
                     # buried in the truncation. The model needs to
                     # see "EXIT CODE: 1" or "Error:" reliably to
                     # decide whether to retry or pivot.
-                    if fname == "execute":
-                        exit_match_full = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                        if exit_match_full and "EXIT CODE:" not in safe_res:
-                            safe_res = f"[FAILURE BANNER] EXIT CODE: {exit_match_full.group(1)}\n" + safe_res
+                    safe_res = _shield_exit_banner(fname, str_res, safe_res)
                     # ONE reading, used by both this banner and the hint
                     # scan 17 lines below — they were two byte-identical
                     # copies of a text rule, and neither read `_outcome`,
@@ -26998,7 +27338,7 @@ class GhostAgent:
 
         # --- THE "PERFECT IT" PROTOCOL INJECTION ---
         # Only trigger proactive optimization for heavy engineering/research tasks
-        heavy_tools_used = any(t.get('name') in ['execute', 'deep_research'] for t in tools_run_this_turn)
+        heavy_tools_used = any(t.get('name') in ['execute', 'deep_research', 'lab'] for t in tools_run_this_turn)
 
         # Skip the whole Perfect-It block during self-play: the
         # isolated context's `ReadOnlySkillMemory.learn_lesson`
@@ -30469,8 +30809,45 @@ class GhostAgent:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _build_request_scope(self, body, req_id: str, turn_origin_value: str, scope=None):
+        """§4SX B0: this request's scope. Only an owner request (a real user
+        turn, not a probe / replay / unattended request) with a session id
+        persists its project to its conversation's focus row. A leaf passes a
+        pre-built scope (its pinned project)."""
+        from .request_scope import (RequestScope, conversation_key_for_session, ORIGIN_MEMBER,
+                                    ORIGIN_OWNER, ORIGIN_PROBE, ORIGIN_REPLAY, ORIGIN_UNATTENDED)
+        if scope is not None:
+            scope.context = self.context
+            return scope
+        sid = (body.get("session_id") if isinstance(body, dict) else "") or ""
+        if requester_is_member():
+            return RequestScope(origin=ORIGIN_MEMBER, context=self.context)
+        try:
+            from .failure_replay import is_replay_request as _is_replay
+            if _is_replay(req_id):
+                return RequestScope(origin=ORIGIN_REPLAY, context=self.context)
+        except Exception:  # noqa: BLE001
+            pass
+        key = conversation_key_for_session(sid)
+        persist = bool(key)
+        if not key:
+            # no session id: request-only; the first-message hash (as before)
+            # still keys this conversation's previews and late corrections
+            from ..tools.projects import conversation_fingerprint
+            key = conversation_fingerprint(body.get("messages") if isinstance(body, dict) else None)
+        from ..tools.projects import _probe_turn_now
+        from ..utils.logging import is_probe_request_id as _is_probe_id
+        if _is_probe_id(req_id) or _probe_turn_now():
+            # a probe keeps a key (its preview → confirm turns pair up) but
+            # never reads or writes a focus row
+            return RequestScope(conversation_key=key, origin=ORIGIN_PROBE, context=self.context)
+        if str(req_id).startswith(_UNOWNED_RID_PREFIXES) or turn_origin_value != "user":
+            return RequestScope(origin=ORIGIN_UNATTENDED, context=self.context)
+        return RequestScope(conversation_key=key, origin=ORIGIN_OWNER, persist=persist,
+                            context=self.context)
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None,
-                          requester_role: str = "", requester_member: str = ""):
+                          requester_role: str = "", requester_member: str = "", scope=None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
         # §4MX r2: the conversation's user turns, counted on the REQUEST as
@@ -30566,6 +30943,30 @@ class GhostAgent:
         # semaphore is NOT similarly deferred on purpose — see the wrapper.
         _stream_owns_unregister = False
 
+        # §4SX B0: the request's scope (project + conversation), installed for
+        # this task and every task it creates; the focus row is read inside
+        # the turn lock (`begin_request_focus`). Installed right before the
+        # `try` whose finally resets it (review r1: an exception in between —
+        # the rule note, the registry — leaked it into the caller's task, which
+        # for a leaf is the parent request).
+        _scope_token = None
+        try:
+            from .request_scope import install as _scope_install
+            _req_scope = self._build_request_scope(body, req_id, _turn_origin, scope)
+            _scope_token = _scope_install(_req_scope)
+            from ..utils.logging import conversation_key_context as _ckc
+            _ckc.set(_req_scope.conversation_key)
+        except Exception:  # noqa: BLE001
+            # review r2: no scope means the context falls back to its
+            # process-global slot — the shared state B0 removed. Run
+            # request-only instead.
+            logger.warning("request scope not built; running request-only", exc_info=True)
+            if _scope_token is None:                # r3: never a second install over the first
+                try:
+                    from .request_scope import install as _scope_install, RequestScope as _RS
+                    _scope_token = _scope_install(_RS(context=self.context))
+                except Exception:  # noqa: BLE001
+                    _scope_token = None
         try:
             if self.agent_semaphore.locked():
                 # §4MU: a wait on the turn lock was invisible — "request
@@ -30780,38 +31181,15 @@ class GhostAgent:
                 # (observed: migration.sql written into an unrelated
                 # project, then four turns burned explaining/undoing it).
                 try:
-                    from ..tools.projects import (
-                        conversation_fingerprint, reconcile_conversation,
-                    )
-                    from .failure_replay import is_replay_request as _is_replay
-                    if requester_is_member() or _is_replay(req_id):
-                        # §4MW r1: an unattended failure REPLAY runs like a
-                        # member's turn here — no binding, owner scope saved and
-                        # restored — so it cannot rebind the owner's project.
-                        # A member's turn runs with NO project and NO
-                        # conversation binding: the projects are the owner's,
-                        # reconciling would let a member rebind (take over)
-                        # the owner's active project by naming it (R4), and a
-                        # stale `conversation_key` made every project-scoped
-                        # path fall back to the owner's bound project (R6:
-                        # member images written into it, owner constraints in
-                        # the member's verifier, follow-up tasks filed there).
-                        # The owner's scope is SAVED and restored when the
-                        # member turn ends (`handle_chat`'s finally), so the
-                        # owner's background paths never see it nulled.
-                        self._member_saved_scope = (
-                            getattr(self.context, "current_project_id", None),
-                            getattr(self.context, "conversation_key", ""))
-                        self.context.current_project_id = None
-                        self.context.conversation_key = ""
-                        from ..tools.projects import _set_scratchpad_scope as _sss
-                        _sss(getattr(self.context, "scratchpad", None), None)
-                    else:
-                        reconcile_conversation(
-                            self.context, conversation_fingerprint(messages)
-                        )
+                    # §4SX B0: the request's project comes from ITS conversation's
+                    # focus row (owner + session id) — or none: a member's turn,
+                    # a replay, a probe, an unattended request and a client with
+                    # no session id never read a row (the scope was built at
+                    # handle_chat start, see `_build_request_scope`)
+                    from ..tools.projects import begin_request_focus
+                    begin_request_focus(self.context)
                 except Exception as e:
-                    logger.debug(f"project conversation reconcile skipped: {e}")
+                    logger.warning(f"conversation focus load failed: {e}")
                 try:            # §4PF (K10): a bare "no" withdraws this conversation's live previews
                     from ..tools.memory import retire_declined_previews as _rdp
                     _rdp(last_user_content)
@@ -32035,11 +32413,24 @@ class GhostAgent:
                                 # port numbers. Cheap registry facts —
                                 # no container execs.
                                 services=self._project_services_brief(
-                                    _proj_id))
+                                    _proj_id),
+                                # §4SX D5: RUNNING — runs + lab machines
+                                # from local records (no probe per turn)
+                                running=self._project_running_brief(_proj_id))
                             if _briefing:
                                 _ds_parts.append(("briefing", _briefing + "\n"))
                     except Exception:
                         logger.debug("project briefing skipped", exc_info=True)
+                    try:
+                        # §4SX B0 (B2): a message that names ANOTHER project gets one
+                        # line; nothing is activated by wording
+                        if not requester_is_member() and not reply_is_public():
+                            from ..tools.projects import project_name_hint
+                            _pnh = project_name_hint(self.context, str(last_user_content or ""))
+                            if _pnh:
+                                _ds_parts.append(("project_hint", f"### PROJECT NAMED\n{_pnh}\n\n"))
+                    except Exception:  # noqa: BLE001
+                        logger.debug("project name hint skipped", exc_info=True)
                     # EXPLICIT CONSTRAINTS OF THE CURRENT REQUEST — surfaced
                     # BEFORE the model plans anything, project or not. The
                     # project briefing covers constraints stored on the
@@ -33039,15 +33430,9 @@ class GhostAgent:
                 requester_member_context.reset(_member_token)          # §4QG
             except Exception:  # noqa: BLE001 — same
                 pass
-            _saved = getattr(self, "_member_saved_scope", None)
-            if _saved is not None:
-                self._member_saved_scope = None
-                try:
-                    self.context.current_project_id, self.context.conversation_key = _saved
-                    from ..tools.projects import _set_scratchpad_scope as _sss
-                    _sss(getattr(self.context, "scratchpad", None), _saved[0])
-                except Exception:  # noqa: BLE001 — restoring must never break the finally
-                    pass
+            if _scope_token is not None:                               # §4SX B0
+                from .request_scope import reset as _scope_reset
+                _scope_reset(_scope_token)
 
     # Banners this agent DETERMINISTICALLY prepends to a reply, all sharing
     # this exact separator and all stacked in FRONT of the answer body:
@@ -34033,6 +34418,8 @@ class GhostAgent:
         _stream_role = str(requester_role or "")
         _stream_member = str(requester_member_context.get() or "")   # §4QG
         _stream_arm = str(prompt_arm_context.get() or "")    # §4MV
+        from .request_scope import current_scope as _cur_scope
+        _stream_scope = _cur_scope()                         # §4SX B0: the drain runs after the finally
         from .queued_messages import delivered as _qd, set_delivered as _q_set
         _stream_delivered = _qd()       # §4RZ step 2: the drain runs after handle_chat's finally
         try:                                                  # §4OJ-c: captured in the request's context
@@ -35798,11 +36185,15 @@ class GhostAgent:
             _member_tok = requester_member_context.set(_stream_member)   # §4QG
             _arm_tok = prompt_arm_context.set(_stream_arm)          # §4MV
             _q_tok = _q_set(_stream_delivered)
+            from .request_scope import install as _sc_inst, reset as _sc_reset
+            _sc_tok = _sc_inst(_stream_scope) if _stream_scope is not None else None
             try:
                 async for _chunk in stream_wrapper():
                     yield _chunk
             finally:
                 _queued_end_request(_q_tok)
+                if _sc_tok is not None:
+                    _sc_reset(_sc_tok)
                 try:
                     prompt_arm_context.reset(_arm_tok)
                     requester_member_context.reset(_member_tok)

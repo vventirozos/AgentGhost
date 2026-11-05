@@ -821,9 +821,17 @@ class TestFileSafety:
         g, api = self._cli(monkeypatch, tmp_path)
         victim = tmp_path / "report.pdf"
         victim.write_text("MY IRREPLACEABLE LOCAL FILE")
-        monkeypatch.setattr(api, "download", lambda n, d: (404, 0))
+        monkeypatch.setattr(api, "download", lambda n, d, *a: (404, 0))
         g.cmd_download("report.pdf", "")
         assert victim.read_text() == "MY IRREPLACEABLE LOCAL FILE"
+
+    def test_download_sends_this_sessions_id(self, monkeypatch, tmp_path):
+        """§4SX B0 review r3: a bare name resolves under the session's focus."""
+        g, api = self._cli(monkeypatch, tmp_path)
+        seen = []
+        monkeypatch.setattr(api, "download", lambda n, d, sid="": seen.append(sid) or (404, 0))
+        g.cmd_download("report.pdf", "")
+        assert seen == [g.session_id] and g.session_id
 
     def test_failed_save_leaves_an_existing_file_alone(self, monkeypatch, tmp_path):
         g, api = self._cli(monkeypatch, tmp_path)
@@ -1828,3 +1836,41 @@ class TestTokenCounter:
         g._probe_cache = cli.Text("● online", style="ok")
         line = g._banner_line(40, g._probe_cache).plain
         assert "online" in line and "ghost" in line and len(line) < 40
+
+
+class TestProjectCallsCarryTheSession:
+    """§4SX B0 review r1: the focus is per conversation; a switch without a
+    session id is a 400 and a list without one never shows the ▸ marker."""
+
+    def test_api_sends_session_id(self, monkeypatch):
+        api = cli.GhostAPI("http://localhost:9", "k")
+        seen = []
+
+        def _json(method, path, **kw):
+            seen.append((method, path, kw))
+            return 200, {}
+        monkeypatch.setattr(api, "_json", _json)
+        api.projects_list("s-1")
+        api.project_switch("p1", "s-1")
+        api.project_resume("p1", "s-1")
+        assert seen[0][2]["params"] == {"session_id": "s-1"}
+        assert seen[1][1].endswith("/p1/switch") and seen[1][2]["body"] == {"session_id": "s-1"}
+        assert seen[2][1].endswith("/p1/resume") and seen[2][2]["body"] == {"session_id": "s-1"}
+
+    def test_use_passes_this_sessions_id(self, monkeypatch):
+        g = cli.GhostCLI.__new__(cli.GhostCLI)
+        g.session_id = "sess-xyz"
+        calls = []
+
+        class _Api:
+            def projects_list(self, sid=""):
+                calls.append(("list", sid))
+                return 200, {"projects": [{"id": "p1"}]}
+
+            def project_switch(self, pid, sid):
+                calls.append(("switch", pid, sid))
+                return 200, {}
+        g.api = _Api()
+        monkeypatch.setattr(g, "notice", lambda *a, **k: None, raising=False)
+        g.cmd_project("use", ["p1"])
+        assert ("list", "sess-xyz") in calls and ("switch", "p1", "sess-xyz") in calls

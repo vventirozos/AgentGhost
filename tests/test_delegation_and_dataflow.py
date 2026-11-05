@@ -436,11 +436,12 @@ class TestWiring:
     def test_tools_advertised_and_dispatchable(self):
         from ghost_agent.tools.registry import TOOL_DEFINITIONS
         names = [t["function"]["name"] for t in TOOL_DEFINITIONS]
-        assert "jobs" in names
+        # §4SX D5: `jobs` is no longer advertised (`run` is); its name dispatches to the run alias
+        assert "jobs" not in names and "run" in names
         # §4SI: delegate / delegate_to_swarm / dream_mode were removed
         assert not {"delegate", "delegate_to_swarm", "dream_mode"} & set(names)
         src = (_SRC / "tools" / "registry.py").read_text()
-        assert '"jobs": lambda' in src and '"delegate": lambda' not in src
+        assert '"jobs": lambda **kwargs: jobs_alias' in src and '"delegate": lambda' not in src
 
     def test_composed_schema_documents_save_as(self):
         from ghost_agent.tools.registry import TOOL_DEFINITIONS

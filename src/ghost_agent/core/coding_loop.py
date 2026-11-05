@@ -56,7 +56,9 @@ from ..utils.helpers import env_positive
 # — `.git` is a configuration surface that names programs to run, and the
 # model can write files. The leaf reads its own diff through `execute` as it
 # always did. See PROJECT_JOURNAL.md §4KB round 5.
-LEAF_ALLOWED_TOOLS = ("file_system", "execute")
+# §4SX D4: `lab` (a disposable machine on the labs host, origin autopilot — kept machines and apps are refused by
+# the tool and by the host; design review D6 M6: `run` joins at D5)
+LEAF_ALLOWED_TOOLS = ("file_system", "execute", "lab", "run")      # §4SX D5 (D6 M6): `run` joins at the switch
 LEAF_MAX_TURNS = int(env_positive("GHOST_LEAF_MAX_TURNS", 14.0))
 LEAF_TIMEOUT_S = env_positive("GHOST_LEAF_TIMEOUT_S", 600.0)
 LEAF_MAX_ATTEMPTS = 2
@@ -370,6 +372,8 @@ def _leaf_prompt(description: str, ledger: str, existing_files: Optional[Dict[st
         "`execute` (a shell in the project directory). Read what exists before editing. Make the "
         "change with targeted edits, then RUN it — run the tests, import the module, start the "
         "script — and fix what the output shows. Prefer small verified steps over one big write. "
+        "If the work needs a real service (a database, a second machine), `lab` gives a disposable one "
+        "(`lab create`, then `lab exec`); destroy it when you are done. "
         "Do not touch files the task does not need. Do not ask the user anything; nobody is present.\n\n"
         "WHEN DONE, end your final reply with exactly these two lines:\n"
         "VERIFY: <one shell command that exits 0 iff this task's work is correct, e.g. "
@@ -391,13 +395,9 @@ def build_leaf_context(context, *, leaf_id: str, project_id: Optional[str] = Non
     # with `current_project_id=None` (the 2026-07-08 root-vs-project class).
     pid = project_id or getattr(context, "current_project_id", None)
     if pid:
+        # outside the leaf's turn (the diff, the verify); inside it the
+        # leaf's own scope carries the pin (`run_leaf_turn`, §4SX B0)
         iso.current_project_id = pid
-        # §4FH C1: `handle_chat` runs the conversation reconciler first thing,
-        # which parks any project without a binding for the turn's
-        # fingerprint — it parked every leaf's pin and the files went to the
-        # sandbox root. The reconciler honours this marker and leaves a
-        # pinned leaf alone; `run_leaf_turn` checks the pin AFTER the turn.
-        iso._leaf_pinned_project = pid
     iso.workspace_model = None
     iso.episodic_memory = None
     iso.journal = None
@@ -489,17 +489,46 @@ async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bo
     agent.max_turns_override = max(2, int(max_turns))
     body = {"model": getattr(iso.args, "model", "default"),
             "messages": [{"role": "user", "content": prompt}], "stream": False}
-    content, _, _ = await asyncio.wait_for(
-        agent.handle_chat(body, background_tasks=None, request_id=f"sub-leaf-{leaf_id}"),
-        timeout=max(30.0, float(timeout_s)))
-    # §4FH C1: the pin must have survived the turn — if anything parked it,
+    # §4SX B0 (r2 #7): the leaf's turn runs under a pre-built scope holding
+    # its pin (no conversation, never a focus row); the after-turn check
+    # reads THAT object, not a ContextVar from inside the awaited task
+    from .request_scope import RequestScope, ORIGIN_LEAF
+    _want = project_id or getattr(context, "current_project_id", None)
+    leaf_scope = RequestScope(project_id=_want, origin=ORIGIN_LEAF)
+    # §4SX D4 review r2 #5/#7: the leaf's labs and its "no lab" answers are tagged with THIS leaf / build
+    from .lab_waits import BUILD_KEY, LEAF_ID
+    _tk = (BUILD_KEY.set(str(leaf_id).rsplit("-a", 1)[0]), LEAF_ID.set(str(leaf_id)))
+    try:
+        content, _, _ = await asyncio.wait_for(
+            agent.handle_chat(body, background_tasks=None, request_id=f"sub-leaf-{leaf_id}",
+                              scope=leaf_scope),
+            timeout=max(30.0, float(timeout_s)))
+    finally:
+        BUILD_KEY.reset(_tk[0])
+        LEAF_ID.reset(_tk[1])
+        # §4SX D4: a leaf's labs are disposable and end with the leaf (a timeout or a crash too); bounded, and a
+        # cancel that lands during it is re-raised (review r2 #11)
+        if _want:
+            try:
+                from ..tools.labs import destroy_leaf_labs
+                from ..tools.runs import stop_leaf_runs
+
+                async def _end_leaf():
+                    # §4SX D5: its runs first (a run on a lab stops before the lab goes), then its labs
+                    await stop_leaf_runs(context, f"project:{_want}", str(leaf_id))
+                    await destroy_leaf_labs(context, f"project:{_want}", str(leaf_id))
+                await asyncio.shield(asyncio.wait_for(_end_leaf(), 120.0))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — a cleanup never masks the turn's own outcome
+                logger.warning("leaf labs not cleaned up: %s: %s", type(e).__name__, e)
+    # §4FH C1: the pin must have survived the turn — if anything moved it,
     # the leaf's files went somewhere other than the project and the
     # attempt is a failure, not a success with an empty diff.
-    _want = project_id or getattr(context, "current_project_id", None)
-    if _want and getattr(iso, "current_project_id", None) != _want:
+    if _want and leaf_scope.project_id != _want:
         raise RuntimeError(
             f"leaf lost its project pin during the turn "
-            f"(wanted {_want}, got {getattr(iso, 'current_project_id', None)!r})")
+            f"(wanted {_want}, got {leaf_scope.project_id!r})")
     return str(content or "").strip()
 
 
@@ -669,5 +698,8 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
                    level="WARNING", icon=Icons.WARN)
     if _stop_requested():
         raise asyncio.CancelledError()
+    from .lab_waits import take_seen
+    _lw, _need = take_seen(leaf_base)          # §4SX D4: a "no lab" answer one of THIS build's leaves got
     return CodingResult(False, f"agentic leaf failed after {max_attempts} attempt(s): "
-                        f"{_short(witness, 200)}", [], "", detail="; ".join(detail_parts))
+                        f"{_short(witness, 200)}", [], "", detail="; ".join(detail_parts),
+                        lab_wait=_lw, lab_needed_mb=_need)

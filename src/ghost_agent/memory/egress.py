@@ -218,6 +218,11 @@ OUTBOUND_TOOLS = {
     "system_utility": {"location", "city", "query", "place", "address", "area", "where"},
     "file_system": "urls", "knowledge_base": "urls", "vision_analysis": "urls",
     "execute": "url_literals",
+    # §4SX Phase B: a lab command runs on a machine whose egress (when it has
+    # any) is Tor — the same policy as the sandbox's code
+    "lab": "url_literals",
+    # §4SX D5: a run's command runs in the sandbox or on a lab machine — the same policy as their code
+    "run": "url_literals",
     # §4MG: `subjects` is a public encyclopedia search over Tor; the prompt
     # goes only to the owner's own GPU node
     "image_generation": {"subjects"},
@@ -381,7 +386,7 @@ def with_privacy_note(result, area: str):
 #: URLs only (§4MB review).
 QUERY_TOOLS = frozenset({"web_search", "deep_research", "darkweb_search", "darkweb_research",
                          "fact_check", "browser", "system_utility"})
-CODE_TOOLS = frozenset({"execute", "jobs", "manage_services"})
+CODE_TOOLS = frozenset({"execute", "jobs", "manage_services", "lab", "run"})
 URL_ONLY_TOOLS = frozenset({"file_system", "knowledge_base", "vision_analysis"})
 #: §4MG: tools where only the `subjects` argument leaves the machine (searched
 #: on Wikipedia over Tor); the rest of the call stays on the owner's nodes
@@ -505,7 +510,12 @@ def content_egress_refusal(tool_name: str, args, context):
         hay = fold(ident_src)[0]              # identifiers: folded (accents, Greek, confusables)
         said = fold(str(user_message() or ""))[0]
         # code: the RAW text — folding spells "curl" "kurl"
-        if tool_name in ("execute", "jobs", "manage_services") and _NET_CLIENT.search(raw.lower()) \
+        # §4SX B: `lab put` is itself the network step — a private file sent to
+        # a lab machine (which may have Tor egress) needs no curl in the call
+        _lab_put = (tool_name == "lab" and isinstance(val, dict)
+                    and str(val.get("action") or "").strip().lower() == "put")
+        if tool_name in ("execute", "jobs", "manage_services", "lab", "run") \
+                and (_lab_put or _NET_CLIENT.search(raw.lower())) \
                 and _PRIVATE_PATH.search(raw.lower()) and not _USER_NAMES_FILES.search(str(user_message() or "")):
             from ..tools.outcome import ToolOutcome
             return ToolOutcome.rejected(

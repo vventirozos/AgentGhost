@@ -1274,70 +1274,35 @@ class TestRemovalAwareAbsence:
                  self._fs("SUCCESS: Wrote 9 chars to 'x.md'.")]
         assert _keys_removable_after_write(tools) == set()
 
-    class _SP:
-        """Dict-backed scratchpad honouring the REAL sentinel keys — these
-        pins must distinguish live wiring, not monkeypatched wiring: the
-        first stamp site was proven unreachable by its own call sites while
-        a monkeypatched pin stayed green (round 14)."""
-        def __init__(self):
-            self.d = {}
-        def get(self, k, default=None):
-            return self.d.get(k, default)
-        def set(self, k, v, **kw):
-            self.d[k] = v
-        def delete(self, k):
-            self.d.pop(k, None)
-
-    def _bound_ctx(self, conv, pid):
-        from unittest.mock import MagicMock
-        from ghost_agent.tools.file_system import (_PROJECT_BIND_PID,
-                                                   _PROJECT_BIND_CONV)
-        ctx = MagicMock()
-        ctx.conversation_key = conv
-        ctx.scratchpad = self._SP()
-        if pid:
-            ctx.scratchpad.d[_PROJECT_BIND_PID] = pid
-            ctx.scratchpad.d[_PROJECT_BIND_CONV] = conv
-        ctx.current_project_id = pid
-        ctx.last_closed_project = None
-        return ctx
-
-    def test_a_genuine_close_stamps_through_the_LIVE_route(self, monkeypatch):
-        """⚠ THE ROUND-14 FINDING. The first stamp lived in
-        `_park_current_project`, whose only callers are the hygiene
-        branches — where ownership is false BY CONSTRUCTION — so the stamp
-        was unreachable from every production path and the same-turn-close
-        false-refute class it closed was silently back. Every genuine close
-        (exit, archive, hard delete) passes through `_set_current(ctx,
-        None)`; the stamp now lives there, one line before the sentinel it
-        reads is deleted. This pin drives the REAL route with REAL sentinel
-        keys — no monkeypatched ownership."""
+    def test_a_genuine_close_stamps_through_the_LIVE_route(self, tmp_path):
+        """⚠ THE ROUND-14 FINDING (§4SX B0 form): every genuine close (exit,
+        archive, hard delete) passes through `_set_current(ctx, None)`; the
+        stamp lives there, and the same call clears THIS conversation's focus
+        row. Driven through the real route and a real store."""
+        from types import SimpleNamespace as _NS
         import ghost_agent.tools.projects as PJ
-        monkeypatch.setattr(PJ, "_snapshot_scratchpad",
-                            lambda ctx, pid: True)   # not under test
-        ctx = self._bound_ctx("conv-9", "pid-9")
+        from ghost_agent.core import request_scope as RS
+        from ghost_agent.memory.projects import ProjectStore
+        store = ProjectStore(tmp_path / "mem")
+        pid = store.create_project("closing")
+        store.set_focus("session:conv-9", pid)
+        ctx = _NS(current_project_id=pid, conversation_key="session:conv-9", scratchpad=None,
+                  workspace_model=None, project_store=store, last_closed_project=None)
+        tok = RS.install(RS.RequestScope(conversation_key="session:conv-9", project_id=pid,
+                                         persist=True, context=ctx))
+        try:
+            PJ._set_current(ctx, None)
+        finally:
+            RS.reset(tok)
+        assert ctx.last_closed_project == ("session:conv-9", pid)
+        assert store.get_focus("session:conv-9") is None
+
+    def test_closing_with_nothing_open_stamps_nothing(self):
+        from types import SimpleNamespace as _NS
+        import ghost_agent.tools.projects as PJ
+        ctx = _NS(current_project_id=None, conversation_key="conv-9", scratchpad=None,
+                  workspace_model=None, project_store=None, last_closed_project=None)
         PJ._set_current(ctx, None)
-        assert ctx.last_closed_project == ("conv-9", "pid-9")
-        from ghost_agent.tools.file_system import _PROJECT_BIND_PID
-        assert _PROJECT_BIND_PID not in ctx.scratchpad.d   # sentinel gone
-
-    def test_closing_a_binding_another_conversation_owns_stamps_nothing(
-            self, monkeypatch):
-        import ghost_agent.tools.projects as PJ
-        from ghost_agent.tools.file_system import _PROJECT_BIND_CONV
-        monkeypatch.setattr(PJ, "_snapshot_scratchpad",
-                            lambda ctx, pid: True)
-        ctx = self._bound_ctx("conv-9", "pid-9")
-        ctx.scratchpad.d[_PROJECT_BIND_CONV] = "conv-OTHER"   # theirs
-        PJ._set_current(ctx, None)
-        assert ctx.last_closed_project is None
-
-    def test_a_hygiene_park_stamps_nothing(self, monkeypatch):
-        import ghost_agent.tools.projects as PJ
-        monkeypatch.setattr(PJ, "_snapshot_scratchpad",
-                            lambda ctx, pid: True)
-        ctx = self._bound_ctx("conv-9", None)      # binds nothing
-        PJ._park_current_project(ctx, "someone-elses-pid", "hygiene")
         assert ctx.last_closed_project is None
 
     def test_a_REWRITE_after_the_exec_still_refutes_on_absence(self):
@@ -1885,14 +1850,6 @@ class TestCapturedProjectId:
         a.context.current_project_id = "live-pid"
         assert a._captured_project_id() == "live-pid"
 
-    def test_a_stomped_global_heals_from_the_conversation_binding(self, monkeypatch):
-        a = self._agent()
-        a.context.current_project_id = None
-        monkeypatch.setattr(
-            "ghost_agent.tools.file_system._conversation_bound_project",
-            lambda ctx: "healed-pid")
-        assert a._captured_project_id() == "healed-pid"
-
     def test_a_closed_project_heals_from_the_close_time_record(self, monkeypatch):
         # ⚠ a same-turn project close clears the global AND the conversation
         # binding; the close path records (conversation_key, pid) at the
@@ -1904,9 +1861,6 @@ class TestCapturedProjectId:
         a.context.current_project_id = None
         a.context.conversation_key = "conv-1"
         a.context.last_closed_project = ("conv-1", "closed-pid")
-        monkeypatch.setattr(
-            "ghost_agent.tools.file_system._conversation_bound_project",
-            lambda ctx: "")
         assert a._captured_project_id() == "closed-pid"
 
     def test_another_conversations_close_heals_nothing(self, monkeypatch):
@@ -1914,9 +1868,6 @@ class TestCapturedProjectId:
         a.context.current_project_id = None
         a.context.conversation_key = "conv-1"
         a.context.last_closed_project = ("conv-OTHER", "their-pid")
-        monkeypatch.setattr(
-            "ghost_agent.tools.file_system._conversation_bound_project",
-            lambda ctx: "")
         assert a._captured_project_id() is None
 
     def test_no_binding_anywhere_means_unscoped_None(self, monkeypatch):
@@ -1924,9 +1875,6 @@ class TestCapturedProjectId:
         a.context.current_project_id = None
         a.context.conversation_key = "conv-1"
         a.context.last_closed_project = None
-        monkeypatch.setattr(
-            "ghost_agent.tools.file_system._conversation_bound_project",
-            lambda ctx: "")
         assert a._captured_project_id() is None
 
 

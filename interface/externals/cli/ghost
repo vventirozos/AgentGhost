@@ -1174,16 +1174,20 @@ class GhostAPI:
         return self._json("POST", "/api/memory/delete", body={"match": match})
 
     # -- files / workspace ------------------------------------------------------
-    def upload(self, path: Path) -> tuple[int, Any]:
+    def upload(self, path: Path, session_id: str = "") -> tuple[int, Any]:
+        # §4SX B0: lands in this session's focused project, if any
         with path.open("rb") as fh:
             return self._json("POST", "/api/upload",
+                              params={"session_id": session_id} if session_id else None,
                               files={"file": (path.name, fh)},
                               timeout=(10, 600))
 
-    def download(self, name: str, dest: Path) -> tuple[int, int]:
+    def download(self, name: str, dest: Path, session_id: str = "") -> tuple[int, int]:
         """Stream a sandbox file to ``dest``. Returns (status, bytes_written).
-        A non-200 leaves ``dest`` untouched — see _stream_to_file."""
+        A non-200 leaves ``dest`` untouched — see _stream_to_file. §4SX B0: a
+        bare name resolves under this session's focused project."""
         with self.http.get(self._url(f"/api/download/{quote(name)}"),
+                           params={"session_id": session_id} if session_id else None,
                            stream=True, timeout=(10, 600)) as r:
             if r.status_code != 200:
                 return r.status_code, 0
@@ -1204,8 +1208,10 @@ class GhostAPI:
                               timeout=(10, 600))
 
     # -- projects ---------------------------------------------------------------
-    def projects_list(self) -> tuple[int, Any]:
-        return self._json("GET", "/api/projects")
+    def projects_list(self, session_id: str = "") -> tuple[int, Any]:
+        # §4SX B0: "current" is per conversation — sent with this session's id
+        return self._json("GET", "/api/projects",
+                          params={"session_id": session_id} if session_id else None)
 
     def project_get(self, pid: str) -> tuple[int, Any]:
         return self._json("GET", f"/api/projects/{quote(pid, safe='')}")
@@ -1214,11 +1220,14 @@ class GhostAPI:
         return self._json("POST", "/api/projects",
                           body={"title": title, "goal": goal})
 
-    def project_switch(self, pid: str) -> tuple[int, Any]:
-        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/switch")
+    def project_switch(self, pid: str, session_id: str) -> tuple[int, Any]:
+        # §4SX B0: the switch applies to THIS session's conversation only
+        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/switch",
+                          body={"session_id": session_id})
 
-    def project_resume(self, pid: str) -> tuple[int, Any]:
-        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/resume")
+    def project_resume(self, pid: str, session_id: str) -> tuple[int, Any]:
+        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/resume",
+                          body={"session_id": session_id})
 
     def project_advance(self, pid: str) -> tuple[int, Any]:
         # An advance runs a full agent task — allow it to take its time.
@@ -2830,7 +2839,7 @@ class GhostCLI:
             return self.notice(f"✖ not a file: {path}", "err")
         with console.status(Text(f"uploading {path.name}…", style="mute"),
                             spinner="dots"):
-            status, data = self.api.upload(path)
+            status, data = self.api.upload(path, self.session_id)
         if status == 200:
             self.notice(f"✓ {data.get('filename', path.name)} → agent sandbox", "ok")
         else:
@@ -2842,7 +2851,7 @@ class GhostCLI:
             dest = dest / Path(name).name
         with console.status(Text(f"downloading {name}…", style="mute"),
                             spinner="dots"):
-            status, size = self.api.download(name, dest)
+            status, size = self.api.download(name, dest, self.session_id)
         if status == 200:
             self.notice(f"✓ {dest} ({size:,} bytes)", "ok")
         else:
@@ -2888,7 +2897,7 @@ class GhostCLI:
 
     # -- projects -----------------------------------------------------------------
     def _resolve_project(self, prefix: str) -> str | None:
-        status, data = self.api.projects_list()
+        status, data = self.api.projects_list(self.session_id)
         if status != 200:
             self.fail(status, data)
             return None
@@ -2905,7 +2914,7 @@ class GhostCLI:
         return None
 
     def cmd_projects(self) -> None:
-        status, data = self.api.projects_list()
+        status, data = self.api.projects_list(self.session_id)
         if status != 200:
             return self.fail(status, data)
         projects = data.get("projects", [])
@@ -2954,10 +2963,10 @@ class GhostCLI:
         elif sub in ("use", "resume"):
             call = (self.api.project_switch if sub == "use"
                     else self.api.project_resume)
-            status, data = call(pid)
+            status, data = call(pid, self.session_id)
             if status != 200:
                 return self.fail(status, data)
-            self.notice(f"✓ active project → {pid}", "ok")
+            self.notice(f"✓ active project → {pid} (this session)", "ok")
             briefing = (data or {}).get("briefing")
             if briefing:
                 console.print(Text(_safe(briefing), style="mute"))

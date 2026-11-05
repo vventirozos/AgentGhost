@@ -1417,6 +1417,55 @@ class SandboxJobSupervisor:
                                 entry={"cleanup_paths": cleanup_paths})
             raise
 
+    def start_detached(self, cmd: str, *, workdir: str = None, label: str = None,
+                       project_id=None, started_via: str = "run") -> Tuple[Optional[dict], str]:
+        """§4SX Phase C (design r1 H1): start ``cmd`` detached RIGHT AWAY as a
+        tracked job (no budget wait, no progress test — the caller asked for a
+        background run). Same script, launcher, row, TTL, cap and re-run guard
+        as a promoted job. Returns ``(entry, "")``, ``(existing+duplicate, "")``
+        or ``(None, reason)``."""
+        wd = str(workdir or CONTAINER_WORKDIR)
+        existing = self._find_running(cmd, wd)
+        if existing is not None:
+            return {**existing, "duplicate": True}, ""
+        with self._lock:
+            self.reap()
+            live = [e for e in self._load().values() if e.get("state") == STATE_RUNNING]
+            if len(live) >= max_concurrent_jobs():
+                return None, (f"{len(live)}/{max_concurrent_jobs()} background jobs already running — "
+                              "stop one first")
+        jid = self._new_id()
+        self._write_script(jid, cmd, job_ttl_s())
+        launcher_pid = None
+        try:
+            launcher_pid = self._launch(jid, {"workdir": wd})
+            pid = None
+            for _ in range(20):
+                pid = self._read_pid(jid)
+                if pid:
+                    break
+                time.sleep(0.1)
+            pid = pid or launcher_pid
+            if not pid:
+                raise RuntimeError("the job did not report a pid")
+            entry = self._promote(jid, cmd=cmd, pid=pid, workdir=wd, label=label,
+                                  project_id=project_id, ran_s=0.0, started_via=started_via)
+            if entry is None:                      # the cap filled in between
+                self._kill_pgroup(pid)
+                self._cleanup_files(jid, drop_log=True)
+                return None, "the background job cap was reached — stop one first"
+            return entry, ""
+        except BaseException:
+            # same guard as run(): no live process without a row
+            pid = self._read_pid(jid) or launcher_pid
+            if pid:
+                try:
+                    self._kill_pgroup(pid)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._cleanup_files(jid, drop_log=True)
+            raise
+
     def _supervise(self, jid: str, cmd: str, launcher_pid, *, budget: float,
                    window: float, workdir: str, label, project_id,
                    cleanup_paths=None, identity: str = None):
@@ -1655,7 +1704,8 @@ class SandboxJobSupervisor:
 
     def _promote(self, jid: str, *, cmd: str, pid: int, workdir: str,
                  label, project_id, ran_s: float,
-                 cleanup_paths=None, identity: str = None) -> Optional[dict]:
+                 cleanup_paths=None, identity: str = None,
+                 started_via: str = None) -> Optional[dict]:
         """Register a still-running command as a tracked job. Returns None
         when the concurrency cap is already taken (the caller kills)."""
         with self._lock:
@@ -1702,6 +1752,10 @@ class SandboxJobSupervisor:
                 # that lands it runs in whoever's context, never the starter's
                 "origin": _current_origin(),
             }
+            if started_via:
+                # §4SX C (design r1 H2): a `run`-started job — the jobs tool
+                # does not adopt it and its wake names `run collect`
+                entry["started_via"] = str(started_via)
             reg[jid] = entry
             self._save(reg)
             self._record_launch(jid, entry["started_by"], entry.get("command") or cmd)

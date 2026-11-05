@@ -1136,3 +1136,20 @@ def test_a_short_nested_cell_keeps_its_parenthesis():
     """Battery Q18: the nested-quote rule needs MIN_QUOTE_WORDS words."""
     units = PT.quotes('> "Truly "it."" (about ninety percent of runs)')
     assert any("ninety" in u for u in units)
+
+
+async def test_the_quote_check_runs_off_the_event_loop(tmp_path, monkeypatch):
+    """§4QA T79 (r32): the fuzzy quote check takes seconds — it runs in a
+    worker thread, never on the loop that serves every other request."""
+    import threading
+    from ghost_agent.core import task_deliverable as TD
+    store = ProjectStore(tmp_path / "mem", sandbox_root=tmp_path / "sb")
+    pid = store.create_project("P")
+    seen = {}
+
+    def spy(*a, **k):
+        seen["thread"] = threading.current_thread()
+        return None
+    monkeypatch.setattr(TD, "quote_problem_of", spy)
+    assert await TD.note_misquotes(store, pid, "t1", "C → results/c.md") is None
+    assert seen["thread"] is not threading.main_thread()

@@ -86,6 +86,7 @@ ICON_CLASS = {
     "🔒": "accent",
     "📣": "accent",
     "🪞": "accent",
+    "🎭": "accent",   # MIRROR (§4SV)
     "🎓": "accent",
     "👍": "accent",   # FEEDBACK_POS — human outcome label (/api/feedback)
     "👎": "accent",   # FEEDBACK_NEG
@@ -106,6 +107,9 @@ ICON_CLASS = {
     "🧱": "tool",
     "🎲": "tool",
     "🧪": "tool",
+    "🏭": "tool",   # LAB_CREATE (§4SX B)
+    "🪓": "tool",   # LAB_DESTROY
+    "📟": "tool",   # LAB_EXEC
     "📌": "tool",     # VERDICT_NOTE — §4OK: a verdict is information, not an error
     "📦": "tool",
     "🏃": "tool",   # JOB_PROMOTE — long sandbox command detached as a job

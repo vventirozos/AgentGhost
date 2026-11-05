@@ -227,7 +227,8 @@ def test_a_replay_takes_the_no_binding_branch():
     import ast, inspect, textwrap
     from ghost_agent.core.agent import GhostAgent
     src = ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(GhostAgent))))
-    assert "if requester_is_member() or _is_replay(req_id):" in src
+    # §4SX B0: the replay gets a request-only scope (no focus row read or written)
+    assert "if _is_replay(req_id):\n                return RequestScope(origin=ORIGIN_REPLAY, context=self.context)" in src
 
 
 async def test_a_stage_that_keeps_failing_abandons_the_case(tmp_path):

@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 
 # ── darkweb_research: a failed fetch is a failure, never page text ──
@@ -17,74 +16,6 @@ async def test_a_failed_onion_fetch_reads_as_a_failure(monkeypatch):
     monkeypatch.setattr(D, "_fetch_raw_html", boom)
     out = await D._fetch_onion_text("http://abcdefghijklmnop.onion/", "socks5h://127.0.0.1:9050")
     assert out.startswith("Error:")
-
-
-# ── postgres_admin: a statement that may have run is never run again ──
-
-class _OpErr(Exception):
-    pass
-
-
-def _fake_pg(execute_side_effect):
-    pg = MagicMock()
-    pg.OperationalError = _OpErr
-    pg.InterfaceError = type("_IfErr", (Exception,), {})
-    conn = MagicMock()
-    cur = MagicMock()
-    cur.execute.side_effect = execute_side_effect
-    conn.cursor.return_value.__enter__.return_value = cur
-    pg.connect.return_value = conn
-    return pg, cur
-
-
-@pytest.mark.parametrize("sql,err", [
-    ("SELECT pg_sleep(999)", "canceling statement due to statement timeout"),
-    ("INSERT INTO t VALUES (1)", "server closed the connection unexpectedly"),
-])
-async def test_a_statement_that_may_have_run_is_not_resent(monkeypatch, sql, err):
-    import sys
-    import ghost_agent.tools.database as DB
-    def se(q, *a, **k):
-        if sql in str(q):
-            raise _OpErr(err)
-    pg, cur = _fake_pg(se)
-    monkeypatch.setitem(sys.modules, "psycopg2", pg)
-    monkeypatch.setitem(sys.modules, "psycopg2.extras", MagicMock())
-    DB._connection_pool.clear() if hasattr(DB, "_connection_pool") else None
-    await DB.tool_postgres_admin("query", "postgresql://ghost@127.0.0.1:5432/agent", sql)
-    sent = [c for c in cur.execute.call_args_list if sql in str(c)]
-    assert len(sent) == 1
-
-
-@pytest.mark.parametrize("sql,ro", [
-    ("SELECT 1", True), ("with x as (select 1) select * from x", True),
-    ("INSERT INTO t VALUES (1)", False), ("EXPLAIN ANALYZE DELETE FROM t", False),
-    ("SELECT nextval('s')", False), ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", False),
-])
-def test_read_only_sql(sql, ro):
-    from ghost_agent.tools.database import _read_only_sql
-    assert _read_only_sql(sql) is ro
-
-
-@pytest.mark.parametrize("sql,ok", [
-    ("ALTER TABLE t DROP COLUMN c", False),
-    ("ALTER TABLE t ALTER COLUMN c TYPE int USING c::int", False),
-    ("CREATE FUNCTION f() RETURNS void AS 'DROP TABLE x' LANGUAGE sql", False),
-    ("ALTER TABLE t ALTER COLUMN c DROP DEFAULT", True),
-    ("ALTER TABLE t ADD COLUMN c int", True),
-    ("CREATE FUNCTION g() RETURNS int AS 'SELECT 1' LANGUAGE sql", True),
-])
-def test_destructive_ddl_needs_confirm(sql, ok):
-    from ghost_agent.tools.validators import validate_sql
-    assert validate_sql(sql)[0] is ok
-    assert validate_sql(sql, confirm=True)[0] is True
-
-
-async def test_another_role_is_refused():
-    from ghost_agent.tools.database import tool_postgres_admin
-    out = await tool_postgres_admin("query", "postgresql://postgres@127.0.0.1:5432/agent", "SELECT 1",
-                                    default_uri="postgresql://ghost@127.0.0.1:5432/agent")
-    assert "refused connection to postgres@" in out
 
 
 # ── system_utility ──

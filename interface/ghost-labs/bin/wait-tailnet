@@ -1,0 +1,9 @@
+#!/bin/bash
+# Wait (≤120 s) for this host's Tailscale IPv4; ghost-labs binds only there.
+for i in $(seq 1 60); do
+  ip=$(tailscale ip -4 2>/dev/null | head -1)
+  [ -n "$ip" ] && { echo "tailnet ip $ip"; exit 0; }
+  sleep 2
+done
+echo "no tailnet IPv4 after 120 s" >&2
+exit 1

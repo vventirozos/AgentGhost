@@ -1,0 +1,6 @@
+name: blank-dev
+description: One Debian dev box with Tor egress — install anything you need
+egress: tor
+members:
+  - {name: dev, image: "ghost-lab/base:1", mem_mb: 1024, cpus: 1.0}
+readiness: {member: dev, cmd: "true", timeout_s: 30}

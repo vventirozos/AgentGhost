@@ -590,6 +590,35 @@ def _master_key_rule():
         return None
 
 
+# §4SX Phase B: the labs host's API key, by VALUE, like the master key. It
+# lives in a file (`--labs-key-file`, env GHOST_LABS_KEY_FILE, default
+# ~/Data/AI/.ghost_labs_key) and travels in every `lab` call's header, so an
+# exception repr or a header dump can carry it into a stored row.
+_LABS_KEY_CACHE: dict = {"source": None, "rule": None}
+
+
+def _labs_key_rule():
+    """A rule redacting the labs API key wherever it appears, or None."""
+    try:
+        import os as _os
+        from pathlib import Path as _Path
+        path = (_os.environ.get("GHOST_LABS_KEY_FILE") or "~/Data/AI/.ghost_labs_key").strip()
+        try:
+            val = _Path(_os.path.expanduser(path)).read_text().strip()
+        except Exception:
+            val = ""
+        if len(val) < _MIN_KEY_LEN:
+            return None
+        if _LABS_KEY_CACHE["source"] != val:
+            _LABS_KEY_CACHE["source"] = val
+            _LABS_KEY_CACHE["rule"] = (
+                "ghost_labs_key", re.compile(re.escape(val)),
+                "<REDACTED_LABS_KEY>")
+        return _LABS_KEY_CACHE["rule"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ── the owner's profile, by VALUE (§4MI) ─────────────────────────────────
 # Every stored system prompt carries the USER PROFILE block — the owner's
 # name, city, company, street address, the family's names and birth dates,
@@ -697,6 +726,9 @@ def redact_text(text: str, config: RedactionConfig | None = None) -> str:
     _mk = None if "ghost_master_key" in disabled else _master_key_rule()
     if _mk is not None:
         out = _mk[1].sub(_mk[2], out)
+    _lk = None if "ghost_labs_key" in disabled else _labs_key_rule()
+    if _lk is not None:
+        out = _lk[1].sub(_lk[2], out)
     # r2 review CRIT: the profile rule is NOT applied here. `redact_text`
     # also feeds the memory journal (smart-memory consolidation input) and
     # the episode store — a placeholder there became a "stated" owner fact

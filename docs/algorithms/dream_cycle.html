@@ -63,7 +63,7 @@
     <li><code>ReadOnlyVectorMemory</code> — <code>add()</code> / <code>smart_update()</code> / <code>delete()</code> are no-ops, and reads are <em>stat-pure</em>: <code>search</code>/<code>search_advanced</code> force <code>record_retrievals=False</code> (a read that bumps retrieval stats is still a write to operator memory), and survivor-credit calls resolve to <code>None</code> through the strict whitelist — a replay earns no production credit by construction.</li>
     <li><code>ReadOnlySkillMemory</code> — carries <code>is_read_only = True</code> as a class marker so sub-agents skip write-oriented paths entirely; the Perfect-It follow-up call is skipped for the same reason.</li>
     <li><code>ReadOnlyGraphMemory</code>, <code>journal = None</code>, <code>profile_memory = None</code>.</li>
-    <li>Tool surface restricted (<code>restrict_tool_surface</code>: schema, dispatch dict and <code>_subagent_allowed_tools</code>; macros dropped as a class), <code>browser</code> denied, <code>default_db</code> and notify targets cleared, the container on <code>network=none</code> (<code>GHOST_SELFPLAY_NETWORK=bridge</code> restores Tor egress), job promotion off (§4MI).</li>
+    <li>Tool surface restricted (<code>restrict_tool_surface</code>: schema, dispatch dict and <code>_subagent_allowed_tools</code>; macros dropped as a class), <code>browser</code> denied, the notify targets and the labs host cleared, the container on <code>network=none</code> (<code>GHOST_SELFPLAY_NETWORK=bridge</code> restores Tor egress), job promotion off (§4MI).</li>
     <li>A replay may not author the agent's selfhood: the autobiographical store is detached (2026-08-11).</li>
   </ul>
 

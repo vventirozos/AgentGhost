@@ -1,0 +1,7 @@
+name: mysql-single
+description: One MySQL 8.0 server (root / lab), Tor egress
+egress: tor
+members:
+  - {name: db1, image: "ghost-lab/mysql:8", mem_mb: 768, cpus: 1.0}
+# TCP + a real login: the image's temporary init server runs --skip-networking and answers ping before the password is set
+readiness: {member: db1, cmd: "mysql -h127.0.0.1 -uroot -plab -Nse 'select 1'", timeout_s: 240}

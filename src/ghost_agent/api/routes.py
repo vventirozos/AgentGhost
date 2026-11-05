@@ -715,6 +715,43 @@ async def operator_self_play_slot(request: Request):
                         status_code=200 if started else 409)
 
 
+# §4SX D5: the Phase C operator route POST /api/operator/run-probe is REMOVED — `run` is advertised to the model,
+# and live checks drive it through probe-header chat turns (X-Ghost-Origin: probe).
+
+
+@router.put("/api/operator/labs/{lab_id}/secrets", dependencies=[Security(verify_api_key)])
+async def operator_lab_secrets(lab_id: str, request: Request):
+    """§4SX D3: a kept app's secret VALUES are set here by the operator, never through the model (tool args are
+    recorded in last_config.json and transcripts). Body {"secret_values": {NAME: value}}. Nothing of the body is
+    logged or stored agent-side; the labs host keeps them. Owner origin (a probe header → probe origin: the host
+    allows it only on a lab a probe made)."""
+    import re as _re
+    if not _re.fullmatch(r"lab_[0-9a-f]{8}", lab_id or ""):
+        return JSONResponse({"error": "bad lab id"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    vals = body.get("secret_values") if isinstance(body, dict) else None
+    if not isinstance(vals, dict) or not vals or not all(isinstance(k, str) and isinstance(v, str)
+                                                        for k, v in vals.items()):
+        return JSONResponse({"error": "body must be {\"secret_values\": {NAME: value, …}}"}, status_code=400)
+    ctx = getattr(get_agent(request), "context", None)
+    from ..tools.labs import LabsNoAnswer, LabsUnreachable, _call, labs_configured
+    if not labs_configured(ctx):
+        return JSONResponse({"error": "no labs host is configured"}, status_code=503)
+    origin = "probe" if str(request.headers.get("x-ghost-origin") or "").strip().lower() == "probe" else "owner"
+    try:
+        st, out = await _call(ctx, "PUT", f"/v1/labs/{lab_id}/secrets", origin=origin,
+                              json_body={"secret_values": vals}, timeout=120)
+    except (LabsUnreachable, LabsNoAnswer) as e:
+        return JSONResponse({"error": f"labs host: {type(e).__name__}"}, status_code=502)
+    out = out if isinstance(out, dict) else {}
+    # the host answers names only — pass that through, never the values
+    return JSONResponse({k: out.get(k) for k in ("lab_id", "secrets", "error", "message") if k in out},
+                        status_code=st)
+
+
 @router.get("/api/operator/self-play-slot", dependencies=[Security(verify_api_key)])
 async def operator_self_play_slot_status(request: Request):
     agent = get_agent(request)
@@ -3476,17 +3513,38 @@ async def lessons_quarantine(request: Request):
     return {"ok": n > 0, "quarantined": n, "trigger": trigger[:120]}
 
 
+def _session_focus_pid(agent, request) -> "str | None":
+    """§4SX B0 review r1: the project an HTTP file call belongs to, from its
+    conversation — ``?session_id=`` or the ``X-Ghost-Session`` header → that
+    conversation's focus row. Outside a request there is no "current
+    project" any more (the focus is per conversation), so a call that names
+    no session is unscoped."""
+    from ..core.request_scope import conversation_key_for_session
+    _qp = getattr(request, "query_params", None)
+    _hdrs = getattr(request, "headers", None) or {}
+    sid = (_qp.get("session_id") if _qp else None) or _hdrs.get("X-Ghost-Session")
+    key = conversation_key_for_session(sid) if isinstance(sid, str) else ""
+    store = getattr(getattr(agent, "context", None), "project_store", None)
+    if not key or store is None:
+        return None
+    try:
+        pid = store.get_focus(key)
+    except Exception:  # noqa: BLE001
+        return None
+    return pid if isinstance(pid, str) and pid else None
+
+
 @router.post("/api/upload", dependencies=[Security(verify_api_key)])
 async def upload_file(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)
-    # When a project is active, land the upload in its scoped dir so it joins
-    # the working set the model sees and the (scoped) file_system can read it.
-    # A client may pass ?project_id=<id> to scope RACE-FREE (the process-global
-    # current_project_id can be pointed at another conversation's project by a
-    # concurrent switch/reconcile); absent that, the global is the fallback.
+    # When the uploading conversation focuses a project, land the upload in
+    # its scoped dir so it joins the working set the model sees and the
+    # (scoped) file_system can read it. ?project_id=<id> names it outright;
+    # otherwise the conversation named by ?session_id= / X-Ghost-Session
+    # (§4SX B0: the focus is per conversation — no process-global fallback).
     from ..tools.file_system import project_scoped_sandbox
     _qp = getattr(request, "query_params", None)
-    _explicit_pid = _qp.get("project_id") if _qp else None
+    _explicit_pid = (_qp.get("project_id") if _qp else None) or _session_focus_pid(agent, request)
     sandbox_dir = project_scoped_sandbox(agent.context, explicit_project_id=_explicit_pid)[0]
     # Reject path traversal AND the absent-filename case explicitly.
     if not file.filename or ".." in file.filename or file.filename.startswith("/"):
@@ -3562,10 +3620,10 @@ async def download_file(request: Request, filename: str):
     # link still resolves. Containment is re-checked below.
     if (not file_path.exists() and "/" not in filename
             and parse_requester_role(_hdrs.get("X-Ghost-Requester")) != "member"):   # never an owner project for a member (R9)
-        # Prefer an explicit ?project_id= (race-free) over the process-global,
-        # which a concurrent conversation's switch could have moved.
+        # An explicit ?project_id=, else the named conversation's focus
+        # (§4SX B0: no process-global project outside a request).
         _qp = getattr(request, "query_params", None)
-        pid = (_qp.get("project_id") if _qp else None) or getattr(agent.context, "current_project_id", None)
+        pid = (_qp.get("project_id") if _qp else None) or _session_focus_pid(agent, request)
         if isinstance(pid, str) and pid.strip():
             cand = (sandbox_dir / "projects" / pid.strip().lower() / filename).resolve()
             if _is_within(sandbox_dir, cand) and cand.exists():

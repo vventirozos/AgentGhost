@@ -957,6 +957,11 @@ async def _note_misquotes_if_done(store, plan, project_id, nxt) -> None:
 
 #: §4SD: a coding step whose leaf ran out of time (task back to READY)
 OUT_OF_TIME_PREFIX = "code build ran out of time (task back to READY)"
+#: §4SX D4: a coding step whose leaf could not get a lab (task back to PENDING, held until the labs host has room)
+LAB_WAIT_PREFIX = "code build waits for the labs host (task back to PENDING)"
+#: review r4 #1: a give-up is NOT a wait (it never restarts by itself) — its own prefix, so no lab-wait branch
+#: (the batch's stop reason, the no-progress scoring) can take it for one
+LAB_GAVE_UP_PREFIX = "code build gave up waiting for the labs host (task waits for the owner)"
 
 
 def _experiment_gate_build(store, project_id, nxt, cres):
@@ -1024,6 +1029,11 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                                    summary=f"{_refusal.reason} (the build reported: {_short_summary(cres.summary or '')})")
 
     if cres.ok:
+        try:
+            from .lab_waits import clear_rounds
+            clear_rounds(store, project_id, nxt.id)        # §4SX D4: it got its lab — the wait count starts over
+        except Exception:  # noqa: BLE001
+            pass
         # Per-file manifest seed (2026-07-24): the build's summary (or the
         # task description) is the best available "what this file does" at
         # creation time — with file-per-task granularity it describes the
@@ -1126,6 +1136,48 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
         # `advance_many` stops on this prefix (review r12: the READY task was
         # picked again at once — 40 times in one owner batch)
         return AdvanceResult(True, nxt.id, "coding", f"{OUT_OF_TIME_PREFIX}: {cres.summary}", None)
+    _lw = str(getattr(cres, "lab_wait", "") or "")
+    if not _lw and not cres.ok:
+        try:                                   # review r6: a build that got past the labs host starts the count over
+            from .lab_waits import clear_rounds
+            clear_rounds(store, project_id, nxt.id)
+        except Exception:  # noqa: BLE001
+            pass
+    if _lw:
+        # §4SX D4: the build could not get a lab — the labs host is down or full, which is not this task
+        # failing. Back to PENDING (FAILED is never retried unattended; BLOCKED would block the parent and
+        # use up its alternatives) with a hold the pick honours until /v1/health has room (core.lab_waits)
+        from .lab_waits import MAX_ROUNDS, clear_holds, rounds_of, set_hold
+        if rounds_of(store, project_id, nxt.id) >= MAX_ROUNDS:
+            # review r2 #6: it waited MAX_ROUNDS times and still got no lab — the owner decides (a lab that never
+            # fits, or a host that stays down), not an endless wait/retry loop
+            _why = (f"{_lw}: no lab after {MAX_ROUNDS} waits for the labs host — {str(cres.summary or '')[:160]}")
+            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_why, wait=("owner", _lw, _why))
+            store.log_event(project_id, nxt.id, "autoadvance_lab_wait_gave_up", {"code": _lw})
+            from .lab_waits import clear_rounds
+            clear_rounds(store, project_id, nxt.id)     # review r5 #1: the owner's retry gets its waits again
+            _increment_budget(store, project_id)
+            return AdvanceResult(True, nxt.id, "blocked", f"{LAB_GAVE_UP_PREFIX} [{_lw}]: {_why}", None)
+        # review r2 #8: the hold BEFORE the claim is released — a tick in between must not take the task
+        set_hold(store, project_id, nxt.id, _lw, str(cres.summary or ""), int(getattr(cres, "lab_needed_mb", 0) or 0))
+        try:
+            store.release_claim(nxt.id, failure_reason=f"code_executor: {cres.summary}"[:300])
+        except Exception:  # noqa: BLE001
+            logger.debug("lab-wait leaf not reset", exc_info=True)
+        _back = str((store.get_task(nxt.id) or {}).get("status") or "").upper()
+        if _back not in ("PENDING", "READY"):
+            clear_holds(store, project_id, [nxt.id])    # review r2 #14: a claimed owner hold went back to its hold
+        _increment_budget(store, project_id)
+        _tick_secs = max(0.0, time.time() - tick_started_at)
+        record_runtime(store, project_id, seconds=_tick_secs, tool_calls=1)
+        store.log_event(project_id, nxt.id, "autoadvance_lab_wait",
+                        {"tool": "code_executor", "code": _lw, "reason": (cres.summary or "")[:200]})
+        _work_log_step(store, project_id, nxt, outcome="had_failures",
+                       files=list(cres.files or []), tools={"code_executor": 1},
+                       note=f"{_lw}: back to PENDING until the labs host has room: {(cres.summary or '')[:200]}")
+        return AdvanceResult(True, nxt.id, "coding",
+                             f"{LAB_WAIT_PREFIX} [{_lw}]: {cres.summary}"
+                             + ("" if _back in ("PENDING", "READY") else f" (back to {_back})"), None)
     plan.update_status(nxt.id, TaskStatus.FAILED,
                        failure_reason=f"code_executor: {cres.summary}")
     _increment_budget(store, project_id)
@@ -1480,6 +1532,18 @@ async def _advance_once_body(
     # and BEFORE any await, so the claim is atomic. Classification and the
     # tool run then happen OUTSIDE the lock, so different leaves still
     # advance in parallel.
+    # §4SX D4: a task whose build could not get a lab waits (unattended) until the labs host has room
+    _lab_held: set = set()
+    _lab_holds: dict = {}
+    try:
+        from .lab_waits import held_ids, holds_of
+        _lab_holds = holds_of(proj)
+        if _lab_holds and not owner_requested:
+            _lab_held = await held_ids(context, store, project_id, proj)
+    except Exception:  # noqa: BLE001
+        _lab_held = set(_lab_holds)
+        logger.warning("lab waits not read for %s", project_id, exc_info=True)
+
     with _get_project_lock(project_id):
         plan = ProjectPlan(store, project_id)
         # in memory only: a held task counts as PENDING for this one pick
@@ -1493,7 +1557,7 @@ async def _advance_once_body(
         # stopped at, e.g. a model experiment) so the pick moves on to the
         # independent work; a task depending on them is still not ready
         _base_skip = None if owner_requested else _is_unrequested_task
-        _ex = set(exclude_ids or ())
+        _ex = set(exclude_ids or ()) | _lab_held
         nxt = plan.next_ready_leaf(
             skip=(_base_skip if not _ex else
                   (lambda n: n.id in _ex or bool(_base_skip and _base_skip(n)))))
@@ -1523,7 +1587,13 @@ async def _advance_once_body(
         # an idle project must still rotate to the back of the round-robin
         # queue or it starves the other ACTIVE projects (see _stamp_…).
         _stamp_autoadvanced(store, project_id)
+        if _lab_held:
+            return AdvanceResult(True, None, "idle",
+                                 f"no READY/PENDING leaf; {len(_lab_held)} task(s) waiting for the labs host")
         return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
+    if nxt.id in _lab_holds:
+        from .lab_waits import clear_holds
+        clear_holds(store, project_id, [nxt.id])     # the claim takes the task: its hold is over
 
     # §4SU Phase 5 (operator 11-02): a task an unattended run HELD after the
     # work happened (a build nobody verified, a declared file missing, a
@@ -2591,6 +2661,8 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
         _pause_if_stuck(context, store, project_id)
     if not (res.task_id or res.classification in ("timeout", "error")) or res.classification == "deferred":
         return res                     # §4PG r3: a deferral is not a step
+    if str(res.summary or "").startswith(LAB_WAIT_PREFIX):
+        return res                     # §4SX D4 review r2 #6: waiting for the labs host is not "no progress"
     score = _step_score(store, project_id, res.task_id)
     if score == "held" and "did not land" not in str(res.summary or ""):
         return res                     # waits on the owner — the hold already said so (r2 m1)
@@ -2940,6 +3012,18 @@ async def advance_many(
                              "status": (store.get_task(res.task_id) or {}).get("status"),
                              "summary": res.summary})
             stop_reason = "out_of_time"           # §4SD r12: not re-picked in the same batch
+            break
+        if res.task_id and res.summary.startswith(LAB_WAIT_PREFIX):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "lab_capacity" if "[lab_capacity]" in res.summary[:120] else "labs_down"   # §4SX D4  (labs_no_answer → labs_down)
+            break
+        if res.task_id and res.summary.startswith(LAB_GAVE_UP_PREFIX):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "lab_gave_up"           # review r4 #1: it waits for the owner — never "starts again by itself"
             break
         if cls == "blocked" and res.task_id and res.summary.startswith("coding executor crashed"):
             advanced.append({"task_id": res.task_id, "classification": res.classification,

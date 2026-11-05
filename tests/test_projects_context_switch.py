@@ -165,12 +165,19 @@ async def test_exit_clears_scratchpad_free_chat_keys(context):
     assert context.scratchpad.get("temp") is None
 
 
-async def test_sentinel_key_survives_switch(context):
-    a = _parse(await tool_manage_projects(context, action="create", title="A"))
-    # Sentinel __current_project__ should always be present
-    assert context.scratchpad.get("__current_project__") == a["created"]
-    b = _parse(await tool_manage_projects(context, action="create", title="B"))
-    assert context.scratchpad.get("__current_project__") == b["created"]
+async def test_the_focus_row_follows_each_create(context):
+    """§4SX B0: the conversation's focus is its project-store row (the old
+    `__current_project__` scratchpad sentinel is gone)."""
+    from tests.focus_helpers import start_request, end_request
+    start_request(context, "session:s1")
+    try:
+        a = _parse(await tool_manage_projects(context, action="create", title="A"))
+        assert context.project_store.get_focus("session:s1") == a["created"]
+        b = _parse(await tool_manage_projects(context, action="create", title="B"))
+        assert context.project_store.get_focus("session:s1") == b["created"]
+        assert context.scratchpad.get("__current_project__") is None
+    finally:
+        end_request()
 
 
 async def test_switch_to_same_project_is_idempotent(context):

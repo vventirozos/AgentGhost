@@ -302,8 +302,8 @@ MUTANTS = [
      '        key = str(project_id or "").strip()',
      "src/ghost_agent/core/workspace_cleanup.py"),
     ("the genuine-close stamp stops firing",
-     "                    if prev and _conversation_bound_project_pid(",
-     "                    if False and _conversation_bound_project_pid(",
+     "    if project_id is None and prev:\n        # what this conversation closed",
+     "    if False:\n        # what this conversation closed",
      "src/ghost_agent/tools/projects.py"),
     ("sweep match back to basename equality",
      "                    if _del is None or (_del != \"ABSENT\"\n"

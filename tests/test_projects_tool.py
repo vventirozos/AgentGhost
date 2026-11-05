@@ -88,14 +88,19 @@ async def test_rejects_when_store_missing(tmp_path):
 
 # --------------------------------------------------------------------- create / switch / exit
 
-async def test_create_enters_project_mode_and_persists_to_scratchpad(context):
-    res = await tool_manage_projects(context, action="create",
-                                     title="T1", kind="CODING", goal="Ship")
-    data = _parse(res)
-    assert "created" in data
-    assert context.current_project_id == data["created"]
-    # Scratchpad sentinel was written
-    assert context.scratchpad.get("__current_project__") == data["created"]
+async def test_create_enters_project_mode_and_persists_the_focus(context):
+    from tests.focus_helpers import start_request, end_request
+    start_request(context, "session:s1")
+    try:
+        res = await tool_manage_projects(context, action="create",
+                                         title="T1", kind="CODING", goal="Ship")
+        data = _parse(res)
+        assert "created" in data
+        assert context.current_project_id == data["created"]
+        # §4SX B0: this conversation's focus row was written
+        assert context.project_store.get_focus("session:s1") == data["created"]
+    finally:
+        end_request()
 
 
 async def test_create_requires_title(context):

@@ -377,6 +377,9 @@ def test_symlinked_deliverable_is_refused(tmp_path):
 
 # ------------------------------------------------- #4 ownership on reference
 
+from tests.focus_helpers import scope_reset  # noqa: F401,E402
+
+
 def _scope_ctx(tmp_path):
     store = ProjectStore(tmp_path / "mem3", sandbox_root=tmp_path / "sb3")
     ctx = _ctx(store, tmp_path)
@@ -385,92 +388,11 @@ def _scope_ctx(tmp_path):
 
 
 def _request(ctx, conv, message):
-    from ghost_agent.tools.projects import reconcile_conversation
+    """A request start of conversation ``conv`` (§4SX B0: its focus row)."""
+    from tests.focus_helpers import start_request
     ctx.last_user_content = message
-    reconcile_conversation(ctx, conv)
+    start_request(ctx, conv)
     return ctx.current_project_id
-
-
-async def test_a_referencing_conversation_does_not_take_the_owners_project(tmp_path):
-    # live: B "show me the results of 448d5afa86f0" → A (the creator) got
-    # "belongs to another conversation" at 12:35 and failed its reads
-    from ghost_agent.tools import projects as PJ
-    from ghost_agent.tools.file_system import _conversation_bound_project
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create the project")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-
-    assert _request(ctx, "convB", "show me all projects") is None          # parked for B
-    assert _request(ctx, "convB", f"show me the results of {pid}") == pid  # referenced
-    assert _conversation_bound_project(ctx) == pid                          # B's writes resolve
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"         # owner kept
-    # B's follow-ups that do not name it keep it (live: "add this picture to the project")
-    assert _request(ctx, "convB", "add this picture to the project") == pid
-    # the owner's next turn still has it
-    assert _request(ctx, "convA", "is there any way to improve your findings?") == pid
-    # a third conversation that never named it does not
-    assert _request(ctx, "convC", "hello") is None
-    # …and parking it for C (a scope clear) kept B's guest seat
-    assert _request(ctx, "convB", "now make it bigger") == pid
-
-
-async def test_a_switch_resets_the_guests(tmp_path):
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create a project called Recursion")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    assert pid
-    _request(ctx, "convB", f"open {pid}")
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-    _request(ctx, "convA", "create a new project called Second one")
-    await tool_manage_projects(ctx, action="create", title="Second one")
-    pid2 = ctx.current_project_id
-    assert pid2 and pid2 != pid
-    assert PJ.project_guests(ctx.scratchpad, pid2) == []
-    assert _request(ctx, "convB", "hello") is None
-
-
-def test_guests_are_capped_and_bound_to_the_pid(tmp_path):
-    from ghost_agent.tools import projects as PJ
-    sp = Scratchpad(persist_path=tmp_path / "g.db")
-    for i in range(12):
-        PJ._add_project_guest(sp, "p1", f"c{i}")
-    assert PJ.project_guests(sp, "p1") == [f"c{i}" for i in range(4, 12)]
-    assert PJ.project_guests(sp, "p2") == []
-
-
-def test_every_sentinel_protection_names_the_guest_key():
-    # class guard: a binding key listed by hand somewhere drops the new one
-    import ast
-    from ghost_agent.tools import projects as PJ
-    pairs = [n for n in ast.walk(ast.parse(Path(PJ.__file__).read_text()))
-             if isinstance(n, (ast.Tuple, ast.Set, ast.List))
-             and [getattr(e, "id", None) for e in n.elts] == ["_CURRENT_SENTINEL", "_CURRENT_CONV_SENTINEL"]]
-    assert pairs == []
-
-
-async def test_a_guest_exit_leaves_the_owner_bound(tmp_path):
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create a project called Recursion")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    _request(ctx, "convB", f"open {pid}")
-    out = json.loads(await tool_manage_projects(ctx, action="exit"))
-    assert out["exited"] == pid
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-    assert _request(ctx, "convB", "hello") is None
-    assert _request(ctx, "convA", "go on") == pid
-    # the OWNER's exit still clears the binding
-    out = json.loads(await tool_manage_projects(ctx, action="exit"))
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) is None
 
 
 # ------------------------------------------------ #6 pre-project folder prefix
@@ -853,7 +775,7 @@ async def test_the_one_task_stop_reaches_the_non_stream_reply_through_handle_cha
     store.add_task(pid, "Summarise notes")
     ctx = make_context()
     ctx.project_store = store
-    ctx.current_project_id = pid
+    store.set_focus("session:s5", pid)          # §4SX B0: the conversation focuses it
     agent = GhostAgent(ctx)
 
     async def _mp(**kw):
@@ -865,7 +787,8 @@ async def test_the_one_task_stop_reaches_the_non_stream_reply_through_handle_cha
         _resp("", [_tc("t0", "manage_projects",
                        {"action": "task_update", "task_id": tid, "status": "done", "result": "notes collected"})]),
     ] + [_resp(final)] * 4)
-    out = await agent.handle_chat({"messages": [{"role": "user", "content": f"proceed with {pid}"}]}, FakeBgTasks())
+    out = await agent.handle_chat({"messages": [{"role": "user", "content": f"proceed with {pid}"}],
+                                   "session_id": "s5"}, FakeBgTasks())
     reply = out[0] if isinstance(out, tuple) else str(out)
     assert store.get_task(tid)["status"] == "DONE"
     assert "say *proceed*" in reply, reply
@@ -1063,34 +986,6 @@ def test_routing_reads_verbs_not_topics(desc, cls):
     assert pa._route_project_work(desc, "research") == cls
 
 
-async def test_a_guest_switch_does_not_take_the_project(tmp_path):
-    # M6: switch/resume from a guest rewrote the owner sentinel
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create the project")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    _request(ctx, "convB", f"open project {pid}")
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=pid)
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-    assert "convB" in PJ.project_guests(ctx.scratchpad, pid)
-    assert _request(ctx, "convA", "go on") == pid
-
-
-async def test_a_probe_never_becomes_a_guest(tmp_path, monkeypatch):
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create the project")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    monkeypatch.setattr(PJ, "_probe_turn_now", lambda: True)
-    _request(ctx, "probe1", f"show me {pid}")
-    assert PJ.project_guests(ctx.scratchpad, pid) == []
-
-
 async def test_a_description_without_a_path_does_not_skip_the_gate(tmp_path):
     # m8: description="…" (no arrow) bypassed the deliverable gate
     ctx, store, pid, tid, ws = await _project_with(tmp_path, "Write theory → theory/t.md")
@@ -1167,7 +1062,7 @@ async def test_a_dropped_write_after_a_closed_task_keeps_its_note(tmp_path, monk
     store.add_task(pid, "Summarise notes")
     ctx = make_context()
     ctx.project_store = store
-    ctx.current_project_id = pid
+    store.set_focus("session:s5", pid)          # §4SX B0: the conversation focuses it
     agent = GhostAgent(ctx)
 
     async def _mp(**kw):
@@ -1180,7 +1075,8 @@ async def test_a_dropped_write_after_a_closed_task_keeps_its_note(tmp_path, monk
     ] + [_resp("Saved the summary to results/n.md.",
                [_tc("t1", "file_system", {"operation": "write", "path": "results/n.md",
                                           "content": "# N\n\nsummary"})])] * 4)
-    out = await agent.handle_chat({"messages": [{"role": "user", "content": f"proceed with {pid}"}]}, FakeBgTasks())
+    out = await agent.handle_chat({"messages": [{"role": "user", "content": f"proceed with {pid}"}],
+                                   "session_id": "s5"}, FakeBgTasks())
     reply = out[0] if isinstance(out, tuple) else str(out)
     assert "say *proceed*" in reply, reply
     assert "⚠ Note" in reply and "`results/n.md` does NOT exist" in reply, reply
@@ -1215,6 +1111,8 @@ async def test_a_transcript_response_cannot_forge_sections(tmp_path):
     body = (tmp_path / "sb" / "projects" / "448d5afa86f0" / "results" / "f.md").read_text()
     assert "````text\nfine\n## 2. Prompt" in body                  # inside a longer fence
     assert "cut off at max_tokens" in body
+    # the per-answer flag under the response itself, not only the summary line
+    assert "_(cut off at max_tokens=" in body and "the answer is incomplete)_" in body
 
 
 async def test_probe_model_has_a_total_time_limit(tmp_path, monkeypatch):
@@ -1285,24 +1183,6 @@ async def test_an_append_that_leaves_only_a_placeholder_is_refused():
     written, why = await _apply_file(runner, {"path": "results/m.md", "append": "..."}, {})
     assert written is None and "only a placeholder" in why
     assert "write" not in calls
-
-
-async def test_a_rebinding_drops_the_old_projects_guests(tmp_path):
-    # M43: A switched away and back — B's old guest seat came back with it
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create a project called Recursion")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    _request(ctx, "convB", f"open {pid}")
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-    _request(ctx, "convA", "create a new project called Second one")
-    await tool_manage_projects(ctx, action="create", title="Second one")
-    _request(ctx, "convA", f"switch to {pid}")
-    await tool_manage_projects(ctx, action="switch", project_id=pid)
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    assert PJ.project_guests(ctx.scratchpad, pid) == []
 
 
 async def test_an_old_root_file_named_like_the_folder_gets_no_note(tmp_path):
@@ -1380,7 +1260,7 @@ async def _closed_then(tmp_path, monkeypatch, first_text, later):
     store.add_task(pid, "Summarise notes")
     ctx = make_context()
     ctx.project_store = store
-    ctx.current_project_id = pid
+    store.set_focus("session:s5", pid)          # §4SX B0: the conversation focuses it
     agent = GhostAgent(ctx)
 
     async def _mp(**kw):
@@ -1392,7 +1272,8 @@ async def _closed_then(tmp_path, monkeypatch, first_text, later):
                                {"action": "task_update", "task_id": tid, "status": "done",
                                 "result": "notes collected"})]),
     ] + [later(_resp, _tc)] * 6)
-    out = await agent.handle_chat({"messages": [{"role": "user", "content": f"proceed with {pid}"}]}, FakeBgTasks())
+    out = await agent.handle_chat({"messages": [{"role": "user", "content": f"proceed with {pid}"}],
+                                   "session_id": "s5"}, FakeBgTasks())
     return (out[0] if isinstance(out, tuple) else str(out)), ctx.llm_client.chat_completion.await_count
 
 
@@ -1502,7 +1383,6 @@ async def test_an_unattended_research_close_without_its_file_is_held(store, tmp_
 def test_any_experiment_in_a_model_project_is_held(goal):
     # INVERTED (r5): three rounds of goal-phrase lists each missed common goals
     assert pa.is_model_experiment("Run the arithmetic test set", goal) is True
-
 
 
 async def _brief(store, tmp_path, pid, slug="lit"):
@@ -1947,22 +1827,6 @@ async def test_a_self_referential_experiment_is_held_too(tmp_path):
     assert store.get_task(t1)["status"] == "PENDING"
 
 
-async def test_the_owner_switching_to_its_own_project_keeps_the_guests(tmp_path):
-    # r9 B-MAJOR-2: every re-switch/resume by the owner dropped the guests
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create a project called Recursion")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    _request(ctx, "convB", f"open {pid}")
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-    _request(ctx, "convA", f"switch to {pid}")
-    await tool_manage_projects(ctx, action="switch", project_id=pid)
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-    assert _request(ctx, "convB", "now make it bigger") == pid
-
-
 def test_a_declared_path_with_the_project_prefix_is_the_projects_file():
     # r9 B-m1
     assert declared_deliverable("Write it → /workspace/projects/448d5afa86f0/results/x.md") == "results/x.md"
@@ -2338,281 +2202,64 @@ async def test_a_long_save_to_name_still_saves(tmp_path):
     assert (tmp_path / "sb" / "projects" / "448d5afa86f0" / "results" / name).exists()
 
 
-# ── operator 2026-10-18: "a guest can't take the binding from the owner" ──
-
-async def _owner_and_guest(tmp_path):
-    from ghost_agent.tools import projects as PJ
-    ctx, store = _scope_ctx(tmp_path)
-    _request(ctx, "convA", "create a project called Recursion")
-    ctx.conversation_key = "convA"
-    await tool_manage_projects(ctx, action="create", title="Recursion")
-    pid = ctx.current_project_id
-    _request(ctx, "convB", f"open {pid}")
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-    return PJ, ctx, store, pid
+def test_the_announcement_check_ignores_the_one_task_notes():
+    """§4QA N25: the one-task stop note and the "call was not run" note are
+    the SYSTEM's — an announcement followed by either is still only an
+    announcement (the raw text with the note is not narration)."""
+    from ghost_agent.core.agent import _announced_then_called
+    from ghost_agent.core.reply_smoothing import TASK_CLOSED_CALL_NOT_RUN, TASK_CLOSED_NOTE, narration_only
+    said = "Let me check the next task now."
+    for note in (TASK_CLOSED_NOTE, TASK_CLOSED_CALL_NOT_RUN):
+        assert not narration_only(said + "\n\n" + note, tool_attempt=True)   # the world the strip matters in
+        assert _announced_then_called(said + "\n\n" + note)
 
 
-@pytest.mark.parametrize("how", ["switch", "create"])
-async def test_a_guest_cannot_take_the_binding_from_the_owner(tmp_path, how):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    if how == "switch":
-        other = store.create_project("Other")
-        out = await tool_manage_projects_for_model(ctx, action="switch", project_id=other)
-    else:
-        _request(ctx, "convB", "create a project called Guest's own")
-        out = await tool_manage_projects_for_model(ctx, action="create", title="Guest's own")
-        other = ctx.current_project_id
-    assert other and other != pid
-    assert ctx.current_project_id == other                                  # this request works on it
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid                  # the owner keeps its binding
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-    assert "for THIS request only" in str(out)
-    assert PJ.project_guests(ctx.scratchpad, pid) == []                     # B left the owner's project
-    assert _request(ctx, "convA", "how is it going?") == pid                # the owner still has it
-    assert _request(ctx, "convB", "continue") is None                       # B never lands back in it
+def test_probe_model_is_advertised_and_dispatched(mock_context):
+    """§4QA M100/M101: the experiment instrument is a built-in — in the schema
+    the model sees AND in the dispatch table."""
+    from ghost_agent.tools import registry as R
+    names = {t["function"]["name"] for t in R.get_active_tool_definitions(mock_context, None, serve_tuned=False)}
+    assert "probe_model" in names
+    assert "probe_model" in {t["function"]["name"] for t in R.TOOL_DEFINITIONS}
+    assert callable(R.get_available_tools(mock_context).get("probe_model"))
 
 
-async def test_a_guest_leaving_a_request_only_project_keeps_the_owners_binding(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    other = store.create_project("Other")
-    await tool_manage_projects(ctx, action="switch", project_id=other)
-    await tool_manage_projects(ctx, action="exit")
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    assert _request(ctx, "convA", "how is it going?") == pid
+async def test_the_project_list_hides_the_brief_hash_map(store, tmp_path):
+    """§4QA R23: the brief hashes are system state — `list` shows each project
+    through `_model_view`, like the no-project listing (R23b)."""
+    store.create_project("Hashes", metadata={"research_brief_shas": {"research/a.md": "f" * 64}, "keep": "me"})
+    out = await tool_manage_projects(_ctx(store, tmp_path), action="list", metadata={"verbose": True})
+    assert '"keep": "me"' in out                       # the verbose listing carries the metadata
+    assert "research_brief_shas" not in out and "f" * 64 not in out
 
 
-async def test_a_conversation_that_is_not_a_guest_still_switches_normally(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convA"                                          # the owner itself
-    other = store.create_project("Other")
-    await tool_manage_projects(ctx, action="switch", project_id=other)
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == other
+async def test_a_needs_user_introspective_task_with_a_promised_file_is_built_at_the_override(tmp_path):
+    """§4QA S6b: the wording here KEEPS needs_user through the gate (a
+    "choose" task about decision-making), so the self-analysis override is
+    what routes it — and a promised theory/ file is built, never briefed."""
+    store = ProjectStore(tmp_path / "m11", sandbox_root=tmp_path / "s11")
+    pid = store.create_project("Agency", goal="Study agency")
+    desc = ("Illusion of Agency: Evaluate whether I truly choose responses or merely predict them. "
+            "Analyze decision-making → theory/agency.md")
+    from ghost_agent.core.project_advancer import settle_gate
+    assert settle_gate(desc, "needs_user", default="research") == "needs_user"   # the override's world
+    t1 = store.add_task(pid, desc)
+    calls = []
 
+    async def builder(*_a, **_k):
+        calls.append("build")
+        ws = Path(store.ensure_workspace(pid))
+        (ws / "theory").mkdir(exist_ok=True)
+        (ws / "theory" / "agency.md").write_text("# Agency\n\n" + "A real paragraph of analysis text. " * 20)
+        return CodingResult(ok=True, summary="wrote it", files=["theory/agency.md"], verified=True)
 
-async def test_a_third_conversation_that_never_joined_is_not_held_as_a_guest(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    _request(ctx, "convC", "hello")
-    ctx.conversation_key = "convC"
-    other = store.create_project("Other")
-    await tool_manage_projects(ctx, action="switch", project_id=other)
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == other               # the existing rule, unchanged
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convC"
+    async def cls(_d):
+        return "needs_user"
 
+    async def runner(name, args):
+        calls.append(name)
+        return "OK"
 
-# r14 (fresh-eye): the hold must outlast the first switch — dropping the guest
-# alone let its NEXT switch (the one the note told it to make) take the binding
-
-async def test_a_held_guest_cannot_take_the_binding_on_a_later_message(tmp_path):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    other = store.create_project("Other")
-    ctx.conversation_key = "convB"
-    await tool_manage_projects_for_model(ctx, action="switch", project_id=other)
-    assert _request(ctx, "convB", "keep working on Other") is None
-    out = await tool_manage_projects_for_model(ctx, action="switch", project_id=other)
-    assert ctx.current_project_id == other and "for THIS request only" in str(out)
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-    assert _request(ctx, "convA", "how is it going?") == pid
-
-
-async def test_a_second_switch_in_the_same_request_is_held_too(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    x, y = store.create_project("X"), store.create_project("Y")
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=x)
-    await tool_manage_projects(ctx, action="switch", project_id=y)
-    assert ctx.current_project_id == y
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-
-
-async def test_a_guest_that_exits_is_held_and_rejoining_ends_the_hold(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    _request(ctx, "convB", f"continue {pid}")
-    await tool_manage_projects(ctx, action="exit")
-    assert PJ.project_held(ctx.scratchpad, pid) == ["convB"]
-    other = store.create_project("Other")
-    await tool_manage_projects(ctx, action="switch", project_id=other)
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid                  # exit did not free it
-    await tool_manage_projects(ctx, action="switch", project_id=pid)        # back as a guest
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-    assert PJ.project_held(ctx.scratchpad, pid) == []
-
-
-async def test_a_guest_pushed_out_by_the_cap_is_held_not_free(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    for i in range(PJ._MAX_GUESTS):
-        _request(ctx, f"conv{i}", f"open {pid}")
-    assert "convB" not in PJ.project_guests(ctx.scratchpad, pid)
-    assert "convB" in PJ.project_held(ctx.scratchpad, pid)
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("Other"))
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-
-
-async def test_the_owners_new_binding_ends_every_hold(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("X"))
-    assert PJ.project_held(ctx.scratchpad, pid) == ["convB"]
-    _request(ctx, "convA", "switch")
-    ctx.conversation_key = "convA"
-    nxt = store.create_project("Next")
-    await tool_manage_projects(ctx, action="switch", project_id=nxt)
-    assert ctx.scratchpad.get(PJ._CURRENT_HELD_SENTINEL) is None
-    assert PJ.project_held(ctx.scratchpad, nxt) == []
-
-
-@pytest.mark.parametrize("next_conv", ["convA", "convC"])
-async def test_a_request_only_projects_keys_survive_whoever_speaks_next(tmp_path, next_conv):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    x = store.create_project("X")
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=x)
-    ctx.scratchpad.set("notes", "guest work in X")
-    _request(ctx, next_conv, "status?")
-    _request(ctx, "convB", "back to X please")
-    await tool_manage_projects(ctx, action="switch", project_id=x)
-    assert ctx.scratchpad.get("notes") == "guest work in X"
-
-
-async def test_the_console_switch_says_when_it_was_held(tmp_path):
-    from fastapi import HTTPException
-    from ghost_agent.api.projects_routes import _set_current_or_held
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"                                        # the last chat was the guest
-    with pytest.raises(HTTPException) as e:
-        _set_current_or_held(ctx, store.create_project("Other"))
-    assert e.value.status_code == 409 and "not switched" in e.value.detail
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    ctx.conversation_key = "convA"
-    _set_current_or_held(ctx, store.create_project("Mine"))               # the owner: no error
-
-
-async def test_a_scope_clear_keeps_the_hold(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("X"))
-    _request(ctx, "convC", "hello")                                        # parks X: a scope clear
-    _request(ctx, "convA", "status?")                                      # the owner's hydrate
-    assert PJ.project_held(ctx.scratchpad, pid) == ["convB"]
-
-
-async def test_a_hold_under_a_stale_scope_tag_survives_a_scope_clear(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    x = store.create_project("X")
-    ctx.scratchpad.set(PJ._CURRENT_HELD_SENTINEL, f"{pid}|convB", namespace=x)   # stale tag
-    PJ._hydrate_scratchpad(ctx, None)                                       # clears scope x
-    assert PJ.project_held(ctx.scratchpad, pid) == ["convB"]
-
-
-# r15 (fresh-eye)
-
-async def test_the_hold_and_the_guests_live_as_long_as_the_owners_binding(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    _request(ctx, "convG", f"open {pid}")                                   # a quiet guest
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("X"))
-    sp = ctx.scratchpad
-
-    def _age(hours):
-        for k in list(sp._timestamps):
-            sp._timestamps[k] -= hours * 3600
-    for _ in range(3):                                                      # 60 h of daily owner turns
-        _age(20)
-        _request(ctx, "convA", "how is it going?")
-    assert PJ.project_held(sp, pid) == ["convB"] and "convG" in PJ.project_guests(sp, pid)
-    _request(ctx, "convB", "work on Other")
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("Other"))
-    assert sp.get(PJ._CURRENT_SENTINEL) == pid
-
-
-async def test_a_refused_console_switch_changes_nothing(tmp_path):
-    from fastapi import HTTPException
-    from ghost_agent.api.projects_routes import _set_current_or_held
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    _request(ctx, "convB", f"open {pid}")                                   # B is the last chat
-    with pytest.raises(HTTPException):
-        _set_current_or_held(ctx, store.create_project("Q"))
-    assert ctx.current_project_id == pid                                    # not re-scoped
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]              # B keeps its seat
-    assert PJ.project_held(ctx.scratchpad, pid) == []
-    assert _request(ctx, "convB", "add this picture to the project") == pid
-
-
-@pytest.mark.parametrize("how", ["guest", "request_only"])
-async def test_an_exited_projects_keys_are_not_left_for_the_next_conversation(tmp_path, how):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    if how == "guest":
-        _request(ctx, "convB", f"continue {pid}")
-    else:
-        await tool_manage_projects(ctx, action="switch", project_id=store.create_project("X"))
-    ctx.scratchpad.set("notes", "B's notes")
-    await tool_manage_projects(ctx, action="exit")
-    _request(ctx, "convC", "hello")
-    assert ctx.scratchpad.get("notes") is None
-
-
-async def test_guests_under_a_stale_scope_tag_survive_a_scope_clear(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    x = store.create_project("X")
-    ctx.scratchpad.set(PJ._CURRENT_GUESTS_SENTINEL, f"{pid}|convB", namespace=x)  # stale tag
-    PJ._hydrate_scratchpad(ctx, None)
-    assert PJ.project_guests(ctx.scratchpad, pid) == ["convB"]
-
-
-async def test_no_number_of_later_holds_frees_a_held_guest(tmp_path):
-    # r16: the held list was capped at 32; the 33rd hold freed the first one
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("Q"))
-    for i in range(41):
-        PJ._add_held(ctx.scratchpad, pid, f"conv{i}")
-    assert "convB" in PJ.project_held(ctx.scratchpad, pid)
-    _request(ctx, "convB", "work on R")
-    ctx.conversation_key = "convB"
-    await tool_manage_projects(ctx, action="switch", project_id=store.create_project("R"))
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-
-
-@pytest.mark.parametrize("how", ["archive", "delete"])
-async def test_a_held_guest_closing_its_request_only_project_keeps_the_owners_binding(tmp_path, how):
-    # r17: forget_project_pointer → _set_current(None) deleted every sentinel,
-    # and the guest's next switch then took the binding
-    from ghost_agent.tools.projects import forget_project_pointer
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convB"
-    scratch = store.create_project("Scratch")
-    await tool_manage_projects(ctx, action="switch", project_id=scratch)
-    if how == "delete":
-        assert store.delete_project(scratch, hard=True)
-    forget_project_pointer(ctx, scratch)
-    assert ctx.current_project_id is None
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) == pid
-    assert ctx.scratchpad.get(PJ._CURRENT_CONV_SENTINEL) == "convA"
-    assert PJ.project_held(ctx.scratchpad, pid) == ["convB"]
-    assert _request(ctx, "convA", "how is it going?") == pid
-
-
-async def test_the_owner_closing_its_own_project_still_clears_the_binding(tmp_path):
-    from ghost_agent.tools.projects import forget_project_pointer
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    _request(ctx, "convA", "archive it"); ctx.conversation_key = "convA"
-    forget_project_pointer(ctx, pid)
-    assert ctx.scratchpad.get(PJ._CURRENT_SENTINEL) is None
-
-
-async def test_a_conversations_own_binding_is_not_anothers(tmp_path):
-    PJ, ctx, store, pid = await _owner_and_guest(tmp_path)
-    ctx.conversation_key = "convA"
-    assert not PJ._binding_is_anothers(ctx.scratchpad, "x" * 12, ctx)
-    ctx.conversation_key = "convB"
-    assert PJ._binding_is_anothers(ctx.scratchpad, "x" * 12, ctx)
-    assert not PJ._binding_is_anothers(ctx.scratchpad, pid, ctx)            # closing the bound one itself
+    await pa.advance_many(_ctx(store, tmp_path), pid, max_tasks=1, tool_runner=runner,
+                          llm_classifier=cls, coding_executor=builder, owner_requested=True)
+    assert calls == ["build"] and store.get_task(t1)["status"] == "DONE"

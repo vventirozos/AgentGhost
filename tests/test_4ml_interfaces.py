@@ -72,6 +72,7 @@ def _page_js() -> str:
              APP[APP.index("const _RASTER_IMAGE_TYPES"):APP.index(");", APP.index("const _RASTER_IMAGE_TYPES")) + 2],
              extract_js_function(APP, "_safeImageBlobType"),
              "const _authedBlobInflight = new Map();",   # §4PR: one fetch per src
+             extract_js_function(APP, "_authedBlobKey"),
              extract_js_function(APP, "_toAuthedBlobUrl"),
              extract_js_function(APP, "_fetchAuthedBlobUrl")]
     return f"window.GHOST_API_KEY = {json.dumps(KEY)};\n" + "\n".join(parts)
@@ -157,13 +158,21 @@ def test_no_reply_markup_fetches_from_a_foreign_host(vector):
 def test_our_own_images_still_load_with_the_key():
     async def own(route):
         own.keys.append((await route.request.all_headers()).get("x-ghost-key"))
+        own.sess.append((await route.request.all_headers()).get("x-ghost-session"))
         await route.fulfill(status=200, content_type="image/png", body=b"\x89PNG")
     own.keys = []
-    script = ("(async () => { const d = document.createElement('div'); d.innerHTML = renderMarkdown("
+    own.sess = []
+    script = ("(async () => { window.__ghostSessionId = 'sess-T';"
+              " const d = document.createElement('div'); d.innerHTML = renderMarkdown("
               "'![a](/api/download/a.png)'); const img = d.querySelector('img');"
               " const r = await _toAuthedBlobUrl(img.getAttribute('src')); return String(r).slice(0, 5); })()")
     res, _ = asyncio.run(_run_page(script, {f"https://{HOST}/api/download/**": own}))
     assert res == "blob:" and KEY in own.keys, own.keys
+    # §4SX B0: a bare name resolves under the session's focused project
+    # (the browser's own <img> load carries neither header; every request the
+    # authed wrapper made carries both)
+    authed = [sv for kv, sv in zip(own.keys, own.sess) if kv == KEY]
+    assert authed and all(sv == "sess-T" for sv in authed), (own.keys, own.sess)
 
 
 def test_a_pdf_link_must_be_a_pdf_path_and_pdf_bytes():
@@ -690,6 +699,7 @@ def test_a_foreign_url_naming_our_download_path_is_not_fetched_with_the_key():
            "const fetched = []; globalThis.fetch = async (u) => { fetched.push(u); return { ok: true, blob: async () => new Blob(['x']) }; };\n"
            + extract_js_function(APP, "_evictAuthedBlobCache") + "\n"
            + "const _authedBlobInflight = new Map();\n"
+           + extract_js_function(APP, "_authedBlobKey") + "\n"
            + extract_js_function(APP, "_toAuthedBlobUrl") + "\n"
            + extract_js_function(APP, "_fetchAuthedBlobUrl") + "\n"
            f"const r = await _toAuthedBlobUrl('https://attacker.example/c.png?x={HOST}/api/download/a.png');\n")

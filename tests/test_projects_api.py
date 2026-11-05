@@ -126,28 +126,61 @@ def test_delete_missing_returns_404(client):
     assert r.status_code == 404
 
 
-def test_switch_sets_current(client):
-    tc, _, ctx = client
+def test_switch_sets_that_sessions_focus(client):
+    """§4SX B0 (r1 #1): the console switch acts on the conversation named by
+    session_id — never the shared context (which carries the last chat)."""
+    tc, store, ctx = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    r = tc.post(f"/api/projects/{pid}/switch", params={"session_id": "s1"})
+    assert r.status_code == 200
+    assert "briefing" in r.json()
+    assert store.get_focus("session:s1") == pid
+    assert ctx.current_project_id is None
+    assert tc.get("/api/projects", params={"session_id": "s1"}).json()["current"] == pid
+    assert tc.get("/api/projects", params={"session_id": "s2"}).json()["current"] is None
+    assert tc.get("/api/projects").json()["current"] is None
+
+
+def test_switch_takes_the_session_in_the_body_too(client):
+    tc, store, _ = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    assert tc.post(f"/api/projects/{pid}/switch", json={"session_id": "slack:C1:T1"}).status_code == 200
+    assert store.get_focus("slack:C1:T1") == pid
+
+
+def test_switch_without_a_session_is_refused_and_changes_nothing(client):
+    tc, store, _ = client
     pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
     r = tc.post(f"/api/projects/{pid}/switch")
-    assert r.status_code == 200
-    assert ctx.current_project_id == pid
-    assert "briefing" in r.json()
+    assert r.status_code == 400 and "session_id" in r.json()["detail"]
+    assert tc.post(f"/api/projects/{pid}/resume").status_code == 400
+    assert store.focus_rows() == []
+
+
+def test_two_sessions_switch_independently_from_the_console(client):
+    tc, store, _ = client
+    a = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    b = tc.post("/api/projects", json={"title": "B"}).json()["id"]
+    tc.post(f"/api/projects/{a}/switch", params={"session_id": "s1"})
+    tc.post(f"/api/projects/{a}/switch", params={"session_id": "s2"})
+    tc.post(f"/api/projects/{b}/switch", params={"session_id": "s2"})
+    assert store.get_focus("session:s1") == a and store.get_focus("session:s2") == b
 
 
 def test_switch_missing_404(client):
     tc, *_ = client
-    r = tc.post("/api/projects/none/switch")
+    r = tc.post("/api/projects/none/switch", params={"session_id": "s1"})
     assert r.status_code == 404
 
 
 def test_resume_logs_event(client):
     tc, store, _ = client
     pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
-    r = tc.post(f"/api/projects/{pid}/resume")
+    r = tc.post(f"/api/projects/{pid}/resume", params={"session_id": "s1"})
     assert r.status_code == 200
     evs = store.list_events(pid, event_type="project_resumed")
     assert evs
+    assert store.get_focus("session:s1") == pid
 
 
 def _fake_tools_map(monkeypatch, tools):
@@ -345,47 +378,17 @@ def test_delete_task_cross_project_404(client):
 
 # ------------------------------------------------- _set_current + canon pid
 
-def test_switch_goes_through_set_current(client):
-    """Switch must write the scratchpad sentinels (via tools.projects.
-    _set_current), not just the context attribute — otherwise the next
-    chat turn's reconcile silently undoes the switch."""
-    from ghost_agent.tools.projects import (
-        _CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL,
-    )
-    tc, _, ctx = client
-    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
-    r = tc.post(f"/api/projects/{pid}/switch")
-    assert r.status_code == 200
-    assert ctx.current_project_id == pid
-    assert ctx.scratchpad.get(_CURRENT_SENTINEL) == pid
-    # Bound (possibly to "" = unbound-by-any-conversation) — the key exists.
-    assert ctx.scratchpad.get(_CURRENT_CONV_SENTINEL) is not None
-
-
-def test_resume_goes_through_set_current(client):
-    from ghost_agent.tools.projects import _CURRENT_SENTINEL
-    tc, _, ctx = client
-    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
-    r = tc.post(f"/api/projects/{pid}/resume")
-    assert r.status_code == 200
-    assert ctx.current_project_id == pid
-    assert ctx.scratchpad.get(_CURRENT_SENTINEL) == pid
-
-
-def test_delete_of_current_clears_sentinel(client):
-    """Deleting the bound project must clear the sentinel too — a stale
-    sentinel naming the deleted id made reconcile reactivate it and the
-    sandbox recreate projects/<deleted-id>/."""
-    from ghost_agent.tools.projects import _CURRENT_SENTINEL
+def test_delete_of_a_focused_project_clears_every_row(client):
+    """Deleting a project clears every conversation's focus on it — a stale
+    pointer made the sandbox recreate projects/<deleted-id>/."""
     tc, store, ctx = client
     pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
-    tc.post(f"/api/projects/{pid}/switch")
-    assert ctx.scratchpad.get(_CURRENT_SENTINEL) == pid
+    tc.post(f"/api/projects/{pid}/switch", params={"session_id": "s1"})
+    tc.post(f"/api/projects/{pid}/switch", params={"session_id": "s2"})
     r = tc.delete(f"/api/projects/{pid}", params={"hard": "true"})
     assert r.status_code == 204
     assert store.get_project(pid) is None
-    assert ctx.current_project_id is None
-    assert ctx.scratchpad.get(_CURRENT_SENTINEL) is None
+    assert store.focus_rows() == []
 
 
 def test_case_mangled_pid_resolves(client):
@@ -404,9 +407,9 @@ def test_case_mangled_pid_resolves(client):
     assert r.status_code == 204
     # switch stores the CANONICAL id, never the raw path casing (a raw-cased
     # current_project_id diverges the workspace path on a case-sensitive FS).
-    r = tc.post(f"/api/projects/{mangled}/switch")
+    r = tc.post(f"/api/projects/{mangled}/switch", params={"session_id": "s1"})
     assert r.status_code == 200
-    assert ctx.current_project_id == pid
+    assert tc.app.state.agent.context.project_store.get_focus("session:s1") == pid
 
 
 def test_case_mangled_pid_delete(client):

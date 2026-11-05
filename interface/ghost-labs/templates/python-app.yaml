@@ -1,0 +1,6 @@
+name: python-app
+description: One Python app box (/opt/venv with flask + gunicorn), port 8080 published, Tor egress
+egress: tor
+members:
+  - {name: app, image: "ghost-lab/python-app:1", mem_mb: 512, cpus: 1.0, ports: [8080]}
+readiness: {member: app, cmd: "true", timeout_s: 30}

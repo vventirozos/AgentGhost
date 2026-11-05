@@ -728,15 +728,27 @@ async def test_no_header_behaves_identically_on_any_request_id(monkeypatch, tmp_
 
 
 async def test_a_member_turn_runs_with_no_project_and_keeps_the_owners_binding(monkeypatch, tmp_path):
+    """R4/R6 (§4SX B0 form): a member's turn — even one naming the owner's
+    project, even with the owner's session id — reads and writes no focus
+    row; the owner's row is intact afterwards."""
+    from ghost_agent.memory.projects import ProjectStore
     agent, ctx, _ = _agent(monkeypatch, tmp_path)
-    ctx.current_project_id = "p-owner"
-    import ghost_agent.tools.projects as pj
-    called = []
-    monkeypatch.setattr(pj, "reconcile_conversation", lambda *a, **k: called.append(1))
-    ctx.llm_client.chat_completion = AsyncMock(return_value=_resp("ok"))
-    await agent.handle_chat({"messages": [{"role": "user", "content": "check project p-owner and tell me"}]},
+    store = ProjectStore(tmp_path / "mem")
+    pid = store.create_project("owner work")
+    store.set_focus("session:s1", pid)
+    ctx.project_store = store
+    seen = {}
+
+    async def _llm(*a, **k):
+        seen["pid"] = ctx.current_project_id
+        return _resp("ok")
+    ctx.llm_client.chat_completion = AsyncMock(side_effect=_llm)
+    await agent.handle_chat({"messages": [{"role": "user", "content": f"check project {pid} and tell me"}],
+                             "session_id": "s1"},
                             FakeBgTasks(), request_id="web-1", requester_role="member")
-    assert called == [] and ctx.current_project_id == "p-owner"   # restored after the member turn (R6)
+    assert seen["pid"] is None
+    assert [r["conversation_key"] for r in store.focus_rows()] == ["session:s1"]
+    assert store.get_focus("session:s1") == pid
 
 
 async def test_a_members_turn_is_not_written_into_the_owners_episodic_memory(monkeypatch, tmp_path):
@@ -813,7 +825,8 @@ async def test_a_members_image_arguments_are_allowlisted(monkeypatch, tmp_path, 
 async def test_a_member_turn_runs_outside_the_owners_scope_and_restores_it(monkeypatch, tmp_path):
     """R6 (CRIT): a stale conversation_key let project-scoped paths fall back
     to the owner's bound project on a member turn. In-turn: no project, no
-    conversation; after the turn: the owner's scope is back."""
+    conversation. §4SX B0: the turn's scope is its own, so nothing has to be
+    restored — the owner's next request loads its own focus row."""
     agent, ctx, _ = _agent(monkeypatch, tmp_path)
     ctx.current_project_id = "p-owner"
     ctx.conversation_key = "owner-conv"
@@ -827,9 +840,25 @@ async def test_a_member_turn_runs_outside_the_owners_scope_and_restores_it(monke
     agent.available_tools = {"image_generation": AsyncMock(side_effect=_img)}
     ctx.llm_client.chat_completion = AsyncMock(side_effect=[
         _resp("", [_tc("c0", "image_generation", {"prompt": "a cat"})]), _resp("Done."), _resp("Done.")])
-    await agent.handle_chat({"messages": [{"role": "user", "content": "make an image of a cat"}]},
+    await agent.handle_chat({"messages": [{"role": "user", "content": "make an image of a cat"}],
+                             "session_id": "s1"},
                             FakeBgTasks(), request_id="web-1", requester_role="member")
     assert seen == {"pid": None, "conv": "", "captured": None}, seen
+
+
+async def test_a_member_turn_never_changes_a_real_contexts_value_outside_it(tmp_path):
+    """§4SX B0: on the real GhostContext the member's scope applies inside
+    its request only; the context's own value is untouched."""
+    from types import SimpleNamespace as _NS
+    from ghost_agent.core import request_scope as RS
+    from ghost_agent.core.agent import GhostContext
+    ctx = GhostContext(_NS(), tmp_path, tmp_path, None)
+    ctx.current_project_id, ctx.conversation_key = "p-owner", "owner-conv"
+    tok = RS.install(RS.RequestScope(origin="member", context=ctx))
+    try:
+        assert ctx.current_project_id is None and ctx.conversation_key == ""
+    finally:
+        RS.reset(tok)
     assert ctx.current_project_id == "p-owner" and ctx.conversation_key == "owner-conv"
 
 
@@ -1108,22 +1137,38 @@ def test_a_members_upload_lands_at_the_root_even_with_a_project_bound(tmp_path):
 
 
 async def test_the_owners_scratchpad_scope_is_restored_after_a_member_turn(monkeypatch, tmp_path):
+    """The member's turn writes with no project scope; the owner's project
+    keys are snapshotted (not lost) and the owner's next request with its
+    focus hydrates them back (§4SX B0: like any other conversation)."""
+    from ghost_agent.memory.projects import ProjectStore
+    from ghost_agent.memory.scratchpad import Scratchpad
     agent, ctx, _ = _agent(monkeypatch, tmp_path)
-    sp = MagicMock(); sp.list_all.return_value = ""; sp.get.return_value = None
-    sp.active_namespace = "p-owner"
+    store = ProjectStore(tmp_path / "mem")
+    pid = store.create_project("owner work")
+    store.set_focus("session:own", pid)
+    ctx.project_store = store
+    sp = Scratchpad()
+    sp.active_namespace = pid
+    sp.set("owner_note", "secret plan", namespace=pid)
     ctx.scratchpad = sp
-    ctx.current_project_id = "p-owner"
     seen = {}
 
     async def _img(**kw):
         seen["ns"] = sp.active_namespace
+        seen["note"] = sp.get("owner_note")
         return "SUCCESS: Image generated."
     agent.available_tools = {"image_generation": AsyncMock(side_effect=_img)}
     ctx.llm_client.chat_completion = AsyncMock(side_effect=[
         _resp("", [_tc("c0", "image_generation", {"prompt": "a cat"})]), _resp("Done."), _resp("Done.")])
     await agent.handle_chat({"messages": [{"role": "user", "content": "make an image of a cat"}]},
                             FakeBgTasks(), request_id="web-1", requester_role="member")
-    assert seen["ns"] is None and sp.active_namespace == "p-owner"
+    assert seen == {"ns": None, "note": None}, seen
+    from tests.focus_helpers import start_request, end_request
+    start_request(ctx, "session:own")
+    try:
+        assert sp.active_namespace == pid and sp.get("owner_note") == "secret plan"
+    finally:
+        end_request()
 
 
 # ── round 8: whole subsystems a member turn never enters ──

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.request_scope — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="coding_loop.html">coding_loop</a>
+    <a class="current" href="request_scope.html">request_scope</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / request_scope.py — the request's project and conversation</h1>
+  <p class="subtitle">&sect;4SX B0 (2026-11-04). The project and conversation a request works in are a value carried in a ContextVar, not shared state on the agent's context. The model of conversation focus is described in <a href="../tools/projects.html#4sx-b0">projects &rarr; conversation focus</a>.</p>
+
+  <h2>What is in it</h2>
+  <ul>
+    <li><code>RequestScope(conversation_key, project_id, origin, persist, context)</code>. It is mutable on purpose. A switch that runs in a child or gathered task must change the request's project, and a child task's <code>ContextVar.set</code> would not reach its parent.</li>
+    <li><code>install(scope)</code> / <code>reset(token)</code> / <code>current_scope(context=None)</code>. With <code>context</code>, a scope is returned only when it was built for that very object.</li>
+    <li><code>conversation_key_for_session(session_id)</code> returns <code>session:&lt;id&gt;</code>, keeps a Slack <code>slack:&lt;…&gt;</code> id as-is, and returns <code>""</code> when there is none.</li>
+    <li>Origins: <code>owner</code>, <code>member</code>, <code>replay</code>, <code>probe</code>, <code>unattended</code>, <code>leaf</code>.</li>
+  </ul>
+
+  <h2>How it is used</h2>
+  <ul>
+    <li><code>GhostContext.current_project_id</code> and <code>conversation_key</code> are properties. Inside a request they read and write that context's scope. Outside one (idle loops, startup), or for a context the scope was not built for, they are the object's own value. <code>copy.copy(context)</code> keeps the values in force at copy time as the copy's own.</li>
+    <li><code>GhostAgent._build_request_scope</code> builds the scope at <code>handle_chat</code> start, right after the origin contextvar. A passed scope (a leaf's) wins. Otherwise it picks, in order: member; replay (<code>probe-fr-</code>/<code>probe-rt-</code>); probe; unattended (<code>sched-</code>/<code>sub-</code>/<code>job-</code>, or any population other than <code>user</code>); owner. Only the owner with a session id gets <code>persist=True</code>. Without a session id, the key is the first-message hash, which still pairs previews and late corrections.</li>
+    <li><code>tools.projects.begin_request_focus</code> runs inside the turn lock. A persisting scope reads its conversation's focus row, and the shared scratchpad follows the request's project.</li>
+    <li><code>tools.projects._set_current</code> writes the row (switch/create/resume) or clears it (exit), and only for a persisting scope.</li>
+    <li>The streamed drain runs after <code>handle_chat</code>'s finally. It captures the scope and re-installs it, like the other request contextvars.</li>
+  </ul>
+  <p>Pins: <code>tests/test_project_conversation_scope.py</code>.</p>
+</main>
+</body>
+</html>

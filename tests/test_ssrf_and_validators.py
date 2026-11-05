@@ -3,7 +3,7 @@
 import pytest
 
 from ghost_agent.utils.helpers import url_ssrf_reason
-from ghost_agent.tools.validators import validate_shell, validate_sql
+from ghost_agent.tools.validators import validate_shell
 
 
 class TestSSRFGuard:
@@ -65,20 +65,3 @@ class TestShellDenyList:
         assert ok is True
 
 
-class TestSQLConfirm:
-    def test_drop_blocked_without_confirm(self):
-        ok, reason = validate_sql("DROP TABLE users")
-        assert ok is False and "confirm" in reason.lower()
-
-    def test_drop_allowed_with_confirm(self):
-        ok, _ = validate_sql("DROP TABLE users", confirm=True)
-        assert ok is True
-
-    def test_truncate_blocked_without_confirm(self):
-        ok, _ = validate_sql("TRUNCATE logs")
-        assert ok is False
-
-    def test_unguarded_delete_still_blocked_even_with_confirm(self):
-        # confirm only authorises DROP/TRUNCATE, not a WHERE-less DELETE.
-        ok, _ = validate_sql("DELETE FROM users", confirm=True)
-        assert ok is False

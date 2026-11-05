@@ -659,7 +659,7 @@ class TestDaemonizedServerGuard:
             "python3 server.py &>/dev/null & sleep 2 && curl -s "
             "http://localhost:8102/")
         assert out is not None
-        assert "manage_services" in out
+        assert "run action='start' lifetime='server'" in out      # §4SX D5
 
     @pytest.mark.parametrize("cmd", [
         "python3 -m http.server 8102 &",

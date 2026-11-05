@@ -339,7 +339,7 @@ def _runner_failure_hint(err: str) -> str:
                      "do not try spelling variants.")
     if "net::ERR_CONNECTION_REFUSED" in e:
         parts.append("Nothing is listening at that address — if it is your own app, it is down (check "
-                     "manage_services); if it is a public site, use another source.")
+                     "`run status`); if it is a public site, use another source.")
     if "net::ERR_CERT" in e or "SSL" in e and "certificate" in e.lower():
         parts.append("The site's certificate failed — it cannot be read over this transport; use another source.")
     if "exceeded its" in e and "budget" in e:

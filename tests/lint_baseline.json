@@ -21,7 +21,6 @@
     "unsubscriptable-object|src/ghost_agent/distill/collector.py|Value 'cached' is unsubscriptable": 2,
     "unsupported-membership-test|src/ghost_agent/memory/vector.py|Value 'neighbor_key' doesn't support membership test": 1,
     "unsupported-membership-test|src/ghost_agent/memory/vector.py|Value 'new_key' doesn't support membership test": 1,
-    "unused-import|src/ghost_agent/api/projects_routes.py|Unused JSONResponse imported from fastapi.responses": 1,
     "unused-import|src/ghost_agent/api/routes.py|Unused Depends imported from fastapi": 1,
     "unused-import|src/ghost_agent/core/agent.py|Unused NATIVE_TOOL_CALL_REPEAT imported from stream_guards": 1,
     "unused-import|src/ghost_agent/core/agent.py|Unused PARAGRAPH_LOOP_MIN_LINE imported from stream_guards": 1,

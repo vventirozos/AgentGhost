@@ -37,7 +37,6 @@ class EvalContext:
     api_key: str = ""
     ghost_home: Optional[Path] = None
     sandbox_dir: Optional[Path] = None
-    default_db: Optional[str] = None
     timeout_s: float = 240.0
     # Populated by the runner after each drive so verifiers/metrics can read it.
     last_metrics: Dict[str, Any] = field(default_factory=dict)
@@ -46,9 +45,8 @@ class EvalContext:
     def from_env(cls, base_url: str, model: str, api_key: str = "", timeout_s: float = 240.0) -> "EvalContext":
         home = Path(os.getenv("GHOST_HOME", str(Path.home() / "ghost_llamacpp")))
         sandbox = home / "sandbox"
-        db = os.getenv("GHOST_DEFAULT_DB") or "postgresql://ghost@127.0.0.1:5432/agent"
         return cls(base_url=base_url, model=model, api_key=api_key,
-                   ghost_home=home, sandbox_dir=sandbox, default_db=db, timeout_s=timeout_s)
+                   ghost_home=home, sandbox_dir=sandbox, timeout_s=timeout_s)
 
     async def ask(self, prompt: str) -> str:
         """Drive the live agent with `prompt`; return the reply text."""
@@ -73,25 +71,6 @@ class EvalContext:
         p = self.sandbox_dir / rel
         try:
             return p.read_text(errors="replace") if p.is_file() else None
-        except Exception:
-            return None
-
-    async def db_scalar(self, query: str) -> Optional[str]:
-        """Run a read-only query against the default DB directly (grounded DB
-        check that does NOT depend on the agent). Returns the first cell as a
-        string, or None on any error."""
-        if not self.default_db:
-            return None
-        try:
-            import psycopg2  # type: ignore
-            conn = psycopg2.connect(self.default_db, connect_timeout=5)
-            try:
-                cur = conn.cursor()
-                cur.execute(query)
-                row = cur.fetchone()
-                return None if row is None else str(row[0])
-            finally:
-                conn.close()
         except Exception:
             return None
 
@@ -228,14 +207,6 @@ def load_behavioral_suite() -> List[BehavioralTask]:
             return False, f"chain result wrong (expected 25 primes<100): {content[:60]!r}"
         return True, ""
 
-    # -- DB: grounded against the REAL database, not the model's arithmetic ---
-    async def _v_db(output: str, ctx: EvalContext):
-        # current_database() = 'agent'; the model cannot produce 'agent:169'
-        # without actually running the query. Cross-check the live DB too.
-        truth = await ctx.db_scalar("SELECT current_database() || ':' || (13*13)::int;")
-        expect = truth or "agent:169"
-        return _has(output, expect)
-
     return [
         BehavioralTask(
             task_id="beh:code_exec_output", category="behavioral",
@@ -256,9 +227,4 @@ def load_behavioral_suite() -> List[BehavioralTask]:
             prompt=("Use Python to count how many prime numbers are below 100, then save just "
                     "that count to a file named primes_count.txt in your workspace."),
             verify=_v_chain),
-        BehavioralTask(
-            task_id="beh:db_grounded_query", category="behavioral",
-            prompt=("Run this exact SQL on my default database and show me the exact result "
-                    "string it returns: SELECT current_database() || ':' || (13*13)::int;"),
-            verify=_v_db),
     ]
