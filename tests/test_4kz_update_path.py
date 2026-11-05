@@ -47,14 +47,14 @@ def _update(pm, gm, vm, cat, key, value, rid):
 
 # ── the profile and its mirrors ──────────────────────────────────────────────
 def test_a_changed_wife_name_leaves_one_value_in_every_store(tmp_path):
-    """Fails where HAS_WIFE fotinh, fotini and φωτεινή all stayed live, and
+    """Fails where HAS_WIFE elenna, elena and έλενα all stayed live, and
     the vector kept every spelling."""
     pm, gm, vm = _stores(tmp_path)
-    for i, v in enumerate(["Fotinh", "Fotini", "Φωτεινή"]):
+    for i, v in enumerate(["Elenna", "Elena", "Έλενα"]):
         _update(pm, gm, vm, "relationships", "wife", v, f"req-{i}")
     wife = [e for e in _edges(gm) if e[0] == "user" and e[1] == "HAS_RELATIONSHIPS_WIFE"]
-    assert wife == [("user", "HAS_RELATIONSHIPS_WIFE", "φωτεινή")]
-    assert _identity(vm) == ["User relationships_wife is Φωτεινή"]
+    assert wife == [("user", "HAS_RELATIONSHIPS_WIFE", "έλενα")]
+    assert _identity(vm) == ["User relationships_wife is Έλενα"]
 
 
 def test_a_value_changed_back_is_written(tmp_path):
@@ -78,16 +78,16 @@ def test_a_key_never_touches_its_sibling_key(tmp_path):
     """Fails where `smart_update` of "User wife is …" deleted "User
     wife_birthdate is …" (distance 0.25)."""
     pm, gm, vm = _stores(tmp_path)
-    _update(pm, gm, vm, "relationships", "wife_birthdate", "January 10, 1982", "req-a")
-    _update(pm, gm, vm, "relationships", "wife", "Fotini", "req-b")
-    assert _identity(vm) == ["User relationships_wife is Fotini", "User relationships_wife_birthdate is January 10, 1982"]
+    _update(pm, gm, vm, "relationships", "wife_birthdate", "January 7, 1982", "req-a")
+    _update(pm, gm, vm, "relationships", "wife", "Elena", "req-b")
+    assert _identity(vm) == ["User relationships_wife is Elena", "User relationships_wife_birthdate is January 7, 1982"]
 
 
 def test_a_list_field_keeps_every_item(tmp_path):
     pm, gm, vm = _stores(tmp_path)
-    _update(pm, gm, vm, "relationships", "children", "Thodoris", "req-a")
-    _update(pm, gm, vm, "relationships", "children", "Leonidas", "req-b")
-    assert _identity(vm) == ["User relationships_children is Leonidas", "User relationships_children is Thodoris"]
+    _update(pm, gm, vm, "relationships", "children", "Markos", "req-a")
+    _update(pm, gm, vm, "relationships", "children", "Kosmas", "req-b")
+    assert _identity(vm) == ["User relationships_children is Kosmas", "User relationships_children is Markos"]
 
 
 def test_a_refused_mirror_keeps_the_old_value(tmp_path):
@@ -139,37 +139,37 @@ def test_an_owner_profile_change_from_the_extractor_syncs_the_mirrors(tmp_path):
 
 
 def test_a_trip_never_replaces_the_home(tmp_path):
-    """Fails in the world of 08-15: "I'm in Kyllini this weekend" expired
+    """Fails in the world of 08-15: "I'm in Paralia this weekend" expired
     the owner's home."""
-    a = _agent(tmp_path, {"score": 0.9, "fact": "The user lives in Kyllini.",
-                          "graph_triplets": [{"subject": "User", "predicate": "LIVES_IN", "object": "Kyllini"},
-                                             {"subject": "User", "predicate": "LOCATED_IN", "object": "Kyllini"}]})
+    a = _agent(tmp_path, {"score": 0.9, "fact": "The user lives in Paralia.",
+                          "graph_triplets": [{"subject": "User", "predicate": "LIVES_IN", "object": "Paralia"},
+                                             {"subject": "User", "predicate": "LOCATED_IN", "object": "Paralia"}]})
     a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "athens"}])
-    _run(a, "USER: I'm in Kyllini this weekend with the kids. Any beach tips?\nAI: …")
+    _run(a, "USER: I'm in Paralia this weekend with the kids. Any beach tips?\nAI: …")
     e = _edges(a.context.graph_memory)
-    assert ("user", "LIVES_IN", "athens") in e and ("user", "LIVES_IN", "kyllini") not in e
+    assert ("user", "LIVES_IN", "athens") in e and ("user", "LIVES_IN", "paralia") not in e
 
 
 def test_a_role_play_across_sentences_writes_nothing(tmp_path):
     a = _agent(tmp_path, {"score": 0.95, "fact": "Likes living in London with Maria.",
                           "graph_triplets": [{"subject": "User", "predicate": "MARRIED_TO", "object": "Maria"},
                                              {"subject": "User", "predicate": "LIVES_IN", "object": "London"}]})
-    a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"}])
+    a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "elena"}])
     _run(a, "USER: Let's play a game. You are my wife Maria. We live in London.\nAI: Sure!")
     e = _edges(a.context.graph_memory)
-    assert ("user", "MARRIED_TO", "fotini") in e and ("user", "MARRIED_TO", "maria") not in e
+    assert ("user", "MARRIED_TO", "elena") in e and ("user", "MARRIED_TO", "maria") not in e
     assert not a.context.memory_system.collection.get(include=["documents"])["documents"]
 
 
 def test_x_not_y_states_x_and_corrects_y(tmp_path):
-    """Fails where "spelled Φωτεινή, not Fotini" was dropped whole."""
+    """Fails where "spelled Έλενα, not Elena" was dropped whole."""
     a = _agent(tmp_path, {"score": 0.95, "fact": "",
-                          "graph_triplets": [{"subject": "User", "predicate": "MARRIED_TO", "object": "Φωτεινή"},
-                                             {"subject": "User", "predicate": "MARRIED_TO", "object": "not Fotini"}]})
-    a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"}])
-    _run(a, "USER: my wife's name is spelled Φωτεινή, not Fotini\nAI: noted")
+                          "graph_triplets": [{"subject": "User", "predicate": "MARRIED_TO", "object": "Έλενα"},
+                                             {"subject": "User", "predicate": "MARRIED_TO", "object": "not Elena"}]})
+    a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "elena"}])
+    _run(a, "USER: my wife's name is spelled Έλενα, not Elena\nAI: noted")
     e = _edges(a.context.graph_memory)
-    assert ("user", "MARRIED_TO", "φωτεινή") in e and ("user", "MARRIED_TO", "fotini") not in e
+    assert ("user", "MARRIED_TO", "έλενα") in e and ("user", "MARRIED_TO", "elena") not in e
 
 
 def test_a_correction_removes_only_that_kind_of_fact(tmp_path):
@@ -204,21 +204,21 @@ def test_we_sold_the_bmw_retracts_it_everywhere(tmp_path):
 def test_an_age_update_is_attributed_before_it_is_anchored(tmp_path):
     """Fails where "is now 10" became "born ~2016-04" BEFORE the gate, words
     the owner never typed, and every age update was refused."""
-    a = _agent(tmp_path, {"score": 0.95, "fact": "The user's son Thodoris is now 10 years old.",
+    a = _agent(tmp_path, {"score": 0.95, "fact": "The user's son Markos is now 10 years old.",
                           "profile_update": {"category": "relationships", "key": "son",
-                                             "value": "Thodoris is now 10 years old"},
+                                             "value": "Markos is now 10 years old"},
                           "graph_triplets": []})
-    _run(a, "USER: my son Thodoris is now 10 years old\nAI: congrats")
+    _run(a, "USER: my son Markos is now 10 years old\nAI: congrats")
     son = str(a.context.profile_memory.load()["relationships"]["son"])
     assert "born ~" in son and "now born" not in son
 
 
 def test_ages_are_never_graph_facts(tmp_path):
     g = GraphMemory(tmp_path)
-    g.add_triplets([{"subject": "leonidas", "predicate": "AGE", "object": "5"},
-                    {"subject": "leonidas", "predicate": "HAS_AGE", "object": "5"},
-                    {"subject": "leonidas", "predicate": "BORN_ON", "object": "2026-03-12"}])
-    assert _edges(g) == {("leonidas", "HAS_BIRTHDATE", "2026-03-12")}
+    g.add_triplets([{"subject": "kosmas", "predicate": "AGE", "object": "5"},
+                    {"subject": "kosmas", "predicate": "HAS_AGE", "object": "5"},
+                    {"subject": "kosmas", "predicate": "BORN_ON", "object": "2026-03-09"}])
+    assert _edges(g) == {("kosmas", "HAS_BIRTHDATE", "2026-03-09")}
 
 
 def test_an_older_statement_never_replaces_a_newer_one(tmp_path):
@@ -237,14 +237,14 @@ def test_journal_items_carry_when_they_were_said(tmp_path):
     assert isinstance(j.load()[0].get("ts"), float)
 
 
-@pytest.mark.parametrize("pred,stmt,ok", [("LIVES_IN", "i'm in kyllini this weekend", False),
-                                          ("LIVES_IN", "we moved to kyllini", True),
+@pytest.mark.parametrize("pred,stmt,ok", [("LIVES_IN", "i'm in paralia this weekend", False),
+                                          ("LIVES_IN", "we moved to paralia", True),
                                           ("WORKS_AT", "i work at globex now", True),
                                           ("MARRIED_TO", "maria is a friend of mine", False)])
 def test_a_single_valued_fact_needs_its_kind_of_statement(pred, stmt, ok):
     value = stmt.split()[-1] if pred != "MARRIED_TO" else "maria"
     if pred == "LIVES_IN":
-        value = "kyllini"
+        value = "paralia"
     if pred == "WORKS_AT":
         value = "globex"
     said = owner_said(value, owner_statements("USER: " + stmt), cue=PREDICATE_CUES[pred])
@@ -264,14 +264,14 @@ def test_the_profile_mirror_outranks_a_stale_synthesis():
     vm = _vm()
     vm.add("The user lives in Athens with his family and works nearby.",
            {"type": "synthesis", "timestamp": "2026-07-07T00:00:00Z"})
-    vm.add("User location is Thrakomakedones", {"type": "identity", "timestamp": "2026-10-03T00:00:00Z"})
+    vm.add("User location is Kalopetres", {"type": "identity", "timestamp": "2026-10-03T00:00:00Z"})
     sel = vm._search_selection("where does the user live, user location")
-    assert sel and sel[0]["doc"] == "User location is Thrakomakedones"
+    assert sel and sel[0]["doc"] == "User location is Kalopetres"
 
 
 def test_a_stale_auto_name_row_is_not_a_master_summary():
     vm = _vm()
-    vm.add("The user's wife's name is Fotini.", {"type": "auto", "timestamp": "2026-01-01T00:00:00Z"})
+    vm.add("The user's wife's name is Elena.", {"type": "auto", "timestamp": "2026-01-01T00:00:00Z"})
     sel = vm._search_selection("what is the name of the user's wife")
     assert all("MASTER SUMMARY" not in vm._render_item(i) for i in sel)
 
@@ -281,26 +281,26 @@ def test_owner_facts_newest_first_with_dates(tmp_path):
     g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "athens"}])
     with sqlite3.connect(g.db_path) as c:
         c.execute("UPDATE triplets SET timestamp='2026-08-05 00:00:00'")
-    g.add_triplets([{"subject": "user", "predicate": "HAS_ADDRESS", "object": "thrakomakedones"}])
+    g.add_triplets([{"subject": "user", "predicate": "HAS_ADDRESS", "object": "kalopetres"}])
     out = g.owner_facts_matching("where do I live, my home address")
-    assert "thrakomakedones" in out[0] and "(as of" in out[0]
+    assert "kalopetres" in out[0] and "(as of" in out[0]
 
 
 @pytest.mark.parametrize("q", ["who is my wife", "my sons birthdays"])
 def test_owner_facts_reach_wife_and_sons(tmp_path, q):
     g = GraphMemory(tmp_path)
-    g.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"},
-                    {"subject": "user", "predicate": "HAS_SON", "object": "leonidas"},
-                    {"subject": "leonidas", "predicate": "BORN_ON", "object": "2026-03-12"}])
+    g.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "elena"},
+                    {"subject": "user", "predicate": "HAS_SON", "object": "kosmas"},
+                    {"subject": "kosmas", "predicate": "BORN_ON", "object": "2026-03-09"}])
     assert g.owner_facts_matching(q)
 
 
 def test_hydration_carries_owner_facts_by_kind(tmp_path):
     from ghost_agent.core.bus import MemoryBus
     g = GraphMemory(tmp_path)
-    g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "thrakomakedones"}])
+    g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "kalopetres"}])
     items = asyncio.run(MemoryBus(graph_memory=g)._fetch_graph("where do I live?"))
-    assert any("thrakomakedones" in i["text"] for i in items)
+    assert any("kalopetres" in i["text"] for i in items)
 
 
 
@@ -324,10 +324,10 @@ def test_a_sale_is_never_stored_as_a_fact(tmp_path):
 
 def test_an_auto_name_row_never_outranks_the_profile_mirror():
     vm = _vm()
-    vm.add("The user's wife's name is Fotini.", {"type": "auto", "timestamp": "2026-01-01T00:00:00Z"})
-    vm.add("User wife is Φωτεινή", {"type": "identity", "timestamp": "2026-10-03T00:00:00Z"})
+    vm.add("The user's wife's name is Elena.", {"type": "auto", "timestamp": "2026-01-01T00:00:00Z"})
+    vm.add("User wife is Έλενα", {"type": "identity", "timestamp": "2026-10-03T00:00:00Z"})
     sel = vm._search_selection("the user's wife name")
-    assert sel and sel[0]["doc"] == "User wife is Φωτεινή"
+    assert sel and sel[0]["doc"] == "User wife is Έλενα"
 
 
 def test_being_read_often_does_not_make_a_fact_newer():

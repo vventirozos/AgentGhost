@@ -42,7 +42,7 @@ JUDGE_GROUNDED_ISSUES = [
     "The agent did not fulfill the explicit user request to notify them in Slack when done.",
     "Does not verify 10 functional apps; Does not verify wallpaper changing feature",
     "The agent failed to execute the first command (`echo alpha`) requested by the user.",
-    "Stiva's Restaurant is not mentioned in the evidence.",
+    "Thalassa's Restaurant is not mentioned in the evidence.",
     # §4IY: the judge uses the same "Constraint violation:" prefix for CONTENT refutes over project constraints
     "Constraint violation: the reply names 'NeuroSynth AI' as the vendor, which appears in no evidence and contradicts the project's stated supplier.",
 ]

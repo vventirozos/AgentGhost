@@ -78,7 +78,7 @@ SPEC = {
   "Run youtube_transcribe on a YouTube URL and report download/transcription results",
   "Define a composed skill 'youtube_transcribe' with specific sequential steps and confirm its activation.",
   "Execute a sequence of shell commands (write to file, count lines, delete file, calculate result) and return only the final number.",
-  "Identify BJJ schools near 'North Athens' using web search and browsing tools.",
+  "Identify BJJ schools near 'South Athens' using web search and browsing tools.",
   "Identify the name and monthly price of the cheapest shared-vCPU plan on https://www.hetzner.com/cloud/server.",
   "Execute a specific shell command and return the exit code verbatim.",
   "Find specific information (Open University MA International Relations Security modules) when initial direct searches and browser attempts fail due to access restrictions (403/404).",

@@ -1,8 +1,8 @@
 """§4KY one-off (2026-10-03): remove the wrong "facts about the owner" the
-operator confirmed — "delete a b c heart attack is wrong":
+operator confirmed — "delete a b c broken wrist is wrong":
   A probe/test leftovers, B the agent's own project/tool state, C other people's
   or game facts (classified on a copy by the fresh-eye review, listed below
-  verbatim), plus `user EXPERIENCED heart attack`. Group D (unclear) and E
+  verbatim), plus `user EXPERIENCED broken wrist`. Group D (unclear) and E
   (life facts) are KEPT. Graph rows go through `delete_edge` (archived);
   profile fields through `delete(exact=True)`. A row no longer live is
   skipped. Run with the agent STOPPED; memory dir backed up first.
@@ -89,7 +89,7 @@ EDGES = [
 [
 "user",
 "GENERATED",
-"image of kyriakos mitsotakis"
+"image of public figure b"
 ],
 [
 "user",
@@ -454,7 +454,7 @@ EDGES = [
 [
 "user",
 "REFERENCES",
-"zoi konstantopoulou"
+"public figure a"
 ],
 [
 "user",
@@ -544,7 +544,7 @@ EDGES = [
 [
 "user",
 "REQUESTED",
-"zoi to spread legs"
+"<explicit request, redacted>"
 ],
 [
 "user",
@@ -624,7 +624,7 @@ EDGES = [
 [
 "user",
 "SEARCHES_FOR",
-"φουσέκης facebook profile leak"
+"<third-party topic, redacted>"
 ],
 [
 "user",
@@ -704,7 +704,7 @@ EDGES = [
 [
 "user",
 "WANTS",
-"kyriakos mitsotakis"
+"public figure b"
 ],
 [
 "user",
@@ -774,7 +774,7 @@ EDGES = [
 [
 "user",
 "EXPERIENCED",
-"heart attack"
+"broken wrist"
 ]
 ]
 PROFILE_FIELDS = [["root", "project_codename"], ["preferences", "last_introspection_learning"], ["preferences", "last_stats_check"], ["projects", "home_lab_worker_node"]]

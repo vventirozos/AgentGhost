@@ -132,7 +132,7 @@
     <strong>The chat stream cannot supply this.</strong> <code>/api/chat</code> carries content
     tokens only — nothing about tools, memory or thinking — so the description comes from a SECOND
     channel, exactly as it does in the browser: the interface server tails the agent's pretty log and
-    rebroadcasts every line over <code>wss://eva.taila2b1d.ts.net:8080/ws?key=…</code>, and the client turns those
+    rebroadcasts every line over <code>wss://mymac.tailnet-example.ts.net:8080/ws?key=…</code>, and the client turns those
     lines into captions. Same host, port and certificate (Let's Encrypt via <code>tailscale cert</code>, §4KR) as the voice endpoints, so
     <code>GHOST_VOICE_VERIFY_TLS</code> applies here too; <code>GHOST_LOG_WS</code> overrides the
     whole URL. The key rides in the <em>query string</em> because the endpoint is gated the way the
@@ -390,7 +390,7 @@
 
   <h3>Voice — repointed 2026-08-02</h3>
   <p>
-    STT/TTS used to target <code>http://192.168.0.24:8000</code>, a Raspberry-Pi
+    STT/TTS used to target <code>http://192.168.1.103:8000</code>, a Raspberry-Pi
     voice server (<code>faster-whisper</code> + Kokoro) that <strong>no longer exists</strong> — so
     voice on this device had been failing silently against a dead LAN host, which is why it looked
     "unused". Both now use the interface's local endpoints (see
@@ -408,7 +408,7 @@
     <li>They require <code>X-Ghost-Key</code>, like <code>/api/chat</code> already did. The interface
       serves a real certificate for its tailnet name (<code>tailscale cert</code>, renewed by §4KR), so
       TLS verification is <strong>on</strong> by default (<code>GHOST_VOICE_VERIFY_TLS=0</code> turns it
-      off). The host is <code>GHOST_HOST</code>, default <code>eva.taila2b1d.ts.net</code> — the name
+      off). The host is <code>GHOST_HOST</code>, default <code>mymac.tailnet-example.ts.net</code> — the name
       the certificate is for. (Before 2026-09 this page said self-signed, verification off.)</li>
   </ul>
   <p>

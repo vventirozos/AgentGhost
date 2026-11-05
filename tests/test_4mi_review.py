@@ -543,17 +543,17 @@ def test_a_query_word_reaches_a_longer_node_only_as_a_whole_token(tmp_path):
 # ── G-4: on-demand fields are never mirrored ─────────────────────────────────
 @pytest.mark.asyncio
 async def test_an_on_demand_profile_field_keeps_an_empty_graph_mirror():
-    """Fails where `user HAS_FOTINI_DESCRIPTION <description>` was hydrated
+    """Fails where `user HAS_ELENA_DESCRIPTION <description>` was hydrated
     by any query word inside it."""
     from ghost_agent.tools.memory import sync_owner_mirrors
-    pm = SimpleNamespace(load=lambda: {"relationships": {"fotini_description": {"v": "tall, brown hair"}}},
+    pm = SimpleNamespace(load=lambda: {"relationships": {"elena_description": {"v": "tall, brown hair"}}},
                          is_on_demand=lambda cat, k: k.endswith("_description"))
     synced = []
     gm = SimpleNamespace(sync_owner_field=lambda k, values, **kw: synced.append((k, list(values))))
     with patch("ghost_agent.memory.profile.ProfileMemory.canonicalize",
                staticmethod(lambda c, k: (c, k))):
-        await sync_owner_mirrors("relationships", "fotini_description", pm, graph_memory=gm)
-    assert synced == [("fotini_description", [])]
+        await sync_owner_mirrors("relationships", "elena_description", pm, graph_memory=gm)
+    assert synced == [("elena_description", [])]
 
 
 # ── G-1: agnostic workspace events ───────────────────────────────────────────

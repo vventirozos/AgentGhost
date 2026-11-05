@@ -29,7 +29,7 @@ async def test_remember_writes_no_graph_edges_when_off(monkeypatch):
     spawned = []
     monkeypatch.setattr(mem, "spawn_bg", lambda coro, name=None: (spawned.append(name), coro.close()))
     ms = MagicMock()
-    out = await mem.tool_remember(text="My bike is a Ducati", memory_system=ms, graph_memory=MagicMock(),
+    out = await mem.tool_remember(text="My bike is a Triumph", memory_system=ms, graph_memory=MagicMock(),
                                   llm_client=AsyncMock(), model_name="m")
     assert "graph-extract" not in spawned and "graph-extract-legacy" not in spawned, (out, spawned)
 

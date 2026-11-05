@@ -47,7 +47,7 @@ ECKIT_HIT = {"title": "eckit-geo: Grid — ECMWF", "body": "Grid specs: type=red
 @pytest.mark.skipif(not S._dict_words(), reason="no system dictionary on this host")
 @pytest.mark.parametrize("query,expected", [
     (ECKIT, ["eckit", "reduced_gg", "nxacc"]),
-    ("best pizza place Kyllini Epydos Greece", ["kyllini", "epydos", "greece"]),
+    ("best pizza place Paralia Epydos Greece", ["paralia", "epydos", "greece"]),
     ("Tempi 2003 bus accident children died", ["tempi", "died"]),          # leading subject; year dropped
     ("tiny AI neural network train 5 minutes minimal resources Python", ["tiny"]),  # plurals are dictionary words
     ("number one supplement for anti aging most researched", []),          # weak leading word, all dictionary

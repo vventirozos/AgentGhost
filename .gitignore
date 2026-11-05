@@ -2,3 +2,20 @@ __pycache__/
 *.pyc
 verify_bench_out/
 verify_bench_cache/
+
+# 11-05 leak audit: never publish secrets, keys or local run state
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.crt
+interface/*.ts.net.*
+scratchpad/
+tmp/
+.pytest_cache/
+.suite_file_times.json
+activity_digest.json
+projects_digest.json
+.claude/

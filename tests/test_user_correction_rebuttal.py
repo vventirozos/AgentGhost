@@ -54,7 +54,7 @@ def test_corpus_complaints_are_candidates(cur):
 
 
 @pytest.mark.parametrize("cur", [
-    "leonidas was born march 12 2026, thodoris was born november 25 2016.",
+    "kosmas was born march 9 2026, markos was born november 22 2016.",
     "the ball is going straight up",
     "at what date is mars gonna be the closest to earth?",
 ])
@@ -62,7 +62,7 @@ def test_plain_copula_is_not_a_negation(cur):
     """The first draft listed bare `is|are|was|were` as negations; these
     corpus messages were all 'rebuttals' of replies that mentioned the
     same words."""
-    reply = ("Leonidas was born in March 2026 and Thodoris in November 2016; the ball "
+    reply = ("Kosmas was born in March 2026 and Markos in November 2016; the ball "
              "is going up; Mars is closest to Earth at opposition, date TBD.")
     assert rebuttal_clause(cur, reply) is None
 

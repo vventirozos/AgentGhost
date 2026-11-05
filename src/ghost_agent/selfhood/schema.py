@@ -53,7 +53,7 @@ class Experience:
     # the final reply (2026-09-05). The template summary records how the
     # turn went ("reached for X and the answer landed"), never what was
     # said, so recall could surface the question and never the answer:
-    # live, "Leonidas age" returned five records of the question and none
+    # live, "Kosmas age" returned five records of the question and none
     # of the birth date. Empty on rows written before the field existed
     # (`from_dict` fills the default) and on turns with no reply text.
     answer_gist: str = ""

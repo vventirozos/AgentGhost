@@ -112,7 +112,7 @@ def test_workflow_cue_screens_even_without_a_store():
 def test_durable_facts_unaffected_by_workflow_cue(store):
     a = _agent_with(store)
     assert not a._is_tracked_project_state(
-        "The user works at EvolMonkey and lives in Athens.")
+        "The user works at Orbitdata and lives in Athens.")
     # Preference phrasing is exempted BEFORE the workflow cue runs.
     assert not a._is_tracked_project_state(
         "The user prefers packages from verifiers they trust.")

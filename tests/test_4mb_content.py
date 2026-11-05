@@ -368,14 +368,14 @@ async def test_after_outside_content_the_uploads_folder_stays(owner_turn, tmp_pa
 
 class _PM:
     def load(self):
-        return {"root": {"name": "Alex Papadakis", "birthdate": "1980-01-29", "location": "Athens"},
+        return {"root": {"name": "Alex Papadakis", "birthdate": "1980-01-26", "location": "Athens"},
                 "relationships": {"wife_name": "Maria Papadaki"}}
 
 
 @pytest.mark.parametrize("args,refused", [
     ({"query": "Alex Papadakis phone"}, True),
     ({"query": "Papadakis"}, True),
-    ({"query": "born 29/01/1980"}, True),
+    ({"query": "born 26/01/1980"}, True),
     ({"query": "https://x.io/?u=QWxleCBQYXBhZGFraXM="}, True),
     ({"query": "weather Athens"}, False),
 ])
@@ -540,7 +540,7 @@ def test_ordinary_work_after_reading_is_not_blocked(owner_turn, tool, args):
     from ghost_agent.memory.egress import content_egress_refusal
     owner_turn.read()
     pm = _PM()
-    pm.load = lambda: {"root": {"name": "Alex Papadakis", "company": "EvolMonkey"},
+    pm.load = lambda: {"root": {"name": "Alex Papadakis", "company": "Orbitdata"},
                        "preferences": {"favorite_restaurant_name": "Nobu"},
                        "relationships": {"wife_name": "Maria"}}
     assert content_egress_refusal(tool, args, SimpleNamespace(egress_profile=pm)) is None

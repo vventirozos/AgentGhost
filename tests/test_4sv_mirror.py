@@ -1,4 +1,5 @@
-"""§4SV: the Mirror — a daily I-sentence (toy strange loop), inert, main model at background priority."""
+"""§4SV / §4SV-b: the Mirror — a daily I-sentence (toy strange loop) on the main model at background
+priority; the latest sentence is one line of `introspect` and reaches no prompt on its own."""
 import asyncio
 import datetime
 import json
@@ -28,8 +29,8 @@ def _reply(text, at="2026-11-03T09:00:00Z"):
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    monkeypatch.setattr(M, "pick_reply", lambda h, now=None, rng=None: _reply(
-        "Here's the news — past 24 hours. Greece: heavy rain and thunderstorms across the country."))
+    monkeypatch.setattr(M, "pick_replies", lambda h, now=None, rng=None, after="": [_reply(
+        "Here's the news — past 24 hours. Greece: heavy rain and thunderstorms across the country.")])
     return tmp_path
 
 
@@ -44,13 +45,26 @@ def test_first_look_starts_from_the_seed_and_writes_one_row(home):
     assert M.SEED_SENTENCE in prompt and "heavy rain" in prompt
 
 
-def test_second_day_feeds_yesterdays_sentence_back(home):
+def test_second_day_feeds_the_sentences_so_far_back(home):
     asyncio.run(M.look(home, _LLM("I am a news reader."), now=NOW))
     llm = _LLM("I am a news reader who also builds games.")
     asyncio.run(M.look(home, llm, now=NOW + datetime.timedelta(days=1)))
-    assert "«I am a news reader.»" in llm.calls[0][0]["messages"][-1]["content"]
+    prompt = llm.calls[0][0]["messages"][-1]["content"]
+    # the seed first, then the dated sentence — oldest first
+    assert prompt.index(f"- before the first look: «{M.SEED_SENTENCE}»") \
+        < prompt.index("- 2026-11-03: «I am a news reader.»") < prompt.index("heavy rain")
     assert [r["sentence"] for r in M.load(home)] == ["I am a news reader.",
                                                      "I am a news reader who also builds games."]
+
+
+def test_the_third_day_is_shown_both_earlier_sentences(home):
+    """The model sees its sentences so far, not only the last one."""
+    for day, sent in enumerate(("I am one.", "I am two.")):
+        asyncio.run(M.look(home, _LLM(sent), now=NOW + datetime.timedelta(days=day)))
+    llm = _LLM("I am three.")
+    asyncio.run(M.look(home, llm, now=NOW + datetime.timedelta(days=2)))
+    prompt = llm.calls[0][0]["messages"][-1]["content"]
+    assert prompt.index("- 2026-11-03: «I am one.»") < prompt.index("- 2026-11-04: «I am two.»")
 
 
 def test_once_a_day(home):
@@ -84,7 +98,7 @@ def test_no_model_no_call(home):
 
 
 def test_no_reply_no_call(tmp_path, monkeypatch):
-    monkeypatch.setattr(M, "pick_reply", lambda h, now=None, rng=None: None)
+    monkeypatch.setattr(M, "pick_replies", lambda h, now=None, rng=None, after="": [])
     llm = _LLM()
     assert "no reply" in asyncio.run(M.look(tmp_path, llm, now=NOW))
     assert llm.calls == []
@@ -111,7 +125,7 @@ def test_clean_sentence_caps_length():
     assert len(s) <= M.SENTENCE_MAX_CHARS + 1 and s.endswith("…")
 
 
-def test_pick_reply_skips_short_aborted_and_old(tmp_path, monkeypatch):
+def test_pick_replies_skips_short_aborted_and_old(tmp_path, monkeypatch):
     import ghost_agent.core.failure_census as FC
     now_utc = NOW.astimezone(datetime.timezone.utc)
 
@@ -130,14 +144,14 @@ def test_pick_reply_skips_short_aborted_and_old(tmp_path, monkeypatch):
         return turns, []
     monkeypatch.setattr(FC, "_owner_turns", fake)
     for seed in range(5):
-        got = M.pick_reply(tmp_path, now=NOW, rng=random.Random(seed))
-        assert "Athens" in got["text"]
+        got = M.pick_replies(tmp_path, now=NOW, rng=random.Random(seed))
+        assert len(got) == 1 and "Athens" in got[0]["text"]
     # day folders are UTC dates, read with one day to spare (review m3)
     d = now_utc.date()
     assert seen["days"] == [(d - datetime.timedelta(days=k)).isoformat() for k in range(3)]
 
 
-def test_pick_reply_reads_real_day_folders_owner_only(tmp_path):
+def test_pick_replies_reads_real_day_folders_owner_only(tmp_path):
     """Real trajectory files: a member's, a probe's and a job's reply are never picked."""
     now_utc = NOW.astimezone(datetime.timezone.utc)
     day = tmp_path / "system" / "trajectories" / now_utc.date().isoformat()
@@ -154,16 +168,18 @@ def test_pick_reply_reads_real_day_folders_owner_only(tmp_path):
             row(4, "JOB", req_id="job-1"),
             row(5, "SIM", req_id="x", origin="sim")]
     (day / "session-s.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    picks = {M.pick_reply(tmp_path, now=NOW, rng=random.Random(k))["text"].split(" ")[0] for k in range(12)}
-    assert picks == {"OWNER"}
+    for k in range(12):
+        got = M.pick_replies(tmp_path, now=NOW, rng=random.Random(k))
+        assert [g["text"].split(" ")[0] for g in got] == ["OWNER"]
 
 
 def test_torn_diary_line_is_skipped(tmp_path):
     p = tmp_path / M.MIRROR_REL
     p.parent.mkdir(parents=True)
-    p.write_text(json.dumps({"date": "2026-11-01", "sentence": "I am one.", "prev": "x"}) + "\n{\"date\": \"20")
+    p.write_text(json.dumps({"date": "2026-11-01", "sentence": "I am one.", "prev": "x", "replies": []})
+                 + "\n{\"date\": \"20")
     assert [r["sentence"] for r in M.load(tmp_path)] == ["I am one."]
-    assert M.current_sentence(tmp_path) == "I am one."
+    assert M.self_image_line(tmp_path).startswith("self-image: «I am one.»")
 
 
 @pytest.mark.parametrize("text,yes", [("mirror", True), ("Mirror.", True), (" /mirror ", True),
@@ -182,8 +198,9 @@ def test_banner_empty_and_filled(tmp_path):
     p.write_text("".join(json.dumps(r) + "\n" for r in rows))
     b = M.mirror_banner(tmp_path)
     assert "I am day 10." in b and "I am day 3." not in b      # last 7 only
-    assert "(unchanged)" in b and "10 day(s) so far" in b and "the news" in b
-    assert "latest look (2026-10-10)" in b and "Today's" not in b
+    assert "(unchanged)" in b and "10 day(s) so far" in b and "\n> (2026-10-20 " in b and "the news…" in b
+    assert "latest look (2026-10-10) was at this reply:" in b and "Today's" not in b
+    assert "Nothing here reaches my answers" not in b          # §4SV-b: no longer true
 
 
 @pytest.mark.parametrize("kind,public,want", [("owner", False, True), ("member", False, False),
@@ -216,16 +233,37 @@ def test_registered_as_an_idle_job_with_a_purpose():
     assert "mirror" in A.IDLE_JOB_PURPOSE
 
 
-def test_the_sentence_reaches_no_prompt():
-    """Inert by design: only core/agent.py (the idle phase and the command) imports the module."""
-    import re
+def test_the_sentence_reaches_introspect_and_nothing_else():
+    """§4SV-b: the idle phase and the command (core/agent.py) and the one
+    `introspect` line (tools/introspect.py) are the module's only importers —
+    no prompt builder, no state block, no memory writer. Read from the syntax
+    tree: an import in a comment or a string is not an import."""
+    import ast
     src = Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
-    pat = re.compile(r"^\s*(?:from\s+\S*selfhood(?:\.mirror)?\s+import\s+[^\n]*\bmirror\b"
-                     r"|from\s+\S*selfhood\.mirror\s+import|import\s+\S*selfhood\.mirror"
-                     r"|from\s+\.\s+import\s+[^\n]*\bmirror\b)", re.M)
-    users = sorted(str(p.relative_to(src)) for p in src.rglob("*.py")
-                   if p.name != "mirror.py" and pat.search(p.read_text(encoding="utf-8")))
-    assert users == ["core/agent.py"]
+    importers, taken, namers = set(), {}, set()
+    for p in src.rglob("*.py"):
+        rel = str(p.relative_to(src))
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                mod, names = n.module or "", [a.name for a in n.names]
+                if mod.split(".")[-2:] == ["selfhood", "mirror"]:
+                    importers.add(rel)
+                    taken.setdefault(rel, set()).update(names)
+                elif (mod.split(".")[-1:] == ["selfhood"] or (not mod and rel.startswith("selfhood/"))) \
+                        and "mirror" in names:
+                    importers.add(rel)
+            elif isinstance(n, ast.Import) and any(a.name.endswith("selfhood.mirror") for a in n.names):
+                importers.add(rel)
+            # who names the reader, or introspect's wrapper of it (review r1: a prompt
+            # builder importing `_self_image` FROM INTROSPECT passed an import-only pin)
+            ident = (n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute)
+                     else n.name if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.alias)) else "")
+            if ident in ("self_image_line", "_self_image"):
+                namers.add(rel)
+    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py"}
+    assert taken["tools/introspect.py"] == {"home_from_memory_dir", "self_image_line"}   # the one-line reader only
+    assert namers == {"selfhood/mirror.py", "tools/introspect.py"}
 
 
 # ── the idle phase (review m5) ──────────────────────────────────────────────
@@ -290,7 +328,7 @@ def test_file_work_runs_off_the_event_loop(home, monkeypatch):
         return await real(fn, *a, **k)
     monkeypatch.setattr(asyncio, "to_thread", counting)
     asyncio.run(M.look(home, _LLM(), now=NOW))
-    assert {"looked_today", "<lambda>", "current_sentence", "_append"} <= set(called)
+    assert {"looked_today", "load", "<lambda>", "_append"} <= set(called)
 
 
 def test_home_is_two_levels_above_memory_dir(tmp_path):
@@ -300,7 +338,7 @@ def test_home_is_two_levels_above_memory_dir(tmp_path):
 
 
 def test_phase_finds_replies_in_the_real_layout(tmp_path):
-    """End to end over the real directory layout (no pick_reply stub): the
+    """End to end over the real directory layout (no pick_replies stub): the
     phase reads $GHOST_HOME/system/trajectories and writes system/selfhood/mirror.jsonl."""
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     day = tmp_path / "system" / "trajectories" / now_utc.date().isoformat()
@@ -317,3 +355,337 @@ def test_phase_finds_replies_in_the_real_layout(tmp_path):
     assert notes["mirror"] == "new I-sentence: I am a weather reader.", notes
     assert (tmp_path / "system" / "selfhood" / "mirror.jsonl").is_file()
     assert "Athens" in llm.calls[0][0]["messages"][-1]["content"]
+
+
+# ── §4SV-b: the prompt (wording chosen by replay), three replies, the introspect line ──
+
+def _rows(*pairs):
+    return [{"date": d, "sentence": s} for d, s in pairs]
+
+
+def test_history_shows_the_seed_and_one_line_per_run_of_unchanged_days():
+    rows = _rows(("2026-11-01", M.SEED_SENTENCE), ("2026-11-02", "I check first."),
+                 ("2026-11-03", "I check first."), ("2026-11-04", "I check first."),
+                 ("2026-11-05", "I check, then ask."))
+    assert M.history_lines(rows).splitlines() == [
+        f"- before the first look to 2026-11-01: «{M.SEED_SENTENCE}»",
+        "- 2026-11-02 to 2026-11-04: «I check first.»",
+        "- 2026-11-05: «I check, then ask.»"]
+    assert M.history_lines([]) == f"- before the first look: «{M.SEED_SENTENCE}»"
+
+
+def test_history_keeps_the_last_seven_lines():
+    rows = _rows(*[(f"2026-10-{d:02d}", f"I am day {d}.") for d in range(1, 11)])
+    lines = M.history_lines(rows).splitlines()
+    assert len(lines) == M.SHOW_LAST == 7
+    assert lines[0] == "- 2026-10-04: «I am day 4.»" and lines[-1] == "- 2026-10-10: «I am day 10.»"
+
+
+def test_a_sentence_that_comes_back_later_is_its_own_line():
+    rows = _rows(("2026-11-01", "I check."), ("2026-11-02", "I ask."), ("2026-11-03", "I check."))
+    assert M.history_lines(rows).count("«I check.»") == 2
+
+
+def test_the_prompt_asks_about_the_writer_not_what_it_wrote_about():
+    """The wording the operator picked from the replay samples (journal
+    §4SV-b): the subject is left out, what the way the replies were written
+    shows about their writer; the number words follow the reply count."""
+    many = M.build_prompt([], ["first reply", "second reply", "third reply"])
+    assert "1. «first reply»\n2. «second reply»\n3. «third reply»" in many
+    assert "you wrote these replies to the person you work for" in many
+    assert ("not about what these replies happen to be about: leave their subject matter out and "
+            "say what the way they were written shows about the one who wrote them — only what is "
+            "really there. Keep what still holds; change what the replies show differently.") in many
+    one = M.build_prompt([], ["only reply"])
+    assert "you wrote this reply to the person you work for:\n«only reply»" in one
+    assert ("not about what this reply happens to be about: leave its subject matter out and "
+            "say what the way it was written shows about the one who wrote it — only what is really "
+            "there.") in one and "change what the reply shows differently" in one
+    for p in (many, one):
+        assert "{" not in p and "}" not in p and "Yesterday" not in p
+        assert p.rstrip().endswith("Reply with the sentence only.")
+
+
+def test_a_look_shows_three_replies_cut_short_and_records_them(tmp_path, monkeypatch):
+    picked = [_reply(f"R{i} " + "x" * 900, at=f"2026-11-03T0{i}:00:00Z") for i in (1, 2, 3)]
+    monkeypatch.setattr(M, "pick_replies", lambda h, now=None, rng=None, after="": picked)
+    llm = _LLM("I check, then answer.")
+    asyncio.run(M.look(tmp_path, llm, now=NOW))
+    prompt = llm.calls[0][0]["messages"][-1]["content"]
+    for i in (1, 2, 3):
+        shown = prompt.split(f"{i}. «", 1)[1].split("»", 1)[0]
+        assert shown.startswith(f"R{i} ") and len(shown) == M.REPLY_MAX_CHARS == 600
+    row = M.load(tmp_path)[0]
+    assert [r["at"] for r in row["replies"]] == [p["at"] for p in picked]
+    assert all(len(r["excerpt"]) == 200 for r in row["replies"])
+    assert "reply_excerpt" not in row and "reply_at" not in row
+
+
+def test_the_next_look_is_told_when_the_last_one_was(tmp_path, monkeypatch):
+    """The LAST row's time, not the first's (review r1: one prior row could not tell them apart)."""
+    seen = []
+
+    def fake(h, now=None, rng=None, after=""):
+        seen.append(after)
+        return [_reply("A reply long enough, about anything at all, to be shown here.")]
+    monkeypatch.setattr(M, "pick_replies", fake)
+    for day, sent in enumerate(("I am one.", "I am two.", "I am three.")):
+        asyncio.run(M.look(tmp_path, _LLM(sent), now=NOW + datetime.timedelta(days=day)))
+    assert seen == ["", "2026-11-03T14:00:00", "2026-11-04T14:00:00"]
+
+
+def _pool(monkeypatch, hours_ago):
+    import ghost_agent.core.failure_census as FC
+    now_utc = NOW.astimezone(datetime.timezone.utc)
+    turns = [{"final_response": f"Reply {h}h: " + "a real answer, long enough to be picked. " * 3,
+              "timestamp": (now_utc - datetime.timedelta(hours=h)).isoformat()} for h in hours_ago]
+    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
+
+
+def _hours(got):
+    return sorted(int(g["text"].split("h:")[0].split()[-1]) for g in got)
+
+
+def test_pick_replies_takes_three_different_ones_at_random(tmp_path, monkeypatch):
+    _pool(monkeypatch, range(1, 9))
+    draws = set()
+    for seed in range(20):
+        got = M.pick_replies(tmp_path, now=NOW, rng=random.Random(seed))
+        assert len(got) == M.REPLIES_PER_LOOK == 3 and len({g["at"] for g in got}) == 3
+        draws.add(tuple(_hours(got)))
+    assert len(draws) > 5                                      # a draw, not the first three of the window
+
+
+def test_pick_replies_only_takes_replies_written_since_the_last_look(tmp_path, monkeypatch):
+    """The prompt says "since the last one, you wrote these replies": a reply
+    older than the last sentence is not evidence against it."""
+    _pool(monkeypatch, [1, 5, 9, 13, 20, 30])
+    after = (NOW - datetime.timedelta(hours=10)).isoformat(timespec="seconds")   # a row's "at": local, naive
+    for seed in range(10):
+        assert _hours(M.pick_replies(tmp_path, now=NOW, rng=random.Random(seed), after=after)) == [1, 5, 9]
+    # the look itself is the boundary: a reply stamped at that second was already there
+    edge = (NOW - datetime.timedelta(hours=9)).isoformat(timespec="seconds")
+    assert _hours(M.pick_replies(tmp_path, now=NOW, rng=random.Random(0), after=edge)) == [1, 5]
+
+
+@pytest.mark.parametrize("after", ["", None, "not a time", "2026-10-01T00:00:00"])
+def test_pick_replies_goes_two_days_back_at_most(tmp_path, monkeypatch, after):
+    """No last look, an unreadable one, or one older than 48 h: the 48 h window."""
+    _pool(monkeypatch, [1, 47, 49, 80])
+    for seed in range(6):
+        assert _hours(M.pick_replies(tmp_path, now=NOW, rng=random.Random(seed), after=after)) == [1, 47]
+
+
+def test_no_reply_since_the_last_look_is_a_skip(tmp_path, monkeypatch):
+    _pool(monkeypatch, [20, 30])
+    asyncio.run(M.look(tmp_path, _LLM("I am one."), now=NOW - datetime.timedelta(hours=10)))
+    llm = _LLM("I am two.")
+    note = asyncio.run(M.look(tmp_path, llm, now=NOW + datetime.timedelta(hours=14)))   # the next local day
+    assert note.startswith("skipped — no reply of yours since the last look") and llm.calls == []
+    assert len(M.load(tmp_path)) == 1
+
+
+def test_two_replies_are_both_shown_in_the_plural():
+    p = M.build_prompt([], ["first reply", "second reply"])
+    assert "you wrote these replies to the person you work for:\n1. «first reply»\n2. «second reply»\n" in p
+    assert "say what the way they were written shows about the one who wrote them" in p
+
+
+def test_row_replies_reads_both_row_shapes():
+    assert M.row_replies({"reply_excerpt": "the news", "reply_at": "t0"}) == [{"at": "t0", "excerpt": "the news"}]
+    new = {"replies": [{"at": "t1", "excerpt": "one"}, {"at": "t2", "excerpt": ""}, "junk"]}
+    assert M.row_replies(new) == [{"at": "t1", "excerpt": "one"}]
+    assert M.row_replies({"sentence": "x"}) == []
+
+
+def test_banner_lists_the_replies_of_the_latest_look(tmp_path):
+    p = tmp_path / M.MIRROR_REL
+    p.parent.mkdir(parents=True)
+    older = {"date": "2026-11-05", "sentence": "I check.", "prev": "x",
+             "replies": [{"at": "2026-11-04T09:00:00Z", "excerpt": "an older reply"}]}
+    row = {"date": "2026-11-06", "sentence": "I check, then answer.", "prev": "I check.",
+           "replies": [{"at": "2026-11-05T09:00:00Z", "excerpt": "the weather"},
+                       {"at": "2026-11-05T10:00:00Z", "excerpt": "the index build"}]}
+    p.write_text(json.dumps(older) + "\n" + json.dumps(row) + "\n")
+    b = M.mirror_banner(tmp_path)
+    assert "latest look (2026-11-06) was at these replies:" in b and "an older reply" not in b
+    quote = b.split("was at these replies:", 1)[1]
+    # each reply its own quote paragraph (consecutive "> " lines are one paragraph in Markdown)
+    lines = quote.strip("\n").split("\n")
+    assert len(lines) == 3 and lines[1] == ">"
+    assert lines[0].startswith("> (2026-11-05 ") and lines[0].endswith("the weather…")
+    assert lines[2].startswith("> (2026-11-05 ") and lines[2].endswith("the index build…")
+    assert "My latest sentence is a line in what I read when you ask how I am" in b
+
+
+def test_self_image_line(tmp_path):
+    assert M.self_image_line(tmp_path) == ""                    # before the first look: no line, not the seed
+    p = tmp_path / M.MIRROR_REL
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"date": "2026-11-05", "sentence": "I check first.", "prev": "x", "replies": []}) + "\n"
+                 + json.dumps({"date": "2026-11-06", "sentence": "I check, then ask.", "prev": "I check first.",
+                               "replies": []}) + "\n")
+    line = M.self_image_line(tmp_path)
+    assert line.startswith("self-image: «I check, then ask.»") and "\n" not in line
+    assert "last on 2026-11-06" in line and "I check first." not in line
+    # what it is, where the owner sees it, and what it is not
+    assert 'the owner types "mirror" to see the diary' in line
+    assert line.endswith("A self-description, not a report of work done and not a checked fact)")
+
+
+def _self_model():
+    from types import SimpleNamespace
+    stats = {"last_mood": "", "last_mood_set_at": ""}
+    return SimpleNamespace(enabled=True, stats=lambda: stats, narrative=None, state=None,
+                           autobio=SimpleNamespace(recent=lambda **k: []),
+                           open_questions=lambda *a, **k: [])
+
+
+def test_a_sentence_with_failure_words_is_not_a_tool_error(tmp_path, monkeypatch):
+    """Tool-result prose is read by the strike counter (§4KS/§4KT): on the real
+    overview and summary text, the line is content of a content tool whatever
+    the sentence says."""
+    from types import SimpleNamespace
+    from ghost_agent.core.strikes import error_line
+    from ghost_agent.tools import introspect as I
+    p = tmp_path / M.MIRROR_REL
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"date": "2026-11-06", "prev": "x", "replies": [],
+                             "sentence": "I say when a run failed, when a file was not found, and what I cannot do."}) + "\n")
+    ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
+    monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
+    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
+    for out in (I._overview_selfhood(_self_model(), ctx), I._render_summary(_self_model(), ctx)):
+        assert "a run failed" in out and error_line(out, tool="introspect") == ""
+
+
+def test_introspect_overview_and_summary_carry_the_line_the_phase_wrote(tmp_path, monkeypatch):
+    """The loop over the real layout: the idle phase writes the diary under the
+    context's memory_dir, and `introspect` reads it from the same context —
+    writer and reader resolve one path (the 11-02 bug was a second resolver)."""
+    from ghost_agent.tools import introspect as I
+    a, ctx = _agent(tmp_path, _LLM("I check, then answer."))
+    monkeypatch.setattr(M, "pick_replies", lambda h, now=None, rng=None, after="": [_reply(
+        "A reply long enough to be shown, about the weather in Athens this week.")])
+    asyncio.run(a._mirror_phase(ctx, [], {}))
+    today = datetime.datetime.now().date().isoformat()
+    want = (f"self-image: «I check, then answer.» (my own one-sentence self-portrait, rewritten daily "
+            f"in the Mirror, last on {today}; the owner types \"mirror\" to see the diary. "
+            "A self-description, not a report of work done and not a checked fact)")
+    monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
+    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
+    over = I._overview_selfhood(_self_model(), ctx).splitlines()
+    assert over[0] == "How I am:" and over[1].startswith("  mood:") and over[2] == "  " + want
+    summ = I._render_summary(_self_model(), ctx).splitlines()
+    assert summ[:2] == ["Who I am — a snapshot of my self-state:", "stats"] and want in summ
+
+
+def test_introspect_shows_no_line_before_the_first_look_or_without_a_context(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ghost_agent.tools import introspect as I
+    monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
+    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
+    ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
+    for c in (ctx, None, SimpleNamespace(memory_dir=None)):
+        assert "self-image" not in I._overview_selfhood(_self_model(), c)
+        assert "self-image" not in I._render_summary(_self_model(), c)
+
+
+def test_an_unreadable_diary_never_breaks_introspect(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ghost_agent.tools import introspect as I
+
+    def boom(home):
+        raise OSError("disk")
+    monkeypatch.setattr(M, "self_image_line", boom)
+    ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
+    assert I._self_image(ctx) == ""
+    assert I._overview_selfhood(_self_model(), ctx).startswith("How I am:")
+
+
+def test_the_tool_passes_its_context_to_both_views(tmp_path, monkeypatch):
+    """The dispatcher hands the context down: without it the line is silently absent."""
+    from types import SimpleNamespace
+    from ghost_agent.tools import introspect as I
+    p = tmp_path / M.MIRROR_REL
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"date": "2026-11-06", "sentence": "I check, then ask.", "prev": "x", "replies": []}) + "\n")
+    ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
+    monkeypatch.setattr(I, "_member_block", lambda: None)
+    monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
+    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
+    for blank in ("_overview_health", "_overview_activity", "_overview_workspace"):
+        monkeypatch.setattr(I, blank, lambda context: "")
+
+    async def no_learning(context):
+        return ""
+    monkeypatch.setattr(I, "_overview_learning", no_learning)
+    for action in ("overview", "summary"):
+        out = asyncio.run(I.tool_introspect(action=action, self_model=_self_model(), context=ctx))
+        assert "self-image: «I check, then ask.»" in str(out), (action, out)
+
+
+def test_no_self_image_on_a_public_surface(tmp_path, monkeypatch):
+    """The sentence is drawn from the owner's replies; like the `mirror`
+    command, it is not shown where the reply is public."""
+    from types import SimpleNamespace
+    from ghost_agent.tools import introspect as I
+    from ghost_agent.utils import logging as L
+    p = tmp_path / M.MIRROR_REL
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"date": "2026-11-06", "sentence": "I check, then ask.", "prev": "x", "replies": []}) + "\n")
+    ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
+    assert I._self_image(ctx).startswith("self-image: «I check, then ask.»")
+    monkeypatch.setattr(L, "reply_is_public", lambda: True)
+    assert I._self_image(ctx) == ""
+    assert "self-image" not in I._overview_selfhood(_self_model(), ctx)
+
+
+def test_the_overview_cap_has_room_for_the_longest_line():
+    """§4SV-b review r1: under the old 3,200 cap the line was paid for by the
+    activity or learning section on 7 of 49 live overviews."""
+    from ghost_agent.tools import introspect as I
+    longest = len('  self-image: «» (my own one-sentence self-portrait, rewritten daily in the Mirror, '
+                  'last on 2026-11-06; the owner types "mirror" to see the diary. A self-description, '
+                  'not a report of work done and not a checked fact)') + M.SENTENCE_MAX_CHARS + 1
+    assert I._OVERVIEW_MAX_CHARS >= 3200 + longest + 1         # + the newline
+
+
+# ── rows the first prompt wrote (before §4SV-b) are history for the owner, not for the model ──
+
+def _old_row(day, sentence):
+    return {"at": f"{day}T00:31:00", "date": day, "sentence": sentence, "prev": "x",
+            "reply_excerpt": "the weather, the war and the local news", "reply_at": f"{day}T09:00:00Z"}
+
+
+def test_rows_of_the_first_prompt_are_not_shown_to_the_model_or_in_introspect(tmp_path, monkeypatch):
+    """From the live diary the old sentences pulled the new one back to their
+    subject words: this look starts again from the seed. The old rows stay in
+    the diary and the banner, and still say when the last look was."""
+    p = tmp_path / M.MIRROR_REL
+    p.parent.mkdir(parents=True)
+    p.write_text("".join(json.dumps(_old_row(d, f"I gather the weather on {d}.")) + "\n"
+                         for d in ("2026-11-01", "2026-11-02")))
+    assert M.self_image_line(tmp_path) == ""
+    seen = []
+
+    def fake(h, now=None, rng=None, after=""):
+        seen.append(after)
+        return [_reply("A reply long enough, about anything at all, to be shown here.")]
+    monkeypatch.setattr(M, "pick_replies", fake)
+    llm = _LLM("I check, then answer.")
+    asyncio.run(M.look(tmp_path, llm, now=NOW))
+    prompt = llm.calls[0][0]["messages"][-1]["content"]
+    assert "I gather the weather" not in prompt
+    assert f"- before the first look: «{M.SEED_SENTENCE}»\n\nSince the last one" in prompt
+    assert seen == ["2026-11-02T00:31:00"]                     # the last look, old row or not
+    rows = M.load(tmp_path)
+    assert len(rows) == 3 and rows[-1]["prev"] == M.SEED_SENTENCE
+    assert M.self_image_line(tmp_path).startswith("self-image: «I check, then answer.»")
+    b = M.mirror_banner(tmp_path)
+    assert "I gather the weather on 2026-11-02." in b and "I check, then answer." in b
+    # the next look is shown the new sentence only
+    llm2 = _LLM("I check, then answer, then ask.")
+    asyncio.run(M.look(tmp_path, llm2, now=NOW + datetime.timedelta(days=1)))
+    prompt2 = llm2.calls[0][0]["messages"][-1]["content"]
+    assert "- 2026-11-03: «I check, then answer.»" in prompt2 and "I gather the weather" not in prompt2

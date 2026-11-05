@@ -215,7 +215,7 @@ def test_a_request_is_compared_in_its_recorded_redacted_form():
 
 def test_name_parts_and_eg_in_general_text():
     from ghost_agent.memory.lesson_scope import is_general_text
-    assert is_general_text("Leonidas-style age questions: verify the date", "how old is leonidas now ?") is False
+    assert is_general_text("Kosmas-style age questions: verify the date", "how old is kosmas now ?") is False
     assert is_general_text("When a request lists examples (e.g. several file types), handle each",
                            "list my files, e.g. the csv ones") is True
 

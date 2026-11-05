@@ -4,7 +4,7 @@ Operator: "while speaking to the agent in English, the agent sometimes
 translates my search to Greek, why?" Measured on the recorded turns: 18 of
 167 English requests that searched issued a Greek-script query (all
 Greece-local subjects — the model's own retrieval judgment, no rule told
-it to; "jiujitsu north athens" in English returned Missouri), 46 of 983
+it to; "jiujitsu south athens" in English returned Missouri), 46 of 983
 queries mixed the scripts, and 14 of 2,112 English requests were ANSWERED
 mostly in Greek (0.66% on prose lines — quoted headlines excluded). There
 was no language rule in the prompt at all. Now rule 5 under COGNITIVE
@@ -85,8 +85,8 @@ def test_quoted_greek_headlines_under_an_english_lead_are_not_a_mismatch():
 
 
 def test_query_switch_and_mixed_script_are_counted():
-    f = M.classify(_row("is there any jiujitsu school at north athens?", "Yes — three schools: …" * 4,
-                        queries=["jiujitsu north athens", "jiu jitsu athens Βόρεια Προάστια", "BJJ γυμναστήριο Χολαργός"]))
+    f = M.classify(_row("is there any jiujitsu school at south athens?", "Yes — three schools: …" * 4,
+                        queries=["jiujitsu south athens", "jiu jitsu athens Βόρεια Προάστια", "BJJ γυμναστήριο Χολαργός"]))
     assert f["n_queries"] == 3 and f["greek_queries"] == 2 and f["mixed_queries"] == 2
 
 

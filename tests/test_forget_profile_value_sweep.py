@@ -2,7 +2,7 @@
 
 Bug: `forget('mortimer')` reported success but the model kept "remembering"
 Mortimer the iguana. Root cause — pets/interests/assets live as VALUES inside
-a list (e.g. assets.pets = ["Hanzo the dog", "Mortimer the iguana"]); the
+a list (e.g. assets.pets = ["Bruno the dog", "Mortimer the iguana"]); the
 profile sweep in `tool_unified_forget` only matched KEYS, so the row (injected
 into the system prompt every turn) was never reached, while soft-delete
 tombstones like "Mortimer (removed)" piled up in the value via update()'s
@@ -36,7 +36,7 @@ def _empty_memory_system():
 def test_value_matcher_token_boundary():
     # Matches a whole token regardless of surrounding punctuation/words.
     assert _value_mentions_target("Mortimer the iguana (removed)", "mortimer")
-    assert _value_mentions_target("Hanzo the dog", "hanzo")
+    assert _value_mentions_target("Bruno the dog", "bruno")
     # Does NOT match a substring that isn't a token boundary.
     assert not _value_mentions_target("language", "age")
     assert not _value_mentions_target("therapist", "rapist")
@@ -51,15 +51,15 @@ def test_value_matcher_token_boundary():
 # --------------------------------------------------------------------------
 def test_prune_value_removes_list_item(tmp_path):
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "pets", "Hanzo the dog")
+    pm.update("assets", "pets", "Bruno the dog")
     pm.update("assets", "pets", "Mortimer the iguana")
     # Now a 2-item list.
-    assert pm.load()["assets"]["pets"] == ["Hanzo the dog", "Mortimer the iguana"]
+    assert pm.load()["assets"]["pets"] == ["Bruno the dog", "Mortimer the iguana"]
 
     res = pm.prune_value("assets", "pets", "mortimer")
     assert "Pruned" in res
-    # Surviving singleton collapses back to a scalar; Hanzo stays.
-    assert pm.load()["assets"]["pets"] == "Hanzo the dog"
+    # Surviving singleton collapses back to a scalar; Bruno stays.
+    assert pm.load()["assets"]["pets"] == "Bruno the dog"
 
 
 def test_prune_value_strips_soft_delete_tombstone(tmp_path):
@@ -99,7 +99,7 @@ def test_prune_value_missing_key(tmp_path):
 @pytest.mark.asyncio
 async def test_unified_forget_removes_pet_stored_as_value(tmp_path):
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "pets", "Hanzo the dog")
+    pm.update("assets", "pets", "Bruno the dog")
     pm.update("assets", "pets", "Mortimer the iguana")
 
     with patch("ghost_agent.tools.memory.asyncio.to_thread") as mock_to_thread:
@@ -118,9 +118,9 @@ async def test_unified_forget_removes_pet_stored_as_value(tmp_path):
         )
 
     assert "Profile" in report
-    # Hanzo survives; Mortimer is gone from the canonical store.
+    # Bruno survives; Mortimer is gone from the canonical store.
     remaining = pm.load()["assets"]["pets"]
-    assert remaining == "Hanzo the dog"
+    assert remaining == "Bruno the dog"
     assert "mortimer" not in str(pm.load()).lower()
 
 

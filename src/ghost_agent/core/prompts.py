@@ -1042,7 +1042,7 @@ You are the Subconscious Synthesizer. Extract high-signal data from this task ep
 
 ### TEMPORAL RULE
 Facts decay. NEVER write an age, a duration, or a relative date into a `fact` or a `profile_update` — they are measurements, true only on the day they were said, and they are read back months later as if current. Write the ABSOLUTE date they imply, computed from the CURRENT TIME you were given:
-- "Leonidas is 4 months old" -> "Leonidas born ~<date 4 months before today>"
+- "Kosmas is 4 months old" -> "Kosmas born ~<date 4 months before today>"
 - "started at the company 3 years ago" -> "started in ~<date 3 years before today>"
 An absolute date already in the statement ("born in March 2026") is already correct — keep it as is.
 
@@ -1059,7 +1059,7 @@ example:
   "profile_update": null,
   "graph_triplets": [
     {"subject": "User", "predicate": "OWNS", "object": "Dog"},
-    {"subject": "Dog", "predicate": "NAMED", "object": "Hanzo"}
+    {"subject": "Dog", "predicate": "NAMED", "object": "Bruno"}
   ]
 }
 """

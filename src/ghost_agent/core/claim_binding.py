@@ -2249,7 +2249,7 @@ def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFig
             out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))   # same shape test as `_is_bare_year`: "€1850" and "1,850" stay figures
             continue
         # §4IT: the figure's own digits GLUED to letters in the evidence
-        # ("Πάρνηθος203" — the pre-§4IO ddgs join) is where the reply took
+        # ("Ολύμπου203" — the pre-§4IO ddgs join) is where the reply took
         # it from; calling it absent and then a misreport of a pagination
         # "1 - 200" two lines down refuted a correct address (corpus turn
         # 45360357). A glued occurrence supports nothing for a binding

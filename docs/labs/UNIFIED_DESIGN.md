@@ -103,8 +103,8 @@ memory `workaround-outlives-its-bug`).
 ```
 RUNNING (probed 12s ago)
   machines: lab_3f2a patroni-3 [pg1 pg2 pg3] disposable, expires 15:40
-            lab_9c01 web (kept) → http://100.94.162.61:20003/
-  runs:     api   app      lab_9c01/web1  :80   up 2d   http://100.94.162.61:20003/
+            lab_9c01 web (kept) → http://100.64.0.10:20003/
+  runs:     api   app      lab_9c01/web1  :80   up 2d   http://100.64.0.10:20003/
             bench task     workspace            running 4m
 ```
 For a conversation without a project, the same block covers the conversation's inventory.
@@ -112,7 +112,7 @@ For a conversation without a project, the same block covers the conversation's i
 ## 5. Where apps live (the big move)
 
 Today's owner apps run in the sandbox (P9). Proposal: **`app` runs live on kept machines on `disorder`**:
-- Reached directly at `http://<labs host>:20xxx/` on the tailnet (D6; today's labs host 100.94.162.61). No `serve-remote.sh`, no 5-port cap, nothing
+- Reached directly at `http://<labs host>:20xxx/` on the tailnet (D6; today's labs host 100.64.0.10). No `serve-remote.sh`, no 5-port cap, nothing
   on loopback (fixes P3).
 - They survive agent restarts and sandbox recreates. Supervision comes from Docker's restart policy plus the manager's health
   check (fixes P2).
@@ -122,7 +122,7 @@ Today's owner apps run in the sandbox (P9). Proposal: **`app` runs live on kept 
 **The one complication (D3):** apps that call the agent's API. Live: `projects/48e0373aaab3/app.py` (chess-coach) uses
 `GHOST_SERVICE_TOKEN` against `host.docker.internal:8000`. Machines can't reach the tailnet (PLAN §3b, by design).
 Options: (a) a per-machine, per-app **allowance to exactly `ghost:8000`** (one host-side forwarder on the lab network
-→ the agent on `eva` (today 100.90.234.23:8000; **not** 100.122.46.101, which is the `ghost` image node, r2 #1), as an **HTTP proxy that allows only `/api/game/*`** (r2 #5), no other tailnet reach), or (b) such apps stay as `preview` in the workspace.
+→ the agent on `eva` (today 100.64.0.12:8000; **not** 100.64.0.13, which is the `ghost` image node, r2 #1), as an **HTTP proxy that allows only `/api/game/*`** (r2 #5), no other tailnet reach), or (b) such apps stay as `preview` in the workspace.
 Recommendation: **(a)**, because it is narrow and explicit, the labs service records it, and it is tested like the egress rows.
 
 **Migration of today's 8 registry rows** (P5): none has run since the 11-01 webos row. Proposal: chess-coach (project
@@ -264,7 +264,7 @@ starts with no focus.
 
 ## 11. The Docker host is a runtime setting (operator requirement, 2026-11-03)
 
-`disorder` / `100.94.162.61` (labs host) and `eva` / `100.90.234.23` (the agent, the target of the D3 path) are **today's values**, never constants. (r2 #1: an earlier draft named 100.122.46.101, which is the `ghost` image node.) Rules:
+`disorder` / `100.64.0.10` (labs host) and `eva` / `100.64.0.12` (the agent, the target of the D3 path) are **today's values**, never constants. (r2 #1: an earlier draft named 100.64.0.13, which is the `ghost` image node.) Rules:
 
 **Agent side** (all read at startup, from args with env defaults, so the isolated-copy capability clear can null them):
 | Setting | Env default | Meaning |
@@ -391,8 +391,8 @@ module is removed) → E (`postgres_admin` + Mac Postgres removal, kept-machine 
 
 ## 13. Independent review r2 (2026-11-03): findings and fixes
 
-r2 was a read-only reviewer who did not write the design. Its #1, #3 and #7 were re-verified by the author (`eva` = 100.90.234.23
-via `dscacheutil`, the launcher's `--image-gen-nodes 100.122.46.101:8000|Ghost`; `create_version` forks a new project id at
+r2 was a read-only reviewer who did not write the design. Its #1, #3 and #7 were re-verified by the author (`eva` = 100.64.0.12
+via `dscacheutil`, the launcher's `--image-gen-nodes 100.64.0.13:8000|Ghost`; `create_version` forks a new project id at
 `tools/projects.py:5436-5444`; `run_leaf_turn` calls `handle_chat` with no `session_id` at `core/coding_loop.py:490-493`).
 Each fix below **overrides** earlier text.
 
@@ -509,20 +509,20 @@ independent review before deploy. Deploy waits for `foreground_requests == 0`, t
 
 ### 15.1 Today (facts)
 - Sandbox apps are published by Docker on **eva's loopback** (127.0.0.1:8100-8104). The owner reaches them only after running
-  `~/Data/AI/bin/serve-remote.sh <port>` on eva, which runs `tailscale serve` and gives `https://eva.taila2b1d.ts.net:<port>/`. That is the middle step.
+  `~/Data/AI/bin/serve-remote.sh <port>` on eva, which runs `tailscale serve` and gives `https://mymac.tailnet-example.ts.net:<port>/`. That is the middle step.
   `tailscale serve status` on eva shows 8100, 3000 and 8088 mapped by hand.
-- The tailnet already has **MagicDNS** and **HTTPS certificates** (eva has `eva.taila2b1d.ts.net` certs; `serve` issues them).
-- The labs host has Tailscale 1.104.5, `disorder.taila2b1d.ts.net`, and `tailscale serve` with `--https`, `--http`, `--tcp`
+- The tailnet already has **MagicDNS** and **HTTPS certificates** (eva has `mymac.tailnet-example.ts.net` certs; `serve` issues them).
+- The labs host has Tailscale 1.104.5, `disorder.tailnet-example.ts.net`, and `tailscale serve` with `--https`, `--http`, `--tcp`
   and `--service` (Tailscale Services: a distinct name + virtual IP per service).
 
 ### 15.2 Design: the agent and the labs service do the exposing, never the owner
 | Layer | What the owner gets | How | Setup |
 |---|---|---|---|
-| **1. Every app gets an HTTPS tailnet URL automatically** | `https://<labs-host>.<tailnet>.ts.net:<port>/` (today `https://disorder.taila2b1d.ts.net:20003/`), a valid certificate, works from any device signed into Tailscale | The forwarder binds **127.0.0.1:<port>** on the labs host (not the tailnet IP), and the labs service runs `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` for it, and `serve --https=<port> off` on stop/destroy. Port = the stable per-(lineage, app) lease | none |
+| **1. Every app gets an HTTPS tailnet URL automatically** | `https://<labs-host>.<tailnet>.ts.net:<port>/` (today `https://disorder.tailnet-example.ts.net:20003/`), a valid certificate, works from any device signed into Tailscale | The forwarder binds **127.0.0.1:<port>** on the labs host (not the tailnet IP), and the labs service runs `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` for it, and `serve --https=<port> off` on stop/destroy. Port = the stable per-(lineage, app) lease | none |
 | **2. One page lists every app** | **`https://<labs-host>.<tailnet>.ts.net/`** (port 443), a read-only **Apps** page: name, project, state (up/restarting/crashloop/stopped), link, RAM, last deploy. One bookmark for everything | Served by the labs service (static HTML from `/v1/labs`, no secrets, no actions), via `tailscale serve --https=443` | none |
 | **3. Previews are exposed too** | `https://<agent-host>.<tailnet>.ts.net:<8100-8104>/` for `server` runs in the workspace, with no `serve-remote.sh` | When a `server` run starts on a published port, the agent runs the same thing `serve-remote.sh` does (and removes it on stop). The Apps page also lists live previews (the agent pushes the list to the labs service) | verify that the launchd daemon can call the Tailscale CLI on macOS (`serve-remote.sh` already locates it in the app bundle); else a tiny root helper |
 | **4. Optional: a name per app** | `https://chess.<tailnet>.ts.net/`, no port numbers | Tailscale Services (`tailscale serve --service=svc:chess …`). It needs a one-time admin-console step: define the services or a tag, and `autoApprovers` for the labs host | **one-time admin console + a test on day 1**; if it works, apps get names and layer 1 stays as a fallback |
-| **5. Optional, per app: the home LAN** | `http://192.168.0.235:<port>/` for devices without Tailscale (TV, a guest) | The forwarder also binds the LAN IP. **Off by default** (the apps have no login); `lab keep … lan: true` turns it on for one app | operator choice per app |
+| **5. Optional, per app: the home LAN** | `http://192.168.1.101:<port>/` for devices without Tailscale (TV, a guest) | The forwarder also binds the LAN IP. **Off by default** (the apps have no login); `lab keep … lan: true` turns it on for one app | operator choice per app |
 
 - **Every reply that starts or deploys an app ends with its link** (from the labs API, never composed, per §11). The RUNNING block
   shows the same links. The web console gets an "Apps" link to the page of layer 2.
@@ -568,7 +568,7 @@ to use. Approval is automatic. Without it, the app keeps its port link.
 - The owner applied the §15.4 policy, tagged the labs host `tag:labs` (the first attempt did not save; on the second the netmap showed
   `Tags ['tag:labs']`) and defined `labs-test` (`tcp:443`, `tag:labs-app`).
 - `sudo tailscale serve --service=svc:labs-test --https=443 --yes 127.0.0.1:18080` on the labs host was auto-approved (CapMap
-  `service-host: svc:labs-test → 100.106.116.221`). From eva, `https://labs-test.taila2b1d.ts.net/` → **HTTP 200 with a valid certificate**.
+  `service-host: svc:labs-test → 100.64.0.14`). From eva, `https://labs-test.tailnet-example.ts.net/` → **HTTP 200 with a valid certificate**.
 - **Propagation delay:** the first request about 10 s after advertising timed out, and it worked a minute later. The service must
   probe the named URL with retries (≤ 2 min) before reporting a name as live, and report the port URL in the meantime.
 - Needs **sudo** (`tailscale serve` as root). The labs service runs as root, so this is fine.

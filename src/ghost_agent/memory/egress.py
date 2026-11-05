@@ -3,17 +3,17 @@
 One detector for every outbound path (the dispatch hook, the tool wrappers a
 macro or a delegate calls, the weather lookup). The first cut matched the
 profile's exact Latin substrings: the review found the postcode alone, the
-Greek spelling ("Μακεδονίας 83"), a \\u-escaped JSON string, "Makedonias
+Greek spelling ("Καλεδονίας 83"), a \\u-escaped JSON string, "Kaledonias
 street 83", a double space and a URL-encoded maps link all went out, and a
-replace without word boundaries turned "Makedonias 830" into "Athens0".
+replace without word boundaries turned "Kaledonias 830" into "Athens0".
 
 The detector works on FOLDED text (lower case, accents stripped, Greek
 transliterated) with an index map back to the original, so a match is
 replaced in the text exactly as written:
   * street + house number, either order, an optional "street/st/odos/οδός"
-    between, the street matched by its stem (Greek inflection: Μακεδονίας /
-    Μακεδονία), the number bounded (83 ≠ 830, 83A is still 83);
-  * the postcode, with or without the Greek "136 76" space.
+    between, the street matched by its stem (Greek inflection: Καλεδονίας /
+    Καλεδονία), the number bounded (83 ≠ 830, 83A is still 83);
+  * the postcode, with or without the Greek "101 01" space.
 The suburb and the city stay: they are what a local search needs.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ import re
 import unicodedata
 from urllib.parse import quote, unquote_plus
 
-#: Cyrillic look-alikes of Latin letters (§4LH review: "Mаkedoniаs" with a
+#: Cyrillic look-alikes of Latin letters (§4LH review: "Kаledoniаs" with a
 #: Cyrillic а went out)
 _CONFUSABLE = {"а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "і": "i",
                "ј": "j", "ѕ": "s", "к": "k", "м": "m", "т": "t", "в": "b", "н": "h"}
@@ -31,7 +31,7 @@ _GR2LAT = {"α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η
            "ς": "s", "τ": "t", "υ": "y", "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o"}
 _STREET_WORDS = r"(?:street|str|st|odos|odou|ave|avenue|leoforos|leof|road|rd)\.?"
 #: what may sit between a street and its number besides separators (§4LH review:
-#: "Makedonias Nr. 83", "#83", "αριθμός 83", "number 83" went out)
+#: "Kaledonias Nr. 83", "#83", "αριθμός 83", "number 83" went out)
 _NUMBER_WORDS = r"(?:no|nr|number|numero|arithmos|ar|#)\.?"
 _STREET_NUMBER = re.compile(r"([^\W\d_][\w'.-]+(?:\s+[^\W\d_][\w'.-]+)?)\s+(\d{1,4})[a-zA-Z]?\b")
 _POSTCODE = re.compile(r"\b(\d{3})\s?(\d{2})\b")
@@ -42,7 +42,7 @@ def fold(text: str):
     out, idx = [], []
     for i, ch in enumerate(text):
         # §4LH review: full-width digits, zero-width joiners and "c" for "k"
-        # ("Macedonias") all carried the address past the detector
+        # ("Caledonias") all carried the address past the detector
         if unicodedata.category(ch) == "Cf":
             continue
         ch = unicodedata.normalize("NFKC", ch)
@@ -66,7 +66,7 @@ def address_patterns(values) -> list:
         for m in _STREET_NUMBER.finditer(first):
             street_words = fold(m.group(1))[0].split()
             # the street is the word(s) before the number; a two-word match
-            # whose first word is the street ("makedonias 83 thrakomakedones")
+            # whose first word is the street ("kaledonias 83 kalopetres")
             # is handled by trying the last word too
             for street in {street_words[-1], " ".join(street_words)}:
                 stem = _stem_re(street)
@@ -75,17 +75,17 @@ def address_patterns(values) -> list:
                 pats.add(rf"(?<![\w]){stem}\w*{sep}{num}(?:[a-z]\b|\b)")
                 pats.add(rf"(?<![\w\d]){num}[a-z]?{sep}{stem}\w*")
         for m in _POSTCODE.finditer(s):
-            # never inside an identifier (§4LH review: arxiv 2401.13676,
-            # issues/13676, v1.13676.tar.gz were rewritten); "136-76" and
-            # "GR-13676" are still the postcode. A bare "PR 13676" is scrubbed
+            # never inside an identifier (§4LH review: arxiv 2401.10101,
+            # issues/10101, v1.10101.tar.gz were rewritten); "101-01" and
+            # "GR-10101" are still the postcode. A bare "PR 10101" is scrubbed
             # too — the §4LB review pinned the postcode alone as a leak.
             pats.add(rf"(?<![\d./#]){m.group(1)}[\s-]?{m.group(2)}(?![\d]|\.\d)")
     return [re.compile(p) for p in sorted(pats, key=len, reverse=True)]
 
 
 def _stem_re(street: str) -> str:
-    """The street's stem over folded text: inflection-tolerant (Μακεδονίας /
-    Μακεδονία), "dh" for "d" tolerated (Makedhonias)."""
+    """The street's stem over folded text: inflection-tolerant (Καλεδονίας /
+    Καλεδονία), "dh" for "d" tolerated (Kaledhonias)."""
     stem = street[:max(5, len(street) - 3)] if len(street) >= 5 else street
     out = re.escape(stem).replace(r"\ ", r"\s+")
     return out.replace("d", "dh?")
@@ -94,7 +94,7 @@ def _stem_re(street: str) -> str:
 def address_parts(values) -> list:
     """(street_stem_regex, house_number) pairs of the address values — for the
     call-level rule: a street and its number in ONE call, however far apart
-    ("house 83 on Makedonias", street and number in separate arguments)."""
+    ("house 83 on Kaledonias", street and number in separate arguments)."""
     parts = set()
     for v in values or ():
         first = str(v or "").split(",")[0]
@@ -116,8 +116,8 @@ def looks_like_street_address(value) -> bool:
 
 def locality(value):
     """``value`` without its street + house number and postcode — the part a
-    geocoder or a local search needs ("Makedonias 83 Thrakomakedones 13676,
-    Athens, Greece" → "Thrakomakedones, Athens, Greece"); None when nothing
+    geocoder or a local search needs ("Kaledonias 83 Kalopetres 10101,
+    Athens, Greece" → "Kalopetres, Athens, Greece"); None when nothing
     is left."""
     v = str(value or "").strip()
     pats = address_patterns([v])
@@ -211,7 +211,7 @@ def _is_url(s: str) -> bool:
 #: owner text that never leaves — a download URL or a transcribe link does).
 #: `execute` ("url_literals"): its code is the owner's own and may hold the
 #: address (a letter it writes), but the sandbox HAS Tor egress — a URL inside
-#: the code (curl 'https://…/search?q=Makedonias+83') is scrubbed (§4LH review).
+#: the code (curl 'https://…/search?q=Kaledonias+83') is scrubbed (§4LH review).
 OUTBOUND_TOOLS = {
     "web_search": None, "deep_research": None, "darkweb_search": None, "darkweb_research": None,
     "fact_check": None, "browser": None,
@@ -348,7 +348,7 @@ def scrub_tool_args(tool_name: str, args, context):
 
 def privacy_note(area: str) -> str:
     """What the model is told when its call was rewritten (§4LB r4: it did
-    not know, re-guessed the town and searched a different Makedonias Ave)."""
+    not know, re-guessed the town and searched a different Kaledonias Ave)."""
     return (f"[privacy: the owner's street address in this call was replaced by its area, '{area}', before it "
             f"left the machine. These results are for {area}; search there — never put the street, number or "
             f"postcode in a query.]")

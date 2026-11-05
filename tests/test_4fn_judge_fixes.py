@@ -1,7 +1,7 @@
 """§4FN pins — the judge, fixed where the 121 human labels said it was wrong.
 
 Three of six false REFUTEs came from one parser bug: a compound age ("5
-months and 23 days old") was read as its last component ("23 days old").
+months and 26 days old") was read as its last component ("26 days old").
 The seven false PASSes were replies that were not answers; the one shape
 that is mechanical and clean on the labelled corpus (a raw tool dump) is
 now refuted before any evidence question. And a machine verdict that a
@@ -30,75 +30,75 @@ from tests.test_memory_claim_check import PROFILE, NOW
 
 @pytest.mark.parametrize("reply", [
     # the three live false refutes of 2026-09-04 (cli feedback: correct answers)
-    "Leonidas is **5 months and 23 days old** today (born March 12, 2026 → Sept 4, 2026 = 176 days).",
-    "Thodoris is **9 years, 9 months and 10 days old** today (born November 25, 2016 → Sept 4, 2026).",
-    "You're right — good catch. Let me recompute: March 12 → September 4. Leonidas is 5 months and 23 days old.",
+    "Kosmas is **5 months and 26 days old** today (born March 9, 2026 → Sept 4, 2026 = 179 days).",
+    "Markos is **9 years, 9 months and 13 days old** today (born November 22, 2016 → Sept 4, 2026).",
+    "You're right — good catch. Let me recompute: March 9 → September 4. Kosmas is 5 months and 26 days old.",
 ])
 def test_a_correct_compound_age_is_not_refuted(reply):
     """World where it fails: the tail component is read as the whole age
-    ("Leonidas is stated as 23 day(s) old, but the stored birth date
-    2026-03-12 makes Leonidas 5.9 months old today")."""
+    ("Kosmas is stated as 23 day(s) old, but the stored birth date
+    2026-03-09 makes Kosmas 5.9 months old today")."""
     assert refute_age_claims(reply=reply, profile=PROFILE, now=dt.date(2026, 9, 4)) == []
 
 
 def test_compound_claims_are_one_claim_in_months_with_their_span():
-    claims = mcc._age_claims("Leonidas is 5 months and 23 days old.")
+    claims = mcc._age_claims("Kosmas is 5 months and 26 days old.")
     assert len(claims) == 1
     count, unit, start, end = claims[0]
-    assert unit == "month" and abs(count - (5 + 23 * 12 / 365.25)) < 0.02
-    assert start == len("Leonidas ") and end == len("Leonidas is 5 months and 23 days old")   # copula included
-    claims = mcc._age_claims("Thodoris is 9 years, 9 months and 10 days old.")
+    assert unit == "month" and abs(count - (5 + 26 * 12 / 365.25)) < 0.02
+    assert start == len("Kosmas ") and end == len("Kosmas is 5 months and 26 days old")   # copula included
+    claims = mcc._age_claims("Markos is 9 years, 9 months and 13 days old.")
     assert len(claims) == 1 and claims[0][1] == "month"
-    assert abs(claims[0][0] - (9 * 12 + 9 + 10 * 12 / 365.25)) < 0.02
+    assert abs(claims[0][0] - (9 * 12 + 9 + 13 * 12 / 365.25)) < 0.02
     # separators and spellings the corpus uses (review mutants 1–4)
-    for text in ("9 years, 9 months, 10 days old", "3 weeks and 2 days old",
-                 "1 year, 2 months and 3 weeks old", "5 months and 23 days-old"):
-        cl = mcc._age_claims("Leonidas is " + text + ".")
+    for text in ("9 years, 9 months, 13 days old", "3 weeks and 2 days old",
+                 "1 year, 2 months and 3 weeks old", "5 months and 26 days-old"):
+        cl = mcc._age_claims("Kosmas is " + text + ".")
         assert len(cl) == 1 and cl[0][1] == "month", text
-    assert mcc._age_claims("Leonidas is 3 weeks and 2 days old.")[0][0] == pytest.approx(3 * 12 / 52 + 2 * 12 / 365.25, abs=0.01)
-    assert mcc._age_claims("Leonidas is 1 year, 2 months and 3 weeks old.")[0][0] == pytest.approx(14 + 3 * 12 / 52, abs=0.01)
+    assert mcc._age_claims("Kosmas is 3 weeks and 2 days old.")[0][0] == pytest.approx(3 * 12 / 52 + 2 * 12 / 365.25, abs=0.01)
+    assert mcc._age_claims("Kosmas is 1 year, 2 months and 3 weeks old.")[0][0] == pytest.approx(14 + 3 * 12 / 52, abs=0.01)
 
 
 def test_compound_tolerance_is_the_month_window_not_a_three_year_band():
     """§4FN review M1: '1 year and 2 months old' for a 5.9-month-old must
     refute exactly as '14 months old' does."""
     now = dt.date(2026, 9, 4)
-    assert refute_age_claims(reply="Leonidas is 14 months old.", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Leonidas is 1 year and 2 months old.", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Leonidas is 1 year, 2 months and 3 days old.", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Thodoris is 9 years, 9 months and 10 days old.", profile=PROFILE, now=now) == []
+    assert refute_age_claims(reply="Kosmas is 14 months old.", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Kosmas is 1 year and 2 months old.", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Kosmas is 1 year, 2 months and 3 days old.", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Markos is 9 years, 9 months and 13 days old.", profile=PROFILE, now=now) == []
 
 
 def test_true_months_is_exact_to_the_day():
     """§4FN review minor 2: (days % 30)/30 read 117.0 for 117.33 and 5.87
     for 5.77 — the remainder must be the days past the last whole month."""
-    assert mcc._true_months(dt.date(2026, 3, 12), dt.date(2026, 9, 4)) == pytest.approx(5 + 23 / 30.4375, abs=0.01)
-    assert mcc._true_months(dt.date(2016, 11, 25), dt.date(2026, 9, 4)) == pytest.approx(117 + 10 / 30.4375, abs=0.01)
-    assert mcc._true_months(dt.date(2026, 3, 12), dt.date(2026, 3, 12)) == 0.0
+    assert mcc._true_months(dt.date(2026, 3, 9), dt.date(2026, 9, 4)) == pytest.approx(5 + 26 / 30.4375, abs=0.01)
+    assert mcc._true_months(dt.date(2016, 11, 22), dt.date(2026, 9, 4)) == pytest.approx(117 + 13 / 30.4375, abs=0.01)
+    assert mcc._true_months(dt.date(2026, 3, 9), dt.date(2026, 3, 9)) == 0.0
 
 
 CORRECT_TWO_SUBJECT_REPLIES = (
     # the docstring's live tie case and the two §4FN C1 compound ties
-    "Your sons are 9 (Thodoris) and 5 months old (Leonidas).",
-    "Your sons are 9 years and 9 months old (Thodoris) and 5 months and 23 days old (Leonidas).",
-    "Your sons are 9 years, 9 months and 10 days old (Thodoris) and 5 months and 23 days old (Leonidas).",
+    "Your sons are 9 (Markos) and 5 months old (Kosmas).",
+    "Your sons are 9 years and 9 months old (Markos) and 5 months and 26 days old (Kosmas).",
+    "Your sons are 9 years, 9 months and 13 days old (Markos) and 5 months and 26 days old (Kosmas).",
     # the six appositive / colon / dash / comma phrasings of review C1-R2 (all correct)
-    "Thodoris (9 years old) and Leonidas (5 months old)",
-    "Leonidas (5 months old) and Thodoris (9 years old)",
-    "Thodoris: 9 years old; Leonidas: 5 months old",
-    "Thodoris — 9 years old, Leonidas — 5 months old",
-    "Thodoris, 9 years old, and Leonidas, 5 months old",
-    "Thodoris (9 years, 9 months and 10 days old) and Leonidas (5 months and 23 days old)",
+    "Markos (9 years old) and Kosmas (5 months old)",
+    "Kosmas (5 months old) and Markos (9 years old)",
+    "Markos: 9 years old; Kosmas: 5 months old",
+    "Markos — 9 years old, Kosmas — 5 months old",
+    "Markos, 9 years old, and Kosmas, 5 months old",
+    "Markos (9 years, 9 months and 13 days old) and Kosmas (5 months and 26 days old)",
     # a following name that is NOT a subject: only a symmetric gap keeps the
-    # true subject (asymmetric-by-name-length bound "9 years" to Leonidas)
-    "Thodoris is 9 years old, like Leonidas.",
-    "Thodoris is 9 years, 9 months and 10 days old, like Leonidas.",
-    "Leonidas is 5 months old, unlike Thodoris.",
+    # true subject (asymmetric-by-name-length bound "9 years" to Kosmas)
+    "Markos is 9 years old, like Kosmas.",
+    "Markos is 9 years, 9 months and 13 days old, like Kosmas.",
+    "Kosmas is 5 months old, unlike Markos.",
     # copula and "aged" subjects, both orders
-    "Thodoris is 9 years old and Leonidas is 5 months old.",
-    "Leonidas is 5 months old and Thodoris is 9 years old.",
-    "Thodoris is 9 years old and Leonidas aged 5 months.",
-    "Leonidas is 5 months and 23 days old; Thodoris is 9 years, 9 months and 10 days old.",
+    "Markos is 9 years old and Kosmas is 5 months old.",
+    "Kosmas is 5 months old and Markos is 9 years old.",
+    "Markos is 9 years old and Kosmas aged 5 months.",
+    "Kosmas is 5 months and 26 days old; Markos is 9 years, 9 months and 13 days old.",
 )
 
 
@@ -113,21 +113,21 @@ def test_correct_two_subject_replies_are_never_refuted(reply):
 
 def test_wrong_ages_in_the_same_shapes_still_refute():
     now = dt.date(2026, 9, 4)
-    assert refute_age_claims(reply="Leonidas is 9 years and 9 months old today.", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Thodoris (5 months old) and Leonidas (9 years old)", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Leonidas: 9 years old; Thodoris: 5 months old", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Leonidas is 3 months old.", profile=PROFILE, now=now)   # upper bound: 5 < 5.8
+    assert refute_age_claims(reply="Kosmas is 9 years and 9 months old today.", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Markos (5 months old) and Kosmas (9 years old)", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Kosmas: 9 years old; Markos: 5 months old", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Kosmas is 3 months old.", profile=PROFILE, now=now)   # upper bound: 5 < 5.8
 
 
 def test_two_subjects_sharing_one_compound_are_ambiguous_not_a_claim():
-    """§4FN review M-B → round 3: 'Thodoris and Leonidas are 9 years and 5
+    """§4FN review M-B → round 3: 'Markos and Kosmas are 9 years and 5
     months old' is two ages glued together. The compound is ONE claim (its
     tail, '5 months old', is never a second one) that binds to NOBODY —
     the ambiguity is decided at the subject, where every other plural
-    surface ("Thodoris and Leonidas: …", "… are, respectively, …") is
+    surface ("Markos and Kosmas: …", "… are, respectively, …") is
     decided too, not by a copula test on the phrase."""
     now = dt.date(2026, 9, 4)
-    reply = "Thodoris and Leonidas are 9 years and 5 months old."
+    reply = "Markos and Kosmas are 9 years and 5 months old."
     claims = mcc._age_claims(reply)
     assert [(c[0], c[1]) for c in claims] == [(113.0, "month")], claims
     assert refute_age_claims(reply=reply, profile=PROFILE, now=now) == []
@@ -136,51 +136,51 @@ def test_two_subjects_sharing_one_compound_are_ambiguous_not_a_claim():
 def test_an_implausible_compound_shadows_its_tail():
     """§4FN review M-A: a declined compound must not fall through to the
     single-unit patterns ('999 years and 11 months old' → '11 months old')."""
-    claims = mcc._age_claims("The artifact is 999 years and 11 months old, Leonidas is 5 months old.")
+    claims = mcc._age_claims("The artifact is 999 years and 11 months old, Kosmas is 5 months old.")
     assert [(c[1], c[0]) for c in claims] == [("month", 5)]
 
 
 def test_a_future_birth_date_is_bad_data_not_evidence():
-    profile = {"family": {"sons": "Leonidas (born 2027-03-12)"}}
-    assert refute_age_claims(reply="Leonidas is 9 years old.", profile=profile, now=dt.date(2026, 9, 4)) == []
+    profile = {"family": {"sons": "Kosmas (born 2027-03-09)"}}
+    assert refute_age_claims(reply="Kosmas is 9 years old.", profile=profile, now=dt.date(2026, 9, 4)) == []
 
 
 def test_the_profile_writer_anchors_a_compound_as_a_whole(monkeypatch):
     """§4FN review M2: `temporal.anchor` read the tail component and anchored
-    a nine-year-old to a birth date ten days ago. A compound is known to at
+    a nine-year-old to a birth date thirteen days ago. A compound is known to at
     least the month, so it anchors in the full-date form (round 3 m1: the
     "smallest unit" expression could never yield a year and was dead)."""
     from ghost_agent.memory import temporal as tp
     said = dt.date(2026, 9, 4)
-    out = tp.anchor("Thodoris is 9 years, 9 months and 10 days old", said_at=said)
-    assert out == "Thodoris born ~2016-11-25", out                    # the copula goes with the phrase, as for single units
-    out = tp.anchor("Leonidas is 5 months and 23 days old", said_at=said)
-    assert out == "Leonidas born ~2026-03-12", out
-    out = tp.anchor("Leonidas is 1 year and 2 months old", said_at=said)
-    assert out == "Leonidas born ~2025-07-04", out                       # months → the day
+    out = tp.anchor("Markos is 9 years, 9 months and 13 days old", said_at=said)
+    assert out == "Markos born ~2016-11-22", out                    # the copula goes with the phrase, as for single units
+    out = tp.anchor("Kosmas is 5 months and 26 days old", said_at=said)
+    assert out == "Kosmas born ~2026-03-09", out
+    out = tp.anchor("Kosmas is 1 year and 2 months old", said_at=said)
+    assert out == "Kosmas born ~2025-07-04", out                       # months → the day
     # declined (implausible) and plural-subject compounds are left whole:
     # the tail must NOT be anchored on its own (review M-A / M-B)
     assert tp.anchor("the artifact is 999 years and 11 months old", said_at=said) == "the artifact is 999 years and 11 months old"
-    assert tp.anchor("Thodoris and Leonidas are 9 years and 5 months old", said_at=said) == "Thodoris and Leonidas are 9 years and 5 months old"
+    assert tp.anchor("Markos and Kosmas are 9 years and 5 months old", said_at=said) == "Markos and Kosmas are 9 years and 5 months old"
     # idempotent, and a quoted span is left alone
     assert tp.anchor(out, said_at=said) == out
-    assert tp.anchor('he wrote "5 months and 23 days old"', said_at=said) == 'he wrote "5 months and 23 days old"' or "2026" not in tp.anchor('he wrote "5 months and 23 days old"', said_at=said)
+    assert tp.anchor('he wrote "5 months and 26 days old"', said_at=said) == 'he wrote "5 months and 26 days old"' or "2026" not in tp.anchor('he wrote "5 months and 26 days old"', said_at=said)
     # the checker and the writer share ONE compound authority
     assert mcc._COMPOUND_AGE_RE is tp._COMPOUND_AGE_RE
 
 
 def test_a_wrong_compound_age_still_refutes():
-    """The compound path must not become a free pass: 9 months and 23 days
-    for a 5.8-month-old is off by four months, outside the window."""
-    issues = refute_age_claims(reply="Leonidas is 9 months and 23 days old.",
+    """The compound path must not become a free pass: 9 months and 26 days
+    for a 5.9-month-old is off by four months, outside the window."""
+    issues = refute_age_claims(reply="Kosmas is 9 months and 26 days old.",
                                profile=PROFILE, now=dt.date(2026, 9, 4))
-    assert len(issues) == 1 and "Leonidas" in issues[0] and "9.76 month(s)" in issues[0]
+    assert len(issues) == 1 and "Kosmas" in issues[0] and "9.85 month(s)" in issues[0]
 
 
 def test_single_unit_claims_are_unchanged():
-    assert refute_age_claims(reply="Leonidas is 9 years old.", profile=PROFILE, now=NOW)
-    assert refute_age_claims(reply="Leonidas is 6 months old.", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply="Leonidas is 23 days old.", profile=PROFILE, now=dt.date(2026, 9, 4))
+    assert refute_age_claims(reply="Kosmas is 9 years old.", profile=PROFILE, now=NOW)
+    assert refute_age_claims(reply="Kosmas is 6 months old.", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="Kosmas is 26 days old.", profile=PROFILE, now=dt.date(2026, 9, 4))
 
 
 # --- reply shape ---------------------------------------------------------------
@@ -430,12 +430,12 @@ def test_locked_late_verdict_is_recorded_as_withheld_at_the_real_handler(mock_co
     agent._backfill_trajectory_outcome = lambda *a, **k: backfilled.append(a)
     agent._emit_late_outcome_correction = lambda *a, **k: backfilled.append(a)
     v = VerifyResult(verdict=getattr(VerifyVerdict, verdict_name), confidence=conf,
-                     reasoning="r", issues=["Stiva's is not in the evidence"])
+                     reasoning="r", issues=["Thalassa's is not in the evidence"])
     agent._record_late_verdict(v, "t-locked")
     assert backfilled == []                                   # withheld from every consequence
     assert [r[:2] for r in recorded] == ([("t-locked", expect)] if expect else [])
     if expect:
-        assert "Stiva" in recorded[0][2]
+        assert "Thalassa" in recorded[0][2]
 
 
 def test_unlocked_late_verdict_is_not_written_to_the_withheld_channel(mock_context):
@@ -549,14 +549,14 @@ def test_override_provenance_is_chained_by_one_helper():
 
 NOT_ABOUT_THE_NAMED_PERSON = (
     # round 3 C2: a name in possessive / attributive position captured any age nearby
-    "Thodoris's laptop is 3 years old.",
-    "Thodoris goes to a school that is 40 years old.",
-    "Thodoris plays for Panellinios, a club 130 years old.",
-    "Leonidas has a cot that is 20 years old.",
-    "Leonidas Street is named after a statue that is 90 years old.",
-    "I looked it up for Thodoris — the tree is 300 years old.",
-    "Thodoris and Maria are 3 years old.",             # an unanchored name in the gap is a word too
-    "The lease is 9 years old (Leonidas signed it)",   # a bracket that does not close on the name is prose
+    "Markos's laptop is 3 years old.",
+    "Markos goes to a school that is 40 years old.",
+    "Markos plays for Sampleton BC, a club 40 years old.",
+    "Kosmas has a cot that is 20 years old.",
+    "Kosmas Street is named after a statue that is 90 years old.",
+    "I looked it up for Markos — the tree is 300 years old.",
+    "Markos and Maria are 3 years old.",             # an unanchored name in the gap is a word too
+    "The lease is 9 years old (Kosmas signed it)",   # a bracket that does not close on the name is prose
 )
 
 
@@ -569,24 +569,24 @@ def test_an_age_the_name_is_not_predicated_of_is_unbound(reply):
 
 LINKED_CORRECT = (
     # round 3 M1: one word between a name and its own age broke the punctuation cue
-    "Thodoris — now 9 years old, Leonidas — now 5 months old",
-    "Thodoris' age: 9 years old. Leonidas' age: 5 months old.",
-    "Thodoris's age is 9 years old; Leonidas's age is 5 months old",
-    "Thodoris = 9 years old, Leonidas = 5 months old",
-    "Thodoris -> 9 years old; Leonidas -> 5 months old",
-    "Thodoris, who is 9 years old, and Leonidas, who is 5 months old",
-    "**Thodoris** is currently about 9 years old",
-    "Thodoris is exactly 9 years old; Leonidas is just 5 months old",
+    "Markos — now 9 years old, Kosmas — now 5 months old",
+    "Markos' age: 9 years old. Kosmas' age: 5 months old.",
+    "Markos's age is 9 years old; Kosmas's age is 5 months old",
+    "Markos = 9 years old, Kosmas = 5 months old",
+    "Markos -> 9 years old; Kosmas -> 5 months old",
+    "Markos, who is 9 years old, and Kosmas, who is 5 months old",
+    "**Markos** is currently about 9 years old",
+    "Markos is exactly 9 years old; Kosmas is just 5 months old",
 )
 LINKED_WRONG = (
-    "Thodoris — now 5 months old, Leonidas — now 9 years old",
-    "Thodoris' age: 5 months old. Leonidas' age: 9 years old.",
-    "Thodoris's age is 5 months old; Leonidas's age is 9 years old",
-    "Thodoris = 5 months old, Leonidas = 9 years old",
-    "Thodoris -> 5 months old; Leonidas -> 9 years old",
-    "Thodoris, who is 5 months old, and Leonidas, who is 9 years old",
-    "**Thodoris** is currently about 5 months old; Leonidas is 9 years old",
-    "Thodoris is exactly 5 months old; Leonidas is just 9 years old",
+    "Markos — now 5 months old, Kosmas — now 9 years old",
+    "Markos' age: 5 months old. Kosmas' age: 9 years old.",
+    "Markos's age is 5 months old; Kosmas's age is 9 years old",
+    "Markos = 5 months old, Kosmas = 9 years old",
+    "Markos -> 5 months old; Kosmas -> 9 years old",
+    "Markos, who is 5 months old, and Kosmas, who is 9 years old",
+    "**Markos** is currently about 5 months old; Kosmas is 9 years old",
+    "Markos is exactly 5 months old; Kosmas is just 9 years old",
 )
 
 
@@ -604,7 +604,7 @@ def test_the_same_links_carry_a_wrong_age_to_its_subject(reply):
     Both children are wrong here, so both are named — identity, not
     'something refuted'."""
     issues = refute_age_claims(reply=reply, profile=PROFILE, now=dt.date(2026, 9, 4))
-    assert {i.split()[0] for i in issues} == {"Thodoris", "Leonidas"}, issues
+    assert {i.split()[0] for i in issues} == {"Markos", "Kosmas"}, issues
 
 
 def test_a_birth_date_between_the_name_and_its_age_is_a_link():
@@ -613,83 +613,83 @@ def test_a_birth_date_between_the_name_and_its_age_is_a_link():
     value is consistent, the wrong one is refuted — so the date tokens are
     proven to BIND, not merely to be tolerated."""
     now = dt.date(2026, 9, 4)
-    live = "- **Leonidas:** born March 12, 2026 → today (Sep 4, 2026) is **about {} months old** (5 months and 3 weeks)."
+    live = "- **Kosmas:** born March 9, 2026 → today (Sep 4, 2026) is **about {} months old** (5 months and 3 weeks)."
     assert refute_age_claims(reply=live.format(6), profile=PROFILE, now=now) == []
-    assert refute_age_claims(reply=live.format(16), profile=PROFILE, now=now)[0].startswith("Leonidas is stated as 16")
-    assert refute_age_claims(reply="| Leonidas | 2026-03-12 | 5 months old |", profile=PROFILE, now=now) == []
-    assert refute_age_claims(reply="| Leonidas | 2026-03-12 | 40 years old |", profile=PROFILE, now=now)
-    assert refute_age_claims(reply="Thodoris (b. 25/11/2016) is 9 years old", profile=PROFILE, now=now) == []
-    assert refute_age_claims(reply="Thodoris (b. 25/11/2016) is 3 years old", profile=PROFILE, now=now)
+    assert refute_age_claims(reply=live.format(16), profile=PROFILE, now=now)[0].startswith("Kosmas is stated as 16")
+    assert refute_age_claims(reply="| Kosmas | 2026-03-09 | 5 months old |", profile=PROFILE, now=now) == []
+    assert refute_age_claims(reply="| Kosmas | 2026-03-09 | 40 years old |", profile=PROFILE, now=now)
+    assert refute_age_claims(reply="Markos (b. 22/11/2016) is 9 years old", profile=PROFILE, now=now) == []
+    assert refute_age_claims(reply="Markos (b. 22/11/2016) is 3 years old", profile=PROFILE, now=now)
 
 
 def test_a_name_that_closes_a_list_is_not_one_persons_subject():
-    """Round 3 C1 (checker half): 'Thodoris and Leonidas: 9 years and 5
-    months old' binds Leonidas under any link rule that ignores the list.
+    """Round 3 C1 (checker half): 'Markos and Kosmas: 9 years and 5
+    months old' binds Kosmas under any link rule that ignores the list.
     A clause-level 'and' is not a list."""
     now = dt.date(2026, 9, 4)
-    for reply in ("Thodoris and Leonidas: 9 years and 5 months old.",
-                  "Your sons Thodoris and Leonidas are aged 9 years and 5 months.",
-                  "Thodoris, Leonidas and Vasilis are 9, 5 months and 46 years old.",
-                  "Thodoris & Leonidas — 9 years and 5 months old"):
+    for reply in ("Markos and Kosmas: 9 years and 5 months old.",
+                  "Your sons Markos and Kosmas are aged 9 years and 5 months.",
+                  "Markos, Kosmas and Vasilis are 9, 5 months and 46 years old.",
+                  "Markos & Kosmas — 9 years and 5 months old"):
         assert refute_age_claims(reply=reply, profile=PROFILE, now=now) == [], reply
-    # control: ", and Thodoris is 12 years old" is a new clause, and wrong
-    issues = refute_age_claims(reply="Leonidas is 5 months old, and Thodoris is 12 years old.", profile=PROFILE, now=now)
-    assert len(issues) == 1 and issues[0].startswith("Thodoris is stated as 12"), issues
+    # control: ", and Markos is 12 years old" is a new clause, and wrong
+    issues = refute_age_claims(reply="Kosmas is 5 months old, and Markos is 12 years old.", profile=PROFILE, now=now)
+    assert len(issues) == 1 and issues[0].startswith("Markos is stated as 12"), issues
 
 
 def test_a_bracketed_name_after_the_phrase_is_its_subject():
     """The agent's own disambiguation form, and the ONLY backward binding:
-    '9 years old (Thodoris)'. The link forward wins when it exists."""
+    '9 years old (Markos)'. The link forward wins when it exists."""
     now = dt.date(2026, 9, 4)
-    assert refute_age_claims(reply="Your sons are 9 years old (Thodoris) and 5 months old (Leonidas).", profile=PROFILE, now=now) == []
-    swapped = refute_age_claims(reply="Your sons are 9 years old (Leonidas) and 5 months old (Thodoris).", profile=PROFILE, now=now)
-    assert {i.split()[0] for i in swapped} == {"Thodoris", "Leonidas"}, swapped
-    assert refute_age_claims(reply="Your sons are 9 years old [Thodoris] and 5 months old [Leonidas].", profile=PROFILE, now=now) == []
-    # forward first: the phrase is predicated of Thodoris; the bracket is an aside
-    assert refute_age_claims(reply="Thodoris is 9 years old (Leonidas)", profile=PROFILE, now=now) == []
-    assert refute_age_claims(reply="Thodoris is 5 months old (Leonidas)", profile=PROFILE, now=now)[0].startswith("Thodoris")
+    assert refute_age_claims(reply="Your sons are 9 years old (Markos) and 5 months old (Kosmas).", profile=PROFILE, now=now) == []
+    swapped = refute_age_claims(reply="Your sons are 9 years old (Kosmas) and 5 months old (Markos).", profile=PROFILE, now=now)
+    assert {i.split()[0] for i in swapped} == {"Markos", "Kosmas"}, swapped
+    assert refute_age_claims(reply="Your sons are 9 years old [Markos] and 5 months old [Kosmas].", profile=PROFILE, now=now) == []
+    # forward first: the phrase is predicated of Markos; the bracket is an aside
+    assert refute_age_claims(reply="Markos is 9 years old (Kosmas)", profile=PROFILE, now=now) == []
+    assert refute_age_claims(reply="Markos is 5 months old (Kosmas)", profile=PROFILE, now=now)[0].startswith("Markos")
 
 
 def test_a_link_never_crosses_a_line():
     """A heading and a list item are two lines; whitespace is a link
-    character, so the line rule is what keeps 'Leonidas:\\n- 9 years old'
+    character, so the line rule is what keeps 'Kosmas:\\n- 9 years old'
     unbound (measured: the three live false refutes were all cross-line)."""
-    assert refute_age_claims(reply="Leonidas:\n- 9 years old", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply="Leonidas: 9 years old", profile=PROFILE, now=NOW)   # same text, one line
+    assert refute_age_claims(reply="Kosmas:\n- 9 years old", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="Kosmas: 9 years old", profile=PROFILE, now=NOW)   # same text, one line
 
 
 def test_the_reader_skips_a_date_glued_onto_a_list():
-    """Round 3 C1, the poisoned loop: a stored 'Thodoris and Leonidas: born
-    ~2017-04-04' read as Leonidas's date refutes the CORRECT answer about
+    """Round 3 C1, the poisoned loop: a stored 'Markos and Kosmas: born
+    ~2017-04-04' read as Kosmas's date refutes the CORRECT answer about
     him forever. The reader must survive data the old writer stored."""
-    glued = {"sons": "Thodoris and Leonidas: born ~2017-04-04"}
+    glued = {"sons": "Markos and Kosmas: born ~2017-04-04"}
     assert mcc.anchored_subjects(glued) == []
-    assert refute_age_claims(reply="Leonidas is 5 months old.", profile=glued, now=NOW) == []
+    assert refute_age_claims(reply="Kosmas is 5 months old.", profile=glued, now=NOW) == []
     # the live shape — each name with its own anchor — still yields both
-    assert [n for n, _ in mcc.anchored_subjects(PROFILE)] == ["Thodoris", "Leonidas"]
+    assert [n for n, _ in mcc.anchored_subjects(PROFILE)] == ["Markos", "Kosmas"]
     # a lowercase word before an anchor is not a name (unchanged from §4EQ)
     assert mcc.anchored_subjects({"k": "my twins born ~2026-04-19"}) == []
 
 
 def test_a_greek_spelled_name_is_a_subject():
     """Round 3 m4: `[A-Z]` is ASCII; the operator's family is Greek."""
-    prof = {"k": "Θοδωρής (born 2016-11-25)"}
-    assert mcc.anchored_subjects(prof) == [("Θοδωρής", dt.date(2016, 11, 25))]
-    issues = refute_age_claims(reply="Θοδωρής is 5 months old.", profile=prof, now=NOW)
-    assert issues and issues[0].startswith("Θοδωρής is stated as 5"), issues
+    prof = {"k": "Μάρκος (born 2016-11-22)"}
+    assert mcc.anchored_subjects(prof) == [("Μάρκος", dt.date(2016, 11, 22))]
+    issues = refute_age_claims(reply="Μάρκος is 5 months old.", profile=prof, now=NOW)
+    assert issues and issues[0].startswith("Μάρκος is stated as 5"), issues
 
 
 @pytest.mark.parametrize("text", [
     # round 3 C1 (writer half): every one of these anchored BOTH children to one date
-    "Thodoris and Leonidas: 9 years and 5 months old",
-    "Thodoris and Leonidas are, respectively, 9 years and 5 months old",
-    "Thodoris and Leonidas are: 9 years and 5 months old",
-    "Thodoris and Leonidas are about 9 years and 5 months old",
-    "Thodoris and Leonidas were 9 years and 5 months old",
+    "Markos and Kosmas: 9 years and 5 months old",
+    "Markos and Kosmas are, respectively, 9 years and 5 months old",
+    "Markos and Kosmas are: 9 years and 5 months old",
+    "Markos and Kosmas are about 9 years and 5 months old",
+    "Markos and Kosmas were 9 years and 5 months old",
     "The boys are: 9 years and 5 months old",              # plural copula, no list
     "The boys were, respectively, 9 years and 5 months old",  # "were" is a tense marker: left alone before any plural rule
-    "Thodoris and Leonidas are 9 and 5 months old",        # single unit at the tail of a list
-    "Θοδωρής και Λεωνίδας: 9 years and 5 months old",
+    "Markos and Kosmas are 9 and 5 months old",        # single unit at the tail of a list
+    "Μάρκος και Κοσμάς: 9 years and 5 months old",
 ])
 def test_the_writer_leaves_a_plural_subject_whole(text):
     from ghost_agent.memory import temporal as tp
@@ -701,10 +701,10 @@ def test_the_writer_still_anchors_one_persons_age():
     a twins phrase, and a clause-level 'and' all anchor."""
     from ghost_agent.memory import temporal as tp
     said = dt.date(2026, 9, 4)
-    assert tp.anchor("The kids are great, and Leonidas is 5 months and 23 days old", said_at=said) == "The kids are great, and Leonidas born ~2026-03-12"
+    assert tp.anchor("The kids are great, and Kosmas is 5 months and 26 days old", said_at=said) == "The kids are great, and Kosmas born ~2026-03-09"
     assert tp.anchor("My twins are 4 months old", said_at=said).startswith("My twins born ~2026-0")
-    out = tp.anchor("Leonidas is 5 months old, and Thodoris is 9 years, 9 months and 10 days old", said_at=said)
-    assert out.endswith("and Thodoris born ~2016-11-25"), out
+    out = tp.anchor("Kosmas is 5 months old, and Markos is 9 years, 9 months and 13 days old", said_at=said)
+    assert out.endswith("and Markos born ~2016-11-22"), out
 
 
 def test_the_writer_counts_a_compound_exactly():
@@ -712,8 +712,8 @@ def test_the_writer_counts_a_compound_exactly():
     30.4375 constant; 40 days came back as 10 days after a month. Exact
     parts: Sep 4 − 40 days = Jul 26, − 12 months = 2025-07-26."""
     from ghost_agent.memory import temporal as tp
-    assert tp.anchor("Thodoris is 1 year and 40 days old", said_at=dt.date(2026, 9, 4)) == "Thodoris born ~2025-07-26"
-    assert tp.anchor("Leonidas is 5 months and 3 weeks old", said_at=dt.date(2026, 9, 4)) == "Leonidas born ~2026-03-14"
+    assert tp.anchor("Markos is 1 year and 40 days old", said_at=dt.date(2026, 9, 4)) == "Markos born ~2025-07-26"
+    assert tp.anchor("Kosmas is 5 months and 3 weeks old", said_at=dt.date(2026, 9, 4)) == "Kosmas born ~2026-03-14"
 
 
 def test_trailing_whitespace_does_not_stall_the_writer():
@@ -727,10 +727,10 @@ def test_trailing_whitespace_does_not_stall_the_writer():
     apart — the round-4 reviewer's inputs can. Linear now: ~10 ms each."""
     import time
     from ghost_agent.memory import temporal as tp
-    for text, head in ((("Leonidas is 5 months and 23 days" + " " * 16000 + "olx"), "Leonidas is 5 months and 23 days"),
-                       (("Leonidas is 5 months" + " " * 8000 + "x"), "Leonidas is 5 months"),
-                       (("Leonidas is 9" + " " * 16000 + "x"), "Leonidas is 9"),            # a count, a run, no unit: the "9-year old" idiom
-                       (("Leonidas is 5 months and 23 days old" + " " * 8000), "Leonidas born ~2026-03-12")):
+    for text, head in ((("Kosmas is 5 months and 26 days" + " " * 16000 + "olx"), "Kosmas is 5 months and 26 days"),
+                       (("Kosmas is 5 months" + " " * 8000 + "x"), "Kosmas is 5 months"),
+                       (("Kosmas is 9" + " " * 16000 + "x"), "Kosmas is 9"),            # a count, a run, no unit: the "9-year old" idiom
+                       (("Kosmas is 5 months and 26 days old" + " " * 8000), "Kosmas born ~2026-03-09")):
         t0 = time.perf_counter()
         out = tp.anchor(text, said_at=dt.date(2026, 9, 4))
         assert time.perf_counter() - t0 < 0.25, text[:30]
@@ -844,8 +844,8 @@ async def test_a_web_exec_refute_keeps_the_reply_shape_stamp(mock_context, tmp_p
 # The round-4 reviewer generated 63 phrasings of its own and executed them.
 # Seven false-refute classes came out of the whitelist itself: tense words
 # ("was", "turns", "at", "in", "on" — a past or future age compared with
-# today), "of" (the age belongs to the noun BEFORE "of Thodoris"), a bare
-# possessive ("Thodoris's 5 month old brother"), "was born … is" chains,
+# today), "of" (the age belongs to the noun BEFORE "of Markos"), a bare
+# possessive ("Markos's 5 month old brother"), "was born … is" chains,
 # the forward candidate outranking the phrase's own bracket, decimals read
 # from their fraction, and week/day claims compared on the month scale.
 # Every word left on the list is pinned in BOTH directions below, and the
@@ -853,31 +853,31 @@ async def test_a_web_exec_refute_keeps_the_reply_shape_stamp(mock_context, tmp_p
 # fails the suite.
 
 LINK_CATALOGUE = {
-    "is": ("Thodoris is 9 years old", "Thodoris is 5 months old"),
-    "'s age": ("Thodoris's age is 9 years old", "Thodoris's age is 5 months old"),
-    "’s age": ("Thodoris’s age is 9 years old", "Thodoris’s age is 5 months old"),
-    "' age": ("Thodoris' age: 9 years old", "Thodoris' age: 5 months old"),
-    "age": ("Thodoris age 9 years old", "Thodoris age 5 months old"),
-    "aged": ("Thodoris aged 9 years old", "Thodoris aged 5 months old"),
-    "now": ("Thodoris — now 9 years old", "Thodoris — now 5 months old"),
-    "currently": ("Thodoris is currently 9 years old", "Thodoris is currently 5 months old"),
-    "today": ("Thodoris is today 9 years old", "Thodoris is today 5 months old"),
-    "just": ("Leonidas is just 5 months old", "Leonidas is just 9 years old"),
-    "already": ("Thodoris is already 9 years old", "Thodoris is already 5 months old"),
-    "still": ("Leonidas is still 5 months old", "Leonidas is still 9 years old"),
-    "only": ("Leonidas is only 5 months old", "Leonidas is only 9 years old"),
-    "about": ("Thodoris is about 9 years old", "Thodoris is about 5 months old"),
-    "around": ("Thodoris is around 9 years old", "Thodoris is around 5 months old"),
-    "roughly": ("Thodoris is roughly 9 years old", "Thodoris is roughly 5 months old"),
-    "approximately": ("Thodoris is approximately 9 years old", "Thodoris is approximately 5 months old"),
-    "nearly": ("Thodoris is nearly 10 years old", "Thodoris is nearly 5 months old"),
-    "almost": ("Thodoris is almost 10 years old", "Thodoris is almost 5 months old"),
-    "exactly": ("Thodoris is exactly 9 years old", "Thodoris is exactly 5 months old"),
-    "over": ("Thodoris is over 9 years old", "Thodoris is over 5 months old"),
-    "under": ("Thodoris is under 10 years old", "Thodoris is under 5 months old"),
-    "who": ("Thodoris, who is 9 years old", "Thodoris, who is 5 months old"),
-    "born": ("Thodoris, born 2016-11-25, is 9 years old", "Thodoris, born 2016-11-25, is 5 months old"),
-    "b": ("Thodoris (b. 2016-11-25) is 9 years old", "Thodoris (b. 2016-11-25) is 5 months old"),
+    "is": ("Markos is 9 years old", "Markos is 5 months old"),
+    "'s age": ("Markos's age is 9 years old", "Markos's age is 5 months old"),
+    "’s age": ("Markos’s age is 9 years old", "Markos’s age is 5 months old"),
+    "' age": ("Markos' age: 9 years old", "Markos' age: 5 months old"),
+    "age": ("Markos age 9 years old", "Markos age 5 months old"),
+    "aged": ("Markos aged 9 years old", "Markos aged 5 months old"),
+    "now": ("Markos — now 9 years old", "Markos — now 5 months old"),
+    "currently": ("Markos is currently 9 years old", "Markos is currently 5 months old"),
+    "today": ("Markos is today 9 years old", "Markos is today 5 months old"),
+    "just": ("Kosmas is just 5 months old", "Kosmas is just 9 years old"),
+    "already": ("Markos is already 9 years old", "Markos is already 5 months old"),
+    "still": ("Kosmas is still 5 months old", "Kosmas is still 9 years old"),
+    "only": ("Kosmas is only 5 months old", "Kosmas is only 9 years old"),
+    "about": ("Markos is about 9 years old", "Markos is about 5 months old"),
+    "around": ("Markos is around 9 years old", "Markos is around 5 months old"),
+    "roughly": ("Markos is roughly 9 years old", "Markos is roughly 5 months old"),
+    "approximately": ("Markos is approximately 9 years old", "Markos is approximately 5 months old"),
+    "nearly": ("Markos is nearly 10 years old", "Markos is nearly 5 months old"),
+    "almost": ("Markos is almost 10 years old", "Markos is almost 5 months old"),
+    "exactly": ("Markos is exactly 9 years old", "Markos is exactly 5 months old"),
+    "over": ("Markos is over 9 years old", "Markos is over 5 months old"),
+    "under": ("Markos is under 10 years old", "Markos is under 5 months old"),
+    "who": ("Markos, who is 9 years old", "Markos, who is 5 months old"),
+    "born": ("Markos, born 2016-11-22, is 9 years old", "Markos, born 2016-11-22, is 5 months old"),
+    "b": ("Markos (b. 2016-11-22) is 9 years old", "Markos (b. 2016-11-22) is 5 months old"),
 }
 
 
@@ -900,18 +900,18 @@ def test_each_link_word_binds_in_both_directions(word):
 
 @pytest.mark.parametrize("sep", [":", " —", " –", " -", ",", " =", " ->", " →", " |"])
 def test_each_link_separator_binds_in_both_directions(sep):
-    assert refute_age_claims(reply=f"Thodoris{sep} 9 years old", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply=f"Thodoris{sep} 5 months old", profile=PROFILE, now=NOW)[0].startswith("Thodoris")
+    assert refute_age_claims(reply=f"Markos{sep} 9 years old", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply=f"Markos{sep} 5 months old", profile=PROFILE, now=NOW)[0].startswith("Markos")
 
 
-DATE_SHAPES = ("2016-11-25", "25/11/2016", "25.11.2016", "November 25, 2016", "Nov. 25 2016",
-               "25 November 2016", "25th Nov 2016", "2016")
+DATE_SHAPES = ("2016-11-22", "22/11/2016", "22.11.2016", "November 22, 2016", "Nov. 22 2016",
+               "22 November 2016", "22nd Nov 2016", "2016")
 
 
 @pytest.mark.parametrize("date", DATE_SHAPES)
 def test_each_date_shape_is_a_link(date):
-    assert refute_age_claims(reply=f"Thodoris (born {date}) is 9 years old", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply=f"Thodoris (born {date}) is 5 months old", profile=PROFILE, now=NOW)[0].startswith("Thodoris")
+    assert refute_age_claims(reply=f"Markos (born {date}) is 9 years old", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply=f"Markos (born {date}) is 5 months old", profile=PROFILE, now=NOW)[0].startswith("Markos")
 
 
 @pytest.mark.parametrize("month", ["January", "Jan", "February", "Feb", "March", "Mar", "April", "Apr", "May",
@@ -920,31 +920,31 @@ def test_each_date_shape_is_a_link(date):
 def test_each_month_name_is_a_link(month):
     """Round-3 survivors: ten month names unexercised (only March and Sep
     were pinned)."""
-    assert refute_age_claims(reply=f"Thodoris, born {month} 25, 2016, is 5 months old", profile=PROFILE, now=NOW)[0].startswith("Thodoris")
-    assert refute_age_claims(reply=f"Thodoris (b. {month} 2016) is 9 years old", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply=f"Markos, born {month} 25, 2016, is 5 months old", profile=PROFILE, now=NOW)[0].startswith("Markos")
+    assert refute_age_claims(reply=f"Markos (b. {month} 2016) is 9 years old", profile=PROFILE, now=NOW) == []
 
 
 def test_a_bare_count_in_the_gap_is_not_a_date():
-    """Round 4 M4: "| Thodoris | 2 | 3 years old |" is a count of bikes."""
-    assert refute_age_claims(reply="| Thodoris | 2 | 3 years old |", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply="| Thodoris | 2016-11-25 | 3 years old |", profile=PROFILE, now=NOW)
+    """Round 4 M4: "| Markos | 2 | 3 years old |" is a count of bikes."""
+    assert refute_age_claims(reply="| Markos | 2 | 3 years old |", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="| Markos | 2016-11-22 | 3 years old |", profile=PROFILE, now=NOW)
 
 
 PAST_OR_FUTURE = (
-    "Thodoris was about 4 years old when you moved in 2021.",
-    "When Thodoris was 3 years old you moved to Athens.",
-    "Leonidas was 2 months old in May.",
-    "Thodoris turned 5 years old in November 2021.",
-    "Leonidas at 3 months old probably started smiling.",
-    "Here is a photo of Thodoris at 2 years old.",
-    "Leonidas turns 7 months old on October 12.",
-    "Thodoris turns 11 years old in November 2027.",
-    "Thodoris in 2036: 19 years old.",
-    "By March Leonidas is 12 months old.",
-    "Leonidas at 12 months old will start walking.",
-    "Thodoris will be 10 years old soon.",
-    "The house in which Thodoris was born is 40 years old.",
-    "The hospital Leonidas was born in is 30 years old.",
+    "Markos was about 4 years old when you moved in 2021.",
+    "When Markos was 3 years old you moved to Athens.",
+    "Kosmas was 2 months old in May.",
+    "Markos turned 5 years old in November 2021.",
+    "Kosmas at 3 months old probably started smiling.",
+    "Here is a photo of Markos at 2 years old.",
+    "Kosmas turns 7 months old on October 9.",
+    "Markos turns 11 years old in November 2027.",
+    "Markos in 2036: 19 years old.",
+    "By March Kosmas is 12 months old.",
+    "Kosmas at 12 months old will start walking.",
+    "Markos will be 10 years old soon.",
+    "The house in which Markos was born is 40 years old.",
+    "The hospital Kosmas was born in is 30 years old.",
 )
 
 
@@ -957,36 +957,36 @@ def test_a_past_or_future_age_is_not_compared_with_today(reply):
 
 def test_a_present_age_beside_a_date_word_still_binds():
     """"today" is not a tense marker; the tense rule is not a blanket mute."""
-    assert refute_age_claims(reply="Leonidas is 5 months old today", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply="Thodoris is 5 months old today", profile=PROFILE, now=NOW)[0].startswith("Thodoris")
+    assert refute_age_claims(reply="Kosmas is 5 months old today", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="Markos is 5 months old today", profile=PROFILE, now=NOW)[0].startswith("Markos")
 
 
 @pytest.mark.parametrize("text", [
-    "Thodoris was 5 years old when they moved in 2021",
-    "Leonidas was 3 months old in June",
-    "Leonidas turns 7 months old on October 12",
-    "Thodoris will be 10 years old soon",                   # "will" alone
-    "the photo of Thodoris at 2 years old",                  # "at N" alone
-    "Thodoris in 2036: 19 years old",                        # "in YYYY" alone
-    "Leonidas in June 2026: 3 months old",                   # "in Month YYYY" alone
-    "Thodoris was 9 years and 2 months old when they moved",
+    "Markos was 5 years old when they moved in 2021",
+    "Kosmas was 3 months old in June",
+    "Kosmas turns 7 months old on October 9",
+    "Markos will be 10 years old soon",                   # "will" alone
+    "the photo of Markos at 2 years old",                  # "at N" alone
+    "Markos in 2036: 19 years old",                        # "in YYYY" alone
+    "Kosmas in June 2026: 3 months old",                   # "in Month YYYY" alone
+    "Markos was 9 years and 2 months old when they moved",
 ])
 def test_the_writer_never_anchors_a_past_or_future_age(text):
-    """Round 4 C1 (writer half): "Thodoris was 5 years old when they moved
+    """Round 4 C1 (writer half): "Markos was 5 years old when they moved
     in 2021" was stored as `born ~2021-03` and then refuted the correct
-    "Thodoris is 9 years old" forever."""
+    "Markos is 9 years old" forever."""
     from ghost_agent.memory import temporal as tp
     assert tp.anchor(text, said_at=NOW) == text
 
 
 NOT_THIS_PERSONS_AGE = (
-    "The father of Thodoris is 46 years old.",
-    "The older brother of Leonidas is 9 years old.",
-    "The father of Thodoris, who is 46 years old, works from home.",
-    "Vasilis, father of Leonidas, is 46 years old.",
-    "Leonidas is the baby brother of Thodoris, 5 months old.",
-    "Thodoris's 5 month old brother Leonidas is doing great.",
-    "Thodoris's 5 months old brother is teething.",
+    "The father of Markos is 46 years old.",
+    "The older brother of Kosmas is 9 years old.",
+    "The father of Markos, who is 46 years old, works from home.",
+    "Vasilis, father of Kosmas, is 46 years old.",
+    "Kosmas is the baby brother of Markos, 5 months old.",
+    "Markos's 5 month old brother Kosmas is doing great.",
+    "Markos's 5 months old brother is teething.",
 )
 
 
@@ -998,12 +998,12 @@ def test_of_and_a_bare_possessive_do_not_hand_the_age_to_the_name(reply):
 
 def test_the_reader_skips_a_date_stored_after_of_or_a_possessive():
     """Round 4 C2/C3, the loop: what the writer stores for "The brother of
-    Leonidas is 9 years old" must not become Leonidas's birth date."""
+    Kosmas is 9 years old" must not become Kosmas's birth date."""
     from ghost_agent.memory import temporal as tp
-    for text, correct in (("The brother of Leonidas is 9 years old", "Leonidas is 5 months old."),
-                          ("The father of Thodoris is 46 years old", "Thodoris is 9 years old."),
-                          ("Vasilis, father of Thodoris, is 46 years old", "Thodoris is 9 years old."),
-                          ("Thodoris's 5 month old brother", "Thodoris's age is 9 years old.")):
+    for text, correct in (("The brother of Kosmas is 9 years old", "Kosmas is 5 months old."),
+                          ("The father of Markos is 46 years old", "Markos is 9 years old."),
+                          ("Vasilis, father of Markos, is 46 years old", "Markos is 9 years old."),
+                          ("Markos's 5 month old brother", "Markos's age is 9 years old.")):
         stored = tp.anchor(text, said_at=NOW)
         assert "born ~" in stored, stored
         assert mcc.anchored_subjects({"k": stored}) == [], stored
@@ -1012,71 +1012,71 @@ def test_the_reader_skips_a_date_stored_after_of_or_a_possessive():
 
 def test_one_name_with_two_stored_dates_is_bad_data_not_evidence():
     """Round 4 C2: the verdict depended on dict order."""
-    a, b = "Thodoris (born 2016-11-25)", "Thodoris (born 1980-01-29)"
+    a, b = "Markos (born 2016-11-22)", "Markos (born 1980-01-26)"
     for prof in ({"a": a, "b": b}, {"b": b, "a": a}):
-        assert refute_age_claims(reply="Thodoris is 9 years old.", profile=prof, now=NOW) == []
-        assert refute_age_claims(reply="Thodoris is 46 years old.", profile=prof, now=NOW) == []
+        assert refute_age_claims(reply="Markos is 9 years old.", profile=prof, now=NOW) == []
+        assert refute_age_claims(reply="Markos is 46 years old.", profile=prof, now=NOW) == []
 
 
 def test_a_bracketed_name_is_an_annotation_of_the_phrase_before_it():
-    """Round 4 C5: "9 years old (Thodoris), 5 months old (Leonidas)" bound
-    the second age to Thodoris because the forward link won."""
-    for reply in ("Your sons are 9 years old (Thodoris), 5 months old (Leonidas).",
-                  "| 9 years old (Thodoris) | 5 months old (Leonidas) |",
-                  "Ages: 9 years old (Thodoris); 5 months old (Leonidas).",
-                  "9 years old (Thodoris) / 5 months old (Leonidas)"):
+    """Round 4 C5: "9 years old (Markos), 5 months old (Kosmas)" bound
+    the second age to Markos because the forward link won."""
+    for reply in ("Your sons are 9 years old (Markos), 5 months old (Kosmas).",
+                  "| 9 years old (Markos) | 5 months old (Kosmas) |",
+                  "Ages: 9 years old (Markos); 5 months old (Kosmas).",
+                  "9 years old (Markos) / 5 months old (Kosmas)"):
         assert refute_age_claims(reply=reply, profile=PROFILE, now=NOW) == [], reply
-    swapped = refute_age_claims(reply="Your sons are 5 months old (Thodoris), 9 years old (Leonidas).", profile=PROFILE, now=NOW)
-    assert {i.split()[0] for i in swapped} == {"Thodoris", "Leonidas"}, swapped
+    swapped = refute_age_claims(reply="Your sons are 5 months old (Markos), 9 years old (Kosmas).", profile=PROFILE, now=NOW)
+    assert {i.split()[0] for i in swapped} == {"Markos", "Kosmas"}, swapped
     # a markdown link and an aside are not annotations
-    assert refute_age_claims(reply="The team page is 2 years old [Thodoris](https://example.org/t)", profile=PROFILE, now=NOW) == []
-    assert refute_age_claims(reply="The cot is 20 years old (a hand-me-down) (Leonidas)", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="The team page is 2 years old [Markos](https://example.org/t)", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="The cot is 20 years old (a hand-me-down) (Kosmas)", profile=PROFILE, now=NOW) == []
 
 
 def test_a_decimal_age_is_one_number():
     """Round 4 C6: "9.5 years old" was read as FIVE years and "5.8 months"
     — the checker's own rendering, quoted back — as eight."""
-    for reply in ("Thodoris is 9.5 years old.", "Leonidas is 5.8 months old.", "Leonidas is about 5.8 months old.",
-                  "Thodoris is 9,5 years old.", "Thodoris is 9 1/2 years old.", "Thodoris is 9-10 years old."):
+    for reply in ("Markos is 9.5 years old.", "Kosmas is 5.8 months old.", "Kosmas is about 5.8 months old.",
+                  "Markos is 9,5 years old.", "Markos is 9 1/2 years old.", "Markos is 9-10 years old."):
         assert refute_age_claims(reply=reply, profile=PROFILE, now=NOW) == [], reply
-    issues = refute_age_claims(reply="Leonidas is 15.5 months old.", profile=PROFILE, now=NOW)
+    issues = refute_age_claims(reply="Kosmas is 15.5 months old.", profile=PROFILE, now=NOW)
     assert issues and "15.5" in issues[0], issues
     from ghost_agent.memory import temporal as tp
-    for text in ("Leonidas is 5.8 months old", "Thodoris is 9-10 years old", "Thodoris is 9 1/2 years old",
-                 "Thodoris is 1.5 years and 2 months old"):
+    for text in ("Kosmas is 5.8 months old", "Markos is 9-10 years old", "Markos is 9 1/2 years old",
+                 "Markos is 1.5 years and 2 months old"):
         assert tp.anchor(text, said_at=NOW) == text, text
 
 
 def test_week_and_day_claims_are_compared_on_their_own_scale():
-    """Round 4 C7: a 176-day-old child "is 26 weeks old" (25 w 1 d) and
+    """Round 4 C7: a 179-day-old child "is 26 weeks old" (25 w 4 d) and
     "177 days old" were refuted by the calendar-month scale."""
-    for reply in ("Leonidas is 26 weeks old.", "Leonidas is 25 weeks old.", "Leonidas is 177 days old.",
-                  "Leonidas is 176 days old.", "Leonidas is 180 days old.", "Leonidas is roughly 180 days old."):
+    for reply in ("Kosmas is 26 weeks old.", "Kosmas is 25 weeks old.", "Kosmas is 177 days old.",
+                  "Kosmas is 179 days old.", "Kosmas is 180 days old.", "Kosmas is roughly 180 days old."):
         assert refute_age_claims(reply=reply, profile=PROFILE, now=NOW) == [], reply
-    for reply in ("Leonidas is 40 weeks old.", "Leonidas is 100 days old."):
+    for reply in ("Kosmas is 40 weeks old.", "Kosmas is 100 days old."):
         issues = refute_age_claims(reply=reply, profile=PROFILE, now=NOW)
-        assert issues and issues[0].endswith("176 days old today"), issues
+        assert issues and issues[0].endswith("179 days old today"), issues
 
 
 def test_one_unit_old_does_not_admit_a_newborn():
     """Round 4 M5: N=1 gave a lower bound of zero."""
-    assert refute_age_claims(reply="Leonidas is 1 year old.", profile=PROFILE, now=NOW)[0].startswith("Leonidas")
-    assert refute_age_claims(reply="Leonidas is 1 month old.", profile=PROFILE, now=dt.date(2026, 4, 2)) == []   # 3 weeks
+    assert refute_age_claims(reply="Kosmas is 1 year old.", profile=PROFILE, now=NOW)[0].startswith("Kosmas")
+    assert refute_age_claims(reply="Kosmas is 1 month old.", profile=PROFILE, now=dt.date(2026, 4, 2)) == []   # 3 weeks
 
 
 def test_a_sentence_opener_before_a_comma_is_not_a_list():
-    """Round 4 M2: "Yes, Thodoris", "Today, Leonidas" were read as lists
+    """Round 4 M2: "Yes, Markos", "Today, Kosmas" were read as lists
     and muted the checker AND the writer."""
-    assert refute_age_claims(reply="Yes, Thodoris is 15 years old.", profile=PROFILE, now=NOW)[0].startswith("Thodoris")
-    assert refute_age_claims(reply="Today, Leonidas is 9 years old.", profile=PROFILE, now=NOW)[0].startswith("Leonidas")
-    assert refute_age_claims(reply="Hi Vasilis, Thodoris is 15 years old.", profile=PROFILE, now=NOW)[0].startswith("Thodoris")
+    assert refute_age_claims(reply="Yes, Markos is 15 years old.", profile=PROFILE, now=NOW)[0].startswith("Markos")
+    assert refute_age_claims(reply="Today, Kosmas is 9 years old.", profile=PROFILE, now=NOW)[0].startswith("Kosmas")
+    assert refute_age_claims(reply="Hi Vasilis, Markos is 15 years old.", profile=PROFILE, now=NOW)[0].startswith("Markos")
     # two ANCHORED names joined by a comma are a list
-    assert refute_age_claims(reply="Thodoris, Leonidas: 9 years and 5 months old", profile=PROFILE, now=NOW) == []
+    assert refute_age_claims(reply="Markos, Kosmas: 9 years and 5 months old", profile=PROFILE, now=NOW) == []
     from ghost_agent.memory import temporal as tp
-    assert tp.anchor("Today, Leonidas is 5 months old", said_at=NOW) == "Today, Leonidas born ~2026-03-20"
+    assert tp.anchor("Today, Kosmas is 5 months old", said_at=NOW) == "Today, Kosmas born ~2026-03-20"
     # the writer keeps no comma lists; the reader is the defence for what it stores
-    stored = tp.anchor("Thodoris, Leonidas: 9 years and 5 months old", said_at=NOW)
-    assert stored == "Thodoris, Leonidas: born ~2017-04-04"
+    stored = tp.anchor("Markos, Kosmas: 9 years and 5 months old", said_at=NOW)
+    assert stored == "Markos, Kosmas: born ~2017-04-04"
     assert mcc.anchored_subjects({"k": stored}) == []
 
 
@@ -1085,22 +1085,22 @@ def test_a_plural_list_far_back_on_the_line_still_guards_a_compound():
     glue two children to one date; a single-unit age later on such a line
     is still one person's."""
     from ghost_agent.memory import temporal as tp
-    text = ("Thodoris and Leonidas are, as of today (September 4, 2026, which is a Friday afternoon), "
+    text = ("Markos and Kosmas are, as of today (September 4, 2026, which is a Friday afternoon), "
             "respectively 9 years and 5 months old")
     assert tp.anchor(text, said_at=NOW) == text
-    assert tp.anchor("Thodoris and Leonidas are brothers and the younger one Leonidas is 5 months old", said_at=NOW) \
-        == "Thodoris and Leonidas are brothers and the younger one Leonidas born ~2026-03-20"
-    assert tp.anchor("Thodoris and Leonidas\nMax is 3 years old", said_at=NOW) == "Thodoris and Leonidas\nMax born ~2023-03"
-    assert tp.anchor("Thodoris and Leonidas: ages 9 years and 5 months old", said_at=NOW) == "Thodoris and Leonidas: ages 9 years and 5 months old"
+    assert tp.anchor("Markos and Kosmas are brothers and the younger one Kosmas is 5 months old", said_at=NOW) \
+        == "Markos and Kosmas are brothers and the younger one Kosmas born ~2026-03-20"
+    assert tp.anchor("Markos and Kosmas\nMax is 3 years old", said_at=NOW) == "Markos and Kosmas\nMax born ~2023-03"
+    assert tp.anchor("Markos and Kosmas: ages 9 years and 5 months old", said_at=NOW) == "Markos and Kosmas: ages 9 years and 5 months old"
     assert tp.anchor("The boys are now about 9 years and 5 months old", said_at=NOW) == "The boys are now about 9 years and 5 months old"
     # a list with NO plural copula after it is not a plural line: grandma's age is grandma's
-    out = tp.anchor("Thodoris and Leonidas love their grandma, who is 70 years and 2 months old", said_at=NOW)
+    out = tp.anchor("Markos and Kosmas love their grandma, who is 70 years and 2 months old", said_at=NOW)
     assert out.endswith("grandma, who born ~1956-07-04"), out
 
 
 def test_names_match_case_insensitively_and_whole():
-    assert refute_age_claims(reply="leonidas is 9 years old.", profile=PROFILE, now=NOW)[0].startswith("Leonidas")
-    assert refute_age_claims(reply="Leonidas is 5 months old.", profile={"k": "Nidas (born 2016-11-25)"}, now=NOW) == []
+    assert refute_age_claims(reply="kosmas is 9 years old.", profile=PROFILE, now=NOW)[0].startswith("Kosmas")
+    assert refute_age_claims(reply="Kosmas is 5 months old.", profile={"k": "Nidas (born 2016-11-22)"}, now=NOW) == []
 
 
 @pytest.mark.asyncio
@@ -1129,7 +1129,7 @@ async def test_a_tool_free_verdict_reaches_the_sidecar(mock_context, tmp_path):
             req_id=rid, trajectory_id=rid)
     def rows():
         return [json.loads(l) for f in (tmp_path / "verdicts").glob("*.jsonl") for l in f.read_text().splitlines() if l.strip()]
-    res, _ = await run("Thodoris is 5 months old.", "m1")
+    res, _ = await run("Markos is 5 months old.", "m1")
     assert res is not None and res.verdict == VerifyVerdict.REFUTED
     assert getattr(res, "override", "") == "memory-claim"
     last = rows()[-1]
@@ -1140,5 +1140,5 @@ async def test_a_tool_free_verdict_reaches_the_sidecar(mock_context, tmp_path):
     assert last["trajectory_id"] == "m2" and last.get("override") == "reply-shape", last
     # a correct tool-free reply records nothing (refute-only, and no verdict to record)
     n = len(rows())
-    res3, _ = await run("Thodoris is 9 years old.", "m3")
+    res3, _ = await run("Markos is 9 years old.", "m3")
     assert res3 is None and len(rows()) == n

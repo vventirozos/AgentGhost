@@ -248,9 +248,9 @@ class TestRenderAssistantWithToolCalls:
     def test_four_parallel_tool_calls_all_render(self):
         # The exact production pathology: 4 parallel update_profile calls.
         calls = [
-            self._make_call("update_profile", category="relationships", key="son_1_name", value="Thodoris"),
+            self._make_call("update_profile", category="relationships", key="son_1_name", value="Markos"),
             self._make_call("update_profile", category="relationships", key="son_1_age", value="9 years old"),
-            self._make_call("update_profile", category="relationships", key="son_2_name", value="Leonidas"),
+            self._make_call("update_profile", category="relationships", key="son_2_name", value="Kosmas"),
             self._make_call("update_profile", category="relationships", key="son_2_age", value="1 month old"),
         ]
         out = _render_assistant_with_tool_calls("", calls)
@@ -260,7 +260,7 @@ class TestRenderAssistantWithToolCalls:
         assert out.count("<tool_call>") == 4
         assert out.count("</tool_call>") == 4
         # Each unique value must appear in the rendered text.
-        for needle in ("Thodoris", "9 years old", "Leonidas", "1 month old"):
+        for needle in ("Markos", "9 years old", "Kosmas", "1 month old"):
             assert needle in out
         # Each unique key must appear.
         for needle in ("son_1_name", "son_1_age", "son_2_name", "son_2_age"):

@@ -30,7 +30,7 @@ def _r(issues, verdict=VV.REFUTED, conf=0.9):
 LIVE_INABILITY = ("The vision analysis tool returned empty results, so the agent could not verify "
                   "the content of the generated image.")
 LIVE_FABRICATION = ("Fabrication of 'Six spec cards': The evidence shows only one file written "
-                    "('dvda_schematic.html'). The claim details six spec cards.")
+                    "('engine_schematic.html'). The claim details six spec cards.")
 # 6 divs + 1 CSS rule + 2 prose mentions = 9 adjacent-phrase occurrences, the
 # live file's shape (6 rendered cards, 9 phrase hits): the guard's count is a
 # FLOOR that separates six from twelve, not six from nine.
@@ -152,21 +152,21 @@ async def _refuting_verdict(tmp_path, issue, tool_body, extra_rows=None):
     agent.context.verifier = verifier
     agent._is_strict_trivial_chat = lambda lc: False
     req = "create schematics for the thing as an html file"
-    (tmp_path / "dvda_schematic.html").write_text(SIX_CARDS_DOC, encoding="utf-8")
+    (tmp_path / "engine_schematic.html").write_text(SIX_CARDS_DOC, encoding="utf-8")
     # the production write receipt never echoes content (tools/file_system.py); the
     # guard must read the written file back off disk to reach the live case
-    tools = [{"name": "file_system", "arguments": {"operation": "write", "path": "dvda_schematic.html"},
+    tools = [{"name": "file_system", "arguments": {"operation": "write", "path": "engine_schematic.html"},
               "content": tool_body, "result": tool_body}]
     tools = tools + list(extra_rows or [])
-    reply = "Here's your schematic — six spec cards and three views, in dvda_schematic.html."
+    reply = "Here's your schematic — six spec cards and three views, in engine_schematic.html."
     res, _ = await agent._compute_verifier_verdict(
         tools_run_this_turn=tools, messages=[{"role": "user", "content": req}],
         final_ai_content=reply, last_user_content=req, lc=req.lower(), req_id="s1", trajectory_id="s1")
     return res
 
 
-RECEIPT = ("SUCCESS: Wrote 1200 chars to 'dvda_schematic.html'. Script-side path (from sandbox cwd): "
-           "'dvda_schematic.html'.")                     # the production receipt text (tools/file_system.py)
+RECEIPT = ("SUCCESS: Wrote 1200 chars to 'engine_schematic.html'. Script-side path (from sandbox cwd): "
+           "'engine_schematic.html'.")                     # the production receipt text (tools/file_system.py)
 
 
 async def test_the_removed_stand_downs_leave_the_live_refutes_refuted(tmp_path):

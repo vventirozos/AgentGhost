@@ -281,7 +281,7 @@ def _is_the_value(value, target_lc: str) -> bool:
     """The stored value IS the target, or is ABOUT it — its distinctive words
     are all the target's, or it is a single item that STARTS with the
     target's entity words ("Mortimer the iguana", "Tesla Model 3" for "my old
-    car Tesla"). A value listing several things ("BMW 118i, Ducati …") is
+    car Tesla"). A value listing several things ("BMW 320d, Triumph …") is
     not (third review: over-correction left Mortimer in the profile)."""
     vw, tw = _distinct_words(str(value)), _distinct_words(target_lc)
     if not vw or not tw:
@@ -302,8 +302,8 @@ def _ordered_words(text: str) -> list:
         return str(text).lower().split()
 
 
-#: relation nouns name a PERSON ("my wife Fotini"); the other attribute nouns
-#: QUALIFY an entity ("Fotini's birthday") and narrow the forget to that fact
+#: relation nouns name a PERSON ("my wife Elena"); the other attribute nouns
+#: QUALIFY an entity ("Elena's birthday") and narrow the forget to that fact
 _RELATION_WORDS = frozenset("wife husband son sons daughter daughters child children kids family".split())
 _QUALIFIER_WORDS = _FORGET_ATTRIBUTE_WORDS - _RELATION_WORDS
 
@@ -329,9 +329,9 @@ def _entity_of(target: str) -> str:
 
 
 def _qualifiers_of(target: str) -> list:
-    """The attribute nouns that qualify the entity: AFTER it ("Fotini's
-    birthday", "Leonidas birthdate") or joined by "of" ("the birthday of
-    Fotini") — not a category before it ("my old car Tesla" is the car)."""
+    """The attribute nouns that qualify the entity: AFTER it ("Elena's
+    birthday", "Kosmas birthdate") or joined by "of" ("the birthday of
+    Elena") — not a category before it ("my old car Tesla" is the car)."""
     from ..memory.lesson_scope import normalize_request
     words = _ordered_words(target)
     ent = set(normalize_request(_entity_of(target)).split())
@@ -381,7 +381,7 @@ def _forget_profile(profile_memory, target: str, related: bool = False, qualifie
         word: `forget name` no longer deleted the owner's name);
       * a list ITEM naming the target, or a scalar whose value IS the target.
     Lists, never deletes: a key that only partly matches (`son` →
-    `son_thodoris_birthdate`), several exact keys, and a scalar that MENTIONS
+    `son_markos_birthdate`), several exact keys, and a scalar that MENTIONS
     the target among other things (`Athens` in the home address, `BMW` in a
     vehicles line). ``related``: an alias from the graph — values only."""
     out, cands = [], []
@@ -391,7 +391,7 @@ def _forget_profile(profile_memory, target: str, related: bool = False, qualifie
         return ["⚠️ Profile: the profile store could not be read — its fields were NOT searched."]
     distinct = _distinct_words(target_lc)
     if qualifiers and not related:
-        # (re-review) "Fotini's birthday" deleted the wife-name field and
+        # (re-review) "Elena's birthday" deleted the wife-name field and
         # every edge about her: an attribute-qualified target removes only
         # the fields naming BOTH the entity and the attribute; fields that
         # merely mention the entity are listed
@@ -432,8 +432,8 @@ def _forget_profile(profile_memory, target: str, related: bool = False, qualifie
     if not related:
         exact, partial = [], []
         key_form = target_lc.replace(" ", "_").replace("-", "_")
-        # …and the ENTITY's form (r8 review: "my wife Fotini" listed
-        # `fotini_description` while "Fotini" deleted it)
+        # …and the ENTITY's form (r8 review: "my wife Elena" listed
+        # `elena_description` while "Elena" deleted it)
         ent_form = _entity_of(target_lc).replace(" ", "_").replace("-", "_")
         forms = [f for f in dict.fromkeys((key_form, ent_form)) if len(f) >= 3]
         for cat, sub in data.items():
@@ -453,7 +453,7 @@ def _forget_profile(profile_memory, target: str, related: bool = False, qualifie
             cands += [f"{c}.{k}" for c, k in exact]
         if family:
             # forgetting a family PERSON takes the fields named after them
-            # too (re-review: `fotini_description` outlived the graph edges)
+            # too (re-review: `elena_description` outlived the graph edges)
             for c, k in partial:
                 if (c, k) not in handled:
                     out.append(_profile_line(profile_memory.delete(c, k), f"Removed {c}.{k}"))
@@ -490,7 +490,7 @@ def _forget_profile(profile_memory, target: str, related: bool = False, qualifie
                     # the owner's own identity fields go only when named
                     # explicitly (`forget Vasilis` removed root.name)
                     # (re-review) nor any root field: the graph keeps the
-                    # matching owner fact (`user WORKS_AT evolmonkey`), so
+                    # matching owner fact (`user WORKS_AT orbitdata`), so
                     # deleting `root.company` left the two disagreeing
                     if _is_the_value(v, target_lc) and cat != "root":
                         out.append(_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k} (value match){tag}"))
@@ -599,7 +599,7 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
     if _ref is not None:
         return _ref
     # Anchor BEFORE the dedup hash and before any store sees it: "remember
-    # that Leonidas is 4 months old" is the single most direct route a
+    # that Kosmas is 4 months old" is the single most direct route a
     # decaying snapshot takes into memory. Anchoring here (rather than
     # inside VectorMemory.add) is deliberate — add() also ingests DOCUMENT
     # chunks, whose "4 months old" belongs to the document's own timeline,
@@ -2001,7 +2001,7 @@ def _on_demand_lines(profile_memory, query: str) -> list:
     implied = set(words)
     for w in words:
         implied |= GraphMemory._CATEGORY_WORDS.get(w, set())
-    # r3: a person's fields are keyed by their NAME ("fotini_description"),
+    # r3: a person's fields are keyed by their NAME ("elena_description"),
     # the question by their role ("my wife") — the role's name field names them
     for _cat, _sub in data.items():
         if not isinstance(_sub, dict):
@@ -2054,7 +2054,7 @@ user users
 """.split())
 # Retrieval review 2026-10-31: "user"/"users" were content words, and every
 # owner edge carries "(User)" — "what's the postgres user home directory"
-# kept all 15 owner edges (Fotini's birthdate, places visited). The owner's
+# kept all 15 owner edges (Elena's birthdate, places visited). The owner's
 # facts reach an OWNER question through `owner_facts_matching`, not this
 # topical filter. (§4SE r5 fixed the same query for the vector rows only.)
 
@@ -2520,7 +2520,7 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
 
 # ── forget: preview, then confirm ───────────────────────────────────────────
 # The re-reviews kept finding wrong deletions in a forget that GUESSED what the
-# user meant ("Fotini's birthday" took the marriage edge; another person's
+# user meant ("Elena's birthday" took the marriage edge; another person's
 # facts were kept as "yours"; Greek names were never found). The model-facing
 # forget is therefore two steps: a PREVIEW that runs the same sweep in plan
 # mode — every destructive call recorded as a numbered item, nothing deleted —
@@ -3288,7 +3288,7 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
         if it.get("kind") in ("profile_field", "profile_item", "profile_previous"):
             _fields.append((it["ref"].get("category"), it["ref"].get("key")))
     # KB review 10-30: a forgotten profile field left its mirrors live ("forget
-    # Hanzo" → `user HAS_DOG_NAME hanzo` and `User dog_name is Hanzo` stayed)
+    # Bruno" → `user HAS_DOG_NAME bruno` and `User dog_name is Bruno` stayed)
     from ..memory.profile import ProfileMemory as _PMc
     for _c, _k in dict.fromkeys(_fields):
         if profile_memory is None or not _c or not _k:
@@ -3968,7 +3968,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                     # object words and a 4-letter stem took COMPANION)
                     _sel = [e for e in _all if _qualifier_matches(str(e[1]).lower().split("_"), _quals)]
                     # an owner fact is never in the default list (r8 review:
-                    # "EvolMonkey work" defaulted `user WORKS_AT evolmonkey`)
+                    # "Orbitdata work" defaulted `user WORKS_AT orbitdata`)
                     _rest = [e for e in _all if e not in _sel or (e in _k and not _family_person)]
                     _sel = [e for e in _sel if e not in _rest]
                     for e in _sel:
@@ -3987,7 +3987,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                     deleted_edges, _kept = _res if isinstance(_res, tuple) and len(_res) == 2 else (0, [])
                     deleted_edges = deleted_edges if isinstance(deleted_edges, int) else 0
                     # the owner's FIELDS named after the entity (`user
-                    # HAS_FOTINI_DESCRIPTION …`): a family member's go with
+                    # HAS_ELENA_DESCRIPTION …`): a family member's go with
                     # her, anyone else's are listed (r8 review)
                     _fields = (await asyncio.to_thread(graph_memory.owner_field_edges, _entity)
                                if hasattr(graph_memory, "owner_field_edges") else [])
@@ -4016,7 +4016,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     # a whole turn, so a MENTION is not a reason to delete it (third review:
     # `forget python` would have removed 30, `forget athens` 18) — the same
     # rule as the profile leg. Deleted only for a PERSON of the owner's
-    # family (the privacy case: `forget Fotini`); otherwise counted and kept.
+    # family (the privacy case: `forget Elena`); otherwise counted and kept.
     if episodic_memory is not None and hasattr(episodic_memory, "forget_mentions"):
         try:
             if _names_an_entity(clean_target) and not _is_owner_name(profile_memory, _entity):
@@ -4327,7 +4327,7 @@ async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, m
         else:
             # Retrieval review 2026-10-31: the check passed no value, so a
             # street address under an ordinary key (root.location =
-            # "Makedonias 83, Thrakomakedones 13676") was hidden from the
+            # "Kaledonias 83, Kalopetres 10101") was hidden from the
             # profile render but mirrored into the graph — and "where do I
             # live?" put it into the prompt. The render checks each VALUE;
             # so does the mirror.

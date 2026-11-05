@@ -15,7 +15,7 @@
   {
    "subject": "agent",
    "predicate": "CONTAINS_TABLE",
-   "object": "web_order_line_options_old",
+   "object": "orders_line_items_old",
    "why": "NOISE (rule): the agent describing its own process"
   },
   {
@@ -159,13 +159,13 @@
   {
    "subject": "user",
    "predicate": "INTERESTED_IN",
-   "object": "dating demographics",
+   "object": "search topic e",
    "why": "UNATTRIBUTED: member words; sensitive"
   },
   {
    "subject": "user",
    "predicate": "ASKED_ABOUT",
-   "object": "fertility intentions of women 38-45 in europe",
+   "object": "search topic f",
    "why": "NOISE (rule): the owner's chatter/requests, not a fact about the owner"
   },
   {
@@ -249,7 +249,7 @@
   {
    "subject": "user",
    "predicate": "ASKED_ABOUT",
-   "object": "sleep supplements",
+   "object": "search topic g",
    "why": "NOISE (rule): the owner's chatter/requests, not a fact about the owner"
   },
   {
@@ -477,7 +477,7 @@
   {
    "subject": "subscription",
    "predicate": "NAMED",
-   "object": "grafana_sw_perfmon_db5_subscription",
+   "object": "metrics_db_subscription",
    "why": "NOISE: one-off debugging detail"
   },
   {
@@ -513,7 +513,7 @@
   {
    "subject": "user",
    "predicate": "HAS_COMPANION",
-   "object": "fotini",
+   "object": "elena",
    "why": "NOISE: 3rd edge for the wife (MARRIED_TO 1685, HAS_SPOUSE 1708)"
   },
   {

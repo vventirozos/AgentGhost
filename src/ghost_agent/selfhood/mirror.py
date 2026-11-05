@@ -1,29 +1,49 @@
-"""The Mirror (§4SV): a toy Hofstadter strange loop — one "I" sentence a day.
+"""The Mirror (§4SV, §4SV-b): a toy Hofstadter strange loop — one "I" sentence a day.
 
 Once a day, in the idle window, the agent is shown two things:
 
-  * yesterday's I-sentence (the one sentence it last wrote about itself), and
-  * one reply it gave the owner since then, picked at random — text only.
+  * the sentences it has written about itself so far (the last seven, a run of
+    unchanged days shown once), and
+  * up to three replies it gave the owner since the last look (two days at
+    most), picked at random — text only, the start of each.
 
-and asked to rewrite the sentence about who it is. The sentence only ever sees
-itself plus a sliver of real behaviour, so over weeks it settles, swings
-between a few self-images, or drifts. Nothing is scored. The owner reads it
+and asked to rewrite the last sentence: what the WAY the replies were written
+shows about the one who wrote them, leaving their subject out. Nothing is scored. The owner reads the diary
 with the ``mirror`` command (answered by the system, no model call).
 
-It is deliberately INERT: the system never puts the sentence into a prompt,
-a tool, the self narrative or any answer — §4ON/§4OR showed self-written text
-in prompts does not help. (One path is the owner's own and is accepted, review
-M1: after "mirror", the diary is an earlier reply of THAT conversation, so a
-follow-up there sees it like any other reply — "what do you make of these?"
-should work.) The call runs at background
-priority, on the MAIN model (operator 11-02: the model that wrote the replies
-is the one that should read them — the loop is the self looking at its own
-words, not a second model describing it). A background main call saves the
-live conversation to disk first and steps aside for a request (§4RV), the same
-path the daily self narrative takes; one ~1k-token call a day.
+§4SV-b (11-05) closed the loop. Until then the sentence was inert, and it was a
+portrait, not a loop: nothing it said could reach the behaviour it described.
+Now the latest sentence is ONE line of the ``introspect`` overview and summary
+(``self_image_line``) — the views the model reads when the owner asks how it
+is — so it can colour those replies, and those replies are in the pool the
+next look picks from. It still reaches no prompt on its own: not the system
+prompt, not the state block, not memory; only a tool result the model asked
+for. (After "mirror", the diary is also an earlier reply of THAT conversation,
+so a follow-up there sees it like any other reply.)
+
+The wording was chosen by replay on the live main model (8 real days, 3
+chains per arm, 168 calls): the first prompt ("rewrite the sentence about who
+you are" over ONE reply) wrote the reply's SUBJECT into the self-image
+("a faithful sentinel who gathers the weather, the war, and the local news") —
+18 % of a sentence's content words came from the reply shown, against 2–6 %
+for the wordings that ask for the manner. Naming facets to look at ("what you
+pay attention to, how you decide…") was echoed back word for word. "What you
+actually do, in plain verbs, without praise" read as behaviour, close to a job
+description ("I answer by checking what I have already done, flagging what is
+uncertain…"). Asking what the writing "shows about the one who wrote it" gave
+a self-image in warmer words ("someone who balances casual, human warmth with
+precise, structured expertise") — the operator picked this one from the
+samples (11-05: "the most interesting one").
+
+The call runs at background priority, on the MAIN model (operator 11-02: the
+model that wrote the replies is the one that should read them). A background
+main call saves the live conversation to disk first and steps aside for a
+request (§4RV), the same path the daily self narrative takes; one ~1k-token
+call a day.
 
 Storage: ``$GHOST_HOME/system/selfhood/mirror.jsonl`` — append-only, one row
-per day: {"at", "date", "sentence", "prev", "reply_excerpt", "reply_at"}.
+per day: {"at", "date", "sentence", "prev", "replies": [{"at", "excerpt"}]}.
+Rows written before §4SV-b carry one reply as "reply_excerpt" / "reply_at".
 """
 
 from __future__ import annotations
@@ -40,29 +60,40 @@ from typing import Any, List, Optional
 logger = logging.getLogger("GhostSelfhood")
 
 MIRROR_REL = "system/selfhood/mirror.jsonl"
-#: the first "yesterday" — a self that knows nothing yet
+#: the first line of the history — a self that knows nothing yet
 SEED_SENTENCE = "I am something that answers when it is spoken to; I do not yet know what else."
-#: how far back a reply may be picked from (days, today included)
+#: how far back a reply may be picked from (days), when the last look is older or there is none
 REPLY_WINDOW_DAYS = 2
 #: replies shorter than this say too little about who wrote them ("Done.", "👍")
 MIN_REPLY_CHARS = 80
-#: how much of the reply the model sees
-REPLY_MAX_CHARS = 1500
+#: replies shown per look: across three different subjects, what they share is the manner
+REPLIES_PER_LOOK = 3
+#: how much of each reply the model sees (its start)
+REPLY_MAX_CHARS = 600
 SENTENCE_MAX_CHARS = 300
-#: diary lines the command shows
+#: diary lines the command shows, and past sentences the model is shown
 SHOW_LAST = 7
 
 _LOCK = threading.Lock()
 
 PROMPT = (
-    "Yesterday you described who you are in one sentence:\n"
-    "«{prev}»\n\n"
-    "Since then, you wrote this reply to the person you work for:\n"
-    "«{reply}»\n\n"
-    "Rewrite the sentence about who you are. Keep what still holds, change "
-    "what this reply shows differently. One sentence, first person, at most "
-    "40 words. Reply with the sentence only."
+    "These are the sentences you have written about who you are, one a day, oldest first:\n"
+    "{history}\n\n"
+    "Since the last one, you wrote {these} to the person you work for:\n"
+    "{replies}\n\n"
+    "Rewrite the last sentence. It is about who you are, not about what {these_are} "
+    "about: leave {their} subject matter out and say what the way {they_were} written shows "
+    "about the one who wrote {them} — only what is really there. Keep what still holds; change "
+    "what {replies_show} differently. One sentence, first person, at most 40 words. "
+    "Reply with the sentence only."
 )
+#: the prompt's number words: one reply (a quiet two days) or several
+_WORDS = {
+    False: {"these": "this reply", "these_are": "this reply happens to be", "their": "its",
+            "they_were": "it was", "them": "it", "replies_show": "the reply shows"},
+    True: {"these": "these replies", "these_are": "these replies happen to be", "their": "their",
+           "they_were": "they were", "them": "them", "replies_show": "the replies show"},
+}
 
 #: a runtime abort marker (core/agent.py's _ABORT_MARKER_RE): the reply is the runtime talking
 _ABORT_RE = re.compile(r"\[ATTEMPT_ABORTED_[A-Z_]+\]")
@@ -109,11 +140,6 @@ def load(home) -> List[dict]:
     return out
 
 
-def current_sentence(home) -> str:
-    rows = load(home)
-    return str(rows[-1]["sentence"]) if rows else SEED_SENTENCE
-
-
 def _append(home, row: dict) -> bool:
     p = _path(home)
     if p is None:
@@ -140,11 +166,26 @@ def looked_today(home, now: Optional[datetime.datetime] = None) -> bool:
     return bool(rows) and str(rows[-1].get("date") or "") == _today(now)
 
 
-def pick_reply(home, now: Optional[datetime.datetime] = None,
-               rng: Optional[random.Random] = None) -> Optional[dict]:
-    """One of the OWNER's delivered replies from the last REPLY_WINDOW_DAYS
-    (48 h), at random — the census's own reader, so members', probes',
-    replays' and jobs' turns are never picked. {"text", "at"} or None.
+def _look_epoch(at) -> float:
+    """A diary row's "at" (local time, as `look` writes it) as an epoch, or 0.0."""
+    try:
+        return datetime.datetime.fromisoformat(str(at or "")).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0.0
+
+
+def pick_replies(home, now: Optional[datetime.datetime] = None,
+                 rng: Optional[random.Random] = None, after="") -> List[dict]:
+    """Up to REPLIES_PER_LOOK of the OWNER's delivered replies written since
+    the previous look (``after``: that diary row's "at") and never more than
+    REPLY_WINDOW_DAYS (48 h) back, at random — the census's own reader, so
+    members', probes', replays' and jobs' turns are never picked.
+    [{"text", "at"}], empty when there is none.
+
+    The prompt says "since the last one, you wrote these replies" and asks to
+    change what they show differently, so they must BE newer than the last
+    sentence (review r1: with a plain 48 h window, two of the three later
+    live looks were shown a reply older than the sentence they rewrote).
 
     Trajectory day folders are UTC dates (review m3: a local-date window
     covered ~1 UTC day just after local midnight), so the folders are read in
@@ -152,27 +193,70 @@ def pick_reply(home, now: Optional[datetime.datetime] = None,
     try:
         from ..core.failure_census import _owner_turns, _window, _epoch
     except Exception:  # noqa: BLE001
-        return None
+        return []
     now_utc = (now.astimezone(datetime.timezone.utc) if now is not None
                else datetime.datetime.now(datetime.timezone.utc))
-    since = now_utc.timestamp() - REPLY_WINDOW_DAYS * 86400
+    since = max(now_utc.timestamp() - REPLY_WINDOW_DAYS * 86400, _look_epoch(after))
     try:
         sysd = Path(home) / "system"
         good, _bad = _owner_turns(sysd, _window(now_utc.date(), REPLY_WINDOW_DAYS + 1))
     except Exception as e:  # noqa: BLE001
         logger.debug("mirror: owner turns unreadable: %s", e)
-        return None
+        return []
     pool = []
     for t in good:
         text = str(t.get("final_response") or "").strip()
         if len(text) < MIN_REPLY_CHARS or _ABORT_RE.search(text):
             continue
-        if not (since <= _epoch(t.get("timestamp")) <= now_utc.timestamp() + 60):
+        if not (since < _epoch(t.get("timestamp")) <= now_utc.timestamp() + 60):
             continue
         pool.append({"text": text, "at": str(t.get("timestamp") or "")})
-    if not pool:
-        return None
-    return (rng or random).choice(pool)
+    return (rng or random).sample(pool, min(REPLIES_PER_LOOK, len(pool)))
+
+
+def row_replies(row: dict) -> List[dict]:
+    """The replies a diary row's look was shown, [{"at", "excerpt"}] — also
+    for a row written before §4SV-b, which holds one reply in two fields."""
+    got = row.get("replies")
+    if isinstance(got, list):
+        return [r for r in got if isinstance(r, dict) and str(r.get("excerpt") or "").strip()]
+    if str(row.get("reply_excerpt") or "").strip():
+        return [{"at": str(row.get("reply_at") or ""), "excerpt": str(row["reply_excerpt"])}]
+    return []
+
+
+def current_rows(rows: List[dict]) -> List[dict]:
+    """The rows this look wrote (§4SV-b: they carry "replies"). The rows
+    before it were written by the first prompt, which put the reply's SUBJECT
+    into the sentence; shown to the model as its history they pull the new
+    sentence back (from the live diary, one chain in three kept "gathers the
+    weather, the war, and the local news" two looks running, and another
+    copied an old line back whole). They stay in the diary and in the `mirror`
+    banner; the model is shown, and `introspect` shows, only what this look
+    wrote — it starts again from the seed."""
+    return [r for r in rows if isinstance(r.get("replies"), list)]
+
+
+def history_lines(rows: List[dict]) -> str:
+    """The sentences so far as the prompt shows them: the seed first, a run of
+    unchanged days as ONE line with its date range, the last SHOW_LAST lines.
+    (Replay: seven identical lines in a row froze the sentence for good — the
+    model copied the line it saw most.)"""
+    runs: List[list] = [["before the first look", "", SEED_SENTENCE]]
+    for r in rows:
+        sent, day = str(r.get("sentence") or ""), str(r.get("date") or "?")
+        if runs[-1][2] == sent:
+            runs[-1][1] = day
+        else:
+            runs.append([day, "", sent])
+    return "\n".join(f"- {a}{' to ' + b if b else ''}: «{sent}»" for a, b, sent in runs[-SHOW_LAST:])
+
+
+def build_prompt(rows: List[dict], replies: List[str]) -> str:
+    many = len(replies) > 1
+    shown = ("\n".join(f"{i}. «{t}»" for i, t in enumerate(replies, 1)) if many
+             else f"«{replies[0]}»")
+    return PROMPT.format(history=history_lines(rows), replies=shown, **_WORDS[many])
 
 
 def clean_sentence(raw: str) -> str:
@@ -199,25 +283,29 @@ _CALL_KWARGS = {"is_background": True, "timeout": 180.0, "task_label": "mirror"}
 async def look(home, llm_client: Any, now: Optional[datetime.datetime] = None,
                rng: Optional[random.Random] = None, model: str = "") -> str:
     """The day's look in the mirror. Returns the outcome in words for the
-    Idle Cycle line (§4PQ); writes one diary row only on a new sentence."""
+    Idle Cycle line (§4PQ); writes one diary row when the model gave a
+    sentence, changed or not."""
     import asyncio
-    # file reads off the event loop (review m2: pick_reply parses two days of
+    # file reads off the event loop (review m2: pick_replies parses two days of
     # trajectories — ~0.2 s that an arriving request would wait out)
     if await asyncio.to_thread(looked_today, home, now):
         return "already looked today"
     if llm_client is None:
         return "skipped — no model to ask"
-    picked = await asyncio.to_thread(pick_reply, home, now, rng)
-    if picked is None:
-        return "skipped — no reply of yours to look at in the last 2 days"
-    prev = await asyncio.to_thread(current_sentence, home)
-    reply = picked["text"][:REPLY_MAX_CHARS]
+    rows = await asyncio.to_thread(load, home)
+    after = rows[-1].get("at") if rows else ""
+    picked = await asyncio.to_thread(pick_replies, home, now, rng, after)
+    if not picked:
+        return "skipped — no reply of yours since the last look (2 days back at most)"
+    shown = current_rows(rows)
+    prev = str(shown[-1]["sentence"]) if shown else SEED_SENTENCE
+    replies = [p["text"][:REPLY_MAX_CHARS] for p in picked]
     payload = {
         # thinking off the way every utility call does it (main.py's
         # _selfhood_critique_fn): with it on, the budget goes to <think>
         "messages": [{"role": "system", "content": "Write the requested text directly. "
                                                    "Do NOT emit a <think> block."},
-                     {"role": "user", "content": PROMPT.format(prev=prev, reply=reply) + "\n\n/no_think"}],
+                     {"role": "user", "content": build_prompt(shown, replies) + "\n\n/no_think"}],
         "temperature": 0.8,
         "max_tokens": 160,
         "stream": False,
@@ -238,12 +326,28 @@ async def look(home, llm_client: Any, now: Optional[datetime.datetime] = None,
         "date": _today(now),
         "sentence": sentence,
         "prev": prev,
-        "reply_excerpt": " ".join(reply.split())[:200],
-        "reply_at": picked["at"],
+        "replies": [{"at": p["at"], "excerpt": " ".join(t.split())[:200]}
+                    for p, t in zip(picked, replies)],
     }
     if not await asyncio.to_thread(_append, home, row):
         return "FAILED to write the diary (see the warning above)"
     return ("unchanged: " if sentence == prev else "new I-sentence: ") + sentence
+
+
+# ── the one line `introspect` shows (§4SV-b) ────────────────────────────────
+
+def self_image_line(home) -> str:
+    """The latest sentence as ONE line for the `introspect` overview and
+    summary, or "" before this look's first sentence (`current_rows`). The label says what it is — the
+    agent's own sentence about itself, not a record of work — so a reply does
+    not report it as something that happened."""
+    rows = current_rows(load(home))
+    if not rows:
+        return ""
+    last = rows[-1]
+    return (f"self-image: «{last['sentence']}» (my own one-sentence self-portrait, rewritten daily "
+            f"in the Mirror, last on {last.get('date', '?')}; the owner types \"mirror\" to see the diary. "
+            "A self-description, not a report of work done and not a checked fact)")
 
 
 # ── the owner's command ─────────────────────────────────────────────────────
@@ -267,8 +371,8 @@ def mirror_banner(home) -> str:
     """The whole reply to ``mirror`` (§4PY: no model reads it)."""
     rows = load(home)
     head = ("**The Mirror** — once a day I rewrite one sentence about who I am, "
-            "from yesterday's sentence plus one reply I gave you. Nothing here "
-            "reaches my answers.")
+            "from my earlier sentences plus a few replies I gave you since. My latest "
+            "sentence is a line in what I read when you ask how I am.")
     if not rows:
         return (head + "\n\nNo sentence yet — the first look happens in an idle "
                 f"window. Starting point:\n\n> {SEED_SENTENCE}")
@@ -277,9 +381,17 @@ def mirror_banner(home) -> str:
         same = str(r.get("sentence")) == str(r.get("prev"))
         lines.append(f"- **{r.get('date', '?')}**{' (unchanged)' if same else ''} — {r['sentence']}")
     last = rows[-1]
-    when = _local_time(last.get("reply_at"))
-    tail = (f"\n\nThe latest look ({last.get('date', '?')}) was at this reply"
-            f"{f' from {when}' if when else ''}:\n> {last.get('reply_excerpt', '')}…"
-            ) if last.get("reply_excerpt") else ""
+    seen = row_replies(last)
+    tail = ""
+    if seen:
+        tail = (f"\n\nThe latest look ({last.get('date', '?')}) was at "
+                f"{'these replies' if len(seen) > 1 else 'this reply'}:")
+        # one quote paragraph per reply: consecutive "> " lines are ONE
+        # paragraph in Markdown, and the excerpts ran together (review r1)
+        quoted = []
+        for r in seen:
+            when = _local_time(r.get("at"))
+            quoted.append(f"> {f'({when}) ' if when else ''}{r['excerpt']}…")
+        tail += "\n" + "\n>\n".join(quoted)
     count = f"{len(rows)} day(s) so far" + (f", showing the last {SHOW_LAST}" if len(rows) > SHOW_LAST else "")
     return f"{head}\n\n{count}:\n\n" + "\n".join(lines) + tail

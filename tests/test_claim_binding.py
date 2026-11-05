@@ -991,7 +991,7 @@ def test_compact_dms_is_not_an_implausible_latitude():
     ("Phi=3.0 (highest), but the system-level Phi is 1.414.", '[execute] "phi": 3.0,\n"phi": 1.4142135623730951,', "the reply states both, at its precision"),
     ("PostgreSQL 19 Beta 2 was released July 16, 2026.", "[web] the batch that also patched 17.10, 16.14", "17.10 written with decimals is not a slip of 19"),
     ("It requires nearly 25 centuries.", "[web] alignment [Source: https://www.wtamu.edu/~cbaird/sq/2013/08/28/when-do-the-planets]\nabout 25 centuries", "a URL path date is not an evidence figure"),
-    ("Over 160+ unbiased reviews.", "[web] See 164 unbiased reviews of Stiva's Restaurant", "a lower bound agrees with 164"),
+    ("Over 160+ unbiased reviews.", "[web] See 164 unbiased reviews of Thalassa's Restaurant", "a lower bound agrees with 164"),
     ("**Flash Gordon** — 200-220mg per pill.", "[web] 10 Pills XTC Pills ca. 240 mg MDMA -Donkey Kong", "mg is a unit; a range against another product"),
     ("the 6-month/10,000 BTC claims", "[web] LENGTH: 0\n[web2] LENGTH: 554", "a path-mask remnant '000' is never 0; meta lines never twin"),
     ("Sea level falls ~0.8 m per year.", "[execute] Net 0.8 m/yr -> 2 years to drop 1 m\nNet 0.9 m/yr -> 2 years to drop 1 m\nNet 1.0 m/yr -> 1 years to drop 1 m", "a parameter sweep is an enumeration"),
@@ -1334,13 +1334,13 @@ def test_unverified_facts_lists_only_exact_defensible_absences():
 
 
 def test_a_figure_glued_in_the_evidence_is_not_a_misreport_of_another_line():
-    """Corpus turn 45360357: the reply's "Πάρνηθος 203" sat in the evidence as
-    "Πάρνηθος203" (the pre-§4IO ddgs join); called absent, it was then
+    """Corpus turn 45360357: the reply's "Ολύμπου 203" sat in the evidence as
+    "Ολύμπου203" (the pre-§4IO ddgs join); called absent, it was then
     "misreported" against a pagination "1 - 200" two lines down."""
-    ev = "[web] λεωφοροςπαρνηθος&μοιρωναχαρνες.Πάρνηθος203. Γυμναστήρια\n[browser] White OwlΘρακομακεδόνες,Αχαρνές, Δυτικά Προάστια, Αττική. 1 - 200."
-    reply = "Λεωφ. Πάρνηθος & Μοίρων (Πάρνηθος 203) — Αχαρνές, Θρακομακεδόνες."
+    ev = "[web] λεωφοροςολυμπου&δαφνηςπευκακια.Ολύμπου203. Γυμναστήρια\n[browser] Blue FoxΚαλοπέτρες,Πευκάκια, Νότια Προάστια, Αττική. 1 - 200."
+    reply = "Λεωφ. Ολύμπου & Δάφνης (Ολύμπου 203) — Πευκάκια, Καλοπέτρες."
     assert [(a.text, a.status) for a in CB.audit_numbers(reply, ev)] == [("203", "unsupported")]
-    assert [(a.text, a.status) for a in CB.audit_numbers(reply, "[web] Πάρνηθος 200, Αχαρνές Θρακομακεδόνες")] == [("203", "misreported")]
+    assert [(a.text, a.status) for a in CB.audit_numbers(reply, "[web] Ολύμπου 200, Πευκάκια Καλοπέτρες")] == [("203", "misreported")]
     assert CB._glued_occurrence("29.45", "orbital period of 29.45years") is True
     assert CB._glued_occurrence("203", "port 2030") is False
 
@@ -1939,3 +1939,11 @@ def test_the_excuse_names_where_it_was_found():
     r = _bind("The sandbox went from 84 entries down to 59.", "The sandbox went from 84 entries down to 59", _AFTER,
               "[file_system] CURRENT SANDBOX DIRECTORY STRUCTURE:\n" + _AFTER, raw=_BEFORE_RAW)
     assert "the turn's output also states" in r.bindings[0].detail
+
+
+@pytest.mark.parametrize("short, full", [("thodoris", "theodoros"), ("thanasis", "athanasios"),
+                                         ("lefteris", "eleftherios"), ("stelios", "stylianos")])
+def test_greek_short_forms_map_to_their_full_name(short, full):
+    """The given-name table is generic data: a bulk text edit once changed one row and nothing failed."""
+    from ghost_agent.core import claim_binding as cb
+    assert cb._GIVEN_NAME_CANON[short] == cb._GIVEN_NAME_CANON[full] == full

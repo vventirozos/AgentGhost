@@ -70,7 +70,7 @@ _FILLER = {"near", "in", "of", "the", "and", "at"}
 
 def _profile_words(prof) -> tuple:
     """(every folded word of the profile, the first word of each value — a
-    person's name: "Fotini", "Leonidas (born …)")."""
+    person's name: "Elena", "Kosmas (born …)")."""
     words, firsts = set(), set()
 
     def walk(v):

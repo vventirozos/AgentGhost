@@ -27,7 +27,7 @@ from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
 NOW = datetime.date(2026, 9, 4)
 # The live store, verbatim: one anchored value holding two subjects.
 PROFILE = {"relationships": {
-    "sons": "Thodoris (born 2016-11-25) and Leonidas (born 2026-03-12)"}}
+    "sons": "Markos (born 2016-11-22) and Kosmas (born 2026-03-09)"}}
 
 
 def _issues(reply, profile=PROFILE, now=NOW):
@@ -47,18 +47,18 @@ def test_a_correct_claim_produces_NOTHING_not_a_confirmation():
     calibration comparison *less* resolvable — a coverage number bought by
     damaging the thing coverage was for.
     """
-    assert _issues("Leonidas is 5 months old.") == []
-    assert _issues("Thodoris is 9 years old.") == []
+    assert _issues("Kosmas is 5 months old.") == []
+    assert _issues("Markos is 9 years old.") == []
     # And the module offers no way to express a pass.
     assert set(M.__all__) == {"refute_age_claims", "anchored_subjects"}
 
 
 def test_a_real_contradiction_refutes():
     """The negatives this exists to produce — the scarce class (57 of 402)."""
-    assert len(_issues("Leonidas is 9 years old.")) == 1
-    assert len(_issues("Thodoris is 3 years old.")) == 1
-    got = _issues("Leonidas is 9 years old.")[0]
-    assert "Leonidas" in got and "2026-03-12" in got, got
+    assert len(_issues("Kosmas is 9 years old.")) == 1
+    assert len(_issues("Markos is 3 years old.")) == 1
+    got = _issues("Kosmas is 9 years old.")[0]
+    assert "Kosmas" in got and "2026-03-09" in got, got
 
 
 # ── absence can never refute ───────────────────────────────────────────────
@@ -72,7 +72,7 @@ def test_no_anchored_fact_means_no_verdict():
     """
     for profile in ({}, None, {"relationships": {"sons": "two boys"}},
                     {"a": {"b": ["no dates here"]}}):
-        assert _issues("Leonidas is 9 years old.", profile=profile) == []
+        assert _issues("Kosmas is 9 years old.", profile=profile) == []
 
 
 def test_a_subject_the_reply_never_names_is_not_judged():
@@ -92,7 +92,7 @@ def test_a_reply_with_no_age_claim_is_not_judged():
 # ── the tolerance is generous, because a rounded answer is not wrong ───────
 
 def test_colloquial_rounding_is_never_refuted():
-    """⚠ THE LIVE CASE THIS TOLERANCE EXISTS FOR. On 2026-09-04 Leonidas was
+    """⚠ THE LIVE CASE THIS TOLERANCE EXISTS FOR. On 2026-09-04 Kosmas was
     5 months 23 days: the store's own `_age_phrase` renders "5 months" and
     the user called it "about 6 months". Both are right.
 
@@ -101,17 +101,17 @@ def test_colloquial_rounding_is_never_refuted():
     the one class the corpus cannot afford noise in.
     """
     for months in (5, 6):
-        assert _issues(f"Leonidas is {months} months old.") == [], months
-    # Thodoris is 9y9m: both 9 and 10 are defensible.
+        assert _issues(f"Kosmas is {months} months old.") == [], months
+    # Markos is 9y9m: both 9 and 10 are defensible.
     for years in (9, 10):
-        assert _issues(f"Thodoris is {years} years old.") == [], years
+        assert _issues(f"Markos is {years} years old.") == [], years
 
 
 def test_the_tolerance_still_catches_what_it_is_for():
     """A window wide enough to swallow everything is not a check."""
-    assert _issues("Leonidas is 2 years old.")        # 24m vs 5.9m
-    assert _issues("Thodoris is 3 years old.")        # 36m vs 117m
-    assert _issues("Leonidas is 30 months old.")
+    assert _issues("Kosmas is 2 years old.")        # 24m vs 5.9m
+    assert _issues("Markos is 3 years old.")        # 36m vs 117m
+    assert _issues("Kosmas is 30 months old.")
 
 
 # ── subject binding: ambiguity must not refute ─────────────────────────────
@@ -119,25 +119,25 @@ def test_the_tolerance_still_catches_what_it_is_for():
 def test_a_tie_between_two_subjects_says_nothing():
     """⚠ THE FALSE REFUTE THIS ALREADY PRODUCED ONCE, on a real reply.
 
-    "Your sons are 9 (Thodoris) and 5 months old (Leonidas)" puts BOTH names
+    "Your sons are 9 (Markos) and 5 months old (Kosmas)" puts BOTH names
     exactly 14 characters from "5 months old". First-wins bound the infant's
     age to the nine-year-old and refuted a correct answer. §4FN round 3:
-    there is no distance any more — "(Thodoris) and " is not a link, and the
+    there is no distance any more — "(Markos) and " is not a link, and the
     bracketed name AFTER the phrase is the subject, so the phrase is checked
-    against Leonidas and found consistent.
+    against Kosmas and found consistent.
     """
     assert _issues(
-        "Your sons are 9 (Thodoris) and 5 months old (Leonidas).") == []
-    assert _issues("Your sons are 9 (Leonidas) and 5 months old (Thodoris).")
+        "Your sons are 9 (Markos) and 5 months old (Kosmas).") == []
+    assert _issues("Your sons are 9 (Kosmas) and 5 months old (Markos).")
 
 
 def test_an_unambiguous_binding_still_works():
     """The subject rule must not be a blanket mute: two claims, each linked
     to its own subject, are both judged."""
-    assert _issues("Thodoris is 9 years old and Leonidas is 5 months old.") == []
-    both = _issues("Thodoris is 2 years old and Leonidas is 40 years old.")
+    assert _issues("Markos is 9 years old and Kosmas is 5 months old.") == []
+    both = _issues("Markos is 2 years old and Kosmas is 40 years old.")
     assert len(both) == 2, both
-    assert {"Thodoris", "Leonidas"} == {i.split()[0] for i in both}
+    assert {"Markos", "Kosmas"} == {i.split()[0] for i in both}
 
 
 def test_binding_does_not_cross_a_LINE():
@@ -154,15 +154,15 @@ def test_binding_does_not_cross_a_LINE():
     same 1977 replies, while the contradictions below still fire.)
     """
     listed = ("Got it — using the corrected dates:\n\n"
-              "- **Leonidas:** born March 12, 2026 → today (Sep 4, 2026) is "
+              "- **Kosmas:** born March 9, 2026 → today (Sep 4, 2026) is "
               "**about 6 months old** (5 months and 3 weeks).\n"
-              "- **Thodoris:** born November 25, 2016 → 9 years old.\n")
+              "- **Markos:** born November 22, 2016 → 9 years old.\n")
     assert _issues(listed) == []
 
     table = ("| Name | Birthdate | Age |\n"
-             "| Thodoris | 2016-11-25 | 9 years |\n"
-             "| Leonidas | 2026-03-12 | 5 months |\n"
-             "| Vasilis | 1980-01-29 | 44 years |\n")
+             "| Markos | 2016-11-22 | 9 years |\n"
+             "| Kosmas | 2026-03-09 | 5 months |\n"
+             "| Vasilis | 1980-01-26 | 44 years |\n")
     assert _issues(table) == [], "a row's age bound to another row's subject"
 
     # And the confinement is not a blanket mute: a contradiction ON the line
@@ -173,14 +173,14 @@ def test_binding_does_not_cross_a_LINE():
     # birthdates is doubly out of reach. The first draft of this control
     # asserted on "| … | 40 years |" and failed, which is the control doing
     # its job: it caught the test being wrong, not the code.
-    assert _issues("| Leonidas | 2026-03-12 | 40 years old |\n")
+    assert _issues("| Kosmas | 2026-03-09 | 40 years old |\n")
 
 
 def test_a_distant_name_is_not_the_subject():
     """The world it fails in: a name sentences back captures an unrelated
     number. §4FN round 3: there is no window — the words between the name
     and the phrase are not a link, and that is the whole test."""
-    far = ("Leonidas is doing well. " + "Filler sentence here. " * 8 +
+    far = ("Kosmas is doing well. " + "Filler sentence here. " * 8 +
            "The lease is 9 years old.")
     assert _issues(far) == []
 
@@ -191,8 +191,8 @@ def test_overlapping_patterns_report_one_issue_not_two():
     """⚠ The age patterns overlap by design ("9 years old" matches two of
     them). This route writes NEGATIVES, where a duplicated issue is a
     duplicated accusation against the same turn."""
-    assert len(_issues("Leonidas is 9 years old.")) == 1
-    assert len(_issues("Leonidas is 9-year old.")) == 1
+    assert len(_issues("Kosmas is 9 years old.")) == 1
+    assert len(_issues("Kosmas is 9-year old.")) == 1
 
 
 # ── the store walk ─────────────────────────────────────────────────────────
@@ -202,8 +202,8 @@ def test_subjects_are_found_wherever_the_anchor_landed():
     `temporal.anchor` found an age phrase, and a key list goes stale the
     first time a fact is stored somewhere new."""
     assert dict(anchored_subjects(PROFILE)) == {
-        "Thodoris": datetime.date(2016, 11, 25),
-        "Leonidas": datetime.date(2026, 3, 12)}
+        "Markos": datetime.date(2016, 11, 22),
+        "Kosmas": datetime.date(2026, 3, 9)}
     nested = {"a": [{"b": {"c": "Maria (born 2001-02-03)"}}]}
     assert anchored_subjects(nested) == [("Maria", datetime.date(2001, 2, 3))]
 
@@ -232,15 +232,15 @@ def test_the_checker_is_total():
 
     # Reaches the walk's own guard.
     assert anchored_subjects(
-        _Hostile({"a": "Leonidas (born 2026-03-12)"})) == []
+        _Hostile({"a": "Kosmas (born 2026-03-09)"})) == []
     # Reaches the outer guard, two different ways.
-    assert refute_age_claims(reply="Leonidas is 9 years old.",
+    assert refute_age_claims(reply="Kosmas is 9 years old.",
                              profile=_Hostile({"a": 1}), now=NOW) == []
-    assert refute_age_claims(reply="Leonidas is 9 years old.",
+    assert refute_age_claims(reply="Kosmas is 9 years old.",
                              profile=PROFILE, now="not-a-date") == []
     # And the cheap type rejections still hold.
     for junk in (None, 42, object(), {"a": object()}, [[[None]]]):
-        assert refute_age_claims(reply="Leonidas is 9 years old.",
+        assert refute_age_claims(reply="Kosmas is 9 years old.",
                                  profile=junk, now=NOW) == []
     for reply in (None, 42, object()):
         assert refute_age_claims(reply=reply, profile=PROFILE, now=NOW) == []
@@ -299,7 +299,7 @@ def _agent(*, verifier_attached=True, profile=PROFILE, no_verifier=False):
     return a
 
 
-WRONG = "Leonidas is 9 years old."
+WRONG = "Kosmas is 9 years old."
 
 
 @pytest.mark.asyncio
@@ -315,19 +315,19 @@ async def test_a_tool_free_turn_reaches_the_arithmetic_check():
     assert v.verdict == VerifyVerdict.REFUTED
     assert v.confidence >= 0.7, "below the consumption bar — nothing would use it"
     assert last_tool is None
-    assert any("Leonidas" in i for i in v.issues)
+    assert any("Kosmas" in i for i in v.issues)
 
 
 @pytest.mark.asyncio
 async def test_a_tool_free_turn_with_a_CORRECT_claim_still_gets_no_verdict():
     # the agent path uses TODAY (not the fixture's NOW): say the age that is true today
     import datetime as _dt
-    _born = _dt.date(2026, 3, 12)
+    _born = _dt.date(2026, 3, 9)
     _today = _dt.date.today()
     _months = (_today.year - _born.year) * 12 + _today.month - _born.month - (1 if _today.day < _born.day else 0)
     v, _ = await _agent()._compute_verifier_verdict(
         tools_run_this_turn=[], messages=[],
-        final_ai_content=f"Leonidas is {_months} months old.",
+        final_ai_content=f"Kosmas is {_months} months old.",
         last_user_content="how old", lc="how old")
     assert v is None
 

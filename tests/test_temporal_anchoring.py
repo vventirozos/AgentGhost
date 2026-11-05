@@ -1,8 +1,8 @@
 """Temporal anchoring — store the invariant, derive the quantity.
 
 REGRESSION UNDER TEST (live, 2026-09-04). The user stated on 2026-07-07
-that his son Leonidas was 4 months old. Two months later the agent still
-answered "Leonidas is 4 months old": the profile store had captured the
+that his son Kosmas was 4 months old. Two months later the agent still
+answered "Kosmas is 4 months old": the profile store had captured the
 MEASUREMENT verbatim and ``get_context_string`` renders bare, unstamped
 ``- key: value`` lines into ``### USER PROFILE ###`` every turn, so the
 snapshot read as present tense for ever.
@@ -53,7 +53,7 @@ def test_stated_age_is_not_recalled_verbatim_two_months_later(tmp_path, at_later
     temporal._today = lambda: monkey_said          # the write happens in July
     try:
         pm.update("relationships", "sons",
-                  "Thodoris (9 years old) and Leonidas (4 months old)")
+                  "Markos (9 years old) and Kosmas (4 months old)")
     finally:
         temporal._today = orig_today               # the read happens in September
 
@@ -77,7 +77,7 @@ def test_stored_value_holds_a_constant_not_a_derived_age(tmp_path):
     orig_today = temporal._today
     temporal._today = lambda: SAID
     try:
-        pm.update("relationships", "sons", "Leonidas (4 months old)")
+        pm.update("relationships", "sons", "Kosmas (4 months old)")
     finally:
         temporal._today = orig_today
 
@@ -94,7 +94,7 @@ def test_rendered_age_advances_with_the_clock(tmp_path, monkeypatch):
     """
     pm = ProfileMemory(tmp_path)
     monkeypatch.setattr(temporal, "_today", lambda: SAID)
-    pm.update("relationships", "sons", "Leonidas (4 months old)")
+    pm.update("relationships", "sons", "Kosmas (4 months old)")
 
     seen = []
     for day, want in [(datetime.date(2026, 9, 4), "6 months old"),
@@ -184,13 +184,13 @@ def test_exact_birth_date_derives_without_a_tilde():
 
     Fails if: _anchor_date ignores the ~ marker / the date's precision.
     """
-    out = temporal.derive("Leonidas was born on 2026-03-07", LATER)
+    out = temporal.derive("Kosmas was born on 2026-03-07", LATER)
     assert "→ 5 months old" in out, out
     assert "~5 months" not in out, out
 
 
 def test_month_name_birth_dates_normalise_and_derive():
-    """A person types "born March 12, 2026", not ISO. Live: the operator
+    """A person types "born March 9, 2026", not ISO. Live: the operator
     stated both children's exact birth dates in a chat turn and the
     pre-change code stored them verbatim, so they carried NO derived age —
     an exact date the model still has to subtract from by hand, which is
@@ -202,10 +202,10 @@ def test_month_name_birth_dates_normalise_and_derive():
     Fails if: _ANCHOR_TEXT_RE is dropped from anchor() (no normalisation)
     or from derive() (legacy rows render no age).
     """
-    for text, iso in [("Leonidas born March 12, 2026", "2026-03-12"),
-                      ("born on 12 March 2026", "2026-03-12"),
-                      ("born Mar 12, 2026", "2026-03-12"),
-                      ("Thodoris born November 25, 2016", "2016-11-25")]:
+    for text, iso in [("Kosmas born March 9, 2026", "2026-03-09"),
+                      ("born on 9 March 2026", "2026-03-09"),
+                      ("born Mar 9, 2026", "2026-03-09"),
+                      ("Markos born November 22, 2016", "2016-11-22")]:
         anchored = temporal.anchor(text, LATER)
         assert f"born {iso}" in anchored, (text, anchored)
         assert temporal.anchor(anchored, LATER) == anchored, anchored
@@ -241,26 +241,26 @@ def test_quoted_spans_are_records_and_are_never_rewritten():
 
     Fails if: _sub_outside_quotes degrades to a plain pattern.sub.
     """
-    rec = '3. web_search(query="Thodoris basketball Panellinios age 9")'
+    rec = '3. web_search(query="Markos basketball Sampleton BC age 9")'
     assert temporal.anchor(rec, SAID) == rec
 
     # …but the same phrase OUTSIDE quotes is still anchored, or the guard
     # would be indistinguishable from deleting the feature.
-    assert temporal.anchor("Thodoris, age 9", SAID) != "Thodoris, age 9"
+    assert temporal.anchor("Markos, age 9", SAID) != "Markos, age 9"
 
 
 def test_attributive_compound_is_annotated_not_replaced():
-    """"a 9-year-old named Thodoris" fills a noun slot. Replacing it in
-    place produced "a born ~2017-02-20 named Thodoris" on a real stored
+    """"a 9-year-old named Markos" fills a noun slot. Replacing it in
+    place produced "a born ~2017-02-20 named Markos" on a real stored
     fact. Annotate instead, and keep the sentence grammatical.
 
     Fails if: the attributive branch replaces; if _AGE_PATTERNS is widened
     to match the fully-hyphenated form again.
     """
-    src = "equipment for a 9-year-old named Thodoris"
+    src = "equipment for a 9-year-old named Markos"
     out = temporal.anchor(src, SAID)
     assert out.startswith("equipment for a 9-year-old (born ~"), out
-    assert out.endswith(") named Thodoris"), out
+    assert out.endswith(") named Markos"), out
     assert "a born ~" not in out, out
     # The derived value still lands next to the frozen token.
     assert "years old" in temporal.derive(out, LATER)
@@ -274,7 +274,7 @@ def test_bare_durations_are_left_alone():
     """
     for text in ["I have 4 months of runway",
                  "the migration took 3 months",
-                 "BMW 118i",
+                 "BMW 320d",
                  "sprint 9"]:
         assert temporal.anchor(text, SAID) == text, text
 
@@ -308,10 +308,10 @@ def test_anchor_is_idempotent():
     Fails if: the attributive lookahead is dropped (double annotation); if
     a derived gloss becomes re-anchorable.
     """
-    for src in ["Thodoris (9 years old) and Leonidas (4 months old)",
-                "his 9-year-old son Thodoris",
+    for src in ["Markos (9 years old) and Kosmas (4 months old)",
+                "his 9-year-old son Markos",
                 "User started BJJ 3 years ago",
-                "Leonidas, 4mo"]:
+                "Kosmas, 4mo"]:
         once = temporal.anchor(src, SAID)
         assert temporal.anchor(once, SAID) == once, src
         assert temporal.anchor(once, LATER) == once, src
@@ -326,9 +326,9 @@ def test_anchor_does_not_rewrite_a_derived_gloss():
     stops covering a unit that _age_phrase can emit (it missed "weeks"
     until the weeks band was added).
     """
-    for anchored in ["Leonidas born ~2026-06-13",   # -> weeks
-                     "Leonidas born ~2026-02-20",   # -> months
-                     "Thodoris born ~2017-01"]:     # -> years
+    for anchored in ["Kosmas born ~2026-06-13",   # -> weeks
+                     "Kosmas born ~2026-02-20",   # -> months
+                     "Markos born ~2017-01"]:     # -> years
         glossed = temporal.derive(anchored, SAID)
         assert "old" in glossed, glossed
         assert temporal.anchor(glossed, SAID) == glossed, glossed
@@ -339,7 +339,7 @@ def test_derive_is_idempotent_and_self_correcting():
 
     Fails if: derive() appends without stripping the previous gloss.
     """
-    anchored = "Leonidas born ~2026-02-20"
+    anchored = "Kosmas born ~2026-02-20"
     once = temporal.derive(anchored, LATER)
     assert temporal.derive(once, LATER) == once
     # A gloss derived at an older date is REPLACED, not appended to.
@@ -358,18 +358,18 @@ def test_restating_an_age_refines_the_anchor_instead_of_accumulating(tmp_path, m
     """
     pm = ProfileMemory(tmp_path)
     monkeypatch.setattr(temporal, "_today", lambda: SAID)
-    pm.update("relationships", "sons", "Leonidas (4 months old)")
+    pm.update("relationships", "sons", "Kosmas (4 months old)")
     first = pm.load()["relationships"]["sons"]
 
     monkeypatch.setattr(temporal, "_today", lambda: LATER)
-    pm.update("relationships", "sons", "Leonidas (6 months old)")
+    pm.update("relationships", "sons", "Kosmas (6 months old)")
     stored = pm.load()["relationships"]["sons"]
 
     assert not isinstance(stored, list), stored
     assert stored.count("born") == 1, stored
     # …and it took the NEWER statement's anchor, in place.
     assert stored != first, (first, stored)
-    assert stored == temporal.anchor("Leonidas (6 months old)", LATER), stored
+    assert stored == temporal.anchor("Kosmas (6 months old)", LATER), stored
 
 
 def test_unanchored_values_keep_byte_exact_dedup(tmp_path):
@@ -435,12 +435,12 @@ def test_load_keeps_the_legacy_shape_for_every_existing_reader(tmp_path):
     recursing into lists.
     """
     pm = ProfileMemory(tmp_path)
-    pm.update("root", "company", "EvolMonkey")
+    pm.update("root", "company", "Orbitdata")
     pm.update("interests", "languages", "python")
     pm.update("interests", "languages", "rust")
 
     plain = pm.load()
-    assert plain["root"]["company"] == "EvolMonkey"
+    assert plain["root"]["company"] == "Orbitdata"
     assert plain["interests"]["languages"] == ["python", "rust"]
     # …while the DISK carries the provenance.
     raw = pm.load_raw()
@@ -536,9 +536,9 @@ def test_restating_a_fact_refreshes_its_stamp(tmp_path):
     fresh = "2026-09-04T00:00:00.000000Z"
 
     # Scalar path.
-    pm.update("root", "company", "EvolMonkey", as_of=stale)
+    pm.update("root", "company", "Orbitdata", as_of=stale)
     assert pm.as_of("root", "company") == stale
-    pm.update("root", "company", "EvolMonkey", as_of=fresh)
+    pm.update("root", "company", "Orbitdata", as_of=fresh)
     assert pm.as_of("root", "company") == fresh
 
     # List path: two values first, THEN restate one of them.
@@ -638,7 +638,7 @@ def test_save_of_an_unwrapped_load_does_not_strip_provenance(tmp_path):
     """
     pm = ProfileMemory(tmp_path)
     when = "2025-01-01T00:00:00.000000Z"
-    pm.update("root", "company", "EvolMonkey", as_of=when)
+    pm.update("root", "company", "Orbitdata", as_of=when)
     pm.update("interests", "languages", "python", as_of=when)
 
     pm.save(pm.load())          # the round trip

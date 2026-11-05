@@ -259,12 +259,12 @@
 
   <h2 id="tls-renewal">TLS certificate renewal (2026-09-29)</h2>
   <p>The web client serves HTTPS with the Let's-Encrypt-via-Tailscale certificate for
-  <code>eva.taila2b1d.ts.net</code> (<code>interface/eva.taila2b1d.ts.net.{crt,key}</code>). The phone
+  <code>mymac.tailnet-example.ts.net</code> (<code>interface/mymac.tailnet-example.ts.net.{crt,key}</code>). The phone
   PWA, service worker and web push all stop when it expires. It was found on 2026-09-29 with 10
   days left (chip DEGRADED), renewed by hand to <strong>2026-12-09</strong>, and renewal is now automatic.</p>
   <ul>
     <li><strong>Job.</strong> LaunchAgent <code>com.local.ghost-cert-renew</code>
-    (<code>~/Library/LaunchAgents</code>) runs <code>/Users/vasilis/Data/AI/bin/renew-ghost-cert.sh</code>
+    (<code>~/Library/LaunchAgents</code>) runs <code>~/Data/AI/bin/renew-ghost-cert.sh</code>
     daily at 04:17 and at login. A login agent, not a boot daemon: the Tailscale CLI talks to the
     login-scoped GUI app (same reasoning as <code>com.local.orbstack-engine</code>).
     Log: <code>~/Data/AI/Logs/ghost-cert-renew.log</code>.</li>

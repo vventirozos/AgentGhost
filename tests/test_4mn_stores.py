@@ -152,15 +152,15 @@ def test_a_profile_removal_is_archived_first_and_refused_when_it_cannot_be(tmp_p
     copy — a confirmed forget could not be undone."""
     from ghost_agent.memory.profile import ProfileMemory
     pm = ProfileMemory(tmp_path)
-    pm.update("family", "children", "Leonidas")
+    pm.update("family", "children", "Kosmas")
     out = pm.delete("family", "children")
     assert "Removed" in out
     rec = json.loads((tmp_path / "profile_removed.jsonl").read_text().splitlines()[-1])
-    assert rec["how"] == "delete" and "Leonidas" in json.dumps(rec["value"])
-    pm.update("family", "children", "Leonidas")
+    assert rec["how"] == "delete" and "Kosmas" in json.dumps(rec["value"])
+    pm.update("family", "children", "Kosmas")
     monkeypatch.setattr(pm, "_archive_removed", lambda *a, **k: False)
     assert "NOTHING was removed" in pm.delete("family", "children")
-    assert "Leonidas" in json.dumps(pm.load_raw())
+    assert "Kosmas" in json.dumps(pm.load_raw())
 
 
 def test_reset_all_keeps_every_row_before_wiping(tmp_path, monkeypatch):

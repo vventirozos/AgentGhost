@@ -72,7 +72,7 @@ def current_source(via: str = "", value=None, field=None) -> Dict[str, str]:
     """The live request's id and the owner's CLAUSE behind ``value``, for a
     writer that runs INSIDE the turn (the update_profile tool, the bus).
     Never the whole message (review r1 MAJOR: a token pasted beside "my car
-    is a Ducati" was stored and replayed into prompts): the one clause of the
+    is a Triumph" was stored and replayed into prompts): the one clause of the
     owner's statements that carries the value — preferring the clause with
     the field's predicate cue ("moved", "wife", "called"), then the widest
     coverage — or "" when none does. Background writers (the extractor) pass

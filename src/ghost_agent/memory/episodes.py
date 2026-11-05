@@ -56,7 +56,7 @@ def _iso(epoch) -> str:
         return get_utc_timestamp()
 
 
-#: Greek → Latin, so "fotini" finds "Φωτεινή" (§4LA)
+#: Greek → Latin, so "elena" finds "Έλενα" (§4LA)
 _GR2LAT = str.maketrans({"α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η": "i", "θ": "th", "ι": "i",
                          "κ": "k", "λ": "l", "μ": "m", "ν": "n", "ξ": "x", "ο": "o", "π": "p", "ρ": "r", "σ": "s",
                          "ς": "s", "τ": "t", "υ": "y", "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o"})
@@ -1249,8 +1249,8 @@ class EpisodicMemory:
         if len(t) < 3:
             return []
         rx = re.compile(r"(?<![\w])" + re.escape(_fold(t)) + r"(?![\w])")
-        # (§4LA) …and in the other script or an inflected form: "fotini"
-        # finds "Φωτεινή", "Φωτεινή" finds "της Φωτεινής"
+        # (§4LA) …and in the other script or an inflected form: "elena"
+        # finds "Έλενα", "Έλενα" finds "της Έλενας"
         _lt = _latin(t)
         lrx = re.compile(r"(?<![\w])" + re.escape(_lt) + (r"\w{0,2}" if len(_lt) >= 4 else "") + r"(?![\w])")
 
@@ -1259,7 +1259,7 @@ class EpisodicMemory:
             return bool(rx.search(_fold(x)) or lrx.search(_latin(x)))
         # every row: an ASCII target must still find "René" (r8 review);
         # 21 ms on the live 400-episode store. The ACTIONS too (§4LA: a recall
-        # result naming Fotini survived "forget Fotini")
+        # result naming Elena survived "forget Elena")
         rows = conn.execute("SELECT id, trigger, context, outcome, lesson, timestamp FROM episodes").fetchall()
         acts: Dict[int, list] = {}
         if actions:

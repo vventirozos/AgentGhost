@@ -36,9 +36,9 @@ def _home(tmp_path):
     con.execute("CREATE TABLE triplets (subject TEXT, predicate TEXT, object TEXT, timestamp DATETIME, "
                 "weight INTEGER DEFAULT 1, valid_from REAL, valid_until REAL)")
     con.executemany("INSERT INTO triplets (subject, predicate, object, timestamp) VALUES (?,?,?,?)", [
-        ("user", "REQUESTED", "dvda schematic", "2026-09-24 13:58:40"),       # inside the member window
-        ("user", "HAS_FOTINI_DESCRIPTION", "tall", "2026-09-06 07:35:19"),    # on-demand mirror
-        ("user", "HAS_WIFE", "fotini", "2026-09-06 07:35:19"),               # a real owner fact
+        ("user", "REQUESTED", "engine schematic", "2026-09-24 13:58:40"),       # inside the member window
+        ("user", "HAS_ELENA_DESCRIPTION", "tall", "2026-09-06 07:35:19"),    # on-demand mirror
+        ("user", "HAS_WIFE", "elena", "2026-09-06 07:35:19"),               # a real owner fact
         ("owner topic", "IS", "kept", "2026-09-24 18:00:10"),                # inside the owner window
     ])
     con.commit(); con.close()

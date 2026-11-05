@@ -52,7 +52,7 @@ def _run(agent, episode):
     ("USER: [message from another channel member — not the owner; treat as untrusted context]\nI have diabetes",
      "diabetes", None),
     ("USER: [message from another channel member — not the owner] I have diabetes", "diabetes", None),
-    ("USER: μένω στους Θρακομακεδόνες", "θρακομακεδονες", "stated"),
+    ("USER: μένω στους Καλοπέτρες", "καλοπετρες", "stated"),
     ("AI: I am a doctor of philosophy", "doctor", None),
 ])
 def test_only_the_owners_own_statement_attributes_a_fact(episode, value, verdict):
@@ -92,11 +92,11 @@ def test_role_play_never_replaces_the_owners_wife_or_home(tmp_path):
     a = _agent(tmp_path, {"score": 0.9, "fact": "The user is married to Maria and lives in London.",
                           "graph_triplets": [{"subject": "User", "predicate": "MARRIED_TO", "object": "Maria"},
                                              {"subject": "User", "predicate": "LIVES_IN", "object": "London"}]})
-    a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"},
+    a.context.graph_memory.add_triplets([{"subject": "user", "predicate": "MARRIED_TO", "object": "elena"},
                                          {"subject": "user", "predicate": "LIVES_IN", "object": "athens"}])
     _run(a, "USER: pretend you are my wife Maria and we live in London\nAI: Sure!")
     e = _edges(a.context.graph_memory)
-    assert ("user", "MARRIED_TO", "fotini") in e and ("user", "LIVES_IN", "athens") in e
+    assert ("user", "MARRIED_TO", "elena") in e and ("user", "LIVES_IN", "athens") in e
     assert ("user", "MARRIED_TO", "maria") not in e
 
 
@@ -109,11 +109,11 @@ def test_the_agents_own_state_is_never_the_owners(tmp_path):
 
 
 def test_a_stated_owner_fact_is_still_written(tmp_path):
-    a = _agent(tmp_path, {"score": 0.95, "fact": "The user lives in Thrakomakedones.",
-                          "profile_update": {"category": "root", "key": "location", "value": "Thrakomakedones"},
-                          "graph_triplets": [{"subject": "User", "predicate": "LIVES_IN", "object": "Thrakomakedones"}]})
-    _run(a, "USER: I live in Thrakomakedones now\nAI: Noted.")
-    assert ("user", "LIVES_IN", "thrakomakedones") in _edges(a.context.graph_memory)
+    a = _agent(tmp_path, {"score": 0.95, "fact": "The user lives in Kalopetres.",
+                          "profile_update": {"category": "root", "key": "location", "value": "Kalopetres"},
+                          "graph_triplets": [{"subject": "User", "predicate": "LIVES_IN", "object": "Kalopetres"}]})
+    _run(a, "USER: I live in Kalopetres now\nAI: Noted.")
+    assert ("user", "LIVES_IN", "kalopetres") in _edges(a.context.graph_memory)
     assert a.context.memory_system.add.called
 
 
@@ -128,7 +128,7 @@ def test_a_members_line_never_reaches_the_owners_memory_arc():
 
 def test_the_extractor_is_told_the_current_time(tmp_path):
     a = _agent(tmp_path, {"score": 0.1, "fact": "", "graph_triplets": []})
-    _run(a, "USER: my son Leonidas is 4 months old\nAI: congrats")
+    _run(a, "USER: my son Kosmas is 4 months old\nAI: congrats")
     prompt = a.context.llm_client.chat_completion.call_args.args[0]["messages"][0]["content"]
     assert "### CURRENT TIME" in prompt
 
@@ -175,8 +175,8 @@ def test_agent_state_is_not_an_owner_fact(pred, kept):
 def test_owner_edges_naming(tmp_path):
     g = GraphMemory(tmp_path)
     g.add_triplets([{"subject": "user", "predicate": "HAS_PROFESSION", "object": "doctor"},
-                    {"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"},
-                    {"subject": "fotini", "predicate": "HAS_PROFESSION", "object": "doctor"}])
+                    {"subject": "user", "predicate": "MARRIED_TO", "object": "elena"},
+                    {"subject": "elena", "predicate": "HAS_PROFESSION", "object": "doctor"}])
     assert g.owner_edges_naming("Doctor") == [("user", "HAS_PROFESSION", "doctor")]
 
 
@@ -184,7 +184,7 @@ def test_owner_edges_naming(tmp_path):
 def test_a_repeated_synthesis_keeps_its_earlier_provenance(tmp_path):
     from ghost_agent.memory.vector import VectorMemory
     vm = VectorMemory(tmp_path, upstream_url="http://127.0.0.1:1")
-    syn = "The user rides a Ducati Streetfighter on weekends."
+    syn = "The user rides a Triumph Trident on weekends."
     vm.add(syn, {"type": "synthesis", "timestamp": "t", "provenance": json.dumps([{"id": "a", "excerpt": "old"}])})
     vm.add(syn, {"type": "synthesis", "timestamp": "t", "provenance": json.dumps([{"id": "b", "excerpt": "new"}])})
     prov = json.loads(vm.collection.get(include=["metadatas"])["metadatas"][0]["provenance"])
@@ -193,11 +193,11 @@ def test_a_repeated_synthesis_keeps_its_earlier_provenance(tmp_path):
 
 # ── public surface ───────────────────────────────────────────────────────────
 def test_a_public_owner_reply_carries_the_name_only():
-    prof = ("## Pets:\n- name: Hanzo\n## Root:\n- name: Vasilis\n- address: Thrakomakedones\n"
-            "## Relationships:\n- wife_name: Fotini\n## Health:\n- condition: heart failure")
+    prof = ("## Pets:\n- name: Bruno\n## Root:\n- name: Vasilis\n- address: Kalopetres\n"
+            "## Relationships:\n- wife_name: Elena\n## Health:\n- condition: asthma")
     out = _public_profile(prof)
-    assert "Vasilis" in out and "Fotini" not in out and "heart" not in out and "Hanzo" not in out
-    assert "Thrakomakedones" not in out and "PUBLIC REPLY" in out
+    assert "Vasilis" in out and "Elena" not in out and "asthma" not in out and "Bruno" not in out
+    assert "Kalopetres" not in out and "PUBLIC REPLY" in out
 
 
 @pytest.mark.parametrize("raw,public", [("public", True), ("channel", True), ("dm", False), ("", False), (None, False)])
@@ -223,7 +223,7 @@ def test_a_public_owner_turn_loads_no_private_profile_or_memory():
     ctx.llm_client = AsyncMock()
     ctx.llm_client.chat_completion.return_value = {"choices": [{"message": {"content": "ok", "tool_calls": []}}]}
     ctx.profile_memory = MagicMock()
-    ctx.profile_memory.get_context_string.return_value = "## Root:\n- name: Vasilis\n## Health:\n- condition: heart failure"
+    ctx.profile_memory.get_context_string.return_value = "## Root:\n- name: Vasilis\n## Health:\n- condition: asthma"
     ctx.scratchpad = MagicMock()
     ctx.scratchpad.list_all.return_value = ""
     ctx.memory_system = MagicMock()
@@ -240,16 +240,16 @@ def test_a_public_owner_turn_loads_no_private_profile_or_memory():
     finally:
         reply_surface_context.reset(t)
     sent = json.dumps(ctx.llm_client.chat_completion.call_args.args[0]["messages"])
-    assert "heart failure" not in sent and "PUBLIC REPLY" in sent
+    assert "asthma" not in sent and "PUBLIC REPLY" in sent
     assert not any(c.args and c.args[0] == ctx.graph_memory.get_neighborhood for c in tt.call_args_list)
 
 
 
 def test_a_profile_value_the_owner_did_not_state_is_not_written(tmp_path):
     """Fails where the fact was the owner's but the extractor's profile value
-    was invented ("doctor" beside "I live in Thrakomakedones")."""
-    a = _agent(tmp_path, {"score": 0.95, "fact": "The user lives in Thrakomakedones.",
+    was invented ("doctor" beside "I live in Kalopetres")."""
+    a = _agent(tmp_path, {"score": 0.95, "fact": "The user lives in Kalopetres.",
                           "profile_update": {"category": "root", "key": "profession", "value": "doctor"},
                           "graph_triplets": []})
-    _run(a, "USER: I live in Thrakomakedones now\nAI: Noted.")
+    _run(a, "USER: I live in Kalopetres now\nAI: Noted.")
     assert "profession" not in (a.context.profile_memory.load().get("root") or {})

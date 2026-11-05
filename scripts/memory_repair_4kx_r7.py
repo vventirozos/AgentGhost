@@ -32,7 +32,7 @@ REWRITE = {
   "solution": "When performing file system operations, verify the creation and content of the file before proceeding to subsequent steps, especially when the request asks for verification (e.g., 'read it back')."
  }
 }
-RESTORE_EDGES = [["user", "RESIDES_IN", "athens"], ["user", "HAS_HOME_IN", "thrakomakedones"], ["user", "HAS_ADDRESS", "thrakomakedones"], ["user", "OWNS", "pista gp rr"]]
+RESTORE_EDGES = [["user", "RESIDES_IN", "athens"], ["user", "HAS_HOME_IN", "kalopetres"], ["user", "HAS_ADDRESS", "kalopetres"], ["user", "OWNS", "pista gp rr"]]
 
 
 def _agent_listening(port: int = 0) -> bool:

@@ -30,8 +30,8 @@ _Q = ("Revolut September 2026 fraudulent government request email domain "
 _LIVE_EDGES = [
     "- (User) -[INTERACTED_WITH]-> (Assistant) -[PROVIDED]-> (News_Headlines) -[DATED]-> (July 27, 2026) [Score 24]",
     "- (User) -[REQUESTED]-> (Custom Skill) -[HAS_NAME]-> (News_Headlines) -[DATED]-> (July 27, 2026) [Score 11]",
-    "- (Ai) -[RESPONDED_TO]-> (User) -[HAS_SON]-> (Leonidas) -[HAS_BIRTHDATE]-> (March 12, 2026) [Score 11]",
-    "- (User) -[HAS_SON]-> (Leonidas) -[BORN_ON]-> (March 12, 2026) [Score 9]",
+    "- (Ai) -[RESPONDED_TO]-> (User) -[HAS_SON]-> (Kosmas) -[HAS_BIRTHDATE]-> (March 9, 2026) [Score 11]",
+    "- (User) -[HAS_SON]-> (Kosmas) -[BORN_ON]-> (March 9, 2026) [Score 9]",
     "- (User) -[HAS_SKILL]-> (News_Headlines) -[DATED]-> (July 27, 2026) [Score 8]",
 ]
 
@@ -108,13 +108,13 @@ def test_the_live_graph_section_keeps_one_edge_and_drops_fourteen():
     kept = _graph_edges_on_topic(_Q, _LIVE_EDGES)
     assert len(kept) == 1
     assert "REQUESTED" in kept[0]
-    assert not any("Leonidas" in e for e in kept)
+    assert not any("Kosmas" in e for e in kept)
 
 
 def test_a_year_alone_cannot_carry_an_edge():
     """FAILS IF: digit tokens count as content words — the live mechanism."""
     assert "2026" not in _graph_query_terms(_Q)
-    only_year = ["- (User) -[HAS_SON]-> (Leonidas) -[BORN_ON]-> (March 12, 2026) [Score 9]"]
+    only_year = ["- (User) -[HAS_SON]-> (Kosmas) -[BORN_ON]-> (March 9, 2026) [Score 9]"]
     assert _graph_edges_on_topic("meeting notes 2026", only_year) == []
 
 
@@ -122,7 +122,7 @@ def test_greek_query_matches_greek_edges():
     """FAILS IF: folding is ASCII-only (the §4HA search-floor mistake, again)."""
     q = "Τέμπη ατύχημα αυτοκίνητο νεκροί"
     edges = ["- (Τέμπη) -[SITE_OF]-> (Ατύχημα) -[DATED]-> (2025) [Score 3]",
-             "- (User) -[HAS_SON]-> (Leonidas) [Score 9]"]
+             "- (User) -[HAS_SON]-> (Kosmas) [Score 9]"]
     kept = _graph_edges_on_topic(q, edges)
     assert len(kept) == 1 and "Τέμπη" in kept[0]
 
@@ -140,7 +140,7 @@ def test_a_query_with_no_content_words_passes_edges_through():
 def test_the_section_disappears_when_no_edge_survives():
     """FAILS IF: an empty section header is still inserted at the top."""
     rows = [{"score": 0.3, "text": "Revolut breach details", "metadata": {"type": "auto"}}]
-    g = _Graph(["- (User) -[HAS_SON]-> (Leonidas) -[BORN_ON]-> (March 12, 2026) [Score 9]"])
+    g = _Graph(["- (User) -[HAS_SON]-> (Kosmas) -[BORN_ON]-> (March 9, 2026) [Score 9]"])
     out = _recall(rows, graph=g)
     assert g.calls, "control: the graph tier was consulted"
     assert "TOPOLOGICAL GRAPH EDGES" not in out

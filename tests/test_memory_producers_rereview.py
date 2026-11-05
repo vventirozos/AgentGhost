@@ -43,17 +43,17 @@ def _owner(tmp_path):
     pm.update("interests", "topics", "llm inference on apple silicon")
     pm.update("assets", "pet", "Mortimer the iguana")
     pm.update("assets", "car", "Tesla Model 3")
-    pm.update("assets", "vehicles", "BMW 118i, Ducati, Sym")
-    pm.update("relationships", "wife_name", "Fotini")
+    pm.update("assets", "vehicles", "BMW 320d, Triumph, Kymco")
+    pm.update("relationships", "wife_name", "Elena")
     gm = GraphMemory(tmp_path)
     gm.add_triplets([{"subject": "hermes", "predicate": "IS_A", "object": "llm"},
                      {"subject": "user", "predicate": "RESEARCHES", "object": "local llms"},
                      {"subject": "user", "predicate": "INTERESTED_IN", "object": "llm inference"},
                      {"subject": "user", "predicate": "HAS_NAME", "object": "vasilis"},
-                     {"subject": "vasilis", "predicate": "WORKS_AT", "object": "evolmonkey"},
-                     {"subject": "evolmonkey", "predicate": "IS_A", "object": "postgresql services company"},
-                     {"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"},
-                     {"subject": "user", "predicate": "LIVES_IN", "object": "thrakomakedones near athens"},
+                     {"subject": "vasilis", "predicate": "WORKS_AT", "object": "orbitdata"},
+                     {"subject": "orbitdata", "predicate": "IS_A", "object": "postgresql services company"},
+                     {"subject": "user", "predicate": "MARRIED_TO", "object": "elena"},
+                     {"subject": "user", "predicate": "LIVES_IN", "object": "kalopetres near athens"},
                      {"subject": "anna", "predicate": "WAS_FOUND_IN", "object": "athens"},
                      {"subject": "user", "predicate": "OWNS", "object": "tesla model 3"},
                      {"subject": "user", "predicate": "HAS_ADDRESS", "object": "athens"},
@@ -106,7 +106,7 @@ def test_an_owner_fact_that_mentions_a_place_is_kept_and_reported(tmp_path):
     pm, gm = _owner(tmp_path)
     out = _forget(tmp_path, "Athens", pm, gm)
     e = _edges(gm)
-    assert ("user", "LIVES_IN", "thrakomakedones near athens") in e
+    assert ("user", "LIVES_IN", "kalopetres near athens") in e
     assert ("user", "HAS_ADDRESS", "athens") in e and "kept" in out        # an owner fact ON the node
     assert ("anna", "WAS_FOUND_IN", "athens") not in e
     rows = [json.loads(l) for l in (tmp_path / gm._ARCHIVE_FILENAME).read_text().splitlines()]
@@ -116,7 +116,7 @@ def test_an_owner_fact_that_mentions_a_place_is_kept_and_reported(tmp_path):
 def test_a_description_is_not_the_entity_but_a_model_is(tmp_path):
     pm, gm = _owner(tmp_path)
     _forget(tmp_path, "postgresql", pm, gm)
-    assert ("evolmonkey", "IS_A", "postgresql services company") in _edges(gm)
+    assert ("orbitdata", "IS_A", "postgresql services company") in _edges(gm)
     assert GraphMemory._node_is("tesla model 3", "tesla") and GraphMemory._node_is("postgresql 17", "postgresql")
     assert not GraphMemory._node_is("postgresql services company", "postgresql")
     assert not GraphMemory._node_is("teslamotors 3", "tesla")
@@ -124,8 +124,8 @@ def test_a_description_is_not_the_entity_but_a_model_is(tmp_path):
 
 def test_forgetting_a_family_member_removes_the_family_edge(tmp_path):
     pm, gm = _owner(tmp_path)
-    _forget(tmp_path, "Fotini", pm, gm)
-    assert ("user", "MARRIED_TO", "fotini") not in _edges(gm)
+    _forget(tmp_path, "Elena", pm, gm)
+    assert ("user", "MARRIED_TO", "elena") not in _edges(gm)
 
 
 @pytest.mark.parametrize("target,field,gone", [("Mortimer", ("assets", "pet"), True),
@@ -142,14 +142,14 @@ def test_a_value_about_the_entity_is_forgotten_a_list_is_not(tmp_path, target, f
 def test_an_attribute_target_lists_its_fields(tmp_path):
     pm, gm = _owner(tmp_path)
     out = _forget(tmp_path, "my wife", pm, gm)
-    assert "relationships.wife_name" in out and pm.load()["relationships"]["wife_name"] == "Fotini"
+    assert "relationships.wife_name" in out and pm.load()["relationships"]["wife_name"] == "Elena"
 
 
 def test_forget_reaches_a_replaced_value(tmp_path):
     pm = ProfileMemory(tmp_path)
-    pm.update("relationships", "son", "Leonidas")
-    pm.update("relationships", "son", "Thodoris")
-    _forget(tmp_path, "Leonidas", pm, GraphMemory(tmp_path))
+    pm.update("relationships", "son", "Kosmas")
+    pm.update("relationships", "son", "Markos")
+    _forget(tmp_path, "Kosmas", pm, GraphMemory(tmp_path))
     assert "previous" not in pm.load_raw()["relationships"]["son"]
 
 
@@ -164,7 +164,7 @@ def test_an_unchanged_value_keeps_no_previous(tmp_path):
 def _ep(tmp_path):
     from ghost_agent.memory.episodes import EpisodicMemory
     ep = EpisodicMemory(tmp_path)
-    ep.record_episode("what did Fotini say about the trip", context="", outcome="ok", lesson="",
+    ep.record_episode("what did Elena say about the trip", context="", outcome="ok", lesson="",
                       actions=[{"tool_name": "recall", "tool_args": "{}", "result": "x", "success": 1}])
     ep.record_episode("weather in Athens today", context="", outcome="ok", lesson="")
     return ep
@@ -177,7 +177,7 @@ def test_a_mention_keeps_the_episode_a_family_member_does_not(tmp_path):
     ep = _ep(tmp_path)
     out = _forget(tmp_path, "Athens", pm, gm, ep)
     assert ep.count() == 2 and "kept" in out
-    _forget(tmp_path, "Fotini", pm, gm, ep)
+    _forget(tmp_path, "Elena", pm, gm, ep)
     assert ep.count() == 1
     rec = json.loads((tmp_path / "episodes_forgotten.jsonl").read_text().splitlines()[0])
     assert rec["actions"] and rec["actions"][0]["result"] == "x"      # actions archived too
@@ -188,17 +188,17 @@ def test_a_mention_keeps_the_episode_a_family_member_does_not(tmp_path):
 def test_forgotten_episodes_lose_their_vector_twins(tmp_path):
     from ghost_agent.memory.episodes import EpisodicMemory
     ep = EpisodicMemory(tmp_path)
-    ep.record_episode("Fotini called", context="", outcome="ok", lesson="")
+    ep.record_episode("Elena called", context="", outcome="ok", lesson="")
     vec = MagicMock()
-    assert ep.forget_mentions("fotini", vec) == 1
+    assert ep.forget_mentions("elena", vec) == 1
     assert vec.collection.delete.called
 
 
 def test_episodes_match_any_field_not_only_the_trigger(tmp_path):
     from ghost_agent.memory.episodes import EpisodicMemory
     ep = EpisodicMemory(tmp_path)
-    ep.record_episode("a family question", context="", outcome="asked Fotini", lesson="")
-    assert ep.count_mentions("fotini") == 1
+    ep.record_episode("a family question", context="", outcome="asked Elena", lesson="")
+    assert ep.count_mentions("elena") == 1
 
 
 # ── graph ────────────────────────────────────────────────────────────────────
@@ -208,13 +208,13 @@ def test_decay_prunes_chatter_and_keeps_life_facts(tmp_path):
     gm = GraphMemory(tmp_path)
     gm.add_triplets([{"subject": "user", "predicate": "GREETED", "object": "ghost"},
                      {"subject": "user", "predicate": "HAS_FAVORITE_COLOR", "object": "green"},
-                     {"subject": "fotini", "predicate": "MARRIED_TO", "object": "user"},
+                     {"subject": "elena", "predicate": "MARRIED_TO", "object": "user"},
                      {"subject": "neil", "predicate": "WAS_FIRST_PERSON_ON_MOON", "object": "1969"},
                      {"subject": "task", "predicate": "HAS_NAME_SUGGESTIONS", "object": "x"}])
     with sqlite3.connect(gm.db_path) as c:
         c.execute("UPDATE triplets SET timestamp = datetime('now', '-90 days')")
     gm.prune_stale_edges(max_age_days=45)
-    assert _edges(gm) == {("user", "HAS_FAVORITE_COLOR", "green"), ("fotini", "MARRIED_TO", "user")}
+    assert _edges(gm) == {("user", "HAS_FAVORITE_COLOR", "green"), ("elena", "MARRIED_TO", "user")}
 
 
 def test_delete_edge_archives_and_matches_the_predicate(tmp_path):
@@ -287,7 +287,7 @@ def test_a_self_play_framed_rule_is_refused(tmp_path):
     ("If Jan is 30 now, two years ago he was 28.", "Jan is 30 years old now", 0.5, False),
     ("Always copy report.txt to backup.txt first.", "copy report.txt to backup.txt", 0.5, False),
     ("When an HTTP request times out, always retry with backoff.", "the HTTP request to the api timed out", 0.5, True),
-    ("Leonidas-style age questions: verify the date", "how old is leonidas now ?", 0.5, False),
+    ("Kosmas-style age questions: verify the date", "how old is kosmas now ?", 0.5, False),
 ])
 def test_generality_names_files_and_numbers(rule, ctx, share, general):
     from ghost_agent.memory.lesson_scope import is_general_text
@@ -297,8 +297,8 @@ def test_generality_names_files_and_numbers(rule, ctx, share, general):
 def test_learn_skill_keeps_a_request_shaped_lesson_for_that_request(tmp_path):
     """(§4KX r8) only the model's OWN lesson; a dictated one stays general."""
     sm = SkillMemory(tmp_path)
-    req = "restart postgres on the evolmonkey box and check it is up"
-    out = sm.learn_lesson("When restarting postgres on the evolmonkey box", "Did not check readiness",
+    req = "restart postgres on the orbitdata box and check it is up"
+    out = sm.learn_lesson("When restarting postgres on the orbitdata box", "Did not check readiness",
                           "Always run pg_isready after restarting postgres.", source="learn_skill",
                           generality_context=req)
     row = sm._load_playbook()[0]
@@ -306,14 +306,14 @@ def test_learn_skill_keeps_a_request_shaped_lesson_for_that_request(tmp_path):
     assert out.scope == "request"
 
 
-@pytest.mark.parametrize("req", ["Learn this: when you restart postgres on the evolmonkey box, run pg_isready after",
-                                 "remember: restart postgres on the evolmonkey box, then run pg_isready",
-                                 "θυμήσου: μετά το restart του postgres στο evolmonkey box τρέξε pg_isready"])
+@pytest.mark.parametrize("req", ["Learn this: when you restart postgres on the orbitdata box, run pg_isready after",
+                                 "remember: restart postgres on the orbitdata box, then run pg_isready",
+                                 "θυμήσου: μετά το restart του postgres στο orbitdata box τρέξε pg_isready"])
 def test_a_lesson_the_user_dictates_is_kept_general(tmp_path, req):
     """Fails in the world where 7 of 10 dictated lessons were silently
     scoped to the one request that taught them."""
     sm = SkillMemory(tmp_path)
-    out = sm.learn_lesson("When restarting postgres on the evolmonkey box", "Did not check readiness",
+    out = sm.learn_lesson("When restarting postgres on the orbitdata box", "Did not check readiness",
                           "Always run pg_isready after restarting postgres.", source="learn_skill",
                           generality_context=req)
     row = sm._load_playbook()[0]

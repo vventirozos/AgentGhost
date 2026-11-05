@@ -18,13 +18,13 @@ def _raw():
 def test_each_listed_sentence_becomes_its_items_with_the_original_date():
     todo = M["plan"](_raw())
     assert todo[("relationships", "sons")] == ("2026-07-07T21:18:28",
-                                              ["Thodoris (born 2016-11-25)", "Leonidas (born 2026-03-12)"])
+                                              ["Markos (born 2016-11-22)", "Kosmas (born 2026-03-09)"])
     assert len(todo[("interests", "hobbies")][1]) == 4 and len(todo[("assets", "vehicles")][1]) == 3
 
 
 def test_a_changed_value_applies_nothing():
     raw = _raw()
-    raw["assets"]["vehicles"]["v"] = "BMW 118i, Ducati Streetfighter V4s, Sym scooter, Vespa"
+    raw["assets"]["vehicles"]["v"] = "BMW 320d, Triumph Trident 660, Kymco scooter, Vespa"
     with pytest.raises(SystemExit, match="nothing applied"):
         M["plan"](raw)
 

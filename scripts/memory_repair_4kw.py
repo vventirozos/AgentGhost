@@ -6,7 +6,7 @@ fresh reviews of the memory and lesson systems.
    2026-09-24); the relationships category vanished by an unattributed path.
    Values from the 2026-09-04 backups (the consistent "sons" line from
    `pre-temporal-…083301`, the birthdates from `pre-consolidate-…`) and the
-   owner's 2026-09-06 `fotini_description` write. Every other key is kept.
+   owner's 2026-09-06 `elena_description` write. Every other key is kept.
 2. EPISODES: remove the episodes written by probe turns and by channel
    members before the member wall (ids from `--episode-ids`, a JSON file
    {"probe": [...], "member": [...]} produced by matching each episode's
@@ -33,17 +33,15 @@ STAMP = time.strftime("%Y%m%dT%H%M%S")
 
 PROFILE_RESTORE = {
     ("root", "name"): ("Vasilis", "2026-09-04T07:52:51"),
-    ("relationships", "wife_name"): ("Fotini", "2026-09-04T07:52:51"),
-    ("relationships", "sons"): ("Thodoris (born 2016-11-25) and Leonidas (born 2026-03-12)", "2026-09-04T08:33:01"),
-    ("relationships", "son_thodoris_birthdate"): (
-        "Thodoris born November 25, 2016 (Vasilis and Fotini's older son)", "2026-09-04T07:52:51"),
-    ("relationships", "son_lleonidas_birthdate"): (
-        "Leonidas born March 12, 2026 (Vasilis and Fotini's younger son)", "2026-09-04T07:52:51"),
-    ("relationships", "fotini_description"): (
-        "Fotini is Vasilis's wife. Recognizable appearance: tan/sunny complexion, long straight hair with "
-        "brown/blonde highlights and some gray at the temples, light skin detail. In one photo "
-        "(photo-20260906-102919.jpg) she wears a pink/lavender tank top + lavender shorts on an outdoor tiled "
-        "terrace.", "2026-09-06T07:35:23"),
+    ("relationships", "wife_name"): ("Elena", "2026-09-04T07:52:51"),
+    ("relationships", "sons"): ("Markos (born 2016-11-22) and Kosmas (born 2026-03-09)", "2026-09-04T08:33:01"),
+    ("relationships", "son_markos_birthdate"): (
+        "Markos born November 22, 2016 (Vasilis and Elena's older son)", "2026-09-04T07:52:51"),
+    ("relationships", "son_lkosmas_birthdate"): (
+        "Kosmas born March 9, 2026 (Vasilis and Elena's younger son)", "2026-09-04T07:52:51"),
+    ("relationships", "elena_description"): (
+        "Elena is Vasilis's wife. Recognizable appearance: short curly dark hair, round glasses. In one photo "
+        "(photo-20260101-000000.jpg) she wears a green raincoat in a park.", "2026-09-06T07:35:23"),
 }
 
 RETRACT_TRIGGERS = (

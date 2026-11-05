@@ -215,7 +215,7 @@ def _tokenize(text: str) -> List[str]:
 
 
 #: Length cap for `answer_gist`. 160 chars is one or two sentences — enough
-#: to carry a fact ("born 12 March 2026", "the table is 41 GB with toast")
+#: to carry a fact ("born 9 March 2026", "the table is 41 GB with toast")
 #: without turning the diary into a transcript. Sized against the 1.1 MB
 #: live log: ~1,800 rows × 160 B adds under 300 KB before compaction.
 ANSWER_GIST_MAX_CHARS = 160

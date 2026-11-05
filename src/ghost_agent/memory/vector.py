@@ -1896,7 +1896,7 @@ class VectorMemory:
                         is_name_memory = (
                             ("name is" in doc_lower or "call me" in doc_lower)
                             # §4KZ: only a CURATED row; a stale auto "wife's
-                            # name is Fotini" ranked as MASTER SUMMARY above
+                            # name is Elena" ranked as MASTER SUMMARY above
                             # the correction
                             and m_type in ("identity", "manual")
                         )

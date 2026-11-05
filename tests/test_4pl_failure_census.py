@@ -132,8 +132,8 @@ async def test_the_live_detector_reads_the_injected_state(tmp_path, monkeypatch)
     was given (here the scratchpad, injected as dynamic state — not in
     `messages`) is backed — the stash must carry it."""
     from tests.helpers import FakeBgTasks
-    agent, ctx = _ctx_agent(tmp_path, monkeypatch, ["Your dog Hanzo is 7.5 years old."])
-    ctx.scratchpad.list_all.return_value = "dog Hanzo: 7.5 years old"   # reaches the model via the injected state only
+    agent, ctx = _ctx_agent(tmp_path, monkeypatch, ["Your dog Bruno is 7.5 years old."])
+    ctx.scratchpad.list_all.return_value = "dog Bruno: 7.5 years old"   # reaches the model via the injected state only
     await agent.handle_chat({"messages": [{"role": "user", "content": "how old is my dog?"}]},
                             FakeBgTasks(), request_id="web-4pl-2", requester_role="owner")
     t = [r for r in _rows(tmp_path) if r["req_id"] == "web-4pl-2" and r["kind"] == "turn"]

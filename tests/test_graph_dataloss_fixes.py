@@ -4,7 +4,7 @@ Seven defects, all of which silently destroyed operator knowledge:
 
 1. `OWNS`/`IS` were treated as FUNCTIONAL predicates, so every new
    `user OWNS X` expired every other `user OWNS *` row — 19 of the 21 expired
-   rows in the production graph were OWNS (BMW, Ducati, evolmonkey, webos,
+   rows in the production graph were OWNS (BMW, Triumph, orbitdata, webos,
    piggybag, nova, chess coach).
 2. `delete_by_target` hard-DELETEd on an unanchored `LIKE '%t%'`:
    `forget("tin")` removed 83 rows, `forget("game")` ~182 (13% of the graph)
@@ -54,16 +54,16 @@ def _insert(gm, subject, predicate, obj, weight=1, valid_from=None, valid_until=
 
 def test_owns_accumulates_instead_of_expiring(gm):
     """You own many things — a second OWNS must not expire the first."""
-    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "bmw 118i"}])
-    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "ducati streetfighter v4s"}])
-    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "evolmonkey"}])
+    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "bmw 320d"}])
+    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "triumph trident 660"}])
+    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "orbitdata"}])
 
     assert _objects(gm, "user", "OWNS") == [
-        "bmw 118i", "ducati streetfighter v4s", "evolmonkey"]
+        "bmw 320d", "orbitdata", "triumph trident 660"]
     assert gm.get_expired_triplets(subject="user") == []
     # ...and all three survive a reload (mirror only loads current edges).
     gm.initialize_graph()
-    for obj in ("bmw 118i", "ducati streetfighter v4s", "evolmonkey"):
+    for obj in ("bmw 320d", "triumph trident 660", "orbitdata"):
         assert gm.nx_graph.has_edge("user", obj)
 
 
@@ -75,9 +75,9 @@ def test_is_is_multi_valued(gm):
 
 
 def test_has_pet_and_other_multivalued_has_predicates_accumulate(gm):
-    gm.add_triplets([{"subject": "user", "predicate": "HAS_PET", "object": "hanzo"}])
+    gm.add_triplets([{"subject": "user", "predicate": "HAS_PET", "object": "bruno"}])
     gm.add_triplets([{"subject": "user", "predicate": "HAS_PET", "object": "mortimer"}])
-    assert _objects(gm, "user", "HAS_PET") == ["hanzo", "mortimer"]
+    assert _objects(gm, "user", "HAS_PET") == ["bruno", "mortimer"]
 
 
 # ------------------------------------------------- 3. functional whitelist
@@ -167,14 +167,14 @@ def test_delete_by_target_still_forgets_the_real_entity(gm):
     gm.add_triplets([
         {"subject": "mortimer", "predicate": "IS_A", "object": "iguana"},
         {"subject": "user", "predicate": "HAS_PET", "object": "mortimer"},
-        {"subject": "user", "predicate": "HAS_PET", "object": "hanzo"},
+        {"subject": "user", "predicate": "HAS_PET", "object": "bruno"},
         {"subject": "vet", "predicate": "TREATED", "object": "mortimer the iguana"},
         {"subject": "user", "predicate": "LIKES", "object": "mortimers"},  # plural form
     ])
     deleted = gm.delete_by_target("mortimer")
     assert deleted == 4
     assert "mortimer" not in gm.nx_graph
-    assert gm.nx_graph.has_edge("user", "hanzo")
+    assert gm.nx_graph.has_edge("user", "bruno")
 
 
 def test_delete_by_target_short_target_rejected(gm):
@@ -282,9 +282,9 @@ def test_merge_reconciles_functional_conflict(gm):
 def test_merge_leaves_multivalued_predicates_alone(gm):
     """The reconciliation must not become a second OWNS-style shredder."""
     _insert(gm, "bob", "OWNS", "bmw", valid_from=100.0)
-    _insert(gm, "bobby", "OWNS", "ducati", valid_from=200.0)
+    _insert(gm, "bobby", "OWNS", "triumph", valid_from=200.0)
     gm.execute_graph_compression([{"old_node": "bobby", "new_node": "bob"}])
-    assert _objects(gm, "bob", "OWNS") == ["bmw", "ducati"]
+    assert _objects(gm, "bob", "OWNS") == ["bmw", "triumph"]
 
 
 def test_merge_drops_edge_between_the_merged_nodes(gm):

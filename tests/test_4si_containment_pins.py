@@ -54,10 +54,10 @@ async def test_isolated_context_cannot_recall(tmp_path):
     real = R.tool_search
     try:
         R.tool_search = _search
-        await get_available_tools(iso)["web_search"](query="pizza Makedonias 83")
+        await get_available_tools(iso)["web_search"](query="pizza Kaledonias 83")
     finally:
         R.tool_search = real
-    assert "Makedonias 83" not in seen["query"] and "Thrakomakedones" in seen["query"]
+    assert "Kaledonias 83" not in seen["query"] and "Kalopetres" in seen["query"]
 
 
 def _agent(ctx):

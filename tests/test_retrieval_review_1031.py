@@ -33,23 +33,23 @@ def _g(tmp_path, *edges):
     "έχω πρόβλημα με την καρδιά μου;",
 ])
 def test_health_facts_are_reached_by_common_phrasings(tmp_path, q):
-    g = _g(tmp_path, ("user", "HAS_CONDITION", "heart failure"), ("user", "TAKES_MEDICATION", "entresto"))
+    g = _g(tmp_path, ("user", "HAS_CONDITION", "asthma"), ("user", "TAKES_MEDICATION", "ventolin"))
     got = g.owner_facts_matching(q, 8)
-    assert any("heart failure" in x for x in got), got
+    assert any("asthma" in x for x in got), got
 
 
 @pytest.mark.parametrize("q, want", [
-    ("what pets do I have", "hanzo"),
-    ("what motorcycle do I ride", "ducati"),
-    ("what cars do I have", "ducati"),
-    ("what's my kid's name", "leonidas"),
+    ("what pets do I have", "bruno"),
+    ("what motorcycle do I ride", "triumph"),
+    ("what cars do I have", "triumph"),
+    ("what's my kid's name", "kosmas"),
     ("what do I specialise in", "postgresql"),
-    ("τι κατοικίδια έχω;", "hanzo"),
+    ("τι κατοικίδια έχω;", "bruno"),
 ])
 def test_synonyms_of_a_kind_reach_its_field(tmp_path, q, want):
-    g = _g(tmp_path, ("user", "HAS_PET_DOG_NAME", "hanzo"), ("user", "HAS_ASSETS_VEHICLES", "ducati monster"),
-           ("user", "HAS_RELATIONSHIPS_SONS", "leonidas"), ("user", "SPECIALIZES_IN", "postgresql"),
-           ("user", "HAS_RELATIONSHIPS_WIFE_NAME", "fotini"))
+    g = _g(tmp_path, ("user", "HAS_PET_DOG_NAME", "bruno"), ("user", "HAS_ASSETS_VEHICLES", "triumph bonneville"),
+           ("user", "HAS_RELATIONSHIPS_SONS", "kosmas"), ("user", "SPECIALIZES_IN", "postgresql"),
+           ("user", "HAS_RELATIONSHIPS_WIFE_NAME", "elena"))
     got = g.owner_facts_matching(q, 8)
     assert any(want in x for x in got), got
 
@@ -57,10 +57,10 @@ def test_synonyms_of_a_kind_reach_its_field(tmp_path, q, want):
 @pytest.mark.parametrize("q", ["best heart rate monitor", "a bike route to the coast", "the cat command in bash",
                                "υγείας υπουργείο νέα"])
 def test_the_new_kind_words_open_on_an_owner_question_only(tmp_path, q):
-    g = _g(tmp_path, ("user", "HAS_CONDITION", "heart failure"), ("user", "HAS_PET_DOG_NAME", "hanzo"),
-           ("user", "HAS_ASSETS_VEHICLES", "ducati monster"))
+    g = _g(tmp_path, ("user", "HAS_CONDITION", "asthma"), ("user", "HAS_PET_DOG_NAME", "bruno"),
+           ("user", "HAS_ASSETS_VEHICLES", "triumph bonneville"))
     got = g.owner_facts_matching(q, 8, extended=False)
-    assert not any(x in " ".join(got) for x in ("heart failure", "hanzo", "ducati")), got
+    assert not any(x in " ".join(got) for x in ("asthma", "bruno", "triumph")), got
 
 
 def test_greek_inflection_matching_is_greek_only():
@@ -75,12 +75,12 @@ def test_greek_inflection_matching_is_greek_only():
 # ── R2: a street address under an ordinary key stays out of the graph ───────
 def test_a_street_address_under_location_is_not_mirrored(tmp_path):
     pm, gm = ProfileMemory(tmp_path), GraphMemory(tmp_path)
-    pm.update("root", "location", "Makedonias 83, Thrakomakedones 13676")
+    pm.update("root", "location", "Kaledonias 83, Kalopetres 10101")
     asyncio.run(M.sync_owner_mirrors("root", "location", pm, gm, None))
     with sqlite3.connect(gm.db_path) as c:
         objs = [r[0] for r in c.execute("select object from triplets where valid_until is null")]
-    assert not any("makedonias" in o for o in objs), objs
-    assert not any("Makedonias" in x for x in gm.owner_facts_matching("where do I live?", 8))
+    assert not any("kaledonias" in o for o in objs), objs
+    assert not any("Kaledonias" in x for x in gm.owner_facts_matching("where do I live?", 8))
 
 
 def test_an_ordinary_location_is_still_mirrored(tmp_path):
@@ -106,18 +106,18 @@ def test_a_mirror_edge_is_dated_when_the_profile_learned_it(tmp_path):
 def test_a_stated_edge_shows_its_stated_date_not_its_last_touch(tmp_path):
     gm = GraphMemory(tmp_path)
     said = dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc).timestamp()
-    gm.add_triplets([{"subject": "user", "predicate": "VISITED", "object": "chalkida"}], as_of=said)
-    gm.add_triplets([{"subject": "user", "predicate": "VISITED", "object": "chalkida"}], as_of=said)   # a bump
+    gm.add_triplets([{"subject": "user", "predicate": "VISITED", "object": "nafplio"}], as_of=said)
+    gm.add_triplets([{"subject": "user", "predicate": "VISITED", "object": "nafplio"}], as_of=said)   # a bump
     got = gm.owner_facts_matching("where have I visited", 8)
     assert any("(as of 2026-08-02)" in x for x in got), got
 
 
 # ── R4: names are shown as stored, not re-cased ─────────────────────────────
 def test_names_are_not_title_cased():
-    line = GraphMemory._format_path((("user", "HAS_ASSETS_VEHICLES", "bmw 118i"),), 1)
-    assert line == "- (User) -[HAS_ASSETS_VEHICLES]-> (bmw 118i)"
-    line = GraphMemory._format_path((("user", "HAS_ROOT_COMPANY", "evolmonkey - postgresql services"),), 1)
-    assert "Evolmonkey" not in line and "Postgresql" not in line
+    line = GraphMemory._format_path((("user", "HAS_ASSETS_VEHICLES", "bmw 320d"),), 1)
+    assert line == "- (User) -[HAS_ASSETS_VEHICLES]-> (bmw 320d)"
+    line = GraphMemory._format_path((("user", "HAS_ROOT_COMPANY", "orbitdata - postgresql services"),), 1)
+    assert "Orbitdata" not in line and "Postgresql" not in line
 
 
 # ── R5 / R6 / R9: what `recall` prints ──────────────────────────────────────
@@ -135,7 +135,7 @@ def test_recall_prints_an_owner_edge_once(tmp_path):
 
 def test_the_word_user_does_not_open_the_owners_edges():
     """Live: "what's the postgres user home directory" printed 15 owner edges."""
-    edges = ["- (User) -[HAS_RELATIONSHIPS_WIFE_BIRTHDATE]-> (1982-01-10)", "- (User) -[VISITED]-> (chalkida)",
+    edges = ["- (User) -[HAS_RELATIONSHIPS_WIFE_BIRTHDATE]-> (1982-01-07)", "- (User) -[VISITED]-> (nafplio)",
              "- (postgres) -[HAS_HOME]-> (/var/lib/postgresql)"]
     kept = M._graph_edges_on_topic("what's the postgres user home directory", edges)
     assert kept == ["- (postgres) -[HAS_HOME]-> (/var/lib/postgresql)"]
@@ -155,19 +155,19 @@ def test_a_one_line_past_request_with_no_shared_word_is_not_shown(tmp_path):
 # ── R8: the owner's own age is worked out ───────────────────────────────────
 def test_a_birthdate_field_carries_its_age(tmp_path):
     pm = ProfileMemory(tmp_path)
-    pm.update("root", "birthdate", "1980-01-29")
-    pm.update("relationships", "wife_birthdate", "1982-01-10")
+    pm.update("root", "birthdate", "1980-01-26")
+    pm.update("relationships", "wife_birthdate", "1982-01-07")
     s = pm.get_context_string()
     today = dt.date.today()
-    age = today.year - 1980 - ((today.month, today.day) < (1, 29))
-    assert f"birthdate: 1980-01-29 → {age} years old" in s
-    assert "wife_birthdate: 1982-01-10 → " in s
-    assert pm.load()["root"]["birthdate"] == "1980-01-29"                  # the value itself unchanged
+    age = today.year - 1980 - ((today.month, today.day) < (1, 26))
+    assert f"birthdate: 1980-01-26 → {age} years old" in s
+    assert "wife_birthdate: 1982-01-07 → " in s
+    assert pm.load()["root"]["birthdate"] == "1980-01-26"                  # the value itself unchanged
 
 
 def test_a_born_value_is_not_glossed_twice(tmp_path):
     pm = ProfileMemory(tmp_path)
-    pm.update("relationships", "son_birthdate", "born 2016-11-25")
+    pm.update("relationships", "son_birthdate", "born 2016-11-22")
     assert pm.get_context_string().count("→") == 1
 
 
@@ -184,7 +184,7 @@ def test_the_restamp_script_only_moves_mirror_dates_earlier(tmp_path):
     early = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc).timestamp()
     gm.add_triplets([{"subject": "user", "predicate": "HAS_LOCATION", "object": "athens, greece"}], raw=True, as_of=late)
     gm.add_triplets([{"subject": "user", "predicate": "HAS_NAME", "object": "vasilis"}], raw=True, as_of=early)
-    gm.add_triplets([{"subject": "user", "predicate": "VISITED", "object": "chalkida"}], as_of=late)
+    gm.add_triplets([{"subject": "user", "predicate": "VISITED", "object": "nafplio"}], as_of=late)
     rows = mod.plan(tmp_path)
     assert [(p, v) for _r, p, v, _vf, _e in rows] == [("HAS_LOCATION", "athens, greece")]
     assert mod.main(["--memory-dir", str(tmp_path), "--apply"]) == 0
@@ -208,8 +208,8 @@ def test_a_row_without_valid_from_sorts_by_its_timestamp(tmp_path):
 def test_recall_dedups_a_weighted_edge_too(tmp_path):
     pm, gm, vm = ProfileMemory(tmp_path), GraphMemory(tmp_path), _vm()
     for _ in range(3):
-        gm.add_triplets([{"subject": "user", "predicate": "HAS_PET_DOG_NAME", "object": "hanzo"}], raw=True)
-    out = _recall("what pets do I have, is hanzo my dog?", pm, gm, vm)
+        gm.add_triplets([{"subject": "user", "predicate": "HAS_PET_DOG_NAME", "object": "bruno"}], raw=True)
+    out = _recall("what pets do I have, is bruno my dog?", pm, gm, vm)
     assert out.count("HAS_PET_DOG_NAME") == 1, out
 
 

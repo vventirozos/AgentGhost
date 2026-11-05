@@ -308,7 +308,7 @@ def is_general_text(text, request, *, max_shared_share: float = 0.5) -> bool:
     # "panerithraikos"), makes the text specific however many general words
     # dilute the ratio. A name is a capitalised word that is neither ALL CAPS
     # ("GROUP", "HTTP") nor an English word ("Python's", "Producer-Consumer")
-    # — each hyphen/possessive part judged alone ("Leonidas-style").
+    # — each hyphen/possessive part judged alone ("Kosmas-style").
     parts = set()
     for m in re.finditer(r"(?:(^|[.!?]\s+)|\b)([A-ZΑ-Ω][\w'-]{3,})", t):
         initial = m.group(1) is not None
@@ -318,7 +318,7 @@ def is_general_text(text, request, *, max_shared_share: float = 0.5) -> bool:
             # a capital INSIDE the word is a product's spelling ("GitHub",
             # "YouTube", "PostgreSQL") — but only against a WINDOW of text
             # (dream): against one request it may be that request's name
-            # ("McDonald", "EvolMonkey", "ZachXBT" — r8 review)
+            # ("McDonald", "Orbitdata", "ZachXBT" — r8 review)
             if max_shared_share >= 1.0 and any(c.isupper() for c in part[1:]):
                 continue
             # inflection stems only for a sentence-initial word ("Determining");

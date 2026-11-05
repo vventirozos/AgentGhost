@@ -205,9 +205,9 @@ async def test_the_owners_digests_never_reach_a_public_reply(monkeypatch, tmp_pa
 def test_the_age_check_never_quotes_a_birth_date_into_a_channel():
     from ghost_agent.core.agent import GhostAgent
     pm = MagicMock()
-    pm.load.return_value = {"relationships": {"sons": ["Thodoris (born 2016-11-25)"]}}
+    pm.load.return_value = {"relationships": {"sons": ["Markos (born 2016-11-22)"]}}
     me = SimpleNamespace(context=SimpleNamespace(profile_memory=pm))
-    reply = "Thodoris is 4 years old."
+    reply = "Markos is 4 years old."
     assert GhostAgent._memory_claim_refutation(me, reply) is not None        # the private control
     t = reply_surface_context.set("public")
     try:

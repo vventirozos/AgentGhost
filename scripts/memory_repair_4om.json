@@ -5,11 +5,11 @@
   {"subject": "user", "predicate": "WANTS_TO_CREATE", "object": "webos", "why": "a request stored as a want (10-12)"},
   {"subject": "user", "predicate": "MANAGES", "object": "project b874650093d2", "why": "a project id, not a fact about the owner (10-12)"},
   {"subject": "3-layer recursive thinking", "predicate": "CULMINATES_IN", "object": "self-affirming self-awareness", "why": "a hypothesis the owner asked to test, stored as a world fact (10-13)"},
-  {"subject": "user", "predicate": "HAS_DOGS", "object": "hanzo", "why": "mirror of the duplicate profile field assets.dogs (kept: pet.dog_name / HAS_DOG_NAME)"}
+  {"subject": "user", "predicate": "HAS_DOGS", "object": "bruno", "why": "mirror of the duplicate profile field assets.dogs (kept: pet.dog_name / HAS_DOG_NAME)"}
  ],
- "profile_remove": [{"category": "assets", "key": "dogs", "expect": "Hanzo", "why": "duplicate of pet.dog_name"}],
+ "profile_remove": [{"category": "assets", "key": "dogs", "expect": "Bruno", "why": "duplicate of pet.dog_name"}],
  "vector": [
-  {"id": "2bb5fa3f3cabc5f8e0a13ee5f8a3211d", "doc_head": "User dogs is Hanzo", "why": "mirror of the duplicate assets.dogs"},
-  {"id": "580941eb50e57037710f581f7bef232a", "doc_head": "The user's dog is named Hanzo.", "why": "third copy of the dog fact (kept: identity row 'User dog_name is Hanzo')"}
+  {"id": "2bb5fa3f3cabc5f8e0a13ee5f8a3211d", "doc_head": "User dogs is Bruno", "why": "mirror of the duplicate assets.dogs"},
+  {"id": "580941eb50e57037710f581f7bef232a", "doc_head": "The user's dog is named Bruno.", "why": "third copy of the dog fact (kept: identity row 'User dog_name is Bruno')"}
  ]
 }

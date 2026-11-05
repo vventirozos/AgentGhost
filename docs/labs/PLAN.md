@@ -18,7 +18,7 @@ journal's §4SW is the Greek voice, so §4SW is taken).
 | D3 | Agent side minimal: one `lab` tool. The agent connects through the env var **`GHOST_LABS_HOST`**. The host service does the lifecycle work deterministically, with no LLM. |
 | D4 | The agent has full root inside labs. Lab egress is **strictly Tor**: fail-closed, no clearnet path, ever. An offline lab (`egress: none`) is also allowed. |
 | D5 | `disorder` itself reaches the internet **freely at setup time only** (apt, Docker Hub, PGDG, pip during `install.sh` / `build-images`). Labs never pull at create time. |
-| D6 | A self-hosted site is reached through a **port on the tailnet** (`http://100.94.162.61:20xxx/`). No onion and no LAN/public exposure. |
+| D6 | A self-hosted site is reached through a **port on the tailnet** (`http://100.64.0.10:20xxx/`). No onion and no LAN/public exposure. |
 | D7 | **The agent and autopilot may both create and destroy labs freely**, for ad-hoc requests and projects, with no owner confirmation. |
 | D8 | A project / experiment may use **more than one lab**, and one lab may have many members (containers). |
 | D9 | New kinds of labs (e.g. MySQL) come in as **data** (Dockerfile + template YAML) on `disorder`, never as agent code. Until a template exists, the agent installs things in a `blank-dev` lab over Tor. The agent may *propose* a recipe, and the operator approves before the image is built. |
@@ -27,7 +27,7 @@ journal's §4SW is the Greek voice, so §4SW is taken).
 
 - Ubuntu 24.04.5 LTS, **aarch64**, 4 cores, 7.9 GB RAM, **no swap**, 117 GB disk (101 GB free).
 - Docker 29.9.2 is active, cgroup v2, apparmor and seccomp default. The firewall backend is **iptables**, with the userland proxy on.
-- Tailscale 100.94.162.61; LAN 192.168.0.235 (not used, because macOS blocks launchd daemons from LAN IPs, see memory `macos-daemon-local-network`). No ufw. NTP is synced. iptables policy is ACCEPT everywhere, with only Docker's chains.
+- Tailscale 100.64.0.10; LAN 192.168.1.101 (not used, because macOS blocks launchd daemons from LAN IPs, see memory `macos-daemon-local-network`). No ufw. NTP is synced. iptables policy is ACCEPT everywhere, with only Docker's chains.
 - Nothing ghost-labs is installed. No containers and no images.
 - `sudo -n` works.
 
@@ -54,7 +54,7 @@ journal's §4SW is the Greek voice, so §4SW is taken).
      connection to a LAN host (192.168.0.x) fails.
    - Labs must not reach the LAN, tailnet or `disorder` host services. Tor's `ReachableAddresses` / an
      ExitPolicy reject on private ranges in the gateway's torrc, plus a test.
-3. **Published ports (D6)** are bound on 100.94.162.61 only, through a **host-side forwarder** (proven in §3b) that
+3. **Published ports (D6)** are bound on 100.64.0.10 only, through a **host-side forwarder** (proven in §3b) that
    listens on the tailnet IP and forwards into the lab network. Lab members never get a non-internal interface, and
    the contract's `-pub` network is NOT built. Forwarders die with their lab (part of destroy and of the leftover check).
 4. **Boot ordering:** `docker.service` is not ordered after `tailscaled.service`, so binding to the
@@ -102,7 +102,7 @@ Built from throwaway `labtest-*` containers. Results:
 | Member names (Docker DNS) | ✅ |
 | **External names via Docker DNS on an internal network** | ❌ **by default.** Fix PROVEN: create members with `--dns <gw-ip>`. The embedded DNS then forwards to the gateway, which redirects to Tor, and member names still resolve |
 | **Host's bridge IP (172.18.0.1:22 → disorder's sshd)** | ⚠ **REACHABLE: a real hole.** On internal networks the host keeps the bridge gateway IP. Fix PROVEN: host `iptables -I INPUT -s <lab pool> -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP`. After it: banner gone, member DNS + Tor still work, host→member (forwarder) still works |
-| Tailnet port publish: host `socat TCP-LISTEN:20000,bind=100.94.162.61,fork TCP:<member>:80` | ✅ from disorder AND from the Mac over the tailnet. LAN IP 192.168.0.235:20000 refused. No `-pub` network needed → **host-side forwarder is the design** (§3.3), with the manager owning the forwarders (asyncio or supervised processes: a socat started from an ssh session died with the session) |
+| Tailnet port publish: host `socat TCP-LISTEN:20000,bind=100.64.0.10,fork TCP:<member>:80` | ✅ from disorder AND from the Mac over the tailnet. LAN IP 192.168.1.101:20000 refused. No `-pub` network needed → **host-side forwarder is the design** (§3.3), with the manager owning the forwarders (asyncio or supervised processes: a socat started from an ssh session died with the session) |
 
 **Requirements this adds to Phase A** (all new vs the contract):
 1. `/etc/docker/daemon.json`: `default-address-pools` = a dedicated range (proposed `10.89.0.0/16`, /24 per network).
@@ -112,7 +112,7 @@ Built from throwaway `labtest-*` containers. Results:
 2. The gateway gets a **fixed IP** on each lab network (e.g. `.2`), because members' `--dns` points at it. ⚠ Docker refuses `--ip` on a
    pool-allocated subnet (verified 11-03), so the manager allocates explicit subnets with an `--ip-range` (contract v2 §11.1).
 3. Members: `--dns <gw>`, `--dns-search lab.invalid` (Docker copied the host's tailnet search domain
-   `taila2b1d.ts.net` into the lab's resolv.conf, a small leak), `sysctl net.ipv6.conf.all.disable_ipv6=1` (Tor DNS
+   `tailnet-example.ts.net` into the lab's resolv.conf, a small leak), `sysctl net.ipv6.conf.all.disable_ipv6=1` (Tor DNS
    returns AAAA, and there is no v6 route, so apps should fall back to v4 fast).
 4. **The default route is lost on every container (re)start** (member start/restart, `rejoin`, disorder reboot). The manager
    re-applies it from a Docker **events** listener (`start` event → nsenter route), and readiness waits for it. Without
@@ -147,7 +147,7 @@ Actions: `templates`, `create`, `list`, `status`, `exec` (+`detach`), `job` (get
 `member` (stop/start/restart/kill/pause/unpause/isolate/rejoin), `logs`, `http`, `extend`, `destroy`,
 `spec`.
 
-- Config: `GHOST_LABS_HOST` (a runtime setting, see UNIFIED_DESIGN §11; today's value `100.94.162.61:8700`), key in `~/Data/AI/.ghost_labs_key` (0600,
+- Config: `GHOST_LABS_HOST` (a runtime setting, see UNIFIED_DESIGN §11; today's value `100.64.0.10:8700`), key in `~/Data/AI/.ghost_labs_key` (0600,
   copied from `disorder:/etc/ghost-labs/api_key`). If either is unset, the tool is **unconfigured and hidden**,
   using the same mechanism `registry.py:1345` uses for `postgres_admin`/`default_db`.
 - HTTP client: plain httpx/curl_cffi **direct**. 100.64/10 is already Tor-bypassed by `compute_tor_proxy`.
@@ -349,7 +349,7 @@ apps, then switch tools) → E. **Run an independent review (r2) of UNIFIED_DESI
    `ghost-labs-manager-prompt.md` v1 where they differ), then this file's §3/§3b. **Superseded here:** §4 `exec detach`/§5's
    `job` action (→ `run`), §6.3 "archive destroys labs" (→ UNIFIED §3.4 + §13 #11 teardown), §6.7's lab-only leaf allowlist
    (→ `("file_system","execute","lab","run")`), §8 `skills/composed_skills.py` (→ `tools/composed_skills.py`), and every
-   `100.122.46.101` (the image node; the agent is `eva` 100.90.234.23, a runtime setting).
+   `100.64.0.13` (the image node; the agent is `eva` 100.64.0.12, a runtime setting).
 2. `ssh disorder 'docker ps -a; docker network ls; sudo iptables -S INPUT'`: it should be clean (prototype removed
    11-03; only the `debian:trixie-slim` image + host `socat` remain).
 3. **No open questions** (exposure X1–X4 answered 11-03, UNIFIED §15; day-1 item: the operator's Tailscale admin-console step for per-app names, then the test). Operator 11-03: autopilot creates **disposable machines only, when a task needs one** (UNIFIED §13 #21).

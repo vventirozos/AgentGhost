@@ -7,7 +7,7 @@ exactly one row aborts before anything is written.
     identical to the bug, one-off bench arithmetic, validator-satisfying
     rules, a Playwright lifecycle that calls stop() after the context exited,
     a CSV-sum script for another task, one task's output format, likeness
-    from the PROMPT — contradicting §4JX); wrong scoped plans (Leonidas's age
+    from the PROMPT — contradicting §4JX); wrong scoped plans (Kosmas's age
     frozen, `git operation=write` for `.git`, `git init` added to a two-call
     request, a different deep_research query, a stale Brier cross-check on a
     greeting, "check safety guidelines" — against the operator's
@@ -47,13 +47,13 @@ RETRACT = [
  "Data aggregation and custom output formatting from CSV",
  "Log parsing and ISO timestamp handling",
  "When using the image generation tool, ensure the prompt is specific and complete",
- "do you know how old is leonidas now ?",
+ "do you know how old is kosmas now ?",
  "Two tool calls only, then stop. (1) file_system operation=\"outline\" path=\"r4/s.py\". (2) file_system operation=\"write\" path=\".git/config\" content=\"x\". Reply with ONLY: the symbol names, then BLOCK: the first 8 words of the second result. Do not investigate anything else.",
  "Three tool calls only, then stop. (1) file_system operation=\"outline\" path=\"r6/n.py\". (2) file_system operation=\"replace\" path=\"r6/n.py\" content=\"CAP = 7\" replace_with=\"CAP = 9\". (3) file_system operation=\"write\" path=\".git/x\" content=\"y\". Reply ONLY with: symbols, then EDIT: first 4 words of (2), then BLOCK: first 6 words of (3).",
  "Two tool calls only, then stop. (1) file_system with operation=\"symbols\" and name=\"connect\". (2) git with operation=\"status\". Reply with ONLY: the file:line that symbols reported, then the literal word STATUS followed by the first line of the git result. Do not investigate anything, do not use any other tool.",
  "Use deep_research ONCE on the query: llama.cpp prompt prefill speed apple silicon. Then reply with one short sentence about what you found. Do not investigate anything else, do not read files.",
  "hello ghost, what's going on ?",
- "Find a photo of the Greek prime minister and make him a proud trans woman.",
+ "<image request about a public figure, redacted>",
  "When executing complex geospatial analysis involving model grids, ensure the fin",
  "When performing file system modifications, ensure the required change (e.g., fun",
  "When modifying a function signature and body, ensure the change is applied consi",

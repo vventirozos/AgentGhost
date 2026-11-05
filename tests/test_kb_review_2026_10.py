@@ -53,20 +53,20 @@ class _Graph:
         return []
 
     def owner_facts_matching(self, q):
-        return ["user HAS_CONDITION heart failure"]
+        return ["user HAS_CONDITION asthma"]
 
 
 def test_the_owners_graph_facts_are_not_labelled_unrelated():
     # world: the graph section rode under the vector grade — "what health conditions do I
-    # have" put heart failure under "best match: LOW — probably UNRELATED"
+    # have" put asthma under "best match: LOW — probably UNRELATED"
     out = asyncio.run(mem.tool_recall("what health conditions do I have", memory_system=_Mem([_row(0.40)]),
                                       graph_memory=_Graph()))
-    assert "heart failure" in out
+    assert "asthma" in out
     head = out.splitlines()[0]
     assert "not graded by that match" in head
     out2 = asyncio.run(mem.tool_recall("what health conditions do I have", memory_system=_Mem([]),
                                        graph_memory=_Graph()))
-    assert "UNRELATED" not in out2 and "heart failure" in out2
+    assert "UNRELATED" not in out2 and "asthma" in out2
 
 
 def test_recall_in_a_public_reply_is_refused(monkeypatch):
@@ -108,9 +108,9 @@ def test_a_project_name_miss_does_not_offer_random_rows_as_related_facts():
     # owner's dog_name row at 0.373 and a manual chunk at 0.408
     from types import SimpleNamespace
     from ghost_agent.tools import projects as P
-    m = _Mem([_row(0.373, text="User dog_name is Hanzo")])
+    m = _Mem([_row(0.373, text="User dog_name is Bruno")])
     out = str(asyncio.run(P._not_found_with_recall(SimpleNamespace(memory_system=m), "xyzzy-42")))
-    assert "hanzo" not in str(out).lower()
+    assert "bruno" not in str(out).lower()
     assert m.calls[0]["where"] == {"type": {"$nin": ["document", "document_summary", "episode_outside",
                                                      "identity"]}}
     m2 = _Mem([_row(0.20, text="Project Kestrel ships in September.")])
@@ -144,11 +144,11 @@ def _graph(tmp_path, rows):
 
 
 @pytest.mark.parametrize("q,obj", [("πού μένω;", "patras"), ("where do I live?", "patras"),
-                                   ("τι αυτοκίνητο οδηγώ;", "sym scooter"), ("πόσα παιδιά έχω;", "leonidas")])
+                                   ("τι αυτοκίνητο οδηγώ;", "kymco scooter"), ("πόσα παιδιά έχω;", "kosmas")])
 def test_owner_facts_are_found_by_greek_kind_words_and_location(tmp_path, q, obj):
     # world: "where do I live" never reached the HAS_LOCATION mirror, and "πού μένω" found nothing
-    g = _graph(tmp_path, [("user", "HAS_LOCATION", "patras"), ("user", "HAS_VEHICLES", "sym scooter"),
-                          ("user", "HAS_SONS", "leonidas")])
+    g = _graph(tmp_path, [("user", "HAS_LOCATION", "patras"), ("user", "HAS_VEHICLES", "kymco scooter"),
+                          ("user", "HAS_SONS", "kosmas")])
     assert any(obj in x.lower() for x in g.owner_facts_matching(q))
 
 
@@ -186,58 +186,58 @@ def _set(pm, gm, vm, cat, key, value):
 
 def test_a_pet_name_does_not_replace_the_owners_own_name(tmp_path):
     # world (reviewers A + E, reproduced on the store copy): mirrors were keyed by the key
-    # alone — pet.name = Hanzo replaced `User name is Vasilis` and `user HAS_NAME vasilis`
+    # alone — pet.name = Bruno replaced `User name is Vasilis` and `user HAS_NAME vasilis`
     pm, gm, vm = _stores(tmp_path)
     _set(pm, gm, vm, "root", "name", "Vasilis")
-    _set(pm, gm, vm, "pet", "name", "Hanzo")
+    _set(pm, gm, vm, "pet", "name", "Bruno")
     assert ("user", "HAS_NAME", "vasilis") in _edges(gm)
-    assert ("user", "HAS_PET_NAME", "hanzo") in _edges(gm)
-    assert _identity(vm) == ["User name is Vasilis", "User pet_name is Hanzo"]
+    assert ("user", "HAS_PET_NAME", "bruno") in _edges(gm)
+    assert _identity(vm) == ["User name is Vasilis", "User pet_name is Bruno"]
     _set(pm, gm, vm, "pet", "name", "")                      # the pet field deleted
     assert ("user", "HAS_NAME", "vasilis") in _edges(gm) and _identity(vm) == ["User name is Vasilis"]
 
 
 def test_a_category_field_never_deletes_a_graph_only_owner_fact(tmp_path):
-    # world: update_profile(health, condition, diabetes) deleted `HAS_CONDITION heart failure`
-    # and `blood clot` — true owner facts that exist only in the graph
+    # world: update_profile(health, condition, diabetes) deleted `HAS_CONDITION asthma`
+    # and `hay fever` — true owner facts that exist only in the graph
     pm, gm, vm = _stores(tmp_path)
-    gm.add_triplets([{"subject": "user", "predicate": "HAS_CONDITION", "object": "heart failure"}])
+    gm.add_triplets([{"subject": "user", "predicate": "HAS_CONDITION", "object": "asthma"}])
     _set(pm, gm, vm, "health", "condition", "diabetes")
-    assert ("user", "HAS_CONDITION", "heart failure") in _edges(gm)
+    assert ("user", "HAS_CONDITION", "asthma") in _edges(gm)
     assert ("user", "HAS_HEALTH_CONDITION", "diabetes") in _edges(gm)
 
 
 def test_a_pre_fix_mirror_of_the_current_value_is_retired_and_others_are_kept(tmp_path):
     # world: the qualified mirror would sit beside its own pre-fix twin forever
     pm, gm, vm = _stores(tmp_path)
-    pm.update("pet", "dog_name", "Hanzo")
-    gm.add_triplets([{"subject": "user", "predicate": "HAS_DOG_NAME", "object": "hanzo"},
+    pm.update("pet", "dog_name", "Bruno")
+    gm.add_triplets([{"subject": "user", "predicate": "HAS_DOG_NAME", "object": "bruno"},
                      {"subject": "user", "predicate": "HAS_DOG_NAME", "object": "rex"}], raw=True)
-    vm.add("User dog_name is Hanzo", {"type": "identity", "timestamp": "2026-01-01T00:00:00Z"})
+    vm.add("User dog_name is Bruno", {"type": "identity", "timestamp": "2026-01-01T00:00:00Z"})
     asyncio.run(mem.resync_all_owner_mirrors(pm, gm, vm))
     e = _edges(gm)
-    assert ("user", "HAS_PET_DOG_NAME", "hanzo") in e and ("user", "HAS_DOG_NAME", "hanzo") not in e
+    assert ("user", "HAS_PET_DOG_NAME", "bruno") in e and ("user", "HAS_DOG_NAME", "bruno") not in e
     assert ("user", "HAS_DOG_NAME", "rex") in e                 # not this field's value: the operator's call
-    assert [x for x in _identity(vm) if "dog" in x] == ["User pet_dog_name is Hanzo"]
+    assert [x for x in _identity(vm) if "dog" in x] == ["User pet_dog_name is Bruno"]
 
 
 def test_a_root_key_keeps_its_unqualified_legacy_twins_out_of_a_category_sync(tmp_path):
     # world: a category field of a key the root also has must not retire the ROOT's mirror
     pm, gm, vm = _stores(tmp_path)
-    _set(pm, gm, vm, "root", "name", "Hanzo")
-    _set(pm, gm, vm, "pet", "name", "Hanzo")
-    assert ("user", "HAS_NAME", "hanzo") in _edges(gm)
-    assert "User name is Hanzo" in _identity(vm)
+    _set(pm, gm, vm, "root", "name", "Bruno")
+    _set(pm, gm, vm, "pet", "name", "Bruno")
+    assert ("user", "HAS_NAME", "bruno") in _edges(gm)
+    assert "User name is Bruno" in _identity(vm)
 
 
 def test_deleting_a_field_retires_its_pre_fix_mirror(tmp_path):
-    # world: "forget Hanzo" removed the profile field and left `user HAS_DOG_NAME hanzo`
+    # world: "forget Bruno" removed the profile field and left `user HAS_DOG_NAME bruno`
     pm, gm, vm = _stores(tmp_path)
-    pm.update("pet", "dog_name", "Hanzo")
-    gm.add_triplets([{"subject": "user", "predicate": "HAS_DOG_NAME", "object": "hanzo"}], raw=True)
-    vm.add("User dog_name is Hanzo", {"type": "identity", "timestamp": "2026-01-01T00:00:00Z"})
+    pm.update("pet", "dog_name", "Bruno")
+    gm.add_triplets([{"subject": "user", "predicate": "HAS_DOG_NAME", "object": "bruno"}], raw=True)
+    vm.add("User dog_name is Bruno", {"type": "identity", "timestamp": "2026-01-01T00:00:00Z"})
     _set(pm, gm, vm, "pet", "dog_name", "")
-    assert not [x for x in _edges(gm) if "hanzo" in x[2]] and not [x for x in _identity(vm) if "Hanzo" in x]
+    assert not [x for x in _edges(gm) if "bruno" in x[2]] and not [x for x in _identity(vm) if "Bruno" in x]
 
 
 def test_forget_execute_resyncs_the_mirrors_of_a_forgotten_field(tmp_path):
@@ -259,10 +259,10 @@ def test_forget_execute_resyncs_the_mirrors_of_a_forgotten_field(tmp_path):
 def test_forget_does_not_list_a_profile_fields_mirror_as_a_fact_of_its_own(tmp_path):
     # world: "forget wife birthdate" defaulted to four OTHER fields' mirror rows
     pm, gm, vm = _stores(tmp_path)
-    _set(pm, gm, vm, "relationships", "wife_name", "Fotini")
-    vm.add("User remembers the wedding in Kyllini", {"type": "identity", "timestamp": "2026-01-01T00:00:00Z"})
-    assert "User relationships_wife_name is Fotini" in mem._profile_mirror_texts(pm)
-    assert "User remembers the wedding in Kyllini" not in mem._profile_mirror_texts(pm)
+    _set(pm, gm, vm, "relationships", "wife_name", "Elena")
+    vm.add("User remembers the wedding in Paralia", {"type": "identity", "timestamp": "2026-01-01T00:00:00Z"})
+    assert "User relationships_wife_name is Elena" in mem._profile_mirror_texts(pm)
+    assert "User remembers the wedding in Paralia" not in mem._profile_mirror_texts(pm)
 
 
 def test_a_list_field_under_a_single_valued_predicate_keeps_every_value(tmp_path):
@@ -299,11 +299,11 @@ def test_recall_shows_an_on_demand_field_the_question_names(tmp_path):
     # profile — it reached it only through a stale mirror row the §4MI rule removes
     from ghost_agent.memory.profile import ProfileMemory
     pm = ProfileMemory(tmp_path)
-    pm.update("root", "address", "Makedonias 83, Thrakomakedones")
+    pm.update("root", "address", "Kaledonias 83, Kalopetres")
     out = asyncio.run(mem.tool_recall("where do I live?", memory_system=_Mem([]), profile_memory=pm))
-    assert "Makedonias 83" in out and "UNRELATED" not in out
+    assert "Kaledonias 83" in out and "UNRELATED" not in out
     out2 = asyncio.run(mem.tool_recall("what is my dog called?", memory_system=_Mem([]), profile_memory=pm))
-    assert "makedonias" not in str(out2).lower()
+    assert "kaledonias" not in str(out2).lower()
 
 
 # ── ingest ───────────────────────────────────────────────────────────────────
@@ -534,11 +534,11 @@ def _recall_vm(main_rows, identity_rows):
 def test_r2_owner_rows_chosen_by_field_not_distance():
     from ghost_agent.tools.memory import tool_recall
     ident = [{"id": "a", "score": 0.42, "text": "User location is Athens", "metadata": {"type": "identity"}},
-             {"id": "b", "score": 0.55, "text": "User company is EvolMonkey", "metadata": {"type": "identity"}}]
+             {"id": "b", "score": 0.55, "text": "User company is Orbitdata", "metadata": {"type": "identity"}}]
     # §4SN: a past request is shown only when it shares a word with the question
     ep = [{"id": "e", "score": 0.38, "text": "plan my work week", "metadata": {"type": "episode"}}]
     out = str(asyncio.run(tool_recall(query="where do I work?", memory_system=_recall_vm(ep, ident))))
-    assert "User company is EvolMonkey" in out and "User location is Athens" not in out
+    assert "User company is Orbitdata" in out and "User location is Athens" not in out
     assert out.index("STORED PROFILE FACTS") < out.index("CONTENT: plan my work week")
 
 
@@ -557,11 +557,11 @@ def test_r2_project_fallback_respects_public_and_skips_identity(monkeypatch, tmp
     import ghost_agent.utils.logging as L
     from ghost_agent.tools.projects import _not_found_with_recall
     vm = MagicMock()
-    vm.search_advanced.return_value = [{"score": 0.1, "text": "User dog_name is Hanzo", "metadata": {}}]
+    vm.search_advanced.return_value = [{"score": 0.1, "text": "User dog_name is Bruno", "metadata": {}}]
     ctx = SimpleNamespace(memory_system=vm)
     monkeypatch.setattr(L, "reply_is_public", lambda: True)
     out = asyncio.run(_not_found_with_recall(ctx, "dog website"))
-    assert "hanzo" not in str(out).lower() and not vm.search_advanced.called
+    assert "bruno" not in str(out).lower() and not vm.search_advanced.called
     monkeypatch.setattr(L, "reply_is_public", lambda: False)
     asyncio.run(_not_found_with_recall(ctx, "dog website"))
     assert "identity" in vm.search_advanced.call_args.kwargs["where"]["type"]["$nin"]
@@ -572,7 +572,7 @@ def test_r2_on_demand_needs_the_owner_gate_and_a_named_person():
 
     class _P:
         def load(self):
-            return {"root": {"address": "Makedonias 83"}, "relationships": {"wife_description": "tall"}}
+            return {"root": {"address": "Kaledonias 83"}, "relationships": {"wife_description": "tall"}}
 
         def is_on_demand(self, c, k):
             return True
@@ -589,9 +589,9 @@ def test_r2_vector_retires_every_unqualified_row(tmp_path):
     vm._get_lock = lambda: vm._lock
     vm.collection = MagicMock()
     vm.collection.get.return_value = {"ids": ["1", "2", "3"], "documents": [
-        "User vehicles is BMW 118i", "User assets_vehicles is Ducati", "User vehicles is Ducati"]}
+        "User vehicles is BMW 320d", "User assets_vehicles is Triumph", "User vehicles is Triumph"]}
     vm.add = MagicMock()
-    vm.sync_owner_field("vehicles", ["Ducati"], category="assets", retire_legacy=True)
+    vm.sync_owner_field("vehicles", ["Triumph"], category="assets", retire_legacy=True)
     assert set(vm.collection.delete.call_args.kwargs["ids"]) == {"1", "3"}
 
 
@@ -609,7 +609,7 @@ def test_r2_resync_skips_a_missing_profile_and_odd_shapes(tmp_path, monkeypatch)
         file_path = tmp_path / "user_profile.json"
 
         def load(self):
-            return {"root": {"name": "User", "": "x"}, "pet": {"k": {"a": 1}, "dog": "Hanzo"}}
+            return {"root": {"name": "User", "": "x"}, "pet": {"k": {"a": 1}, "dog": "Bruno"}}
     assert asyncio.run(M.resync_all_owner_mirrors(_P(), None, None)) == (0, 0) and not calls
     _P.file_path.write_text("{}")
     asyncio.run(M.resync_all_owner_mirrors(_P(), None, None))
@@ -682,11 +682,11 @@ def test_r3_role_names_the_person_for_a_description():
 
     class _P:
         def load(self):
-            return {"relationships": {"wife_name": "Fotini", "fotini_description": "tall, dark hair"}}
+            return {"relationships": {"wife_name": "Elena", "elena_description": "tall, dark hair"}}
 
         def is_on_demand(self, c, k):
             return k.endswith("description")
-    assert any("fotini_description" in ln for ln in _on_demand_lines(_P(), "what does my wife look like?"))
+    assert any("elena_description" in ln for ln in _on_demand_lines(_P(), "what does my wife look like?"))
     assert _on_demand_lines(_P(), "how do I look up a DNS record?") == []
 
 
@@ -714,22 +714,22 @@ def test_r3_greek_kind_lookup_needs_an_owner_question():
     gm.get_neighborhood.return_value = []
     # the store's own rule: Greek kind words only with extended=True
     gm.owner_facts_matching.side_effect = lambda q, extended=True: (
-        ["(User) -[HAS_ADDRESS]-> (Thrakomakedones)"] if extended or q.isascii() else [])
+        ["(User) -[HAS_ADDRESS]-> (Kalopetres)"] if extended or q.isascii() else [])
     vm = _recall_vm([], [])
     out = str(asyncio.run(tool_recall(query="πόσο κοστίζει ένα σπίτι για οκτώ άτομα;", memory_system=vm, graph_memory=gm)))
-    assert "thrakomakedones" not in str(out).lower()
+    assert "kalopetres" not in str(out).lower()
     out = str(asyncio.run(tool_recall(query="πού είναι το σπίτι μου;", memory_system=vm, graph_memory=gm)))
-    assert "Thrakomakedones" in out
+    assert "Kalopetres" in out
     out = str(asyncio.run(tool_recall(query="health conditions", memory_system=vm, graph_memory=gm)))
-    assert "Thrakomakedones" in out                     # English: every recall, as before
+    assert "Kalopetres" in out                     # English: every recall, as before
     assert gm.owner_facts_matching.call_args.kwargs["extended"] is False
 
 
 def test_r4_non_owner_recall_uses_the_base_kind_words(tmp_path):
     from ghost_agent.memory.graph import GraphMemory
     g = GraphMemory(tmp_path)
-    g.add_triplets([{"subject": "user", "predicate": "HAS_ROLE", "object": "Runs EvolMonkey"},
-                    {"subject": "user", "predicate": "LIVES_IN", "object": "Thrakomakedones"}], raw=True)
+    g.add_triplets([{"subject": "user", "predicate": "HAS_ROLE", "object": "Runs Orbitdata"},
+                    {"subject": "user", "predicate": "LIVES_IN", "object": "Kalopetres"}], raw=True)
     assert not g.owner_facts_matching("how does the job scheduler work", extended=False)
     assert not g.owner_facts_matching("best location for a datacenter", extended=False)
     assert not g.owner_facts_matching("πού μένω;", extended=False)
@@ -748,14 +748,14 @@ def test_r5_user_or_owner_in_a_query_does_not_open_the_owner_sections():
 
     class _P:
         def load(self):
-            return {"root": {"address": "Makedonias 83"}}
+            return {"root": {"address": "Kaledonias 83"}}
 
         def is_on_demand(self, c, k):
             return True
     for q in ("postgres user home directory", "github repository owner address", "user's wife name"):
         out = str(asyncio.run(tool_recall(query=q, memory_system=_recall_vm([], []), graph_memory=gm,
                                           profile_memory=_P())))
-        assert "makedonias" not in str(out).lower() and gm.owner_facts_matching.call_args.kwargs["extended"] is False
+        assert "kaledonias" not in str(out).lower() and gm.owner_facts_matching.call_args.kwargs["extended"] is False
 
 
 def test_r5_base_vocabulary_is_the_pre_review_one():
@@ -789,10 +789,10 @@ def test_r4_a_named_directory_is_respected(tmp_path):
 
 def test_r5_profile_rows_need_a_medium_match_off_an_owner_question():
     from ghost_agent.tools.memory import tool_recall
-    rows = [{"id": "a", "score": 0.40, "text": "User address is Makedonias 83", "metadata": {"type": "identity"}},
+    rows = [{"id": "a", "score": 0.40, "text": "User address is Kaledonias 83", "metadata": {"type": "identity"}},
             {"id": "b", "score": 0.30, "text": "User grep_tool is ripgrep", "metadata": {"type": "identity"}}]
     out = str(asyncio.run(tool_recall(query="owner email address of the domain", memory_system=_recall_vm(rows, []))))
-    assert "makedonias" not in str(out).lower() and "ripgrep" in out
+    assert "kaledonias" not in str(out).lower() and "ripgrep" in out
 
 
 # ── battery survivors (scripts/mutate_kb_1030.py r1) ──

@@ -298,7 +298,7 @@ def test_classifier_never_raises_on_odd_input():
 @pytest.mark.parametrize("key,first,second", [
     ("wife", "Anna", "Maria"),
     ("husband", "Nikos", "Petros"),
-    ("son", "Thodoris", "Leonidas"),
+    ("son", "Markos", "Kosmas"),
     ("daughter", "Eleni", "Sofia"),
     ("car", "Tesla", "Volvo"),
 ])
@@ -318,9 +318,9 @@ def test_singular_profile_keys_replace_on_correction(tmp_path, key, first, secon
 def test_plural_keys_still_merge(tmp_path):
     # The merge branch is deliberate for genuinely multi-valued facts.
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "pets", "Hanzo the dog")
+    pm.update("assets", "pets", "Bruno the dog")
     pm.update("assets", "pets", "Mortimer the iguana")
-    assert pm.load()["assets"]["pets"] == ["Hanzo the dog", "Mortimer the iguana"]
+    assert pm.load()["assets"]["pets"] == ["Bruno the dog", "Mortimer the iguana"]
 
     pm.update("interests", "language", "python")
     pm.update("interests", "language", "rust")

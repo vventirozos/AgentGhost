@@ -115,14 +115,14 @@ _CORRECTION_RE = re.compile(
 #
 # Measured over 1490 consecutive live turn pairs (2026-07-07..09-17): 24
 # candidates (1.6%), of which roughly a third are genuine corrections and
-# the rest are birthdays ("leonidas was born march …"), questions ("at what
+# the rest are birthdays ("kosmas was born march …"), questions ("at what
 # date is mars …"), tests and philosophy. So this is a CANDIDATE gate for
 # the judge (`adjudication_prompt`), never a promoter: a rebuttal clause
 # promotes only when a judge rules `corrects=true`. Cost: ~1 judge call per
 # 62 turns on top of Signal A's 1 per 100.
 #: ⚠ Every alternative here NEGATES. A first draft listed the bare copulas
 #: (`is|are|was|were`) with an optional `not` after them, so "the ball is
-#: going straight up" and "leonidas was born march" were "negated clauses"
+#: going straight up" and "kosmas was born march" were "negated clauses"
 #: — the corpus count above was taken with that draft and was inflated;
 #: the pin `test_plain_copula_is_not_a_negation` holds the line.
 _NEGATION = (

@@ -55,13 +55,13 @@ def _ask(reply):
 # ── C1: an owner correction removes only what it is about ───────────────────
 def test_not_selling_the_bmw_keeps_the_bmw(tmp_path):
     """Reproduced: "I'm not selling the BMW after all" (SELLING, negated)
-    deleted assets.vehicles "BMW 118i" — the live value."""
+    deleted assets.vehicles "BMW 320d" — the live value."""
     a = _agent(tmp_path, {"score": 0.2, "fact": "",
                           "graph_triplets": [{"subject": "user", "predicate": "SELLING", "object": "BMW"}]})
-    a.context.profile_memory.update("assets", "vehicles", "BMW 118i")
-    a.context.profile_memory.update("assets", "vehicles", "Ducati Monster")
+    a.context.profile_memory.update("assets", "vehicles", "BMW 320d")
+    a.context.profile_memory.update("assets", "vehicles", "Triumph Bonneville")
     _run(a, "USER: I'm not selling the BMW after all\nAI: ok")
-    assert "118i" in json.dumps(_profile(a)["assets"])
+    assert "320d" in json.dumps(_profile(a)["assets"])
 
 
 def test_a_negated_trip_keeps_the_home_location(tmp_path):
@@ -76,9 +76,9 @@ def test_a_negated_trip_keeps_the_home_location(tmp_path):
 def test_never_sold_is_not_a_removal(tmp_path):
     a = _agent(tmp_path, {"score": 0.2, "fact": "",
                           "graph_triplets": [{"subject": "user", "predicate": "SOLD", "object": "BMW"}]})
-    a.context.profile_memory.update("assets", "vehicles", "BMW 118i")
+    a.context.profile_memory.update("assets", "vehicles", "BMW 320d")
     _run(a, "USER: I never sold the BMW, it's in the garage\nAI: ok")
-    assert "118i" in json.dumps(_profile(a)["assets"])
+    assert "320d" in json.dumps(_profile(a)["assets"])
 
 
 @pytest.mark.parametrize("said, pred", [
@@ -88,11 +88,11 @@ def test_never_sold_is_not_a_removal(tmp_path):
 def test_a_real_removal_still_removes(tmp_path, said, pred):
     a = _agent(tmp_path, {"score": 0.2, "fact": "",
                           "graph_triplets": [{"subject": "user", "predicate": pred, "object": "BMW"}]})
-    a.context.profile_memory.update("assets", "vehicles", "BMW 118i")
-    a.context.profile_memory.update("assets", "vehicles", "Ducati Monster")
+    a.context.profile_memory.update("assets", "vehicles", "BMW 320d")
+    a.context.profile_memory.update("assets", "vehicles", "Triumph Bonneville")
     _run(a, f"USER: {said}\nAI: ok")
     assert json.dumps(_profile(a)["assets"]).count("BMW") == 0
-    assert "Ducati" in json.dumps(_profile(a)["assets"])
+    assert "Triumph" in json.dumps(_profile(a)["assets"])
 
 
 def test_a_negated_fact_of_the_same_kind_is_removed(tmp_path):
@@ -129,7 +129,7 @@ def test_nova_down_keeps_the_whole_batch_without_spending_a_retry(tmp_path):
     a = _agent(tmp_path, {})
     a.context.llm_client.chat_completion = AsyncMock(side_effect=OffMainNodeUnavailable(
         "all off-main nodes failed; main-model fallback is disabled for this call"))
-    j = _journal(a, tmp_path, "USER: my dog is named Hanzo\nAI: nice", "USER: my wife is Fotini\nAI: ok",
+    j = _journal(a, tmp_path, "USER: my dog is named Bruno\nAI: nice", "USER: my wife is Elena\nAI: ok",
                  "USER: my car is a BMW\nAI: ok")
     asyncio.run(a.process_journal_queue(respect_idle=False))
     assert j.pending_count() == 3
@@ -142,7 +142,7 @@ def test_a_non_transient_failure_is_dropped_and_said(tmp_path, monkeypatch):
     a.context.llm_client.chat_completion = AsyncMock(side_effect=RuntimeError("bad request"))
     lines = []
     monkeypatch.setattr("ghost_agent.core.agent.pretty_log", lambda tag, msg="", **k: lines.append((tag, msg)))
-    j = _journal(a, tmp_path, "USER: my dog is named Hanzo\nAI: nice")
+    j = _journal(a, tmp_path, "USER: my dog is named Bruno\nAI: nice")
     asyncio.run(a.process_journal_queue(respect_idle=False))
     assert j.pending_count() == 0
     msgs = [m for t, m in lines if t == "Memory Journal"]
@@ -154,7 +154,7 @@ def test_the_summary_counts_only_items_the_model_read(tmp_path, monkeypatch):
     a = _agent(tmp_path, {"score": 0.1, "fact": "", "graph_triplets": []})
     lines = []
     monkeypatch.setattr("ghost_agent.core.agent.pretty_log", lambda tag, msg="", **k: lines.append((tag, msg)))
-    _journal(a, tmp_path, "USER: my dog is named Hanzo\nAI: nice", "USER: what time is it in Tokyo\nAI: 3am")
+    _journal(a, tmp_path, "USER: my dog is named Bruno\nAI: nice", "USER: what time is it in Tokyo\nAI: 3am")
     asyncio.run(a.process_journal_queue(respect_idle=False))
     assert ("Memory Journal", "read 1 memory (1 without an owner fact cue, not read)") in lines
     assert a.context.llm_client.chat_completion.await_count == 1
@@ -181,12 +181,12 @@ def test_a_negated_profile_value_is_not_written(tmp_path):
 
 # ── C4: one fact, one home ──────────────────────────────────────────────────
 def test_a_value_the_profile_holds_is_not_filed_again(tmp_path):
-    """Live: the tool saved assets.dogs=Hanzo, the extractor added pet.dog_name."""
+    """Live: the tool saved assets.dogs=Bruno, the extractor added pet.dog_name."""
     a = _agent(tmp_path, {"score": 0.4, "fact": "",
-                          "profile_update": {"category": "pet", "key": "dog_name", "value": "Hanzo"},
+                          "profile_update": {"category": "pet", "key": "dog_name", "value": "Bruno"},
                           "graph_triplets": []})
-    a.context.profile_memory.update("assets", "dogs", "Hanzo")
-    _run(a, "USER: my dog's name is Hanzo\nAI: saved")
+    a.context.profile_memory.update("assets", "dogs", "Bruno")
+    _run(a, "USER: my dog's name is Bruno\nAI: saved")
     assert "pet" not in _profile(a) or "dog_name" not in _profile(a)["pet"]
 
 
@@ -214,21 +214,21 @@ def test_extractor_category(given, want):
 def test_profile_field_holding_folds_case_and_lists(tmp_path):
     from ghost_agent.memory.profile import ProfileMemory
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "vehicles", "BMW 118i")
-    pm.update("assets", "vehicles", "Ducati Monster")
-    assert _profile_field_holding(pm, "ducati monster") == "assets.vehicles"
-    assert _profile_field_holding(pm, "Ducati") == "" and _profile_field_holding(pm, "") == ""
+    pm.update("assets", "vehicles", "BMW 320d")
+    pm.update("assets", "vehicles", "Triumph Bonneville")
+    assert _profile_field_holding(pm, "triumph bonneville") == "assets.vehicles"
+    assert _profile_field_holding(pm, "Triumph") == "" and _profile_field_holding(pm, "") == ""
 
 
 # ── C5: each owner message is extracted once ────────────────────────────────
 def test_the_previous_turns_owner_line_is_not_extracted_again(tmp_path):
-    """Live: "my dog's name is Hanzo" stored twice, 5 s apart — the next
+    """Live: "my dog's name is Bruno" stored twice, 5 s apart — the next
     turn's item still carried it."""
     a = _agent(tmp_path, {"score": 0.1, "fact": "", "graph_triplets": []})
-    _run(a, "USER: my dog's name is Hanzo\nASSISTANT: Saved!\nUSER: what's my dog's name?\nAI: Hanzo")
+    _run(a, "USER: my dog's name is Bruno\nASSISTANT: Saved!\nUSER: what's my dog's name?\nAI: Bruno")
     prompt = a.context.llm_client.chat_completion.await_args.args[0]["messages"][0]["content"]
     episode = prompt.split("### EPISODE LOG:")[-1]
-    assert "Hanzo" not in episode and "what's my dog's name?" in episode
+    assert "Bruno" not in episode and "what's my dog's name?" in episode
 
 
 def test_latest_owner_episode():
@@ -271,7 +271,7 @@ def test_an_old_item_is_anchored_and_stamped_when_said(tmp_path):
 # ── review round 1 ──────────────────────────────────────────────────────────
 @pytest.mark.parametrize("said, who, cat, key", [
     ("my son Leo isn't in kindergarten anymore", "Leo", "relationships", "son_name"),
-    ("my wife Fotini doesn't smoke anymore", "Fotini", "relationships", "wife_name"),
+    ("my wife Elena doesn't smoke anymore", "Elena", "relationships", "wife_name"),
 ])
 def test_a_cessation_about_someone_else_removes_nobody(tmp_path, said, who, cat, key):
     a = _agent(tmp_path, {"score": 0.2, "fact": "",
@@ -294,10 +294,10 @@ def test_a_move_to_the_birthplace_still_updates_the_location(tmp_path):
 def test_the_held_value_skip_needs_a_related_field(tmp_path):
     from ghost_agent.memory.profile import ProfileMemory
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "dogs", "Hanzo")
+    pm.update("assets", "dogs", "Bruno")
     pm.update("root", "birthplace", "Athens")
     pm.update("preferences", "memory_usage", "High")
-    assert _profile_field_holding(pm, "Hanzo", "pet", "dog_name") == "assets.dogs"
+    assert _profile_field_holding(pm, "Bruno", "pet", "dog_name") == "assets.dogs"
     assert _profile_field_holding(pm, "high", "preferences", "memory_usage_tolerance") == "preferences.memory_usage"
     assert _profile_field_holding(pm, "Athens", "root", "location") == ""
     pm.update("home", "city", "Athens")
@@ -320,11 +320,11 @@ def test_an_item_that_always_fails_on_the_worker_does_not_block_the_queue(tmp_pa
     """Review r1: one always-failing item came back at the HEAD of every
     drain — after 10 drains nothing behind it had run."""
     a = _poison_agent(tmp_path)
-    j = _journal(a, tmp_path, "USER: my poison item\nAI: x", "USER: my dog is named Hanzo\nAI: nice")
+    j = _journal(a, tmp_path, "USER: my poison item\nAI: x", "USER: my dog is named Bruno\nAI: nice")
     asyncio.run(a.process_journal_queue(respect_idle=False))     # poison fails → goes BEHIND
-    asyncio.run(a.process_journal_queue(respect_idle=False))     # Hanzo runs, then poison fails again
+    asyncio.run(a.process_journal_queue(respect_idle=False))     # Bruno runs, then poison fails again
     texts = [c.args[0]["messages"][0]["content"] for c in a.context.llm_client.chat_completion.await_args_list]
-    assert any("Hanzo" in t for t in texts)
+    assert any("Bruno" in t for t in texts)
     for i in range(a._NODE_DOWN_MAX + 4):      # the worker answers other items: the poison item counts
         j.append("smart_memory", {"text": f"USER: my note {i}\nAI: x", "model": "m"})
         asyncio.run(a.process_journal_queue(respect_idle=False))
@@ -344,8 +344,8 @@ def test_a_multi_line_owner_message_reaches_the_extractor(tmp_path):
 
 
 def test_an_item_whose_own_message_is_missing_is_not_re_extracted(tmp_path):
-    a = _agent(tmp_path, {"score": 0.95, "fact": "The user's dog is named Hanzo.", "graph_triplets": []})
-    out = _run(a, "USER: my dog's name is Hanzo\nAI: Saved!", owner_text="what's the weather like")
+    a = _agent(tmp_path, {"score": 0.95, "fact": "The user's dog is named Bruno.", "graph_triplets": []})
+    out = _run(a, "USER: my dog's name is Bruno\nAI: Saved!", owner_text="what's the weather like")
     assert out == "skipped" and a.context.llm_client.chat_completion.await_count == 0
 
 
@@ -369,11 +369,11 @@ def test_a_profile_value_that_states_a_removal_is_not_written(tmp_path):
 
 
 def test_the_drain_hands_each_item_its_own_message(tmp_path):
-    a = _agent(tmp_path, {"score": 0.95, "fact": "The user's dog is named Hanzo.", "graph_triplets": []})
+    a = _agent(tmp_path, {"score": 0.95, "fact": "The user's dog is named Bruno.", "graph_triplets": []})
     (tmp_path / "jdir").mkdir()
     j = MemoryJournal(tmp_path / "jdir")
     a.context.journal = j
-    j.append("smart_memory", {"text": "USER: my dog's name is Hanzo\nAI: Saved!", "model": "m",
+    j.append("smart_memory", {"text": "USER: my dog's name is Bruno\nAI: Saved!", "model": "m",
                               "user": "what's the weather like"})
     asyncio.run(a.process_journal_queue(respect_idle=False))
     assert a.context.llm_client.chat_completion.await_count == 0
@@ -409,9 +409,9 @@ def test_fields_about_someone_else_have_no_owner_kind():
 def test_a_son_named_after_his_grandfather_is_filed(tmp_path):
     from ghost_agent.memory.profile import ProfileMemory
     pm = ProfileMemory(tmp_path)
-    pm.update("relationships", "father_name", "Leonidas")
+    pm.update("relationships", "father_name", "Kosmas")
     pm.update("relationships", "wife_employer", "Google")
-    assert _profile_field_holding(pm, "Leonidas", "relationships", "son_name") == ""
+    assert _profile_field_holding(pm, "Kosmas", "relationships", "son_name") == ""
     assert _profile_field_holding(pm, "Google", "root", "employer") == ""
 
 
@@ -427,7 +427,7 @@ def test_an_outage_keeps_every_item_however_long_it_lasts(tmp_path):
     a = _agent(tmp_path, {})
     a.context.llm_client.chat_completion = AsyncMock(side_effect=OffMainNodeUnavailable(
         "all off-main nodes failed; main-model fallback is disabled for this call"))
-    j = _journal(a, tmp_path, "USER: my dog is named Hanzo\nAI: nice", "USER: my wife is Fotini\nAI: ok")
+    j = _journal(a, tmp_path, "USER: my dog is named Bruno\nAI: nice", "USER: my wife is Elena\nAI: ok")
     for _ in range(3 * (a._NODE_DOWN_MAX + 4)):
         asyncio.run(a.process_journal_queue(respect_idle=False))
     assert j.pending_count() == 2
@@ -442,10 +442,10 @@ def test_a_long_code_led_message_still_matches_its_arc(tmp_path):
 
 def test_an_image_turns_arc_reads_its_text():
     from ghost_agent.core.agent import _build_memory_arc
-    msgs = [{"role": "user", "content": [{"type": "text", "text": "this is my dog\nhis name is Hanzo"},
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "this is my dog\nhis name is Bruno"},
                                           {"type": "image_url", "image_url": {"url": "data:x"}}]}]
     arc = _build_memory_arc(msgs, "nice dog", tools_run=[])
-    assert "his name is Hanzo" in arc and "\\n" not in arc and "image_url" not in arc
+    assert "his name is Bruno" in arc and "\\n" not in arc and "image_url" not in arc
 
 
 def test_profile_like_categories_fold_to_root():
@@ -461,7 +461,7 @@ def test_a_cessation_leaves_a_possession_in_the_profile(tmp_path, said, pred):
     """The trade-off: a possession leaves by a removal or the owner's forget."""
     a = _agent(tmp_path, {"score": 0.2, "fact": "",
                           "graph_triplets": [{"subject": "user", "predicate": pred, "object": "BMW"}]})
-    a.context.profile_memory.update("assets", "vehicles", "BMW 118i")
+    a.context.profile_memory.update("assets", "vehicles", "BMW 320d")
     _run(a, f"USER: {said}\nAI: ok")
     assert "BMW" in json.dumps(_profile(a)["assets"])
 
@@ -515,7 +515,7 @@ def test_skipped_items_do_not_hide_an_outage(tmp_path):
         "all off-main nodes failed; main-model fallback is disabled for this call"))
     texts = []
     for i in range(4):
-        texts += [f"USER: my dog {i} is named Hanzo\nAI: nice", "USER: ok thanks\nAI: np"]
+        texts += [f"USER: my dog {i} is named Bruno\nAI: nice", "USER: ok thanks\nAI: np"]
     _journal(a, tmp_path, *texts)
     asyncio.run(a.process_journal_queue(respect_idle=False))
     assert a.context.llm_client.chat_completion.await_count == 2
@@ -532,7 +532,7 @@ def test_the_owner_returning_keeps_a_stepped_aside_item(tmp_path):
         a.context.last_activity_time = _dt.datetime.now()       # the owner comes back mid-call
         return await _inner(payload, **k)
     a.context.llm_client.chat_completion.side_effect = _call
-    j = _journal(a, tmp_path, "USER: my poison item\nAI: x", "USER: my dog is named Hanzo\nAI: nice")
+    j = _journal(a, tmp_path, "USER: my poison item\nAI: x", "USER: my dog is named Bruno\nAI: nice")
     asyncio.run(a.process_journal_queue(respect_idle=True))
     assert a.context.llm_client.chat_completion.await_count == 1
     assert j.pending_count() == 2

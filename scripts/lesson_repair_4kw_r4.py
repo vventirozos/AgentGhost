@@ -14,7 +14,7 @@ to exactly one row aborts before anything is written.
   * RE-KEY 2 scoped lessons to the user's ACTUAL request (traced through
     their source trajectory).
   * REWRITE 14 general lessons that named one request's entities or files
-    (Hetzner, Leonidas, Fousekis/Revolut, KYC passport, war scenarios,
+    (Hetzner, Kosmas, Fousekis/Revolut, KYC passport, war scenarios,
     `.frag_copy`, IFS, kc_probe.py, farewell(), logslow.py, 'emp1', 'can you
     dig it?', 'delete it'): the example goes, the rule stays; a changed
     trigger gets a fresh twin.
@@ -73,7 +73,7 @@ RETRACT = [
  "Run youtube_transcribe on a YouTube URL and report download/transcription results",
  "Define a composed skill 'youtube_transcribe' with specific sequential steps and confirm its activation.",
  "Execute a sequence of shell commands (write to file, count lines, delete file, calculate result) and return only the final number.",
- "Identify BJJ schools near 'North Athens' using web search and browsing tools.",
+ "Identify BJJ schools near 'South Athens' using web search and browsing tools.",
  "Identify the name and monthly price of the cheapest shared-vCPU plan on https://www.hetzner.com/cloud/server.",
  "Execute a specific shell command and return the exit code verbatim.",
  "Find specific information (Open University MA International Relations Security modules) when initial direct searches and browser attempts fail due to access restrictions (403/404).",
@@ -88,7 +88,7 @@ REWRITE = {
  "When querying external services, use specific, direct URLs for known resources (": {
   "solution": "When querying external services, use specific, direct URLs for the provider's own resource pages (pricing, status, documentation) rather than relying solely on general search results."
  },
- "When asked about specific entities (e.g., Leonidas), prioritize answering from s": {
+ "When asked about specific entities (e.g., Kosmas), prioritize answering from s": {
   "trigger": "When asked about a specific entity with a format or source constraint, follow both constraints",
   "solution": "When answering questions about a specific entity, adhere strictly to the requested format (e.g., one short sentence) and to the requested source (e.g., only from your own records)."
  },

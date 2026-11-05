@@ -51,7 +51,7 @@ def _setup(bot, monkeypatch):
     bot._SEEN_MESSAGES.clear()
 
 
-def _mention(ts="1792440607.383519", user=MEMBER, channel="C56FKAHTP", files=None):
+def _mention(ts="1792440607.383519", user=MEMBER, channel="C0CHANNEL1", files=None):
     ev = {"type": "app_mention", "user": user, "channel": channel, "ts": ts,
           "thread_ts": "1792440277.327819",
           "text": f"<@{BOT}> dress this lady in the image i am attaching as a witch"}
@@ -149,7 +149,7 @@ def test_each_event_is_logged_and_a_duplicate_says_which_kind(bot, monkeypatch, 
     asyncio.run(bot.handle_mention(_mention(), AsyncMock(), body=body))
     asyncio.run(bot.handle_mention(_mention(), AsyncMock(), body={"event_id": "Ev2"}))
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "mention event channel=C56FKAHTP ts=1792440607.383519" in text
+    assert "mention event channel=C0CHANNEL1 ts=1792440607.383519" in text
     assert "event_id=Ev1" in text and "files=1" in text
     assert "same event id — a redelivery" in text
     assert "first event id Ev1" in text

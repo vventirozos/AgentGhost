@@ -1070,7 +1070,7 @@ async def test_the_expansion_and_the_value_prune_see_the_same_target(
     # Two successive updates make a real LIST (passing a list literal is
     # stringified, which routes the sweep down the scalar delete path and
     # never exercises prune_value at all).
-    pm.update("assets", "pets", "Hanzo the dog")
+    pm.update("assets", "pets", "Bruno the dog")
     pm.update("assets", "pets", "Mortimer the iguana")
     graph = MagicMock()
     # NO expansion: the value prune is then the only path that can remove
@@ -1090,7 +1090,7 @@ async def test_the_expansion_and_the_value_prune_see_the_same_target(
     assert "Mortimer" not in _pets, (
         f"{spelling!r} reported a value prune that did not happen: {_pets}"
     )
-    assert "Hanzo" in _pets, "the prune took an unrelated value with it"
+    assert "Bruno" in _pets, "the prune took an unrelated value with it"
     # ...and the report names the string the sweeps actually used.
     assert f"'{spelling}'" not in report or spelling == "mortimer", (
         f"the report names {spelling!r}, which no sweep consulted"

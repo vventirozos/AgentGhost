@@ -66,15 +66,15 @@ def test_a_turn_whose_writes_failed_is_not_recorded_completed(failed, outcome):
 # ── introspect's overview kept its head and lost its tail ─────────────
 
 def test_the_overview_keeps_its_last_sections_when_long(monkeypatch):
-    """a97ca03e: the 3,200-char cut dropped the short sections at the end
+    """a97ca03e: the cut at the cap (then 3,200 chars) dropped the short sections at the end
     (§4NM: the post-mortem defects section is gone; the workspace line is
     the tail that must survive)."""
     from ghost_agent.tools import introspect as I
-    monkeypatch.setattr(I, "_overview_selfhood", lambda sm: "S" * 900)
+    monkeypatch.setattr(I, "_overview_selfhood", lambda sm, context=None: "S" * 900)
     monkeypatch.setattr(I, "_overview_activity", lambda ctx: "A" * 900)
 
     async def _long(ctx):
-        return "L" * 1500
+        return "L" * (I._OVERVIEW_MAX_CHARS - 1700)     # with the two 900s: over the cap (§4SV-b raised it)
     monkeypatch.setattr(I, "_overview_learning", _long)
     monkeypatch.setattr(I, "_overview_workspace", lambda ctx: "Workspace: 2 projects")
     out = asyncio.run(I._render_overview(None, SimpleNamespace()))

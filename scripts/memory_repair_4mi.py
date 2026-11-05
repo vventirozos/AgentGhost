@@ -9,9 +9,9 @@ Three reviewers measured, on a snapshot of the live `system/` dir:
   `recall_relevant` served them to the owner ("what is my name" → five
   member rows);
 * the knowledge graph held triplets written during those member threads
-  (`generated images DEPICTS classical roman masturbatorium`, `user
-  REQUESTED dvda schematic`, …) that the owner's prompts hydrated;
-* the graph mirrored an ON-DEMAND profile field (`user HAS_FOTINI_DESCRIPTION
+  (`generated images DEPICTS <explicit subject>`, `user
+  REQUESTED <explicit diagram>`, …) that the owner's prompts hydrated;
+* the graph mirrored an ON-DEMAND profile field (`user HAS_ELENA_DESCRIPTION
   …`) that any query word inside it seeded into a prompt;
 * the workspace activity log held probe-driven events (§4LN/§4LO, 10-04/05)
   with no project id, which every project's wake-up prefix kept forever, and

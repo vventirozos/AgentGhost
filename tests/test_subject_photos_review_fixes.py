@@ -291,25 +291,25 @@ async def test_an_opaque_photo_with_no_shape_still_goes_as_its_own_bytes(tmp_pat
 def _profile():
     import re
     pm = MagicMock()
-    pm.egress_scrubber = lambda: ([re.compile(r"Makedonias\s*83", re.I)], "Athens")
-    pm.address_values = lambda: ["Makedonias 83, Athens"]
-    pm.load = lambda: {"root": {"name": "Vasilis Example", "address": "Makedonias 83, Athens"}}
+    pm.egress_scrubber = lambda: ([re.compile(r"Kaledonias\s*83", re.I)], "Athens")
+    pm.address_values = lambda: ["Kaledonias 83, Athens"]
+    pm.load = lambda: {"root": {"name": "Vasilis Example", "address": "Kaledonias 83, Athens"}}
     return pm
 
 
 def test_a_singular_subject_is_scrubbed_like_subjects():
     from ghost_agent.memory.egress import scrub_tool_args
     ctx = SimpleNamespace(profile_memory=_profile(), egress_profile=None)
-    new, changed = scrub_tool_args("image_generation", {"prompt": "my house", "subject": "Makedonias 83"}, ctx)
-    assert changed and "Makedonias" not in new["subject"] and new["prompt"] == "my house"
+    new, changed = scrub_tool_args("image_generation", {"prompt": "my house", "subject": "Kaledonias 83"}, ctx)
+    assert changed and "Kaledonias" not in new["subject"] and new["prompt"] == "my house"
     # JSON-string args too
-    new, changed = scrub_tool_args("image_generation", json.dumps({"prompt": "my house", "subject": "Makedonias 83"}), ctx)
-    assert changed and "Makedonias" not in new
+    new, changed = scrub_tool_args("image_generation", json.dumps({"prompt": "my house", "subject": "Kaledonias 83"}), ctx)
+    assert changed and "Kaledonias" not in new
     # a `subject` that IS the prompt is the prompt: left alone (scrubbing it
     # alone would make it differ from the prompt and turn it into a search)
-    args = {"subject": "my house at Makedonias 83"}
+    args = {"subject": "my house at Kaledonias 83"}
     assert scrub_tool_args("image_generation", args, ctx) == (args, False)
-    args = {"prompt": "my house at Makedonias 83", "subject": "my house at Makedonias 83"}
+    args = {"prompt": "my house at Kaledonias 83", "subject": "my house at Kaledonias 83"}
     assert scrub_tool_args("image_generation", args, ctx) == (args, False)
 
 

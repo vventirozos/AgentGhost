@@ -233,9 +233,9 @@ def test_a_deleted_image_is_not_linked(tmp_path):
 
 # ── privacy: `subjects` leave the machine ───────────────────────────────────
 
-def _profile(address="Makedonias 83, Athens", name="Vasilis Example"):
+def _profile(address="Kaledonias 83, Athens", name="Vasilis Example"):
     pm = MagicMock()
-    pm.egress_scrubber = lambda: ([__import__("re").compile(r"Makedonias\s*83", __import__("re").I)], "Athens")
+    pm.egress_scrubber = lambda: ([__import__("re").compile(r"Kaledonias\s*83", __import__("re").I)], "Athens")
     pm.address_values = lambda: [address]
     pm.load = lambda: {"root": {"name": name, "address": address}}
     return pm
@@ -246,9 +246,9 @@ def test_the_owner_address_is_scrubbed_from_subjects_only():
     from ghost_agent.memory.egress import scrub_tool_args
     ctx = SimpleNamespace(profile_memory=_profile(), egress_profile=None)
     new, changed = scrub_tool_args("image_generation",
-                                   {"prompt": "my house at Makedonias 83", "subjects": ["Makedonias 83"]}, ctx)
-    assert changed and "Makedonias" not in json.dumps(new["subjects"])
-    assert new["prompt"] == "my house at Makedonias 83"            # the prompt stays on the owner's node
+                                   {"prompt": "my house at Kaledonias 83", "subjects": ["Kaledonias 83"]}, ctx)
+    assert changed and "Kaledonias" not in json.dumps(new["subjects"])
+    assert new["prompt"] == "my house at Kaledonias 83"            # the prompt stays on the owner's node
 
 
 def test_owner_identifiers_in_subjects_are_refused_after_outside_content(monkeypatch):

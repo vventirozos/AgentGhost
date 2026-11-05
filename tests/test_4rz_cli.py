@@ -1355,7 +1355,7 @@ class TestHoldWords:
         assert compiled(root / "tools" / "memory.py", "_DENY_RE") == \
             (cli._DENY_RE.pattern, cli._DENY_RE.flags & __import__("re").IGNORECASE)
         from ghost_agent.memory.profile import _fold
-        for t in ("Φωτεινή", "ΣΤΟΠ", "Straße", "café", "", None, 7, "STOP the Tools"):
+        for t in ("Έλενα", "ΣΤΟΠ", "Straße", "café", "", None, 7, "STOP the Tools"):
             assert cli._fold(t) == _fold(t), t
 
 

@@ -43,9 +43,9 @@ from ..memory.temporal import (_AGE_PATTERNS, _ANCHOR_RE, _ANCHOR_TEXT_RE,
 # Not the nearest one. Three review rounds of "nearest name within N
 # characters" each moved the defect instead of removing it (§4FN C1 →
 # C1-R2 → round 3 C2/M1): a nearby name captured any age at all
-# ("Thodoris's laptop is 3 years old", "Leonidas has a cot that is 20
+# ("Markos's laptop is 3 years old", "Kosmas has a cot that is 20
 # years old" — REFUTED), while one word between a name and its own age
-# ("Thodoris — now 9 years old") handed the age to the OTHER child. A
+# ("Markos — now 9 years old") handed the age to the OTHER child. A
 # distance is a proxy for the grammar; the grammar itself is short enough
 # to read.
 #
@@ -56,23 +56,23 @@ from ..memory.temporal import (_AGE_PATTERNS, _ANCHOR_RE, _ANCHOR_TEXT_RE,
 # and the name is not the subject, so the phrase is skipped: an unbound
 # phrase costs a label we never had, a mis-bound one writes a 0.0 on a
 # correct turn. A name is also never the subject when it closes a LIST
-# ("Thodoris and Leonidas: 9 years and 5 months old" is two ages). The
+# ("Markos and Kosmas: 9 years and 5 months old" is two ages). The
 # one backward form is the agent's own disambiguation, a bracketed name
-# right after the phrase: "9 years old (Thodoris) and 5 months old
-# (Leonidas)".
+# right after the phrase: "9 years old (Markos) and 5 months old
+# (Kosmas)".
 #
-# A DATE is a link too: the agent's usual arithmetic shape is "Leonidas:
-# born March 12, 2026 → today (Sep 4, 2026) is about 6 months old", and a
-# table row is "| Leonidas | 2026-03-12 | 5 months old |" — the birth date
+# A DATE is a link too: the agent's usual arithmetic shape is "Kosmas:
+# born March 9, 2026 → today (Sep 4, 2026) is about 6 months old", and a
+# table row is "| Kosmas | 2026-03-09 | 5 months old |" — the birth date
 # standing between the name and the age is the computation, not another
-# subject. A date SHAPE, not bare digits: "| Thodoris | 2 | 3 years old |"
+# subject. A date SHAPE, not bare digits: "| Markos | 2 | 3 years old |"
 # is a count of bikes (round 4 M4).
 #
 # What is deliberately NOT a link (round 4 C1–C4): tense and time words
 # ("was", "turned", "turns", "at", "in", "on" — a past or future age is
 # not today's, and `tense_marked` skips the whole line anyway), "of" (the
-# age belongs to the noun BEFORE "of Thodoris"), a bare possessive
-# ("Thodoris's 5 month old brother" — only "'s age" links), and nouns of
+# age belongs to the noun BEFORE "of Markos"), a bare possessive
+# ("Markos's 5 month old brother" — only "'s age" links), and nouns of
 # any kind. Every word on the list is pinned in both directions.
 _MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|"
           r"july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
@@ -87,18 +87,18 @@ _SUBJECT_LINK_RE = re.compile(
     r"(?:[\s:—–\-,=>→()*|.]|\b(?:" + _LINK_WORDS + r")\b|(?<!\w)" + _DATE + r"(?!\w))*\Z",
     re.IGNORECASE)
 _ANNOT_OPEN_RE = re.compile(r"\s*[(\[]\s*")
-#: …and "[Thodoris](https://…)" is a markdown link, not an annotation
+#: …and "[Markos](https://…)" is a markdown link, not an annotation
 _ANNOT_CLOSE_RE = re.compile(r"\s*[)\]](?!\()")
-#: "the father of Thodoris", "the brother of Leonidas": the name after "of"
+#: "the father of Markos", "the brother of Kosmas": the name after "of"
 #: is a modifier of the noun before it — never the subject of the age, in a
 #: reply or in a stored value (round 4 C2)
 _OF_RE = re.compile(r"\bof\s*\Z", re.IGNORECASE)
-#: a stored "Thodoris's born ~2026-03-20 brother" names the possessor, not
+#: a stored "Markos's born ~2026-03-20 brother" names the possessor, not
 #: the person the date belongs to (round 4 C3)
 _POSSESSIVE_RE = re.compile(r"['’]s?\Z", re.IGNORECASE)
 #: a bracketed name is an ANNOTATION of the phrase before it, never the
-#: subject of the phrase after it: "9 years old (Thodoris), 5 months old
-#: (Leonidas)" (round 4 C5)
+#: subject of the phrase after it: "9 years old (Markos), 5 months old
+#: (Kosmas)" (round 4 C5)
 _BRACKETED_BEFORE_RE = re.compile(r"[(\[]\s*\Z")
 _BRACKETED_AFTER_RE = re.compile(r"\s*[)\]]")
 
@@ -108,9 +108,9 @@ _BRACKETED_AFTER_RE = re.compile(r"\s*[)\]]")
 #: interleave and the nearest name by character count belongs to the previous
 #: row:
 #:
-#:   "- **Leonidas:** born March 12, 2026 → … about 6 months old
-#:    - **Thodoris:** …"        -> bound the infant's age to the 9-year-old
-#:   "| Vasilis | 1980-01-29 | 44 years |"  -> bound Vasilis's age to Thodoris
+#:   "- **Kosmas:** born March 9, 2026 → … about 6 months old
+#:    - **Markos:** …"        -> bound the infant's age to the 9-year-old
+#:   "| Vasilis | 1980-01-26 | 44 years |"  -> bound Vasilis's age to Markos
 #:
 #: A line is the unit these replies are actually organised in — one list item,
 #: one table row, one sentence. Binding across lines is what turned a correct
@@ -160,14 +160,14 @@ def anchored_subjects(profile: Any) -> List[Tuple[str, Any]]:
     first time a fact is stored somewhere new (the whole-reader-set rule).
 
     The NAME is the word immediately before the anchor, which is how these
-    read in the live store: ``"Thodoris (born 2016-11-25) and Leonidas (born
-    2026-03-12)"``. A value with no name in front of the anchor yields
+    read in the live store: ``"Markos (born 2016-11-22) and Kosmas (born
+    2026-03-09)"``. A value with no name in front of the anchor yields
     nothing — an unattributable birth date cannot refute a claim about anyone.
-    Nor does a name that closes a LIST: ``"Thodoris and Leonidas: born
+    Nor does a name that closes a LIST: ``"Markos and Kosmas: born
     ~2017-04-04"`` is one date glued onto two people (a writer defect this
     module must survive in data already stored — round 3 C1), and reading it
-    as Leonidas's would refute the correct answer about him forever. Names
-    are Unicode ("Θοδωρής (born 2016-11-25)" is a subject — round 3 m4).
+    as Kosmas's would refute the correct answer about him forever. Names
+    are Unicode ("Μάρκος (born 2016-11-22)" is a subject — round 3 m4).
     """
     out: List[Tuple[str, Any]] = []
 
@@ -193,7 +193,7 @@ def anchored_subjects(profile: Any) -> List[Tuple[str, Any]]:
                 if born is None:
                     continue
                 # The name sits before the anchor, possibly through an
-                # opening bracket: "Leonidas (born 2026-03-12".
+                # opening bracket: "Kosmas (born 2026-03-09".
                 head = text[:m.start()].rstrip(" ([-—,:")
                 nm = re.search(r"(?<![\w'’-])(" + _NAME_TOKEN + r")\s*$", head)
                 if not nm or not nm.group(1)[:1].isupper():
@@ -218,7 +218,7 @@ def _age_claims(reply: str) -> List[Tuple[float, str, int, int]]:
     same patterns that ANCHOR a stored age — so the writer and this checker
     cannot disagree about what an age phrase is. A bare "age 9" (no unit) is
     years, matching that module. Returns ``(count, unit, start, end)``: a
-    compound ("5 months and 23 days old") is ONE claim, in MONTHS (the
+    compound ("5 months and 26 days old") is ONE claim, in MONTHS (the
     unit whose tolerance is honest for it — one month below, two above —
     where its largest unit's would admit a 3-year band for "1 year and 2
     months", review §4FN M1); ``start``/``end`` are the phrase span the
@@ -230,11 +230,11 @@ def _age_claims(reply: str) -> List[Tuple[float, str, int, int]]:
     # issue is a duplicated accusation. Spans that overlap are one claim.
     spans: List[Tuple[int, int]] = []
     found: List[Tuple[float, str, int, int]] = []
-    # §4FN: a COMPOUND age ("5 months and 23 days old", "9 years, 9 months
-    # and 10 days old") is ONE claim whose value is the sum, not the last
-    # component. The single-unit patterns below match "23 days old" inside
-    # it and refuted three correct replies live (2026-09-04: "Leonidas is
-    # stated as 23 day(s) old, but the stored birth date … makes Leonidas
+    # §4FN: a COMPOUND age ("5 months and 26 days old", "9 years, 9 months
+    # and 13 days old") is ONE claim whose value is the sum, not the last
+    # component. The single-unit patterns below match "26 days old" inside
+    # it and refuted three correct replies live (2026-09-04: "Kosmas is
+    # stated as 23 day(s) old, but the stored birth date … makes Kosmas
     # 5.9 months old"). Compounds are taken first, as whole-day totals so
     # the generous window below still applies, and their spans shadow the
     # single-unit matches inside them.
@@ -242,7 +242,7 @@ def _age_claims(reply: str) -> List[Tuple[float, str, int, int]]:
         # the span shadows the single-unit patterns EVEN when the compound
         # yields no claim (implausible total, review §4FN M-A): reading its
         # tail component is the original defect. A plural compound
-        # ("Thodoris and Leonidas are 9 years and 5 months old") is not
+        # ("Markos and Kosmas are 9 years and 5 months old") is not
         # decided here: its subject is a list, and the binding below never
         # takes a list or a plural copula as a link (round 3 C1).
         spans.append((m.start(), m.end()))
@@ -300,9 +300,9 @@ def refute_age_claims(*, reply: str, profile: Any, now=None) -> List[str]:
             if unit not in _UNIT_MONTHS or count < 0:
                 continue
             line_lo, line_hi = _line_span(reply, start)
-            # a past or future age is not today's (round 4 C1): "Thodoris
-            # was 4 years old when you moved", "Leonidas turns 7 months old
-            # on October 12", "By March Leonidas is 12 months old"
+            # a past or future age is not today's (round 4 C1): "Markos
+            # was 4 years old when you moved", "Kosmas turns 7 months old
+            # on October 9", "By March Kosmas is 12 months old"
             if tense_marked(reply[line_lo:line_hi]):
                 continue
             if (line_lo, line_hi) not in occ_cache:

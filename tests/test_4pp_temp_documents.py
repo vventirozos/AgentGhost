@@ -233,12 +233,12 @@ def test_a_slack_key_never_reaches_the_session_store(tmp_path, caplog):
     app, _ = _make_app(tmp_path, handle_chat=capture)
     with caplog.at_level(logging.WARNING, logger="GhostAgent"), TestClient(app) as c:
         r = c.post("/api/chat", json={"model": "test-model", "stream": False,
-                                      "session_id": "slack:dm:U56CVBHHQ",
+                                      "session_id": "slack:dm:U0OWNER01",
                                       "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 200
         assert c.get("/api/sessions").json()["sessions"] == []
     assert "session NOT persisted" not in caplog.text
-    assert seen["session_id"] == "slack:dm:U56CVBHHQ"            # the state-of-work key still reaches the agent
+    assert seen["session_id"] == "slack:dm:U0OWNER01"            # the state-of-work key still reaches the agent
 
 
 def test_a_web_session_id_still_persists(tmp_path):

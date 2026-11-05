@@ -369,7 +369,7 @@ def test_word_caps(req, reply, expect):
 
 
 @pytest.mark.parametrize("reply", ["3.12.4", "Open-source.", "2026-09-08", "Twenty-one.", "turn_state_check.py",
-                                   "v.ventirozos@evolmonkey.com", "https://example.org/a/b?c=1", "O'Brien"])
+                                   "owner@orbitdata.com", "https://example.org/a/b?c=1", "O'Brien"])
 def test_one_token_answers_are_one_word(reply):
     """Review #4: `\\w+` split "3.12.4" into three words and refuted it. A
     word is a whitespace token carrying a letter or digit."""
@@ -857,9 +857,9 @@ def test_a_shape_refute_queues_no_retroactive_correction(member_turn, mock_conte
     agent._record_late_verdict(shape, "t-shape", conv_fp="c1", force_correction=True)
     assert agent._pending_corrections == []
     grounded = VerifyResult(verdict=VerifyVerdict.REFUTED, confidence=0.9, reasoning="r",
-                            issues=["Stiva's is not in the evidence"])
+                            issues=["Thalassa's is not in the evidence"])
     agent._record_late_verdict(grounded, "t-fact", conv_fp="c1", force_correction=True)
-    assert len(agent._pending_corrections) == 1 and "Stiva" in agent._pending_corrections[0]["note"]
+    assert len(agent._pending_corrections) == 1 and "Thalassa" in agent._pending_corrections[0]["note"]
 
 
 def test_the_repair_directive_for_a_shape_refute_asks_for_the_same_answer_reshaped():
@@ -871,7 +871,7 @@ def test_the_repair_directive_for_a_shape_refute_asks_for_the_same_answer_reshap
     d = _render_refute_directive(crit, "Reply with STRICT JSON", shape_only=True)
     assert "SHAPE" in d and "Re-send the SAME answer" in d and "NO tool calls" in d
     assert "Do NOT repeat the same claim" not in d
-    d0 = _render_refute_directive("Stiva's is not in the evidence", "find a burger")
+    d0 = _render_refute_directive("Thalassa's is not in the evidence", "find a burger")
     assert "Do NOT repeat the same claim" in d0 and "SHAPE" not in d0
 
 

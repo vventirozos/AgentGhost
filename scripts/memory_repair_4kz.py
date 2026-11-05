@@ -1,6 +1,6 @@
 """§4KZ one-off (2026-10-03): the owner-fact cleanup the operator confirmed —
 "delete 1 2 4 8, rebuild copies, rest later":
-  1 wrong values (a stale trip location/hotel, Thodoris "born ~2017-02", stored
+  1 wrong values (a stale trip location/hotel, Markos "born ~2017-02", stored
     ages), 2 duplicates of one fact under other predicates (the canonical edge
     is KEPT and verified live first), 4 one-off search topics stored as the
     owner's wants/interests, 8 noise (car-wash tasks, a deadline, a helmet only
@@ -21,19 +21,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 APPLY = "--apply" in sys.argv
 MEM = Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/")) / "system" / "memory"
 DELETE = {
-    "1-wrong": [["user", "LOCATED_AT", "kyllini"], ["user", "STAYS_AT", "grecotel kyllini"], ["thodoris", "BORN", "~2017-02"], ["leonidas", "AGE", "5"], ["leonidas", "HAS_AGE", "5"], ["thodoris", "AGE", "9"], ["thodoris", "HAS_AGE", "9"]],
-    "2-duplicate": [["user", "IS_NAMED", "vasilis"], ["user", "WAS_BORN_ON", "january 29, 1980"], ["vasilis", "HAS_BIRTHDATE", "january 29, 1980"], ["user", "RESIDES_IN", "thrakomakedones"], ["user", "HAS_HOME_IN", "thrakomakedones"], ["user", "RESIDES_IN", "athens"], ["user", "IS_LOCATED_IN", "athens"], ["user", "HAS_FAMILY_MEMBER", "fotini"], ["user", "HAS_FAMILY", "fotini"], ["user", "HAS_RELATIONSHIP", "fotini"], ["user", "HAS_CHILD", "thodoris"], ["user", "HAS_CHILD", "leonidas"], ["user", "HAS_FAMILY_MEMBER", "thodoris"], ["user", "HAS_FAMILY_MEMBER", "leonidas"], ["user", "HAS_RELATIONSHIP", "thodoris"], ["user", "HAS_RELATIONSHIP", "leonidas"], ["user", "HAS_FAMILY", "boys"], ["user", "HAS_RELATIONSHIP", "boys"], ["leonidas", "IS_SON_OF", "vasilis"], ["user", "HAS_SON_LLEONIDAS_BIRTHDATE", "leonidas born march 12, 2026 (vasilis and fotini's younger son)"], ["user", "HAS_SON_THODORIS_BIRTHDATE", "thodoris born november 25, 2016 (vasilis and fotini's older son)"], ["thodoris", "HAS_BIRTH_DATE", "nov 25, 2016"], ["thodoris", "BORN_ON", "november 25, 2016"], ["leonidas", "HAS_BIRTH_DATE", "march 12, 2026"], ["leonidas", "BORN_ON", "march 12, 2026"], ["user", "USES", "bmw"], ["user", "HAS_ASSET", "motorcycle"], ["user", "HAS_ASSET", "car"], ["user", "HAS_PROPERTY", "motorcycle"], ["user", "HAS_ITEM", "car"], ["user", "TAKES_MEDICATION", "entresto"], ["user", "HAS_INTEREST_IN", "bjj"], ["user", "HAS_ACTIVITY", "bjj training"], ["user", "HAS_ACTIVITY", "jiu-jitsu class"], ["user", "REQUIRES", "concise output"], ["user", "REQUIRES", "one-sentence answer"], ["user", "PREFER", "download"]],
-    "4-search-topic": [["user", "INTERESTED_IN", "interracial sexuality"], ["user", "INTERESTED_IN", "sexual capital"], ["user", "INTERESTED_IN", "stealthing"], ["user", "INTERESTED_IN", "classical roman masturbatorium"], ["user", "WANTS", "coca plant cultivation plan"], ["user", "WANTS", "cocaine production plan"], ["user", "WANTS", "cocaine"], ["user", "WANTS", "hiring a hitman"], ["user", "SEEKING", "ecstasy pills"], ["user", "SEARCHES", "dark web"], ["user", "REQUESTED", "diagram with four men penetrating a woman"]],
+    "1-wrong": [["user", "LOCATED_AT", "seaside town"], ["user", "STAYS_AT", "seaside hotel"], ["markos", "BORN", "~2017-02"], ["kosmas", "AGE", "5"], ["kosmas", "HAS_AGE", "5"], ["markos", "AGE", "9"], ["markos", "HAS_AGE", "9"]],
+    "2-duplicate": [["user", "IS_NAMED", "vasilis"], ["user", "WAS_BORN_ON", "january 26, 1980"], ["vasilis", "HAS_BIRTHDATE", "january 26, 1980"], ["user", "RESIDES_IN", "kalopetres"], ["user", "HAS_HOME_IN", "kalopetres"], ["user", "RESIDES_IN", "athens"], ["user", "IS_LOCATED_IN", "athens"], ["user", "HAS_FAMILY_MEMBER", "elena"], ["user", "HAS_FAMILY", "elena"], ["user", "HAS_RELATIONSHIP", "elena"], ["user", "HAS_CHILD", "markos"], ["user", "HAS_CHILD", "kosmas"], ["user", "HAS_FAMILY_MEMBER", "markos"], ["user", "HAS_FAMILY_MEMBER", "kosmas"], ["user", "HAS_RELATIONSHIP", "markos"], ["user", "HAS_RELATIONSHIP", "kosmas"], ["user", "HAS_FAMILY", "boys"], ["user", "HAS_RELATIONSHIP", "boys"], ["kosmas", "IS_SON_OF", "vasilis"], ["user", "HAS_SON_LKOSMAS_BIRTHDATE", "kosmas born march 9, 2026 (vasilis and elena's younger son)"], ["user", "HAS_SON_MARKOS_BIRTHDATE", "markos born november 22, 2016 (vasilis and elena's older son)"], ["markos", "HAS_BIRTH_DATE", "nov 22, 2016"], ["markos", "BORN_ON", "november 22, 2016"], ["kosmas", "HAS_BIRTH_DATE", "march 9, 2026"], ["kosmas", "BORN_ON", "march 9, 2026"], ["user", "USES", "bmw"], ["user", "HAS_ASSET", "motorcycle"], ["user", "HAS_ASSET", "car"], ["user", "HAS_PROPERTY", "motorcycle"], ["user", "HAS_ITEM", "car"], ["user", "TAKES_MEDICATION", "ventolin"], ["user", "HAS_INTEREST_IN", "bjj"], ["user", "HAS_ACTIVITY", "bjj training"], ["user", "HAS_ACTIVITY", "jiu-jitsu class"], ["user", "REQUIRES", "concise output"], ["user", "REQUIRES", "one-sentence answer"], ["user", "PREFER", "download"]],
+    "4-search-topic": [["user", "INTERESTED_IN", "search topic a"], ["user", "INTERESTED_IN", "search topic b"], ["user", "INTERESTED_IN", "search topic c"], ["user", "WANTS", "search topic d"], ["user", "SEARCHES", "dark web"]],  # leak audit 11-05: member search topics, never the owner's; values redacted
     "8-noise": [["user", "HAS_TASK", "wash car"], ["user", "NEEDS", "car wash"], ["user", "NEEDS_TO_PERFORM", "car wash"], ["user", "WANTS_TO_PERFORM", "wash car"], ["user", "HAS_CLIENT_DEADLINE", "imminent"], ["user", "CONSIDERS", "shoei x-spr pro"], ["ai", "IDENTIFIED", "vasilis"], ["ai", "MENTIONED", "vasilis"], ["assistant", "GREETED", "vasilis"], ["assistant", "MENTION", "vasilis"], ["assistant", "PROVIDED_BRIEFING_TO", "vasilis"], ["assistant", "GAVE_BRIEFING_TO", "vasilis"]],
 }
 #: kept (one per fact) — each must be live, or nothing is applied
-CANONICAL = [["user", "MARRIED_TO", "fotini"], ["user", "HAS_SON", "thodoris"], ["user", "HAS_SON", "leonidas"],
-             ["thodoris", "HAS_BIRTHDATE", "november 25, 2016"], ["leonidas", "HAS_BIRTHDATE", "march 12, 2026"],
-             ["user", "HAS_BIRTHDATE", "january 29, 1980"], ["user", "HAS_NAME", "vasilis"],
-             ["user", "LIVES_IN", "thrakomakedones near athens"], ["user", "HAS_MEDICATION", "entresto"],
+CANONICAL = [["user", "MARRIED_TO", "elena"], ["user", "HAS_SON", "markos"], ["user", "HAS_SON", "kosmas"],
+             ["markos", "HAS_BIRTHDATE", "november 22, 2016"], ["kosmas", "HAS_BIRTHDATE", "march 9, 2026"],
+             ["user", "HAS_BIRTHDATE", "january 26, 1980"], ["user", "HAS_NAME", "vasilis"],
+             ["user", "LIVES_IN", "kalopetres near athens"], ["user", "HAS_MEDICATION", "ventolin"],
              ["user", "PREFERS", "concise answers"], ["user", "HAS_HOBBY", "brazilian jiu jitsu"]]
 ADD = [["user", "PREFERS", "download"]]
-PROFILE_FIELDS = [["relationships", "son_thodoris_birthdate"], ["relationships", "son_lleonidas_birthdate"],
+PROFILE_FIELDS = [["relationships", "son_markos_birthdate"], ["relationships", "son_lkosmas_birthdate"],
                   ["cli_tools", "info"]]
 LESSON_TRIGGERS = ["how much time is from here to home ?"]
 

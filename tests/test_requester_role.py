@@ -168,7 +168,7 @@ def _agent(monkeypatch, tmp_path):
     ctx.args.smart_memory = 0.9
     ctx.journal = MagicMock()
     pm = MagicMock()
-    pm.get_context_string = lambda: "## Root:\n- name: Vasilis\n- address: Makedonias 83, Athens"
+    pm.get_context_string = lambda: "## Root:\n- name: Vasilis\n- address: Kaledonias 83, Athens"
     pm.load = lambda: {"root": {"name": "Vasilis"}}
     ctx.profile_memory = pm
     from ghost_agent.selfhood import SelfModel
@@ -200,7 +200,7 @@ async def test_a_member_turn_carries_no_profile_no_handle_no_smart_memory(monkey
     await agent.handle_chat({"messages": [{"role": "user", "content": ask}]},
                             FakeBgTasks(), request_id="slack-11112222", requester_role="member")
     sys_prompt = await _system_prompt(ctx)
-    assert "Makedonias" not in sys_prompt and "Vasilis" not in sys_prompt
+    assert "Kaledonias" not in sys_prompt and "Vasilis" not in sys_prompt
     assert [k for k, _ in appended if k == "smart_memory"] == []
     assert _MEMBER_PROFILE_PLACEHOLDER in sys_prompt          # both paths carry the BOUNDARY, not silence
     assert "channel MEMBER" in sys_prompt and "must never be presented as this user's" in sys_prompt
@@ -214,7 +214,7 @@ async def test_the_owner_keeps_the_profile_on_both_paths(monkeypatch, tmp_path, 
     agent, ctx, appended = _agent(monkeypatch, tmp_path)
     await agent.handle_chat({"messages": [{"role": "user", "content": ask}]},
                             FakeBgTasks(), request_id="web-1", requester_role="owner")
-    assert "Makedonias" in await _system_prompt(ctx)
+    assert "Kaledonias" in await _system_prompt(ctx)
 
 
 async def _drive_streamed_final(role, req_id):
@@ -268,7 +268,7 @@ async def test_the_owner_turn_keeps_all_three(monkeypatch, tmp_path):
     await agent.handle_chat({"messages": [{"role": "user", "content": "hello, who are you"}]},
                             FakeBgTasks(), request_id="slack-33334444", requester_role="owner")
     sys_prompt = await _system_prompt(ctx)
-    assert "Makedonias" in sys_prompt and _MEMBER_PROFILE_PLACEHOLDER not in sys_prompt
+    assert "Kaledonias" in sys_prompt and _MEMBER_PROFILE_PLACEHOLDER not in sys_prompt
     assert [k for k, _ in appended if k == "smart_memory"] == ["smart_memory"]
     assert ctx.self_model.capture_turn.call_args_list, "the fixture must reach the autobiography capture"
     assert any(c.kwargs.get("user_handle") == "Vasilis" for c in ctx.self_model.capture_turn.call_args_list)
@@ -280,7 +280,7 @@ async def test_a_turn_with_no_role_is_the_owners_whatever_its_id(monkeypatch, tm
     agent, ctx, appended = _agent(monkeypatch, tmp_path)
     await agent.handle_chat({"messages": [{"role": "user", "content": "hello, who are you"}]},
                             FakeBgTasks(), request_id="slack-55556666")
-    assert "Makedonias" in await _system_prompt(ctx)
+    assert "Kaledonias" in await _system_prompt(ctx)
     assert [k for k, _ in appended if k == "smart_memory"] == ["smart_memory"]
 
 
@@ -288,7 +288,7 @@ async def test_a_web_turn_with_no_role_is_the_owners(monkeypatch, tmp_path):
     agent, ctx, appended = _agent(monkeypatch, tmp_path)
     await agent.handle_chat({"messages": [{"role": "user", "content": "hello, who are you"}]},
                             FakeBgTasks(), request_id="web-77778888")
-    assert "Makedonias" in await _system_prompt(ctx)
+    assert "Kaledonias" in await _system_prompt(ctx)
     assert [k for k, _ in appended if k == "smart_memory"] == ["smart_memory"]
 
 

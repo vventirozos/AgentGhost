@@ -49,5 +49,5 @@ def test_apply_restores_the_profile_keeping_every_other_key(monkeypatch, tmp_pat
         pass   # the fixture has no chroma store: the episode/lesson halves stop there
     prof = json.loads((mem / "user_profile.json").read_text())
     assert prof["root"]["name"]["v"] == "Vasilis" and prof["root"]["location"]["v"] == "Athens"
-    assert prof["relationships"]["wife_name"]["v"] == "Fotini" and prof["interests"] == {"a": "b"}
+    assert prof["relationships"]["wife_name"]["v"] == "Elena" and prof["interests"] == {"a": "b"}
     assert list(mem.glob("user_profile.json.pre-4kw-repair-*.bak"))

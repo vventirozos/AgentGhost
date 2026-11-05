@@ -16,12 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 APPLY = "--apply" in sys.argv
 MEM = Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/")) / "system" / "memory"
 SPLIT = {
-    ("relationships", "sons"): ("Thodoris (born 2016-11-25) and Leonidas (born 2026-03-12)",
-                                ["Thodoris (born 2016-11-25)", "Leonidas (born 2026-03-12)"]),
+    ("relationships", "sons"): ("Markos (born 2016-11-22) and Kosmas (born 2026-03-09)",
+                                ["Markos (born 2016-11-22)", "Kosmas (born 2026-03-09)"]),
     ("interests", "hobbies"): ("Brazilian jiu jitsu, cars, motorcycles, Technology (special interest in AI)",
                                ["Brazilian jiu jitsu", "cars", "motorcycles", "Technology (special interest in AI)"]),
-    ("assets", "vehicles"): ("BMW 118i, Ducati Streetfighter V4s, Sym scooter",
-                             ["BMW 118i", "Ducati Streetfighter V4s", "Sym scooter"]),
+    ("assets", "vehicles"): ("BMW 320d, Triumph Trident 660, Kymco scooter",
+                             ["BMW 320d", "Triumph Trident 660", "Kymco scooter"]),
 }
 
 

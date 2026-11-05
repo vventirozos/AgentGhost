@@ -87,8 +87,8 @@
 
   <p>Each flag takes a comma-separated list of <code>url|model</code> pairs:</p>
 
-  <pre class="shell">--worker-nodes "http://192.168.1.20:8088|gemma-4-e4b"
---critic-nodes "http://192.168.1.20:8088|gemma-4-e4b"</pre>
+  <pre class="shell">--worker-nodes "http://192.168.1.102:8088|gemma-4-e4b"
+--critic-nodes "http://192.168.1.102:8088|gemma-4-e4b"</pre>
 
   <p>Production points both at the same single server on the helper box Nova (Gemma 4 E4B, four slots). The separate critic server it used to run beside it was removed on 2026-10-25. The verifier's LLM judge is off (§4OW, 2026-10-14), so today the critic pool only runs the pixel check after an image reply (<code>GHOST_VISUAL_CHECK_POOL=critic</code>) and nothing that needs a judge-trained model. If you turn the judge back on (<code>GHOST_VERIFIER_JUDGE=1</code>), the old advice applies again: the critic must return verdicts inside <code>GHOST_VERIFY_WORKER_TIMEOUT</code> (45&nbsp;s) under real load, or its verdicts fall back onto your main model — see the verifier reference's <a href="core/verifier.html">judge-model selection</a> section.</p>
 

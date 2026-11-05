@@ -1,6 +1,6 @@
 """§4KX r8 one-off (2026-10-03): restore the owner's health, profession and
 companion facts the graph decay pruned before those predicates were durable
-(heart failure, blood clot, Entresto twice, companion; the profession edge was wrong), from
+(asthma, hay fever, Ventolin twice, companion; the profession edge was wrong), from
 graph_pruned_archive.jsonl. Only these five; each must be in the archive as a
 `prune_stale_edges` row, be an owner fact under the CURRENT rule, and not be
 live already — else nothing is applied.
@@ -14,9 +14,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 APPLY = "--apply" in sys.argv
 MEM = Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/")) / "system" / "memory"
-RESTORE_EDGES = [["user", "HAS_CONDITION", "heart failure"], ["user", "HAS_CONDITION", "blood clot"],
-                 ["user", "HAS_MEDICATION", "entresto"], ["user", "TAKES_MEDICATION", "entresto"],
-                 ["user", "HAS_COMPANION", "fotini"]]
+RESTORE_EDGES = [["user", "HAS_CONDITION", "asthma"], ["user", "HAS_CONDITION", "hay fever"],
+                 ["user", "HAS_MEDICATION", "ventolin"], ["user", "TAKES_MEDICATION", "ventolin"],
+                 ["user", "HAS_COMPANION", "elena"]]
 #: (2026-10-03, operator: "im not a doctor") `user HAS_PROFESSION doctor` was restored by the first run and then
 #: removed at the operator's word — never restore it again
 

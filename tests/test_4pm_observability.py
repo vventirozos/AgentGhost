@@ -44,7 +44,7 @@ NOT_ANSWERED = "[FAILURE BANNER] NOT deleted: the user has not answered yet — 
     ({"name": "file_system", "result": "REJECTED: ask [designed stop: clarify_first]", "error": ""}, "asked_user"),
     ({"name": "execute", "result": "EXIT CODE: 1\nTraceback: boom", "error": "exit 1"}, "failed"),
     ({"name": "web_search", "result": "ERROR: web search returned ZERO results", "error": "x"}, "failed"),
-    ({"name": "recall", "result": "Hanzo is 7", "error": ""}, "ok"),
+    ({"name": "recall", "result": "Bruno is 7", "error": ""}, "ok"),
 ])
 def test_a_stored_row_is_classed_by_its_text(row, want):
     """Fails where a guard refusal is booked as a failure (39 of 53

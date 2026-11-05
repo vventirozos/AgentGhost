@@ -24,11 +24,11 @@ def test_no_writer_stores_a_moving_target_world_fact(tmp_path):
                         # an OWNER fact is not a world fact — kept whatever its predicate
                         {"subject": "user", "predicate": "HAS_CURRENT_EMPLOYER", "object": "acme"},
                         # a DURABLE relation of someone else (family, work) — kept too
-                        {"subject": "fotini", "predicate": "CURRENT_EMPLOYER", "object": "athens uni"}])
+                        {"subject": "elena", "predicate": "CURRENT_EMPLOYER", "object": "athens uni"}])
     import sqlite3
     with sqlite3.connect(g.db_path) as c:
         rows = c.execute("SELECT subject, predicate, object FROM triplets").fetchall()
-    assert sorted(rows) == [("fotini", "CURRENT_EMPLOYER", "athens uni"), ("postgresql", "RELEASED_IN", "1996"),
+    assert sorted(rows) == [("elena", "CURRENT_EMPLOYER", "athens uni"), ("postgresql", "RELEASED_IN", "1996"),
                             ("user", "HAS_CURRENT_EMPLOYER", "acme")], rows
     assert n == 3
 
@@ -62,7 +62,7 @@ def test_the_stale_fact_repair_takes_only_live_non_owner_moving_targets(tmp_path
                           ("postgresql", "HAS_VERSION", "17.0", 5.0),          # already expired
                           ("postgresql", "RELEASED_IN", "1996", None),
                           ("user", "HAS_CURRENT_EMPLOYER", "acme", None),          # the owner's: kept
-                          ("fotini", "CURRENT_EMPLOYER", "athens uni", None)])     # durable: kept
+                          ("elena", "CURRENT_EMPLOYER", "athens uni", None)])     # durable: kept
     monkeypatch.setenv("GHOST_HOME", str(tmp_path))
     spec = importlib.util.spec_from_file_location("rep4mm", ROOT / "scripts" / "memory_repair_4mm.py")
     r = importlib.util.module_from_spec(spec)

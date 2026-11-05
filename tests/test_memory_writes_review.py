@@ -40,16 +40,16 @@ class _Vec:
 def _stores(tmp_path):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "name", "Vasilis")
-    pm.update("relationships", "wife_name", "Fotini")
-    pm.update("assets", "vehicles", "BMW 118i, Ducati Streetfighter V4S, Sym scooter")
+    pm.update("relationships", "wife_name", "Elena")
+    pm.update("assets", "vehicles", "BMW 320d, Triumph Trident 660S, Kymco scooter")
     pm.update("interests", "hobbies", "cars, jiu jitsu")
     pm.update("root", "address", "12 Oak Street, Athens")
     gm = GraphMemory(tmp_path)
-    gm.add_triplets([{"subject": "leonidas", "predicate": "IS_SON_OF", "object": "fotini"},
-                     {"subject": "user", "predicate": "MARRIED_TO", "object": "fotini"},
-                     {"subject": "user", "predicate": "HAS_CHILD", "object": "leonidas"},
+    gm.add_triplets([{"subject": "kosmas", "predicate": "IS_SON_OF", "object": "elena"},
+                     {"subject": "user", "predicate": "MARRIED_TO", "object": "elena"},
+                     {"subject": "user", "predicate": "HAS_CHILD", "object": "kosmas"},
                      {"subject": "mortimer", "predicate": "IS_A", "object": "iguana"},
-                     {"subject": "evolmonkey", "predicate": "IS_A", "object": "postgresql services company"}])
+                     {"subject": "orbitdata", "predicate": "IS_A", "object": "postgresql services company"}])
     return pm, gm
 
 
@@ -64,12 +64,12 @@ def _edges(gm):
 
 # ── forget: expansion, profile, graph ────────────────────────────────────────
 def test_forgetting_a_child_never_reaches_his_mother(tmp_path):
-    """Fails in the world where the expansion followed IS_SON_OF to fotini and
-    deleted the owner's wife's facts and `user MARRIED_TO fotini`."""
+    """Fails in the world where the expansion followed IS_SON_OF to elena and
+    deleted the owner's wife's facts and `user MARRIED_TO elena`."""
     pm, gm = _stores(tmp_path)
-    _forget(tmp_path, "Leonidas", pm, gm)
-    assert ("user", "MARRIED_TO", "fotini") in _edges(gm)
-    assert pm.load()["relationships"]["wife_name"] == "Fotini"
+    _forget(tmp_path, "Kosmas", pm, gm)
+    assert ("user", "MARRIED_TO", "elena") in _edges(gm)
+    assert pm.load()["relationships"]["wife_name"] == "Elena"
 
 
 def test_an_alias_is_still_followed_and_a_class_never_reaches_its_instances(tmp_path):
@@ -96,7 +96,7 @@ def test_the_owners_identity_is_never_forgotten_by_a_loose_word(tmp_path, target
     pm, gm = _stores(tmp_path)
     _forget(tmp_path, target, pm, gm)
     assert pm.load()["root"]["name"] == "Vasilis"
-    assert ("user", "MARRIED_TO", "fotini") in _edges(gm)
+    assert ("user", "MARRIED_TO", "elena") in _edges(gm)
 
 
 def test_an_explicit_field_is_forgotten(tmp_path):
@@ -107,10 +107,10 @@ def test_an_explicit_field_is_forgotten(tmp_path):
 
 def test_a_list_item_is_pruned_alone(tmp_path):
     pm, gm = _stores(tmp_path)
-    pm.update("assets", "pets", "Hanzo the dog")
+    pm.update("assets", "pets", "Bruno the dog")
     pm.update("assets", "pets", "Mortimer the iguana")
     _forget(tmp_path, "Mortimer", pm, gm)
-    assert pm.load()["assets"]["pets"] in ("Hanzo the dog", ["Hanzo the dog"])
+    assert pm.load()["assets"]["pets"] in ("Bruno the dog", ["Bruno the dog"])
 
 
 # ── graph decay ──────────────────────────────────────────────────────────────
@@ -118,13 +118,13 @@ def test_decay_keeps_owner_facts_and_prunes_noise(tmp_path):
     """Fails in the world where every weight-1 edge older than 45 days went —
     the owner's marriage, children and vehicles among them."""
     gm = GraphMemory(tmp_path)
-    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "bmw 118i"},
-                     {"subject": "leonidas", "predicate": "IS_SON_OF", "object": "fotini"},
+    gm.add_triplets([{"subject": "user", "predicate": "OWNS", "object": "bmw 320d"},
+                     {"subject": "kosmas", "predicate": "IS_SON_OF", "object": "elena"},
                      {"subject": "weather", "predicate": "MENTIONS", "object": "rain"}])
     with sqlite3.connect(gm.db_path) as c:
         c.execute("UPDATE triplets SET timestamp = datetime('now', '-90 days')")
     gm.prune_stale_edges(max_age_days=45)
-    assert _edges(gm) == {("user", "OWNS", "bmw 118i"), ("leonidas", "IS_SON_OF", "fotini")}
+    assert _edges(gm) == {("user", "OWNS", "bmw 320d"), ("kosmas", "IS_SON_OF", "elena")}
 
 
 # ── update_profile and the store ─────────────────────────────────────────────
@@ -148,19 +148,19 @@ def test_the_store_refuses_an_empty_value(tmp_path, value):
 def test_a_replaced_singleton_keeps_one_previous_value(tmp_path):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "name", "Vasilis")
-    out = pm.update("root", "name", "Leonidas")
+    out = pm.update("root", "name", "Kosmas")
     assert "(was: 'Vasilis')" in out
-    pm.update("root", "name", "Thodoris")
+    pm.update("root", "name", "Markos")
     raw = pm.load_raw()["root"]["name"]
-    assert raw["previous"]["v"] == "Leonidas" and "previous" not in raw["previous"]
+    assert raw["previous"]["v"] == "Kosmas" and "previous" not in raw["previous"]
 
 
 def test_deleting_a_field_removes_its_graph_edge_and_every_fragment(tmp_path):
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "pets", "Hanzo")
+    pm.update("assets", "pets", "Bruno")
     pm.update("assets", "pets", "Mortimer")
     gm = GraphMemory(tmp_path)
-    gm.add_triplets([{"subject": "user", "predicate": "HAS_PETS", "object": "hanzo"},
+    gm.add_triplets([{"subject": "user", "predicate": "HAS_PETS", "object": "bruno"},
                      {"subject": "user", "predicate": "HAS_PETS", "object": "mortimer"}])
     vec = MagicMock()
     asyncio.run(M.tool_update_profile(category="assets", key="pets", value="", profile_memory=pm,
@@ -168,7 +168,7 @@ def test_deleting_a_field_removes_its_graph_edge_and_every_fragment(tmp_path):
     assert not _edges(gm)
     # §4KZ: the vector mirror is SYNCED to the (now empty) field
     vec.sync_owner_field.assert_called_once_with("pets", [], category="assets", retire_legacy=True,
-                                                  legacy_values=["Hanzo", "Mortimer"])
+                                                  legacy_values=["Bruno", "Mortimer"])
 
 
 def test_the_dedup_check_reads_the_canonical_field(tmp_path):
@@ -199,13 +199,13 @@ def test_reset_all_never_wipes_in_the_call_that_asks(request_text):
 def test_forget_removes_the_episodes_that_name_the_entity(tmp_path):
     from ghost_agent.memory.episodes import EpisodicMemory
     ep = EpisodicMemory(tmp_path)
-    ep.record_episode("what did Fotini say about the trip", context="", outcome="ok", lesson="")
+    ep.record_episode("what did Elena say about the trip", context="", outcome="ok", lesson="")
     ep.record_episode("weather in Athens", context="", outcome="ok", lesson="")
     pm, gm = _stores(tmp_path)
-    out = _forget(tmp_path, "Fotini", pm, gm, ep)
+    out = _forget(tmp_path, "Elena", pm, gm, ep)
     assert ep.count() == 1 and "Episodes: Forgot 1" in out
     rows = [json.loads(l) for l in (tmp_path / "episodes_forgotten.jsonl").read_text().splitlines()]
-    assert rows[0]["trigger"].startswith("what did Fotini")
+    assert rows[0]["trigger"].startswith("what did Elena")
 
 
 def test_the_expansion_anchors_on_the_exact_node_and_never_reaches_instances(tmp_path):
@@ -219,13 +219,13 @@ def test_the_expansion_anchors_on_the_exact_node_and_never_reaches_instances(tmp
 def test_episodes_are_kept_when_their_archive_cannot_be_written(tmp_path):
     from ghost_agent.memory.episodes import EpisodicMemory
     ep = EpisodicMemory(tmp_path)
-    ep.record_episode("what did Fotini say", context="", outcome="ok", lesson="")
+    ep.record_episode("what did Elena say", context="", outcome="ok", lesson="")
     (tmp_path / "episodes_forgotten.jsonl").mkdir()              # unwritable as a file
-    assert ep.forget_mentions("fotini") == 0 and ep.count() == 1
+    assert ep.forget_mentions("elena") == 0 and ep.count() == 1
 
 
 def test_episodes_match_the_whole_word_only(tmp_path):
     from ghost_agent.memory.episodes import EpisodicMemory
     ep = EpisodicMemory(tmp_path)
-    ep.record_episode("join the fotinista club", context="", outcome="ok", lesson="")
-    assert ep.forget_mentions("fotini") == 0 and ep.count() == 1
+    ep.record_episode("join the elenasta club", context="", outcome="ok", lesson="")
+    assert ep.forget_mentions("elena") == 0 and ep.count() == 1

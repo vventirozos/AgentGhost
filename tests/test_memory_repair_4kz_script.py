@@ -15,18 +15,18 @@ def _live():
 def test_every_listed_row_is_removed_and_no_kept_fact_is():
     todo = {tuple(r) for r in M["check"](_live())}
     assert todo.isdisjoint({tuple(c) for c in M["CANONICAL"]})
-    assert ("user", "MARRIED_TO", "fotini") not in todo and ("thodoris", "BORN", "~2017-02") in todo
+    assert ("user", "MARRIED_TO", "elena") not in todo and ("markos", "BORN", "~2017-02") in todo
 
 
 def test_a_missing_kept_fact_applies_nothing():
-    live = _live() - {("user", "MARRIED_TO", "fotini")}
+    live = _live() - {("user", "MARRIED_TO", "elena")}
     with pytest.raises(SystemExit, match="nothing applied"):
         M["check"](live)
 
 
 def test_the_later_items_are_not_touched():
     rows = {tuple(r) for rows in M["DELETE"].values() for r in rows}
-    for kept in [("user", "RUNS", "evolmonkey"), ("user", "HAS_ACCOUNT_WITH", "interactive brokers"),
-                 ("user", "OWNS", "pista gp rr"), ("fotini", "HAS_BIRTHDATE", "january 10, 1982"),
-                 ("user", "HAS_COMPANION", "fotini"), ("user", "HAS_CONDITION", "heart failure")]:
+    for kept in [("user", "RUNS", "orbitdata"), ("user", "HAS_ACCOUNT_WITH", "interactive brokers"),
+                 ("user", "OWNS", "pista gp rr"), ("elena", "HAS_BIRTHDATE", "january 7, 1982"),
+                 ("user", "HAS_COMPANION", "elena"), ("user", "HAS_CONDITION", "asthma")]:
         assert kept not in rows

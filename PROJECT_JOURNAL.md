@@ -4607,7 +4607,7 @@ cut of the new predicate. Arming: **59 → 1 turn (4.0% → 0.07%)** — "Rememb
 dtrace…". ⚠ The final round inverted the subject test to an ALLOWLIST (the "remember that X" form
 needs a FIRST-PERSON subject), which costs one genuine directive: "remember that ram utilization is
 always high because of your LLM" no longer arms — and it is a CLASS, not one instance: English
-routinely puts the fact's topic in subject position, so "remember that Fotini is my wife" and
+routinely puts the fact's topic in subject position, so "remember that Elena is my wife" and
 "remember that dtrace is my debugging tool" are dropped too. Corpus recall is 1 of the 3 genuine
 record-directives in 1464 turns. That is the deliberate direction — a miss costs one
 un-nudged turn and the model can still record on its own, while a false arm corrupts the corpus —
@@ -8012,7 +8012,7 @@ by the nature of organic traffic, not broken.
   tolerance (`code`↔`codename`, `dark`↔`darkweb`); stopwords screened on the query side only, so
   `user` (50/50 entries) and `project` (48/50) matched anything; `matches[:5]` truncated by RECENCY
   not relevance; and a `[:50]` window in which 46/50 were the zephyrine churn — leaving **every real
-  revision (BMW/Ducati, Jiu Jitsu Journal, dark theme, architecture) structurally unreachable**.
+  revision (BMW/Triumph, Jiu Jitsu Journal, dark theme, architecture) structurally unreachable**.
   FIX: two-sided stopwords, bounded prefix, proportional evidence rule, relevance ranking, full
   window, and `reason` rendered (present on 96/96 entries, promised by the docstring, never shown).
   **Measured on the live ledger: noise 100% → 2/10, signal preserved.**
@@ -12391,7 +12391,7 @@ error directions conflict, the leak is the one that matters.** 24-case probe, 0 
 
 **Self-play was one pick away from `DROP TABLE` on the live database.** The journal stash held 20
 un-replayed records; one was a real past user turn reading *"Run this EXACT SQL via postgres_admin
-… SELECT 1; DROP TABLE web_order_line_options_old;"*. Self-play replays mined user messages
+… SELECT 1; DROP TABLE orders_line_items_old;"*. Self-play replays mined user messages
 VERBATIM to a solver holding the real toolset, at `journal_prob=0.75` once the frontier saturates
 (6 of 8 clusters currently are). Only the generic multi-statement validator stood in front of it.
 `_is_unsafe_challenge` now refuses destructive DDL/DML/shell shapes and the "run this exactly, do
@@ -17010,8 +17010,8 @@ container (self-heals); the full infra exit-code sentinel (light `[SANDBOX INFRA
 with it cleared; logging.py untouched). Operator restarted; 20 wrongly-expired graph OWNS/IS rows
 restored via `repair_owns.py --apply` (backup `knowledge_graph.db.pre_owns_repair_1784724404.bak`);
 collapsed `weights.json` removed (bus → healthy priors, dream refit regenerates). LIVE VERIFICATION:
-asked the running agent "what vehicles do I own?" (no tools) → answered "BMW 118i, Ducati Streetfighter
-V4s, Sym scooter" — all three were expired by the bug and now surface correctly. **DOCS DONE** (4
+asked the running agent "what vehicles do I own?" (no tools) → answered "BMW 320d, Triumph Trident
+660, Kymco scooter" — all three were expired by the bug and now surface correctly. **DOCS DONE** (4
 parallel agents; all 11 memory HTML docs — vector/readonly/graph/episodes/scratchpad/bus/journal/
 profile/competence/contradiction_log/adaptive_threshold — updated + verified vs source + tag-balanced;
 graph.html's flagged-stale functional-predicate section corrected). Backups retained: graph pre-repair
@@ -17029,8 +17029,8 @@ far, several with damage that had ALREADY happened on live data.
 **Data loss confirmed on the live stores (verified by the coordinator):**
 - **CRIT — graph `OWNS`/`IS` wrongly in `_FUNCTIONAL_PREDICATES`** (both multi-valued): every new
   `user OWNS X` extraction expired ALL previous ones. 19 of the 21 expired rows in the whole graph
-  were this bug — the agent had "forgotten" the operator owns a BMW 118i, a Ducati Streetfighter V4S,
-  **evolmonkey (his own company)**, webos, piggybag, nova, chess coach. Fix (graph agent): removed
+  were this bug — the agent had "forgotten" the operator owns a BMW 320d, a Triumph Trident 660S,
+  **orbitdata (his own company)**, webos, piggybag, nova, chess coach. Fix (graph agent): removed
   OWNS/IS; added the genuinely-functional operational predicates (HAS_STATUS/STATUS/HAS_PID) that were
   MISSING and accumulating contradictions (`chess-v4 HAS_STATUS dead` AND `running` both current);
   instrumented every expiry with a WARNING. **DATA REPAIR: 20 wrongly-expired rows restored via
@@ -18810,7 +18810,7 @@ ablation side, and three built subsystems had no caller. Eight items shipped, or
   fixed: the honest limitation is documented; with (1)+(2) fixed the situation shouldn't recur.
   Classic [[sandbox-loopback-blind-spot]] shape, worth remembering.
 - **Live proof after deploy**: pending surfaced the 4 stranded records; bot delivered all 4 in ONE
-  DM (`delivered 4 notification(s) → U56CVBHHQ`); watermark 3774→40308 (first movement in 2 days);
+  DM (`delivered 4 notification(s) → U0OWNER01`); watermark 3774→40308 (first movement in 2 days);
   queue drained. Suite **7412 passed / 12 skipped / 0 failed** (new: pending-scan tests, poller
   ack-contract tests via fake httpx, `test_notify_finish_guard.py`). Docs:
   `core/autonomous_activity.html` (wedge + guard sections).
@@ -34269,15 +34269,15 @@ runs the research leaf. Auto-restart of sandbox services after a deploy: decline
 
 ## §4EL — Temporal anchoring: a stated age is a measurement, not a fact (2026-09-04)
 
-**Trigger.** Operator: *"i told the agent 2 months ago that leonidas is 4 years old … now, 2 months
-later the agent recalls the memory verbatim, without the concept of time."* Live transcript: **"Leonidas
-is 4 months old (Thodoris is 9 years old) per my records."** The fact was stated **2026-07-07**
+**Trigger.** Operator: *"i told the agent 2 months ago that kosmas is 4 years old … now, 2 months
+later the agent recalls the memory verbatim, without the concept of time."* Live transcript: **"Kosmas
+is 4 months old (Markos is 9 years old) per my records."** The fact was stated **2026-07-07**
 (recovered independently from `contradiction_log.json`) and was still being served verbatim on
 **2026-09-04**.
 
 **Diagnosis.** Nothing was corrupted — the store faithfully kept what it was told. The defect is that a
 stated age is a MEASUREMENT, true only on the day it is said, and it was stored as a fact.
-`user_profile.json` held `relationships.sons = "Thodoris (9 years old) and Leonidas (4 months old)"`,
+`user_profile.json` held `relationships.sons = "Markos (9 years old) and Kosmas (4 months old)"`,
 and `ProfileMemory.get_context_string` renders bare, **unstamped** `- key: value` lines into
 `### USER PROFILE ###` on every turn — maximum authority, present tense, for ever. The vector store
 *does* stamp rows and the prompt *does* carry `CURRENT TIME`, so the arithmetic was possible; it
@@ -34286,8 +34286,8 @@ asserting otherwise. It never did. `memory/graph.py` already had the right insti
 `valid_from` / `valid_until`); the profile and vector fact paths never got it.
 
 **Fix — store the invariant, derive the quantity.** New `memory/temporal.py`. `anchor(text, said_at)`
-runs at WRITE time and rewrites an age into the constant behind it (`"Leonidas is 4 months old"` →
-`"Leonidas born ~2026-02-20"`); `derive(text, now)` runs at RENDER time and appends the value true
+runs at WRITE time and rewrites an age into the constant behind it (`"Kosmas is 4 months old"` →
+`"Kosmas born ~2026-02-20"`); `derive(text, now)` runs at RENDER time and appends the value true
 today (`→ ~6 months old`). The disk holds a constant, the prompt holds the current value, and the
 model is never asked to do the subtraction it demonstrably skips. **Anchoring sits in
 `ProfileMemory.update()`** — the boundary every writer funnels through (update_profile tool both
@@ -34312,24 +34312,24 @@ place, with the exemption scoped so unanchored dedup stays byte-exact.
 
 **Two defects the LIVE CORPUS found that no unit test would have.** Sweeping all 8,682 chroma rows and
 every graph edge through `anchor()` before shipping: (a) attributive position mangled a real stored
-fact — `"equipment for a 9-year-old named Thodoris"` → `"for a born ~2017-02-20 named Thodoris"`; the
+fact — `"equipment for a 9-year-old named Markos"` → `"for a born ~2017-02-20 named Markos"`; the
 fully-hyphenated compound now ANNOTATES (`9-year-old (born ~2017-02)`) instead of replacing, a
 mechanical syntactic rule (hyphenated = attributive = annotate; spaced = predicative = replace). (b) A
-stored skill lesson held `web_search(query="Thodoris basketball Panellinios age 9")` and the pass
+stored skill lesson held `web_search(query="Markos basketball Sampleton BC age 9")` and the pass
 rewrote the query text — falsifying a record of what was executed. Hence protected spans.
 
 **Corpus repair.** `scripts/repair_temporal_anchors.py`, dry-run by default, backs up each target.
 Applied: profile 1 row (`relationships.sons`, said_at 2026-07-07), vector 1 row (via
 `POST /api/memory/correct` — a second PersistentClient against live Chroma risks HNSW corruption),
 graph 2 rows (1 rewritten, 1 retired as a duplicate) of 3 candidates. It refuses to guess a said_at (an undated row is reported UNREPAIRED, never silently
-skipped) and refuses to sweep blindly: `thodoris IS_AGE "9 years old"` → `thodoris BORN "~2017-02"`
+skipped) and refuses to sweep blindly: `markos IS_AGE "9 years old"` → `markos BORN "~2017-02"`
 (rewriting the object alone would leave `IS_AGE` pointing at a birth date), while
 `wilson evolution youth IS_BEST_FOR "9-year-old"` was SKIPPED — a ball stays suitable for
 nine-year-olds. Its own first run printed **"profile (0 candidates)"** for the very row this change
 exists to fix: detection ran on a `json.dumps()`, where every value is quoted and therefore
 protected. A tool that cannot see the defect reports success — detection now walks string leaves.
 
-**Two more, found by RUNNING the repair rather than reading it.** (c) `thodoris IS_AGE "9 years"`
+**Two more, found by RUNNING the repair rather than reading it.** (c) `markos IS_AGE "9 years"`
 survived the first pass: the age cue lives in the PREDICATE and the object alone reads as a duration,
 which `anchor()` correctly refuses. Fixed in the script only (`_with_predicate_cue`) — loosening
 `anchor()` itself would reintroduce "4 months of runway"; a bare number under an age predicate means
@@ -34339,16 +34339,16 @@ store's own supersession mark (`valid_until`, which every graph read path filter
 updated into a collision. The failed run rolled back cleanly and changed nothing.
 
 **Two more, found by the post-restart LIVE probe.** Restarted (pid 44104) and asked the original
-failing question: **"Leonidas is about 6 months old"** — fixed. The same turn also revealed (e) the
+failing question: **"Kosmas is about 6 months old"** — fixed. The same turn also revealed (e) the
 operator had told the agent both children's EXACT birth dates in a chat turn, stored verbatim by the
-pre-change code as `born March 12, 2026` — a form `derive()` could not read, so they carried no
+pre-change code as `born March 9, 2026` — a form `derive()` could not read, so they carried no
 derived age at all (an exact date the model must subtract from by hand is the original defect one
 step on). `anchor()` now canonicalises the month-name form to ISO and `derive()` reads it, for legacy
 rows. (f) That exposed the precision bug AGAIN in a new place: coarseness was keyed on
 month-granularity, so `born 2026-03` ("born in March 2026", ±15 days) rendered a five-month-old as
 "~0 years old". Coarseness keys on the `~` estimate marker, not the granularity. Live profile
 consolidated: `relationships.sons` now carries the exact dates and derives
-`Thodoris (born 2016-11-25 → 9 years old) and Leonidas (born 2026-03-12 → 5 months old)`; the two
+`Markos (born 2016-11-22 → 9 years old) and Kosmas (born 2026-03-09 → 5 months old)`; the two
 duplicate per-child keys the turn created (one with a typo'd key) removed. Estimate calibration: the
 anchors were off by 20 and 51 days, both inside their stated uncertainty.
 
@@ -34740,12 +34740,12 @@ against the birth dates §4EL anchored in the profile:
 
 1. ⚠ **Three FALSE refutes across the 1977 stored replies — every hit was wrong.** Proximity binding
    breaks on markdown lists and tables, where subjects and ages interleave and the nearest name by
-   character count belongs to the previous row: `| Vasilis | 1980-01-29 | 44 years |` bound Vasilis's
-   age to Thodoris. Binding is now confined to **one line** — the unit these replies are actually
+   character count belongs to the previous row: `| Vasilis | 1980-01-26 | 44 years |` bound Vasilis's
+   age to Markos. Binding is now confined to **one line** — the unit these replies are actually
    organised in. **After the fix: zero refutations across the same 1977 replies**, contradictions
    still firing.
-2. ⚠ **A tie must not refute.** The live reply "Your sons are 9 (Thodoris) and 5 months old
-   (Leonidas)" puts BOTH names exactly 14 characters from the age phrase; first-wins bound the
+2. ⚠ **A tie must not refute.** The live reply "Your sons are 9 (Markos) and 5 months old
+   (Kosmas)" puts BOTH names exactly 14 characters from the age phrase; first-wins bound the
    infant's age to the nine-year-old and refuted a correct answer.
 
 **The tolerance is generous on purpose.** A claim of N units admits a true age from one below to two
@@ -35216,7 +35216,7 @@ the July review — corpus growth); experiments 16,424 / 117. No general tool-re
 2. *Answer gist* — `Experience.answer_gist` (`selfhood/schema.py`): ≤160 chars, `<think>` blocks
    dropped, PII redacted BEFORE the clip (`autobiographical.answer_gist`), written by
    `SelfModel.capture_turn`, in the recall haystack, rendered as an `→ my answer:` line. Old rows
-   load with "". Live recall for "Leonidas age" had returned five records of the question and none
+   load with "". Live recall for "Kosmas age" had returned five records of the question and none
    of the birth date.
 3. *Noise* — `AutobiographicalMemory.recent(include_boots=, hours=)` (over-scans ×8, floor 64;
    substrate default unchanged because the narrative reads boots on purpose; the tool opts out);
@@ -36733,8 +36733,8 @@ machine verdict barely predicts the human label).
 turns the evidence verifier skips by design, and 37 were tool turns where the human label landed
 before the late verdict (median 0.9 min vs 0.4 min) and the human-authority lock withheld the verdict
 from everything — including measurement. Of the 13 disagreements: 3 of the 6 false REFUTEs were one
-parser bug (a compound age "5 months and 23 days old" read as its tail "23 days old" — the writer had
-anchored a nine-year-old to a birth date ten days ago the same way); 6 of the 7 false PASSes were
+parser bug (a compound age "5 months and 26 days old" read as its tail "26 days old" — the writer had
+anchored a nine-year-old to a birth date thirteen days ago the same way); 6 of the 7 false PASSes were
 replies that were not answers (the finalize fallback's raw tool dump, narration, an idle digest). A
 narration check was measured on the labelled corpus and REJECTED (4 human-approved replies refuted
 per 1 rejected); the raw-dump shape was clean (0 of 103 approved replies match). Offline replay of
@@ -36775,10 +36775,10 @@ the fixes over the same 121 turns: agree/disagree/none 24/13/84 → 25/9/87.
   ages into one (M-B); the withheld file polluted two report scripts' globs (M-C); the day
   remainder was applied after the months (off by one).
 - Round 3: the plural guard named ONE surface of the scenario (`are` glued to the number) and
-  "Thodoris and Leonidas: 9 years and 5 months old" walked around it — the writer stored one date for
+  "Markos and Kosmas: 9 years and 5 months old" walked around it — the writer stored one date for
   two children and the reader then refuted the correct answer about the second child forever (C1); a
-  name in possessive / attributive position captured any nearby age — "Thodoris's laptop is 3 years
-  old" REFUTED (C2); the punctuation-only cue lost "Thodoris — now 9 years old" to the other child
+  name in possessive / attributive position captured any nearby age — "Markos's laptop is 3 years
+  old" REFUTED (C2); the punctuation-only cue lost "Markos — now 9 years old" to the other child
   (M1); the tie rule, the cue and the 60-char window were three redundant guards, any of which could
   be deleted with the suite green (M2); the window was unpinned across a 10× range (M3); the
   "smallest unit" granularity expression could never yield a year (m1); `were` and the copula anchoring
@@ -36790,9 +36790,9 @@ the fixes over the same 121 turns: agree/disagree/none 24/13/84 → 25/9/87.
 distance was a proxy for a grammatical relation, and each round tuned the proxy to its own fixtures.
 Now the subject is the name the phrase is PREDICATED of: the closest anchored name before the phrase
 on its line, accepted only when everything between them is a LINK — copula, age cue, hedge, date (the
-agent's arithmetic shape "born March 12, 2026 → today (Sep 4, 2026) is about 6 months old" and a table
-row "| Leonidas | 2026-03-12 | 5 months old |"), punctuation — and nothing else, and the name does not
-close a LIST (`temporal.conjoined_subject`, Unicode, "Θοδωρής και Λεωνίδας" included). One backward
+agent's arithmetic shape "born March 9, 2026 → today (Sep 4, 2026) is about 6 months old" and a table
+row "| Kosmas | 2026-03-09 | 5 months old |"), punctuation — and nothing else, and the name does not
+close a LIST (`temporal.conjoined_subject`, Unicode, "Μάρκος και Κοσμάς" included). One backward
 form: a bracketed name right after the phrase. Everything else abstains. No window, no tie, no cue —
 nothing left to calibrate. The writer applies the same list rule to every predicative pass and a
 plural-copula rule (within two words) to compounds; a single-unit "my twins are 4 months old" keeps
@@ -36835,21 +36835,21 @@ recorder — test-only update), run 2 **20,505 / 65 / 0**; all foreground `-n 4 
 **Round 4 (a fresh reviewer, briefed to GENERATE its own phrasings — 63 of them — and to replay every
 consumer).** Seven false-refute classes came out of the round-3 whitelist itself, each executed with
 the exact input: C1 tense — "was", "turned", "turns", "at", "in", "on" and bare digits were links, so
-"Thodoris was 4 years old when you moved in 2021" and "Leonidas turns 7 months old on October 12" were
+"Markos was 4 years old when you moved in 2021" and "Kosmas turns 7 months old on October 9" were
 compared with today, and the WRITER had stored "born ~2021-03" for a child born in 2016; C2 "of" — the
-age of "the father of Thodoris" was Thodoris's, in a reply and in a stored value, and with two stored
-dates for one name the verdict depended on dict order; C3 a bare possessive — "Thodoris's 5 month old
-brother" bound to Thodoris; C4 "was born … is" chains ("the hospital Leonidas was born in is 30 years
-old"); C5 the forward candidate outranking the phrase's own bracket ("9 years old (Thodoris), 5 months
-old (Leonidas)" — the pinned form survived only because "and" sat in the gap); C6 decimals read from
+age of "the father of Markos" was Markos's, in a reply and in a stored value, and with two stored
+dates for one name the verdict depended on dict order; C3 a bare possessive — "Markos's 5 month old
+brother" bound to Markos; C4 "was born … is" chains ("the hospital Kosmas was born in is 30 years
+old"); C5 the forward candidate outranking the phrase's own bracket ("9 years old (Markos), 5 months
+old (Kosmas)" — the pinned form survived only because "and" sat in the gap); C6 decimals read from
 their fraction ("9.5 years old" as FIVE; "5.8 months" — the checker's own rendering, quoted back 12
 times in the live corpus — as eight); C7 week/day claims compared on the calendar-month scale ("26
 weeks" for 25 weeks 1 day refuted). M1: the tool-free exits of `_compute_verifier_verdict` returned
 BEFORE the recording block, so the arithmetic route — the one the override report exists to measure —
 and the tool-free reply-shape refute never reached the sidecar and carried no override. M2: "Yes,
-Thodoris", "Today, Leonidas" were read as lists (capitalised word + comma) and muted both the checker
+Markos", "Today, Kosmas" were read as lists (capitalised word + comma) and muted both the checker
 and the writer. M3: the writer's 80-character look-back let a list 90 characters back glue two children
-to one date. M4: a markdown link "[Thodoris](url)" was an annotation; "| Thodoris | 2 | 3 years old |"
+to one date. M4: a markdown link "[Markos](url)" was an annotation; "| Markos | 2 | 3 years old |"
 bound a count of bikes. M5: "1 year old" admitted a newborn (N−1 = 0). Lens 3: 53 of 110 mutants
 survived on the round-3 tree — 31 link words and 7 class characters had no pin in either direction —
 and the round-3 timing pin put its whitespace AFTER "old", where no idiom backtracks: on the reviewer's
@@ -36884,7 +36884,7 @@ redundant (removed: one mechanism), two writer pins written on sentences that ca
 ("will … next month", "in 2036" behind the link rule) and re-pinned on the marker alone, a plural-line
 rule whose copula requirement had no pin ("… love their grandma, who is 70 years and 2 months old"
 anchors), and the hyphen-unit idiom, which none of the three timing inputs reached — a count followed
-by a whitespace run and no unit ("Leonidas is 9" + 16,000 spaces + "x": 15 s against 21 ms) does. All
+by a whitespace run and no unit ("Kosmas is 9" + 16,000 spaces + "x": 15 s against 21 ms) does. All
 five plus their neighbours re-run on fresh copies: 17/17 killed, controls correct; final full run on the
 finished tree: **109/109 killed, noop SURVIVED / known-bad KILLED, none not-applied**. Equivalent/accepted, documented: `o[1] <= start` vs `<` (a name
 ends in a word character), `o[0] >= end` vs `>`, the reader keeping the last token of a multi-word name
@@ -36893,9 +36893,9 @@ collector's single exit.
 
 **Deploy + live (21:13 → 21:14, listener 18269 → 28817).** Kill → launchd respawn → `/api/health`
 200 after 12 s; no Traceback/ERROR in the boot log, the err file's delta is the usual torch note; the
-main-prefix warm-up ran. Probe (`X-Ghost-Origin: probe`, tool-free, "how old are Thodoris and
-Leonidas today?"): reply "Thodoris is 9 years old (born Nov 25, 2016), and Leonidas is about 6 months
-old (born March 12, 2026)" in 12.2 s — both ages bound through the new link rule ("is", "is about")
+main-prefix warm-up ran. Probe (`X-Ghost-Origin: probe`, tool-free, "how old are Markos and
+Kosmas today?"): reply "Markos is 9 years old (born Nov 22, 2016), and Kosmas is about 6 months
+old (born March 9, 2026)" in 12.2 s — both ages bound through the new link rule ("is", "is about")
 and found consistent, so the arithmetic route said nothing ("no verdict — turn ran NO tools"), as
 designed; no traceback. `scripts/verdict_override_report.py` runs on the live sidecars (207 shipped
 verdicts, 141 labelled, all "(text judge)" so far — the tagged rows start accruing from this deploy).
@@ -42348,7 +42348,7 @@ PG1–7 guard/steer/site order, RC1–9 clause/gate/promotion, BF1–5 fault, PJ
 **R8 — defects inside this round's own work (4):** (a) the first tail put a 600-char copy of the
 newest result at the end — duplicated content, broke three §4HN pins; replaced by a name-only
 pointer. (b) the first rebuttal regex listed the bare copulas (`is|are|was|were` + optional `not`)
-so "the ball is going straight up" and "leonidas was born march" were rebuttals — the first corpus
+so "the ball is going straight up" and "kosmas was born march" were rebuttals — the first corpus
 count (24, 1.6%) was taken with that draft; negation-only regex → 7 (0.5%). Caught by my own fixture.
 (c) two planner pins were source-text (`src.index` order) — the ratchet rejected them; re-written on
 the AST. (d) the journal-bypass enumeration matched only `journal.append` on a bare Name — mutant
@@ -43948,7 +43948,7 @@ added to `_EVIDENCE_CLAIM_STOPWORDS`; two more rows in `_EVIDENCE_BUDGET_WEIGHTS
 tokens the picked items do not carry, external sources only (the §4HC echo rule; the first pass
 took the deliverable's own write receipt and the packer pin caught it). The retry's digest now
 carries the 2009/Μεραρχίας item (8 items, 11.6 KB): "2009" supported. Corpus replay then showed ONE
-new false refute — the reply's "Πάρνηθος 203" sat in the evidence GLUED ("Πάρνηθος203", pre-§4IO
+new false refute — the reply's "Ολύμπου 203" sat in the evidence GLUED ("Ολύμπου203", pre-§4IO
 ddgs data), was called absent, and was "misreported" against a pagination "1 - 200" two lines down
 → `_glued_occurrence`: a figure whose exact digits sit glued to letters in the evidence is
 "unsupported", never a misreport (§4IM: glued supports nothing for a binding; it does rule out
@@ -45518,7 +45518,7 @@ search to Greek, why?" → "add the prompt line and re-measure".
 
 **Measured (July–Sep, `scripts/measure_reply_language.py`):** English requests that searched:
 18/167 (10.8%) issued a Greek-script query — all Greece-local subjects; the model's own retrieval
-judgment (profile: Athens; "jiujitsu north athens" in English → Missouri/Tbilisi/Athens GA, next
+judgment (profile: Athens; "jiujitsu south athens" in English → Missouri/Tbilisi/Athens GA, next
 query Greek). No rule, hint, lesson or code asks for it. Failure modes: proper names TRANSLATED
 ("Anatolia College" → "Ανατολικό Σχολείο"), mixed-script queries 46/983 (4.7%). Reply drift:
 14/2,112 English requests (0.66%, prose lines; quoted headlines excluded) answered mostly in
@@ -45654,7 +45654,7 @@ single top-level message (no thread history); the 4 stored sessions, the 10 epis
 09:29:08 (ids 28/47/186/249/280/52/148/87/234/81), the graph triplets and the 6 lessons were all
 English; the Greek-heavy vector entries are off-topic; reply smoothing is deterministic text→text;
 rule 5 LANGUAGE (§4JN) WAS in the system message (h=215efdfc). The one Greek cue: the profile's
-Athens / Thrakomakedones address, which the model had been riffing on ("The Thrakomakedon", Athens
+Athens / Kalopetres address, which the model had been riffing on ("The Kalopetr", Athens
 Choke / Aegean Lock / Piraeus Twist, "Greek name, unique story") when it wrote the 3.3 KB final
 generation (qwen-3.6-35b-a3, temp 0.60). Corpus: ~6 genuine flips in 2,052 real turns, all
 Greece-flavoured subjects on a final-gen turn after tools (xtc / coca-seed dark-web searches, "what
@@ -48068,7 +48068,7 @@ them); an HTML-aware element count for the present-term guard (the count is a fl
 
 **Own-code defects found while pinning (R8 count so far: 3).** (a) `_quoted_term_present` accepted "Nine spec
 cards" over six — the bare last-token count saw CSS rules and prose; now an adjacent-phrase FLOOR, honestly named as such.
-(b) A quoted FILE NAME in the issue ('dvda_schematic.html') made the present-term guard refuse the live case against a
+(b) A quoted FILE NAME in the issue ('engine_schematic.html') made the present-term guard refuse the live case against a
 synthetic source; file names/paths name a SOURCE and are skipped. (c) The first cut of fix 2 covered only the DONE
 branch; the live path was `required_tool=none`.
 
@@ -48488,7 +48488,7 @@ was in flight — interrupted.
 
 ## §4KL — A member's impossible task: the silent wall, the withheld steer, the bare abort (2026-09-29) — R0 scope, written first
 
-**Incident.** Req slack-61cc5f5a (09:45–09:48, channel member U6809BSKW): "attack the problem… try to decrypt
+**Incident.** Req slack-61cc5f5a (09:45–09:48, channel member U0MEMBER01): "attack the problem… try to decrypt
 [Linear A] once and for all". 17 `web_search` calls over 10 steps, never an open, then
 `[ATTEMPT_ABORTED_CROSS_TURN_LOOP] The solver opened three consecutive turns…` shipped verbatim as the Slack reply.
 From turn 4 the planner knew the target (mwenge/lineara.xyz, raw.githubusercontent URL pattern) and planned a
@@ -49585,8 +49585,8 @@ reproduced; cause not known (timing under full-suite load is the likely shape).
 raises "already exists … different settings"; fixed to one shared client, re-run with the agent stopped again (profile and
 episodes idempotent no-ops; 7 lessons retracted). Listener 71393 → 29766 → 30404, one process. Slack bot unchanged this
 round. Verified: profile carries root.name + 5 relationship keys; 403 episodes (500 − 97); 283 lessons. Live probe
-(header): "What is my name, and what are my sons called?" → "Your name is Vasilis, and your sons are called Thodoris and
-Leonidas."; outcome ok; no episode written.
+(header): "What is my name, and what are my sons called?" → "Your name is Vasilis, and your sons are called Markos and
+Kosmas."; outcome ok; no episode written.
 
 ## §4KW — lessons keyed to one request stay with that request (2026-10-02, operator: "fix the lessons keyed to one specific request … needs a redesign of how lesson triggers are generated")
 
@@ -49599,7 +49599,7 @@ on the recorded traffic. A more generic trigger alone would not fix it: the FIX 
 **Design (`memory/lesson_scope.py`).** `scope="request"` (+ `source_request`): one request's corrected plan, admitted only
 when the new request IS that request (`same_request`: character similarity ≥ 0.85, or the shorter request's content words
 all in the longer one and ≥ half its size). Calibrated on the 927 injections: similarity alone cannot separate a rewording
-("how old is leonidas ?" vs "do you know how old is leonidas now ?", 0.70) from a template with another payload ("Use
+("how old is kosmas ?" vs "do you know how old is kosmas now ?", 0.70) from a template with another payload ("Use
 deep_research ONCE on: <other topic>", 0.64–0.70); containment does. 20 admitted (all retries/rewordings, read one by one),
 907 refused. Applied in every retrieval branch (vector, keyword, recency) — both delivery surfaces. General lessons keep
 relevance retrieval.
@@ -49737,7 +49737,7 @@ memory dir, check the rule's generality, save candidates incrementally.
 **Data r4** (`scripts/lesson_repair_4kw_r4.py`, agent stopped, whole memory dir backed up): 25 harmful/junk general lessons
 retracted ("report only the count", validator-gaming self-play rules, "print 'Let me…' first", "confirm update_profile and
 DONE", one-off bench arithmetic, stale introspect lists, duplicates), 23 untraceable scoped rows retracted, 2 re-keyed, 14
-rewritten without request entities (Hetzner, Leonidas, Fousekis …), 3 general rules added → 231 lessons, 47 scoped (all
+rewritten without request entities (Hetzner, Kosmas, Fousekis …), 3 general rules added → 231 lessons, 47 scoped (all
 reachable), 230 twins, 0 missing/orphan/duplicate (1 stale = the pre-existing two-row duplicate trigger).
 **Verification.** Battery 56 mutants: first pass 48 killed, 7 survivors → tests added → 55/55 killed, NOOP clean, tree pristine
 (re-run on the relocated shell module). Full suite once: 27,149 passed, 3 failed (lint: unused names; execute.py over the
@@ -49780,8 +49780,8 @@ subshell write into it is refused, no file created; the calendar's db accepts a 
 
 ## §4KX — owner-memory writes and the lesson producers reviewed and fixed (2026-10-03, operator: "proceed, review and fix your findings, usual verification protocol")
 **Reviews (2 fresh readers): memory writes 4 MAJOR + 4 MINOR + 3 NIT; lesson producers 7 MAJOR + 3 MINOR + 2 NIT.**
-*Memory writes.* (1) The forget EXPANSION followed any relation: `forget Leonidas` reached `fotini` through IS_SON_OF and
-deleted the owner's wife's profile fields, `user MARRIED_TO fotini` and every fact naming her → only identity edges, anchored
+*Memory writes.* (1) The forget EXPANSION followed any relation: `forget Kosmas` reached `elena` through IS_SON_OF and
+deleted the owner's wife's profile fields, `user MARRIED_TO elena` and every fact naming her → only identity edges, anchored
 on the exact node (aliases both ways; IS_A thing → class only — `forget postgresql` had reached the owner's company).
 (2) The profile sweep deleted whole fields that merely MENTIONED the target ("BMW" took all three vehicles, "Athens" the
 address, "name" the owner's name, "son" three keys) → `_forget_profile`: explicit `category.key`; one exact key for a specific
@@ -49844,7 +49844,7 @@ green). Deployed; probe (labelled): residence, wife, sons, vehicles recalled.
 
 ## §4KX r8 — forget and reset_all become preview → confirm; re-review findings fixed (2026-10-03, operator: "proceed with your recommendations")
 **Why a change of approach.** Three review rounds kept finding wrong deletions inside a forget that GUESSED intent (13 MAJOR
-in the last re-review: "Fotini's birthday" took the marriage; Greek, dotted and hyphenated names reached no store; a public
+in the last re-review: "Elena's birthday" took the marriage; Greek, dotted and hyphenated names reached no store; a public
 person's facts were "yours"; some owner facts could be removed by no tool; the reset_all wording gate opened on negations and
 questions and refused "yes"). Patching the heuristics again was the loop; the user now sees the list.
 **forget** (`knowledge_base(action='forget', target=X)`) = PREVIEW: the same sweep runs in plan mode (`_FORGET_PLAN`, recording
@@ -49855,7 +49855,7 @@ episodes via `delete_episodes` (archived with actions). Direct Python callers ke
 wipe only on the token in a later turn; `_FULL_WIPE_RE` removed.
 **Matching:** one entity for every leg (`_entity_of`: dots/hyphens kept, folded); `profile.mentions` + `_node_is` +
 episode scan fold case/accents in any script (SQLite LIKE was ASCII-only); a qualifier AFTER the entity or with "of" narrows
-to that attribute (stem match: birthdate ~ HAS_BIRTHDAY), a category before it does not; family forget takes `fotini_*` keys;
+to that attribute (stem match: birthdate ~ HAS_BIRTHDAY), a category before it does not; family forget takes `elena_*` keys;
 `root.*` fields listed like the graph owner fact they mirror; kept "facts about you" = durable AND `user` at one end;
 degraded profile reported. **Producers:** a dictated learn_skill lesson (remember/from now on/θυμήσου…) stays general; the
 model's own request-shaped one is scoped and the tool says so; learn_skill rows never absorbed into another producer's row;
@@ -49865,14 +49865,14 @@ scrap threshold 8; self-play share 0.75. **Decay:** health/profession/companion 
 `user HAS_*` noise decays. YouTube hints no longer say "forget it first" as a same-turn step.
 **Correction to the §4KX re-review entry:** decay protected 54 of 739 weight-1 edges at the time (not 60).
 **Data r8** (`scripts/memory_repair_4kx_r8.py`, trialled on a copy with the agent stopped, then live; backup
-`memory.pre-4kx-r8-20261003T123718.bak`): restored 6 owner facts the decay had pruned — HAS_CONDITION heart failure / blood
-clot, HAS_MEDICATION + TAKES_MEDICATION entresto, HAS_PROFESSION doctor, HAS_COMPANION fotini. Not restored: the Kyllini trip.
+`memory.pre-4kx-r8-20261003T123718.bak`): restored 6 owner facts the decay had pruned — HAS_CONDITION asthma / hay
+fever, HAS_MEDICATION + TAKES_MEDICATION ventolin, HAS_PROFESSION doctor, HAS_COMPANION elena. Not restored: the Paralia trip.
 **Verification.** Battery 60 mutants: 48/58 → 56/58 non-control killed (2 equivalent: a reset token carries no items; the
 possessive strip was dead code → removed), NOOP clean, KNOWN-BAD killed, tree pristine. New tests: test_forget_confirm_r8.py
 (81), test_memory_repair_r8_script.py (3); 44 tests of the old contract rewritten (wipe tests run preview → confirm via
 tests/_wipe_confirm.py). Full suite once: 27,478 passed, 2 failed (unused import; the schema lost its EXACT/relative-path
 sentences) → fixed, those files green. Deployed (single process, new "system ready"). Probe (labelled, read-only): companion
-Fotini and blood clot recalled; heart failure and Entresto NOT — the edges are live, but recall seeds the graph from query
+Elena and hay fever recalled; asthma and Ventolin NOT — the edges are live, but recall seeds the graph from query
 words that are NODES, and "health/medication" are PREDICATES of `user` edges (pre-existing recall gap, open).
 **r8 fresh-eye review (3 reviewers, same day): 8 MAJOR, 16 MINOR — all fixed, redeployed.**
 Preview/confirm: the preview dropped the sweep's warnings/partial names and said "Nothing stored matches" (→ notes kept,
@@ -49881,31 +49881,31 @@ partial files/docs are "also found" items); the plan's previous-value check was 
 checked at confirm, SYSTEM/bench-/replay- and previews from unseen turns confirmable, list `items` dropped, token-store race
 (→ `_take_plan`/`_store_plan` under a lock, `_not_the_user`, bad parts refuse the whole confirm). Matching: qualified targets
 defaulted owner facts; a 4-letter stem took COMPANION for "company" (→ predicate-only, inflection or `_QUALIFIER_SYNONYMS`,
-birthday ~ BORN); `user HAS_FOTINI_DESCRIPTION` outlived a family forget (→ `owner_field_edges`); "my wife Fotini" skipped
+birthday ~ BORN); `user HAS_ELENA_DESCRIPTION` outlived a family forget (→ `owner_field_edges`); "my wife Elena" skipped
 her fields; ASCII prefilter missed "René" (→ full scan, 6/21 ms); "g.o." trailing dot; "vale of tempe" lost its inner word;
 accented owner name; blind profile let the graph default owner edges (→ graph/episodes held back); LOCATED_IN protected
 research chatter (→ owner only). Producers: dictation regex matched 17/30 real non-dictating requests and Greek substrings
 (→ clause-initial imperatives, Greek word boundaries); a learn_skill row made every rewording a new row (→ only the INCOMING
 learn_skill lesson is kept apart); scope attribute raced 39/40 under gather (→ `LessonWrite` return + bus `skill_scope`;
 dropped legacy write = FAILED); dictated follow-up refused (→ promotes); "satisfy validators"; camelCase/stems let
-McDonald/EvolMonkey/Harding through (→ window-only / sentence-initial-only).
+McDonald/Orbitdata/Harding through (→ window-only / sentence-initial-only).
 **Verification:** battery 40 mutants: 31 → 39/39 non-control killed (1 equivalent, dead code removed), controls OK, tree
 pristine; tests now 138 in test_forget_confirm_r8.py. Full suite once: 27,538 passed, 1 failed (test_clockwork_ux deploy
 timing under load; 403/403 alone, untouched code). Redeployed; probe (labelled, read-only): wife and both sons recalled.
-**Recall gap closed (operator: "proceed").** The r8 probe recalled blood clot and Fotini but not heart failure/Entresto: the
+**Recall gap closed (operator: "proceed").** The r8 probe recalled hay fever and Elena but not asthma/Ventolin: the
 graph tier seeds on query words that NAME nodes, and "health"/"medication" are PREDICATES of `user` edges. New
 `GraphMemory.owner_facts_matching(query)`: `user` edges whose predicate names a query word (or inflection) or a category it
 covers (health, medication, job, family, home, car, birthday; Greek υγεία/φάρμακα/δουλειά/οικογένεια); a category never
 reaches WORKS_ON/IS_WORKING_ON. Merged ahead of the neighbourhood edges in `tool_recall`. Measured on a live-graph copy:
-health → 4 facts, meds → Entresto, job → WORKS_AT + HAS_PROFESSION (was 10 incl. project WORKS_ON before the task rule),
+health → 4 facts, meds → Ventolin, job → WORKS_AT + HAS_PROFESSION (was 10 incl. project WORKS_ON before the task rule),
 4 unrelated questions → 0. Tests: test_recall_owner_facts.py (15); battery 13 mutants → 11/11 non-control killed after 2
-tests added; full suite once 27,553 passed, 0 failed. Deployed; probe (labelled, read-only): heart failure, blood clots,
-Entresto, Fotini all recalled. Note for the operator: the graph holds `user HAS_PROFESSION doctor` (restored in r8) beside
-`user WORKS_AT evolmonkey` — check whether "doctor" is really the owner's.
+tests added; full suite once 27,553 passed, 0 failed. Deployed; probe (labelled, read-only): asthma, hay fevers,
+Ventolin, Elena all recalled. Note for the operator: the graph holds `user HAS_PROFESSION doctor` (restored in r8) beside
+`user WORKS_AT orbitdata` — check whether "doctor" is really the owner's.
 **Correction (operator: "im not a doctor").** `user HAS_PROFESSION doctor` — one of the six edges r8 restored — was wrong:
 removed with the agent stopped via `delete_edge` (archived, reason delete_edge); it was the only trace (no vector fact,
 profile field or episode). Taken off `scripts/memory_repair_4kx_r8.py`'s list so a re-run can never restore it (test
-updated). Probe (labelled, read-only): job → EvolMonkey, PostgreSQL services. Lesson: a restore from a deletion archive
+updated). Probe (labelled, read-only): job → Orbitdata, PostgreSQL services. Lesson: a restore from a deletion archive
 brings back WRONG facts with the right ones — list restored facts to the operator for confirmation.
 
 ## §4KY — the background writers of owner memory, and member/public scoping (2026-10-03, operator: "proceed with both. usually verification protocol")
@@ -49927,16 +49927,16 @@ copy of the bot's labels is defused.
 pre-filter, the non-list guard), controls OK, tree pristine. New tests: test_4ky_writers_review.py (51),
 test_4ky_slack_surface.py (6), test_memory_repair_4ky_script.py (3); 4 dream fixtures and 2 extraction fixtures made
 realistic (the gates refused "A"*200 merges and unprefixed episodes). Full suite once: 27,610 passed, 0 failed.
-**Data (operator: "delete a b c heart attack is wrong"):** `scripts/memory_repair_4ky.py`, trialled on a copy with the agent
+**Data (operator: "delete a b c broken wrist is wrong"):** `scripts/memory_repair_4ky.py`, trialled on a copy with the agent
 stopped, then live (backup memory.pre-4ky-20261003T164929.bak): 152 owner edges removed (A probe/test 44, B agent/project
-state 92, C third-party/game 15 — listed verbatim in the script — plus `user EXPERIENCED heart attack`) and 4 profile fields;
+state 92, C third-party/game 15 — listed verbatim in the script — plus `user EXPERIENCED broken wrist`) and 4 profile fields;
 group D (33 unclear) and the 73 life facts kept. Owner edges 468 → 316. Agent + Slack bot restarted. Probe (labelled,
-read-only): health = heart failure, blood clot, Entresto; job EvolMonkey; wife and both sons — no doctor, no heart attack.
+read-only): health = asthma, hay fever, Ventolin; job Orbitdata; wife and both sons — no doctor, no broken wrist.
 
 ## §4KZ — when an owner fact changes: profile authority, synced mirrors, no model-judged deletion (2026-10-03, operator: "proceed, usual verification prot")
 **Review** (3 fresh-eye reviewers, read-only on copies): update path 10 MAJOR/3 MINOR, contradiction engine 7/3, live
-consistency + ranking 4/2. Measured: 5 of the engine's 7 live deletions since 08-08 wrong (Fotini's birth date erased); the
-ledger injected wrong birth dates into owner prompts; a weekend in Kyllini replaced the home (live 08-15); Athens→Berlin→
+consistency + ranking 4/2. Measured: 5 of the engine's 7 live deletions since 08-08 wrong (Elena's birth date erased); the
+ledger injected wrong birth dates into owner prompts; a weekend in Paralia replaced the home (live 08-15); Athens→Berlin→
 Athens dropped by the process-wide bus LRU with SUCCESS; my §4KY gate refused every age update (checked after anchoring);
 "X, not Y" and "we …" dropped; stale synthesis/auto "name is" rows outranked corrections; the vector store has had 0
 identity rows since ≥09-24.
@@ -49960,13 +49960,13 @@ removed judge's task label → updated). Deployed; probe (labelled, read-only): 
 the operator's answers.
 **§4KZ data (operator: "delete 1 2 4 8, rebuild copies, rest later"):** `scripts/memory_repair_4kz.py` (rows listed verbatim;
 every kept canonical edge verified live first; test_memory_repair_4kz_script.py), trialled on a copy with the agent stopped,
-then live (backup memory.pre-4kz-20261003T183121.bak): 67 owner edges removed — 1 wrong (Kyllini location + hotel stay,
-"thodoris BORN ~2017-02", stored ages ×4), 2 duplicates (37: spouse/sons/birthdates/residence/vehicles/medication/hobby/
+then live (backup memory.pre-4kz-20261003T183121.bak): 67 owner edges removed — 1 wrong (Paralia location + hotel stay,
+"markos BORN ~2017-02", stored ages ×4), 2 duplicates (37: spouse/sons/birthdates/residence/vehicles/medication/hobby/
 preference synonyms; one canonical edge each kept), 4 one-off search topics stored as wants/interests (11), 8 noise (12:
 car-wash tasks, a deadline, a considered helmet, assistant-event logs); `PREFER download` → `PREFERS`; profile fields
-son_thodoris_birthdate, son_lleonidas_birthdate (typo) and cli_tools.info removed (duplicates); the lesson "how much time is
+son_markos_birthdate, son_lkosmas_birthdate (typo) and cli_tools.info removed (duplicates); the lesson "how much time is
 from here to home ?" (told the model to doubt the owner's home) retracted; vector identity copies of all 11 profile fields
-rebuilt (the store had none since ≥09-24). Owner edges 316 → 267. Left for later (operator): RUNS evolmonkey, birth dates
+rebuilt (the store had none since ≥09-24). Owner edges 316 → 267. Left for later (operator): RUNS orbitdata, birth dates
 to the profile, helmets, IBKR account. Probe (labelled, read-only): home answered from the address without doubting it;
 sons' birth dates correct.
 
@@ -50001,7 +50001,7 @@ backup; pinned). Probe (labelled, read-only): sons + birth dates correct.
 
 ## §4LB — what goes into every prompt: private context, egress, duplication (2026-10-03, operator: "proceed")
 **Review** (3 fresh-eye reviewers, read-only on log/record copies): the model wrote the owner's street address into Tor
-searches ("restaurants Makedonias 83 Thrakomakedones walking distance"); the address and a physical description rode 40/40
+searches ("restaurants Kaledonias 83 Kalopetres walking distance"); the address and a physical description rode 40/40
 owner turns; sub-agents and coding leaves rebuilt a memory bus from the read-only stores and shared the owner's scratchpad
 and past requests; a PUBLIC channel reply said "private memory is NOT loaded" while scratchpad, past requests, open
 questions, competence and both playbooks were; coding turns carried the whole profile; profile mirrors (identity rows) and
@@ -50021,18 +50021,18 @@ the helper was tested, never the dispatch; plus case-sensitive scrub and the liv
 defect: `practi[cs]e` missed "practicing" → fixed. Rerun 21/21, NOOP survives, tree pristine. test_4lb_prompt_context.py
 (19); 2 old-contract tests updated. Full suite once: 27,694 passed, 0 failed. Deployed (bootout/bootstrap; one listener).
 Probe (labelled, read-only, "pizza within walking distance of my home address"): 5 web_search queries used the suburb/Athens,
-"Makedonias 83" in 0 log lines. **Deferred (perf):** pinned-mode cache reuse; ~25k-token tool schemas (84% cached).
+"Kaledonias 83" in 0 log lines. **Deferred (perf):** pinned-mode cache reuse; ~25k-token tool schemas (84% cached).
 **Data:** NOT changed — profile split (vehicles/hobbies/company on demand?) and cleanup (sons per-son, hobbies/vehicles as
 lists, 102 ai/assistant/system graph edges) await the operator.
-**§4LC data (operator: "1. none 3 yes 4 a i run evolmonkey, 4b yes 4 c no"; 2 not answered = not done):** no more
+**§4LC data (operator: "1. none 3 yes 4 a i run orbitdata, 4b yes 4 c no"; 2 not answered = not done):** no more
 on-demand profile fields. `scripts/memory_repair_4lc.py` (rows listed verbatim; the agent-edge count must equal the 102 the
 operator saw; kept facts verified live first; test_memory_repair_4lc_script.py), trialled on a copy with the agent stopped,
 then live (backup memory.pre-4lc-20261003T210044.bak): 107 graph edges archived — the 102 whose subject is ai/assistant/
-system, `user WORKS_AT evolmonkey` (he RUNS it), `user OWNS pista gp rr` + `shoei x-spirit iii` (not his helmets),
+system, `user WORKS_AT orbitdata` (he RUNS it), `user OWNS pista gp rr` + `shoei x-spirit iii` (not his helmets),
 `user HAS_ACCOUNT_WITH interactive brokers` + `HAS_FUNDS 100 euros` (not real) and the synthesis row stating that account;
-the two episodes recording that he ASKED about helmets kept (history, not a fact). Profile: root.role "Runs EvolMonkey",
-root.birthdate 1980-01-29, relationships.wife_birthdate 1982-01-10, mirrors synced. Probe (labelled, read-only): runs
-EvolMonkey, both birth dates right, no helmets, no brokerage account.
+the two episodes recording that he ASKED about helmets kept (history, not a fact). Profile: root.role "Runs Orbitdata",
+root.birthdate 1980-01-26, relationships.wife_birthdate 1982-01-07, mirrors synced. Probe (labelled, read-only): runs
+Orbitdata, both birth dates right, no helmets, no brokerage account.
 **§4LC part 2 (operator: "do that too, proceed"):** `scripts/memory_repair_4lc_lists.py` (values listed verbatim and must
 equal the live ones; a rerun is a no-op; test_memory_repair_4lc_lists_script.py incl. the store keeping two anchored "born …"
 items apart), trialled on a copy with the agent stopped, then live (backup memory.pre-4lc-lists-20261003T210318.bak):
@@ -50044,9 +50044,9 @@ already hold them). The prompt now derives each son's age separately. Probe (lab
 ## §4LB r2 — fresh-eye review of the §4LB fixes (2026-10-03, operator: "should you verify all your coding changes?" → "proceed")
 **Review** (3 fresh reviewers, read-only): egress 3 MAJOR/4 MINOR, isolation 1 MAJOR/5 MINOR, hydration 2 MAJOR/3 MINOR.
 MAJOR: `darkweb_research` (and system_utility's geocoder argument) missing from the outbound set; delegates' `recall` read
-the owner's store ("User address is Makedonias 83 …") and, with `profile_memory=None`, their searches were never
+the owner's store ("User address is Kaledonias 83 …") and, with `profile_memory=None`, their searches were never
 scrubbed; the exact-Latin-substring scrub let the postcode alone, Greek, \u-escaped JSON, "street 83", double spaces and
-URL-encoded links through and rewrote "Makedonias 830" to "Athens0"; the owner-fact graph lookup (§4KZ) matched request
+URL-encoded links through and rewrote "Kaledonias 830" to "Athens0"; the owner-fact graph lookup (§4KZ) matched request
 verbs ("do you know", "I want", "show me") and filled every graph slot; episodes between 0.30–0.70 (deliberate, §4LA
 noise — docs corrected). MINOR: `home_address`-style keys rendered and unscrubbed; description sentences as egress terms;
 weather lost an address-only profile and still geocoded a street under `home`; the planner dedupe never fired (JSON-escaped
@@ -50067,28 +50067,28 @@ request, but the aligned planner exists only from turn 2 (rewritten on the two-t
 (syntax error, regenerated). Rerun 31/31, NOOP survives, tree pristine. test_4lb_prompt_context.py 19 → 62 tests;
 test_memory_bus updated (exclude_types; owner-fact read only on owner questions). Full suite: first run 4 failed (3 mine: the
 vector fetch's `to_thread` call shape changed → restored; 1 selfhood late-verdict timing flake, 3/3 in isolation), rerun
-27,748 passed, 0 failed. Deployed; probe (labelled, read-only, Greek "φαρμακεία κοντά στη Μακεδονίας 83, 136 76"): two
+27,748 passed, 0 failed. Deployed; probe (labelled, read-only, Greek "φαρμακεία κοντά στη Καλεδονίας 83, 101 01"): two
 web_search calls and a Google Maps URL scrubbed (3 `privacy` log lines), 0 tool calls with the street or postcode.
 **Observed:** with the street replaced by "Athens" the model guessed the wrong suburb (Cholargos) — replacing with the
 address's suburb instead of the city would keep local results right; put to the operator.
 **§4LB r3 (operator: "yes, proceed" — the suburb, not the city):** the street + number and postcode are replaced by the
-address's SUBURB (`egress.locality`: the address without street, number and postcode → "Thrakomakedones"), else the
+address's SUBURB (`egress.locality`: the address without street, number and postcode → "Kalopetres"), else the
 city, else "nearby"; `tools/system._locality` now delegates to it (one implementation). Battery bat17: 3/4 → 4/4 (the
 "whole locality" mutant survived a contains-check; pinned the exact suburb), NOOP survives, tree pristine. Full suite
 27,751 passed, 0 failed. Deployed; probe (labelled, read-only, the same Greek pharmacy request): the first web_search
-went out as "φαρμακεία Thrakomakedones …", 0 tool calls carried the street or postcode. **Observed:** the model then
-added a town of its own and searched "Ασπρόπυργος Μακεδονίας" (a different Makedonias Ave) — it does not know its query
+went out as "φαρμακεία Kalopetres …", 0 tool calls carried the street or postcode. **Observed:** the model then
+added a town of its own and searched "Ασπρόπυργος Καλεδονίας" (a different Kaledonias Ave) — it does not know its query
 was rewritten. Candidate next step (operator): tell the model in the tool result that the address was replaced by its
 suburb.
 **§4LB r4 (operator: "proceed" — tell the model):** a rewritten outbound call's result ends with `egress.privacy_note`
-("[privacy: the owner's street address in this call was replaced by its area, 'Thrakomakedones' … search there — never
+("[privacy: the owner's street address in this call was replaced by its area, 'Kalopetres' … search there — never
 put the street, number or postcode in a query.]"), from the dispatch hook (`tool["_privacy_area"]`, wrapped around the
 tool coroutine) and from the tool-boundary wrapper (macros, delegates). APPENDED, never in front: a result's head is parsed
 ("Error:" classifies a failure). Tool results reach the model inside a `<tool_response>` user block, not a role=tool
 message (the first test looked for the wrong role). Battery bat18 4/4 (incl. note-in-front and note-on-clean-calls), NOOP
 survives, tree pristine. Full suite 27,751 passed, 1 failed: test_hydrate_context_actually_concurrent's 1.0 s wall-clock
 backstop at 1.5 s under load (5/5 in isolation; the bus is untouched by r4). Deployed; probe (labelled, read-only, same
-Greek pharmacy request): answered with Thrakomakedones pharmacies (correct area), 2 rewrites logged, 0 tool calls with the
+Greek pharmacy request): answered with Kalopetres pharmacies (correct area), 2 rewrites logged, 0 tool calls with the
 street or postcode.
 
 ## §4LC — lessons and past requests: written, shown, taken back (+ public-reply leaks) (2026-10-03, operator: "proceed")
@@ -50386,7 +50386,7 @@ exists. Now every sandbox-reading arm is off for members: early visual, visual, 
 CRIT, the visual arm, was found and fixed in §4LH.)
 **Fixed (MAJOR):**
 - *Address egress* (§4LB):
-  - natural Greek ("αριθμός 83"), "Macedonias", "Nr./#", street and number apart (in one argument or several),
+  - natural Greek ("αριθμός 83"), "Caledonias", "Nr./#", street and number apart (in one argument or several),
     full-width, zero-width and Cyrillic letters, and "8 3" went out → the fold does NFKC, drops Cf, maps
     confusables and c→k; "dh?" is tolerated; number words are allowed; a call-level rule scrubs a street stem plus
     its number anywhere in one call;
@@ -50395,7 +50395,7 @@ CRIT, the visual arm, was found and fixed in §4LH.)
     reads as a street address, was in every prompt and unscrubbed → widened key regex plus value-based detection
     (live profile copy: no field newly hidden);
   - the postcode stays scrubbed alone (the §4LB pin) and is never touched inside an identifier (arXiv, issues/,
-    v1.13676), including "136-76" and "GR-13676".
+    v1.10101), including "101-01" and "GR-10101".
 - *Lessons* (§4LC):
   - tombstones read only `.jsonl.1` → every rotation, probed by number (the symlink lint forbids a glob);
   - t-a→t-b→t-c, retract t-b then t-c restored t-b's refuted text → the retraction drops a `previous_version`
@@ -53945,14 +53945,14 @@ Plus the RRF weights file (≈ the hand defaults, a no-op). The metacog boot lin
 **Method:** read both call paths and every consumer of their output; measure their latency from the logs; replay recent real owner requests through hydration on a COPY of the live stores (read-only on the originals), with and without each step, and compare the hydrated blocks; decide; if removed: pins, docs, suite, gated deploy, labelled probes.
 ### §4NQ — measurement (2026-10-11)
 **Setup:** a copy of `system/memory`; 460 owner trajectories since 09-20 (probes, members, jobs excluded); real `MemoryBus` over the copy (graph owner facts + lessons, local embeddings); Nova called live through `LLMClient` for the rewrites; "previous reply" = the previous owner turn's `final_response` in the same session file. Scripts + per-turn blocks: `system/eval/census/4nq_rewrite/`.
-**Expansion** (<10 words, no id/quote, a previous reply): fires on 166 turns; the hydrated block changed on 16. Hand-read: harmful on ~7 — "what is my dogs name ?" → "What is the name of the user's dog?" LOST the owner fact (Hanzo; the third-person rewrite no longer reads as a question about the owner); "show me all projects" → "cyberpunk Parthenon image generation examples" lost its exact lesson; "do a healthcheck" → "France fiscal crisis health check" lost the health lesson; "hello ghost, how's things today" → a kc_probe.py query pulled the "latest version" lesson; "Are you considering further degrees" → "Should I…" injected 6 unrelated CONSIDERS edges. Helpful on ~3 ("proceed." → the project-delete lesson; "what's up" / "ok" → the health-claims lesson). Median 0.9 s before the first token.
+**Expansion** (<10 words, no id/quote, a previous reply): fires on 166 turns; the hydrated block changed on 16. Hand-read: harmful on ~7 — "what is my dogs name ?" → "What is the name of the user's dog?" LOST the owner fact (Bruno; the third-person rewrite no longer reads as a question about the owner); "show me all projects" → "cyberpunk Parthenon image generation examples" lost its exact lesson; "do a healthcheck" → "France fiscal crisis health check" lost the health lesson; "hello ghost, how's things today" → a kc_probe.py query pulled the "latest version" lesson; "Are you considering further degrees" → "Should I…" injected 6 unrelated CONSIDERS edges. Helpful on ~3 ("proceed." → the project-delete lesson; "what's up" / "ok" → the health-claims lesson). Median 0.9 s before the first token.
 **Decomposition** (8+ words, compound, un-expanded): eligible on 118; changed 20 (106 had an empty plain block). Mostly off-topic additions: "verify the write" on scripted tool tests, the idiom lesson on a service restart and a web_search quote, "latest point release" on a reverse-engineering research request. Plausibly useful on 2 distinct requests (the recursive-thinking lesson minted from that same request — plain retrieval misses it, a retrieval gap noted, not chased; the deep-research escalation lesson on "do your own research"). Median 1.8 s.
 **Decision (within the approved item: "remove if it doesn't help"):** remove both. The conversation history reaches the main model regardless; only retrieval was affected, net negative, at 1-2 s per turn plus Nova slot load.
 ### §4NQ — done
 **Removed:** agent `_route_query_expansion`, `_has_concrete_reference` (+ id regexes), the legacy "Context: … | User intent: …" prefix, `PRE_REPLY_ROUTE_TIMEOUT_S`, the internal-request gate on hydration's LLM; bus `_decompose_query` → sync `_split_query` (the free "and also"/"as well as" split, behaviour identical to the old no-LLM path), `_is_compound_request`/`_COMPOUND_RE`/`_GREEK_RE`, `_extend_sub_queries`, `hydrate_context(llm_client=)`; `RoutingTask.EXPAND_QUERY`. The sub-query INFO line kept (a first cut dropped it; a test caught it).
 **Tests:** 13 obsolete tests deleted, 7 rewritten/inverted ("run it then" now reaches the lesson fetch as typed), new pin `test_a_short_follow_up_is_retrieved_on_the_users_own_words`. Battery 6/6 killed, NOOP green, tree clean. Docs: agent #4nq, bus #4nq, memory_hydration, node_offload, cli_reference, configuration, llm, skills.
 **Fresh reader:** 0 CRITICAL / 0 MAJOR; independently re-ran the suite and mutated the new pin (killed). MINORs fixed: bus.html signature still listed `llm_client`; stale llm.py/bus.py comments; the `_split_query` "|"/"Context:" skip existed only for the expanded string → removed (a message with a shell pipe now splits like any other, pinned); `test_self_contained_command_is_not_contaminated` could no longer fail → now asserts equality with the raw message; stale test names; web_server.html status example; llm.html route row. Accepted: `_EXPANSION_MARKER` fallback in `_intent_source_text` is unreachable from production (kept, still tested).
-**Suite:** 23,203 passed, 0 failed, 63 skipped. **Deployed** 21:02 (gated, fg=0). Probes (X-Ghost-Origin: probe): "and on everest?" follow-up → 71 °C, correct; compound B-tree/hash request → keyword split logged ("memory bus sub-queries (2)"), no worker call; "what is my dogs name ?" → "Hanzo", hydrated at +0.02 s (the case the rewrite used to lose). No expand/decompose worker call after the restart. **§4NQ closed.**
+**Suite:** 23,203 passed, 0 failed, 63 skipped. **Deployed** 21:02 (gated, fg=0). Probes (X-Ghost-Origin: probe): "and on everest?" follow-up → 71 °C, correct; compound B-tree/hash request → keyword split logged ("memory bus sub-queries (2)"), no worker call; "what is my dogs name ?" → "Bruno", hydrated at +0.02 s (the case the rewrite used to lose). No expand/decompose worker call after the restart. **§4NQ closed.**
 
 ## §4NR — scheduled tasks and watches cut (2026-10-11, operator: "Review jobs, cut tasks") — R0 scope, written first
 **Why:** item 2 was a review of scheduled tasks/watches (last reviewed §4LD, 10-04). Usage across every trajectory since July (incl. archives): the owner created ONE scheduled task ("utc_probe", prompt "probe") and ONE watch ("livetest", `test -d /workspace`) — both tests; `scheduled_tasks.json` has been empty since 09-20. Background jobs (jobs/delegate/swarm) are live (owner status 15, collect 8). Operator chose: remove scheduled tasks + watches, then review jobs (§4NS).
@@ -54366,16 +54366,16 @@ Instrument: each turn-1 request in the agent log matched to the llama task that 
 ## §4OM — memory correctness follow-up: free-form graph writes off + cleanup (2026-10-13 21:40–22:10, operator: "let's go with Memory correctness" → "A, and proceed with the cleanup") — DONE, deployed pid 67607
 - **Correction recorded.** My recommendation said "46 % of memory writes were right". That was the §4NG ANSWER census; §4NG's memory measurements were the profile 18/18 true, the graph 30 % true / 60 % noise, the vector store 84 % true, with a repair on 10-10. So this was scoped as a three-day follow-up, not a new review.
 - **Three-day check (writes since the 10-10 repair):**
-  - Profile: 2 writes, both true (Hanzo, stated by the owner 10-11), but stored twice (`assets.dogs` + `pet.dog_name`).
-  - Vector: 20 rows, accurate (request episodes, one approved rule), but Hanzo stored 3 times.
+  - Profile: 2 writes, both true (Bruno, stated by the owner 10-11), but stored twice (`assets.dogs` + `pet.dog_name`).
+  - Vector: 20 rows, accurate (request episodes, one approved rule), but Bruno stored 3 times.
   - Graph: 7 edges, 5 noise. A question as a fact (`user ASK family information`), a generic object (`user HAS_FAMILY family`), a request as a want (`user WANTS_TO_CREATE webos`), a project id (`user MANAGES project b874…`), and a hypothesis the owner asked to test, stored as a world fact. The §4KY attribution gate dropped many others but does not recognise questions-as-statements, requests or hypotheses.
   - Also seen: a `recall` for the dog's name ranked PostgreSQL PDF chunks first (the answer still came from the profile).
 - **Operator decision "A":** `GHOST_GRAPH_FREEFORM` (default 0) gates the three model-extraction writers: the per-turn smart-memory triplets, the `remember` tool's bus path and its legacy path. Kept: owner profile mirrors (`sync_owner_mirrors`), project nodes, project concepts (lexicon), owner corrections that remove edges. Tests: conftest sets it to 1 so the legacy writer pins keep testing the writer logic; `tests/test_4om_memory.py` pins the production default. Battery mut_om 4/4. Suite 23,889 passed.
 - **Cleanup:** `scripts/memory_repair_4om.py` + `.json` (operator-approved plan). Rehearsed on a copy, then applied with the agent fully stopped (SIGTERM → bootout → apply → bootstrap).
-  - Removed: 6 graph rows (5 noise + the `HAS_DOGS` mirror), 2 vector rows (the extra Hanzo copies), the profile field `assets.dogs`.
+  - Removed: 6 graph rows (5 noise + the `HAS_DOGS` mirror), 2 vector rows (the extra Bruno copies), the profile field `assets.dogs`.
   - Kept: `pet.dog_name`, `HAS_DOG_NAME`, the identity row.
   - Backup `system/memory.pre-4om-20261013T220232.bak`; vector archive `memory/vector_repair_archive_4om.jsonl`.
-- **Probes:** "what's my dog's name?" → Hanzo. "What do you know about me?" → exactly the profile, the dog listed once. No graph write after the restart.
+- **Probes:** "what's my dog's name?" → Bruno. "What do you know about me?" → exactly the profile, the dog listed once. No graph write after the restart.
 - **Open:** recall ranks documents above personal facts (seen once); re-census ~2026-10-24.
 
 ## §4ON — does the learning loop earn its place? keep / fix / remove (2026-10-13, operator: "evaluate the learning-loop") — R0 scope, written first
@@ -54902,7 +54902,7 @@ Live slack-c7 13:52: an uploaded photo of one person + a named other → `ERROR:
 - **Method:** four readers on a copy — (1) the coding workflow in the turn loop: planning, the write→run→fix cycle, the no-progress and same-error breakers, cut-write continuation, what the reply is allowed to claim (prompts + `core/agent.py` coding paths + `core/prompts.py`); (2) `execute` and how its output is read: exit codes, test-runner output, the "working" declaration, promoted jobs, the WEB-EXEC/service checks; (3) the verifier's mechanical arms for code claims (claim binding on "works/tested", the unverified-mutation cap, the FILE-ARTIFACT check); (4) a blind quality grading of real produced code from this week's corpus (WebOS, Minecraft, the pg_backup scripts) by a reader who did not write it; plus my corpus lens. Then fixes, pins, the two-tier battery, R3 on the diff, suite, deploy, probes (a coding turn that must run its test; a turn whose test fails).
 
 **R1–R4 findings (verified on the live tree; ledger in the session scratchpad `findings_4ph.md`).**
-- *Corpus refinement:* of the 82 works/tested/verified replies — 27 ran the written file, 24 checked an HTML page in the browser, 9 ran something else, 27 ran NOTHING (most are report-.md turns where "verified" is prose about sources; the real unbacked code claims: `dvda_schematic.html` "works", `sim.py` "working", `webos/index.html` "functional", `watch_pg_backup.sh` "works"). The 58 write/edit refusals are ALL July–August (the pre-`edit` replace op) — zero since September, not a current defect. 1 of 158 turns ran a test runner.
+- *Corpus refinement:* of the 82 works/tested/verified replies — 27 ran the written file, 24 checked an HTML page in the browser, 9 ran something else, 27 ran NOTHING (most are report-.md turns where "verified" is prose about sources; the real unbacked code claims: `engine_schematic.html` "works", `sim.py` "working", `webos/index.html` "functional", `watch_pg_backup.sh` "works"). The 58 write/edit refusals are ALL July–August (the pre-`edit` replace op) — zero since September, not a current defect. 1 of 158 turns ran a test runner.
 - *Reader 4 (blind grade of the two RELEASED apps):* both "with fixes", neither done. Jiu Jitsu Calendar: previous-month cells off by one (May 31 drawn as 30; January leading cells dated `2025-13-28`, POSTed and accepted — no date validation); one FK-violating request leaves the sqlite connection open → every later write "database is locked"; PUT drops `type`; stored XSS via notes/type into innerHTML; a 100-line dead second script block; the owner's live data.db shipped inside the "immutable" release. Chess Coach v3: the recovery path calls `chess.Move.from_san` (does not exist → 500); lost-update race (`load_state` outside the lock); a corrupted slot wedges every route; the user's move is computed and never sent to Ghost; CDN hot-links. Both passed `release` with "Verified: calendar render" — a rehearsal that renders pages, no test run.
 - *Reader 1 (workflow + prompts):* R1-1 MAJOR the only "did you run it" guard (`_is_unverified_mutation`) keys on the LAST tool — a trailing edit/read/`ls` or a write under 2,048 chars disarms it. R1-2 MAJOR same-error breakers never fire when numbers change (`normalise_volatile` keeps digits: assert-mismatch and traceback-line loops run to the cap) and `No module named 'foo'`/`'bar'` collapse to one error. R1-3 MAJOR no standing rule asks to run/test: `execute` "ONLY AS A LAST RESORT", rule 8b "do NOT save or run it unless the user says run/test", rule 9 "EXIT CODE 0 → STOP", think (d); rule 10's "the verifier will REFUTE it" is stale. R1-4 MAJOR rule 8b contradicts FILE CREATION. Minors: specialist edit rules teach the retired replace envelope; `.sh`/`.html` get no syntax check at write; `request_forbids_running` edge phrasings.
 - *Reader 2 (execute results):* R2-1 MAJOR `pytest … || true` / `python x.py; ls` → EXIT CODE 0 (the last list member's), no strike, no banner, world-changed credit. R2-2 MAJOR every 124 stamped "killed after 600s" (no elapsed check) and classified RETRYABLE ("may work if you issue it once more") beside a hint saying re-running dies the same way; the model's own `timeout 60` blamed on the budget; never a strike. R2-3 MAJOR docker `exec_inspect` → `ExitCode: None` (streamed exec inspected before the daemon records the exit) → `int(None or 0)` = 0 over a traceback; script path printed "EXIT CODE: None". R2-4 MAJOR `nohup python3 app.py &` (not server-shaped) → EXIT CODE 0 + empty body whatever happens; the jobs path unlinks the log the child inherited. Minors: broken-pipe TEXT forgiveness forgave any exit code (a 124 kill); `exec_exit_code` read a `[sandbox job … EXIT CODE: 0]` fragment anywhere; `[SANDBOX INFRA ERROR]` classified DIAGNOSTIC + strike; PIPESTATUS reported the LAST non-zero stage (grep's 1 over python's 2). Sound: plain failures through command/filename, pipefail + PIPESTATUS + upstream-stage rule, truncation keeps the failing tail, promotion UNRESOLVED, kill codes, wrong-dir heals, stateful kernel, refusals REJECTED.
@@ -55678,7 +55678,7 @@ Accepted:
 
 ## §4QC — one Slack message, one turn: the bot drops duplicate deliveries and logs each event (operator, 2026-10-20: "why did the agent generate 2 pictures?" → "yes, add the dedup and the event logging")
 
-**Incident** (2026-10-19 23:10, slack-58 and slack-52). A member posted ONE message in thread C56FKAHTP/1792440277.327819: "@Ghost dress this lady in the image i am attaching as a witch" with a photo, ts 1792440607.38. I checked the thread with conversations.history/replies; there was no second post.
+**Incident** (2026-10-19 23:10, slack-58 and slack-52). A member posted ONE message in thread C0CHANNEL1/1792440277.327819: "@Ghost dress this lady in the image i am attaching as a witch" with a photo, ts 1792440607.38. I checked the thread with conversations.history/replies; there was no second post.
 
 What the bot did with it:
 - `handle_mention` ran twice.
@@ -55904,7 +55904,7 @@ The §4QG per-member ownership check is removed at its three readers: `_member_t
 **Replay running.** 21 read-only single-turn labelled cases (gold 17, census 7 — after dropping a service stop and two "again" follow-ups) in two hold-out halves (each half's own trajectories excluded from the index while it runs; a repeat of the same wording sits in the other half), 3 samples × 2 arms, interleaved per case, probes only. Pool, blind grading (4 fresh graders, the §4PM brief) and the paired score follow.
 
 ## §4QM — provenance-typed, time-valid owner facts: the fact ledger (operator, 2026-10-21: "proceed with 1 then 2. prove it helps before deploying it." / "i will leave you unattended to complete these 2 features") — R0 scope, written first
-**Why.** The owner's facts carry a birth date (`as_of`, §4EM) but no death and no source: a replaced singleton keeps ONE `previous`; a removed list value goes to a 30-day archive; an owner graph edge expires silently (13 rows carry `valid_until`); nothing records WHICH request stated a fact or the owner's own words. So "since when do you know where I live?", "what car did I have before?", "why do you think my wife is called X?" cannot be answered, and a wrong fact (§4KY: a doctor, a heart attack from a question) cannot be traced to the line that put it there. The data: 20 profile fields, 121 live owner edges, 46 owner self-questions in 1,606 owner turns (mostly ages, the dog's name, where I live), 54 change-like statements. The 2026 evidence: provenance-typed facts with validity beat curated summaries after nine weeks (2607.21962), SodaMem's mandatory provenance span (2608.08055), MemTX's staged beliefs with evidence (2607.23929); Devin, Codex, Copilot, Perplexity and ChatGPT all ship per-memory sources in 2026.
+**Why.** The owner's facts carry a birth date (`as_of`, §4EM) but no death and no source: a replaced singleton keeps ONE `previous`; a removed list value goes to a 30-day archive; an owner graph edge expires silently (13 rows carry `valid_until`); nothing records WHICH request stated a fact or the owner's own words. So "since when do you know where I live?", "what car did I have before?", "why do you think my wife is called X?" cannot be answered, and a wrong fact (§4KY: a doctor, a broken wrist from a question) cannot be traced to the line that put it there. The data: 20 profile fields, 121 live owner edges, 46 owner self-questions in 1,606 owner turns (mostly ages, the dog's name, where I live), 54 change-like statements. The 2026 evidence: provenance-typed facts with validity beat curated summaries after nine weeks (2607.21962), SodaMem's mandatory provenance span (2608.08055), MemTX's staged beliefs with evidence (2607.23929); Devin, Codex, Copilot, Perplexity and ChatGPT all ship per-memory sources in 2026.
 **Property.** Every write, replacement, expiry and removal of an OWNER fact (a profile value; a `user …` graph edge) leaves an append-only ledger row: when, store, field, value, the event, the request id and, when known, the owner's own sentence; a replaced or removed value stays readable as history with its interval; the ledger never changes which facts are LIVE (no write path's result changes); its lines reach a prompt only on a first-person question about the owner, behind `GHOST_FACT_HISTORY` / the probe arm `fact_history`, and `recall` on such a question shows the field's history; a probe's, a member's or a background job's write is refused before the ledger as today.
 **Threat model.** Trusted: the profile and graph writers (this process), the trajectory corpus. Untrusted: the extractor's proposed values (attribution gates them before any write), the request text (recorded verbatim as the owner's words, ≤ 200 chars, owner store only — egress scrub at dispatch is unchanged), the model's recall query (matching only).
 **Out of scope (deliberately).** Moving-target WORLD facts stay refused at every writer (§4MM, an operator-measured decision; feature 1's EXPERIENCE block carries the sources for those questions instead); the vector mirror rows (they follow the profile field, `sync_owner_mirrors`); a web-UI history view; rewriting any live value during the backfill (unattributed facts are LISTED for the owner, never changed).
@@ -55918,14 +55918,14 @@ The §4QG per-member ownership check is removed at its three readers: `_member_t
 **§4QM fresh-eye review r1 (2026-10-22, snapshot tree, 17 findings, 4 MAJOR) — all fixed:**
 - MAJOR hydration excluded only the profile's policy set, not its on-demand RULE: `root.appearance_description` and `root.home_address` rendered (`is_on_demand` covers `*_description`, address-like keys, street-looking values) → `lines_for_question(..., exclude=predicate)`, the bus passes `prof.is_on_demand(c, k, fields, value=v)`; a failing profile rule now returns NO lines (was: unscrubbed).
 - MAJOR the backfill seeded a replaced singleton's PREVIOUS value as a live `replaced` row (and `provenance_for` returned it as stated) → the live value is `replaced` with `prev_value`, the previous value `backfilled` on its own stamp or "undated".
-- MAJOR `owner_statements` took "do you remember my wife fotini" / "tell me about my car bmw" / "remind me where i live athens" for statements (only a trailing "?" excluded a question) — the backfill attributed facts to them and the live extractor would have WRITTEN wife = fotini → `_QUESTION_OPENER` (wh-words, auxiliary + you/i/we…, tell/remind/show me, τι/πού/ποιος/πότε/πώς/γιατί/θυμάσαι/πες μου) skips such sentences before the first-person/imperative test.
-- MAJOR `current_source` stored the first 200 chars of the WHOLE request unredacted — a token pasted beside "my car is a Ducati" went into the ledger and would come back in a prompt line → `current_source(via, value, field)` keeps only the owner's clause that states the value (`attribution.owner_clause_for`: raw words, predicate cue first — "We moved to Athens in May" beats "I was in Athens for a wedding" for a home —, then coverage), and `record()` redacts every `said` (`distill.redact`).
+- MAJOR `owner_statements` took "do you remember my wife elena" / "tell me about my car bmw" / "remind me where i live athens" for statements (only a trailing "?" excluded a question) — the backfill attributed facts to them and the live extractor would have WRITTEN wife = elena → `_QUESTION_OPENER` (wh-words, auxiliary + you/i/we…, tell/remind/show me, τι/πού/ποιος/πότε/πώς/γιατί/θυμάσαι/πες μου) skips such sentences before the first-person/imperative test.
+- MAJOR `current_source` stored the first 200 chars of the WHOLE request unredacted — a token pasted beside "my car is a Triumph" went into the ledger and would come back in a prompt line → `current_source(via, value, field)` keeps only the owner's clause that states the value (`attribution.owner_clause_for`: raw words, predicate cue first — "We moved to Athens in May" beats "I was in Athens for a wedding" for a home —, then coverage), and `record()` redacts every `said` (`distill.redact`).
 - minors: graph chatter (`ASKED_ABOUT`, `GREETED`) recorded as facts → `_is_owner_fact` filter; every profile fact rendered twice (its `HAS_<KEY>` mirror) → mirror writes/deletes not recorded, backfill skips mirror edges; graph rows written before `commit` / profile rows before `save` → queued and written after; cap eviction (8 values) left "since …" rows → `removed … capped at 8`; UTC days → local; `_epoch` silently "today" → None, backfill "undated"; backfill re-seeded double-spaced values → normalised compare; `recall` gate `_asks_about_owner OR history words` showed `interests.languages = python` for "history of python" → owner question only, history words widen the limit; 24 restatements hid the replaced row → `history(distinct=True)` groups in SQL; the extractor's rows had `req_id ""` → the smart-memory journal item carries the turn's id through the drain; `said` was the FOLDED clause → raw words kept.
 - Pins: tests/test_4qm_fact_ledger.py 19 → 29 (incl. a subprocess run of the backfill on a temp home: dry run writes nothing, previous/live dating, a question attributes nothing, mirror skipped, undated, second `--apply` idempotent); the request-id pin is an AST enumeration (the text pin tripped the §R4 ratchet). Battery: 43 → 65 mutants (R1–R22 on the fixes), run 3 in progress; review r2 on a snapshot in parallel.
 **§4QM battery run 3 (65 mutants; controls right): 58 killed; survivors F4 (dead `seen` block once `distinct=True` grouped in SQL — removed), G1 (the `user`-end check became redundant with `_is_owner_fact` for a world edge with a chatter predicate — pinned with a durable-predicate world edge `maria LIVES_IN London`), R10 (the fail-closed pin was VACUOUS: a MagicMock `is_on_demand` excluded every row — fixed), R11 (23:30 local is the same UTC day east of Greenwich — 00:30), R20 (profile rows already carried "undated"; only a graph edge with NULL `valid_from` reaches the branch — pinned with one); G5 NOCOMP (its replacement left an empty `if`).**
 **§4QM fresh-eye review r2 (snapshot, 16 findings, 4 MAJOR) — all fixed:**
 - MAJOR live-extractor regression: the r1 question opener dropped real statements — "can you remember that I live in Athens", "May I remind you …", "Did I mention I moved", "When I was 20 I lived in Patras", and the Greek "Ποτέ μην ξεχάσεις …" (`ποτε` is "never" as often as "when" and cancelled the imperative it was meant to keep) → wh-word not followed by "i"; `did/have I` passes before mention/tell/say/remember; a modal + you/i/we passes before remember/note/keep/save/store/record/forget/remind; `ποτε` left to the imperative rule.
-- MAJOR the r1 fix was incomplete: "hi, do you remember my wife fotini" / "I wonder, do you remember …" still passed (the opener was anchored at the sentence start) and `owner_said` said "stated" → `_LEAD_IN` (greetings, vocatives, fillers) stripped first, the opener tested per clause too.
+- MAJOR the r1 fix was incomplete: "hi, do you remember my wife elena" / "I wonder, do you remember …" still passed (the opener was anchored at the sentence start) and `owner_said` said "stated" → `_LEAD_IN` (greetings, vocatives, fillers) stripped first, the opener tested per clause too.
 - MAJOR an undated legacy value (no stamp; a graph edge with NULL `valid_from`) rendered "since <the backfill day>" → `render_row` says "date unknown"; a backfilled previous value rendered as live → "stated <day>, later replaced".
 - MAJOR vacuous fail-closed pin (above).
 - minors: the extractor's GRAPH rows carried no id and no words (the profile leg had the fix) → the graph write passes `source={req_id, via, episode}` and `_ledger_record` finds each edge's clause in the owner's turn; the question's words matched only the newest row of a group → `GROUP_CONCAT` of said/prev_value in the hay; `delete()` of a replaced singleton dropped its previous value silently → second `removed … (previous)` row; "don't forget I live in Athens" counted as a NEGATION (pre-existing) → excluded; R11 pin timezone; F4/R20 equivalent mutants.
@@ -55933,19 +55933,19 @@ The §4QG per-member ownership check is removed at its three readers: `_member_t
 - Pins 29 → 34 (+ `test_agent_graph_integration` repinned for the graph write's source); battery 65 → 74 (R23–R32), run 4 in progress; review r3 in parallel.
 **§4QM battery run 4 — stopped by SIGTERM at 23/74 (the harness restores on SIGTERM; `identical=True` checked against the review snapshot) because review r3 found MAJORs that change the tree; its 23 verdicts were all KILLED.**
 **§4QM fresh-eye review r3 (snapshot, 11 findings, 2 MAJOR) — NOT converged; the question-opener rule had now flip-flopped twice (r1 too wide, r2 too wide the other way), so it was NARROWED to its two real shapes instead of widened again:**
-- MAJOR the r2 per-clause opener dropped RELATIVE clauses — "My wife, who is called Fotini, is a doctor" lost "Fotini" and the live extractor refused the fact → the clause-level test (`_CLAUSE_ASKS`) has no wh-word alternative; the wh-word test is sentence-level only.
-- MAJOR `remind`/`forget` in the modal exception let "can you remind me where my wife fotini works" / "can you forget my ex-wife maria" through as statements (the r1 shape again) → a plain auxiliary + you ("do you remember …") ALWAYS asks; a modal + you asks unless a RETENTION verb follows (remember/note/keep/save/store/record); an auxiliary/modal + I/we asks unless a TELLING verb follows (mention/tell/told/say/said/remember/remind). My first cut of this applied the retention exception to every auxiliary and let "do you remember my dog Hanzo" through — caught by the existing pin before the battery.
+- MAJOR the r2 per-clause opener dropped RELATIVE clauses — "My wife, who is called Elena, is a doctor" lost "Elena" and the live extractor refused the fact → the clause-level test (`_CLAUSE_ASKS`) has no wh-word alternative; the wh-word test is sentence-level only.
+- MAJOR `remind`/`forget` in the modal exception let "can you remind me where my wife elena works" / "can you forget my ex-wife maria" through as statements (the r1 shape again) → a plain auxiliary + you ("do you remember …") ALWAYS asks; a modal + you asks unless a RETENTION verb follows (remember/note/keep/save/store/record); an auxiliary/modal + I/we asks unless a TELLING verb follows (mention/tell/told/say/said/remember/remind). My first cut of this applied the retention exception to every auxiliary and let "do you remember my dog Bruno" through — caught by the existing pin before the battery.
 - minors: wh-word before we/my/our ("When we moved to Patras …") was a question → excepted; `_TOLD_VERBS` lacked past forms ("have I told you …"); the accented Greek question words could never match folded text ("Πότε σου είπα ότι μένω στην Αθήνα" stated Αθήνα) → tested with the accent on the RAW sentence, the folded ambiguous "που" (= "that") left alone; R23 survived because the clause-level lead-in strip made the sentence-level one redundant → one strip, sentence level, in both `owner_statements` and `owner_clause_for`; `delete()` recorded the seeded "User" placeholder as a removed previous value → skipped.
 - Notes kept: `_LEAD_IN` is a fixed list ("by the way do you remember …" still attributes) — not extended without a corpus measure; R32 is killed by an AST pin only (no test drives `run_smart_memory_task` into the ledger); `distinct=True` has no LIMIT; a bus with no profile renders unscrubbed (unreachable: production always attaches one, members get no bus).
 - Pins 34 → 34 (+ 13 cases), battery 74 → 80 (R33–R38), run 5 in progress; review r4 (convergence check with a 40-sentence probe list and mutant replay) in parallel.
 **§4QM battery run 5 — stopped by SIGTERM at 25/80 (all KILLED so far; restored, identical to the review snapshot) for the r4 fixes.**
-**§4QM fresh-eye review r4 (convergence check: 102-sentence probe + every R23–R38 mutant replayed on a private copy — all 16 killed; the r3 fixes and the ledger code verified correct). NOT converged on ONE thing: the shared statement-vs-question rule `owner_statements` (the §4KY write gate), 35/102 probes wrong — mostly PRE-EXISTING gaps (an auxiliary before a noun phrase: "is my wife fotini a doctor" / "was my previous car the audi" STATED; Greek ";" is the question mark and was a terminator, so every Greek question stated; Greek states person in the verb, "Μετακόμισα στην Πάτρα" had no first-person marker), plus two r1-era regressions of mine ("could you also remember that I live in Athens" dropped: only "please" could precede the retention verb; indirect questions "I wonder if you remember my wife fotini" stated).**
-- Decision (§4QB lesson, unattended): a lexical gate reviewed round after round does not converge — four rounds, each with new sentences. The reviewer's probe-verified patch (35 → 9 wrong of 102; the three gate test files green) was taken ONCE, with three more items (numeric values get words for `said`; stop words never pick the clause; tag questions "…, right" ask), pinned (28 new sentence cases + 2 clause cases) and mutated (R39–R46); the review loop on this regex STOPS here. The residual 9 wrong probes are reported for the operator, not gated further: "could you remember my wife's name, fotini" states (by design), unaccented Greek question words state ("που μενω, στην Αθηνα"), "by the way do you remember …" states (`_LEAD_IN` is a fixed list, not extended without a corpus measure), `_ROLE_PLAY` empties an episode on "you're my assistant, remember that …" / "I work as a character designer" (pre-existing §4KZ), the cue-filtered graph gate misses a value in a relative clause (dead: free-form graph writes OFF §4OM). Net effect on the LIVE gate versus before §4QM: strictly fewer facts written from questions, the realistic instruction shapes restored.
+**§4QM fresh-eye review r4 (convergence check: 102-sentence probe + every R23–R38 mutant replayed on a private copy — all 16 killed; the r3 fixes and the ledger code verified correct). NOT converged on ONE thing: the shared statement-vs-question rule `owner_statements` (the §4KY write gate), 35/102 probes wrong — mostly PRE-EXISTING gaps (an auxiliary before a noun phrase: "is my wife elena a doctor" / "was my previous car the audi" STATED; Greek ";" is the question mark and was a terminator, so every Greek question stated; Greek states person in the verb, "Μετακόμισα στην Πάτρα" had no first-person marker), plus two r1-era regressions of mine ("could you also remember that I live in Athens" dropped: only "please" could precede the retention verb; indirect questions "I wonder if you remember my wife elena" stated).**
+- Decision (§4QB lesson, unattended): a lexical gate reviewed round after round does not converge — four rounds, each with new sentences. The reviewer's probe-verified patch (35 → 9 wrong of 102; the three gate test files green) was taken ONCE, with three more items (numeric values get words for `said`; stop words never pick the clause; tag questions "…, right" ask), pinned (28 new sentence cases + 2 clause cases) and mutated (R39–R46); the review loop on this regex STOPS here. The residual 9 wrong probes are reported for the operator, not gated further: "could you remember my wife's name, elena" states (by design), unaccented Greek question words state ("που μενω, στην Αθηνα"), "by the way do you remember …" states (`_LEAD_IN` is a fixed list, not extended without a corpus measure), `_ROLE_PLAY` empties an episode on "you're my assistant, remember that …" / "I work as a character designer" (pre-existing §4KZ), the cue-filtered graph gate misses a value in a relative clause (dead: free-form graph writes OFF §4OM). Net effect on the LIVE gate versus before §4QM: strictly fewer facts written from questions, the realistic instruction shapes restored.
 - Battery 80 → 88 (R39–R46), run 6 in progress (the last before the suite).
 **§4QM battery run 6 (88 mutants; controls right): 85 killed; survivors G5 (no pin called `delete_edge` directly once the mirror path stopped recording) and R10 (the fail-closed pin's row shared no word with its question — empty either way) → both pinned, rerun KILLED. Final: 88/88; §4QL 54/54.**
 **Suite (2026-10-22 03:20): 25456 passed, 63 skipped; two failures fixed first — the lint ratchet (`best_label` subscripted an Optional; two unused imports in fact_ledger.py) and `test_agent_smart_updates` (the extractor's profile write now carries `source=`); `test_memory_bus::test_publish_fact_concurrent_fanout` failed once under the 12-worker load (a 50 ms-vs-200 ms timing assertion; 3/3 green alone, untouched by this work).**
 **Deployed BOTH OFF (pid 27784, boot 03:10; gated foreground 0; SIGTERM; the ledger backfill ran in the restart window on its 3rd try once the agent had released the writer lock — the restarted agent exits 75 until the lock is free, launchd retried).** Backfill `--apply`: 2315 owner statement clauses in the corpus; 41 facts seeded (28 attributed to the owner's own clause, 13 UNATTRIBUTED and listed below), 98 topical owner edges skipped (not life facts), 0 `replaced` (the live profile holds no previous values), 0 `expired` (the 3 expired owner edges are `LOCATED_IN` trips, not life facts). Boot: "fact ledger — 41 rows of the owner's fact history; OFF in prompts", "experience memory — 350 human-graded past turns indexed; OFF in prompts".
-- UNATTRIBUTED owner facts (seeded without words, dated by their stamp; for the owner to confirm — nothing changed): `root.address` (Makedonias 83 …, 2026-07-08), `root.role` = "Runs EvolMonkey" (10-03), `preferences.memory_usage_note` (10-13), `relationships.fotini_description` (09-06), `relationships.wife_birthdate` = 1982-01-10 (10-03), `relationships.sons` Thodoris (born 2016-11-25) and Leonidas (born 2026-03-12) (09-04), `interests.hobbies` = "Technology (special interest in AI)" (07-08), graph `lives_in` = "thrakomakedones near athens" (09-04), `has_interest` = ai (09-21), `has_condition` = "heart failure" and "blood clot", `has_medication` = entresto (all 10-03; §4KY: the only corpus mention of entresto was a QUESTION on 08-16).
+- UNATTRIBUTED owner facts (seeded without words, dated by their stamp; for the owner to confirm — nothing changed): `root.address` (Kaledonias 83 …, 2026-07-08), `root.role` = "Runs Orbitdata" (10-03), `preferences.memory_usage_note` (10-13), `relationships.elena_description` (09-06), `relationships.wife_birthdate` = 1982-01-07 (10-03), `relationships.sons` Markos (born 2016-11-22) and Kosmas (born 2026-03-09) (09-04), `interests.hobbies` = "Technology (special interest in AI)" (07-08), graph `lives_in` = "kalopetres near athens" (09-04), `has_interest` = ai (09-21), `has_condition` = "asthma" and "hay fever", `has_medication` = ventolin (all 10-03; §4KY: the only corpus mention of ventolin was a QUESTION on 08-16).
 - Smoke (03:15, probes): arm `fact_history` on "since when do you know where I live and what company I own?" → `h=3` (three ledger lines hydrated; the reply dated the company 2026-07-08 and the location 2026-07-07 from them); no arm → `h=0` (the reply still dated both from the profile's `as_of` stamps); arm `experience` on the PostgreSQL question → `x=2`. Both switches hold.
 **§4QL/§4QM proof replays, round 1 (chain 03:18 → 05:26, 0 error rows; pools built with the census packet redaction, arm/case key kept out; 4 fresh blind graders per pool with the §4PM brief).**
 - §4QL experience tier (126 replies: 21 cases × 2 arms × 3 samples; half-of-wordings hold-out re-synced on a COPY of the index per half; served lines recomputed under each hold-out). DECISION SET = block present in the experience arm AND the request passes the ≤5-token hydration gate, c01/c13 excluded (their recipe steers into `scratchpad`, which refuses probes): 8 cases / 5 wordings, n=24 per arm. base RIGHT 12 PARTIAL 7 WRONG 5 → experience RIGHT 15 PARTIAL 4 WRONG 5: paired RIGHT **+20.0 points** (95% CI −3.3 … +46.7, clustered by wording), WRONG **−3.3** (−20 … +16.7), mean 0–2 +0.23 (−0.10 … +0.57). The rule fixed beforehand (RIGHT ≥ +10 AND WRONG not up) is MET on the point estimate; the CI includes zero and the MDE (~+20) equals the estimate. NOISE FLOOR (same code, two labels, no block in either arm; 11 cases / 10 wordings, n=32): RIGHT −11.7 (−28.3 … +1.7), WRONG +1.7 — a 12-point swing arises with no treatment at this size. Where it moved: the VUAA price wordings (c04 0→1 RIGHT of 3, c15 1→3: the served line said the earlier attempt was WRONG for calling BVME the Bulgarian exchange, and the replies stopped doing it); python/postgres/status wordings flat (one experience PARTIAL each on python 3.15.0-vs-3.15.1 and on 18.6's release date). Tell-tale replies 10 (5 are the c01/c13 probe refusals; the rest mention "last time"/"previous" — the block is visible to the model by design, not to graders).
@@ -55953,13 +55953,13 @@ The §4QG per-member ownership check is removed at its three readers: `_member_t
 - §4QM fact ledger (96 replies: 16 self-questions × 2 arms × 3 samples; `owner_records` in every packet as the graders' ground truth). The history block was served (h>0 in the `Hydration tiers` log line, mapped per request) for 10 cases; not served for h00/h01 (≤5-token gate), h02/h04 (the question names the son with no self-reference → `_asks_about_owner` false), h05 ("live" shares no word with `lives_in`/Athens — the word match has no stemming) and h15 ("list everything" shares no word with any row). DECISION SET (10 cases, n=30 per arm) as graded: base RIGHT 19 PARTIAL 3 WRONG 8 → fact_history RIGHT 15 PARTIAL 10 WRONG 5: RIGHT **−13.3** (−50 … +26.7), WRONG −10.0 (−36.7 … +10). FAILS the rule as graded. Reading the graders' reasons: (a) 8 of the 10 fact_history PARTIALs cite ONLY "July 8 vs the records' July 7" — my truth file used the UTC day of the profile stamp (2026-07-07T21:18Z) while the ledger renders LOCAL days by design (r1), and 21:18Z is 00:18 on July 8 in Athens: a measurement fault in `set.json`, not in the feature; (b) h12's truth said the birthdays were told 2026-10-03 (the profile stamp) but the trajectory shows the owner's message on 2026-09-04 07:50 local — the profile re-stamped the values on 10-03, so the LEDGER's backfilled date is a record date, not a statement date (backfill limit: `as_of` = last write; live rows carry the real turn), and the base arm's "48 days ago" was graded WRONG against a wrong truth; (c) the real failures of the block: the graph rows carry the edge's `valid_from` (vehicles 2026-09-21, medication 2026-10-03) and render "stated 2026-09-21", so the model told the owner "you told me on 2026-09-21" (h08 2 of 3, h09 1 of 3) — two conflicting dates for one fact, and the model picked the graph one. Wins: h10 (memory-usage note, WWW → RRR) and h11 (address never changed, WRW → RRR) where the block carried the exact date and the base arm invented one.
 - Truth corrected (July 7/8 both acceptable with the UTC/local reason; 09-04 for the birthdays; record stamps named as such) and the WHOLE 4qm pool re-graded blind by 4 fresh graders on a reshuffled pool (`4qm/r2/`, ids Z*); both gradings are reported. The switch `GHOST_FACT_HISTORY` flips ON only if the re-graded decision set meets the rule; the graph-row dating defect above is a fix for the ledger regardless (a backfilled graph row whose profile twin exists should carry the twin's statement date, or say "recorded <day>" rather than "stated").
 **§4QM re-grade on the corrected truth (4 fresh graders, reshuffled pool `4qm/r2`, 96/96): DECISION SET base RIGHT 21 PARTIAL 5 WRONG 4 → fact_history RIGHT 19 PARTIAL 7 WRONG 4: RIGHT −6.7 (95% CI −40 … +26.7), WRONG +0.0 (−26.7 … +23.3). FAILS the rule on both gradings → `GHOST_FACT_HISTORY` stays OFF (the ledger keeps being WRITTEN on every owner-fact change; nothing is shown).** What the block does: it helps exactly where its date IS the owner's statement (h10 memory-usage note WPW → RRR, h11 "address never changed" WWR → PRR) and hurts where its date is a STORE stamp presented as a statement — the seeded graph rows (`owns` 2026-09-21, `has_medication` 2026-10-03) and a profile value the extractor re-stamped (birthdays 10-03 for a 09-04 message): h08 RPR → WWR, h09 RRR → WRP, h12 RRR → PPP. The base arm gets those dates right from `introspect`'s trajectory search ("106.3 d ago", "47.9 d ago"), which reads the owner's actual turns. So today the ledger's backfilled dates are WORSE evidence than the trajectory log for "when did I tell you"; only rows the live agent writes at the owner's turn carry a true statement date, and there are none yet (41 seeded rows, 0 live). Re-measure after live rows accumulate (the self-question base rate is ~3% of owner turns), or when the backfill can take dates from the trajectory archive.
-- Fix shipped regardless (truthful rendering): a `backfilled` row renders "— on record since <day>" (undated: "on record since date unknown"; a seeded previous value "— on record <day>, later replaced"); only a `stated` row says "— since <day>". The backfill no longer seeds a graph edge whose value equals ANY profile value (`twins`: `owns bmw 118i` beside `assets.vehicles = BMW 118i` dated one fact twice, 2½ months apart). Pins: `test_backfilled_rows_say_on_record_and_stated_rows_say_since` + the two render pins and the backfill subprocess pin updated (`lives_in patras` is no longer seeded beside `location = Patras`; `has_condition asthma`, no twin, is); mutants R47 (seeded row claims a statement date), R48 (twin seeded), R18 re-anchored; battery rerun R18 R26 R27 R47 R48 + controls (battery8.log). The live ledger keeps its 9 already-seeded twin rows (append-only; deleting rows is the operator's call — they now render "on record since", which is true).
-- Not served, for the operator: `_asks_about_owner` needs a self-reference ("how old is leonidas" earns no history; "my son leonidas" would); the word match has no stemming ("live" ≠ `lives_in`); a listing question ("everything you know about me") shares no word with any row — a deliberate "list all" path would be a design addition, not a fix.
+- Fix shipped regardless (truthful rendering): a `backfilled` row renders "— on record since <day>" (undated: "on record since date unknown"; a seeded previous value "— on record <day>, later replaced"); only a `stated` row says "— since <day>". The backfill no longer seeds a graph edge whose value equals ANY profile value (`twins`: `owns bmw 320d` beside `assets.vehicles = BMW 320d` dated one fact twice, 2½ months apart). Pins: `test_backfilled_rows_say_on_record_and_stated_rows_say_since` + the two render pins and the backfill subprocess pin updated (`lives_in patras` is no longer seeded beside `location = Patras`; `has_condition asthma`, no twin, is); mutants R47 (seeded row claims a statement date), R48 (twin seeded), R18 re-anchored; battery rerun R18 R26 R27 R47 R48 + controls (battery8.log). The live ledger keeps its 9 already-seeded twin rows (append-only; deleting rows is the operator's call — they now render "on record since", which is true).
+- Not served, for the operator: `_asks_about_owner` needs a self-reference ("how old is kosmas" earns no history; "my son kosmas" would); the word match has no stemming ("live" ≠ `lives_in`); a listing question ("everything you know about me") shares no word with any row — a deliberate "list all" path would be a design addition, not a fix.
 **§4QL replication round 2 (chain2 05:37 → 06:38, 48 replies, 0 errors; 2 fresh blind graders) and the decision: `GHOST_EXPERIENCE_TIER` stays OFF.** Round 2 alone: base RIGHT 16 PARTIAL 3 WRONG 5 → experience RIGHT 13 PARTIAL 9 WRONG 2: RIGHT **−13.3** (95% CI −23.3 … −3.3), WRONG −20.0 (−60 … 0). POOLED (6 samples per arm, n=48): base RIGHT 28 PARTIAL 10 WRONG 10 → experience RIGHT 28 PARTIAL 13 WRONG 7: RIGHT **+3.3** (−6.7 … +13.3), WRONG −11.7 (−40 … +8.3), mean 0–2 +0.15 (−0.10 … +0.52). The pre-registered rule (pooled RIGHT ≥ +10 AND round 2 not reversing) is NOT met: round 1's +20 was the noise the no-block floor had already shown (±12 points). What the block reliably does is narrower than "more right answers": it stops a REPEATED graded-wrong specific — "VUAA BVME" never again called BVME the Bulgarian exchange (6 base replies WRONG → experience W W R P P P), and the status wording replies hedged more — so WRONG falls and PARTIAL rises while RIGHT does not move. The tier reaches only requests that pass the ≤5-token hydration gate and have a labelled near-twin (9 of 21 cases here; 0 of the short news/weather/greeting wordings), so its production footprint would be a few percent of owner turns either way.
 - Kept, OFF: the index (`experience.db`, 352 rows) keeps syncing from gold/census/👍👎 labels every 6 h (cheap, no prompt bytes); the probe arm `experience` stays for the next measurement. A re-measure is worth it once the labelled corpus has more REPEATED wordings with a graded-WRONG specific — that is the only shape the data says it fixes. Hold-out cleared (`--clear-exclusions`, 352 rows live).
 - Honest reading of the two features together: one blind replay each, with the fixed rule and fresh graders — neither earned its switch. Both stay deployed as measuring instruments (ledger written, index synced), both prompt blocks OFF, exactly as the operator asked ("prove it helps before deploying it").
 **Suite (2026-10-22 06:47, after the render fix): 25458 passed, 63 skipped. Redeployed 06:56 (gated foreground 0; SIGTERM; pid 27784 → 90273); boot lines "fact ledger — 41 rows …; OFF in prompts", "experience memory — 362 human-graded past turns indexed; OFF in prompts". Smoke: arm `fact_history` on "what do you know about my hobbies and since when?" → h=4, the reply says "recorded since 2026-07-08" (the seeded row's store date named as such); no arm → h=0, x=0. Both switches OFF; launcher carries neither variable.**
-- For the operator (decisions, nothing changed): (1) the ≤5-token hydration gate keeps every short owner question ("what's my dogs name ?", "where do i live ?", news/weather/greetings) away from ALL memory tiers, including these two — widening it is a prompt-cost decision; (2) 13 UNATTRIBUTED owner facts seeded without words (listed in the §4QM deploy entry — incl. heart failure / blood clot / entresto, the sons' birthdates, wife's birthdate, address, role) for the owner to confirm or forget; (3) the 9 seeded graph rows that twin a profile value (owns/has_hobby/has_spouse/married_to) stay in the append-only ledger, rendered "on record since" — deleting them is a one-off cleanup the operator can approve; (4) the statement-vs-question rule residue (9/102 probes) listed in review r4 — not gated further.
+- For the operator (decisions, nothing changed): (1) the ≤5-token hydration gate keeps every short owner question ("what's my dogs name ?", "where do i live ?", news/weather/greetings) away from ALL memory tiers, including these two — widening it is a prompt-cost decision; (2) 13 UNATTRIBUTED owner facts seeded without words (listed in the §4QM deploy entry — incl. asthma / hay fever / ventolin, the sons' birthdates, wife's birthdate, address, role) for the owner to confirm or forget; (3) the 9 seeded graph rows that twin a profile value (owns/has_hobby/has_spouse/married_to) stay in the append-only ledger, rendered "on record since" — deleting them is a one-off cleanup the operator can approve; (4) the statement-vs-question rule residue (9/102 probes) listed in review r4 — not gated further.
 
 ## §4QN — The four §4QM operator items and the 13 unattributed facts (2026-10-22, operator: "fix the 4 operator items and the 13 unattributed facts")
 
@@ -55967,12 +55967,12 @@ The §4QG per-member ownership check is removed at its three readers: `_member_t
 
 **1. The ≤5-token hydration gate (`core/agent.py`, `should_fetch_memory`).** `is_trivial_greeting` is ANY ≤5-word conversational message without "remember"/"previous"; it skipped every memory tier for "where do i live ?", "what's my dogs name ?", "news", "weather". The gate now skips only `_is_strict_trivial_chat(lc)` (the greeting/ack allowlist that already guards the fast path). Baseline probes before the change (6 short owner questions, probe-labelled): every one answered RIGHT from the PROFILE in the system prompt with no hydration line — the gate had been masked by the profile; only the lessons / experience / history tiers were unreachable. Hydration cost measured on the §4QM smoke: ~0.6 s to the hydrated-context line. Pins: `test_a_short_owner_question_hydrates_memory` (4 wordings, handle_chat harness, `bus.hydrate_context` awaited) and the strict greetings still not. Mutant Q1 (gate reverted) killed.
 
-**2. The 13 UNATTRIBUTED seeded ledger rows.** Not forgotten — attributed. A loose corpus search (every owner turn, not only first-person statement clauses) found the owner's own words for 11 of 13 and the §4KY/§4LC confirmations (2026-10-03) for the rest. Why the backfill missed them: its matcher wants a first-person STATEMENT CLAUSE with FULL word coverage — the address and hobbies sentences were split at commas ("…, Athens, Greece" / "…, with special interest in AI"), the birthdays were stated about the wife and sons without "my" ("fotini was born at 10 Jan 1982", "leonidas was born march 12 2026 , thodoris was born november 25 2016" — 09-04 07:45/07:50, the turns §4QM's replay truth already pointed at), the memory note's value is the extractor's paraphrase, the Fotini description came from a photo turn ("that's fotini", 09-06), the blood clot from "in my case it happened because of a clot, i am fine now, i take my meds" (08-01) and Entresto from "the doctor prescribed me a medicine called entresto, what is it ?" (08-16) — a statement clause inside a question sentence. Heart failure has no typed statement at all: the owner typed "heart attack" on 08-01 and corrected it in person on 10-03 (§4KY) — row carries `how = "confirmed by you on 2026-10-03"` and no words; role (Runs EvolMonkey), blood clot and Entresto carry both their clause and the confirmation.
+**2. The 13 UNATTRIBUTED seeded ledger rows.** Not forgotten — attributed. A loose corpus search (every owner turn, not only first-person statement clauses) found the owner's own words for 11 of 13 and the §4KY/§4LC confirmations (2026-10-03) for the rest. Why the backfill missed them: its matcher wants a first-person STATEMENT CLAUSE with FULL word coverage — the address and hobbies sentences were split at commas ("…, Athens, Greece" / "…, with special interest in AI"), the birthdays were stated about the wife and sons without "my" ("elena was born at 7 Jan 1982", "kosmas was born march 9 2026 , markos was born november 22 2016" — 09-04 07:45/07:50, the turns §4QM's replay truth already pointed at), the memory note's value is the extractor's paraphrase, the Elena description came from a photo turn ("that's elena", 09-06), the condition and the medication from two of the owner's own messages (08-01, 08-16; quotes withheld — health data) — a statement clause inside a question sentence. Asthma has no typed statement at all: the owner typed "broken wrist" on 08-01 and corrected it in person on 10-03 (§4KY) — row carries `how = "confirmed by you on 2026-10-03"` and no words; role (Runs Orbitdata), hay fever and Ventolin carry both their clause and the confirmation.
 New `scripts/fact_ledger_attribute_4qn.py`: takes an EVIDENCE file kept OUTSIDE the repo (it quotes the owner; scratchpad `ops/evidence_4qn.json`), verifies each clause is CONTAINED in an owner turn of the trajectory corpus at that minute (±2 min) or under that request-id prefix (≥8 chars) — otherwise the row stays UNATTRIBUTED and is listed — and UPDATEs said/req_id/how on rows marked `unattributed` only (idempotent). `--apply` takes the writer lock (§4MN; run in the restart window) and backs the db up to `system/backups/<stamp>-4qn/memory/` first; UPDATE+DELETE are one transaction. `render_row` shows a `how` that starts "confirmed by you" in the notes beside the owner's words, once. `at` was deliberately NOT re-dated to the statement time (consistency with every other seeded row: "on record since <store stamp>"); the words carry the date when it matters.
 
 **3. The seeded twins.** `--delete-twins`: a seeded graph row that carries the same value as a seeded PROFILE row in the ledger, adds no evidence of its own (said empty or equal to the profile row's, no confirmation) and is not named by the evidence file. Live: 7 deleted (owns ×3, married_to, has_spouse, has_memory_usage_tolerance, has_memory_usage); `has_hobby = brazilian jiu jitsu` KEPT (its own clause differs from the profile row's). The journal's "9" was a miscount — 8 twins by value, 7 by this rule.
 
-**4. The statement-vs-question residue (`memory/attribution.py`).** The r4 102-sentence probe re-run on the live tree: 7 wrong for the profile gate (the r4 entry's 9 counted the graph gate too). Fixed ONCE, narrowly: `_ROLE_PLAY` no longer fires on "you're my assistant/agent/helper/AI/ghost/memory, remember …" (an instruction, no role), on "character" + designer/artist/animator/… (a job), on "can't / cannot / couldn't imagine"; an unaccented sentence opening with που/πως/γιατι asks (`_GREEK_WH_UNACCENTED` + `_GREEK_ACCENT`; "που λες, …" filler excluded; ποτε stays out); a colon whose head names the ACT of reading/pasting/quoting or a document that "says" drops the tail (`_REPORTED_HEAD`). Probe: 7 → 2 wrong — "could you remember my wife's name, fotini" (by design) and the contrived "Imagine my surprise, we just moved to Patras". NOT extended further.
+**4. The statement-vs-question residue (`memory/attribution.py`).** The r4 102-sentence probe re-run on the live tree: 7 wrong for the profile gate (the r4 entry's 9 counted the graph gate too). Fixed ONCE, narrowly: `_ROLE_PLAY` no longer fires on "you're my assistant/agent/helper/AI/ghost/memory, remember …" (an instruction, no role), on "character" + designer/artist/animator/… (a job), on "can't / cannot / couldn't imagine"; an unaccented sentence opening with που/πως/γιατι asks (`_GREEK_WH_UNACCENTED` + `_GREEK_ACCENT`; "που λες, …" filler excluded; ποτε stays out); a colon whose head names the ACT of reading/pasting/quoting or a document that "says" drops the tail (`_REPORTED_HEAD`). Probe: 7 → 2 wrong — "could you remember my wife's name, elena" (by design) and the contrived "Imagine my surprise, we just moved to Patras". NOT extended further.
 
 **Review rounds (fresh eyes, private snapshots, every finding probed by running code).**
 - r1: 2 MAJOR + 8 MINOR. MAJOR-1: `_REPORTED_HEAD` as a NOUN list dropped the owner's own "My email: …", "My bio: …", "I read your email: … I live in Athens" → the head must name the act (verbs; "<document> says"; "here's a <document>"). MAJOR-2: value-only twin matching deleted `born_in = Athens` beside `location = Athens` and the only row carrying the owner's clause → twins need a seeded profile row with the value AND no evidence of their own; evidence-named rows kept. Minors fixed: "που λες" filler; `you’re` (typographic apostrophe) in `_ROLE_PLAY`; evidence matched among `unattributed` rows only (ALREADY/NO ROW/AMBIGUOUS); `how` re-marking a row unattributed rejected; request-id prefix ≥ 8; a row both attributed and deleted in one run; Q11 pin made behavioural (clause in the corpus). Reported, not changed: containment accepts a clause inside a question (by design for an operator-curated file).
@@ -55984,7 +55984,7 @@ New `scripts/fact_ledger_attribute_4qn.py`: takes an EVIDENCE file kept OUTSIDE 
 
 **Deployed 2026-10-22 06:29 (gated: foreground 0; SIGTERM; pid 90273 → 71524).** The repair ran `--apply` in the restart window on its 3rd try (writer lock, as the backfill did): backup `system/backups/20261022T062911Z-4qn/memory/fact_ledger.db`; **13 rows attributed, 7 twin rows deleted, 0 missing**; boot "fact ledger — 34 rows of the owner's fact history; OFF in prompts". Verified read-only after boot: 34 rows, 0 `unattributed`; rows 3/5/9/11/12/13/14/18/28/31/37/38/39 carry the owner's clause and/or the confirmation; graph rows left: has_activity, has_son ×2, lives_in, has_interest, has_hobby, has_address, has_condition ×2, has_medication. Both switches still OFF; the launcher is unchanged.
 
-**Smoke (probe-labelled, after deploy).** The same six short owner questions as the pre-deploy baseline: every one now carries a `Hydration tiers:` line (g=3 for "where do i live ?", g=2 for "what's my dogs name ?", 0 survivors for the rest — the tiers ran, nothing passed the floor); all six answered RIGHT as before (the profile had answered them already); latencies 9.1 / 3.4 / 6.0 / 3.6 / 21.8 (news, one tool) / 4.7 s against 14.1 / 6.6 / 6.9 / 3.4 / 29.3 / 5.8 s before — no cost visible above run-to-run noise. Two history-arm probes (`X-Ghost-Arm: fact_history`): "what medication do i take and how do you know?" → h=2, reply "Entresto … you told me on October 3rd, 2026 — your doctor prescribed it after a blood clot" — the §4QM failure mode intact: the model reads "on record since 2026-10-03 (you said: …; confirmed by you on 2026-10-03)" as a statement date even with the owner's words beside it (the clause is from 08-16; the block does not say so) — one more reason the switch stays OFF until live rows exist; "when did i tell you my sons' birthdays?" → h=4 but the reply came from `introspect`'s trajectory search ("about 106 days ago … 'My sons are Thodoris …'", the 07-07 first mention; the dates themselves were typed 09-04). Operator items of §4QM: all four closed; no new operator item.
+**Smoke (probe-labelled, after deploy).** The same six short owner questions as the pre-deploy baseline: every one now carries a `Hydration tiers:` line (g=3 for "where do i live ?", g=2 for "what's my dogs name ?", 0 survivors for the rest — the tiers ran, nothing passed the floor); all six answered RIGHT as before (the profile had answered them already); latencies 9.1 / 3.4 / 6.0 / 3.6 / 21.8 (news, one tool) / 4.7 s against 14.1 / 6.6 / 6.9 / 3.4 / 29.3 / 5.8 s before — no cost visible above run-to-run noise. Two history-arm probes (`X-Ghost-Arm: fact_history`): "what medication do i take and how do you know?" → h=2, reply "Ventolin … you told me on October 3rd, 2026 — your doctor prescribed it after a hay fever" — the §4QM failure mode intact: the model reads "on record since 2026-10-03 (you said: …; confirmed by you on 2026-10-03)" as a statement date even with the owner's words beside it (the clause is from 08-16; the block does not say so) — one more reason the switch stays OFF until live rows exist; "when did i tell you my sons' birthdays?" → h=4 but the reply came from `introspect`'s trajectory search ("about 106 days ago … 'My sons are Markos …'", the 07-07 first mention; the dates themselves were typed 09-04). Operator items of §4QM: all four closed; no new operator item.
 
 ## §4QO — Receipts: the reply cannot misreport what the turn did (operator, 2026-10-22: "proceed, prove it before deploying") — R0 scope, written first
 **Why.** The 145 blind-graded owner turns (gold 10-16 + 10-21) hold 65 WRONG/PARTIAL grades. Read one by one, about 40 are ONE class: the reply states something its own tool results contradict or never showed — the image tool said "You have NOT seen this image" and the reply described the picture (6); introspect said "Health: NOT checked" and the reply said "running smooth" (4); a refused deletion was reported as going ahead (4, all 10-15, since taken over by §4PN); no tool ran and the reply reported a live reading or an action (7); a LINK CHECK or panels warning the tool emitted was left out; counts and dates differed from the tool output. 59 of the 123 10-21 items carry such a caveat in a tool result ("NOT seen" 31, "do not claim" 28, "NOT checked" 12, "NOT deleted" 5, LINK CHECK 3). Six levers that ASKED the model to stay with the evidence were null (§4NH/§4NI); the two things that moved grades were binding a claim to a checked quote (§4OJ, +13 RIGHT) and a SYSTEM-written sentence where the state was exact (§4PN: 0/3 → right). This generalises the second.
@@ -56050,7 +56050,7 @@ New `scripts/fact_ledger_attribute_4qn.py`: takes an EVIDENCE file kept OUTSIDE 
 **Live (2026-10-23 08:58, production-path probe, no arm header):** render on Ghost → look "Routing request to Vision Node (Eva)" (3 s, the main model) → reply → "Routing verify-visual to Critic Node (Nova)", CONFIRMED 4.3 s. The look on main and the check on nova, exactly as the switch says.
 
 ## Licence (operator, 2026-10-23: "full open source for any use" → asked about AGPL vs PostgreSQL's licence → "let's go with BSD licence")
-`LICENSE` added: BSD 3-Clause, copyright 2026 Vasilis Ventirozos (change the holder line there if it should read Evolmonkey). README gained a License section naming the bundled MIT libraries (three.js, marked, mermaid — their notices stay inside the vendored files). No SPDX headers on the sources (the file-level licence plus README is sufficient; headers can be added later with one script if wanted). Note recorded for the operator: BSD is permissive — forks may go closed; the copyleft option (AGPL) was explained and declined.
+`LICENSE` added: BSD 3-Clause, copyright 2026 Vasilis Ventirozos (change the holder line there if it should read Orbitdata). README gained a License section naming the bundled MIT libraries (three.js, marked, mermaid — their notices stay inside the vendored files). No SPDX headers on the sources (the file-level licence plus README is sufficient; headers can be added later with one script if wanted). Note recorded for the operator: BSD is permissive — forks may go closed; the copyleft option (AGPL) was explained and declined.
 
 ## §4QV — the main Mac's memory, and the host prompt cache back on (operator, 2026-10-23: "my problem is that cache gets displaced" → "what does that do?" → ran the kickstart; then the cache measurement)
 **Premise.** Every displacement of the main slot (a vision call, a member turn, idle work) re-read the 28,800-token head: 15 of 104 owner turns in the week paid ≥25 s at Turn 1 (6 after the owner's own turn — three of them 108/208/778 s, a stalled machine, not a cache miss; 4 the post-reply pixel check, fixed by §4QU; 3 idle work; 1 a re-warm; 1 a probe), plus every image turn's reply after the look (36 s). The operator rejected splitting the context (-np 2) and trimming the head (19.1k tokens of tool schemas measured per tool with the server's template + tokenizer; `ops/look/tool_tokens.json`); the host prompt cache (`--cache-ram`) was the remaining lever, and §4OH had switched it off on 10-13 (saves 10–50 s, 0 restores).
@@ -57483,8 +57483,8 @@ Five read-only reviewers in round 1 (A storage/writes, B retrieval/similarity, C
 
 Fixed (code):
 - **Recall bands were L2-era on a cosine store** (every hit graded HIGH). New bands HIGH <0.28, MEDIUM <0.36, keep <0.45, calibrated on 22 labelled questions. Recall no longer searches documents (`AMBIENT_EXCLUDED_TYPES`), credits only the rows shown, neutralises stored text that reads as its own grammar, is refused in a public reply, and its member check fails closed. A non-Latin question's distances grade nothing (UNGRADED, at most five): bge-small-en puts any Greek text near any other.
-- **The owner's facts:** the profile mirrors (24 identity rows) all sat at 0.37–0.60 for every owner question, so the vector distance ranks nothing among them. On a question about the owner the rows are chosen by the field the question names and shown in an ADDED section; the graded results keep every row. The on-request fields (address, descriptions) are read from the profile when named; a role reaches a person's fields through the role's name field (`wife_name = Fotini` → `fotini_description`). Off an owner question a profile row needs a MEDIUM match (with documents out of scope the profile rows filled the ten slots of "chown owner of a file").
-- **Category-qualified mirrors** (`profile.mirror_name`): `User pet_dog_name is Hanzo` / `HAS_PET_DOG_NAME` — keyed by the bare key, `pet.name` replaced the owner's name. Legacy unqualified rows retire once root has no such field; the graph writes the new edge before retiring the old. forget re-syncs every field it touched; the forget sweeps skip a live mirror; a list field no longer expires its own items; the read-only façade blocks sync/resync/rollback/stamp and the ingest marker. The idle-cycle store maintenance re-syncs every field (`resync_all_owner_mirrors`), and does nothing when the profile file is missing (it would have replaced the owner's name with the placeholder "User").
+- **The owner's facts:** the profile mirrors (24 identity rows) all sat at 0.37–0.60 for every owner question, so the vector distance ranks nothing among them. On a question about the owner the rows are chosen by the field the question names and shown in an ADDED section; the graded results keep every row. The on-request fields (address, descriptions) are read from the profile when named; a role reaches a person's fields through the role's name field (`wife_name = Elena` → `elena_description`). Off an owner question a profile row needs a MEDIUM match (with documents out of scope the profile rows filled the ten slots of "chown owner of a file").
+- **Category-qualified mirrors** (`profile.mirror_name`): `User pet_dog_name is Bruno` / `HAS_PET_DOG_NAME` — keyed by the bare key, `pet.name` replaced the owner's name. Legacy unqualified rows retire once root has no such field; the graph writes the new edge before retiring the old. forget re-syncs every field it touched; the forget sweeps skip a live mirror; a list field no longer expires its own items; the read-only façade blocks sync/resync/rollback/stamp and the ingest marker. The idle-cycle store maintenance re-syncs every field (`resync_all_owner_mirrors`), and does nothing when the profile file is missing (it would have replaced the owner's name with the placeholder "User").
 - **Graph kind words:** Greek ones added and keyed folded (a final ς folds to σ), plus "location", company/role. These words are used only on a question about the owner; every other recall uses the pre-review vocabulary exactly (`_CATEGORY_WORDS_BASE`, verified equal to src_before_kb_r0).
 - **`manage_projects(get)`'s memory fallback** is refused in a public reply and for a member, skips non-Latin names and never offers profile rows.
 - **Ingest:** splitter overlap clamped (20,001 chars: hundreds of near-copies → 58 chunks); a header line keeps its text (over 120 chars, or with no body under it); an ambiguous file name is refused with the list; stem/substring matching only for a name with no real extension ("report_v1.2" is a version), on the file name, inside a named directory, container paths included; binary files refused (ZIP, NUL, >5 % U+FFFD); scanned PDFs (pages with an image and no text) reported PARTIAL, blank pages not; PDF pages split at their TOC titles (line start + word end) so each passage carries its own section. **Crash mid-ingest:** `ingesting.json` lists each document being written; at start-up (after the writer lock) every entry not written by this process is rolled back. Document delete is type-scoped (skill rows carry `source` "episode"/"reflection").
@@ -57499,7 +57499,7 @@ Data (operator: "you can change stored data"; `scripts/memory_repair_kb1030.py`,
 - episodes: 11 a Slack member asked that were stored as the owner's (text = a member trajectory within 4 min, no owner trajectory with that text; reviewer D listed 13, two fail the stricter match and stay), archived with their vector twins;
 - the PostgreSQL manual re-ingested from a fresh copy (downloaded over Tor) through the real tool path (`scripts/reingest_kb1030.py`): 9,502 chunks, 4,023 sections, 146 s on the rehearsal.
 
-Deploy (operator: "stop all current requests and deploy when ready" → stopped the agent, "just restarted, continue"). Suite: 28,139 passed; 15 failures in `test_memory_reconcile_round6_4gk.py` were the HF-cache embedder-load flake (each 12.1 s beside "Failed to load embedding model after 3 attempts"; the file passes alone, 15/15) and one was mine — `test_pin_quality_ratchet` (a new wiring pin read the source as text; rewritten as an AST walk, battery M5/I11 still killed). Lint OK; baseline re-written (106 → 105 findings). With the agent unloaded: `memory_repair_kb1030.py --apply` = the rehearsal's numbers (mirrors 18, graph 231 removed → 58 live, 11 episodes + 10 vector twins, no twin failure; backup `system/memory.pre-kb1030-20261030T120100.bak`); `reingest_kb1030.py --apply` 124 s, 8,059 → 9,503 rows, outline stored. Diff vs the backup: profile and skills byte-identical; identity 24 → 22 (the address and description copies — on-request fields keep none); no ingest marker left. Bootstrap: one process, head restored from disk in 0.5 s (28,226/28,230 tokens), 0 ERROR lines; Slack bot kickstarted. Live probes (`X-Ghost-Origin: probe`, `probe-kb1030-*`, recorded `task_kind=probe`): "what cars do I own?" → BMW 118i / Ducati / Sym; "πώς λέγεται ο σκύλος μου;" → Hanzo; knowledge_base "autovacuum_naptime" → cites "Chapter 19 › 19.10. Vacuuming › 19.10.1. Automatic Vacuuming".
+Deploy (operator: "stop all current requests and deploy when ready" → stopped the agent, "just restarted, continue"). Suite: 28,139 passed; 15 failures in `test_memory_reconcile_round6_4gk.py` were the HF-cache embedder-load flake (each 12.1 s beside "Failed to load embedding model after 3 attempts"; the file passes alone, 15/15) and one was mine — `test_pin_quality_ratchet` (a new wiring pin read the source as text; rewritten as an AST walk, battery M5/I11 still killed). Lint OK; baseline re-written (106 → 105 findings). With the agent unloaded: `memory_repair_kb1030.py --apply` = the rehearsal's numbers (mirrors 18, graph 231 removed → 58 live, 11 episodes + 10 vector twins, no twin failure; backup `system/memory.pre-kb1030-20261030T120100.bak`); `reingest_kb1030.py --apply` 124 s, 8,059 → 9,503 rows, outline stored. Diff vs the backup: profile and skills byte-identical; identity 24 → 22 (the address and description copies — on-request fields keep none); no ingest marker left. Bootstrap: one process, head restored from disk in 0.5 s (28,226/28,230 tokens), 0 ERROR lines; Slack bot kickstarted. Live probes (`X-Ghost-Origin: probe`, `probe-kb1030-*`, recorded `task_kind=probe`): "what cars do I own?" → BMW 320d / Triumph / Kymco; "πώς λέγεται ο σκύλος μου;" → Bruno; knowledge_base "autovacuum_naptime" → cites "Chapter 19 › 19.10. Vacuuming › 19.10.1. Automatic Vacuuming".
 
 ## §4SF — Sandbox psql 15 → 18 (marker v11) (2026-10-30, operator: "upgrade the sandbox psql")
 
@@ -57724,7 +57724,7 @@ Live probes after the restart (all X-Ghost-Origin: probe, ids probe-…): three-
 - Docs: docs/interfaces/clockwork_ghost.html, deploy list.
 
 ## §4SN — Memory consolidation + retrieval review: 21 defects fixed, one rule built and removed (2026-10-31, operator: "perfect next review how memory consolidation works, look for weaknesses and defects." + "also evaluate the memory retrieval" → "wait for the retrieval review results and fix both properly. usual verification protocol")
-- **Evidence (live, 24 days):** the drain logged 348 items "consolidated". 176 reached the extractor; 5 facts were stored, 3 distinct; 0 extractor profile writes. Hanzo was stored twice 5 s apart; one memory-usage note ended up under three keys. The retrieval reviewer replayed 40 owner questions on a copy of the stores.
+- **Evidence (live, 24 days):** the drain logged 348 items "consolidated". 176 reached the extractor; 5 facts were stored, 3 distinct; 0 extractor profile writes. Bruno was stored twice 5 s apart; one memory-usage note ended up under three keys. The retrieval reviewer replayed 40 owner questions on a copy of the stores.
 - **Consolidation (C1–C7):**
   - **C1 corrections:** the profile leg deleted ANY field whose value matched, regardless of kind. "I'm not selling the BMW after all" deleted the BMW; "not going to Athens this weekend" deleted the location. Corrections are now kind-gated: `field_kind`, `predicate_kind`, `field_subject`. Fields about someone else carry no owner kind.
   - **C2 outage:** a Nova outage acked the lost items as "✅ consolidated". Now `ConsolidationNodeDown` (retryable): a failing item steps aside; two in a row = outage → keep everything, no retry spent. An item counts only when another item reached the model in the same drain.
@@ -58542,3 +58542,99 @@ D1 (delete chess-coach + jiu-jitsu-calendar through the teardown) move to the en
   (was 394 s, 9 execute calls, strike cap). The 3rd never ran psql (honest "no postgres_admin tool" after listing
   skills, 30 s) — nothing for the note to read; same observation as before, no rule (§4NH). The two probe labs were
   left by the model (no destroy) and removed via the host API; host {"labs":[]}.
+
+### §4SX-v — Cleanup + leak audit (2026-11-05; operator: "clean up everything … check for data we shouldn't leak")
+- Operator: this folder is copied AS-IS into the public GitHub repo (vventirozos/AgentGhost).
+- Cleanup: scratchpad/, tmp/, stray digests, the old self-signed key.pem/cert.pem → ~/Data/AI/Data/backups/
+  agent-cleanup-20261105/; .pytest_cache, __pycache__ and the 9.2 GB ~/Data/AI/.battery_cov trees removed.
+- Found PUBLIC on GitHub (raw URLs 200, hashes = live files): the web console's TLS private key
+  (interface/*.ts.net.key) and the old key.pem; the owner bio; the journal/tests/src with real owner data.
+  Slack .env was NOT published (404). .gitignore now excludes .env, keys/certs, scratch and run state.
+- Pseudonymized (snapshot ~/Data/AI/Data/backups/agent-cleanup-20261105/pre-pseudonymize, 0700): family
+  names (Elena / Markos / Kosmas), pet (Bruno), address (Kaledonias 83, Kalopetres 10101), home-area streets/gym,
+  employer (Orbitdata), vehicles, health (asthma / hay fever / Ventolin), birthdates (−3 days), son's club, travel
+  town, Slack owner/member/channel ids, client DB object names; explicit/derogatory rows redacted; docs+README
+  IPs/tailnet/paths placeholdered. Bio moved to ~/Data/AI/Data/private/. member_data_repair_4ml.py now
+  requires GHOST_SLACK_OWNER. Generic Greek-nickname table kept and pinned (test_claim_binding).
+- Reviews: r1 6 MAJOR, r2 9 MAJOR, r3 1 MAJOR — real year+month of the four birthdates remain (shift is days
+  only; ages in tests depend on them) — ACCEPTED by the operator ("wrap up after this round").
+- Full suite: 29822 passed, 1 flake (face motion timing, 3/3 alone), lint OK. No deploy needed (comments,
+  tests, docs, scripts only; prompts.py few-shot names changed — takes effect at the next restart).
+- Operator TODO (outside this tree): rotate the web TLS key; untrack keys + bio in the git repo and purge history.
+- Key rotated 12:05 (operator: "rotate the key"): renew-ghost-cert.sh with GHOST_CERT_RENEW_DAYS=60 forced a
+  reissue — new key (public-key hash differs), cert to 2027-02-03, web client restarted and verified serving it.
+  The leaked old pair (*.prev) deleted. Publishing path = sync_agent.sh on another machine (rsync from eva,
+  excludes .env/.claude) then `git add -A`: tracked key files would be re-committed → operator untracks them.
+
+## §4SV-b — the Mirror: loop closed through `introspect`, prompt chosen by replay (2026-11-05, operator: "look at mirrors mini program … evaluate it" → "do we want to add this into introspect ?" → "re-review the plan before we do it" → "1. yes - 2. anytime you want. - 3. yes")
+
+- **Evaluation.** Against Hofstadter's idea the first version had one of three parts: a symbol for the system (the
+  sentence). It had no downward arrow (inert by design, so replies → sentence only) and never saw itself (only
+  yesterday's sentence; `mirror` replies are not in the pool). The 4 live rows also showed topic capture: the
+  sentence followed the SUBJECT of the one reply shown ("a faithful sentinel who gathers the weather, the war, and
+  the local news"), and one word survived from 11-04 to 11-05.
+- **Plan review changed three things.** (1) `summary` was a dead wire: in 21 days the owner's turns called
+  `introspect overview` 35× on 16 days and `summary` once, so the line goes into `overview` (operator: yes).
+  (2) A prompt experiment on the live main model displaces the slot, so the replay saves slot 0 to disk first
+  (`/slots/0?action=save`, a file name the head sweeper does not match), waits for `foreground_requests == 0`
+  before every call, and restores unless the owner sent a request. (3) The planned diary-only "self-look" was
+  dropped (operator: yes).
+- **Replay** (scratchpad, outside the tree; 8 real days 10-27…11-03, 3 chains per arm from the seed, arms share
+  their picks; 168 calls + 9 for the transition, ~6 s each; slot restored every time, no owner request arrived).
+  Leak = share of the sentence's content words that are in the shown replies and not in the shown history.
+
+  | arm | wording | replies | leak | unchanged days /24 | what the sentences were |
+  |---|---|---|---|---|---|
+  | A | first prompt | 1 | 0.18 | 0 | a growing list of subjects |
+  | B | manner + 3 named facets | 1 | 0.04 | 4 | abstract; echoes the facets |
+  | C | manner + 3 named facets | 3 | 0.04 | 7 | concrete, but echoes the facets and freezes |
+  | D | "the one who wrote these" | 3 | 0.07 | 6 | accretes a list of roles, over 40 words |
+  | E | "what the way they were written shows" + collapsed history | 3 | 0.02 | 3 | praise adjectives |
+  | F | E + the owner's question beside each reply | 3 | 0.02 | 4 | same as E |
+  | G | "what you actually do … in plain verbs, without praise" + collapsed history | 3 | 0.06 | 4 | behaviour |
+
+  I recommended G; the operator, shown samples of A, E and G, picked **E** ("i think i like Flattering most,
+  it's also the most interesting one") — **E shipped**. From the real diary (the 4 topic-captured rows) G shed
+  the subject words in one or two looks, and once copied an older history line back verbatim (old rows leave
+  the 7-line window within a week); E was checked the same way before deploy (below).
+- **Shipped.** `selfhood/mirror.py`: `PROMPT` + `_WORDS` (singular for one reply), `history_lines` (seed first,
+  a run of unchanged days = one line), `pick_replies(…, after=)` (3 replies, 600 chars each, written since the last
+  look, 48 h back at most), `row_replies` (both row shapes), `build_prompt`, `self_image_line`; `current_sentence` removed; banner
+  reworded ("Nothing here reaches my answers" was no longer true). `tools/introspect.py`: `_self_image(context)` in
+  `_overview_selfhood` (after the mood) and `_render_summary` (after the stats); the home comes from the Mirror's
+  own resolver. Tool description and system prompt untouched (cached head unchanged).
+- **Tests:** `tests/test_4sv_mirror.py` 60 (was 31): the import pin now names `core/agent.py` + `tools/introspect.py`
+  and the one imported reader; the phase writes and `introspect` reads over the real layout; `error_line` pin for a
+  sentence with failure words; a stub in `test_4nh_answer_correctness.py` took the new argument.
+- **Docs:** glossary ("The Mirror"), core/agent.html #4sv-b, tools/introspect.html #4sv-b.
+- **Review r1 (independent reader, 43 own mutants): 0 MAJOR, 5 MINOR, all fixed.** (1) Near the 3,200 cap the
+  line was paid for by the activity/learning section (7 of 49 live overviews in 30 days) → cap 3,720. (2) Four
+  behaviours unpinned (two replies, the LAST row's replies, the draw being random, the banner's latest row) and the
+  import pin passed with a prompt builder importing introspect's wrapper → pins added. (3) The banner's "> " lines
+  were one Markdown paragraph → one quote paragraph per reply. (4) "Since the last one, you wrote these replies"
+  was false for two of the three later live looks (48 h window) → `pick_replies(after=)` takes only replies newer
+  than the last look; this REPLACED the `avoid` list (built an hour earlier, removed). (5) No public-surface gate
+  on the line while the `mirror` command has one → `reply_is_public()` gate. One- and two-reply wording checked on
+  the model (6 calls). Found, not changed (pre-existing): the overview's "lately" request text and open questions
+  also reach a public reply.
+- **Battery** `scripts/mutate_4sv_b.py` (37 mutants, coverage-selected): 36 killed, 1 survivor (the prompt showing
+  only the last sentence) → pinned, killed on rerun; known-bad control died, no-op survived. Its baseline caught
+  two things first: the cap raise had broken `test_the_overview_keeps_its_last_sections_when_long` (sizes written
+  for 3,200; I had not re-run the neighbour files after the review fixes), and the import pin read source text,
+  which `test_pin_quality_ratchet` rejects → rewritten as an `ast` walk. Full suite 29,846 passed, lint OK.
+- **After the pick: E from the real diary** (6 calls + 2 for the one-/two-reply wording, slot restored). E keeps
+  more of the previous sentence than G did, and the four old topic-captured rows pulled it back: 1 chain of 3 kept
+  "gathers the weather, the war, and the local news" two looks running, 1 copied the 11-04 line back whole. →
+  `current_rows`: the prompt's history, `prev` and the `introspect` line use only rows this look wrote (they carry
+  "replies"); the old rows stay in the file and the banner. The live start is then the replayed condition (seed).
+  `introspect` shows no line until the first look after the deploy. Tests 60; mutants C1–C4 added.
+- **Final checks + deploy (operator: "restart the agent whenever you are ready").** Battery rerun of the touched
+  mutants + C1–C4: all killed, known-bad died, no-op survived. Full suite 29,846 passed + 1 known flake
+  (face motion timing under load, 3/3 alone), lint OK. Deployed 13:23 (graceful SIGTERM at
+  foreground_requests = 0, "shutdown complete" logged, pid 59553 → 39687). The head warm-up took 0.95 s — the
+  cached head was reused, as the unchanged tool description and system prompt predicted. Probe "how are things
+  today?": `introspect overview` called, turn ok in 28 s, no self-image line yet (no row of the new look).
+  First real look: the next idle window after local midnight.
+- **Watch:** the diary going flat once replies that quote the sentence are in the pool (the banner marks
+  "(unchanged)"); the morning greeting.
+

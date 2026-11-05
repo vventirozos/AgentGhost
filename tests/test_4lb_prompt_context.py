@@ -22,9 +22,9 @@ def _profile(tmp_path):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "name", "Vasilis")
     pm.update("root", "location", "Athens, Greece")
-    pm.update("root", "address", "Makedonias 83 Thrakomakedones 13676, Athens, Greece")
-    pm.update("relationships", "wife_name", "Fotini")
-    pm.update("relationships", "fotini_description", "tan complexion, long straight hair")
+    pm.update("root", "address", "Kaledonias 83 Kalopetres 10101, Athens, Greece")
+    pm.update("relationships", "wife_name", "Elena")
+    pm.update("relationships", "elena_description", "short curly dark hair, round glasses")
     pm.update("preferences", "grep_tool", "ripgrep")
     return pm
 
@@ -34,19 +34,19 @@ def test_the_address_and_descriptions_are_on_request_only(tmp_path):
     """Fails where the street address and a physical description rode 40/40
     owner turns (relevant to 4)."""
     out = _profile(tmp_path).get_context_string()
-    assert "makedonias" not in str(out).lower() and "long straight hair" not in out
-    assert "Fotini" in out and "Athens" in out
-    assert "root.address" in out and "relationships.fotini_description" in out   # named, so it can be asked for
+    assert "kaledonias" not in str(out).lower() and "short curly dark hair" not in out
+    assert "Elena" in out and "Athens" in out
+    assert "root.address" in out and "relationships.elena_description" in out   # named, so it can be asked for
 
 
 def test_the_full_profile_is_still_there_on_request(tmp_path):
     out = _profile(tmp_path).get_context_string(full=True)
-    assert "Makedonias 83" in out and "long straight hair" in out
+    assert "Kaledonias 83" in out and "short curly dark hair" in out
 
 
 def test_the_owner_can_add_on_demand_fields(tmp_path):
     pm = _profile(tmp_path)
-    pm.update("assets", "vehicles", "BMW 118i")
+    pm.update("assets", "vehicles", "BMW 320d")
     (tmp_path / "profile_prompt_policy.json").write_text(json.dumps({"on_demand": ["assets.vehicles"]}))
     assert "BMW" not in pm.get_context_string()
 
@@ -54,7 +54,7 @@ def test_the_owner_can_add_on_demand_fields(tmp_path):
 def test_the_coding_persona_gets_the_preferences_only(tmp_path):
     from ghost_agent.core.agent import _specialist_profile
     out = _specialist_profile(SimpleNamespace(profile_memory=_profile(tmp_path)), "")
-    assert "ripgrep" in out and "fotini" not in str(out).lower() and "athens" not in str(out).lower()
+    assert "ripgrep" in out and "elena" not in str(out).lower() and "athens" not in str(out).lower()
 
 
 def test_the_profile_closes_the_system_prompt():
@@ -66,18 +66,18 @@ def test_the_profile_closes_the_system_prompt():
 
 # ── egress ───────────────────────────────────────────────────────────────────
 def test_the_street_address_never_leaves_in_a_query(tmp_path):
-    """Fails where "restaurants Makedonias 83 Thrakomakedones walking distance"
+    """Fails where "restaurants Kaledonias 83 Kalopetres walking distance"
     went out over Tor."""
     from ghost_agent.core.agent import _scrub_owner_private, _OUTBOUND_TOOLS
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
-    out = _scrub_owner_private(json.dumps({"query": "restaurants Makedonias 83 Thrakomakedones walking distance"}), ctx)
-    assert "Makedonias" not in out and "83" not in out and "Thrakomakedones" in out
+    out = _scrub_owner_private(json.dumps({"query": "restaurants Kaledonias 83 Kalopetres walking distance"}), ctx)
+    assert "Kaledonias" not in out and "83" not in out and "Kalopetres" in out
     assert _scrub_owner_private(json.dumps({"query": "news about postgres 18"}), ctx) is None
     assert {"web_search", "deep_research", "darkweb_search", "darkweb_research", "browser",
             "fact_check"} <= set(_OUTBOUND_TOOLS)
     # the model's casing is not the profile's
-    low = _scrub_owner_private(json.dumps({"query": "cafes near makedonias 83"}), ctx)
-    assert "makedonias" not in low.lower() and "Thrakomakedones" in low
+    low = _scrub_owner_private(json.dumps({"query": "cafes near kaledonias 83"}), ctx)
+    assert "kaledonias" not in low.lower() and "Kalopetres" in low
 
 
 @pytest.mark.asyncio
@@ -88,27 +88,27 @@ async def test_the_dispatched_search_carries_the_city_not_the_street(monkeypatch
     search = AsyncMock(return_value="results")
     agent.available_tools = {"web_search": search}
     ctx.llm_client.chat_completion = AsyncMock(side_effect=[
-        _resp("", [_tc("c0", "web_search", {"query": "restaurants Makedonias 83 Thrakomakedones"})]),
+        _resp("", [_tc("c0", "web_search", {"query": "restaurants Kaledonias 83 Kalopetres"})]),
         _resp("Done."), _resp("Done."), _resp("(unreachable)")])
     await agent.handle_chat({"messages": [{"role": "user", "content": "restaurants near my home"}]},
                             FakeBgTasks(), request_id="web-1", requester_role="owner")
     assert search.await_count == 1
     sent = json.dumps(search.await_args.kwargs, default=str) + json.dumps(search.await_args.args, default=str)
-    assert "Makedonias" not in sent and "Thrakomakedones" in sent
+    assert "Kaledonias" not in sent and "Kalopetres" in sent
     # r4: the model is TOLD (it re-guessed the town when it was not)
     second = ctx.llm_client.chat_completion.call_args_list[1]
     payload = second.args[0] if second.args and isinstance(second.args[0], dict) else second.kwargs
     # (the result rides a <tool_response> block)
-    assert any("replaced by its area, 'Thrakomakedones'" in str(m.get("content"))
+    assert any("replaced by its area, 'Kalopetres'" in str(m.get("content"))
                for m in payload["messages"] if isinstance(m, dict))
 
 
 def test_weather_never_geocodes_the_street_address(tmp_path):
     from ghost_agent.tools import system as S
     pm = ProfileMemory(tmp_path)
-    pm.update("root", "address", "Makedonias 83 Thrakomakedones 13676, Athens, Greece")
+    pm.update("root", "address", "Kaledonias 83 Kalopetres 10101, Athens, Greece")
     loc = S._find_location_in_profile(pm.load())
-    assert not loc or "makedonias" not in str(str(loc)).lower()
+    assert not loc or "kaledonias" not in str(str(loc)).lower()
 
 
 # ── delegates and public replies ─────────────────────────────────────────────
@@ -130,7 +130,7 @@ async def test_a_public_owner_reply_carries_no_private_context(monkeypatch, tmp_
 
 
 def test_graph_chains_through_the_agents_own_nodes_are_dropped(tmp_path):
-    """Fails where "(Ai)-[RESPONDED_TO]->(User)-[HAS_SON]->(Leonidas)" was
+    """Fails where "(Ai)-[RESPONDED_TO]->(User)-[HAS_SON]->(Kosmas)" was
     injected into a question about MoE models."""
     g = GraphMemory(tmp_path)
     g.add_triplets([{"subject": "ai", "predicate": "RESPONDED_TO", "object": "moe models"},
@@ -163,40 +163,40 @@ def test_the_self_play_report_is_left_out_unless_asked():
 
 # ── §4LB r2: the review of the fixes ─────────────────────────────────────────
 @pytest.mark.parametrize("query,leaks", [
-    ("pharmacy 13676", "13676"),                                  # the postcode alone
-    ("pharmacy 136 76", "136 76"),
-    ("φαρμακείο Μακεδονίας 83 Θρακομακεδόνες", "83"),               # Greek
-    ("Makedonias street 83", "83"),
-    ("Makedonias  83", "83"),
-    ("83 Makedonias", "83"),
-    ("cafes near Makedonias 83A", "83A"),
+    ("pharmacy 10101", "10101"),                                  # the postcode alone
+    ("pharmacy 101 01", "101 01"),
+    ("φαρμακείο Καλεδονίας 83 Καλοπέτρες", "83"),               # Greek
+    ("Kaledonias street 83", "83"),
+    ("Kaledonias  83", "83"),
+    ("83 Kaledonias", "83"),
+    ("cafes near Kaledonias 83A", "83A"),
 ])
 def test_every_form_of_the_street_is_scrubbed(tmp_path, query, leaks):
     from ghost_agent.core.agent import _scrub_owner_private
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
     raw = json.dumps({"query": query})                             # \u-escaped Greek too
     out = json.loads(_scrub_owner_private(raw, ctx, "web_search"))["query"]
-    assert leaks not in out and "Thrakomakedones" in out
+    assert leaks not in out and "Kalopetres" in out
 
 
-@pytest.mark.parametrize("query", ["Makedonias 830 Athens", "brown hair dye", "Thrakomakedones bakery",
+@pytest.mark.parametrize("query", ["Kaledonias 830 Athens", "brown hair dye", "Kalopetres bakery",
                                    "postgres 18 release notes"])
 def test_other_text_is_left_alone(tmp_path, query):
-    """Fails where "Makedonias 830" became "Athens0" and a description's
+    """Fails where "Kaledonias 830" became "Athens0" and a description's
     first clause was an egress term."""
     from ghost_agent.core.agent import _scrub_owner_private
     pm = _profile(tmp_path)
-    pm.update("relationships", "fotini_description", "brown hair, blue eyes")
+    pm.update("relationships", "elena_description", "brown hair, blue eyes")
     assert _scrub_owner_private(json.dumps({"query": query}), SimpleNamespace(profile_memory=pm), "web_search") is None
 
 
 def test_a_url_encoded_link_is_scrubbed(tmp_path):
     from ghost_agent.core.agent import _scrub_owner_private
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
-    for url in ("https://www.google.com/maps/search/Makedonias+83+Thrakomakedones",
-                "https://duckduckgo.com/?q=Makedonias%2083"):
+    for url in ("https://www.google.com/maps/search/Kaledonias+83+Kalopetres",
+                "https://duckduckgo.com/?q=Kaledonias%2083"):
         out = _scrub_owner_private({"operation": "navigate", "url": url}, ctx, "browser")
-        assert "83" not in out["url"] and "Thrakomakedones" in out["url"]
+        assert "83" not in out["url"] and "Kalopetres" in out["url"]
 
 
 def test_local_tools_scrub_only_what_leaves(tmp_path):
@@ -205,8 +205,8 @@ def test_local_tools_scrub_only_what_leaves(tmp_path):
     from ghost_agent.core.agent import _scrub_owner_private
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
     assert _scrub_owner_private({"operation": "write", "path": "letter.txt",
-                                 "content": "Send to Makedonias 83"}, ctx, "file_system") is None
-    out = _scrub_owner_private({"operation": "download", "url": "https://x.org/?addr=Makedonias+83"},
+                                 "content": "Send to Kaledonias 83"}, ctx, "file_system") is None
+    out = _scrub_owner_private({"operation": "download", "url": "https://x.org/?addr=Kaledonias+83"},
                                ctx, "file_system")
     assert "83" not in out["url"]
 
@@ -240,16 +240,16 @@ async def test_the_tool_itself_scrubs_a_call_that_skips_the_dispatch(tmp_path):
     from ghost_agent.tools.registry import _egress_scrubbed
     inner = AsyncMock(return_value="ok")
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
-    await _egress_scrubbed("darkweb_research", inner, ctx)(query="Makedonias 83 Thrakomakedones")
-    assert "Makedonias 83" not in inner.await_args.kwargs["query"]
+    await _egress_scrubbed("darkweb_research", inner, ctx)(query="Kaledonias 83 Kalopetres")
+    assert "Kaledonias 83" not in inner.await_args.kwargs["query"]
 
 
 def test_weather_uses_the_locality_of_an_address():
     from ghost_agent.tools.system import _find_location_in_profile as loc
     assert loc({"root": {"address": "Kifisias 10, Marousi"}}) == "Marousi"
-    assert loc({"root": {"home": "Makedonias 83 Thrakomakedones"}}) == "Thrakomakedones"
-    assert loc({"root": {"location": "Athens, Greece", "address": "Makedonias 83"}}) == "Athens, Greece"
-    assert loc({"root": {"location": "Makedonias 83, Athens"}}) == "Athens"
+    assert loc({"root": {"home": "Kaledonias 83 Kalopetres"}}) == "Kalopetres"
+    assert loc({"root": {"location": "Athens, Greece", "address": "Kaledonias 83"}}) == "Athens, Greece"
+    assert loc({"root": {"location": "Kaledonias 83, Athens"}}) == "Athens"
 
 
 @pytest.mark.parametrize("ask,expect", [
@@ -321,9 +321,9 @@ def test_owner_facts_only_for_a_question_about_the_owner(query, asks):
 def test_request_verbs_do_not_name_owner_facts(tmp_path):
     g = GraphMemory(tmp_path)
     g.add_triplets([{"subject": "user", "predicate": "KNOWS", "object": "regex"},
-                    {"subject": "user", "predicate": "LIVES_IN", "object": "thrakomakedones"}])
+                    {"subject": "user", "predicate": "LIVES_IN", "object": "kalopetres"}])
     assert not any("KNOWS" in x for x in g.owner_facts_matching("do you know my view", 8))
-    assert any("thrakomakedones" in x for x in g.owner_facts_matching("where do I live", 8))
+    assert any("kalopetres" in x for x in g.owner_facts_matching("where do I live", 8))
 
 
 def test_the_agent_filter_drops_only_the_agents_own_lines(tmp_path):
@@ -353,10 +353,10 @@ def test_the_off_topic_gate_measures_only_kept_rows():
 def test_the_geocoder_argument_is_scrubbed_and_other_utility_text_is_not(tmp_path):
     from ghost_agent.core.agent import _scrub_owner_private
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
-    out = _scrub_owner_private({"action": "check_weather", "location": "Makedonias 83 Thrakomakedones"},
+    out = _scrub_owner_private({"action": "check_weather", "location": "Kaledonias 83 Kalopetres"},
                                ctx, "system_utility")
     assert "83" not in out["location"]
-    assert _scrub_owner_private({"action": "note", "content": "Makedonias 83"}, ctx, "system_utility") is None
+    assert _scrub_owner_private({"action": "note", "content": "Kaledonias 83"}, ctx, "system_utility") is None
 
 
 def test_a_coding_leaf_carries_the_owner_profile_for_scrubbing_only(tmp_path):
@@ -401,16 +401,16 @@ def test_the_street_becomes_the_suburb_so_a_local_search_stays_local(tmp_path):
     """Operator 2026-10-03: with "Athens" the model searched the wrong suburb
     (Cholargos). The suburb keeps it local; the street and number stay home."""
     from ghost_agent.core.agent import _scrub_owner_private
-    out = json.loads(_scrub_owner_private(json.dumps({"query": "φαρμακεία κοντά στη Μακεδονίας 83, 136 76"}),
+    out = json.loads(_scrub_owner_private(json.dumps({"query": "φαρμακεία κοντά στη Καλεδονίας 83, 101 01"}),
                                           SimpleNamespace(profile_memory=_profile(tmp_path)), "web_search"))["query"]
-    assert "Thrakomakedones" in out and "83" not in out and "136" not in out
+    assert "Kalopetres" in out and "83" not in out and "101 01" not in out and "10101" not in out
 
 
 @pytest.mark.parametrize("address,location,expect", [
-    ("Makedonias 83 Thrakomakedones 13676, Athens, Greece", "Athens, Greece", "Thrakomakedones"),   # the suburb only
+    ("Kaledonias 83 Kalopetres 10101, Athens, Greece", "Athens, Greece", "Kalopetres"),   # the suburb only
     ("Kifisias 10, Marousi", "Athens, Greece", "Marousi"),       # the suburb after the comma
-    ("Makedonias 83", "Athens, Greece", "Athens"),               # no suburb: the city
-    ("Makedonias 83", "", "nearby")])                             # neither
+    ("Kaledonias 83", "Athens, Greece", "Athens"),               # no suburb: the city
+    ("Kaledonias 83", "", "nearby")])                             # neither
 def test_the_replacement_falls_back_to_the_city(tmp_path, address, location, expect):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "address", address)
@@ -426,7 +426,7 @@ async def test_the_note_follows_the_result_so_its_head_still_parses(tmp_path):
     from ghost_agent.tools.registry import _egress_scrubbed
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
     out = await _egress_scrubbed("web_search", AsyncMock(return_value="Error: search engines down"), ctx)(
-        query="pizza Makedonias 83")
-    assert out.startswith("Error: search engines down") and "replaced by its area, 'Thrakomakedones'" in out
+        query="pizza Kaledonias 83")
+    assert out.startswith("Error: search engines down") and "replaced by its area, 'Kalopetres'" in out
     clean = await _egress_scrubbed("web_search", AsyncMock(return_value="results"), ctx)(query="pizza Athens")
     assert clean == "results"                       # nothing rewritten, nothing added

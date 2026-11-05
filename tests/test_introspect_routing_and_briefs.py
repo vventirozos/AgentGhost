@@ -104,17 +104,17 @@ def test_description_declares_verbose_section_and_hours_for_recent():
 
 def test_capture_stores_a_redacted_clipped_answer_gist(tmp_path: Path):
     sm = SelfModel(root=tmp_path)
-    long_reply = ("<think>private reasoning</think>\n\nLeonidas was born on "
-                  "12 March 2026, so he is about six months old.  Mail me at "
+    long_reply = ("<think>private reasoning</think>\n\nKosmas was born on "
+                  "9 March 2026, so he is about six months old.  Mail me at "
                   "dad@example.com if that is wrong. " + "x" * 300)
     exp = sm.capture_turn(trajectory_id="t-1",
-                          user_request="how old is leonidas?",
+                          user_request="how old is kosmas?",
                           tool_names=[], outcome="passed",
                           final_response=long_reply)
     assert exp is not None
     g = exp.answer_gist
     assert "private reasoning" not in g
-    assert "12 March 2026" in g
+    assert "9 March 2026" in g
     assert "dad@example.com" not in g and "[REDACTED_EMAIL]" in g
     assert len(g) <= 160 and g.endswith("…")
     assert "\n" not in g
@@ -130,7 +130,7 @@ def test_recall_finds_a_memory_by_its_answer_vocabulary(tmp_path: Path):
     sm = SelfModel(root=tmp_path)
     sm.capture_turn(trajectory_id="t-1", user_request="how old is he?",
                     tool_names=[], outcome="passed",
-                    final_response="His birthdate is 12 March 2026.")
+                    final_response="His birthdate is 9 March 2026.")
     sm.capture_turn(trajectory_id="t-2", user_request="weather please",
                     tool_names=["system_utility"], outcome="passed",
                     final_response="Sunny, 28 degrees.")
@@ -142,10 +142,10 @@ async def test_recall_renders_the_answer_line(tmp_path: Path):
     sm = SelfModel(root=tmp_path)
     sm.capture_turn(trajectory_id="t-1", user_request="how old is he?",
                     tool_names=[], outcome="passed",
-                    final_response="His birthdate is 12 March 2026.")
+                    final_response="His birthdate is 9 March 2026.")
     out = await tool_introspect(action="recall", query="birthdate",
                                 self_model=sm)
-    assert "→ my answer: His birthdate is 12 March 2026." in out
+    assert "→ my answer: His birthdate is 9 March 2026." in out
 
 
 def test_answer_gist_helper_edges():
@@ -243,16 +243,16 @@ async def test_repeated_requests_collapse_with_a_count(tmp_path: Path):
     sm = SelfModel(root=tmp_path)
     for i, outcome in enumerate(("unknown", "unknown", "passed")):
         sm.capture_turn(trajectory_id=f"t-{i}",
-                        user_request="how old is leonidas now ?",
+                        user_request="how old is kosmas now ?",
                         tool_names=[], outcome=outcome, final_response="six months")
     sm.capture_turn(trajectory_id="t-x", user_request="unrelated",
                     tool_names=[], outcome="passed", final_response="ok")
     recent = await tool_introspect(action="recent", self_model=sm, limit=5)
-    assert recent.count("how old is leonidas now") == 1
+    assert recent.count("how old is kosmas now") == 1
     assert "(×3) [passed]" in recent
-    recall = await tool_introspect(action="recall", query="leonidas",
+    recall = await tool_introspect(action="recall", query="kosmas",
                                    self_model=sm)
-    assert recall.count("how old is leonidas now") == 1
+    assert recall.count("how old is kosmas now") == 1
     assert "(×3)" in recall
 
 

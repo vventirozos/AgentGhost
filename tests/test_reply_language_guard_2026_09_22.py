@@ -51,13 +51,13 @@ REPLY_GR = (
     "Όταν είπαμε να βρούμε κάτι που δεν υπάρχει ακόμα, έκανα έρευνα στο τι είναι ήδη "
     "established στον κόσμο των submissions και πώς αθλητές έγιναν διάσημοι.\n\n"
     "Εδώ είναι το πλάνο που έγραψα:\n\n---\n\n"
-    "## 🥋 Η Πρόταση: **\"The Thrakomakedon\"**\n\n"
+    "## 🥋 Η Πρόταση: **\"The Kalopetr\"**\n\n"
     "Ένα νέο leg lock που συνδυάζει στοιχεία από ankle lock, heel hook και figure-four grip, "
     "αλλά με έναν τρόπο που δεν υπάρχει ακόμα στη βιβλιογραφία του BJJ.\n\n"
     "- Εισέρχεσαι από half-guard/underhook\n- Κάνεις figure-four grip γύρω από τον αστράγαλο\n\n"
-    "Θέλεις να ξεκινήσουμε με το να σχεδιάσουμε τα exact mechanics του Thrakomakedon;")
+    "Θέλεις να ξεκινήσουμε με το να σχεδιάσουμε τα exact mechanics του Kalopetr;")
 REPLY_EN = (
-    "Here is the plan I wrote up. The proposal is a new leg lock, \"The Thrakomakedon\", "
+    "Here is the plan I wrote up. The proposal is a new leg lock, \"The Kalopetr\", "
     "entered from half-guard with a figure-four grip around the ankle and calf.\n\n"
     "- Phase 1: drill the mechanics with cooperative partners\n"
     "- Phase 2: win a local tournament with it and name it publicly\n\n"

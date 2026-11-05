@@ -464,7 +464,7 @@ IDLE_JOB_PURPOSE = {
     "selfhood-narrative": "rewrites the agent's running diary",
     "stale-questions": "lists its open questions older than 3 days",
     "workspace-narrative": "rewrites the running summary of the workspace",
-    "mirror": "rewrites its one-sentence self-description from yesterday's plus one of your replies",
+    "mirror": "rewrites its one-sentence self-description from its earlier ones plus a few of your replies",
     "failure-replay": "replays one of your past failures or runs your regression tests",
 }
 
@@ -2086,7 +2086,7 @@ def _profile_field_holding(profile_memory, value, category=None, key=None) -> st
                 continue
             for k, cur in sub.items():
                 # review r2: the same SUBJECT too — `father_name` holding
-                # Leonidas is no reason to skip `son_name` Leonidas, nor
+                # Kosmas is no reason to skip `son_name` Kosmas, nor
                 # `wife_employer` Google to skip the owner's `employer`
                 if key is not None and not (_fs(cat, k) == _subj
                                             and ((_kind and _fk(cat, k) == _kind) or (_stems & _key_stems(k)))):
@@ -14572,9 +14572,10 @@ class GhostAgent:
 
         # Phase 2.8c (§4SV): the Mirror — a toy strange loop. Once a day the
         # main model rewrites the agent's one-sentence self-description from
-        # yesterday's sentence plus one of the owner's replies. INERT: the
-        # sentence reaches no prompt; only the owner's `mirror` command shows
-        # it. The MAIN model at background priority (operator: the model that
+        # its earlier sentences plus a few of the owner's replies. §4SV-b: the
+        # latest sentence is one line of `introspect` (overview, summary) and
+        # in no prompt otherwise; the owner's `mirror` command shows the
+        # diary. The MAIN model at background priority (operator: the model that
         # wrote the replies reads them); the conversation is saved first
         # (§4RV). Listed on the Idle Cycle line only when it looked.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
@@ -15029,7 +15030,7 @@ class GhostAgent:
             # Consolidation review 2026-10-31 (CRITICAL): the graph leg above
             # honoured the predicate but this profile leg matched the VALUE in
             # every field — "I'm not selling the BMW after all" (SELLING)
-            # deleted assets.vehicles "BMW 118i", "I'm not going to Athens
+            # deleted assets.vehicles "BMW 320d", "I'm not going to Athens
             # this weekend" (TRAVELING_TO) deleted root.location. A negated
             # statement now removes only a field of the SAME KIND (LIVES_IN →
             # a location field); a field with no kind is removed only by a
@@ -15077,7 +15078,7 @@ class GhostAgent:
         import re
         # Consolidation review 2026-10-31: a journal item carries the last
         # four messages, and the owner's sentence from the PREVIOUS turn was
-        # extracted again on this turn's item (Hanzo stored twice 5 s apart;
+        # extracted again on this turn's item (Bruno stored twice 5 s apart;
         # one memory-usage note written under two keys 4 s apart). Each owner
         # message has its own item: extraction, attribution and this filter
         # read only the newest one.
@@ -15191,7 +15192,7 @@ class GhostAgent:
                     profile_up = None
                 # TEMPORAL ANCHORING of the extracted fact. The synthesizer
                 # copies the user's phrasing, so a stated age arrives here
-                # as a snapshot ("…two sons, Thodoris 9 and Leonidas 4mo")
+                # as a snapshot ("…two sons, Markos 9 and Kosmas 4mo")
                 # and lands in BOTH the vector store and the profile. Both
                 # legs are anchored from the same string so the stores
                 # cannot disagree. said_at defaults to now: consolidation
@@ -15518,7 +15519,7 @@ class GhostAgent:
                     # correct here rather than a threshold-relative one.
                     # §4KZ: NO model-judged deletion. The belief-revision engine
                     # let one LLM call delete stored facts; on the live store 5
-                    # of its 7 deletions since 08-08 were wrong (Fotini's birth
+                    # of its 7 deletions since 08-08 were wrong (Elena's birth
                     # date, an exact date for an approximation, another subject's
                     # fact). A changed OWNER fact is a PROFILE change: the
                     # profile is written and its graph/vector mirrors are synced
@@ -23513,10 +23514,10 @@ class GhostAgent:
 
                 # §4LB EGRESS: the owner's private on-demand values (the street
                 # address) never leave the machine in a query — the model wrote
-                # "restaurants Makedonias 83 Thrakomakedones" into Tor searches.
+                # "restaurants Kaledonias 83 Kalopetres" into Tor searches.
                 # Replaced by the address's suburb in the call's own arguments,
                 # and the RESULT says so (r4: the model, not told, re-guessed
-                # the town and searched another Makedonias Ave).
+                # the town and searched another Kaledonias Ave).
                 if _cname in _OUTBOUND_TOOLS:
                     _scrubbed = _scrub_owner_private(tool["function"].get("arguments"), self.context, _cname)
                     if _scrubbed is not None:
@@ -31641,7 +31642,7 @@ class GhostAgent:
 
                 # (§4KZ) The contradiction ledger is NOT injected any more: on
                 # the live ledger it put wrong, long-gone facts into owner
-                # prompts ("Thodoris born ~2017-03", the role-play "user plays
+                # prompts ("Markos born ~2017-03", the role-play "user plays
                 # Black against Vasilis") and nothing ever cleaned it. The
                 # profile is the current truth and is always in the prompt.
 

@@ -55,8 +55,8 @@ DELETE = {
         "When performing file operations on paths located within special or system-managed directories that may have restricted access or require specialized handling."
     ],
     "B-private": [
-        "Fact check whether <@U56CVBHHQ> enjoys the company of young C programmers",
-        "i am thinking signing thodoris for basketball, i was told that panerithraikos is a good team, what do you think ?"
+        "Fact check whether <@U0OWNER01> enjoys the company of young C programmers",
+        "i am thinking signing markos for basketball, i was told that panerithraikos is a good team, what do you think ?"
     ],
     "C-dead-git-tool": [
         "When a file system operation targets a path within a known system or repository ",

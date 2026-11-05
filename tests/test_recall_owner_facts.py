@@ -1,6 +1,6 @@
 """§4KX r8 probe follow-up (2026-10-03): recall reaches the owner's facts by
 their KIND. The graph tier seeded on NODE names, so "what health conditions do
-I have" never reached `user HAS_CONDITION heart failure`. Each test names the
+I have" never reached `user HAS_CONDITION asthma`. Each test names the
 world it fails in."""
 import asyncio
 
@@ -12,26 +12,26 @@ from ghost_agent.tools import memory as M
 
 def _owner_graph(tmp_path):
     g = GraphMemory(tmp_path)
-    g.add_triplets([{"subject": "user", "predicate": "HAS_CONDITION", "object": "heart failure"},
-                    {"subject": "user", "predicate": "TAKES_MEDICATION", "object": "entresto"},
-                    {"subject": "user", "predicate": "HAS_COMPANION", "object": "fotini"},
-                    {"subject": "user", "predicate": "WORKS_AT", "object": "evolmonkey"},
+    g.add_triplets([{"subject": "user", "predicate": "HAS_CONDITION", "object": "asthma"},
+                    {"subject": "user", "predicate": "TAKES_MEDICATION", "object": "ventolin"},
+                    {"subject": "user", "predicate": "HAS_COMPANION", "object": "elena"},
+                    {"subject": "user", "predicate": "WORKS_AT", "object": "orbitdata"},
                     {"subject": "user", "predicate": "WORKS_ON", "object": "pinball.html"},
-                    {"subject": "user", "predicate": "HAS_SON", "object": "leonidas"},
+                    {"subject": "user", "predicate": "HAS_SON", "object": "kosmas"},
                     {"subject": "postgres", "predicate": "HAS_CONDITION", "object": "replication lag"}])
     return g
 
 
 # §4SN: names are shown as stored (lowercase), not re-cased by .title()
 @pytest.mark.parametrize("query,expect", [
-    ("what health conditions do I have", ["heart failure", "entresto"]),
-    ("what medication do I take", ["entresto"]),
-    ("τι φάρμακα παίρνω;", ["entresto"]),
-    ("η υγεία μου", ["heart failure"]),
-    ("which conditions are on file", ["heart failure"]),
-    ("who is my companion", ["fotini"]),
-    ("what is my job", ["evolmonkey"]),
-    ("tell me about my family", ["leonidas"]),
+    ("what health conditions do I have", ["asthma", "ventolin"]),
+    ("what medication do I take", ["ventolin"]),
+    ("τι φάρμακα παίρνω;", ["ventolin"]),
+    ("η υγεία μου", ["asthma"]),
+    ("which conditions are on file", ["asthma"]),
+    ("who is my companion", ["elena"]),
+    ("what is my job", ["orbitdata"]),
+    ("tell me about my family", ["kosmas"]),
 ])
 def test_an_owner_fact_is_found_by_its_kind(tmp_path, query, expect):
     out = " ".join(_owner_graph(tmp_path).owner_facts_matching(query))
@@ -59,8 +59,8 @@ class _NoVec:
 
 
 def test_recall_reports_the_owners_facts_by_kind(tmp_path):
-    """Fails in the world of the live probe: heart failure and Entresto were
+    """Fails in the world of the live probe: asthma and Ventolin were
     stored and recall never returned them."""
     out = asyncio.run(M.tool_recall("what health conditions and medication do I have", memory_system=_NoVec(),
                                     graph_memory=_owner_graph(tmp_path)))
-    assert "heart failure" in out and "entresto" in out
+    assert "asthma" in out and "ventolin" in out

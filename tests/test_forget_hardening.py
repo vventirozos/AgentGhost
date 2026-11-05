@@ -87,7 +87,7 @@ def test_removal_text_detection():
     assert is_removal_or_negation_text("The user no longer owns a car")
     assert is_removal_or_negation_text("user does not have a cat")
     # Positive facts are NOT flagged.
-    assert not is_removal_or_negation_text("User owns a dog named Hanzo")
+    assert not is_removal_or_negation_text("User owns a dog named Bruno")
     assert not is_removal_or_negation_text("User lives in Athens")
     assert not is_removal_or_negation_text("")
 
@@ -97,7 +97,7 @@ def test_removal_triplet_detection():
     assert is_removal_triplet({"subject": "user", "predicate": "NO_LONGER_HAS", "object": "iguana"})
     assert is_removal_triplet({"subject": "user", "predicate": "HAS_PET", "object": "iguana (removed)"})
     # A clean ownership edge survives.
-    assert not is_removal_triplet({"subject": "user", "predicate": "HAS_PET", "object": "hanzo"})
+    assert not is_removal_triplet({"subject": "user", "predicate": "HAS_PET", "object": "bruno"})
     assert not is_removal_triplet("not a dict")
 
 
@@ -126,7 +126,7 @@ def test_graph_connected_entities(tmp_path):
 async def test_forget_vector_literal_override(tmp_path):
     mem = FakeMemSys([
         ("m1", "User previously had an iguana that was removed", {"type": "identity"}),
-        ("d1", "User owns a dog named Hanzo", {"type": "auto"}),
+        ("d1", "User owns a dog named Bruno", {"type": "auto"}),
     ])
     with patch("ghost_agent.tools.memory.asyncio.to_thread") as mt:
         mt.side_effect = _passthrough_to_thread()
@@ -154,11 +154,11 @@ async def test_forget_expands_to_alias(tmp_path):
         {"subject": "user", "predicate": "PREVIOUSLY_OWNED", "object": "iguana"},
     ])
     pm = ProfileMemory(tmp_path)
-    pm.update("assets", "pets", "Hanzo the dog")
+    pm.update("assets", "pets", "Bruno the dog")
     pm.update("assets", "pets", "Mortimer the iguana")
     mem = FakeMemSys([
         ("t1", "User previously had an iguana that was removed", {"type": "identity"}),
-        ("k1", "User owns a dog named Hanzo", {"type": "auto"}),
+        ("k1", "User owns a dog named Bruno", {"type": "auto"}),
     ])
 
     with patch("ghost_agent.tools.memory.asyncio.to_thread") as mt:
@@ -168,8 +168,8 @@ async def test_forget_expands_to_alias(tmp_path):
             profile_memory=pm, graph_memory=g,
         )
 
-    # Profile: Mortimer pruned from the list, Hanzo survives.
-    assert pm.load()["assets"]["pets"] == "Hanzo the dog"
+    # Profile: Mortimer pruned from the list, Bruno survives.
+    assert pm.load()["assets"]["pets"] == "Bruno the dog"
     # Vector: the iguana tombstone (an ALIAS of mortimer) is gone...
     assert "t1" not in mem.collection.docs
     # ...the dog fact stays.

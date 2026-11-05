@@ -114,7 +114,7 @@
   <ul>
     <li><strong>Kind words people use.</strong> <code>owner_facts_matching</code> looked kind words up by exact key. The genitive in "τι προβλήματα υγείας έχω;" and the words heart/καρδιά, pets/dog/cat/κατοικίδια, motorcycle/bike/cars/vehicles, kid and specialise/expertise all found nothing. These are now keys, opening on an <em>owner</em> question only (<code>extended</code>). <code>_greek_kind_key</code> matches a Greek inflection (a shared stem of ≥ 3 letters; the key cut only by a noun ending σ/α/η, so the particle "μεν" is not the verb μένω; the rest of the word a case ending from <code>_GREEK_ENDINGS</code>, so παιδεία "education" and παιδικό "kindergarten" are not παιδιά "children", while γιο/γιου → γιος and ονόματα → όνομα), also for owner questions only, so "υγείας υπουργείο νέα" stays news. English keys stay exact.</li>
     <li><strong>The date shown is when the fact was stated</strong> (<code>valid_from</code>; a legacy row with none sorts and shows by its <code>timestamp</code>), not the row's last touch. The 10-30 mirror re-sync had stamped every owner edge "as of 2026-10-30" beside the profile's "as of 2026-07-07", and the model "used the most recent data". <code>sync_owner_field(..., as_of_by_value=)</code> now writes a mirror edge dated when the profile learned the value. <code>scripts/restamp_owner_mirrors_4sn.py</code> (dry run by default, backs up on <code>--apply</code>) moves the existing mirror edges' <code>valid_from</code>, only ever <em>earlier</em>.</li>
-    <li><strong>Names are shown as stored.</strong> Nodes are folded to lowercase (the dedup key), and <code>_format_path</code>'s <code>.title()</code> re-cased them wrongly: the model saw "Bmw 118I" and "Evolmonkey - Postgresql Services". Only the owner node is printed as "User".</li>
+    <li><strong>Names are shown as stored.</strong> Nodes are folded to lowercase (the dedup key), and <code>_format_path</code>'s <code>.title()</code> re-cased them wrongly: the model saw "Bmw 320D" and "Orbitdata - Postgresql Services". Only the owner node is printed as "User".</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
@@ -142,7 +142,7 @@
     <li>Decay: health and profession predicates are durable (CONDITION, MEDICATION, DIAGNOSIS, ALLERGY, HEALTH, DISEASE,
     PROFESSION, COMPANION), and <code>LOCATED_IN</code>; a trip (<code>IS_AT</code>, <code>LOCATED_NEAR</code>) still decays. A
     <code>user HAS_*</code> carrying TEST/PROBE/DEMO/SAMPLE/… is noise and decays. <code>scripts/memory_repair_4kx_r8.py</code>
-    restored the six owner facts the decay had pruned (heart failure, blood clot, Entresto ×2, profession, companion).</li>
+    restored the six owner facts the decay had pruned (asthma, hay fever, Ventolin ×2, profession, companion).</li>
   </ul>
   <h2 id="forget-project"><code>forget_project(project_id, title, forget_title)</code> <span class="tag">2026-10-06</span></h2>
   <p>The graph leg of a project hard delete (see <a href="../tools/projects.html">manage_projects</a>). Deletes every row, current <em>and</em> expired, where a node holds the project id as a whole token (<code>project:&lt;id&gt;</code>, <code>project &lt;id&gt;</code>, a bare id under <code>project HAS_ID</code>; a longer id that contains it is not matched), every edge of the <code>task:&lt;tid&gt;</code> nodes the project owned via <code>HAS_TASK</code>, and, when <code>forget_title</code>, the generic <code>project HAS_TITLE &lt;title&gt;</code> edge (folded comparison). Shared concept nodes (<code>technique:bayesian</code>) lose only this project's edge. Input that is not an 8+ char hex id deletes nothing. Rows are archived to <code>graph_pruned_archive.jsonl</code> (reason <code>forget_project</code>) before deletion; if the archive write fails they are soft-expired instead (recoverable, like <code>delete_by_target</code>). Blocked on <code>ReadOnlyGraphMemory</code>.</p>
@@ -158,7 +158,7 @@
     <li><code>_CANONICAL_PREDICATES</code>: spouse, birth-date, residence and medication synonyms are written as ONE predicate
     (MARRIED_TO, HAS_BIRTHDATE, LIVES_IN, HAS_MEDICATION…). Ages (AGE/HAS_AGE) are not stored — the birth date is the fact.</li>
     <li>LIVES_IN is home (single-valued); LOCATED_IN / LOCATED_AT / STAYS_AT / IS_AT / VISITING are PRESENCE — not single-valued,
-    not durable (a weekend in Kyllini replaced the owner's home on 08-15).</li>
+    not durable (a weekend in Paralia replaced the owner's home on 08-15).</li>
     <li><code>add_triplets(as_of=…)</code>: a single-valued edge stated EARLIER than the live one does not replace it (a re-queued
     journal item expired "lives in Patras" back to Athens). Journal items carry <code>ts</code>.</li>
     <li><code>owner_edges_naming(value, predicate)</code>: a correction removes only that kind of fact; a removal verb (sold,

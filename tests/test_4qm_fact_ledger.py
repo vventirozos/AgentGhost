@@ -72,19 +72,19 @@ def test_record_history_and_render(led):
 def test_history_by_question_words_matches_key_value_or_the_owners_words(led):
     """Broken world: "what car did I have before?" finds nothing because the
     row's KEY is `vehicles` and only the value says "BMW"."""
-    led.record(store="profile", category="assets", key="vehicles", value="BMW 118i", event="stated",
-               source={"said": "my car is a BMW 118i"})
-    led.record(store="profile", category="assets", key="vehicles", value="BMW 118i", event="removed", how="prune:bmw",
+    led.record(store="profile", category="assets", key="vehicles", value="BMW 320d", event="stated",
+               source={"said": "my car is a BMW 320d"})
+    led.record(store="profile", category="assets", key="vehicles", value="BMW 320d", event="removed", how="prune:bmw",
                source={"said": "we sold the BMW"})
-    led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="stated")
+    led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="stated")
     lines = led.lines_for_question("what car did I have before, the bmw?")
     assert len(lines) == 2 and all("vehicles" in ln for ln in lines) and 'removed' in lines[0]
-    assert led.lines_for_question("what is my dogs name?") == ["- pet.dog_name = Hanzo — since " + FL._day(time.time())]
+    assert led.lines_for_question("what is my dogs name?") == ["- pet.dog_name = Bruno — since " + FL._day(time.time())]
     assert led.lines_for_question("tell me about the weather") == []
     # a value restated many times is ONE line
     for _ in range(3):
-        led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="restated")
-    assert len(led.lines_for_question("my dog hanzo")) == 2
+        led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="restated")
+    assert len(led.lines_for_question("my dog bruno")) == 2
 
 
 def test_said_is_clipped_and_plain_values_fold_stamped_shapes():
@@ -96,19 +96,19 @@ def test_said_is_clipped_and_plain_values_fold_stamped_shapes():
 def test_current_source_reads_the_live_request_but_keeps_only_the_owners_clause():
     """Broken worlds: an in-turn write records no request id / no words; the
     WHOLE message is stored (review r1 MAJOR: a token pasted beside "my car
-    is a Ducati" went into the ledger and back into prompts); a question
+    is a Triumph" went into the ledger and back into prompts); a question
     clause is taken for the statement."""
     from ghost_agent.utils import logging as L
     from ghost_agent.memory.lesson_scope import current_request
-    msg = "here is my token sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 keep it; my dog is called Hanzo"
+    msg = "here is my token sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 keep it; my dog is called Bruno"
     t1 = L.request_id_context.set("req-123"); t2 = current_request.set(msg)
     try:
-        src = FL.current_source(via="profile", value="Hanzo", field=("pet", "dog_name"))
-        assert src == {"req_id": "req-123", "said": "my dog is called Hanzo", "via": "profile"}
+        src = FL.current_source(via="profile", value="Bruno", field=("pet", "dog_name"))
+        assert src == {"req_id": "req-123", "said": "my dog is called Bruno", "via": "profile"}
         assert FL.current_source(via="profile") == {"req_id": "req-123", "said": "", "via": "profile"}
         assert FL.current_source(via="profile", value="Tesla", field=("assets", "car"))["said"] == ""
-        current_request.set("do you remember my dog Hanzo")
-        assert FL.current_source(via="profile", value="Hanzo", field=("pet", "dog_name"))["said"] == ""
+        current_request.set("do you remember my dog Bruno")
+        assert FL.current_source(via="profile", value="Bruno", field=("pet", "dog_name"))["said"] == ""
     finally:
         current_request.reset(t2); L.request_id_context.reset(t1)
 
@@ -116,10 +116,10 @@ def test_current_source_reads_the_live_request_but_keeps_only_the_owners_clause(
 def test_the_owners_words_are_redacted_before_they_are_stored(led):
     """Broken world: a key, an e-mail or a password inside the owner's sentence
     is stored raw and rendered into a prompt line."""
-    led.record(store="profile", category="assets", key="car", value="Ducati", event="stated",
-               source={"said": "my car is a Ducati, mail me at vasilis@example.com, key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"})
+    led.record(store="profile", category="assets", key="car", value="Triumph", event="stated",
+               source={"said": "my car is a Triumph, mail me at vasilis@example.com, key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"})
     r = led.history("assets", "car")[0]
-    assert "example.com" not in r["said"] and "sk-ant" not in r["said"] and r["said"].startswith("my car is a Ducati")
+    assert "example.com" not in r["said"] and "sk-ant" not in r["said"] and r["said"].startswith("my car is a Triumph")
     assert "<REDACTED" in r["said"]
 
 
@@ -153,17 +153,17 @@ def test_profile_update_records_stated_restated_replaced(profile, led):
 
 def test_profile_removals_record_removed_with_how(profile, led):
     """Broken world: a forgotten value leaves no trace of WHEN or HOW it went."""
-    profile.update("assets", "vehicles", "BMW 118i"); profile.update("assets", "vehicles", "Ducati")
-    profile.update("root", "company", "Acme"); profile.update("root", "company", "EvolMonkey")
-    profile.update("pet", "dog_name", "Hanzo")
+    profile.update("assets", "vehicles", "BMW 320d"); profile.update("assets", "vehicles", "Triumph")
+    profile.update("root", "company", "Acme"); profile.update("root", "company", "Orbitdata")
+    profile.update("pet", "dog_name", "Bruno")
     assert profile.prune_value("assets", "vehicles", "bmw").startswith("Pruned")
-    assert profile.remove_item("assets", "vehicles", "Ducati").startswith("Removed")
+    assert profile.remove_item("assets", "vehicles", "Triumph").startswith("Removed")
     assert profile.drop_previous("root", "company").startswith("Removed")
     assert profile.delete("pet", "dog_name").startswith("Removed")
     got = {(r["key"], r["value"], r["how"]) for r in _all(led) if r["event"] == "removed"}
-    assert got == {("vehicles", "BMW 118i", "prune:bmw"), ("vehicles", "Ducati", "remove_item"),
-                   ("company", "Acme", "drop_previous"), ("dog_name", "Hanzo", "delete")}
-    assert "pet" not in profile.load() and profile.load()["root"]["company"] == "EvolMonkey"
+    assert got == {("vehicles", "BMW 320d", "prune:bmw"), ("vehicles", "Triumph", "remove_item"),
+                   ("company", "Acme", "drop_previous"), ("dog_name", "Bruno", "delete")}
+    assert "pet" not in profile.load() and profile.load()["root"]["company"] == "Orbitdata"
 
 
 def test_a_profile_without_a_ledger_writes_as_before(tmp_path):
@@ -196,7 +196,7 @@ def test_graph_owner_edges_record_stated_restated_expired_removed(tmp_path, led)
     g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "Athens"}])
     g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "Patras"}],
                    source={"req_id": "r2", "said": "we moved to Patras"})
-    g.sync_owner_field("dog_name", ["Hanzo"])
+    g.sync_owner_field("dog_name", ["Bruno"])
     g.sync_owner_field("dog_name", [])
     g.add_triplets([{"subject": "user", "predicate": "ASKED_ABOUT", "object": "weather"},
                     {"subject": "user", "predicate": "GREETED", "object": "ghost"}])
@@ -272,13 +272,13 @@ def test_history_tier_off_in_production_on_by_switch_or_arm(production, monkeypa
     """Broken worlds: history lines on a production turn with the switch off;
     the arm honoured on a non-probe; a non-self question getting history."""
     from ghost_agent.utils import logging as L
-    led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="stated", source={"said": "my dog is Hanzo"})
+    led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="stated", source={"said": "my dog is Bruno"})
     bus = _bus(led)
     q = "what's my dogs name?"
     assert asyncio.run(bus._fetch_history(q)) == []
     monkeypatch.setenv(FL.ENV_FLAG, "1")
     out = asyncio.run(bus._fetch_history(q))
-    assert out and out[0]["source"] == "history" and "pet.dog_name = Hanzo" in out[0]["text"]
+    assert out and out[0]["source"] == "history" and "pet.dog_name = Bruno" in out[0]["text"]
     assert asyncio.run(bus._fetch_history("what is the dog breed with the longest name?")) == []   # not about the owner
     monkeypatch.delenv(FL.ENV_FLAG)
     t1 = L.prompt_arm_context.set("fact_history"); t2 = L.request_id_context.set("probe-4qm-1")
@@ -297,16 +297,16 @@ def test_hydrated_history_skips_on_demand_fields_and_scrubs_the_street(monkeypat
     monkeypatch.setenv(FL.ENV_FLAG, "1")
     from ghost_agent.core.bus import MemoryBus
     pm = ProfileMemory(tmp_path)
-    pm.update("root", "address", "Makedonias 83 Thrakomakedones 13676, Athens, Greece")
-    led.record(store="profile", category="root", key="address", value="Makedonias 83 Thrakomakedones 13676, Athens, Greece",
-               event="stated", source={"said": "My home address is Makedonias 83 Thrakomakedones 13676"})
+    pm.update("root", "address", "Kaledonias 83 Kalopetres 10101, Athens, Greece")
+    led.record(store="profile", category="root", key="address", value="Kaledonias 83 Kalopetres 10101, Athens, Greece",
+               event="stated", source={"said": "My home address is Kaledonias 83 Kalopetres 10101"})
     led.record(store="profile", category="root", key="location", value="Athens, Greece", event="stated",
-               source={"said": "I live at Makedonias 83 Thrakomakedones, Athens"})
+               source={"said": "I live at Kaledonias 83 Kalopetres, Athens"})
     bus = MemoryBus(profile_memory=pm, fact_ledger=led)
     out = asyncio.run(bus._fetch_history("where do I live and what's my address?"))
     texts = [o["text"] for o in out]
     assert len(texts) == 1 and "root.location = Athens, Greece" in texts[0]
-    assert "Makedonias" not in " ".join(texts) and "83" not in " ".join(texts)
+    assert "Kaledonias" not in " ".join(texts) and "83" not in " ".join(texts)
     # recall (on demand) still shows the field itself
     from ghost_agent.tools.memory import tool_recall
     ms = MagicMock(); ms.search_advanced = MagicMock(return_value=[])
@@ -317,11 +317,11 @@ def test_hydrated_history_skips_on_demand_fields_and_scrubs_the_street(monkeypat
 def test_history_block_renders_under_its_header_and_logs_its_tier(monkeypatch, led, caplog):
     import logging as _l
     monkeypatch.setenv(FL.ENV_FLAG, "1")
-    led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="stated")
+    led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="stated")
     bus = _bus(led)
     with caplog.at_level(_l.INFO, logger="GhostAgent"):
         out = asyncio.run(bus.hydrate_context("what's my dogs name?", context_budget=4000, raw_user_text="what's my dogs name?"))
-    assert out.startswith(FL.HEADER) and "pet.dog_name = Hanzo" in out
+    assert out.startswith(FL.HEADER) and "pet.dog_name = Bruno" in out
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Hydration tiers:"))
     assert " h=1 " in line and " h1)" in line
 
@@ -376,11 +376,11 @@ def test_the_extractor_names_the_owners_clause_behind_a_value():
     drain's empty request instead of the sentence the owner typed."""
     from ghost_agent.core.agent import _owner_sentence_for
     from ghost_agent.memory.attribution import PREDICATE_CUES, cue_for_field, owner_statements, owner_clause_for
-    ep = "USER: My dog is called Hanzo. I don't drive a Tesla, we live in Athens.\nAI: noted.\nUSER: do you remember my wife Fotini"
-    assert _owner_sentence_for("Hanzo", ep) == "My dog is called Hanzo"          # the owner's RAW words (review r1)
+    ep = "USER: My dog is called Bruno. I don't drive a Tesla, we live in Athens.\nAI: noted.\nUSER: do you remember my wife Elena"
+    assert _owner_sentence_for("Bruno", ep) == "My dog is called Bruno"          # the owner's RAW words (review r1)
     assert _owner_sentence_for("Athens, Greece", ep) == "we live in Athens"
     assert _owner_sentence_for("Tesla", ep) == "" and _owner_sentence_for("", ep) == ""
-    assert _owner_sentence_for("Fotini", ep) == ""                              # a question states nothing
+    assert _owner_sentence_for("Elena", ep) == ""                              # a question states nothing
     # the field's predicate cue beats an earlier clause that only shares the word (review r1)
     ep2 = "USER: I was in Athens last weekend for a wedding. We moved to Athens in May."
     assert owner_clause_for("Athens, Greece", ep2) == "I was in Athens last weekend for a wedding"
@@ -390,14 +390,14 @@ def test_the_extractor_names_the_owners_clause_behind_a_value():
 
 
 def test_a_question_without_a_question_mark_is_not_a_statement():
-    """Broken world (review r1 MAJOR): "do you remember my wife fotini",
+    """Broken world (review r1 MAJOR): "do you remember my wife elena",
     "tell me about my car bmw", "remind me where i live athens" passed as the
-    owner's statements — attributed, and would have WRITTEN wife = fotini."""
+    owner's statements — attributed, and would have WRITTEN wife = elena."""
     from ghost_agent.memory.attribution import owner_statements
-    for q in ("do you remember my wife fotini", "tell me about my car bmw", "remind me where i live athens",
+    for q in ("do you remember my wife elena", "tell me about my car bmw", "remind me where i live athens",
               "what is my dogs name", "have you got my address", "θυμάσαι τη γυναίκα μου", "πες μου που μένω"):
         assert owner_statements("USER: " + q) == [], q
-    assert owner_statements("USER: remember my wife is called Fotini") == [("remember my wife is called fotini", False)]
+    assert owner_statements("USER: remember my wife is called Elena") == [("remember my wife is called elena", False)]
     assert owner_statements("USER: we moved to Patras, not Athens.")[0][0] == "we moved to patras"
 
 
@@ -447,14 +447,14 @@ def test_hydration_applies_the_profiles_whole_on_demand_rule(monkeypatch, led, t
     pm = ProfileMemory(tmp_path)
     pm.ledger = led
     pm.update("root", "appearance_description", "brown hair, scar on the left cheek")
-    pm.update("root", "home_address", "Makedonias 83 Thrakomakedones 13676")
+    pm.update("root", "home_address", "Kaledonias 83 Kalopetres 10101")
     pm.update("root", "location", "Athens, Greece")
-    pm.update("notes", "info", "parking spot: Makedonias 83")          # a street-looking VALUE under a plain key
+    pm.update("notes", "info", "parking spot: Kaledonias 83")          # a street-looking VALUE under a plain key
     bus = MemoryBus(profile_memory=pm, fact_ledger=led)
     out = asyncio.run(bus._fetch_history("what did i tell you about my appearance description, home address and location?"))
     texts = " ".join(o["text"] for o in out)
     assert "root.location = Athens, Greece" in texts
-    assert "scar" not in texts and "appearance" not in texts and "Makedonias" not in texts and "83" not in texts
+    assert "scar" not in texts and "appearance" not in texts and "Kaledonias" not in texts and "83" not in texts
 
 
 def test_history_fails_closed_without_the_profiles_rules(monkeypatch, led):
@@ -513,9 +513,9 @@ def test_days_are_local_and_unreadable_stamps_are_undated(led):
 def test_provenance_skips_removals_and_expiries(led):
     """Battery F9: the newest row for a value may be its removal — provenance
     is the row that STATED it."""
-    led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="stated", source={"req_id": "r1"})
-    led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="removed", how="delete")
-    p = led.provenance_for("pet", "dog_name", "Hanzo")
+    led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="stated", source={"req_id": "r1"})
+    led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="removed", how="delete")
+    p = led.provenance_for("pet", "dog_name", "Bruno")
     assert p and p["event"] == "stated" and p["req_id"] == "r1"
 
 
@@ -541,12 +541,12 @@ def test_backfill_seeds_the_stores_history_once_and_truthfully(tmp_path):
     day = home / "system" / "trajectories" / "2026-07-01"
     day.mkdir(parents=True)
     turns = [_owner_turn("a" * 32, "Hi. We moved to Patras last year, by the way.", "2026-07-01T10:00:00Z", "r-moved"),
-             _owner_turn("b" * 32, "do you remember my wife fotini", "2026-07-02T10:00:00Z", "r-ask")]
+             _owner_turn("b" * 32, "do you remember my wife elena", "2026-07-02T10:00:00Z", "r-ask")]
     (day / "session-x.jsonl").write_text("".join(json.dumps(t) + "\n" for t in turns), encoding="utf-8")
     pm = ProfileMemory(mdir)
     pm.update("root", "location", "Athens, Greece", as_of="2026-05-01T09:00:00")
     pm.update("root", "location", "Patras", as_of="2026-07-03T09:00:00")
-    pm.update("relationships", "wife", "Fotini", as_of="2026-07-03T09:00:00")
+    pm.update("relationships", "wife", "Elena", as_of="2026-07-03T09:00:00")
     data = pm.load_raw()
     data.setdefault("assets", {})["car"] = "Audi  A3"                   # legacy: no stamp, double space
     pm.save(data)
@@ -571,7 +571,7 @@ def test_backfill_seeds_the_stores_history_once_and_truthfully(tmp_path):
     assert live["event"] == "replaced" and live["prev_value"] == "Athens, Greece"
     assert live["said"] == "We moved to Patras last year" and live["req_id"] == "r-moved"
     assert rows[("profile", "location", "Athens, Greece")]["event"] == "backfilled"
-    wife = rows[("profile", "wife", "Fotini")]
+    wife = rows[("profile", "wife", "Elena")]
     assert wife["said"] == "" and wife["how"] == "unattributed"         # a question attributes nothing
     car = rows[("profile", "car", "Audi A3")]
     assert "undated" in car["how"]
@@ -595,36 +595,36 @@ def test_requests_to_remember_are_statements_and_hidden_questions_are_not():
     """Broken worlds (review r2): the question opener dropped real statements —
     modal requests to remember, "did I mention", "when I was 20 …", the Greek
     "ποτέ μην …" imperative — and a greeting or a lead clause before the
-    question hid it ("hi, do you remember my wife fotini" wrote wife = fotini)."""
+    question hid it ("hi, do you remember my wife elena" wrote wife = elena)."""
     from ghost_agent.memory.attribution import owner_statements, owner_said
-    kept = ("can you remember that I live in Athens", "Can you please remember my wife is called Fotini",
+    kept = ("can you remember that I live in Athens", "Can you please remember my wife is called Elena",
             "could you note that my employer is Acme", "would you remember that I moved to Patras",
             "May I remind you that I live in Athens", "Did I mention I moved to Patras",
-            "When I was 20 I lived in Patras", "Ποτέ μην ξεχάσεις ότι η γυναίκα μου λέγεται Φωτεινή",
+            "When I was 20 I lived in Patras", "Ποτέ μην ξεχάσεις ότι η γυναίκα μου λέγεται Έλενα",
             "hey, we moved to Patras last year")
     for st in kept:
         assert owner_statements("USER: " + st), st
-    dropped = ("hi, do you remember my wife fotini", "hey do you remember my wife fotini",
-               "I wonder, do you remember my wife fotini", "ok so, what is my wife's name fotini",
-               "have you got my wife fotini in your memory", "can you tell me my wife fotini")
+    dropped = ("hi, do you remember my wife elena", "hey do you remember my wife elena",
+               "I wonder, do you remember my wife elena", "ok so, what is my wife's name elena",
+               "have you got my wife elena in your memory", "can you tell me my wife elena")
     for q in dropped:
-        assert "fotini" not in " ".join(c for c, _ in owner_statements("USER: " + q)), q
-        assert owner_said("fotini", owner_statements("USER: " + q)) != "stated", q
+        assert "elena" not in " ".join(c for c, _ in owner_statements("USER: " + q)), q
+        assert owner_said("elena", owner_statements("USER: " + q)) != "stated", q
     # "don't forget …" states, it does not negate (r2 note)
     assert owner_statements("USER: Don't forget I live in Athens.") == [("don't forget i live in athens", False)]
-    assert owner_statements("USER: never forget my wife is Fotini") == [("never forget my wife is fotini", False)]
+    assert owner_statements("USER: never forget my wife is Elena") == [("never forget my wife is elena", False)]
     assert owner_statements("USER: I don't live in Athens any more")[0][1] is True
     # review r3: a relative clause is not a question; a modal + "remind me"/"forget"
     # IS one; a wh-word before we/my/our opens a statement; "have I told you" states;
     # the Greek question word is read with its accent on the raw sentence
-    for st, value in (("My wife, who is called Fotini, is a doctor.", "Fotini"),
+    for st, value in (("My wife, who is called Elena, is a doctor.", "Elena"),
                       ("My car, which is a BMW, is parked outside.", "BMW"),
                       ("I have two kids, who are called Nikos and Maria.", "Nikos"),
                       ("When we moved to Patras last year we bought a house.", "Patras"),
-                      ("What my wife Fotini likes is hiking.", "Fotini"),
-                      ("have I told you about my wife fotini", "fotini")):
+                      ("What my wife Elena likes is hiking.", "Elena"),
+                      ("have I told you about my wife elena", "elena")):
         assert owner_said(value, owner_statements("USER: " + st)) == "stated", st
-    for q, value in (("can you remind me where my wife fotini works", "fotini"),
+    for q, value in (("can you remind me where my wife elena works", "elena"),
                      ("could you remind me what car i drive, the bmw", "bmw"),
                      ("can you forget my ex-wife maria", "maria"),
                      ("Πότε σου είπα ότι μένω στην Αθήνα", "Αθήνα"),
@@ -635,21 +635,21 @@ def test_requests_to_remember_are_statements_and_hidden_questions_are_not():
     # indirect question asks; Greek ";" is the question mark; a tag question asks;
     # a colon lead hides nothing; instructions with also/just/make a note state;
     # Greek states person in the verb
-    for q, value in (("is my wife fotini a doctor", "fotini"), ("was my previous car the audi", "audi"),
-                     ("does my wife fotini still work at evangelismos", "fotini"),
-                     ("I wonder if you remember my wife fotini", "fotini"),
-                     ("I want to know if you still remember my wife fotini", "fotini"),
-                     ("η γυναίκα μου είναι η Φωτεινή;", "Φωτεινή"), ("μένω ακόμα στην Αθήνα;", "Αθήνα"),
-                     ("you know my wife fotini, right", "fotini"), ("quick question: is my wife fotini a doctor", "fotini"),
+    for q, value in (("is my wife elena a doctor", "elena"), ("was my previous car the audi", "audi"),
+                     ("does my wife elena still work at evangelismos", "elena"),
+                     ("I wonder if you remember my wife elena", "elena"),
+                     ("I want to know if you still remember my wife elena", "elena"),
+                     ("η γυναίκα μου είναι η Έλενα;", "Έλενα"), ("μένω ακόμα στην Αθήνα;", "Αθήνα"),
+                     ("you know my wife elena, right", "elena"), ("quick question: is my wife elena a doctor", "elena"),
                      ("Any idea where I live, Athens or Patras", "Athens")):
         assert owner_said(value, owner_statements("USER: " + q)) != "stated", q
     for st, value in (("could you also remember that I live in Athens", "Athens"),
-                      ("can you just note that my wife is Fotini", "Fotini"),
+                      ("can you just note that my wife is Elena", "Elena"),
                       ("could you make a note that I live in Athens", "Athens"),
                       ("Can I ask you to remember that I live in Athens", "Athens"),
-                      ("I don't know if you remember, but my wife is Fotini", "Fotini"),
+                      ("I don't know if you remember, but my wife is Elena", "Elena"),
                       ("Μετακόμισα στην Πάτρα", "Πάτρα"), ("Λοιπόν, μετακομίσαμε στην Πάτρα", "Πάτρα"),
-                      ("Παντρεύτηκα τη Φωτεινή", "Φωτεινή")):
+                      ("Παντρεύτηκα την Έλενα", "Έλενα")):
         assert owner_said(value, owner_statements("USER: " + st)) == "stated", st
     from ghost_agent.memory.attribution import owner_clause_for
     assert owner_clause_for("1985-03-05", "USER: my birthday is 1985-03-05") == "my birthday is 1985-03-05"
@@ -672,13 +672,13 @@ def test_backfilled_rows_say_on_record_and_stated_rows_say_since(led):
     edge's creation (2026-09-21) and rendered "since 2026-09-21 (you said: …)",
     so the model told the owner "you told me on 2026-09-21" about a fact stated
     in July. Only a row the live agent wrote at the owner's turn may say since."""
-    led.record(store="graph", category="graph", key="owns", value="bmw 118i", event="backfilled",
-               source={"said": "I own a BMW 118i"}, at="2026-09-21T16:03:03")
-    led.record(store="profile", category="pet", key="dog_name", value="Hanzo", event="stated",
-               source={"said": "my dogs name is Hanzo"}, at="2026-10-11T16:18:09")
+    led.record(store="graph", category="graph", key="owns", value="bmw 320d", event="backfilled",
+               source={"said": "I own a BMW 320d"}, at="2026-09-21T16:03:03")
+    led.record(store="profile", category="pet", key="dog_name", value="Bruno", event="stated",
+               source={"said": "my dogs name is Bruno"}, at="2026-10-11T16:18:09")
     lines = led.render_lines(led.history("graph", "owns") + led.history("pet", "dog_name"))
-    assert '- graph.owns = bmw 118i — on record since 2026-09-21 (you said: "I own a BMW 118i")' in lines
-    assert '- pet.dog_name = Hanzo — since 2026-10-11 (you said: "my dogs name is Hanzo")' in lines
+    assert '- graph.owns = bmw 320d — on record since 2026-09-21 (you said: "I own a BMW 320d")' in lines
+    assert '- pet.dog_name = Bruno — since 2026-10-11 (you said: "my dogs name is Bruno")' in lines
     assert not any("since 2026-09-21" in ln and "on record" not in ln for ln in lines)
 
 
@@ -711,10 +711,10 @@ def test_the_extractors_graph_rows_name_the_owners_clause_per_edge(tmp_path, led
     from ghost_agent.memory.graph import GraphMemory
     g = GraphMemory(tmp_path)
     g.ledger = led
-    ep = "USER: hi. We moved to Patras last year. my wife is Fotini\nAI: noted."
+    ep = "USER: hi. We moved to Patras last year. my wife is Elena\nAI: noted."
     g.add_triplets([{"subject": "user", "predicate": "LIVES_IN", "object": "Patras"},
-                    {"subject": "user", "predicate": "MARRIED_TO", "object": "Fotini"}],
+                    {"subject": "user", "predicate": "MARRIED_TO", "object": "Elena"}],
                    source={"req_id": "r9", "via": "extractor", "episode": ep})
     rows = {r["key"]: r for r in _all(led)}
     assert rows["lives_in"]["said"] == "We moved to Patras last year" and rows["lives_in"]["req_id"] == "r9"
-    assert rows["married_to"]["said"] == "my wife is Fotini" and rows["married_to"]["via"] == "extractor"
+    assert rows["married_to"]["said"] == "my wife is Elena" and rows["married_to"]["via"] == "extractor"

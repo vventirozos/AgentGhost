@@ -65,7 +65,7 @@ _LEARNING_CACHE_TTL_S = 600.0
 _LEARNING_CACHE: Dict[str, Tuple[float, str]] = {}
 
 # action='overview' — the one-call "how are you" briefing.
-_OVERVIEW_MAX_CHARS = 3200
+_OVERVIEW_MAX_CHARS = 3720     # §4SV-b: 3200 + the longest self-image line, so no other section pays for it
 _OVERVIEW_ACTIVITY_HOURS = 24.0
 _OVERVIEW_RECENT_N = 3
 _OVERVIEW_LEARNING_HEADS = ("LESSONS:",)   # §4PJ: COMPETENCE/CALIBRATION removed
@@ -277,11 +277,33 @@ WORK_LOG_NOTE = ("(a log of requests I worked on — what was ASKED, not facts a
                  "facts about the owner are the USER PROFILE)")
 
 
-def _render_summary(self_model) -> str:
+def _self_image(context, *, indent: str = "") -> str:
+    """The Mirror's latest sentence as one line, or "" (§4SV-b). The home is
+    resolved by the Mirror's own resolver from the same `memory_dir` the idle
+    phase writes under — one path for the writer and this reader. Not on a
+    public surface: the sentence is drawn from the owner's replies, and the
+    `mirror` command is refused there too."""
+    try:
+        from ..selfhood.mirror import home_from_memory_dir, self_image_line
+        from ..utils.logging import reply_is_public
+        if reply_is_public():
+            return ""
+        line = self_image_line(home_from_memory_dir(getattr(context, "memory_dir", None)))
+        return indent + line if line else ""
+    except Exception as e:  # noqa: BLE001 — a view must render without it
+        logger.debug("introspect self-image read skipped: %s", e)
+        return ""
+
+
+def _render_summary(self_model, context=None) -> str:
     stats = self_model.stats()
     parts: List[str] = []
     parts.append("Who I am — a snapshot of my self-state:")
     parts.append(_render_stats(stats))
+
+    image = _self_image(context)
+    if image:
+        parts.append("\n" + image)
 
     carried = _render_carried_state(self_model)
     if carried:
@@ -635,7 +657,7 @@ def _failed_listed(recent) -> int:
                if str(getattr(exp, "outcome", "") or "") == "failed")
 
 
-def _overview_selfhood(self_model) -> str:
+def _overview_selfhood(self_model, context=None) -> str:
     if self_model is None or not getattr(self_model, "enabled", False):
         return ("How I am: selfhood is disabled (--no-self-model / "
                 "--no-memory) — no mood, open questions or diary to report.")
@@ -671,6 +693,9 @@ def _overview_selfhood(self_model) -> str:
                          f"{MOOD_STALE_AFTER_HOURS:.0f}h)")
         else:
             lines.append("  mood: no reading on file")
+        image = _self_image(context, indent="  ")
+        if image:
+            lines.append(image)
         carried = _render_carried_state(self_model, indent="  ")
         lines.append(carried if carried else
                      "  nothing carried over: no open questions or "
@@ -858,7 +883,7 @@ def _overview_health(context) -> str:
 async def _render_overview(self_model, context) -> str:
     _known = _overview_health(context)
     parts = [OVERVIEW_HEALTH_LINE + ("\n" + _known if _known else ""),
-             _overview_selfhood(self_model),
+             _overview_selfhood(self_model, context),
              _overview_activity(context),
              await _overview_learning(context),
              _overview_workspace(context)]
@@ -1047,7 +1072,7 @@ async def tool_introspect(
             )
 
         # Default: summary.
-        return _render_summary(self_model)
+        return _render_summary(self_model, context)
     except Exception as e:  # noqa: BLE001 — never break the turn
         logger.warning("introspect tool failed: %s: %s", type(e).__name__, e)
         return _TO_failed(f"Introspection failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)

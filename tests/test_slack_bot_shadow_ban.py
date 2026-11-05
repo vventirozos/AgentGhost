@@ -214,10 +214,10 @@ def test_the_LIVE_reply_index_is_never_touched_by_a_test(monkeypatch, tmp_path):
     live = tmp_path / "pretend-live-index.json"
     live.write_text(json.dumps({
         "C_REAL:1786899694.380169": {"req_id": "8f6145e8",
-                                     "requester": "U55NMJT1N",
+                                     "requester": "U0MEMBER02",
                                      "t": 1786899694.0},
         "C_REAL:1786911129.690559": {"req_id": "7c701369",
-                                     "requester": "U56CVBHHQ",
+                                     "requester": "U0OWNER01",
                                      "t": 1786911129.0},
     }))
     before = live.read_text()

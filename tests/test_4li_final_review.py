@@ -15,7 +15,7 @@ from ghost_agent.memory.profile import ProfileMemory
 from tests.test_critic_async import agent, _final, _make_verifier, _verdict  # noqa: F401 — fixture
 
 
-def _profile(tmp_path, key="address", value="Makedonias 83 Thrakomakedones 13676, Athens, Greece"):
+def _profile(tmp_path, key="address", value="Kaledonias 83 Kalopetres 10101, Athens, Greece"):
     pm = ProfileMemory(tmp_path)
     pm.update("root", "name", "Vasilis")
     pm.update("root", key, value)
@@ -92,10 +92,10 @@ def test_fact_check_is_not_a_source_for_the_claim():
 
 # ── the address never leaves ─────────────────────────────────────────────────
 @pytest.mark.parametrize("query", [
-    "Οδός Μακεδονίας αριθμός 83", "Macedonias 83", "Makedonias Nr. 83", "Makedonias #83", "Makedonias_83",
-    "Makedonias Street, Thrakomakedones, number 83", "house 83 on Makedonias in Thrakomakedones",
-    "Makedonias Thrakomakedones 83", "Ｍakedonias ８３", "Makedonias\u200b 83", "Mаkedoniаs 83", "Makedonias 8 3",
-    "Makedonias 8\u200b3", "Makedhonias 83",
+    "Οδός Καλεδονίας αριθμός 83", "Caledonias 83", "Kaledonias Nr. 83", "Kaledonias #83", "Kaledonias_83",
+    "Kaledonias Street, Kalopetres, number 83", "house 83 on Kaledonias in Kalopetres",
+    "Kaledonias Kalopetres 83", "Ｋaledonias ８３", "Kaledonias\u200b 83", "Kаledoniаs 83", "Kaledonias 8 3",
+    "Kaledonias 8\u200b3", "Kaledhonias 83",
 ])
 def test_ordinary_phrasings_of_the_address_are_scrubbed(tmp_path, query):
     """Fails where natural Greek, the English spelling, "Nr."/"#", the street
@@ -105,51 +105,51 @@ def test_ordinary_phrasings_of_the_address_are_scrubbed(tmp_path, query):
 
 
 def test_the_street_and_number_in_separate_arguments_are_scrubbed(tmp_path):
-    out, changed = _scrub(tmp_path, "web_search", {"query": "Makedonias pharmacy", "location": "83"})
-    assert changed and "Makedonias" not in json.dumps(out) and "83" not in json.dumps(out)
+    out, changed = _scrub(tmp_path, "web_search", {"query": "Kaledonias pharmacy", "location": "83"})
+    assert changed and "Kaledonias" not in json.dumps(out) and "83" not in json.dumps(out)
 
 
-@pytest.mark.parametrize("url", ["https://maps.example/?q=Makedonias+Nr.+83", "https://maps.example/?q=Makedonias+%2383"])
+@pytest.mark.parametrize("url", ["https://maps.example/?q=Kaledonias+Nr.+83", "https://maps.example/?q=Kaledonias+%2383"])
 def test_execute_url_forms_with_a_number_word_are_scrubbed(tmp_path, url):
     out, changed = _scrub(tmp_path, "execute", {"command": f"curl '{url}'"})
     assert changed and "83" not in out["command"]
 
 
 def test_execute_urls_are_scrubbed_but_its_code_is_not(tmp_path):
-    """Fails where curl 'https://…?q=Makedonias+83' in execute went out —
+    """Fails where curl 'https://…?q=Kaledonias+83' in execute went out —
     the sandbox has Tor egress."""
-    code = "curl 'https://nominatim.example/search?q=Makedonias+83' > out.json\necho 'Makedonias 83' > letter.txt"
+    code = "curl 'https://nominatim.example/search?q=Kaledonias+83' > out.json\necho 'Kaledonias 83' > letter.txt"
     out, changed = _scrub(tmp_path, "execute", {"command": code})
-    assert changed and "q=Makedonias+83" not in out["command"] and "echo 'Makedonias 83'" in out["command"]
+    assert changed and "q=Kaledonias+83" not in out["command"] and "echo 'Kaledonias 83'" in out["command"]
 
 
-@pytest.mark.parametrize("key,value", [("home", "Makedonias 83, Athens"), ("homeAddress", "Makedonias 83"),
-                                       ("lives_at", "Makedonias 83"), ("location", "Makedonias 83")])
+@pytest.mark.parametrize("key,value", [("home", "Kaledonias 83, Athens"), ("homeAddress", "Kaledonias 83"),
+                                       ("lives_at", "Kaledonias 83"), ("location", "Kaledonias 83")])
 def test_an_address_under_another_key_is_hidden_and_scrubbed(tmp_path, key, value):
     """Fails where "home"/"homeAddress"/"lives_at"/"location" held the street
     and it reached every prompt and web_search."""
     pm = _profile(tmp_path, key=key, value=value)
-    assert "Makedonias" not in pm.get_context_string()
+    assert "Kaledonias" not in pm.get_context_string()
     from ghost_agent.memory.egress import scrub_tool_args
-    out, changed = scrub_tool_args("web_search", {"query": "Makedonias 83 pharmacy"},
+    out, changed = scrub_tool_args("web_search", {"query": "Kaledonias 83 pharmacy"},
                                    SimpleNamespace(profile_memory=pm))
     assert changed
 
 
-@pytest.mark.parametrize("args", [{"url": "https://arxiv.org/abs/2401.13676"},
-                                  {"url": "https://github.com/ggml-org/llama.cpp/issues/13676"},
-                                  {"url": "https://example.com/files/v1.13676.tar.gz"}])
+@pytest.mark.parametrize("args", [{"url": "https://arxiv.org/abs/2401.10101"},
+                                  {"url": "https://github.com/ggml-org/llama.cpp/issues/10101"},
+                                  {"url": "https://example.com/files/v1.10101.tar.gz"}])
 def test_an_identifier_that_contains_the_postcode_is_left_alone(tmp_path, args):
     """Fails where the postcode rewrote arxiv ids, issue numbers and file
-    versions inside URLs (a bare "PR 13676" in a query is still scrubbed —
+    versions inside URLs (a bare "PR 10101" in a query is still scrubbed —
     the §4LB review pinned the postcode alone as a leak)."""
     assert _scrub(tmp_path, "web_search" if "query" in args else "browser", args) == (args, False)
 
 
-@pytest.mark.parametrize("q", ["Thrakomakedones 13676 bakery", "pharmacy 136-76", "GR-13676 post office"])
+@pytest.mark.parametrize("q", ["Kalopetres 10101 bakery", "pharmacy 101-01", "GR-10101 post office"])
 def test_the_postcode_in_any_form_is_scrubbed(tmp_path, q):
     out, changed = _scrub(tmp_path, "web_search", {"query": q})
-    assert changed and "13676" not in out["query"] and "136-76" not in out["query"]
+    assert changed and "10101" not in out["query"] and "101-01" not in out["query"]
 
 
 # ── lessons ──────────────────────────────────────────────────────────────────

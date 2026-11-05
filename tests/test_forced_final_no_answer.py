@@ -468,7 +468,7 @@ def test_the_text_only_scrub_sentence_is_refuted_as_a_no_answer():
     ('Αυτό είναι ενδιαφέρον ερώτημα — δεν το έχω συναντήσει μέχρι τώρα. Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή και τη σχέση του με τον "συνέκτη Φριζήρα".', True),
     ("Θα ψάξω στο διαδίκτυο και θα επιστρέψω με στοιχεία.", True),
     ("Πάμε να δούμε τι λένε οι πηγές.", True),
-    ("Ο Φριζής γεννήθηκε το 1893 στη Χαλκίδα.", False),                    # an answer
+    ("Ο Φριζής γεννήθηκε το 1893 στη Ναύπλιο.", False),                    # an answer
     ("Θέλεις να ψάξω και για τον συλλέκτη;", False),                        # a question to the user (Greek ";")
     ("Θα ψάξω για τον συλλέκτη, αν θέλεις;", False),                        # a beat opener, but addressed to the user
     ("Θα ψάξω για τον συλλέκτη αν μου πεις το όνομά σου.", False),           # addressed ("σου")
@@ -487,7 +487,7 @@ def test_the_text_only_scrub_sentence_is_refuted_as_a_no_answer():
     ("I will not delete the production database.", False),
     ('Let me check the page. It says "closed until March".', False),
     ("I'll check the logs; then I'll restart the service.", True),
-    ("Ας κάνω έρευνα: η πηγή λέει \"ο Φριζής υπηρέτησε ως ραβίνος της Χαλκίδας από το 1923\".", False),   # a long quote is a finding
+    ("Ας κάνω έρευνα: η πηγή λέει \"ο Φριζής υπηρέτησε ως ραβίνος της Ναύπλιος από το 1923\".", False),   # a long quote is a finding
 ])
 def test_narration_only_reads_greek_beats_and_short_quotes(text, expect):
     assert rs.narration_only(text) is expect
@@ -503,7 +503,7 @@ async def test_a_zero_tool_turn_that_only_announces_work_gets_one_continuation_w
     agent, ctx = _agent(monkeypatch, [
         _resp("Αυτό είναι ενδιαφέρον ερώτημα. Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή."),   # announced, nothing done
         _resp("Ψάχνω.", [_tc("c0", "web_search", {"query": "Μορντεχάι Φριζής Φριζήρας"})]),        # the continuation acts
-        _resp("Καμία σχέση: ο Φριζής ήταν ραβίνος της Χαλκίδας· ο Φριζήρας είναι συλλέκτης στην Πάτρα (Reuters)."),
+        _resp("Καμία σχέση: ο Φριζής ήταν ραβίνος της Ναύπλιος· ο Φριζήρας είναι συλλέκτης στην Πάτρα (Reuters)."),
         _resp("(unreachable)"),
     ])
     out, _, _ = await agent.handle_chat(

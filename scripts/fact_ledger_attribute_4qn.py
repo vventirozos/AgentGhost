@@ -4,7 +4,7 @@ words, and delete the seeded graph rows that twin a profile value.
 The §4QM backfill attributed a seeded fact only to a first-person STATEMENT
 CLAUSE carrying every word of the value. Thirteen live rows had none: the
 clause was split at a comma ("…, Athens, Greece"), the owner stated the fact
-about someone else without "my" ("fotini was born at 10 Jan 1982"), the value
+about someone else without "my" ("elena was born at 7 Jan 1982"), the value
 is the extractor's paraphrase ("High memory usage is normal …"), or the owner
 confirmed the fact in person (§4KY/§4LC, 2026-10-03) and never typed it.
 
@@ -17,7 +17,7 @@ the trajectory corpus at that minute (±2 min) or under that request id
 CONTAINS it (case/accent-folded, whitespace-normalised); a row whose clause
 is not found stays UNATTRIBUTED and is listed. Containment is the check, not
 the statement rule: the operator curates the file, and a clause inside a
-question sentence ("the doctor prescribed me entresto, what is it?") is
+question sentence ("the doctor prescribed me ventolin, what is it?") is
 accepted on their word. A request-id prefix must be at least 8 characters.
 An entry with no clause must carry a `how` that starts with "confirmed by
 you" — the ledger renders it. Rows are matched by (store, category, key)

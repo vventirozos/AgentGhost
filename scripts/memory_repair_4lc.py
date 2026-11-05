@@ -1,11 +1,11 @@
 """§4LC one-off (2026-10-03): the owner-fact answers to the §4KZ/§4LB questions —
-"1. none 3 yes 4 a i run evolmonkey, 4b yes 4 c no":
+"1. none 3 yes 4 a i run orbitdata, 4b yes 4 c no":
   3  the 102 graph edges whose subject is the agent itself (ai/assistant/system:
      log noise such as "assistant GENERATED image", never facts about the owner)
-  4a the owner RUNS EvolMonkey: `user WORKS_AT evolmonkey` removed, the profile
-     gains root.role ("Runs EvolMonkey")
-  4b birth dates into the profile: root.birthdate 1980-01-29,
-     relationships.wife_birthdate 1982-01-10 (mirrors synced)
+  4a the owner RUNS Orbitdata: `user WORKS_AT orbitdata` removed, the profile
+     gains root.role ("Runs Orbitdata")
+  4b birth dates into the profile: root.birthdate 1980-01-26,
+     relationships.wife_birthdate 1982-01-07 (mirrors synced)
   4c NOT owned / not real: the AGV Pista GP RR and Shoei X-Spirit III helmets,
      the Interactive Brokers account with €100 (graph edges + the one synthesis
      row stating it). The episodes recording that he ASKED about helmets stay.
@@ -22,18 +22,18 @@ MEM = Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/")) / "syst
 AGENT_SUBJECTS = ("ai", "assistant", "system")
 AGENT_EDGES_EXPECTED = 102
 DELETE = {
-    "4a-works-at": [["user", "WORKS_AT", "evolmonkey"]],
+    "4a-works-at": [["user", "WORKS_AT", "orbitdata"]],
     "4c-not-owned": [["user", "OWNS", "pista gp rr"], ["user", "OWNS", "shoei x-spirit iii"],
                      ["user", "HAS_ACCOUNT_WITH", "interactive brokers"], ["user", "HAS_FUNDS", "100 euros"]],
 }
 #: the vector rows stating a 4c fact (exact id + the text it must still carry)
 VECTOR_DELETE = {"b2c437fcc4eaec0196bb23181f0ce43c": "Interactive Brokers account with 100 euros"}
 #: kept — each must be live, or nothing is applied
-CANONICAL = [["user", "RUNS", "evolmonkey"], ["evolmonkey", "IS_A", "postgresql services company"],
-             ["user", "HAS_BIRTHDATE", "january 29, 1980"], ["fotini", "HAS_BIRTHDATE", "january 10, 1982"],
-             ["user", "MARRIED_TO", "fotini"]]
-PROFILE_SET = [["root", "role", "Runs EvolMonkey"], ["root", "birthdate", "1980-01-29"],
-               ["relationships", "wife_birthdate", "1982-01-10"]]
+CANONICAL = [["user", "RUNS", "orbitdata"], ["orbitdata", "IS_A", "postgresql services company"],
+             ["user", "HAS_BIRTHDATE", "january 26, 1980"], ["elena", "HAS_BIRTHDATE", "january 7, 1982"],
+             ["user", "MARRIED_TO", "elena"]]
+PROFILE_SET = [["root", "role", "Runs Orbitdata"], ["root", "birthdate", "1980-01-26"],
+               ["relationships", "wife_birthdate", "1982-01-07"]]
 
 
 def _agent_listening(port: int = 0) -> bool:

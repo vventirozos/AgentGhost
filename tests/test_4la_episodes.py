@@ -34,7 +34,7 @@ def test_an_unrelated_question_gets_no_episodes(tmp_path):
     put 5 unrelated episodes into every owner turn."""
     em, vm = _em(tmp_path), _vm()
     for t in ["fix the docker compose healthcheck for postgres", "transcribe the youtube talk about rust",
-              "find bjj gyms near thrakomakedones"]:
+              "find bjj gyms near kalopetres"]:
         em.record_episode(t, outcome="done", success=True, vector_memory=vm)
     assert em.search_similar("asdf qwerty", 5, vm) == []
     assert em.search_similar("recipe for pancakes", 5, vm) == []
@@ -44,7 +44,7 @@ def test_an_unrelated_question_gets_no_episodes(tmp_path):
 
 def test_an_empty_semantic_answer_does_not_fall_back_to_any_shared_word(tmp_path):
     em, vm = _em(tmp_path), _vm()
-    em.record_episode("what is the weather in kyllini today", outcome="sunny", success=True, vector_memory=vm)
+    em.record_episode("what is the weather in paralia today", outcome="sunny", success=True, vector_memory=vm)
     assert em.search_similar("what is my blood type", 5, vm) == []
 
 
@@ -104,7 +104,7 @@ def test_an_episode_is_redacted(tmp_path):
 def test_a_reindexed_twin_carries_the_episodes_own_date(tmp_path):
     """Fails where a re-ingest stamped "now" (133 twins up to 19 days late)."""
     em, vm = _em(tmp_path), _vm()
-    eid = em.record_episode("plan the trip to chalkida with the family", outcome="ok", success=True)
+    eid = em.record_episode("plan the trip to nafplio with the family", outcome="ok", success=True)
     with sqlite3.connect(em.db_path) as c:
         c.execute("UPDATE episodes SET timestamp=? WHERE id=?", (1767225600.0, eid))   # 2026-01-01
     em.reconcile_vector_index(vm)
@@ -196,15 +196,15 @@ def test_the_teach_gate_fails_closed(monkeypatch):
 
 # ── forgetting ───────────────────────────────────────────────────────────────
 def test_forget_finds_a_name_inside_a_tool_result(tmp_path):
-    """Fails where a recall RESULT naming Fotini survived "forget Fotini"."""
+    """Fails where a recall RESULT naming Elena survived "forget Elena"."""
     em = _em(tmp_path)
-    em.record_episode("who is my sister?", actions=[{"tool": "recall", "result": "Your sister is Fotini, lives in Patras"}],
+    em.record_episode("who is my sister?", actions=[{"tool": "recall", "result": "Your sister is Elena, lives in Patras"}],
                       outcome="She lives in Patras.", success=True)
-    assert em.count_mentions("fotini") == 1
+    assert em.count_mentions("elena") == 1
 
 
-@pytest.mark.parametrize("stored,typed", [("Η Φωτεινή έρχεται αύριο", "fotini"), ("ήρθε της Φωτεινής η μάνα", "Φωτεινή"),
-                                          ("Fotini said hi", "Φωτεινή")])
+@pytest.mark.parametrize("stored,typed", [("Η Έλενα έρχεται αύριο", "elena"), ("ήρθε της Έλενας η μάνα", "Έλενα"),
+                                          ("Elena said hi", "Έλενα")])
 def test_forget_crosses_scripts_and_greek_inflection(tmp_path, stored, typed):
     em = _em(tmp_path)
     em.record_episode(stored, outcome="ok", success=True)
@@ -219,10 +219,10 @@ def test_a_short_name_does_not_swallow_longer_words(tmp_path):
 
 def test_a_twin_that_could_not_be_deleted_is_reported(tmp_path):
     em = _em(tmp_path)
-    eid = em.record_episode("dinner with fotini on friday", outcome="ok", success=True)
+    eid = em.record_episode("dinner with elena on friday", outcome="ok", success=True)
     vm = MagicMock()
     vm.collection.delete.side_effect = RuntimeError("chroma down")
-    assert em.delete_episodes([eid], vm, reason="forget fotini") == 1
+    assert em.delete_episodes([eid], vm, reason="forget elena") == 1
     assert em.last_twin_failures == [eid]
     from ghost_agent.tools import memory as M
     out = M._execute_item({"kind": "episode", "ref": {"id": eid}, "label": "episode #1"}, vm, None, None, None,
@@ -232,10 +232,10 @@ def test_a_twin_that_could_not_be_deleted_is_reported(tmp_path):
 
 def test_the_forgotten_archive_says_what_and_when_and_expires(tmp_path):
     em = _em(tmp_path)
-    eid = em.record_episode("dinner with fotini", outcome="ok", success=True)
-    em.delete_episodes([eid], reason="forget fotini")
+    eid = em.record_episode("dinner with elena", outcome="ok", success=True)
+    em.delete_episodes([eid], reason="forget elena")
     row = json.loads((tmp_path / "episodes_forgotten.jsonl").read_text().splitlines()[0])
-    assert row["forgot"] == "forget fotini" and row["forgot_at"] > 0
+    assert row["forgot"] == "forget elena" and row["forgot_at"] > 0
     row["forgot_at"] = time.time() - 40 * 86400
     (tmp_path / "episodes_forgotten.jsonl").write_text(json.dumps(row) + "\n")
     # the NEXT deletion purges what is past the retention

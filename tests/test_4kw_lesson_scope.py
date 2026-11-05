@@ -57,7 +57,7 @@ def test_a_rewording_is_the_same_request(a, b):
     ("Redo this", "redo this"), ("Redo this", "redo"), ("proceed", "proceed"), ("hello ghost, what's going on ?", "hi ghost"),
     # fail-closed by design: a retry that adds or drops a word
     ("show me all projects", "sounds good. show me all projects."),
-    ("do you know how old is leonidas now ?", "how old is leonidas ?"),
+    ("do you know how old is kosmas now ?", "how old is kosmas ?"),
     ("show me all projects", "shw me all projcts"),                     # typos of short words
     # the first calibration's near misses
     ("Use deep_research ONCE on the query: llama.cpp prompt prefill speed apple silicon. Then reply with one short sentence",

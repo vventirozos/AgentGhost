@@ -67,7 +67,7 @@
     <li><strong>Key sweep</strong> — exact key match, then word-boundary substring match on keys only (so <code>forget('age')</code> can't wipe a <code>language</code> key). Matched keys are deleted whole.</li>
     <li><strong>Value sweep</strong> — for every key not already handled, match the <em>values</em> with <code>_value_mentions_target</code> (token/word-boundary aware). A matching scalar deletes the key; matching list items are pruned via <code>ProfileMemory.prune_value</code>, dropping the key/category when emptied.</li>
   </ol>
-  <p>Stage 2 fixes the long-standing case where a forgotten entity lived as a <em>value</em> (e.g. <code>assets.pets = ["Hanzo the dog", "Mortimer the iguana"]</code>): the key-only sweep never matched <code>forget('mortimer')</code>, so the model kept reporting the pet as owned — often annotated "(removed)" from an earlier soft-delete tombstone the merge semantics left behind. The token-boundary matcher avoids the destructive greedy-substring behaviour the key-only rule originally guarded against. Covered by <code>tests/test_forget_profile_value_sweep.py</code>.</p>
+  <p>Stage 2 fixes the long-standing case where a forgotten entity lived as a <em>value</em> (e.g. <code>assets.pets = ["Bruno the dog", "Mortimer the iguana"]</code>): the key-only sweep never matched <code>forget('mortimer')</code>, so the model kept reporting the pet as owned — often annotated "(removed)" from an earlier soft-delete tombstone the merge semantics left behind. The token-boundary matcher avoids the destructive greedy-substring behaviour the key-only rule originally guarded against. Covered by <code>tests/test_forget_profile_value_sweep.py</code>.</p>
 
   <h3>Vector sweep — literal-mention override</h3>
   <p>The semantic sweep originally deleted a candidate only when its L2 distance fell under a type-dependent threshold (<code>0.8</code> auto / <code>0.6</code> identity). That silently missed facts that <em>name</em> the entity outright — e.g. forgetting <code>iguana</code> left <em>"user previously had an iguana that was removed"</em> in place because the sentence-vs-word distance exceeded the bar. The sweep now also deletes any candidate whose text mentions the target as a word-boundary token, regardless of distance. <code>n_results</code> was raised 10 → 20 so more candidates are examined.</p>
@@ -597,7 +597,7 @@
     email, address …) go only when named explicitly.</li>
     <li><strong>Graph leg</strong>: skipped for a target of hub or attribute words and for the owner's own name. The neighbour
     expansion follows only IDENTITY edges anchored on the exact node: <code>mortimer IS_A iguana</code> (thing → class) and
-    aliases both ways; never a relationship (<code>forget leonidas</code> no longer reaches his mother) and never a class's
+    aliases both ways; never a relationship (<code>forget kosmas</code> no longer reaches his mother) and never a class's
     instances.</li>
     <li><strong>Episode leg</strong> (new): episodes that name a specific entity are archived to
     <code>episodes_forgotten.jsonl</code>, then deleted with their vector twins.</li>
@@ -613,7 +613,7 @@
   <ul>
     <li><strong>Profile</strong>: an explicit <code>category.key</code> is deleted; one exact key for a specific word; a list item naming the
     entity is pruned; a scalar is removed when it IS or STARTS WITH the entity ("Mortimer the iguana", "Tesla Model 3" for "my old car
-    Tesla") and is not a list ("BMW 118i, Ducati, Sym" is listed). Attribute words ("my wife") list the fields they name. A value
+    Tesla") and is not a list ("BMW 320d, Triumph, Kymco" is listed). Attribute words ("my wife") list the fields they name. A value
     replaced earlier and kept as <code>previous</code> is forgotten too. Owner identity fields only by explicit name.</li>
     <li><strong>Graph</strong> (<code>GraphMemory.forget_entity</code>): an edge goes when one of its nodes IS the entity (or the entity plus
     a version/model: "tesla model 3"); an owner life fact that only mentions it is kept and reported, unless the entity is the
@@ -651,8 +651,8 @@
   <p><strong>Matching</strong>, shared by every leg: one <em>entity</em> (<code>_entity_of</code>) — hub, attribute and function
   words and possessives dropped, dots and hyphens kept ("node.js", "pista-gp"); accent- and case-folded, any script
   (<code>profile.mentions</code>, <code>GraphMemory._node_is</code>, the episode scan), so Greek names are found. An attribute
-  word <em>after</em> the entity or joined by "of" narrows the forget to that attribute ("Fotini's birthday" takes the birthday
-  edge and <code>fotini_birthday</code>, not the marriage); a category before it does not ("my old car Tesla"). Forgetting a family
+  word <em>after</em> the entity or joined by "of" narrows the forget to that attribute ("Elena's birthday" takes the birthday
+  edge and <code>elena_birthday</code>, not the marriage); a category before it does not ("my old car Tesla"). Forgetting a family
   member also takes the profile keys named after them. A <code>root.*</code> field is listed, like the graph's owner fact it
   mirrors. Another person's facts are theirs: only facts with <code>user</code> at one end are kept as "facts about you". A
   read-degraded profile says it was not searched. Direct Python callers of <code>tool_unified_forget</code> keep the immediate
@@ -670,14 +670,14 @@
     "already gone" instead of ✅ when nothing was there.</li>
     <li>Matching: the qualifier is matched on the PREDICATE only — same word, an inflection, or a listed other name
     (<code>_QUALIFIER_SYNONYMS</code>: birthday ~ BORN/BIRTHDATE; "company" no longer takes COMPANION); an owner fact is never in a
-    qualified target's default list. The owner's fields named after a person (<code>user HAS_FOTINI_DESCRIPTION</code>,
+    qualified target's default list. The owner's fields named after a person (<code>user HAS_ELENA_DESCRIPTION</code>,
     <code>GraphMemory.owner_field_edges</code>) go with a family member and are listed otherwise. The entity keeps words inside the
     name ("vale of tempe"); trailing dots are ignored ("g.o."); every live row is scanned, so "rene" finds "René". An unreadable
     profile holds the graph and episode legs back (the owner's name is unknown).</li>
   </ul>
   <h2 id="recall-owner-facts">recall: the owner's facts by their kind <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
   <p>The graph tier seeded its search on query words that NAME a node, so a fact asked for by its kind — "what health
-  conditions do I have" — was unreachable: <code>user HAS_CONDITION heart failure</code> has no node called "health". Recall
+  conditions do I have" — was unreachable: <code>user HAS_CONDITION asthma</code> has no node called "health". Recall
   now also adds the owner's facts whose PREDICATE names a query word (same word or an inflection) or a category it covers
   (<code>GraphMemory.owner_facts_matching</code>: health, medication, job, family, home, car, birthday …, and Greek υγεία /
   φάρμακα / δουλειά / οικογένεια). Only edges with <code>user</code> at one end; a category never reaches a task in progress
@@ -784,7 +784,7 @@
 </ul>
 <h3>Owner facts in the graph and vector store</h3>
 <ul>
-  <li><strong>Category-qualified mirrors.</strong> A profile field outside the root category used to be mirrored under its bare key, so the dog's name and the owner's name were one fact (<code>User name is Hanzo</code>). Mirrors are now named <code>&lt;category&gt;_&lt;key&gt;</code> (<code>profile.mirror_name</code>): <code>User pet_dog_name is Hanzo</code> and <code>HAS_PET_DOG_NAME</code>. Root fields keep the bare key.</li>
+  <li><strong>Category-qualified mirrors.</strong> A profile field outside the root category used to be mirrored under its bare key, so the dog's name and the owner's name were one fact (<code>User name is Bruno</code>). Mirrors are now named <code>&lt;category&gt;_&lt;key&gt;</code> (<code>profile.mirror_name</code>): <code>User pet_dog_name is Bruno</code> and <code>HAS_PET_DOG_NAME</code>. Root fields keep the bare key.</li>
   <li><strong>Old mirrors are retired only on proof.</strong> An unqualified mirror goes only when its value is the field's current value or a value just deleted, and only when the root category has no field of that key. The idle-cycle store maintenance re-syncs every field (<code>resync_all_owner_mirrors</code>) and logs any that lag.</li>
   <li><strong>forget re-syncs.</strong> After a confirmed forget, every profile field it touched is re-synced with its old value, so its graph and vector copies go too. The forget sweeps no longer delete an identity row that is the mirror of a live profile field.</li>
   <li>A list field (children, pets) no longer expires its own previous values on each write.</li>
@@ -818,7 +818,7 @@
 <ul>
   <li><strong>The owner-facts section is added, never subtracted.</strong> Round two removed the identity rows from the graded results and showed only those whose field the question named, so "what cars do I have", "when was I born" and "who am I" lost facts recall used to show. The graded results now keep every row; the section on top is extra.</li>
   <li>The graph's kind lookup runs on every English recall again (as before this review). The Greek kind words added here open it only on a question about the owner ("ένα σπίτι για οκτώ άτομα" had printed the address).</li>
-  <li>A person's fields are often keyed by their name (<code>fotini_description</code>): "my wife" reaches them through the role's name field (<code>wife_name = Fotini</code>). "How do I look up …" is not a question about the owner's looks.</li>
+  <li>A person's fields are often keyed by their name (<code>elena_description</code>): "my wife" reaches them through the role's name field (<code>wife_name = Elena</code>). "How do I look up …" is not a question about the owner's looks.</li>
   <li><strong>The Greek owner check was measured and stopped</strong> after three review rounds in which each fix opened the next hole (the pattern in the project's "a heuristic gate does not converge" lesson). On a 58-sentence probe list built from the reviewers' cases it scores 57/58 (before this review 40/58, round two 40/58, round three 48/58). The one miss, "πώς φτιάχνω μουσακά;", is a first-person question that is not about the owner; it costs nothing, because a fact is shown only when the question also names its kind. The list is pinned in the tests. Known misses outside it: "πώς τον λένε τον σκύλο;" (no first person), Greek inflections the kind words do not list (σκύλο, χόμπι).</li>
   <li><strong>Ingest:</strong> a name with a directory ("docs/bitcoin") resolves by its file name again; a <code>#</code> line with no body under it (stacked comments, an H1 straight above an H2) keeps its text; a page whose only image is inline counts as a scan.</li>
 </ul>

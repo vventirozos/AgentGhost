@@ -64,7 +64,7 @@ Value := str                      # LEGACY — as_of unknown
   <p><strong>Log levels (2026-07-25):</strong> the sink ring rotating at its designed 3-cap is routine by-design behaviour, not a leak signal — it now logs at <code>debug</code> only. A <em>real</em> multi-valued key overflowing the 8-cap keeps the operator-stream <code>WARNING</code>: that is the context-pressure-leak signal the message exists for. (The repeated <code>notes.info</code> WARNING was operator-flagged as noise the same day the smart-memory caller stopped feeding the sink — see below.)</p>
 
   <h2>Forgetting values (not just keys)</h2>
-  <p>The profile is injected into the system prompt every turn via <code>get_context_string()</code>, so it is the <em>authoritative</em> source the model answers from — vector and graph stores are secondary. This made one deletion bug user-visible: pets / interests / assets are stored as <strong>values</strong> (e.g. <code>assets.pets = ["Hanzo the dog", "Mortimer the iguana"]</code>), but <code>unified_forget</code>'s profile sweep only matched <strong>keys</strong>. <code>forget('mortimer')</code> therefore never reached the row — it kept being injected, so the model kept "remembering" the deleted pet even after reporting success. The merge semantics above compounded it: a "Mortimer is gone" interaction <em>appended</em> a soft-delete tombstone string (<code>"Mortimer the iguana (removed)"</code>) rather than deleting anything.</p>
+  <p>The profile is injected into the system prompt every turn via <code>get_context_string()</code>, so it is the <em>authoritative</em> source the model answers from — vector and graph stores are secondary. This made one deletion bug user-visible: pets / interests / assets are stored as <strong>values</strong> (e.g. <code>assets.pets = ["Bruno the dog", "Mortimer the iguana"]</code>), but <code>unified_forget</code>'s profile sweep only matched <strong>keys</strong>. <code>forget('mortimer')</code> therefore never reached the row — it kept being injected, so the model kept "remembering" the deleted pet even after reporting success. The merge semantics above compounded it: a "Mortimer is gone" interaction <em>appended</em> a soft-delete tombstone string (<code>"Mortimer the iguana (removed)"</code>) rather than deleting anything.</p>
   <p><code>prune_value(category, key, target)</code> closes this: it removes every list item (or a matching scalar) whose text <em>mentions</em> the target, collapsing a surviving singleton list back to a scalar and dropping the key — and the category — when nothing remains. Matching is <strong>token/word-boundary aware</strong> so <code>forget('age')</code> does not strip a value of <code>'language'</code>, while <code>forget('mortimer')</code> still matches <code>'Mortimer the iguana (removed)'</code>. <code>unified_forget</code> now runs this value sweep after its key sweep (see <a href="../tools/memory_tools.html">memory tools</a>). <em>Since 2026-10-03 a scalar is removed only when it IS (or starts with) the entity; a field that merely mentions it is listed — <a href="../tools/memory_tools.html#rereview">current rules</a>.</em></p>
 
   <h2>Robustness — <code>profile_update</code> shape</h2>
@@ -115,11 +115,11 @@ Value := str                      # LEGACY — as_of unknown
   <p class="warn"><strong>⚠ Deploy order: code, then data.</strong> New code reads legacy bare values fine (unwrapping is identity on a string), but an agent still running the older <code>ProfileMemory</code> renders a stamped value as a raw dict — <code>{'v': 'Athens, Greece', 'as_of': …}</code> — straight into every system prompt, and hands the same dict to <code>tool_check_location</code>. The script printed this before applying.</p>
 
   <h2>Temporal anchoring — a stated age is not a fact (2026-09-04)</h2>
-  <p>This store renders bare, <strong>unstamped</strong> <code>- key: value</code> lines into <code>### USER PROFILE ###</code> on every turn, so anything time-dependent written into it reads as present tense for ever. Live: <code>relationships.sons = "Thodoris (9 years old) and Leonidas (4 months old)"</code>, stated 2026-07-07, was still being recalled verbatim two months later.</p>
+  <p>This store renders bare, <strong>unstamped</strong> <code>- key: value</code> lines into <code>### USER PROFILE ###</code> on every turn, so anything time-dependent written into it reads as present tense for ever. Live: <code>relationships.sons = "Markos (9 years old) and Kosmas (4 months old)"</code>, stated 2026-07-07, was still being recalled verbatim two months later.</p>
   <p>Two changes, both in this file:</p>
   <ul>
-    <li><code>update()</code> anchors at the store BOUNDARY — <code>"Leonidas (4 months old)"</code> is stored as <code>"Leonidas (born ~2026-02-20)"</code>. Placed here rather than per-caller because every writer funnels through <code>update()</code>: the <code>update_profile</code> tool (both paths), the bus's <code>_profile</code> leg, and smart-memory consolidation. Nothing can bypass it.</li>
-    <li><code>get_context_string()</code> DERIVES the current value at render time: <code>- sons: Thodoris (born ~2017-01 → ~9 years old) and Leonidas (born ~2026-02-20 → ~6 months old)</code>. The disk keeps constants; the prompt gets what is true today, and the model is never asked to subtract a timestamp it will not notice. The gloss is a rounded age, not a date, so the block still changes only when the age changes — <code>{{PROFILE}}</code> is inside the byte-stable system prefix and must not churn daily.</li>
+    <li><code>update()</code> anchors at the store BOUNDARY — <code>"Kosmas (4 months old)"</code> is stored as <code>"Kosmas (born ~2026-02-20)"</code>. Placed here rather than per-caller because every writer funnels through <code>update()</code>: the <code>update_profile</code> tool (both paths), the bus's <code>_profile</code> leg, and smart-memory consolidation. Nothing can bypass it.</li>
+    <li><code>get_context_string()</code> DERIVES the current value at render time: <code>- sons: Markos (born ~2017-01 → ~9 years old) and Kosmas (born ~2026-02-20 → ~6 months old)</code>. The disk keeps constants; the prompt gets what is true today, and the model is never asked to subtract a timestamp it will not notice. The gloss is a rounded age, not a date, so the block still changes only when the age changes — <code>{{PROFILE}}</code> is inside the byte-stable system prefix and must not churn daily.</li>
   </ul>
   <p><strong><code>_same_fact()</code> is the dedup change this forced.</strong> Anchoring makes two statements of the same fact differ in bytes ("4 months old" in July, "6 months old" in September), so the exact-string merge dedup would have kept BOTH and injected two contradictory birth dates into every prompt. Values carrying an anchor now compare on <code>temporal.signature()</code> — anchor-blind — so the newer statement refines in place. The exemption is deliberately scoped to anchored values: everything else keeps byte-exact semantics, so this cannot silently collapse distinct interests (<code>python</code> and <code>Python</code> still both persist). See <a href="temporal.html">memory / temporal.py</a> for the full design, the known limitations, and the corpus-repair script. Tests: <code>tests/test_temporal_anchoring.py</code>.</p>
 
@@ -127,7 +127,7 @@ Value := str                      # LEGACY — as_of unknown
   <p><strong>Fail-closed on transient read errors.</strong> ProfileMemory was the only small store without the <code>_degraded</code> discipline its siblings have: an EIO/EACCES read was treated as corruption — the INTACT profile was shunted to a <code>.corrupt-*</code> sidecar, identity reverted to <code>{"name": "User"}</code>, and the next <code>save()</code> overwrote the real file. Now: OSError (≠ FileNotFoundError) serves the default in-memory, leaves the on-disk file untouched, and BLOCKS writes until a read succeeds; parse corruption keeps the sidecar path. <code>save()</code> also fsyncs before the rename (torn-write window). The bus's profile leg and the smart-memory consolidation both now REQUIRE category+key on a profile_update — the old "info"/"notes" defaults minted permanent junk keys like <code>cli_tools.info</code> outside the notes ring (no rotation, no value cap, injected into every prompt). Tests: <code>::TestProfileFailClosed</code>.</p>
 
   <h2 id="4sn">Age of a birth-date field (2026-10-31, §4SN)</h2>
-  <p>The age was derived only for a value that says "born …". <code>root.birthdate: 1980-01-29</code> and <code>wife_birthdate</code> were shown raw, so "how old am I?" left the model to subtract. A birth-date <em>key</em> (<code>birthdate</code>, <code>birthday</code>, <code>dob</code>, <code>*_birthdate</code>) now renders <code>1980-01-29 → 46 years old</code>. The stored value is unchanged, and a value that already says "born" is not glossed twice. The text changes once a year per person, so the cached prompt head changes with it.</p>
+  <p>The age was derived only for a value that says "born …". <code>root.birthdate: 1980-01-26</code> and <code>wife_birthdate</code> were shown raw, so "how old am I?" left the model to subtract. A birth-date <em>key</em> (<code>birthdate</code>, <code>birthday</code>, <code>dob</code>, <code>*_birthdate</code>) now renders <code>1980-01-26 → 46 years old</code>. The stored value is unchanged, and a value that already says "born" is not glossed twice. The text changes once a year per person, so the cached prompt head changes with it.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
   <h2 id="writes-review">Empty values and replaced values <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
@@ -159,7 +159,7 @@ Value := str                      # LEGACY — as_of unknown
   I moved" never reached the profile); <code>drop_previous</code> uses the canonical field map.</p>
   <h2 id="4lb">What every prompt carries <span class="tag">2026-10-03 &sect;4LB</span></h2>
   <p>Measured over 40 owner turns: the profile was relevant to 4 and used by none, yet carried the street address and a
-  physical description every time — and the model wrote "Makedonias 83" into Tor web searches. Now:</p>
+  physical description every time — and the model wrote "Kaledonias 83" into Tor web searches. Now:</p>
   <ul>
     <li><strong>On request only:</strong> <code>root.address</code>, every <code>*_description</code>, and any
     address-like key (<code>address</code>, <code>street</code>, <code>postcode</code>, <code>zip</code> in the key name —
@@ -171,13 +171,13 @@ Value := str                      # LEGACY — as_of unknown
     hook AND the tool callables themselves (a composed-skill macro or a delegate calls them directly). It folds the text
     (lower case, accents off, Greek transliterated, URL-decoded; a JSON string is parsed, so \u-escaped Greek is seen) and
     matches the street + house number in either order, with "street/st/odos" between and the street by its stem
-    (Μακεδονίας / Makedonias), the number bounded (83 ≠ 830; 83A is 83), and the postcode with or without the Greek space.
+    (Καλεδονίας / Kaledonias), the number bounded (83 ≠ 830; 83A is 83), and the postcode with or without the Greek space.
     The match is replaced, in the text as written, by the address's SUBURB (<code>egress.locality</code>: the address
-    without street, number and postcode — "Thrakomakedones"), else the owner's city, else "nearby". Operator 2026-10-03:
+    without street, number and postcode — "Kalopetres"), else the owner's city, else "nearby". Operator 2026-10-03:
     with "Athens" the live probe searched the wrong suburb. The model is TOLD: a rewritten call's result ends with
-    <code>egress.privacy_note</code> ("[privacy: … replaced by its area, 'Thrakomakedones' … search there]") — appended,
+    <code>egress.privacy_note</code> ("[privacy: … replaced by its area, 'Kalopetres' … search there]") — appended,
     never in front, because a result's head is parsed (an "Error:" prefix classifies a failed call). Not told, the model
-    re-guessed the town and searched another Makedonias Ave (r4).
+    re-guessed the town and searched another Kaledonias Ave (r4).
     <code>OUTBOUND_TOOLS</code> says which arguments of which tool leave: every argument of web_search, deep_research,
     darkweb_search, darkweb_research, fact_check and browser; <code>location</code>/<code>city</code>/<code>query</code>
     of system_utility (the geocoder); only URLs for file_system, knowledge_base and vision_analysis (their local paths and
@@ -191,14 +191,14 @@ Value := str                      # LEGACY — as_of unknown
   <h2 id="4li">The address detector, after the final review <span class="tag">2026-10-04 &sect;4LI</span></h2>
   <ul>
     <li>Folding runs NFKC, drops invisible format characters, and maps Cyrillic look-alikes and "c" to their Latin /
-    "k" forms, so "Ｍakedonias ８３", a zero-width space or "Macedonias" match. "Makedhonias" is tolerated, and so is
+    "k" forms, so "Ｋaledonias ８３", a zero-width space or "Caledonias" match. "Kaledhonias" is tolerated, and so is
     a spaced number ("8 3").</li>
     <li>Between street and number, "no. / nr / # / number / αριθμός" are allowed. A call that carries the street stem
-    AND its number anywhere ("house 83 on Makedonias", the street and the number in separate arguments) has both
+    AND its number anywhere ("house 83 on Kaledonias", the street and the number in separate arguments) has both
     replaced (<code>egress.address_parts</code>).</li>
-    <li>The postcode, including "136-76" and "GR-13676", is scrubbed on its own, but never inside an identifier:
-    arXiv <code>2401.13676</code>, <code>issues/13676</code> and <code>v1.13676.tar.gz</code> are left as written.</li>
-    <li><code>execute</code> is outbound for the URLs inside its code: a <code>curl 'https://…?q=Makedonias+83'</code>
+    <li>The postcode, including "101-01" and "GR-10101", is scrubbed on its own, but never inside an identifier:
+    arXiv <code>2401.10101</code>, <code>issues/10101</code> and <code>v1.10101.tar.gz</code> are left as written.</li>
+    <li><code>execute</code> is outbound for the URLs inside its code: a <code>curl 'https://…?q=Kaledonias+83'</code>
     is scrubbed, while the rest of the code (a letter it writes) is the owner's and is left alone.</li>
     <li>An address under any key the model picks (<code>home</code>, <code>residence</code>, <code>lives_at</code>,
     <code>homeAddress</code>, <code>addr</code>, <code>domicile</code>), or any value that reads as a street address

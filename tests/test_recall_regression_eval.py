@@ -64,7 +64,7 @@ def env(tmp_path_factory):
 
     gm = GraphMemory(root / "graph")
     gm.add_triplets([
-        {"subject": "vasilis", "predicate": "WORKS_AT", "object": "evolmonkey"},
+        {"subject": "vasilis", "predicate": "WORKS_AT", "object": "orbitdata"},
         {"subject": "ghost", "predicate": "RUNS_ON", "object": "port 8000"},
     ])
 

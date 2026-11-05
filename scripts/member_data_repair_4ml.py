@@ -45,7 +45,7 @@ SYS = HOME / "system"
 MEM = SYS / "memory"
 INDEX = Path(os.environ.get("GHOST_SLACK_REPLY_INDEX_PATH",
                             "/Users/vasilis/Data/AI/Logs/ghost-slack-reply-index.json"))
-OWNER = os.environ.get("GHOST_SLACK_OWNER", "U56CVBHHQ")
+OWNER = os.environ["GHOST_SLACK_OWNER"]      # required: never default to a real id (11-05 leak audit)
 STAMP = time.strftime("%Y%m%dT%H%M%S")
 
 

@@ -8,7 +8,7 @@ reply came out in Greek. Nothing in the prompt asked for Greek: rule 5
 LANGUAGE (§4JN) was in the system message, the recalled memories were
 English, the Slack payload was a single message. The only Greek cue was the
 profile's Athens address, which the model had been riffing on ("The
-Thrakomakedon") when it wrote the long final generation. §4JN measured this
+Kalopetr") when it wrote the long final generation. §4JN measured this
 drift at 0.66% of English requests BEFORE the prompt rule; the rule did not
 close it, and the finalize path had no language check at all — the judge
 grades content, not script.

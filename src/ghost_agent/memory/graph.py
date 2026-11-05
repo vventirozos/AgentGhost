@@ -29,7 +29,7 @@ def _entity_pattern(target: str) -> "re.Pattern":
 
 
 def _fold(text) -> str:
-    """Case- and accent-folded text (Greek "Φωτεινή" ~ "φωτεινη")."""
+    """Case- and accent-folded text (Greek "Έλενα" ~ "ελενα")."""
     import unicodedata
     t = unicodedata.normalize("NFD", str(text or "").casefold())
     return "".join(ch for ch in t if not unicodedata.combining(ch))
@@ -96,7 +96,7 @@ class GraphMemory:
     #: are deliberately absent. Comparison is case-insensitive (uppercased).
     _FUNCTIONAL_PREDICATES = {
         # Biographical
-        # (§4KZ: LOCATED_IN is PRESENCE — a weekend in Kyllini expired the
+        # (§4KZ: LOCATED_IN is PRESENCE — a weekend in Paralia expired the
         # owner's home; home is LIVES_IN, and a birth date is one date)
         "WORKS_AT", "LIVES_IN", "DRIVES", "MARRIED_TO", "HAS_BIRTHDATE",
         "BORN_IN", "STUDIES_AT", "EMPLOYED_BY",
@@ -261,7 +261,7 @@ class GraphMemory:
         "TAKES_MEDICATION": "HAS_MEDICATION", "HAS_SONS": "HAS_SON", "HAS_CHILDREN": "HAS_CHILD",
     }
     #: an AGE is a measurement that is wrong a year later — the birth date is
-    #: the fact (live: "Leonidas AGE 5" from "5 months")
+    #: the fact (live: "Kosmas AGE 5" from "5 months")
     _DECAYING_PREDICATES = {"AGE", "HAS_AGE", "IS_AGED", "AGED"}
 
     @classmethod
@@ -524,8 +524,8 @@ class GraphMemory:
     def _node_is(node: str, entity: str) -> bool:
         """The node IS the entity, or a short name starting with it ("tesla
         model 3" for "tesla") — not a phrase or list that mentions it
-        ("thrakomakedones near athens", "athens, greece")."""
-        # folded both sides (re-review: "Φωτεινή" never matched "φωτεινη")
+        ("kalopetres near athens", "athens, greece")."""
+        # folded both sides (re-review: "Έλενα" never matched "ελενα")
         # …and hyphen/underscore ~ space ("pista-gp" names "pista gp")
         n = " ".join(re.sub(r"[-_]+", " ", _fold(node)).split()).rstrip(".,;:!?")
         e = " ".join(re.sub(r"[-_]+", " ", _fold(entity)).split()).rstrip(".,;:!?")
@@ -552,7 +552,7 @@ class GraphMemory:
 
     def owner_field_edges(self, entity: str) -> list:
         """Live `user HAS_<…>` edges whose PREDICATE names ``entity`` — the
-        graph twins of profile fields like `fotini_description` (r8 review:
+        graph twins of profile fields like `elena_description` (r8 review:
         they outlived a family forget and were not even listed)."""
         words = [w for w in re.split(r"[\s_\-]+", _fold(entity)) if w]
         if not words:
@@ -723,9 +723,9 @@ class GraphMemory:
     def owner_facts_matching(self, query: str, limit: int = 20, extended: bool = True) -> List[str]:
         """The owner's facts (`user …` edges) whose PREDICATE names a word of
         the query or a category it covers — "what health conditions do I have"
-        finds `user HAS_CONDITION heart failure`. The neighbourhood lookup
+        finds `user HAS_CONDITION asthma`. The neighbourhood lookup
         seeds on NODE names, so a fact asked for by its kind was unreachable
-        (§4KX r8 probe: heart failure and Entresto were stored and never
+        (§4KX r8 probe: asthma and Ventolin were stored and never
         recalled)."""
         words = [w for w in re.findall(r"\w+", _fold(query)) if len(w) >= 3]
         if not words:
@@ -747,7 +747,7 @@ class GraphMemory:
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 # NEWEST first, and the date is shown (§4KZ: by weight, a
-                # stale "located at kyllini" outranked the current home and
+                # stale "located at paralia" outranked the current home and
                 # the model could not tell which was newer)
                 # Retrieval review 2026-10-31: the date shown is WHEN IT WAS
                 # STATED (valid_from), not the row's last touch (timestamp —
@@ -799,8 +799,7 @@ class GraphMemory:
         KB review 10-30: NAME is `profile.mirror_name` — ``<CATEGORY>_<KEY>``
         outside the root category, a predicate only this mirror writes (keyed
         by the key alone, `pet.name` deleted `HAS_NAME vasilis`, and
-        `health.condition` deleted the graph-only `HAS_CONDITION heart
-        failure`). ``retire_legacy``: a pre-fix unqualified `HAS_<KEY> <v>`
+        `health.condition` deleted the graph-only `HAS_CONDITION asthma`). ``retire_legacy``: a pre-fix unqualified `HAS_<KEY> <v>`
         whose value IS this field's current value (or one of ``legacy_values``,
         the values a delete just removed) is this field's own pre-fix mirror
         and goes; any other legacy edge is left alone (the old extractor
@@ -1108,7 +1107,7 @@ class GraphMemory:
             for s, o, pred in rows:
                 # only an IDENTITY edge names the same thing twice ("mortimer
                 # IS_A iguana"); a relationship names ANOTHER entity —
-                # `forget leonidas` followed IS_SON_OF to fotini and deleted
+                # `forget kosmas` followed IS_SON_OF to elena and deleted
                 # the owner's wife's facts (profile-writes review)
                 _p = str(pred or "").upper()
                 # ALIASES only (another name for the same thing): a class
@@ -1117,7 +1116,7 @@ class GraphMemory:
                 if not self._ALIAS_PREDICATE_RE.fullmatch(_p):
                     continue
                 # the target must BE the node (not a token of it: `forget
-                # postgresql` reached "evolmonkey IS_A postgresql services
+                # postgresql` reached "orbitdata IS_A postgresql services
                 # company"), and a class link runs one way only: the thing →
                 # its class ("mortimer IS_A iguana"); a class's instances are
                 # never followed. Aliases run both ways.
@@ -1193,7 +1192,7 @@ class GraphMemory:
                         (int(keep_min_weight),),
                     ).fetchall()
                     # an OWNER fact never decays by age (profile-writes review:
-                    # `user MARRIED_TO fotini`, `HAS_CHILD leonidas`, the
+                    # `user MARRIED_TO elena`, `HAS_CHILD kosmas`, the
                     # HAS_<KEY> edges update_profile writes, `user OWNS …` —
                     # stated once, never reinforced, due to go at 45 days)
                     rows = [r for r in rows if not self._is_owner_fact(r[0], r[1], r[2])]
@@ -1222,7 +1221,7 @@ class GraphMemory:
                        "SISTER", "FAMILY", "BIRTH", "BIRTHDATE", "BIRTHDAY", "BORN", "OWNS", "OWNED", "OWN",
                        "RESIDES", "LIVES", "HOME", "ADDRESS", "EMPLOYED", "EMPLOYER", "PET", "PETS",
                        # health and profession (re-review: decay had pruned the owner's
-                       # heart condition and medication)
+                       # a health condition and medication)
                        "CONDITION", "CONDITIONS", "MEDICATION", "MEDICATIONS", "DIAGNOSIS", "DIAGNOSED",
                        "ALLERGY", "ALLERGIES", "ALLERGIC", "HEALTH", "DISEASE", "PROFESSION", "COMPANION"}
     #: a `user HAS_<KEY>` written by a probe or a test is noise, not a fact
@@ -1589,7 +1588,7 @@ class GraphMemory:
                 elif not fuzzy:
                     # §4MJ: hydration asks for no fuzzy seeds — 91 graph
                     # items on 80 real turns came only from them and 0 were
-                    # relevant ("sitting"→`stealthing`, "going"→`coding`)
+                    # relevant ("sitting"→`setting`, "going"→`coding`)
                     matches = []
                 else:
                     # Same hub protection on the fuzzy tier: 'systemd' is a
@@ -1677,7 +1676,7 @@ class GraphMemory:
     def _format_path(chain: Tuple[Tuple[str, str, str], ...], score: int) -> str:
         # Retrieval review 2026-10-31: names are stored folded to lowercase
         # (the dedup key), and `.title()` re-cased them wrongly — the model saw
-        # "Bmw 118I", "Evolmonkey - Postgresql Services", "(Born 2016-11-25)"
+        # "Bmw 320D", "Orbitdata - Postgresql Services", "(Born 2016-11-22)"
         # and repeated them. Shown as stored; only the owner node is named.
         def _disp(x):
             return "User" if str(x).strip().lower() == "user" else str(x)

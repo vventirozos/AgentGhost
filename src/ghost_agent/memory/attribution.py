@@ -51,9 +51,9 @@ _NEGATION = re.compile(
     re.IGNORECASE)
 _QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”|«[^»]*»|```.*?```", re.DOTALL)
 #: a sentence that ASKS without a question mark ("do you remember my wife
-#: fotini", "tell me about my car bmw", "remind me where i live") — a
+#: elena", "tell me about my car bmw", "remind me where i live") — a
 #: question is never the owner's statement of a fact (§4KY; §4QM review r1:
-#: these attributed facts and would have written "wife = fotini")
+#: these attributed facts and would have written "wife = elena")
 #: review r2: a wh-word followed by "I" opens a statement ("When I was 20 I
 #: lived in Patras"); a modal request to REMEMBER is an instruction ("can you
 #: remember that I live in Athens", "may I remind you …", "did I mention …");
@@ -65,7 +65,7 @@ _QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”|«[^»]*»|```.*?```", re.DOTALL
 #: asks unless it goes on to a TELLING verb ("did I mention", "have I told
 #: you", "may I remind you" state). The wh-word test is SENTENCE-level only:
 #: after a comma "who/which/where" is a relative pronoun ("My wife, who is
-#: called Fotini, is a doctor"). Greek question words are tested with their
+#: called Elena, is a doctor"). Greek question words are tested with their
 #: accent on the RAW sentence (folded "που" is also the relative "that").
 _RETAIN_VERBS = r"(?:(?:please|also|just|kindly)\s+)*(?:remember|note|keep|save|store|record|add|write|log|update|make\s+a\s+note|memori[sz]e|learn)"
 _TOLD_VERBS = r"(?:ever\s+)?(?:mention(?:ed)?|tell|told|say|said|remember|remind|ask\s+you\s+to)"
@@ -101,10 +101,10 @@ _REPORTED_HEAD = re.compile(
     r"|\b(?:article|bio|biography|post|page|site|book|email|message|excerpt|snippet|text)\s+(?:says|said|reads|states|wrote)\b"
     r"|\bhere'?s\s+(?:a|an|the|some)\s+(?:bio|biography|article|excerpt|snippet|quote|text|email)\b",
     re.IGNORECASE)
-#: a tag question ("you know my wife fotini, right") asks (review r4)
+#: a tag question ("you know my wife elena, right") asks (review r4)
 _TAG_Q = re.compile(r"\b(?:right|correct|huh|eh|yes|no)\s*$|(?<!\w)(?:σωστα|ετσι|ναι|οχι)\s*$", re.IGNORECASE)
 #: a greeting / vocative / filler before the real sentence ("hi, do you
-#: remember my wife fotini" — review r2: the opener was anchored at the
+#: remember my wife elena" — review r2: the opener was anchored at the
 #: sentence start and the greeting hid the question); stripped at the
 #: SENTENCE level only, in `owner_statements` and `owner_clause_for` alike
 _LEAD_IN = re.compile(r"^\s*(?:(?:hi|hey|hello|yo|ok(?:ay)?|so|and|well|also|ghost|γει[αά](?:\s+σου)?|ε|λοιπον|λοιπόν)[,!\s]+)+",
@@ -165,7 +165,7 @@ def latest_owner_episode(episode: str) -> str:
 
     Consolidation review 2026-10-31: a journal item carries the last four
     messages, so the owner's sentence from the previous turn was extracted
-    AGAIN on this turn's item — "my dog's name is Hanzo" stored twice 5 s
+    AGAIN on this turn's item — "my dog's name is Bruno" stored twice 5 s
     apart, and the memory-usage note written under two different keys 4 s
     apart. Each owner message has its own journal item; extraction reads only
     that one. An episode with no speaker marks (a legacy item) is returned
@@ -192,8 +192,8 @@ def owner_statements(episode: str) -> list:
     declarative sentence the owner wrote: questions and quoted text excluded,
     and NOTHING from a turn that sets up role-play anywhere (§4KZ: "Let's play
     a game. You are my wife Maria. We live in London." passed sentence by
-    sentence). Negation is per CLAUSE: "spelled Φωτεινή, not Fotini" states
-    Φωτεινή and negates Fotini."""
+    sentence). Negation is per CLAUSE: "spelled Έλενα, not Elena" states
+    Έλενα and negates Elena."""
     lines = owner_lines(episode)
     if any(_ROLE_PLAY.search(_fold(b)) for b in lines):
         return []
@@ -218,8 +218,8 @@ def owner_statements(episode: str) -> list:
             for clause in re.split(_CLAUSE_SPLIT, f):
                 clause = clause.strip(" .!")
                 # a clause that itself ASKS ("I wonder, do you remember my wife
-                # fotini") states nothing (review r2); a relative clause ("my
-                # wife, who is called Fotini, …") is not a question (review r3)
+                # elena") states nothing (review r2); a relative clause ("my
+                # wife, who is called Elena, …") is not a question (review r3)
                 if clause and not _CLAUSE_ASKS.search(clause):
                     out.append((clause, bool(_NEGATION.search(clause))))
     return out
@@ -343,8 +343,8 @@ def predicate_kind(canonical_predicate) -> str:
 
 
 #: what a statement must SAY for a single-valued owner fact to change — a
-#: shared value word is not enough (§4KZ: "I'm in Kyllini this weekend" made
-#: "lives in Kyllini" and replaced the owner's home)
+#: shared value word is not enough (§4KZ: "I'm in Paralia this weekend" made
+#: "lives in Paralia" and replaced the owner's home)
 PREDICATE_CUES = {
     "LIVES_IN": r"\b(?:live|lives|living|lived|moved?|moving|home|reside\w*|settled)\b|(?<!\w)(?:μενω|μενουμε|μετακομισ\w*|σπιτι)(?!\w)",
     "WORKS_AT": r"\b(?:work|works|working|worked|job|employ\w*|joined|hired|career)\b|(?<!\w)(?:δουλευω|δουλεια|εργαζομαι)(?!\w)",

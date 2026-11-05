@@ -31,7 +31,7 @@ def test_a_duplicated_row_applies_nothing():
         M["check"](rows + rows[:1])
 
 
-@pytest.mark.parametrize("word", ["Hetzner", "Leonidas", "Fousekis", "Revolut", "KYC", "war scenarios",
+@pytest.mark.parametrize("word", ["Hetzner", "Kosmas", "Fousekis", "Revolut", "KYC", "war scenarios",
                                   "frag_copy", "IFS", "kc_probe", "farewell", "logslow", "emp1", "dig it",
                                   "delete it"])
 def test_no_rewrite_keeps_the_request_specifics(word):

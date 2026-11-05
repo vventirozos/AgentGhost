@@ -1,6 +1,6 @@
 """Temporal anchoring — store the invariant, derive the quantity.
 
-A stated age is a MEASUREMENT, not a fact. "Leonidas is 4 months old" is
+A stated age is a MEASUREMENT, not a fact. "Kosmas is 4 months old" is
 true only on the day it is said; stored verbatim it is wrong a month later
 and nothing downstream can tell. The profile block carries no timestamp at
 all (``ProfileMemory.get_context_string`` renders bare ``- key: value``
@@ -8,7 +8,7 @@ lines into ``### USER PROFILE ###`` on every turn), so a snapshot reads to
 the model as PRESENT TENSE for ever.
 
 Observed live: the fact was stated 2026-07-07 and was still being recalled
-verbatim as "Leonidas is 4 months old" on 2026-09-04, ~2 months later.
+verbatim as "Kosmas is 4 months old" on 2026-09-04, ~2 months later.
 The vector store does stamp its rows and the prompt does carry CURRENT
 TIME, so the arithmetic was *possible* — but it required the model to
 notice an ISO stamp, subtract, and then overrule an unstamped profile line
@@ -17,10 +17,10 @@ that flatly asserted otherwise. It never did.
 The invariant behind an age is a BIRTH DATE, which is constant. This
 module converts one into the other:
 
-    anchor("Leonidas is 4 months old", said_at=2026-07-07)
-        -> "Leonidas born ~2026-02-20"
-    derive("Leonidas born ~2026-02-20", now=2026-09-04)
-        -> "Leonidas born ~2026-02-20 -> ~6 months old"
+    anchor("Kosmas is 4 months old", said_at=2026-07-07)
+        -> "Kosmas born ~2026-02-20"
+    derive("Kosmas born ~2026-02-20", now=2026-09-04)
+        -> "Kosmas born ~2026-02-20 -> ~6 months old"
 
 ``anchor()`` runs at WRITE time, ``derive()`` at RENDER time. What is on
 disk is therefore always a constant, and what the model reads is always
@@ -75,7 +75,7 @@ __all__ = ["anchor", "derive", "signature", "has_anchor"]
 # ── Anchor surface form ─────────────────────────────────────────────────
 # ``born ~YYYY-MM-DD`` / ``born ~YYYY-MM`` / ``born ~YYYY``. The optional
 # ``on``/``in`` filler lets derive() also gloss a birth date the user
-# stated directly ("Leonidas was born on 2026-03-07"), which is the same
+# stated directly ("Kosmas was born on 2026-03-07"), which is the same
 # fact class and needs the same arithmetic.
 _ANCHOR_RE = re.compile(
     r"\bborn\s+(?:on\s+|in\s+)?(~?)(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?",
@@ -87,8 +87,8 @@ _MONTHS = {m: i for i, m in enumerate(
      "august", "september", "october", "november", "december"], start=1)}
 _MONTH_ALT = "|".join(list(_MONTHS) + [m[:3] for m in _MONTHS])
 
-# The month-NAME form a person actually types: "born March 12, 2026",
-# "born on 12 March 2026", "born in March 2026". anchor() normalises this
+# The month-NAME form a person actually types: "born March 9, 2026",
+# "born on 9 March 2026", "born in March 2026". anchor() normalises this
 # to ISO at write time, but the form still has to be READ: the live
 # profile already held two of these (the operator stated both children's
 # exact birth dates in a chat turn), written by the pre-change code and
@@ -220,10 +220,10 @@ def _fmt_anchor(d: datetime.date, unit: str) -> str:
 # ── Write-time: age / relative phrases -> absolute anchors ──────────────
 #
 # Each pattern captures (count, unit-or-None). A leading copula is swept
-# into the match and dropped, so "Leonidas is 4 months old" becomes
-# "Leonidas born ~2026-02-20" rather than "Leonidas is born ~…".
+# into the match and dropped, so "Kosmas is 4 months old" becomes
+# "Kosmas born ~2026-02-20" rather than "Kosmas is born ~…".
 # (§4KZ: "is NOW 10 years old" left "is now" outside the match and produced
-# "Thodoris is now born ~2016-04")
+# "Markos is now born ~2016-04")
 _COPULA = r"(?:\b(?:is|was|are|were|turns|turned)\s+(?:now\s+|already\s+|just\s+)?)?"
 
 #: The COUNT of an age phrase. The look-behind keeps a decimal's fraction
@@ -245,11 +245,11 @@ _UNIT_ALT = (r"year|years|yr|yrs|month|months|mo|mos|"
 # Note both spaced variants require whitespace on at least one side of the
 # compound, which is what keeps the fully-hyphenated ATTRIBUTIVE form
 # ("9-year-old son") out of this list — see _ATTRIB_AGE_RE below.
-#: "N years, M months and D days old" / "5 months and 23 days old" — two or
+#: "N years, M months and D days old" / "5 months and 26 days old" — two or
 #: three components joined by ", " / " and " / ", and ", ending in "old".
 #: ONE authority for the profile WRITER (`anchor`) and the CHECKER
 #: (`core/memory_claim_check`): before §4FN both read the TAIL component
-#: ("23 days old") — the writer anchored a nine-year-old to a birth date ten
+#: ("26 days old") — the writer anchored a nine-year-old to a birth date ten
 #: days ago and the checker refuted three correct replies (2026-09-04).
 #: Groups: (1,2) first component, (3,4) second, (5,6) optional third.
 #: The tail is ``[\s-]+old``, not ``\s*[-\s]\s*old``: one class for the
@@ -273,31 +273,31 @@ _MONTHS_PER_UNIT = {"year": 12.0, "month": 1.0, "week": 12.0 / 52.0,
 
 # ── A PLURAL SUBJECT gets no anchor ────────────────────────────────────
 #
-# "Thodoris and Leonidas: 9 years and 5 months old" is two ages, and one
+# "Markos and Kosmas: 9 years and 5 months old" is two ages, and one
 # birth date for two people corrupts the record: the checker then reads
 # the name before the anchor and refutes the CORRECT answer about the
 # second child forever (review §4FN M-B, and round 3 C1 — the first guard
 # named one surface of the scenario, ``are`` glued to the number, and
-# "Thodoris and Leonidas: …", "… are, respectively, …", "… are about …"
+# "Markos and Kosmas: …", "… are, respectively, …", "… are about …"
 # walked around it). Two shapes, read from the text BEFORE the phrase:
 #
-#   * a LIST of capitalised names right before it — "Thodoris and
-#     Leonidas", "Thodoris, Leonidas and Vasilis" (`conjoined_subject`);
+#   * a LIST of capitalised names right before it — "Markos and
+#     Kosmas", "Markos, Kosmas and Vasilis" (`conjoined_subject`);
 #   * a plural copula within a couple of words of a COMPOUND — "are:",
 #     "are, respectively,", "are about" (`plural_clause`). A single-unit
 #     phrase keeps §4EL's reading of "are": "my twins are 4 months old"
 #     is one birth date, correctly.
 #
-# Names are Unicode (``[^\W\d_]``, then ``isupper``): "Θοδωρής and
-# Λεωνίδας" is a list too.
+# Names are Unicode (``[^\W\d_]``, then ``isupper``): "Μάρκος and
+# Κοσμάς" is a list too.
 # The joiner is "and" / "&" / "και"; a bare COMMA joins two names only for a
-# caller that can tell a name from a sentence opener: "Yes, Thodoris",
-# "Today, Leonidas", "Hi Vasilis, Thodoris" are an opener and a subject,
+# caller that can tell a name from a sentence opener: "Yes, Markos",
+# "Today, Kosmas", "Hi Vasilis, Markos" are an opener and a subject,
 # and reading them as a list muted the writer AND the checker (round 4
 # M2). The checker passes its anchored names (`comma_names`); the reader
 # of stored values passes None (any capitalised word counts — it is the
-# last defence against a date already glued onto "Thodoris, Leonidas:");
-# the writer passes nothing (no comma lists). "Thodoris, Leonidas and
+# last defence against a date already glued onto "Markos, Kosmas:");
+# the writer passes nothing (no comma lists). "Markos, Kosmas and
 # Vasilis" is a list for everyone, through its "and" tail.
 _NAME_TOKEN = r"[^\W\d_][\w'’-]*"
 _JOINED = r"\s*(?:,?\s*&|,?\s*\band\b|,?\s*\bκαι\b)\s*"
@@ -323,8 +323,8 @@ _PLURAL_COPULA_RE = re.compile(r"\bare\b", re.IGNORECASE)
 
 # ── A PAST OR FUTURE age is not today's ────────────────────────────────
 #
-# "Thodoris was 5 years old when they moved in 2021", "Leonidas turns 7
-# months old on October 12", "By March Leonidas is 12 months old": the
+# "Markos was 5 years old when they moved in 2021", "Kosmas turns 7
+# months old on October 9", "By March Kosmas is 12 months old": the
 # writer anchored these to the day they were SAID (a birth date in 2021 for
 # a child born in 2016) and the checker compared them with today (round 4
 # C1). The marker can sit anywhere on the line — before the name as easily
@@ -363,10 +363,10 @@ def _line_before(text: str, pos: int) -> str:
 def conjoined_subject(text_before: str, trail_words: int = 0,
                       comma_names=()) -> bool:
     """True when the words right before a phrase are a LIST of capitalised
-    names, at most ``trail_words`` words after the last one ("Thodoris and
-    Leonidas are 9 and " → the age belongs to several people). Only
+    names, at most ``trail_words`` words after the last one ("Markos and
+    Kosmas are 9 and " → the age belongs to several people). Only
     punctuation may follow the list when ``trail_words`` is 0. A comma-only
-    pair ("Thodoris, Leonidas") counts when its first name is in
+    pair ("Markos, Kosmas") counts when its first name is in
     ``comma_names`` (lower-cased), or for every capitalised word when
     ``comma_names`` is None; never when it is empty."""
     text_before = text_before or ""
@@ -389,10 +389,10 @@ def plural_clause(text_before: str) -> bool:
 
 def plural_line(text_before: str) -> bool:
     """True when the line's subject is a LIST of names followed, however
-    far back, by a plural copula: "Thodoris and Leonidas are, as of today
+    far back, by a plural copula: "Markos and Kosmas are, as of today
     (September 4, 2026, …), respectively 9 years and 5 months old" (round
     4 M3). Applied to COMPOUNDS only: a single-unit age later on such a
-    line ("… are brothers and the younger one Leonidas is 5 months old")
+    line ("… are brothers and the younger one Kosmas is 5 months old")
     is one person's and stays anchored."""
     text_before = text_before or ""
     for m in _LIST_ANYWHERE_RE.finditer(text_before):
@@ -450,8 +450,8 @@ def compound_age_months(m: "re.Match") -> Optional[float]:
 def _birth_from_parts(when: datetime.date, months: int, days: int) -> datetime.date:
     """The birth date ``months`` and ``days`` before ``when``: the days are
     subtracted FIRST, then the whole months — the order the age was counted
-    in ("9 years, 9 months and 10 days" on 2026-09-04: Sep 4 − 10 days =
-    Aug 25, − 117 months = 2016-11-25; months first lands on the 24th).
+    in ("9 years, 9 months and 13 days" on 2026-09-04: Sep 4 − 13 days =
+    Aug 22, − 117 months = 2016-11-22; months first lands on the 21st).
     Exact: no month-length constant (round 3 m3 — the fraction round trip
     through 30.4375 was one unpinned approximation too many)."""
     return _shift_months(when - datetime.timedelta(days=days), -months)
@@ -469,7 +469,7 @@ _AGE_PATTERNS = [
                 re.IGNORECASE), True),
     # "9yo", "9 y/o"
     (re.compile(_COPULA + _NUM + r"\s*(yo|y/o)\b", re.IGNORECASE), True),
-    # "4mo" — the compact form an extractor emits ("Leonidas, 4mo")
+    # "4mo" — the compact form an extractor emits ("Kosmas, 4mo")
     (re.compile(_COPULA + _NUM + r"\s*(mo|mos)\b(?!\w)", re.IGNORECASE), True),
     # "age 9" / "aged 9" — a bare number after an age cue means YEARS
     (re.compile(r"\bage[d]?\s+" + _NUM + r"\b(?!\s*[-\s]?\s*(?:year|month|week|day))",
@@ -480,9 +480,9 @@ _AGE_PATTERNS = [
 ]
 
 # ATTRIBUTIVE form: a fully-hyphenated compound modifying (or standing in
-# for) a noun — "his 9-year-old son Thodoris", "a 4-month-old named
-# Leonidas". Replacing it in place produces garbage — "equipment for a born
-# ~2017-02-20 named Thodoris" was the live result on a real stored fact —
+# for) a noun — "his 9-year-old son Markos", "a 4-month-old named
+# Kosmas". Replacing it in place produces garbage — "equipment for a born
+# ~2017-02-20 named Markos" was the live result on a real stored fact —
 # because the compound is filling an adjective/noun slot, not a predicate.
 #
 # So this one form ANNOTATES instead of replacing: "9-year-old (born
@@ -501,7 +501,7 @@ _ATTRIB_AGE_RE = re.compile(
 # Verbatim spans — a quoted string is a RECORD (a search query the agent
 # ran, a command, a code literal), not a claim about the user, and
 # rewriting one falsifies the record. Live proof: a stored skill lesson
-# held `web_search(query="Thodoris basketball Panellinios age 9")`, and
+# held `web_search(query="Markos basketball Sampleton BC age 9")`, and
 # without this guard the anchor pass rewrote the query text itself.
 _QUOTED_RE = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`")
 
@@ -520,7 +520,7 @@ def _protected_spans(text: str) -> list:
     * a QUOTED string is a record (a search query the agent ran, a
       command, a code literal), and rewriting one falsifies the record.
       Live proof: a stored skill lesson held
-      ``web_search(query="Thodoris basketball Panellinios age 9")`` and an
+      ``web_search(query="Markos basketball Sampleton BC age 9")`` and an
       unguarded pass rewrote the query text itself.
     * a DERIVED gloss ("→ ~3 weeks old") is render output. If one ever
       flows back into a writer, anchoring it would freeze a rendered value
@@ -596,7 +596,7 @@ def anchor(text, said_at=None) -> str:
     # Compounds next, as ONE phrase (§4FN): the single-unit patterns below
     # would otherwise anchor the tail component alone.
     def _sub_compound(m: "re.Match") -> str:
-        # "Thodoris and Leonidas are 9 years and 5 months old" is two ages,
+        # "Markos and Kosmas are 9 years and 5 months old" is two ages,
         # not one: a plural subject gets no anchor (review §4FN M-B / round
         # 3 C1 — see the helpers). The look-back starts at the NUMBER so a
         # copula inside the match counts.
@@ -615,7 +615,7 @@ def anchor(text, said_at=None) -> str:
 
     for pattern, has_unit in _AGE_PATTERNS:
         def _sub(m: "re.Match", _hu=has_unit) -> str:
-            # "Thodoris and Leonidas are 9 and 5 months old": the tail age
+            # "Markos and Kosmas are 9 and 5 months old": the tail age
             # of a LIST of people is nobody's birth date (round 3 C1); a
             # past or future age is not a birth date either (round 4 C1)
             pre = _line_before(m.string, m.start(1))
@@ -761,7 +761,7 @@ def _age_phrase(born: datetime.date, now: datetime.date, approx: bool,
 def derive(text, now=None) -> str:
     """Expand every anchor in ``text`` with the value true at ``now``.
 
-    ``"Leonidas born ~2026-02-20"`` -> ``"Leonidas born ~2026-02-20 -> ~6
+    ``"Kosmas born ~2026-02-20"`` -> ``"Kosmas born ~2026-02-20 -> ~6
     months old"``. Render-time only — the result is never persisted, so
     the store keeps holding constants. Any pre-existing gloss is stripped
     first, which makes this idempotent and self-correcting if a derived
@@ -805,7 +805,7 @@ def signature(text) -> str:
     treat two statements of the SAME fact as identical.
 
     Without this, anchoring would turn a harmless restatement into an
-    accumulation: "Leonidas is 4 months old" and, six weeks later, "…is 5
+    accumulation: "Kosmas is 4 months old" and, six weeks later, "…is 5
     months old" produce different anchor dates, so the profile's
     exact-string dedup would keep BOTH and inject two contradictory birth
     dates into every prompt. Comparing signatures instead lets the newer

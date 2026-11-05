@@ -77,7 +77,7 @@ _SINK_MAX_VALUE_CHARS = 200
 # ON-DISK SHAPE. A value is either a bare string/list (LEGACY: as_of
 # unknown) or a stamped object:
 #
-#     "company":   {"v": "EvolMonkey",   "as_of": "2026-01-15T09:00:00Z"}
+#     "company":   {"v": "Orbitdata",   "as_of": "2026-01-15T09:00:00Z"}
 #     "languages": [{"v": "python", "as_of": …}, {"v": "rust", "as_of": …}]
 #
 # Stamps are PER VALUE, not per key, because a merging key accumulates its
@@ -176,7 +176,7 @@ _DEGRADED_MSG = ("Error: the profile store could not be read, so it is write-pro
 
 
 def _fold(text) -> str:
-    """Case- and accent-folded text (Greek "Φωτεινή" ~ "φωτεινη")."""
+    """Case- and accent-folded text (Greek "Έλενα" ~ "ελενα")."""
     import unicodedata
     t = unicodedata.normalize("NFD", str(text or "").casefold())
     return "".join(ch for ch in t if not unicodedata.combining(ch))
@@ -239,9 +239,9 @@ MIRROR_ROOT_CATEGORY = "root"
 def mirror_name(category: str, key: str) -> str:
     """The name a profile field's mirrors carry — the key for a ROOT field,
     ``<category>_<key>`` otherwise (KB review 10-30: keyed by the key alone,
-    `pet.name = Hanzo` replaced the owner's own `User name is Vasilis` and
+    `pet.name = Bruno` replaced the owner's own `User name is Vasilis` and
     `user HAS_NAME vasilis`, and `health.condition` deleted the graph-only
-    `HAS_CONDITION heart failure`)."""
+    `HAS_CONDITION asthma`)."""
     cat = str(category or "").strip().lower()
     k = str(key or "").strip().lower()
     if not cat or cat == MIRROR_ROOT_CATEGORY:
@@ -466,7 +466,7 @@ class ProfileMemory:
         Exact equality, as before — EXCEPT when either side carries a
         temporal anchor, where the comparison goes anchor-blind. Without
         that exemption, anchoring would convert a harmless restatement
-        into an accumulation: "Leonidas is 4 months old" and, six weeks
+        into an accumulation: "Kosmas is 4 months old" and, six weeks
         later, "…is 5 months old" anchor to different dates, so the
         exact-string dedup below would keep BOTH and inject two
         contradictory birth dates into every system prompt. Matching on
@@ -578,7 +578,7 @@ class ProfileMemory:
     def drop_previous_mentioning(self, target: str) -> list:
         """Remove the `previous` value of any field whose replaced value
         names ``target`` (whole word) — `forget` must reach it too (third
-        review: `forget Leonidas` left `previous: Leonidas` on disk)."""
+        review: `forget Kosmas` left `previous: Kosmas` on disk)."""
         t = str(target or "").strip().lower()
         if len(t) < 3:
             return []
@@ -632,7 +632,7 @@ class ProfileMemory:
             cat = str(category).strip().lower()
             k = str(key).strip().lower()
             # TEMPORAL ANCHORING at the store boundary. A stated age is a
-            # measurement, not a fact — "Leonidas is 4 months old" is only
+            # measurement, not a fact — "Kosmas is 4 months old" is only
             # true on the day it is said, and this store renders bare,
             # UNSTAMPED `- key: value` lines into every system prompt, so a
             # snapshot reads as present tense for ever (observed live: a
@@ -862,7 +862,7 @@ class ProfileMemory:
         This is the value-level counterpart to :meth:`delete` (which can
         only remove a whole key). It exists because pets / interests / assets
         are stored as VALUES inside a list — e.g.
-        ``assets.pets = ["Hanzo the dog", "Mortimer the iguana (removed)"]`` —
+        ``assets.pets = ["Bruno the dog", "Mortimer the iguana (removed)"]`` —
         so ``forget('mortimer')`` previously had no way to reach them and the
         stale entry kept being injected into the system prompt every turn.
 
@@ -939,7 +939,7 @@ class ProfileMemory:
 
     #: §4LB: fields that are NOT rendered into every prompt — reachable on
     #: request (recall / the profile tools) — by default the street address
-    #: (the model wrote "Makedonias 83" into Tor web searches) and any
+    #: (the model wrote "Kaledonias 83" into Tor web searches) and any
     #: ``*_description`` (a physical description from a photo). The owner can
     #: extend the list in ``profile_prompt_policy.json`` next to the profile
     #: (``{"on_demand": ["assets.vehicles", …]}``).
@@ -1034,8 +1034,8 @@ class ProfileMemory:
         """Render the profile for the ``{{PROFILE}}`` system-prompt slot.
 
         Temporal anchors are DERIVED here, not stored: a value held as
-        ``Leonidas (born ~2026-02-20)`` is rendered as
-        ``Leonidas (born ~2026-02-20 → ~6 months old)``. The store keeps
+        ``Kosmas (born ~2026-02-20)`` is rendered as
+        ``Kosmas (born ~2026-02-20 → ~6 months old)``. The store keeps
         constants; the prompt gets the value that is true today. This is
         the whole point of the split — the model is never asked to
         subtract a timestamp it will not notice, because the line it reads
@@ -1103,7 +1103,7 @@ class ProfileMemory:
         """
         text = _derive(str(unwrap(item)))
         # Retrieval review 2026-10-31: the age was derived only for a value
-        # that SAYS "born …" — `root.birthdate: 1980-01-29` and
+        # that SAYS "born …" — `root.birthdate: 1980-01-26` and
         # `wife_birthdate` were shown raw and "how old am I?" left the model
         # to subtract (the design: it never does). A birth-date KEY's value
         # gets the same gloss, the value itself unchanged.
@@ -1121,7 +1121,7 @@ class ProfileMemory:
         """`` (as of 2026-01-15)`` / `` (as of …, may be stale)`` / ``""``."""
         _k = str(key).strip().lower()
         # a person's birthdate or name never goes stale, whoever's it is
-        # ("son_thodoris_birthdate" — data audit §4KW)
+        # ("son_markos_birthdate" — data audit §4KW)
         # (not every "_name": an employer_name can go stale — third review)
         if not as_of or _k in _DURABLE_KEYS or _k.endswith(("_birthdate", "_birthday")) \
                 or (_k.endswith("_name") and _k[:-5] in _DURABLE_KEYS):

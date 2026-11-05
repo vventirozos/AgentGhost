@@ -226,15 +226,15 @@ def test_forgetting_a_document_keeps_unrelated_owner_facts(tmp_path, target):
     """Fails in the world where `forget <document>` deleted the owner's birth
     date, sons' birthdates and home town (distances 0.53–0.65, live 09-09)."""
     from ghost_agent.tools.memory import tool_unified_forget
-    ms = _sweep_ms([("f1", 0.55, "The user's birth date is 1980-01-29"),
-                    ("f2", 0.62, "The user lives in Thrakomakedones")])
+    ms = _sweep_ms([("f1", 0.55, "The user's birth date is 1980-01-26"),
+                    ("f2", 0.62, "The user lives in Kalopetres")])
     asyncio.run(tool_unified_forget(target, tmp_path, ms))
     assert "f1" not in _deleted_ids(ms) and "f2" not in _deleted_ids(ms)
 
 
 def test_forgetting_an_entity_needs_a_near_match_or_a_literal_mention(tmp_path):
     from ghost_agent.tools.memory import tool_unified_forget
-    ms = _sweep_ms([("near", 0.1, "user keeps an iguana"), ("far", 0.55, "The user's birth date is 1980-01-29"),
+    ms = _sweep_ms([("near", 0.1, "user keeps an iguana"), ("far", 0.55, "The user's birth date is 1980-01-26"),
                     ("lit", 0.9, "the pinball machine is in the garage")])
     asyncio.run(tool_unified_forget("pinball", tmp_path, ms))
     assert set(_deleted_ids(ms)) == {"near", "lit"}
@@ -432,7 +432,7 @@ def test_an_entity_forget_removes_facts_that_share_its_word(tmp_path):
     from ghost_agent.tools.memory import tool_unified_forget
     ms = _sweep_ms([("addr", 0.57, "The user's home address is 14 Kifisias, Athens"),
                     ("job", 0.41, "The user works as a software engineer at Google"),
-                    ("bday", 0.55, "The user's birth date is 1980-01-29")])
+                    ("bday", 0.55, "The user's birth date is 1980-01-26")])
     asyncio.run(tool_unified_forget("my address", tmp_path, ms))
     assert _deleted_ids(ms) == ["addr"]
 
@@ -556,7 +556,7 @@ def test_a_case_variant_of_the_projects_folder_is_locked(tmp_path, variant):
 def test_forget_never_deletes_through_a_hub_word(tmp_path):
     from ghost_agent.tools.memory import tool_unified_forget
     facts = [(f"f{i}", 0.5, t) for i, t in enumerate([
-        "The user's birth date is 1980-01-29", "The user lives in Thrakomakedones", "The user's nickname is Bill",
+        "The user's birth date is 1980-01-26", "The user lives in Kalopetres", "The user's nickname is Bill",
         "The user works as a software engineer at Google"])]
     ms = _sweep_ms(facts)
     asyncio.run(tool_unified_forget("user nickname", tmp_path, ms))
@@ -616,5 +616,5 @@ def test_only_named_relations_and_birthdates_are_durable():
     from ghost_agent.memory.profile import ProfileMemory
     old = "2020-01-01T00:00:00"
     assert ProfileMemory._staleness_marker("wife_name", old) == ""
-    assert ProfileMemory._staleness_marker("son_thodoris_birthdate", old) == ""
+    assert ProfileMemory._staleness_marker("son_markos_birthdate", old) == ""
     assert ProfileMemory._staleness_marker("employer_name", old) != ""

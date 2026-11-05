@@ -81,7 +81,7 @@ def test_the_autobiography_capture_refuses_a_public_reply():
 
 def test_no_owner_name_in_a_tool_schema():
     from ghost_agent.tools.registry import TOOL_DEFINITIONS
-    assert "Fotini" not in json.dumps(TOOL_DEFINITIONS)
+    assert "Elena" not in json.dumps(TOOL_DEFINITIONS)
 
 
 # ── lens 3 (code) ───────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ def test_a_chain_contained_in_a_longer_chain_is_not_returned_twice(tmp_path):
 @pytest.mark.parametrize("q,intent", [
     ("hello ghost, how are you?", "contextual"),
     ("how are things today", "contextual"),
-    ("how old is leonidas?", "factual"),
+    ("how old is kosmas?", "factual"),
     ("how do I fix the docker probe", "procedural"),
     ("how to configure nginx", "procedural"),
     ("should I drive or walk to the car wash", "contextual"),

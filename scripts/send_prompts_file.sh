@@ -5,7 +5,8 @@
 # Usage:
 #   scripts/send_prompts_file.sh [prompts_file]
 #
-# Default prompts file: init_personal_data.prompts (in cwd).
+# Default prompts file: init_personal_data.prompts (in cwd). The owner's real one is kept OUTSIDE the repo:
+#   ~/Data/AI/Data/private/init_personal_data.prompts (never commit personal data).
 
 set -u
 
