@@ -233,7 +233,7 @@ async def test_the_wake_prompt_defuses_output_and_reads_the_exit_like_collect(mo
     monkeypatch.setattr(SJ, "get_job_supervisor", lambda sm: _S())
     seen = []
 
-    async def fake_fg(ctx, body, rid):
+    async def fake_fg(ctx, body, rid, project_id=None):
         seen.append(body["messages"][0]["content"])
         return "done", None, None
     monkeypatch.setattr(MAIN, "_handle_chat_foreground", fake_fg)

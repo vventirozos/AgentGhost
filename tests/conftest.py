@@ -1177,3 +1177,17 @@ def _legacy_browser_sentinel(monkeypatch):
         monkeypatch.setattr(_B, "_new_nonce", lambda: "")
     except Exception:  # noqa: BLE001 — a test run that never imports the tool
         pass
+
+
+@pytest.fixture(autouse=True)
+def _labs_host_id_memo():
+    """§4SX review 11-05: `tools.labs._LAST_HOST_ID` remembers the labs host's id for the `unknown_lab` wording — a
+    module global, so one test's host id must not decide another's text."""
+    import sys as _sys
+    _L = _sys.modules.get("ghost_agent.tools.labs")
+    if _L is not None:
+        _L._LAST_HOST_ID.clear()
+    yield
+    _L = _sys.modules.get("ghost_agent.tools.labs")
+    if _L is not None:
+        _L._LAST_HOST_ID.clear()

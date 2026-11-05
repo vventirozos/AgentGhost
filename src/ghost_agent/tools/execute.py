@@ -786,9 +786,9 @@ def _promotion_banner(job: dict, ran_s: int, run_name: str = "") -> str:
                f"result with run(action='collect', name='{run_name}') once it "
                f"finishes. Stop it with run(action='stop', name='{run_name}').\n")
     else:
-        how = (f"▎ Poll it with jobs(action='status', job_id='{jid}'); read its full "
-               f"result with jobs(action='collect', job_id='{jid}') once it "
-               f"finishes. Cancel it with jobs(action='cancel', job_id='{jid}').\n")
+        how = (f"▎ Poll it with run(action='status', name='{jid}'); read its full "
+               f"result with run(action='collect', name='{jid}') once it "
+               f"finishes. Stop it with run(action='stop', name='{jid}').\n")
     return (
         f"{head}\n"
         f"{how}"

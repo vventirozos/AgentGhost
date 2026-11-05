@@ -119,8 +119,8 @@ async def test_promoted_command_forecloses_the_retry(tmp_path):
     assert "still running" in low
     assert "not finished" in low
     # It must also say how to get the answer, and how to stop it.
-    assert "jobs(action='status', job_id='job-1a2b3c4d')" in res
-    assert "collect" in low and "cancel" in low
+    assert "run(action='status', name='job-1a2b3c4d')" in res
+    assert "collect" in low and "stop" in low          # review 11-05 W-M2: run collect / run stop
     assert ".jobs/job-1a2b3c4d.log" in res
 
 

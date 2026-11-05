@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Optional
 from fastapi import Body, FastAPI, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from . import redact
 from .errors import LabError
 from .labs import ORIGINS
 from .service import Service
@@ -21,14 +22,21 @@ def _origin(value: Optional[str]) -> str:
     return v if v in ORIGINS else "autopilot"
 
 
+MIN_KEY_LEN = 16
+
+
 def create_app(svc: Service, api_key: str) -> FastAPI:
+    # fail closed (review 11-05 #11): an empty key file made compare_digest(b"", b"") admit every request
+    if not isinstance(api_key, str) or len(api_key.strip()) < MIN_KEY_LEN:
+        raise ValueError(f"the API key is empty or shorter than {MIN_KEY_LEN} characters; refusing to serve")
+    api_key = api_key.strip()
     app = FastAPI(title="ghost-labs", docs_url=None, redoc_url=None, openapi_url=None)
     mgr = svc.mgr
 
     @app.middleware("http")
     async def auth(request: Request, call_next):
         given = request.headers.get("x-labs-key", "")
-        if not hmac.compare_digest(given.encode(), api_key.encode()):
+        if not given or not hmac.compare_digest(given.encode(), api_key.encode()):
             return JSONResponse(status_code=401, content={"error": "unauthorized", "message": "missing or wrong X-Labs-Key",
                                                           "hint": "send the key from /etc/ghost-labs/api_key"})
         return await call_next(request)
@@ -123,8 +131,10 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
     def jobs(lab_id: str, x_origin: Optional[str] = O):
         mgr.get(lab_id)
         mgr.touch(lab_id, _origin(x_origin))
-        return {"lab_id": lab_id, "jobs": svc.store.q("SELECT job_id, member, cmd, state, exit_code, started_at, ended_at "
-                                                       "FROM jobs WHERE lab_id=? ORDER BY started_at", (lab_id,))}
+        rows = svc.store.q("SELECT job_id, member, cmd, state, exit_code, started_at, ended_at "
+                           "FROM jobs WHERE lab_id=? ORDER BY started_at", (lab_id,))
+        rules = mgr.redactor()      # review 11-05 #17: a job's cmd is echoed redacted
+        return {"lab_id": lab_id, "jobs": [{**r, "cmd": redact.apply(r["cmd"] or "", rules)} for r in rows]}
 
     @app.get("/v1/labs/{lab_id}/jobs/{job_id}")
     def job(lab_id: str, job_id: str, tail_bytes: int = 65536, x_origin: Optional[str] = O):
@@ -134,7 +144,8 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
     @app.delete("/v1/labs/{lab_id}/jobs/{job_id}")
     def kill_job(lab_id: str, job_id: str, x_origin: Optional[str] = O):
         origin = _origin(x_origin)
-        return act(lab_id, "job_kill", origin, lambda: mgr.job(lab_id, job_id, 65536, kill=True), job_id=job_id)
+        return act(lab_id, "job_kill", origin, lambda: mgr.job(lab_id, job_id, 65536, kill=True, origin=origin),
+                   job_id=job_id)
 
     @app.put("/v1/labs/{lab_id}/files")
     def put_file(lab_id: str, body: Dict[str, Any] = Body(...), x_origin: Optional[str] = O):

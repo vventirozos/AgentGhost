@@ -588,7 +588,47 @@ _MAX_RESUMES_PER_HOUR = 12
 _resume_times: list = []
 
 
-async def _handle_chat_foreground(context, body, request_id: str):
+def _project_turn_scope(context, project_id):
+    """(scope, why-not) for an unattended turn (a job's wake, a project-owned scheduled task) that belongs to a
+    project — review 11-05 P-M1: its project pinned, origin unattended (owner gates hold; no conversation, no focus
+    row). ``(None, "")``: no project (the turn runs unscoped, as it always did). ``(None, why)``: the project is
+    gone, archived, or its row could not be read — the turn must NOT run (r12 M2: it ran with no project, in the root
+    workspace, as an owner turn; a transient store error did the same to a live project)."""
+    pid = str(project_id or "").strip()
+    if not pid:
+        return None, ""
+    store = getattr(context, "project_store", None)
+    if store is None:
+        return None, "the project store is unavailable"
+    proj, err = None, ""
+    for _try in range(3):                         # "database is locked" is transient: asked again before giving up
+        try:
+            proj, err = store.get_project(pid), ""
+            break
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+            time.sleep(0.2 * (_try + 1))
+    if err:
+        return None, f"project {pid} could not be read ({err[:120]})"
+    status = str((proj or {}).get("status") or "") if isinstance(proj, dict) else ""
+    if proj is None:
+        return None, f"project {pid} no longer exists"
+    if "archiv" in status.lower() or "delet" in status.lower():
+        return None, f"project {pid} is {status.lower()}"
+    from .core.request_scope import ORIGIN_UNATTENDED, RequestScope
+    return RequestScope(project_id=pid, origin=ORIGIN_UNATTENDED), ""
+
+
+def _unattended_project_scope(context, project_id):
+    """The scope of `_project_turn_scope`, or None (no project / not runnable)."""
+    return _project_turn_scope(context, project_id)[0]
+
+
+#: the reply of an unattended project turn that did not run (r12 M2) — callers record it, never as the task's result
+PROJECT_TURN_SKIPPED = "[PROJECT TURN SKIPPED"
+
+
+async def _handle_chat_foreground(context, body, request_id: str, project_id=None):
     """§4CB R1 A-F3 / R2 A-MAJ-4: every autonomous full-turn dispatch
     (scheduled task, job resume) is a FOREGROUND request for its duration —
     unmarked, the biological tick ran consolidation mid-turn and the RSS
@@ -619,10 +659,18 @@ async def _handle_chat_foreground(context, body, request_id: str):
                                          (trajectory_id_context, ""), (_EVENT_PROJECT_OVERRIDE, None),
                                          (reply_tap_context, None),
                                          (effort_override_context, ""))]                # §4RB: no web override
+    # r13 m3: the store read (and its retries' sleeps) off the event loop
+    _scope, _why = await asyncio.to_thread(_project_turn_scope, context, project_id)
+    if _why:
+        for v, t in reversed(_clean):
+            v.reset(t)
+        pretty_log("Unattended Turn Skipped", f"{request_id}: {_why} — not run", level="WARNING", icon=Icons.WARN)
+        return f"{PROJECT_TURN_SKIPPED}: {_why}]", None, None
     _mark_foreground(context.agent, +1)
     try:
         return await context.agent.handle_chat(
-            body, BackgroundTasks(), request_id=request_id)   # the role rides the contextvar set above
+            body, BackgroundTasks(), request_id=request_id,   # the role rides the contextvar set above
+            **({"scope": _scope} if _scope is not None else {}))
     finally:
         _mark_foreground(context.agent, -1)
         for v, t in reversed(_clean):
@@ -641,10 +689,13 @@ def _collect_hint(entry, context=None) -> str:
             return f"run(action='collect', name='{_rn}')"
         if (entry or {}).get("started_via") == "run":
             # review r4: its run name was reused by a newer job — the job id reaches THIS one
-            return f"jobs(action='collect', job_id='{str(entry['id'])[:40]}')"
+            return f"run(action='collect', name='{str(entry['id'])[:40]}')"
     if (entry or {}).get("started_via") == "run":
         return f"run(action='collect', name='{str((entry or {}).get('label') or '')[:60]}')"
-    return "jobs(action='collect')"
+    if (entry or {}).get("id"):
+        # r12: the wake turn of a project's job is OWNED now (its project scope) — a bare collect names nothing there
+        return f"run(action='collect', name='{str(entry['id'])[:40]}')"
+    return "run(action='collect')"
 
 
 async def _resume_after_job(context, entry) -> bool:
@@ -778,7 +829,19 @@ async def _resume_after_job(context, entry) -> bool:
             note_untrusted_content("job_output", req_id=_wake_id)
         except Exception:  # noqa: BLE001
             pass
-        _content, _, _ = await _handle_chat_foreground(context, body, _wake_id)
+        # review 11-05 P-M1: the wake continues the work in the job's PROJECT (its files, labs and runs)
+        _content, _, _ = await _handle_chat_foreground(context, body, _wake_id,
+                                                       project_id=(entry or {}).get("project_id"))
+        if str(_content or "").startswith(PROJECT_TURN_SKIPPED):
+            # r12 M2: its project is archived / gone / unreadable — the result is recorded, never continued unscoped
+            from .core.autonomous_activity import record_scheduled_result
+            record_scheduled_result(
+                getattr(context, "activity_log", None), job_id=_wake_id, task_name=f"background job {jid}",
+                content=f"finished ({state}{f', exit {code}' if code is not None else ''}), but its follow-up turn "
+                        f"did not run: {str(_content)[len(PROJECT_TURN_SKIPPED) + 2:].rstrip(']')}. Ask me to collect "
+                        f"it ({_collect_hint(entry, context)}).",
+                ok=False, duration_s=time.time() - _started)
+            return True
         # Fresh review (§4KW): the wake's conclusion ("say briefly what the
         # job produced — the user has not seen this output") was DISCARDED —
         # internal turns are excluded from the digest and the notify
@@ -1447,6 +1510,12 @@ async def lifespan(app):
         pretty_log("Activity Ledger Failed", f"{type(e).__name__}: {e}",
                    level="WARNING", icon=Icons.WARN)
 
+    # §4SX review 11-05 (R-M4/P-M2): the labs and runs of leaves the previous process left mid-build
+    try:
+        from .core.leaf_reaper import start_leaf_reaper
+        start_leaf_reaper(context)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("leaf reaper skipped: %s: %s", type(e).__name__, e)
     # §4SX Phase B: one line naming the labs host, its version and health —
     # in the background (a down host must not hold the boot for its timeout)
     try:
@@ -1583,12 +1652,14 @@ async def lifespan(app):
                 # for cron and catch-up runs (an interval task rewrote the store
                 # every tick) — so a restart can tell a missed one (§4MD)
                 try:
-                    _base_id = str(job_id).split("__catchup")[0]
+                    # r12 M1: its OWN name — reusing `_base_id` turned `X__retry` back into the retry's id, so the
+                    # owner lookup below found no task and a project's retried task ran with no project
+                    _fire_id = str(job_id).split("__catchup")[0]
                     from apscheduler.triggers.cron import CronTrigger as _CTf
-                    _jf = _sched.get_job(_base_id) if _sched else None
+                    _jf = _sched.get_job(_fire_id) if _sched else None
                     if str(job_id).endswith("__catchup") or (
                             _jf is not None and isinstance(getattr(_jf, "trigger", None), _CTf)):
-                        await asyncio.to_thread(_tools_tasks.note_task_fired, _base_id, started)
+                        await asyncio.to_thread(_tools_tasks.note_task_fired, _fire_id, started)
                 except Exception:  # noqa: BLE001
                     pass
                 pretty_log(
@@ -1619,8 +1690,17 @@ async def lifespan(app):
                 # foreground bracket (it supplies the empty BackgroundTasks
                 # shim — handle_chat only uses it for optional post-turn
                 # async work, so a request-scoped one isn't needed).
+                # review 11-05 P-M1: a project-owned task (owner "project:<id>") runs IN its project
+                _owner = ""
+                try:
+                    _owner = str((_tools_tasks._load_task_store().get(_base_id) or {}).get("owner") or "")
+                except Exception:  # noqa: BLE001
+                    _owner = ""
                 _content, _, _ = await _handle_chat_foreground(
-                    context, body, f"sched-{job_id}")
+                    context, body, f"sched-{job_id}",
+                    project_id=_owner[len("project:"):] if _owner.startswith("project:") else None)
+                if str(_content or "").startswith(PROJECT_TURN_SKIPPED):
+                    return False                  # r12 M2: not run — never booked as the task's result
                 # The turn's CONCLUSION now reaches the operator via the
                 # activity ledger (next-turn digest + outbound push) —
                 # previously the final content was DISCARDED and only
@@ -1706,8 +1786,21 @@ async def lifespan(app):
             mgr = getattr(context, "sandbox_manager", None)
             if mgr is None or not hasattr(mgr, "execute"):
                 return
+            # r12 m5: a project's watch checks IN its project folder (a relative `test -f out/done` saw the root),
+            # and an archived / deleted project's watch does not check at all (its reaction would run unscoped)
+            _wkw = {}
             try:
-                out, code = await asyncio.to_thread(mgr.execute, check_command, 60)
+                _wown = str((_tools_tasks._load_task_store().get(job_id) or {}).get("owner") or "")
+            except Exception:  # noqa: BLE001
+                _wown = ""
+            if _wown.startswith("project:"):
+                _wpid = _wown[len("project:"):]
+                _wsc, _wwhy = await asyncio.to_thread(_project_turn_scope, context, _wpid)
+                if _wwhy:
+                    return
+                _wkw = {"workdir": f"/workspace/projects/{_wpid}"}
+            try:
+                out, code = await asyncio.to_thread(lambda: mgr.execute(check_command, 60, **_wkw))
             except Exception as e:  # noqa: BLE001
                 pretty_log("Watch Check Error",
                            f"{job_id} ({task_name}): {type(e).__name__}: {e}",

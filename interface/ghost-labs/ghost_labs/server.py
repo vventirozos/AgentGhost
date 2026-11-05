@@ -31,8 +31,13 @@ def main() -> int:
     except RuntimeError as e:
         log.error("refusing to start: %s", e)
         return 2
+    try:
+        app = create_app(svc, C.api_key())
+    except (RuntimeError, ValueError, OSError) as e:
+        log.error("refusing to start: %s", e)
+        return 2
     svc.mgr.ports.serve_page(APPS_PAGE_PORT)
-    api = uvicorn.Server(uvicorn.Config(create_app(svc, C.api_key()), host=cfg.resolved_bind_host,
+    api = uvicorn.Server(uvicorn.Config(app, host=cfg.resolved_bind_host,
                                         port=int(cfg.bind_port), log_level="info", access_log=False))
     page = uvicorn.Server(uvicorn.Config(create_apps_page(svc), host="127.0.0.1", port=APPS_PAGE_PORT,
                                          log_level="warning", access_log=False))

@@ -244,10 +244,16 @@ def test_program_output_is_scanned_for_its_printed_error(tool, text, expected):
 
 
 def test_a_jobs_result_is_a_programs_output():
-    """A detached job's output is program output (the CLI's own lines)."""
-    assert error_line("[CLI] Exiting due to transcription failure.", tool="jobs") \
-        == "[CLI] Exiting due to transcription failure."
-    assert "jobs" in PROGRAM_OUTPUT_TOOLS and "execute" in PROGRAM_OUTPUT_TOOLS
+    """A detached job's OWN output is program output (the CLI's own lines). §4SX review 11-05 R-m5: `jobs` is an
+    alias of `run` now — a status LISTING under that name is content ("failed" is a row's state), a job's collected
+    result is program output (also under `run`, which reaches it by job id)."""
+    out = "--- job-1a2b3c4d: transcribe ---\n[CLI] Exiting due to transcription failure."
+    for t in ("jobs", "run", "manage_services"):
+        assert error_line(out, tool=t) == "[CLI] Exiting due to transcription failure.", t
+        assert error_line("RUN ERROR — " + out, tool=t) == "[CLI] Exiting due to transcription failure.", t
+        assert error_line(ToolOutcome.ok("RUNS (2):\n  build — job — failed (exit 1)\n  api — server — running"),
+                          tool=t) == "", t
+    assert "jobs" not in PROGRAM_OUTPUT_TOOLS and "execute" in PROGRAM_OUTPUT_TOOLS
     assert "web_search" not in PROGRAM_OUTPUT_TOOLS and "browser" not in PROGRAM_OUTPUT_TOOLS
 
 

@@ -417,3 +417,5 @@ MINOR only. The stored-row grading converged on ONE exit rule, `runs._headed` (`
 lab (`lab exec … stdin=`). The Mac's Postgres is removed AFTER the deploy. Next: full suite → ONE deploy (agent +
 host kept.py/labs.py/service.py/api.py) → D1 (delete the two apps, drop the 6 legacy service rows, backed up) →
 prod functional tests. **DONE 11-05 (journal §4SX-t): deployed, D1 done, Mac Postgres removed, prod 10/12 + tools 15/16 (all non-passes = test design / designed refusals).**
+**11-05 end-to-end re-review r11–r16 (journal §4SX-u):** six fresh-eye rounds agent + host until clean; by-id jobs read ONE
+registry record; lab paths resolve as file_system; host stats bounded, backfill removed. Deployed after battery + full suite.

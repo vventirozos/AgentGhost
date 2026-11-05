@@ -2466,7 +2466,7 @@ _EXTERNAL_EVIDENCE_TOOLS = frozenset({
     "lab",      # §4SX B: program output from a lab machine
     "run",      # §4SX D5: a run's logs / collected output are program output
     "vision_analysis", "news_headlines", "query_document", "knowledge_base",
-    "database", "recall", "system_utility",
+    "recall", "system_utility",       # (§4SX E: `database` / postgres_admin is gone — review 11-05)
 })
 
 
@@ -7079,9 +7079,20 @@ def _batch_call_depends(name: str, args: dict, prev_name: str, prev_args: dict) 
         return act in ("put", "get", "deploy")       # §4SX D3: deploy tars the workspace folder execute built
     if prev_name != "lab":
         return False
-    if act in ("put", "get") and pact in ("put", "get"):
-        return True                      # workspace files move in written order, across labs too
+    if act in ("put", "get", "deploy") and pact in ("put", "get", "deploy"):
+        # workspace files move in written order, across labs too (review 11-05 M4: `get A → app/seed.sql`, then
+        # `deploy B folder=app` packed the folder before the get wrote it)
+        return True
+    if act in _LAB_LINEAGE_ACTIONS and pact in _LAB_LINEAGE_ACTIONS:
+        # versions of one app share a data volume and a lineage: keep / switch / destroy / backup of two labs in one
+        # batch run in written order (review 11-05 M4: a destroy decided drop_data while a keep of the next version
+        # landed; r12 m2: two destroys side by side each saw the other still kept, so neither dropped the shared
+        # volume — both said "KEPT: the other shares it")
+        return True
     lid, plid = str(a.get("lab_id") or "").strip(), str(pa.get("lab_id") or "").strip()
+    flab, pflab = _lab_from_lab(a), _lab_from_lab(pa)
+    if (flab and flab == plid) or (pflab and pflab == lid):
+        return True                      # `switch B from_lab=A` and a call on A (review 11-05 M4)
     if lid and plid:
         return lid == plid
     # no lab id on one side: a `list` reports what the earlier changes left;
@@ -7093,6 +7104,26 @@ def _batch_call_depends(name: str, args: dict, prev_name: str, prev_args: dict) 
     if act == "create":
         return pact == "destroy"
     return False
+
+
+#: UNRESOLVED results that mean "the backend did not answer / could not verify" (review 11-05 R-m11), not "still
+#: running" — the MULTI-STEP OUTCOME gives them their own line
+_NO_ANSWER_CODES = frozenset({"run_no_answer", "run_unreachable", "run_unverified", "lab_no_answer"})
+
+#: lab actions on one app's lineage (data volume, serving version) — ordered across labs in a batch
+_LAB_LINEAGE_ACTIONS = frozenset({"keep", "deploy", "rehearse", "switch", "rollback", "restore", "destroy",
+                                  "backup"})
+
+
+def _lab_from_lab(a: dict) -> str:
+    """``params.from_lab`` of a `lab` call (a dict, or JSON text), or ""."""
+    p = a.get("params")
+    if isinstance(p, str):
+        try:
+            p = json.loads(p) if p.strip() else {}
+        except ValueError:
+            p = {}
+    return str(p.get("from_lab") or "").strip() if isinstance(p, dict) else ""
 
 
 _RUN_LAB_RE = re.compile(r"^\s*(lab_[0-9a-f]{8})/")
@@ -7119,6 +7150,8 @@ def _run_call_depends(name, a, act, prev_name, pa, pact) -> bool:
         if prev_name == "lab":
             m = _RUN_LAB_RE.match(str(a.get("where") or ""))
             plid = str(pa.get("lab_id") or "").strip()
+            if pact in ("put", "get", "deploy") and not m and act not in ("status", "logs", "url", "collect"):
+                return True              # r12 M3: a workspace run reads what an earlier `lab get` writes (as execute)
             return bool(m and plid and m.group(1) == plid) or pact in _LAB_APP_ACTIONS
         if prev_name == "run":
             n, pn = str(a.get("name") or "").strip(), str(pa.get("name") or "").strip()
@@ -7151,6 +7184,27 @@ async def _after_deps(deps, coro, my_done):
         my_done.set()
 
 
+def _batch_as_run(name, args):
+    """(name, args) as `_batch_call_depends` reads them: the old `manage_services` / `jobs` names are `run` calls
+    (review 11-05 W-m: `manage_services start` + `execute curl` in one batch ran unordered — the curl raced the
+    start). Their action and id spellings map to run's."""
+    if name not in ("manage_services", "jobs"):
+        return name, args
+    a = dict(args) if isinstance(args, dict) else {}
+    act = str(a.get("action") or "").strip().lower()
+    a["action"] = {"cancel": "stop", "list": "status"}.get(act, act)
+    if not a.get("name") and a.get("job_id"):
+        a["name"] = a["job_id"]
+    if name == "manage_services" and (a.get("name") or a.get("service") or a.get("service_name")):
+        # r12 m4: the alias's own spelling of the run name (`My_API` runs as `my-api`)
+        try:
+            from ..tools.runs import _alias_name
+            a["name"] = _alias_name(a.get("name") or a.get("service") or a.get("service_name")) or a.get("name")
+        except Exception:  # noqa: BLE001
+            pass
+    return "run", a
+
+
 def _wire_batch_waits(exec_coros, tool_call_metadata):
     """§4SX B: the batch's `execute` / `lab` calls (still in the concurrent,
     stoppable phase) each wait for the EARLIER calls they depend on
@@ -7158,10 +7212,10 @@ def _wire_batch_waits(exec_coros, tool_call_metadata):
     ``tool_call_metadata[i]`` holds the tool name at 0 and its args at 9.
     Independent calls are left exactly as they were. Returns the new list."""
     out = list(exec_coros)
-    seq = [(k, tool_call_metadata[i][0],
-            tool_call_metadata[i][9] if len(tool_call_metadata[i]) > 9 else {})
+    seq = [(k, *_batch_as_run(tool_call_metadata[i][0],
+                              tool_call_metadata[i][9] if len(tool_call_metadata[i]) > 9 else {}))
            for k, (i, _) in enumerate(out)
-           if tool_call_metadata[i][0] in ("execute", "lab", "run")]
+           if tool_call_metadata[i][0] in ("execute", "lab", "run", "manage_services", "jobs")]
     dep_of = {k: [pk for (pk, pn, pa) in seq[:j] if _batch_call_depends(nm, ar, pn, pa)]
               for j, (k, nm, ar) in enumerate(seq)}
     waited = {pk for v in dep_of.values() for pk in v}
@@ -10116,7 +10170,7 @@ def _ends_with_action_promise(text) -> str:
 #: silently skipped (vs. terminal-tool re-calls, which are dropped by
 #: design). Used for the honesty note when force_final_response eats a call.
 _MUTATING_TOOLS_FOR_DROP_NOTE = frozenset({
-    "file_system", "execute", "manage_services", "manage_projects", "database",
+    "file_system", "execute", "manage_services", "manage_projects",
     "lab", "run",
 })
 
@@ -18576,7 +18630,7 @@ class GhostAgent:
         # escalations spent. The mechanical arms below still run on every turn.
         if verifier_judge_enabled():
             _multi_code, _multi_out = "", ""
-            if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
+            if "execute" in tool_name.lower():         # (§4SX E: the postgres tool is gone — review 11-05)
                 code_text = _reconstruct_executed_code(messages, last_tool)
                 if code_text:
                     # every step, not only the last (refute audit 2026-09-25)
@@ -24784,9 +24838,14 @@ class GhostAgent:
                                        # §4SX D5 review r4: a job that EXITED with no recorded
                                        # code is not "still running" — its own bucket below
                                        and getattr(_outcome, "reason_code", None)
-                                       != "run_exit_unknown"),
+                                       != "run_exit_unknown"
+                                       and getattr(_outcome, "reason_code", None) not in _NO_ANSWER_CODES),
                         # review r5: neither SUCCEEDED nor FAILED — finished, exit unknown
                         "exit_unknown": getattr(_outcome, "reason_code", None) == "run_exit_unknown",
+                        # review 11-05 R-m11: the backend did not answer / the result was not verified — not
+                        # "still running" (a collect of an ended job, an unanswered url or stop)
+                        "unanswered": (_outcome.status is _OutcomeStatus.UNRESOLVED and not _intr
+                                       and getattr(_outcome, "reason_code", None) in _NO_ANSWER_CODES),
                         # 140 chars cut the useful half off an argument
                         # error: the missing-parameter messages carry a
                         # worked call at the END, and in any turn that mixed
@@ -25399,7 +25458,7 @@ class GhostAgent:
                     # work visible to future turns.
                     if (_res_is_error and fname in (
                             "execute", "browser", "vision_analysis",
-                            "file_system")
+                            "file_system", "lab", "run")      # review 11-05 W-m: lab/run work is project work
                             and getattr(self.context,
                                         "current_project_id", None)):
                         # Count FAILED work-tool calls too — see the
@@ -25431,7 +25490,7 @@ class GhostAgent:
                                 getattr(self.context, "_project_work_files",
                                         set()).add(str(ptarget_raw or ptarget))
                             if ((fname in ("execute", "browser",
-                                           "vision_analysis")
+                                           "vision_analysis", "lab", "run")
                                  or (fname == "file_system" and is_mutating))
                                     and not _pf_promoted):
                                 # …but not a run that is still going: this

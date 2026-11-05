@@ -1248,7 +1248,10 @@ def get_active_tool_definitions(context, query: str = None, *,
                     )
                     target_skill_names = None
             
-            _existing_names = {t.get("function", {}).get("name") for t in active_tools}
+            # + the unadvertised dispatch-only names (review 11-05 W-m: a skill named `jobs` / `manage_services` was
+            # advertised here, while dispatch sent its calls to the alias)
+            _existing_names = ({t.get("function", {}).get("name") for t in active_tools}
+                               | {"manage_services", "jobs"})
             for skill_name, skill_info in manager.get_all_skills().items():
                 if skill_info.get("status") == "active":
                     if target_skill_names is not None and skill_name not in target_skill_names:

@@ -641,7 +641,7 @@ _WEB_TOOLS = frozenset({
 })
 _BROWSER_READ_OPS = frozenset({"navigate", "extract_text", "get_text", "read", "open", ""})
 _BROWSER_ACTION_OPS = frozenset({"interact", "click", "type", "scroll"})     # count as a read only when the page loaded
-_LOCAL_READ_TOOLS = frozenset({"file_system", "knowledge_base", "query_document", "database"})
+_LOCAL_READ_TOOLS = frozenset({"file_system", "knowledge_base", "query_document"})   # (§4SX E: no `database`)
 _ASSERTIVE_MIN_WORDS = 30
 
 

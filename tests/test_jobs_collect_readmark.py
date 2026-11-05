@@ -89,7 +89,7 @@ class TestCollectAllReadmark:
         assert "RESULT-0" not in out and "RESULT-1" not in out
         assert "No NEW results" in out
         # …and it hints that already-collected results are re-fetchable by id.
-        assert "job_id" in out and ids[-1] in out
+        assert "name='<job id>'" in out and ids[-1] in out      # review 11-05 W-M2: the run route
 
     def test_by_id_refetch_works_after_collect_all(self):
         ctx, _, ids = _ctx_with_done()

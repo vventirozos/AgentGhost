@@ -591,8 +591,10 @@ def write_bytes_nofollow_rel(root: Path, rel: str, data: bytes) -> None:
                 nxt = _open_dir_nofollow(comp, dir_fd=dfd)
             _close_quietly(dfd)
             dfd = nxt
+        # O_NONBLOCK (review 11-05 r12 F5): a FIFO planted at the target blocked open() forever — on the event loop
+        # for `lab get`; with no reader it now fails ENXIO, and the fstat below refuses any non-regular file
         flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-                 | getattr(os, "O_NOFOLLOW", 0))
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         try:
             fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
         except OSError as exc:
@@ -616,6 +618,10 @@ def write_bytes_nofollow_rel(root: Path, rel: str, data: bytes) -> None:
         # them. The manual close covers only the window BEFORE ownership
         # transfers.
         try:
+            import stat as _stat
+            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(_errno.EINVAL, f"{parts[-1]} is not a regular file — not written")
+            _block_if_regular(fd)                               # §4SD: O_NONBLOCK was for the open only
             fh = os.fdopen(fd, "wb", closefd=True)
         except BaseException:
             _close_quietly(fd)
@@ -1332,6 +1338,36 @@ def _safe_project_id(pid) -> str:
     return cleaned
 
 
+def _project_row_gone(context, pid: str) -> bool:
+    """True only when the project store is real and positively has no row for ``pid`` (unknown → False)."""
+    store = getattr(context, "project_store", None)
+    get = getattr(store, "get_project", None)
+    if not callable(get) or type(store).__module__.startswith("unittest.mock"):
+        return False
+    try:
+        return get(pid) is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _deleted_project_block(sandbox_dir, project_store):
+    """r12 m1: a write in a turn scoped to a project that was DELETED during it (`project_scoped_sandbox` no longer
+    makes its folder) is refused — each write's own `mkdir(parents=True)` recreated the orphan folder. Only when the
+    folder is gone AND the store positively has no row (a store error never blocks a write)."""
+    try:
+        sd = Path(str(sandbox_dir)) if sandbox_dir is not None else None
+        if sd is None or sd.parent.name != "projects" or sd.is_dir():
+            return None
+        from types import SimpleNamespace
+        if _project_row_gone(SimpleNamespace(project_store=project_store), sd.name):
+            return ToolOutcome.rejected(
+                f"SYSTEM BLOCK: project {sd.name} was deleted — its workspace is gone, so nothing was written. "
+                "Switch to another project (or none) first.", world_changed=False, reason_code="project_deleted")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=None):
     """Return ``(host_dir, container_workdir)`` scoped to the active project's
     workspace (``<sandbox>/projects/<id>/``), creating the dir on demand; or
@@ -1369,7 +1405,13 @@ def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=
     if pid and not stateful and base is not None:
         sub = base / "projects" / pid
         try:
-            sub.mkdir(parents=True, exist_ok=True)
+            if not sub.is_dir() and _project_row_gone(context, pid):
+                # review 11-05 P-m6: a project deleted DURING a turn scoped to it — never recreate its folder (an
+                # orphan workspace for a row that no longer exists); its file writes are refused by
+                # `_deleted_project_block` (r12 m1: each write's own mkdir brought the folder back)
+                pass
+            else:
+                sub.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
         return sub, f"{_CONTAINER_WORKDIR}/projects/{pid}"
@@ -7611,6 +7653,9 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     # Release immutability: block mutations into a RELEASED project's
     # workspace at the WRITE PATH (see _released_write_block).
     if str(operation or "").strip().lower() not in _READ_ONLY_OPS:
+        _gone = _deleted_project_block(sandbox_dir, kwargs.get("project_store"))
+        if _gone is not None:
+            return _gone
         # EVERY candidate target, not just the first one that happens to be
         # set: `move`/`copy` carry the source in `path` and the real write in
         # `destination`, and the old `path or filename or destination` chain

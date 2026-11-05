@@ -240,6 +240,8 @@ def assess_turn_evidence(tools_run: Optional[Iterable[Dict[str, Any]]]
             # read branch, its "SUCCESS: Wrote …" counted as substantive, and
             # one scratch-file write silenced the gate for the whole turn.
             continue
+        if name == "run" and str((args or {}).get("action") or "").strip().lower() in ("start", "stop", "restart"):
+            continue        # review 11-05 R-m6: a run start/stop/restart is a mutation, the same rule
         a.consulted += 1
         why = _empty_reason(name, args, content, is_error)
         if why is None:

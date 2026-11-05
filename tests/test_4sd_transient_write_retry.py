@@ -178,8 +178,23 @@ import ast
 import pathlib
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
-_NONBLOCK_MODULES = ["tools/file_system.py", "api/routes.py", "core/project_research.py",
-                     "core/task_deliverable.py"]
+_KNOWN_NONBLOCK_MODULES = ["tools/file_system.py", "api/routes.py", "core/project_research.py",
+                           "core/task_deliverable.py", "tools/labs.py"]
+
+
+def _names_o_nonblock(path):
+    tree = ast.parse(path.read_text())
+    return any((isinstance(n, ast.Constant) and n.value == "O_NONBLOCK")
+               or (isinstance(n, ast.Attribute) and n.attr == "O_NONBLOCK") for n in ast.walk(tree))
+
+
+# review 11-05 r16: a hand list missed tools/labs.py (`_tar_walk` read a deploy without the switch) — every module
+# whose CODE names O_NONBLOCK is checked
+_NONBLOCK_MODULES = sorted(p.relative_to(_SRC).as_posix() for p in _SRC.rglob("*.py") if _names_o_nonblock(p))
+
+
+def test_the_module_discovery_finds_every_known_nonblocking_module():
+    assert set(_KNOWN_NONBLOCK_MODULES) <= set(_NONBLOCK_MODULES)
 
 
 def _nonblock_functions_missing_the_switch(tree):

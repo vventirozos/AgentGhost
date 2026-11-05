@@ -223,6 +223,9 @@ OUTBOUND_TOOLS = {
     "lab": "url_literals",
     # §4SX D5: a run's command runs in the sandbox or on a lab machine — the same policy as their code
     "run": "url_literals",
+    # review 11-05 W-M1: the unadvertised old names reach `run` (runs.manage_services_alias / jobs_alias) without
+    # the `run` scrub wrapper — the dispatch scrub keys on the name the model CALLED, so they carry run's policy
+    "manage_services": "url_literals", "jobs": "url_literals",
     # §4MG: `subjects` is a public encyclopedia search over Tor; the prompt
     # goes only to the owner's own GPU node
     "image_generation": {"subjects"},

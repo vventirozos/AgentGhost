@@ -374,7 +374,7 @@ def test_a_job_wake_runs_once_under_its_own_id_and_records_its_conclusion(monkey
     import ghost_agent.core.autonomous_activity as AA
     seen, rec = [], []
 
-    async def _fg(ctx, body, rid):
+    async def _fg(ctx, body, rid, project_id=None):
         seen.append(rid)
         return "the job built 3 files", None, None
     monkeypatch.setattr(M, "_handle_chat_foreground", _fg)

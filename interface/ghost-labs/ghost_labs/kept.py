@@ -88,6 +88,9 @@ def valid_workdir(wd: str) -> bool:
     return not any(wd == t or wd.startswith(t + "/") for t in WORKDIR_DENY_TREES)
 
 
+KEEPABLE_STATES = ("ready", "unready")
+
+
 def data_volume_name(lineage: str, app: str, member: str, lab_id: str = "") -> str:
     base = f"ghost-labdata-{lineage}-{app}-{member}"
     return f"{base}-{lab_id}" if lab_id else base
@@ -124,6 +127,9 @@ class Kept:
         self._last_daily = 0.0
         self._app_locks: Dict[str, threading.Lock] = {}
         self._app_locks_guard = threading.Lock()
+        self._backups_running: set = set()
+        self._backup_threads: Dict[str, threading.Thread] = {}
+        self._backups_guard = threading.Lock()
 
     @contextlib.contextmanager
     def _app_locked(self, name: str, timeout: float = 120.0):
@@ -145,6 +151,14 @@ class Kept:
         if row["lifetime"] != "kept" or not row["app_json"]:
             raise LabError("not_kept", f"lab {lab_id} is not kept", hint="POST /v1/labs/{id}/keep first")
         return loads(row["app_json"])
+
+    def _log_text(self, text: str, n: int = 200) -> str:
+        """actions.log text: redacted FIRST, then cut (review r12 F5: cut first, a secret straddling the cut
+        left its head unmatched by the redactor and it was logged as typed)."""
+        try:
+            return self.mgr.redact_text(str(text))[:n]
+        except Exception:  # noqa: BLE001 — a broken redactor must not let the text through
+            return "<unredactable>"
 
     def _save(self, lab_id: str, app: Dict[str, Any]) -> None:
         self.store.update_lab(lab_id, app_json=dumps(app))
@@ -252,14 +266,22 @@ class Kept:
                 raise LabError("bad_request", f"the live version runs in member {oapp.get('member')!r}; a second "
                                "version must use the same app.member", field="app.member", live_lab=other)
         need = sum(m["mem_mb"] for m in members.values())
-        with self.mgr.create_lock:
-            self.mgr.check_kept_capacity(need)
+        probe_tier = origin == "probe"
         with self.mgr.locked(lab_id, timeout=60):
-            for n in names:
-                if n not in values and n not in self.store.secrets(lineage, name):
-                    values[n] = base64.b64encode(_secrets.token_bytes(32)).decode()
-            for n, v in values.items():
-                self.store.set_secret(lineage, name, n, v)
+            # re-read INSIDE the lab lock (review 11-05 #6: two /keep calls on one lab both passed the check
+            # made before it, and the second overwrote the first's app and orphaned its secrets)
+            cur = self.store.lab(lab_id)
+            if cur is None:
+                self.mgr.get(lab_id)          # raises unknown_lab
+            if cur["lifetime"] == "kept":
+                raise LabError("already_kept", f"lab {lab_id} is already kept", hint="use deploy / app actions")
+            if cur["state"] not in KEEPABLE_STATES:
+                # review r13 C: a lab being torn down (destroying), still building (creating) or failed became
+                # production — the reaper never reaps a kept lab, and the next restart called it "unready"
+                raise LabError("not_ready", f"lab {lab_id} is {cur['state']}; only a ready or unready lab can be kept",
+                               hint="wait until it is ready, or create a new lab", state=cur["state"])
+            if probe_tier:
+                self._guard_probe_namespace(lineage, name, lab_id)
             if self._live_holder(lineage, name, lab_id) != other:
                 raise LabError("busy", "another version of this app changed state meanwhile", hint="retry")
             staged = bool(other)
@@ -270,11 +292,33 @@ class Kept:
                    "last_error": None, "started_at": None, "next_restart_at": None, "data_seed": [],
                    "lease_key": f"{lineage}/{name}", "switched_from": None, "last_backup_at": 0,
                    "last_backup_attempt_at": 0}
-            self.store.update_lab(lab_id, lifetime="kept", lineage=lineage, ttl_idle_s=0, ttl_max_s=0, lan=int(lan),
-                                  agent_api_url=agent_api_url or None, app_json=dumps(app),
-                                  # a probe's kept lab is a test fixture: the reaper retires it (§4SX D3 r1 H2)
-                                  **({"retire_at": time.time() + 86400} if str(row.get("origin") or "") == "probe"
-                                     else {}))
+            # the kept-pool check and the flip to kept under ONE create lock (review 11-05 #6: parallel keeps of
+            # different labs each passed the check before either counted, and overfilled the pool)
+            # lab lock held, create_lock waited for: allowed by the lock order in Manager.__init__ — a create_lock
+            # holder never blocks on a lab lock (eviction only tries it, review r12 F4)
+            if not self.mgr.create_lock.acquire(timeout=60):
+                raise LabError("busy", "a create or keep holds the budget lock", hint="retry shortly", retry_after_s=10)
+            try:
+                self.mgr.check_kept_capacity(need, new_containers=False)
+                self.store.update_lab(lab_id, lifetime="kept", lineage=lineage, ttl_idle_s=0, ttl_max_s=0, lan=int(lan),
+                                      agent_api_url=agent_api_url or None, app_json=dumps(app),
+                                      # a probe's kept lab is a test fixture: the reaper retires it (§4SX D3 r1 H2)
+                                      **({"retire_at": time.time() + 86400} if str(row.get("origin") or "") == "probe"
+                                         else {}))
+            finally:
+                self.mgr.create_lock.release()
+            if probe_tier:
+                # what this probe makes in the namespace is its own: its retirement removes exactly that
+                self._claim("app", f"{lineage}/{name}", lab_id)
+                self._claim("svc", name, lab_id)
+            else:
+                # a non-probe keep owns the namespace from now on: no probe retirement may delete it (CRIT 2)
+                self._drop_claims(lineage, name)
+            for n in names:
+                if n not in values and n not in self.store.secrets(lineage, name):
+                    values[n] = base64.b64encode(_secrets.token_bytes(32)).decode()
+            for n, v in values.items():
+                self.store.set_secret(lineage, name, n, v)
             if agent_api_url:
                 self._ensure_sidecar(lab_id)
             for m in members:
@@ -286,6 +330,60 @@ class Kept:
                     self._start_app(lab_id, app, count=False)
             self._save(lab_id, app)
         return self.mgr.detail(lab_id)
+
+    # ------------------------------------------------------------ the probe namespace (review 11-05 CRIT 2)
+    def _claim(self, kind: str, key: str, lab_id: str) -> None:
+        self.store.x("INSERT OR IGNORE INTO probe_claims VALUES (?,?,?,?)", (kind, key, lab_id, time.time()))
+
+    def _claimed(self, kind: str, key: str) -> bool:
+        return bool(self.store.q("SELECT 1 FROM probe_claims WHERE kind=? AND key=?", (kind, key)))
+
+    def _drop_claims(self, lineage: str, app: str) -> None:
+        self.store.x("DELETE FROM probe_claims WHERE kind='app' AND key=?", (f"{lineage}/{app}",))
+        self.store.x("DELETE FROM probe_claims WHERE kind='svc' AND key=?", (app,))
+
+    def _left_behind(self, lineage: str, app: str, lab_id: str) -> List[str]:
+        """What already exists for (lineage, app) and for the Service name svc:<app>, that no probe claimed:
+        data volumes, secrets, the stable port lease, backups, archives, another kept version — and, for the
+        tailnet-wide name, any lease or kept app of that name in any lineage. A destroy without drop_data
+        leaves the data, secrets and lease behind on purpose (contract v2 §11.3), with no live kept lab to say
+        whose they are; this is what says it."""
+        found: List[str] = []
+        key = f"{lineage}/{app}"
+        if not self._claimed("app", key):
+            try:
+                if self.docker.volumes.list(filters={"label": [f"ghost.data.lineage={lineage}", f"ghost.data.app={app}"]}):
+                    found.append("data volumes")
+            except Exception:  # noqa: BLE001 — can't tell: refuse (fail closed)
+                found.append("data volumes (could not be listed)")
+            if self.store.secrets(lineage, app):
+                found.append("secrets")
+            if self.store.q("SELECT 1 FROM ports WHERE lease_key=?", (key,)):
+                found.append("the app's port lease")
+            if self.store.q("SELECT 1 FROM backups WHERE lineage=? AND app=?", (lineage, app)):
+                found.append("backups")
+            if self.store.q("SELECT 1 FROM archives WHERE lineage=? AND app=?", (lineage, app)):
+                found.append("deploy archives")
+            if any(l["lab_id"] != lab_id and l["lifetime"] == "kept" and l["lineage"] == lineage and l["app_json"]
+                   and (loads(l["app_json"]) or {}).get("name") == app for l in self.store.labs()):
+                found.append("another kept version")
+        if not self._claimed("svc", app):
+            if any((r["lease_key"] or "").split("/", 1)[-1] == app
+                   for r in self.store.q("SELECT lease_key FROM ports WHERE lease_key != ''")):
+                found.append(f"the Service name svc:{app}")
+            elif any(l["lab_id"] != lab_id and l["lifetime"] == "kept" and l["app_json"]
+                     and (loads(l["app_json"]) or {}).get("name") == app for l in self.store.labs()):
+                found.append(f"the Service name svc:{app}")
+        return found
+
+    def _guard_probe_namespace(self, lineage: str, app: str, lab_id: str) -> None:
+        """A probe keeps only into a namespace that is empty or that probes made (review 11-05 CRIT 2: a probe
+        took over the owner's destroyed-but-kept shop/web — its /data, secrets, port and Service name — and its
+        retirement 24 h later deleted the owner's data)."""
+        found = self._left_behind(lineage, app, lab_id)
+        if found:
+            raise LabError("owner_only", f"{lineage}/{app} holds {', '.join(found)} that a probe did not make",
+                           hint="pick another app name (and lineage) for the probe, or ask the owner", field="app.name")
 
     def _validate_agent_api(self, url: str) -> None:
         import ipaddress
@@ -341,7 +439,9 @@ class Kept:
         sm = next(m for m in spec["members"] if m["name"] == member)
         mem = self.mgr.member(lab_id, member)
         try:
-            self.mgr.container(lab_id, member).remove(force=True)
+            # with its anonymous volumes (review 11-05 #3: mysql:8's VOLUME leaked one per recreate); kept data
+            # is on the named /data volume (PGDATA=/data/pg, datadir=/data/mysql), which this never removes
+            self.mgr.remove_container(self.mgr.container(lab_id, member))
         except Exception:  # noqa: BLE001
             pass
         gw = net.gateway_ip(row["subnet"]) if row["egress"] == "tor" else None
@@ -520,10 +620,10 @@ class Kept:
             self._stop_proc(lab_id, app)
             app.update(state="crashloop", next_restart_at=None)
             log.error("app %s in %s is in crashloop (%s)", app["name"], lab_id, why)
-            self.mgr.actions.write(lab_id, "app_crashloop", why[:200])
+            self.mgr.actions.write(lab_id, "app_crashloop", self._log_text(why))
         else:
             app.update(state="restarting", next_restart_at=now + _backoff(len(app["crash_times"])))
-            self.mgr.actions.write(lab_id, "app_restart_scheduled", why[:200])
+            self.mgr.actions.write(lab_id, "app_restart_scheduled", self._log_text(why))
 
     # ------------------------------------------------------------ supervisor
     def tick(self) -> None:
@@ -590,12 +690,9 @@ class Kept:
                 if app.get("mounted") and now - float(app.get("last_backup_at") or 0) > 86400 \
                         and now - float(app.get("last_backup_attempt_at") or 0) > BACKUP_RETRY_S:
                     app["last_backup_attempt_at"] = now
-                    self._save(lab_id, app)
-                    try:
-                        self._backup_locked(lab_id, "daily")
-                    except Exception:  # noqa: BLE001
-                        log.exception("daily backup failed for %s", lab_id)
-                    app = loads(self.store.lab(lab_id)["app_json"])
+                    # its own thread (review 11-05 #16: a hook may run 1800 s, and run here it stalled crash
+                    # detection for every app); it waits for this lock, which the tick releases below
+                    self._spawn_daily_backup(lab_id)
                 self._save(lab_id, app)
             except LabError:
                 pass
@@ -611,13 +708,46 @@ class Kept:
             self._last_daily = now
             self.backup_sqlite()
 
+    def _spawn_daily_backup(self, lab_id: str) -> bool:
+        with self._backups_guard:
+            if lab_id in self._backups_running:
+                return False
+            self._backups_running.add(lab_id)
+        t = threading.Thread(target=self._daily_backup, args=(lab_id,), daemon=True,
+                             name=f"ghost-labs-backup-{lab_id}")
+        self._backup_threads[lab_id] = t
+        t.start()
+        return True
+
+    def join_backups(self, timeout: float = 30.0) -> None:
+        """Wait for the running daily backups (tests; a clean shutdown)."""
+        for t in list(self._backup_threads.values()):
+            t.join(timeout)
+
+    def _daily_backup(self, lab_id: str) -> None:
+        """The daily backup, off the supervisor thread. It holds THIS lab's lock for the whole backup (the hook,
+        then the copy): while it runs the supervisor skips this one app (its lock is taken non-blocking) and goes
+        on supervising every other app. The lock is what keeps a deploy/switch/restore of this lab from running
+        into the middle of the copy."""
+        try:
+            with self.mgr.locked(lab_id, timeout=600):
+                row = self.store.lab(lab_id)
+                if not row or row["lifetime"] != "kept" or not row["app_json"] or not loads(row["app_json"]).get("mounted"):
+                    return
+                self._backup_locked(lab_id, "daily")
+        except Exception:  # noqa: BLE001
+            log.exception("daily backup failed for %s", lab_id)
+        finally:
+            with self._backups_guard:
+                self._backups_running.discard(lab_id)
+
     def _exited(self, lab_id: str, app: Dict[str, Any], why: str) -> None:
         """The app process is gone. A container restart (reboot, Docker restart, OOM of the
         member) is not an app crash: start it again without counting (backstop for a missed event)."""
         if self._restarted_since(lab_id, app):
             self.mgr.apply_route(lab_id, app["member"])
             self._start_app(lab_id, app, count=False)
-            self.mgr.actions.write(lab_id, "app_start_after_member_restart", why[:200])
+            self.mgr.actions.write(lab_id, "app_start_after_member_restart", self._log_text(why))
         else:
             self._record_crash(lab_id, app, why)
 
@@ -1250,7 +1380,7 @@ class Kept:
                     self._save(lid, a)
                     self.store.update_lab(lid, retire_at=self._live_retire(lid))
             out.append(msg)
-            self.mgr.actions.write(lab_id, "interrupted_move", msg[:200])
+            self.mgr.actions.write(lab_id, "interrupted_move", self._log_text(msg))
         return out
 
     def _reverse(self, live_lab: str, other: str, archive, why: str) -> Dict[str, Any]:
@@ -1273,7 +1403,7 @@ class Kept:
                 a = loads(row["app_json"])
                 a["last_error"] = f"{why}; reverse failed: {_msg(e)}"
                 self._save(live_lab, a)
-            self.mgr.actions.write(live_lab, "reverse_failed", _msg(e)[:200])
+            self.mgr.actions.write(live_lab, "reverse_failed", self._log_text(_msg(e)))
             return {"ok": False, "error": _msg(e)}
 
     def _switch_locked(self, lab_id: str, from_lab: str, last) -> Dict[str, Any]:
@@ -1456,25 +1586,36 @@ class Kept:
         lineage = row["lineage"]
         members = [m["name"] for m in self.store.members(lab_id)]
         fresh = app.get("data") == "fresh"
+        # its own fresh volumes carry its lab id: no other lab can ever have mounted them
         vols = [data_volume_name(lineage, app["name"], m, lab_id) for m in members] if app.get("name") and fresh else []
         out = self.mgr.destroy(lab_id, reason="retired", by="reaper", origin="owner", include_kept=True, _force=True)
         others = [l for l in self.store.labs() if l["lifetime"] == "kept" and l["lineage"] == lineage]
+        kept_back: List[str] = []
         if app.get("name") and not [l for l in others if l["app_json"]
                                     and (loads(l["app_json"]) or {}).get("name") == app["name"]]:
+            # the last version: the namespace goes with it ONLY where a probe made it (review 11-05 CRIT 2)
             key = app.get("lease_key") or f"{lineage}/{app['name']}"
-            for p in self.store.q("SELECT port FROM ports WHERE lease_key=?", (key,)):
-                self.mgr.ports.unpublish(p["port"])
-            self.store.x("DELETE FROM ports WHERE lease_key=?", (key,))
-            if self.cfg.ts_services:
+            if self._claimed("app", f"{lineage}/{app['name']}"):
+                for p in self.store.q("SELECT port FROM ports WHERE lease_key=?", (key,)):
+                    self.mgr.ports.unpublish(p["port"])
+                self.store.x("DELETE FROM ports WHERE lease_key=?", (key,))
                 try:
-                    self.mgr.ports.unserve_service(app["name"])
+                    vols += [v.name for v in self.docker.volumes.list(filters={"label": [
+                        f"ghost.data.lineage={lineage}", f"ghost.data.app={app['name']}"]}) if v.name not in vols]
                 except Exception:  # noqa: BLE001
-                    log.exception("unserve %s", app["name"])
-            try:
-                vols += [v.name for v in self.docker.volumes.list(filters={"label": [
-                    f"ghost.data.lineage={lineage}", f"ghost.data.app={app['name']}"]}) if v.name not in vols]
-            except Exception:  # noqa: BLE001
-                log.exception("data volumes of %s/%s not listed", lineage, app["name"])
+                    log.exception("data volumes of %s/%s not listed", lineage, app["name"])
+                self.store.x("DELETE FROM secrets WHERE lineage=? AND app=?", (lineage, app["name"]))
+            else:
+                kept_back.append(f"{lineage}/{app['name']}: data, secrets and port lease (not made by a probe)")
+            if self._claimed("svc", app["name"]):
+                if self.cfg.ts_services:
+                    try:
+                        self.mgr.ports.unserve_service(app["name"])
+                    except Exception:  # noqa: BLE001
+                        log.exception("unserve %s", app["name"])
+            else:
+                kept_back.append(f"svc:{app['name']} (not made by a probe)")
+            self._drop_claims(lineage, app["name"])
         removed = []
         for v in vols:
             try:
@@ -1483,8 +1624,14 @@ class Kept:
             except Exception:  # noqa: BLE001
                 pass
         if lineage and not others:
-            self.store.x("DELETE FROM secrets WHERE lineage=?", (lineage,))
+            # the lineage's last kept lab: the secrets of every app a probe made in it (and only those)
+            for c in self.store.q("SELECT key FROM probe_claims WHERE kind='app'"):
+                lin, _, a = c["key"].partition("/")
+                if lin == lineage:
+                    self.store.x("DELETE FROM secrets WHERE lineage=? AND app=?", (lineage, a))
         out["data_volumes_removed"] = removed
+        if kept_back:
+            out["kept_back"] = kept_back
         return out
 
     def destroy_with_data(self, lab_id: str, origin: str) -> Dict[str, Any]:
@@ -1566,6 +1713,7 @@ class Kept:
             pass
         api = self.docker.api
         hc = api.create_host_config(init=True, mem_limit="96m", memswap_limit="96m", pids_limit=64,
+                                    cap_drop=["NET_RAW"],     # no forged packets from the proxy (review 11-05 #5)
                                     sysctls={"net.ipv4.ip_forward": "0", "net.ipv6.conf.all.disable_ipv6": "1"},
                                     restart_policy={"Name": "unless-stopped"})
         sip = net.host_in(row["subnet"], SIDECAR_OCTET)
@@ -1578,7 +1726,7 @@ class Kept:
 
     def remove_sidecar(self, lab_id: str) -> None:
         try:
-            self.docker.containers.get(f"ghost-labs-agentapi-{lab_id}").remove(force=True)
+            self.mgr.remove_container(self.docker.containers.get(f"ghost-labs-agentapi-{lab_id}"))
         except Exception:  # noqa: BLE001
             pass
         self.drop_sidecar_rule(lab_id)

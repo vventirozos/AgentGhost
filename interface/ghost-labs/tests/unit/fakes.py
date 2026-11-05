@@ -27,14 +27,24 @@ class FakeContainer:
         self.status = "running"
         self.attrs = {"State": {"Pid": 4242, "StartedAt": "x"}}
         self.removed = False
+        self.removed_with_volumes = None
         self.exec_log = []
+        self.anon_volumes = []          # names of the anonymous volumes Docker made for it (image VOLUME lines)
+        self.mem_usage = 0              # bytes, what stats() reports (cgroup usage)
+        self.mem_inactive_file = 0      # bytes of reclaimable page cache inside it
+        self.mem_active_file = 0        # bytes of hot page cache (MemAvailable counts it already, review r13 A)
 
     def reload(self):
         pass
 
-    def remove(self, force=False):
+    def remove(self, force=False, v=False):
+        """Like docker: v=True also removes the container's anonymous volumes."""
         self.removed = True
+        self.removed_with_volumes = v
         self.client._containers.pop(self.name, None)
+        if v:
+            for name in self.anon_volumes:
+                self.client._volumes.pop(name, None)
 
     def start(self):
         self.status = "running"
@@ -57,6 +67,11 @@ class FakeContainer:
     def exec_run(self, cmd, environment=None, **kw):
         self.exec_log.append(cmd)
         return SimpleNamespace(exit_code=0, output=b"")
+
+    def stats(self, stream=True, one_shot=None, decode=None):
+        assert not stream, "the manager reads one sample"
+        return {"memory_stats": {"usage": self.mem_usage, "stats": {"inactive_file": self.mem_inactive_file,
+                                                                   "active_file": self.mem_active_file}}}
 
     def logs(self, tail=200):
         return b"log line\n"
@@ -103,9 +118,12 @@ class _Coll:
 
     def list(self, all=False, filters=None, names=None):
         out = []
+        in_use = {v for c in self.c._containers.values() for v in getattr(c, "anon_volumes", [])}
         for o in self._store().values():
             labels = o.labels if self.kind != "volumes" else o.attrs["Labels"]
             if names and o.name not in names:
+                continue
+            if self.kind == "volumes" and (filters or {}).get("dangling") and o.name in in_use:
                 continue
             if _match(labels, filters):
                 out.append(o)
@@ -120,10 +138,11 @@ class _Coll:
                 return o
         raise NotFound(key)
 
-    def create(self, name, labels=None, ipam=None, **kw):
+    def create(self, name, labels=None, ipam=None, options=None, **kw):
         if self.kind == "networks":
             subnet = ipam["Config"][0]["Subnet"] if ipam else ""
             o = FakeNetwork(self.c, name, labels or {}, subnet)
+            o.attrs["Options"] = dict(options or {})
         else:
             o = FakeVolume(self.c, name, labels or {})
         self._store()[name] = o
@@ -154,8 +173,18 @@ class FakeAPI:
     def create_container(self, image, name=None, labels=None, **kw):
         o = FakeContainer(self.c, name, labels or {}, image)
         o.create_kwargs = kw
+        for path in self.c.image_volumes.get(image, []):       # the image's VOLUME lines
+            vname = f"{next(_ids):064x}"
+            self.c._volumes[vname] = FakeVolume(self.c, vname, {"com.docker.volume.anonymous": ""})
+            o.anon_volumes.append(vname)
         self.c._containers[name] = o
         return {"Id": o.id}
+
+    def inspect_container(self, cid):
+        for o in self.c._containers.values():
+            if o.id == cid or o.name == cid:
+                return {"Mounts": [{"Type": "volume", "Name": v, "Destination": "/anon"} for v in o.anon_volumes]}
+        raise NotFound(cid)
 
     def start(self, cid):
         pass
@@ -183,6 +212,7 @@ class FakeDocker:
         self.networks = _Coll(self, "networks")
         self.volumes = _Coll(self, "volumes")
         self.images = FakeImages(["ghost-lab/base:1", "ghost-lab/pg:18", "ghost-lab/web:1"])
+        self.image_volumes = {"ghost-lab/mysql:8": ["/var/lib/mysql"]}
         self.api = FakeAPI(self)
 
     def ping(self):

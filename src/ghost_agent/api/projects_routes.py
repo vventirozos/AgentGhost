@@ -325,6 +325,19 @@ async def resume_project(pid: str, request: Request, session_id: Optional[str] =
     proj = store.get_project(pid)
     if not proj:
         raise HTTPException(404, "project not found")
+    if str(proj.get("status", "")).upper() == "ARCHIVED":
+        # review 11-05 P-m8: the tool's resume rule — restore the status it was archived FROM (a RELEASED project
+        # keeps its attestation); the route only set focus, so the CLI's project_resume left it ARCHIVED
+        store.update_project(pid, status=str(((proj.get("metadata") or {}).get("archived_from")) or "ACTIVE").upper())
+
+        def _clear_af(meta):
+            meta.pop("archived_from", None)
+            return meta
+        try:
+            store._atomic_metadata_update(pid, _clear_af)
+        except Exception:  # noqa: BLE001
+            pass
+        proj = store.get_project(pid) or proj
     if not store.set_focus(key, pid):
         raise HTTPException(404, "project not found")
     store.log_event(pid, None, "project_resumed", {})

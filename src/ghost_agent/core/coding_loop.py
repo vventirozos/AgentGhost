@@ -467,6 +467,13 @@ class _BackgroundOnlyLLM:
             yield chunk
 
 
+
+#: leaf end (review 11-05 m8): bound on stopping the leaf's runs, then on destroying its labs
+#: leaf ends still running after their turn was cancelled (held until done)
+_LEAF_END_TASKS: set = set()
+LEAF_RUN_STOP_BOUND_S = 90.0
+LEAF_LAB_DESTROY_BOUND_S = 150.0
+
 async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bool,
                         max_turns: int = LEAF_MAX_TURNS,
                         timeout_s: float = LEAF_TIMEOUT_S,
@@ -509,16 +516,35 @@ async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bo
         # §4SX D4: a leaf's labs are disposable and end with the leaf (a timeout or a crash too); bounded, and a
         # cancel that lands during it is re-raised (review r2 #11)
         if _want:
+            _t_end = None
             try:
                 from ..tools.labs import destroy_leaf_labs
                 from ..tools.runs import stop_leaf_runs
 
                 async def _end_leaf():
-                    # §4SX D5: its runs first (a run on a lab stops before the lab goes), then its labs
-                    await stop_leaf_runs(context, f"project:{_want}", str(leaf_id))
-                    await destroy_leaf_labs(context, f"project:{_want}", str(leaf_id))
-                await asyncio.shield(asyncio.wait_for(_end_leaf(), 120.0))
+                    # §4SX D5: its runs first (a run on a lab stops before the lab goes), then its labs. Each step
+                    # has its OWN bound (review 11-05 m8: one shared 120 s let slow run stops starve the lab destroy)
+                    try:
+                        await asyncio.wait_for(stop_leaf_runs(context, f"project:{_want}", str(leaf_id)),
+                                               LEAF_RUN_STOP_BOUND_S)
+                    except asyncio.TimeoutError:
+                        logger.warning("leaf %s: stopping its runs timed out — its labs are destroyed anyway",
+                                       leaf_id)
+                    await asyncio.wait_for(destroy_leaf_labs(context, f"project:{_want}", str(leaf_id)),
+                                           LEAF_LAB_DESTROY_BOUND_S)
+                _t_end = asyncio.ensure_future(_end_leaf())
+                await asyncio.shield(_t_end)
             except asyncio.CancelledError:
+                if _t_end is not None and not _t_end.done():
+                    # r12/r13: the turn was cancelled; the shielded end runs on — held until done (a bare task can be
+                    # collected mid-run) and its error logged once, here (nobody awaits it any more)
+                    _LEAF_END_TASKS.add(_t_end)
+
+                    def _seen(f, _lid=leaf_id):
+                        _LEAF_END_TASKS.discard(f)
+                        if not f.cancelled() and f.exception() is not None:
+                            logger.warning("leaf %s end: %s: %s", _lid, type(f.exception()).__name__, f.exception())
+                    _t_end.add_done_callback(_seen)
                 raise
             except Exception as e:  # noqa: BLE001 — a cleanup never masks the turn's own outcome
                 logger.warning("leaf labs not cleaned up: %s: %s", type(e).__name__, e)
@@ -558,6 +584,10 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
         if _stop_requested():                  # §4SD r6: a verify the stop killed is a stop
             raise asyncio.CancelledError()
         leaf_id = f"{leaf_base}-a{attempt}"
+        # review 11-05 P-m3: only the LAST attempt's "no lab" answer may turn the build's failure into a lab wait —
+        # an earlier attempt's (a lab_limit, then an attempt that skipped the lab and failed its own verify) is dropped
+        from .lab_waits import take_seen as _drop_seen
+        _drop_seen(leaf_base)
         before = snapshot_workspace(ws)
         prompt = _leaf_prompt(description, ledger, existing_files, research_context,
                               single_file, witness)

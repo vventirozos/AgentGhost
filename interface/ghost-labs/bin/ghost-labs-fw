@@ -4,8 +4,13 @@
 # - filter: chain GHOST-LABS-IN (NEW from the lab pool / gateway / sidecar nets → DROP), jumped from
 #   INPUT position 1. tailscaled inserts its ts-input jump at the top when it starts (it ACCEPTs udp
 #   41641 from anywhere), so position is re-asserted, not just presence (review r1 core #19).
+#   Matched by source AND by input interface (review 11-05 #5: a member can forge its source address):
+#   every lab bridge is named glab-<id> (net.lab_bridge), the fixed ones glabs-gw0 / glabs-api0.
 # - raw PREROUTING: packets from the gateway/sidecar bridges toward private ranges DROP before
 #   ts-forward and DOCKER-USER can see them.
+# - mangle FORWARD: nothing is routed out of a lab bridge (review 11-05 #5: a NET_ADMIN member routed via
+#   the bridge's .1 into the tailnet; ts-forward ACCEPTs -o tailscale0 before Docker's internal drop).
+#   Traffic inside a lab is bridged (in and out the same glab-*), so it does not match.
 set -euo pipefail
 CONF=/etc/ghost-labs/fw.env
 # shellcheck disable=SC1090
@@ -21,6 +26,9 @@ for src in "$POOL" "$GW_SUBNET" "$API_SUBNET"; do
     iptables -D INPUT -s "$src" -m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP
   done
 done
+for ifc in 'glab-+' glabs-gw0 glabs-api0; do
+  iptables -A "$CH" -i "$ifc" -m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP
+done
 first=$(iptables -S INPUT | grep -m1 '^-A INPUT' || true)
 if [ "$first" != "-A INPUT -j $CH" ]; then
   while iptables -C INPUT -j "$CH" 2>/dev/null; do iptables -D INPUT -j "$CH"; done
@@ -31,4 +39,6 @@ for br in glabs-gw0 glabs-api0; do
     iptables -t raw -C PREROUTING -i "$br" -d "$dst" -j DROP 2>/dev/null || iptables -t raw -A PREROUTING -i "$br" -d "$dst" -j DROP
   done
 done
+iptables -t mangle -C FORWARD -i 'glab-+' ! -o 'glab-+' -j DROP 2>/dev/null \
+  || iptables -t mangle -I FORWARD 1 -i 'glab-+' ! -o 'glab-+' -j DROP
 echo "ghost-labs-fw: rules in place"

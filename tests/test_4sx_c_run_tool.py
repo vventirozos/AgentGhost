@@ -198,6 +198,16 @@ async def test_two_conversations_get_two_services(tmp_path, scope):
 
 # ------------------------------------------------------------------ workspace job (real SandboxJobSupervisor)
 
+def seed_job(ctx, sandbox_id, status="running", label="x"):
+    """A jobs-registry row for a promoted sandbox job (review 11-05 r14: `run … name=<job id>` reads THIS record)."""
+    from ghost_agent.core.jobs import get_job_registry
+    reg = get_job_registry(ctx)
+    j = reg.register("sandbox", label, sandbox_job_id=sandbox_id)
+    if status != "running":
+        reg.finish(j.id, status=status, result="r")
+    return j
+
+
 def _kill_jobs(sb):
     from ghost_agent.sandbox.jobs import get_job_supervisor
     for e in get_job_supervisor(sb).list_entries():
@@ -286,7 +296,7 @@ def test_start_detached_respects_the_cap_and_the_rerun_guard(tmp_path, monkeypat
 def test_a_run_jobs_wake_names_run_collect():
     from ghost_agent.main import _collect_hint
     assert _collect_hint({"started_via": "run", "label": "bench"}) == "run(action='collect', name='bench')"
-    assert _collect_hint({"label": "x"}) == "jobs(action='collect')"
+    assert _collect_hint({"label": "x"}) == "run(action='collect')"     # review 11-05 W-M2
 
 
 # ------------------------------------------------------------------ lab runs (FakeLabs)

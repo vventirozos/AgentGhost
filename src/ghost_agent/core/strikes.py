@@ -94,7 +94,12 @@ _ERROR_LINE_RE = re.compile(
 #: "cannot" and "terror" are the subject matter. §4KT (2026-09-30), measured
 #: on 9,119 corpus results: 96/1,750 successful searches, 324/761 loaded
 #: pages and 450/1,399 file reads yielded an "error line".
-PROGRAM_OUTPUT_TOOLS = frozenset({"execute", "jobs"})
+PROGRAM_OUTPUT_TOOLS = frozenset({"execute"})
+#: §4SX review 11-05 (R-m5): `jobs` / `manage_services` are now aliases whose results are `run` results (a
+#: listing's "failed"/"lost" rows are its content) — they are read like `run`; a job's OWN result (the jobs
+#: supervisor's collect, reached by `run collect name=<job id>`) is program output under any of the three names
+_RUN_LIKE_TOOLS = frozenset({"run", "jobs", "manage_services"})
+_JOB_COLLECT_HEAD_RE = re.compile(r"^(?:--- job-[0-9a-f]{6,16}(?: \[[A-Z_]+\])?: |Collected \d+ finished job)")
 #: §4SX B: only a `lab` EXEC result is program output (its header names the
 #: lab/member and the exit); `logs`, `status`, `http`, `spec` return CONTENT —
 #: a Postgres log's "ERROR: relation x does not exist" is its subject (review
@@ -112,9 +117,10 @@ def is_program_output(tool, output="") -> bool:
     t = str(tool)
     if t in PROGRAM_OUTPUT_TOOLS:
         return True
-    if t == "run":
+    if t in _RUN_LIKE_TOOLS:
         _o = "\n".join(ln for ln in str(output or "").splitlines() if not ln.strip().startswith(_FAILURE_BANNER))
-        return bool(_RUN_COLLECT_HEAD_RE.match(_o.strip()))
+        _o = re.sub(r"^RUN (?:ERROR|UNRESOLVED) — ", "", _o.strip())   # the inline exit head over a job collect
+        return bool(_RUN_COLLECT_HEAD_RE.match(_o) or _JOB_COLLECT_HEAD_RE.match(_o))
     if t != "lab":
         return False
     for ln in str(output or "").splitlines():

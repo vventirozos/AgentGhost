@@ -11,6 +11,7 @@ from .errors import LabError
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 EGRESS = ("tor", "none")
+ALLOWED_CAPS = ("NET_ADMIN", "NET_RAW")
 
 
 def _member(m: Dict[str, Any], where: str) -> Dict[str, Any]:
@@ -23,8 +24,9 @@ def _member(m: Dict[str, Any], where: str) -> Dict[str, Any]:
     if not NAME_RE.match(name):
         raise LabError("bad_request", f"{where}: bad member name {name!r}", field="members")
     cap_add = list(m.get("cap_add") or [])
-    if any(c != "NET_ADMIN" for c in cap_add):
-        raise LabError("bad_request", f"{where}: only NET_ADMIN may be added", field="cap_add")
+    # NET_RAW is dropped from every member unless listed here (review 11-05 #5); NET_ADMIN as before
+    if any(c not in ALLOWED_CAPS for c in cap_add):
+        raise LabError("bad_request", f"{where}: only {', '.join(ALLOWED_CAPS)} may be added", field="cap_add")
     ports = [int(p) for p in (m.get("ports") or [])]
     if any(not (1 <= p <= 65535) for p in ports):
         raise LabError("bad_request", f"{where}: bad port", field="ports")

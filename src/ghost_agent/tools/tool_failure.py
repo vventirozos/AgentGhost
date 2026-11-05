@@ -549,14 +549,20 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
     # §4SX D5 review r5: a job that finished with NO recorded exit code is neither — listing it under
     # SUCCEEDED told the model "do NOT report it as failed" about a build whose output showed the error
     unknown_ops = [o for o in op_outcomes if o.get("exit_unknown") and not o.get("interrupted")]
+    # review 11-05 R-m11: no answer / not verified — whether it took effect is unknown, and it is NOT running work
+    unanswered_ops = [o for o in op_outcomes if o.get("unanswered") and not o.get("interrupted")]
     op_outcomes = [o for o in op_outcomes if not o.get("unresolved") and not o.get("interrupted")
-                   and not o.get("exit_unknown")]
+                   and not o.get("exit_unknown") and not o.get("unanswered")]
     stopped = ("  STOPPED BY THE USER (not done — do NOT report these as done; run them "
                "again only if the user asks): "
                + "; ".join(str(o.get("tool", "?")) for o in stopped_ops) + "\n") if stopped_ops else ""
     if unknown_ops:
         stopped += ("  FINISHED, EXIT CODE NOT RECORDED (not a verdict — judge each by its output): "
                     + "; ".join(str(o.get("tool", "?")) for o in unknown_ops) + "\n")
+    if unanswered_ops:
+        stopped += ("  NO ANSWER / NOT VERIFIED (it may or may not have taken effect — check its status before "
+                    "repeating it; do NOT report it as done): "
+                    + "; ".join(str(o.get("tool", "?")) for o in unanswered_ops) + "\n")
     ok_ops = [o for o in op_outcomes if o.get("ok")]
     failed_ops = [o for o in op_outcomes if not o.get("ok")]
     # A turn carrying in-flight work is worth summarising even when the
@@ -571,6 +577,12 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
                 f"RUNNING, {len(op_outcomes) + len(unknown_ops)} finished.\n"
                 f"  STILL RUNNING (no verdict yet — do NOT re-dispatch, and "
                 f"do NOT report these as done): {_r}\n"
+                f"  FINISHED: {_done}\n{stopped}\n")
+    if unanswered_ops and not (ok_ops and failed_ops):
+        # review 11-05 R-m11: these were "STILL RUNNING" before — the summary still names them, truthfully
+        _done = "; ".join(str(o.get("tool", "?")) for o in op_outcomes + unknown_ops) or "none"
+        return (f"MULTI-STEP OUTCOME — {len(unanswered_ops)} call(s) WITHOUT AN ANSWER, "
+                f"{len(op_outcomes) + len(unknown_ops)} finished.\n"
                 f"  FINISHED: {_done}\n{stopped}\n")
     # Only worth a summary when the turn was MIXED — a uniform all-fail turn
     # is served fine by the normal diagnostic.

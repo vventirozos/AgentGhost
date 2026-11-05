@@ -55,7 +55,8 @@ READ_ONLY_TOOLS = {
     "knowledge_base": {"query", "list_docs", "expand", "transcript", "outline"},
     "file_system": {"read", "read_chunked", "list_files", "search", "find", "inspect", "outline", "symbols"},
     "manage_projects": {"list", "get", "status", "task_list", "search", "event_log", "details", "artifact_list"},
-    "manage_services": {"status", "logs", "list"},
+    # (review 11-05 W-m: `manage_services` is gone from the advertised tools — an alias of `run`, which refuses a
+    #  replay outright — so the refusal text no longer names it)
     "manage_skills": {"list"}, "manage_composed_skills": {"list"}, "manage_tasks": {"list"},
     "vision_analysis": {"describe_picture", "extract_text_picture", "graph_analysis", "extract_text_pdf"},
 }

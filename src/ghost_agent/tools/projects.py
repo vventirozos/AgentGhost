@@ -1254,6 +1254,9 @@ _ADVANCE_STOP_BLURB = {
                  "again (PENDING) and the autopilot starts it again by itself once the labs host answers (after "
                  "a host that took the request and went silent: at least 15 minutes and a free lab slot). "
                  "Tell the user; nothing failed in the project itself.",
+    "lab_owner_hold": "Stopped: the build could not get a lab, and the task was one the user had put on hold — it "
+                      "is back ON HOLD and WAITS FOR THE USER (it does not start again by itself). Tell the user "
+                      "what the labs host said.",
     "lab_gave_up": "Stopped: the build could not get a lab after several waits for the labs host — the task now "
                    "WAITS FOR THE USER (it does not start again by itself). Tell the user what the labs host "
                    "said, and that they can free room on it or retry the task.",
@@ -1311,7 +1314,7 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     stopped_early = batch.stop_reason in (
         "failed", "repeated_failures", "budget_or_inactive", "needs_user",
         "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "out_of_time",
-        "in_progress", "open_but_waiting", "labs_down", "lab_capacity", "lab_gave_up")
+        "in_progress", "open_but_waiting", "labs_down", "lab_capacity", "lab_gave_up", "lab_owner_hold")
     if batch.stop_reason == "model_experiment":
         # §4SU Phase 5: the batch carries on past an experiment — name IT,
         # not the last task that ran

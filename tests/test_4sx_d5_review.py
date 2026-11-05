@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_4sx_c_run_tool import (  # noqa: E402,F401
-    JobSandbox, SvcSandbox, _ctx, _fast, _kill_jobs, happy_handler, scope)
+    JobSandbox, SvcSandbox, _ctx, _fast, _kill_jobs, happy_handler, scope, seed_job)
 
 from ghost_agent.core import lab_waits as W  # noqa: E402
 from ghost_agent.core import request_scope as RS  # noqa: E402
@@ -201,6 +201,7 @@ async def test_an_ownerless_turn_reads_and_cancels_its_job_through_the_jobs_rule
         return "jobs-said"
     monkeypatch.setattr(D, "tool_jobs", fake_jobs)
     c, tok = _ownerless(tmp_path)
+    seed_job(c, "job-1a2b3c4d")
     try:
         assert await R.tool_run(c, action="collect", name="job-1a2b3c4d") == "jobs-said"
         assert await R.tool_run(c, action="stop", name="job-1a2b3c4d") == "jobs-said"
@@ -226,6 +227,7 @@ async def test_the_jobs_alias_in_an_ownerless_turn_falls_back_to_the_jobs_tool(t
         return "jobs-said"
     monkeypatch.setattr(D, "tool_jobs", fake_jobs)
     c, tok = _ownerless(tmp_path)
+    seed_job(c, "job-1a2b3c4d")
     try:
         assert await R.jobs_alias(context=c, action="collect", job_id="job-1a2b3c4d") == "jobs-said"
         assert calls == [("collect", "job-1a2b3c4d")]
@@ -449,9 +451,10 @@ async def test_a_reused_run_name_never_points_the_alias_at_the_newer_job(tmp_pat
     assert (await R.jobs_alias(context=c, action="cancel", job_id="job-aaaa1111")).reason_code == "run_ended"
     await R.jobs_alias(context=c, action="collect", job_id="job-aaaa1111")
     assert ran == [] and seen == []
-    assert await R.jobs_alias(context=c, action="collect", job_id="job-cccc3333") == "jobs-said"   # no row at all
+    seed_job(c, "job-cccc3333")
+    assert await R.jobs_alias(context=c, action="collect", job_id="job-cccc3333") == "jobs-said"   # no run row at all
     assert seen == [("collect", "job-cccc3333")]
-    assert _collect_hint({"id": "job-aaaa1111"}, c) == "jobs(action='collect')"
+    assert _collect_hint({"id": "job-aaaa1111"}, c) == "run(action='collect', name='job-aaaa1111')"   # r12
 
 
 async def test_an_exited_job_with_no_known_exit_is_unresolved_live_and_stored(tmp_path, scope, monkeypatch):
@@ -757,6 +760,7 @@ async def test_an_ownerless_stop_ends_the_jobs_run_row(tmp_path, scope, monkeypa
     monkeypatch.setattr(D, "tool_jobs", fake_jobs)
     monkeypatch.setattr(R, "_supervisors", lambda ctx: (None, _Jobs()))
     c, tok = _ownerless(tmp_path)
+    seed_job(c, "job-1a2b3c4d")
     try:
         assert await R.tool_run(c, action="stop", name="job-1a2b3c4d") == "cancelled"
     finally:
@@ -998,7 +1002,7 @@ def test_the_landed_hint_for_a_reused_run_name_names_the_job_id(tmp_path, scope)
     reg.add(name="bench", place="workspace", lifetime="job", command="x", port=None, owner=own, origin="owner",
             backend="jobs", backend_ref="job-bbbb2222")
     e = {"id": "job-aaaa1111", "started_via": "run", "label": "bench"}
-    assert _collect_hint(e, c) == "jobs(action='collect', job_id='job-aaaa1111')"
+    assert _collect_hint(e, c) == "run(action='collect', name='job-aaaa1111')"
     assert _collect_hint({"id": "job-bbbb2222", "started_via": "run", "label": "bench"}, c) == \
         "run(action='collect', name='bench')"
 
@@ -1051,8 +1055,14 @@ def test_the_turn_loop_books_an_exit_unknown_collect_in_its_own_bucket():
     vals = {k.value: ast.unparse(v) for k, v in zip(d.keys, d.values) if isinstance(k, ast.Constant)}
     def ev(expr, code):
         _o = SimpleNamespace(reason_code=code, status=OutcomeStatus.UNRESOLVED)
-        return eval(expr, {"getattr": getattr, "_outcome": _o, "_OutcomeStatus": OutcomeStatus, "_intr": False})
-    assert ev(vals["unresolved"], "run_no_answer") is True          # the env reaches a real verdict
+        from ghost_agent.core.agent import _NO_ANSWER_CODES
+        return eval(expr, {"getattr": getattr, "_outcome": _o, "_OutcomeStatus": OutcomeStatus, "_intr": False,
+                           "_NO_ANSWER_CODES": _NO_ANSWER_CODES})
+    assert ev(vals["unresolved"], "run_still_running") is True      # the env reaches a real verdict
+    # review 11-05 R-m11: an unanswered call is its own bucket, never "still running"
+    assert ev(vals["unresolved"], "run_no_answer") is False
+    assert ev(vals["unanswered"], "run_no_answer") is True
+    assert ev(vals["unanswered"], "run_still_running") is False
     assert ev(vals["exit_unknown"], "run_exit_unknown") is True
     assert ev(vals["exit_unknown"], "run_no_answer") is False
     try:

@@ -444,6 +444,9 @@ async def test_list_names_my_labs_destroyed_by_someone_else_and_marks_expired(tm
     inv.record_destroy("lab_aaaaaaaa", by="project:z")
     inv.record_create("lab_bbbbbbbb", owner="conversation:conv1", origin="owner", template="pg-single")
     fake.on("GET", "/v1/labs", (200, {"labs": [_detail()]}))
+    # review 11-05 M2: an unlisted row is ASKED about before it is retired
+    fake.on("GET", "/v1/labs/lab_bbbbbbbb", (404, {"error": "unknown_lab"}))
+    fake.on("DELETE", "/v1/labs/lab_bbbbbbbb", (404, {"error": "unknown_lab"}))
     r = await L.tool_lab(c, action="list")
     assert "lab_aaaaaaaa (pg-single) — destroyed" in r and "by project:z" in r
     assert "lab_bbbbbbbb (pg-single) — gone from the labs host" in r
@@ -475,13 +478,14 @@ async def test_put_and_get_stay_inside_the_workspace(tmp_path, fake, scope):
     assert fake.calls == []
 
 
-async def test_get_writes_the_file_and_workspace_prefix_is_the_root(tmp_path, fake, scope):
+async def test_get_writes_the_file_and_workspace_prefix_is_the_project_root(tmp_path, fake, scope):
     c = _ctx(tmp_path, pid="p1")
     scope(c)
     fake.on("GET", f"/v1/labs/{LAB}/files", (200, {"content_b64": base64.b64encode(b"LOG").decode(), "bytes": 3}))
     r = await L.tool_lab(c, action="get", lab_id=LAB, member="db", path="/var/log/x", sandbox_path="/workspace/out/x.log")
     assert r.status is OutcomeStatus.OK
-    assert (c.sandbox_dir / "out" / "x.log").read_bytes() == b"LOG"
+    # r14: `/workspace/<x>` in a project turn is the project's <x>, as file_system resolves it
+    assert (c.sandbox_dir / "projects" / "p1" / "out" / "x.log").read_bytes() == b"LOG"
     await L.tool_lab(c, action="get", lab_id=LAB, member="db", path="/var/log/x", sandbox_path="x.log")
     assert (c.sandbox_dir / "projects" / "p1" / "x.log").read_bytes() == b"LOG"
 
@@ -775,8 +779,8 @@ async def test_list_says_host_changed_and_skips_rows_newer_than_the_ask(tmp_path
         return await real(context, method, path, **kw)
     monkeypatch.setattr(L, "_call", routed)
     r = await L.tool_lab(c, action="list")
-    assert "lab_cccccccc (pg-single) — missing (host changed" in r
-    assert inv.get("lab_cccccccc")["destroyed_by"] == "host_changed"     # said, then retired (r2 minor 2)
+    assert "lab_cccccccc (pg-single) — not on this labs host's list: it was made on labs host old-host" in r
+    assert inv.get("lab_cccccccc")["destroyed_at"] is None     # review 11-05 M2: NOT retired (teardown still sees it)
     assert "lab_dddddddd" not in r and inv.get("lab_dddddddd")["destroyed_at"] is None
 
 
@@ -1127,11 +1131,14 @@ async def test_list_says_each_retirement_once(tmp_path, fake, scope):
         con.execute("UPDATE labs SET destroyed_at=? WHERE lab_id='lab_abababab'", (_t.time() - 2 * 86400,))
     fake.on("GET", "/v1/labs", (200, {"labs": []}))
     fake.on("GET", "/v1/health", (200, {"host_id": "new-host"}))
+    fake.on("GET", "/v1/labs/lab_eeeeeeee", (404, {"error": "unknown_lab"}))
+    fake.on("DELETE", "/v1/labs/lab_eeeeeeee", (404, {"error": "unknown_lab"}))
     first = await L.tool_lab(c, action="list")
-    assert "lab_eeeeeeee (pg-single) — gone" in first and "lab_ffffffff (pg-single) — missing (host changed" in first
+    assert "lab_eeeeeeee (pg-single) — gone" in first and "lab_ffffffff (pg-single) — not on this labs host" in first
     assert "lab_abababab" not in first
     second = await L.tool_lab(c, action="list")
-    assert "lab_eeeeeeee" not in second and "lab_ffffffff" not in second
+    # the retired row is said once; the other-host row is NOT retired, so it is said on every list (review 11-05 M2)
+    assert "lab_eeeeeeee" not in second and "lab_ffffffff" in second
 
 
 def test_status_question_parse_tolerates_control_characters_and_all_owners_strings():
@@ -1149,6 +1156,9 @@ async def test_a_probe_destroys_only_its_own_labs(tmp_path, fake, scope):
     r = await L.tool_lab(c, action="destroy", lab_id=LAB)
     assert r.status is OutcomeStatus.REJECTED and not any(x.method == "DELETE" for x in fake.calls)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _detail(owner="conversation:conv1")))
+    r = await L.tool_lab(c, action="destroy", lab_id=LAB)
+    assert r.status is OutcomeStatus.REJECTED          # r13 R2: its key, but an OWNER made it — not the probe's
+    fake.on("GET", f"/v1/labs/{LAB}", (200, _detail(owner="conversation:conv1", origin="probe")))
     r = await L.tool_lab(c, action="destroy", lab_id=LAB)
     assert r.status is OutcomeStatus.OK
 

@@ -313,9 +313,25 @@ def _service_reply(status: int, reply: Any, context=None, lab_id: str = "") -> T
         from ..memory.lab_inventory import inventory_for
         inv = inventory_for(context)
         row = inv.get(lab_id) if inv else None
-        if row and row.get("destroyed_at") and row.get("destroyed_by") not in _QUIET_DESTROYERS:
+        if row and row.get("destroyed_at") and str(row.get("destroyed_by") or "").startswith("host_changed"):
+            # review 11-05 r12 F2: CLOSED here, never destroyed — it may still run on the host it was made on
+            extra = (f"\nIts record here was closed {time.strftime('%Y-%m-%d %H:%M', time.localtime(row['destroyed_at']))}: "
+                     f"it was made on labs host {row.get('host_id') or 'another host'}, which this agent no longer "
+                     "uses (nothing was deleted there).")
+        elif row and row.get("destroyed_at") and row.get("destroyed_by") not in _QUIET_DESTROYERS:
             extra = (f"\nIt was destroyed {time.strftime('%Y-%m-%d %H:%M', time.localtime(row['destroyed_at']))}"
                      f" by {row.get('destroyed_by') or 'someone'}.")
+        elif row and row.get("host_id") and row["host_id"] != _LAST_HOST_ID.get("id"):
+            # review 11-05 M3: a lab made on ANOTHER labs host is not "gone" because this one does not know it
+            now_id = _LAST_HOST_ID.get("id")
+            extra = (f"\nThis labs host does not know it: it was made on labs host {row['host_id']}, and the "
+                     f"configured host is {now_id}. It may still be running there; this agent cannot reach it."
+                     if now_id else
+                     f"\nThe labs host does not know it. It was made on labs host {row['host_id']}: if that is "
+                     "the configured host, it expired (TTL); if not, it may still be running there.")
+        elif row and row.get("leftovers") and not row.get("destroyed_at"):
+            extra = (f"\nIt was destroyed, but the labs host still holds {row['leftovers']} — `lab destroy {lab_id}` "
+                     "checks again once the operator cleared them.")
         elif row:
             extra = "\nIt is gone from the labs host (labs expire after their TTL)."
         extra += " Create a new lab (from the recipe, if one is saved) instead of retrying this id."
@@ -396,8 +412,21 @@ def _render_lab(d: Dict[str, Any]) -> str:
 
 # ------------------------------------------------------------------ sandbox files
 
-def _sandbox_path(context, rel: str) -> Tuple[Optional[Path], str]:
-    """(resolved path inside the workspace, error)."""
+def shown_path(context, p: Path) -> str:
+    """The workspace spelling of a resolved path (`/workspace/<rel>`), as the replies show it (review r14/r15: a
+    `put sandbox_path=/etc/passwd` reads `<project>/etc/passwd` — the reply must not echo `/etc/passwd`)."""
+    try:
+        rel = Path(p).relative_to(Path(context.sandbox_dir).resolve()).as_posix()
+        return "/workspace" + ("/" + rel if rel and rel != "." else "")
+    except (ValueError, TypeError, AttributeError):
+        return str(p)
+
+
+def _sandbox_path(context, rel: str, write: bool = False) -> Tuple[Optional[Path], str]:
+    """(resolved path inside the workspace, error). An unattended build (``confine_writes_to_project``) reads and
+    writes only inside its own project folder, as `file_system` does (review 11-05 r12 F6: `/workspace/projects/<other>`
+    reached another project's files, a `get` overwrote them and a `put` sent its .env to a lab). ``write``: a RELEASED
+    project's folder is refused like a `file_system` write."""
     from .file_system import project_scoped_sandbox
     root = getattr(context, "sandbox_dir", None)
     if not root:
@@ -406,13 +435,31 @@ def _sandbox_path(context, rel: str) -> Tuple[Optional[Path], str]:
     rel = str(rel or "").strip()
     if not rel:
         return None, "sandbox_path is required"
-    if rel.startswith("/workspace/"):
-        base, rel = root, rel[len("/workspace/"):]
-    else:
-        base = Path(project_scoped_sandbox(context)[0] or root).resolve()
-    p = (base / rel).resolve()
+    scoped = Path(project_scoped_sandbox(context)[0] or root).resolve()
+    from .file_system import _deleted_project_block, _get_safe_path
+    _gone = _deleted_project_block(scoped, getattr(context, "project_store", None))
+    if _gone is not None:
+        return None, str(_gone)                    # r13 R5: never recreates a deleted project's folder
+    try:
+        # r13 R7 / r15: EVERY spelling resolves as file_system resolves it (`projects/<own>/x`, `/workspace/x` and
+        # `/x` in a project turn are the project's x), so a file `file_system` wrote is the file `lab put` sends.
+        # A re-homed absolute path is shown by where it landed (`shown_path`), never by the spelling given.
+        p = _get_safe_path(scoped, rel).resolve()
+    except (ValueError, OSError):
+        return None, f"{rel} is outside the workspace"
     if p != root and root not in p.parents:
         return None, f"{rel} is outside the workspace"
+    if getattr(context, "confine_writes_to_project", False) is True and p != scoped and scoped not in p.parents:
+        return None, (f"{rel} is outside this build's project folder — an unattended build moves files only inside "
+                      "its own project (use a path inside it); nothing was sent or written")
+    if write:
+        try:
+            from .file_system import _released_write_block
+            rb = _released_write_block(getattr(context, "project_store", None), scoped, str(p))
+        except Exception:  # noqa: BLE001
+            rb = None
+        if rb:
+            return None, str(rb)
     return p, ""
 
 
@@ -498,10 +545,25 @@ async def tool_lab(context, action: str = "", lab_id: str = "", template: str = 
             return ToolOutcome(f"LAB ERROR (not_allowed): {_kept_refusal(origin, context)}.",
                                status=OutcomeStatus.REJECTED, reason_code="lab_not_allowed", world_changed=False)
         if action not in ("templates", "create", "list"):
-            why = await _autopilot_owner_refusal(context, lab_id, owner)
+            why = await _autopilot_owner_refusal(context, lab_id, owner, action)
             if why:
                 return ToolOutcome(f"LAB ERROR (not_allowed): {why}", status=OutcomeStatus.REJECTED,
                                    reason_code="lab_not_allowed", world_changed=False)
+    if origin == "probe" and action == "list" and (_truthy(all_owners) or not owner):
+        # review 11-05 r12 F4 / r13 R1: no owner filter on the host = every owner's labs — a probe lists only its own
+        return ToolOutcome("LAB ERROR (not_allowed): a probe lists only its own labs (no all_owners; with no project "
+                           "and no conversation it lists none — the labs it made are named in its create results).",
+                           status=OutcomeStatus.REJECTED, reason_code="lab_not_allowed", world_changed=False)
+    if origin == "probe" and action not in ("templates", "create", "list") and (
+            action not in KEPT_ACTIONS or (lab_id and not _kept_refusal(origin, context))):
+        # (a kept action outside a probe project is refused by the action itself, before any host call)
+        # review 11-05 m6: the "own labs only" rule covered destroy (and the kept actions: probe projects only,
+        # refused before any call) — every other action on a lab (exec, put, get, member kill/isolate, extend…)
+        # is held to it too
+        why = await _autopilot_owner_refusal(context, lab_id, owner, action, who="probe")
+        if why:
+            return ToolOutcome(f"LAB ERROR (not_allowed): {why}", status=OutcomeStatus.REJECTED,
+                               reason_code="lab_not_allowed", world_changed=False)
     try:
         out = await _dispatch(context, action, origin, owner, lab_id=lab_id, template=template, params=params,
                               label=label, purpose=purpose, member=member, cmd=cmd, timeout_s=timeout_s,
@@ -521,23 +583,53 @@ async def tool_lab(context, action: str = "", lab_id: str = "", template: str = 
     return out
 
 
-async def _autopilot_owner_refusal(context, lab_id: str, owner: str) -> str:
-    """'' when the lab is the caller's own (its host detail, or — gone from the host — its inventory row)."""
-    if not owner:
+async def _autopilot_owner_refusal(context, lab_id: str, owner: str, action: str = "", who: str = "autopilot") -> str:
+    """'' when the lab is the caller's own (its host detail, or — gone from the host — its inventory row).
+    ``who``="autopilot": a KEPT (production) lab is refused for everything but `status` even when it is the
+    project's own (review 11-05 m5: exec/put/get/logs/http on production reached the host, and get/logs/http were
+    guarded on neither side). ``who``="probe": the probe tier touches only labs it made (review 11-05 m6)."""
+    if not owner and who == "autopilot":
         return "unattended work with no project touches no lab"
     try:
-        st, d = await _call(context, "GET", f"/v1/labs/{lab_id}", origin="autopilot")
-    except (LabsUnreachable, LabsNoAnswer):
-        return ""                                  # the action itself reports the host's silence
+        st, d = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=who)
+    except (LabsUnreachable, LabsNoAnswer) as e:
+        # fail CLOSED (review 11-05 r12 F1: "" let the action go — a host that timed out once answers the next call,
+        # and an autopilot destroy / a get on production then went through unchecked)
+        return (f"the labs host did not answer the ownership check of {lab_id} ({e}) — nothing was sent; "
+                "try again")
+    if who == "probe" and st == 200 and isinstance(d, dict) and str(d.get("origin") or "") != "probe":
+        # r13 R2: a probe that switched into an OWNER's project has that project's owner key — the key alone made
+        # the owner's labs "its own" (destroy, exec, get from kept). A probe's lab is one the host says a probe made
+        return f"{lab_id} was not made by a probe — a probe touches only labs it made."
+    if not owner:
+        # a probe with no project and no conversation (probes carry no conversation key): the labs it made have no
+        # owner and origin probe on the host — those, and only those (review 11-05 r12 F7)
+        if (st == 200 and isinstance(d, dict) and not str(d.get("owner") or "")
+                and str(d.get("origin") or "") == "probe"):
+            return ""
+        if st == 404:
+            return ""                              # unknown: the action's own 404 answers
+        return f"{lab_id} is not a lab this probe made — a probe touches only labs it made."
+    if st not in (200, 404):
+        # review 11-05 m9: not an ownership answer — say what happened, never "belongs to someone else"
+        return f"the labs host answered HTTP {st} to the ownership check of {lab_id} — nothing was sent; try again"
     theirs = str(d.get("owner") or "") if st == 200 and isinstance(d, dict) else ""
+    if (who == "autopilot" and st == 200 and isinstance(d, dict) and str(d.get("lifetime") or "") == "kept"
+            and action != "status"):
+        return (f"{lab_id} is KEPT (production) — unattended work never runs commands on, reads files from or "
+                "changes a production machine; use a disposable lab of the project.")
     if st == 404:
         from ..memory.lab_inventory import inventory_for
         inv = inventory_for(context)
         row = inv.get(lab_id) if inv is not None else None
         theirs = str((row or {}).get("owner") or "")
+        if who == "probe" and row and str(row.get("origin") or "") != "probe":
+            return f"{lab_id} was not made by a probe — a probe touches only labs it made."
         if not theirs:
             return ""                              # unknown everywhere: the action's own 404 answers
     if theirs != owner:
+        if who == "probe":
+            return f"{lab_id} belongs to {theirs or 'someone else'} — a probe touches only labs it made."
         return (f"{lab_id} belongs to {theirs or 'someone else'} — unattended work uses only its own "
                 f"project's labs ({owner}); create one.")
     return ""
@@ -622,6 +714,11 @@ async def destroy_leaf_labs(context, owner: str, leaf_id: str) -> List[str]:
             inv.mark_leftovers(lid, ", ".join(map(str, left)))
             logger.warning("leaf lab %s destroyed with leftovers: %s", lid, left)
         elif st in (200, 204) or (st == 404 and isinstance(body, dict) and body.get("error") == "unknown_lab"):
+            if st == 404 and await lab_on_other_host(context, lid):
+                # review 11-05 r12 F3: made on ANOTHER labs host — not listed is not gone (the M2/M3 rule); the row
+                # stays live for project teardown, and the boot reaper does not replay it as destroyed
+                logger.warning("leaf lab %s was made on another labs host — not marked destroyed", lid)
+                continue
             inv.record_destroy(lid, by="leaf_end")
             gone.append(lid)
         else:
@@ -686,6 +783,19 @@ def _probe_project(context) -> bool:
         return False
 
 
+def _read_inside(context, path: Path, max_bytes: int) -> bytes:
+    """The bytes of a workspace file, opened component by component from the workspace root with O_NOFOLLOW
+    (review 11-05 CRIT: a check-then-`read_bytes` followed a link swapped in between). OSError/ValueError when any
+    component is a link or the file is not a regular file."""
+    from .file_system import read_bytes_nofollow_fd
+    root = Path(context.sandbox_dir).resolve()
+    dfd = _open_inside(root, path.parent)
+    try:
+        return read_bytes_nofollow_fd(path.name, dir_fd=dfd, max_bytes=max_bytes)
+    finally:
+        os.close(dfd)
+
+
 def _open_inside(base: Path, root: Path) -> int:
     """An fd on ``root`` opened component by component from ``base`` with O_NOFOLLOW|O_DIRECTORY (code r1 #4: a
     parent swapped for a symlink after the path was resolved cannot redirect the walk outside the workspace)."""
@@ -723,6 +833,7 @@ def tar_folder(root: Path, base: Optional[Path] = None) -> Tuple[bytes, List[str
 def _tar_walk(buf, skipped, total, root, top) -> Tuple[bytes, List[str], str]:
     import io
     import stat as _stat
+    from .file_system import _block_if_regular
     import tarfile
     walk = (os.fwalk(".", dir_fd=top, follow_symlinks=False) if top is not None
             else os.fwalk(str(root), follow_symlinks=False))
@@ -760,6 +871,9 @@ def _tar_walk(buf, skipped, total, root, top) -> Tuple[bytes, List[str], str]:
                     if not _stat.S_ISREG(st.st_mode):
                         skipped.append(rel)
                         continue
+                    # §4SD (review r16): O_NONBLOCK was for the open only — a buffered read on the virtiofs mount that
+                    # hits EAGAIN returns a SHORT file (a truncated deploy reported as success) or None
+                    _block_if_regular(fd, st)
                     with os.fdopen(os.dup(fd), "rb") as fh:
                         data = fh.read(DEPLOY_MAX_BYTES + 1)
                 except OSError:
@@ -958,7 +1072,7 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
         if err:
             return bad(err)
         if not root.is_dir():
-            return bad(f"{folder} is not a folder in the workspace")
+            return bad(f"{shown_path(context, root)} is not a folder in the workspace")
         try:
             data, skipped, err = await asyncio.to_thread(tar_folder, root, Path(context.sandbox_dir).resolve())
         except OSError as e:                    # code r1 #5: the folder changed under the walk
@@ -1103,6 +1217,10 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
         if st != 200:
             return _service_reply(st, body)
         labs = body.get("labs") or []
+        if origin == "probe":
+            # r14: a probe that switched into an owner's project has that project's key — it lists only labs a probe
+            # made (the host marks each lab's origin)
+            labs = [l for l in labs if str(l.get("origin") or "") == "probe"]
         out = [f"Labs{'' if params is None else ' of ' + owner}: {len(labs)}"]
         out += [_render_lab(l) for l in labs]
         from ..memory.lab_inventory import inventory_for
@@ -1111,6 +1229,8 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
             live = {l.get("lab_id") for l in labs}
             host_id = await _host_id(context, origin)
             for r in inv.rows(owner):
+                if origin == "probe" and str(r.get("origin") or "") != "probe":
+                    continue
                 if r["lab_id"] in live or r["created_at"] >= t_asked:   # (made after the host was asked)
                     continue
                 if not r.get("destroyed_at") and r.get("leftovers"):
@@ -1122,20 +1242,24 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
                                + ("the operator must clear them on that host" if _on else
                                   f"`lab destroy {r['lab_id']}` checks again once the operator cleared them"))
                     continue
-                if not r.get("destroyed_at") and r.get("host_id") and host_id and r["host_id"] != host_id:
-                    out.append(f"{r['lab_id']} ({r['template']}) — missing (host changed: it was made on "
-                               f"{r['host_id']}, the labs host is now {host_id})")
-                    inv.record_destroy(r["lab_id"], by="host_changed")      # said once, then retired
+                if not r.get("destroyed_at") and r.get("host_id") and r["host_id"] != host_id:
+                    # made on ANOTHER labs host, or this host's identity is unknown right now: "not listed" is not
+                    # "gone" — never retired here (review 11-05 M2: retiring it hid it from project teardown, and a
+                    # failed /v1/health retired it as "expired")
+                    out.append(f"{r['lab_id']} ({r['template']}) — not on this labs host's list: it was made on "
+                               f"labs host {r['host_id']}, and the configured host is "
+                               f"{host_id or 'not answering /v1/health right now'}. It may still run there; "
+                               "this agent cannot reach it")
                     continue
                 if r.get("destroyed_at") and (r.get("destroyed_by") in _QUIET_DESTROYERS
+                                              or str(r.get("destroyed_by") or "").startswith("host_changed")
                                               or time.time() - float(r["destroyed_at"]) > RECENT_DESTROY_S):
                     continue        # already reported (r2 minor 2: not on every later list)
                 if r.get("destroyed_at") and r.get("destroyed_by") and r["destroyed_by"] != owner:
                     out.append(f"{r['lab_id']} ({r['template']}) — destroyed {_when(r['destroyed_at'])} "
                                f"by {r['destroyed_by']}")
                 elif not r.get("destroyed_at"):
-                    out.append(f"{r['lab_id']} ({r['template']}) — gone from the labs host (expired or removed)")
-                    inv.record_destroy(r["lab_id"], by="expired")
+                    out.append(await _settle_unlisted(context, origin, inv, r))
         return ToolOutcome("\n".join(out), status=OutcomeStatus.OK, world_changed=False)
 
     if action == "status":
@@ -1151,12 +1275,16 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
         if err:
             return ToolOutcome(f"LAB ERROR (bad_request): {err}", status=OutcomeStatus.REJECTED,
                                reason_code="lab_bad_request", world_changed=False)
-        if not src.is_file():
-            return ToolOutcome(f"LAB ERROR (bad_request): no file {a['sandbox_path']} in the workspace",
+        try:
+            # read through dir fds with O_NOFOLLOW (review 11-05 CRIT: a link swapped in after the path check made
+            # `put` send a host file — e.g. the labs key — to a lab, where `lab exec cat` showed it)
+            data = _read_inside(context, src, PUT_MAX_BYTES + 1)
+        except (OSError, ValueError):
+            return ToolOutcome(f"LAB ERROR (bad_request): no file {shown_path(context, src)} in the workspace "
+                               "(or it is a link — `put` sends regular files only)",
                                status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
-        data = src.read_bytes()
         if len(data) > PUT_MAX_BYTES:
-            return ToolOutcome(f"LAB ERROR (bad_request): {a['sandbox_path']} is {len(data)} bytes "
+            return ToolOutcome(f"LAB ERROR (bad_request): {shown_path(context, src)} is {len(data)} bytes "
                                f"(max {PUT_MAX_BYTES})", status=OutcomeStatus.REJECTED,
                                reason_code="lab_bad_request", world_changed=False)
         st, body = await _call(context, "PUT", f"/v1/labs/{lab_id}/files", origin=origin, timeout=120,
@@ -1164,13 +1292,13 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
                                           "content_b64": base64.b64encode(data).decode()})
         if st != 200:
             return _service_reply(st, body, context, lab_id)
-        return ToolOutcome(f"[{lab_id}/{a['member']}] put {a['sandbox_path']} → {a['path']} "
+        return ToolOutcome(f"[{lab_id}/{a['member']}] put {shown_path(context, src)} → {a['path']} "
                            f"({body.get('bytes')} bytes)", status=OutcomeStatus.OK, world_changed=True)
 
     if action == "get":
-        dst, err = _sandbox_path(context, a["sandbox_path"])
+        dst, err = _sandbox_path(context, a["sandbox_path"], write=True)
         if not err and dst.is_dir():
-            err = f"{a['sandbox_path']} is a folder — name the file to write"
+            err = f"{shown_path(context, dst)} is a folder — name the file to write"
         if err:
             return ToolOutcome(f"LAB ERROR (bad_request): {err}", status=OutcomeStatus.REJECTED,
                                reason_code="lab_bad_request", world_changed=False)
@@ -1183,10 +1311,20 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
         except ValueError:
             return ToolOutcome("LAB ERROR (internal): the labs host sent an unreadable file",
                                status=OutcomeStatus.FAILED, reason_code="lab_internal", world_changed=False)
-        existed = dst.exists()
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(data)
-        return ToolOutcome(f"[{lab_id}/{a['member']}] got {a['path']} → {a['sandbox_path']} ({len(data)} bytes, "
+        existed = os.path.lexists(dst)
+        try:
+            # every component opened O_NOFOLLOW from the workspace root (review 11-05 CRIT: the host call waits up
+            # to 120 s between the path check and this write; a link planted in that window wrote lab bytes onto
+            # the Mac). A planted link is replaced by the real file, never followed.
+            from .file_system import write_bytes_nofollow_rel
+            root = Path(context.sandbox_dir).resolve()
+            import asyncio as _aio
+            await _aio.to_thread(write_bytes_nofollow_rel, root, str(dst.relative_to(root)), data)   # off the loop
+        except (OSError, ValueError) as e:
+            return ToolOutcome(f"LAB ERROR (bad_request): could not write {shown_path(context, dst)} in the workspace "
+                               f"({type(e).__name__}: {e})", status=OutcomeStatus.FAILED,
+                               reason_code="lab_bad_request", world_changed=False)
+        return ToolOutcome(f"[{lab_id}/{a['member']}] got {a['path']} → {shown_path(context, dst)} ({len(data)} bytes, "
                            + ("REPLACED the file that was there" if existed else "now in the workspace") + ")",
                            status=OutcomeStatus.OK, world_changed=True)
 
@@ -1244,7 +1382,23 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
         try:
             st, d = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin)
         except LabsNoAnswer as e:            # nothing was deleted yet
-            return _no_answer(context, "status", str(e))
+            # review 11-05 m7: no DELETE was sent — say so (the generic no-answer text says "may have happened")
+            return ToolOutcome(f"LAB ERROR (no_answer): the labs host did not answer the status check before the "
+                               f"destroy ({e}); NOTHING was deleted — {lab_id} is as it was. Try again.",
+                               status=OutcomeStatus.FAILED, reason_code="lab_no_answer", world_changed=False)
+        if (st == 404 and _row0 and not _row0.get("destroyed_at") and not _row0.get("leftovers")
+                and _row0.get("host_id") and isinstance(d, dict) and d.get("error") == "unknown_lab"):
+            _hnow = await _host_id(context, origin)
+            if _hnow and _row0["host_id"] != _hnow:
+                if origin != "owner":
+                    return _service_reply(st, d, context, lab_id)
+                # review 11-05 M2/M3: made on ANOTHER labs host — `lab list` and project teardown keep such a row live
+                # (not listed is not gone); only the owner's own destroy closes the record, and it says what it did
+                _inv0.record_destroy(lab_id, by="host_changed (closed by the owner)")
+                return ToolOutcome(f"{lab_id} was made on labs host {_row0['host_id']}; the configured host is "
+                                   f"{_hnow} and does not know it. Its record here is CLOSED (nothing was deleted on "
+                                   f"{_row0['host_id']} — if it still runs there, it must be cleared on that host).",
+                                   status=OutcomeStatus.OK, world_changed=True)
         if (st == 404 and _row0 and _row0.get("leftovers") and not _row0.get("destroyed_at")
                 and (origin != "probe" or _row0.get("owner") == owner)):
             # §4SX D2 r5: destroyed earlier with leftovers — only the DELETE asks the host about them again
@@ -1271,7 +1425,7 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
         if st != 200:
             return _service_reply(st, d, context, lab_id)
         theirs = str(d.get("owner") or "")
-        if origin == "probe" and theirs != owner:
+        if origin == "probe" and (theirs != owner or str(d.get("origin") or "") != "probe"):
             # r2 minor 7: the service guards only autopilot; a probe never
             # destroys a lab it did not make
             return ToolOutcome(f"LAB ERROR (not_allowed): {lab_id} belongs to {theirs or 'another owner'}; "
@@ -1315,6 +1469,9 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
             # the host could not remove everything: the lab stays on record, so a project delete still sees it
             if inv is not None:
                 inv.mark_leftovers(lab_id, ", ".join(map(str, left)))
+            if str(d.get("lifetime") or "") == "kept":
+                # review 11-05 m9: its containers are gone even with leftovers — the app runs on it ended too
+                await _end_app_runs(context, str(d.get("owner") or ""), origin)
             return ToolOutcome(f"{lab_id} destroyed, but the labs host could not remove: {', '.join(map(str, left))[:300]}"
                                " — the operator must clear them on the labs host.", status=OutcomeStatus.FAILED,
                                reason_code="lab_leftovers", world_changed=True)
@@ -1344,12 +1501,73 @@ _QUIET_DESTROYERS = frozenset({"expired", "host_changed"})
 RECENT_DESTROY_S = 24 * 3600
 
 
+async def _settle_unlisted(context, origin: str, inv, r) -> str:
+    """The `lab list` line for a live local row of THIS labs host that the host's list leaves out — asked, not
+    assumed (review 11-05 M2: it was retired as "expired" unseen, so leftovers of a lab the host's reaper destroyed
+    were never asked about, and project teardown's leftovers pass never ran for it). The row is retired only when the
+    host says the lab is gone with nothing left."""
+    lid, tpl = r["lab_id"], r.get("template") or ""
+    try:
+        st, b = await _call(context, "GET", f"/v1/labs/{lid}", origin=origin, timeout=20)
+        if st == 200:
+            return f"{lid} ({tpl}) — left out of the list, but the labs host still has it ({(b or {}).get('state')})"
+        if not (st == 404 and isinstance(b, dict) and b.get("error") == "unknown_lab"):
+            return f"{lid} ({tpl}) — left out of the list; the labs host answered HTTP {st} about it (not retired)"
+        # no row on the host: a DELETE only reports what is left of it (the host removes nothing it has no row for)
+        st, b = await _call(context, "DELETE", f"/v1/labs/{lid}", origin=origin, timeout=60)
+    except (LabsUnreachable, LabsNoAnswer) as e:
+        return f"{lid} ({tpl}) — left out of the list; the labs host did not answer about it ({e}; not retired)"
+    b = b if isinstance(b, dict) else {}
+    if st == 200 and b.get("leftovers"):
+        inv.mark_leftovers(lid, ", ".join(map(str, b["leftovers"])))
+        return (f"{lid} ({tpl}) — destroyed, but the labs host still holds {', '.join(map(str, b['leftovers']))}; "
+                f"`lab destroy {lid}` checks again once the operator cleared them")
+    if st == 200 or (st == 404 and b.get("error") == "unknown_lab"):
+        inv.record_destroy(lid, by="expired")
+        return f"{lid} ({tpl}) — gone from the labs host (expired or removed)"
+    return f"{lid} ({tpl}) — left out of the list; the labs host answered HTTP {st} about it (not retired)"
+
+
+async def lab_on_other_host(context, lab_id: str, origin: str = "autopilot") -> str:
+    """The labs host id a local row says ``lab_id`` was made on, when that is NOT the configured host. "" = this
+    host / no row / no host id on the row. When this host's id is not known yet it is asked (/v1/health); if it does
+    not answer, a row WITH a host id counts as other (never "destroyed" on a guess).
+    Review 11-05 M3: a 404 from the configured host is not "destroyed" for a lab made elsewhere."""
+    try:
+        from ..memory.lab_inventory import inventory_for
+        inv = inventory_for(context)
+        row = inv.get(lab_id) if inv else None
+    except Exception:  # noqa: BLE001
+        return ""
+    hid = str((row or {}).get("host_id") or "")
+    if not hid:
+        return ""
+    now_id = _LAST_HOST_ID.get("id") or await _host_id(context, origin)
+    return hid if hid != now_id else ""
+
+
+def other_host_phrase(other: str) -> str:
+    """How a lab made on labs host ``other`` is described when the configured host does not know it (r12: when the
+    configured host's own id is unknown, "which this agent cannot reach" may be false — ``other`` can be it)."""
+    if _LAST_HOST_ID.get("id"):
+        return f"labs host {other}, which this agent cannot reach"
+    return (f"labs host {other}; the configured labs host did not say who it is (/v1/health), so it may or may not "
+            "be that host — check `lab list` again")
+
+
+#: the id the configured labs host last gave on /v1/health (read by the `unknown_lab` wording; "" = not known yet)
+_LAST_HOST_ID: Dict[str, str] = {}
+
+
 async def _host_id(context, origin: str) -> str:
     try:
         hs, h = await _call(context, "GET", "/v1/health", origin=origin, timeout=10)
     except (LabsUnreachable, LabsNoAnswer):
         return ""
-    return str(h.get("host_id") or "") if hs == 200 and isinstance(h, dict) else ""
+    hid = str(h.get("host_id") or "") if hs == 200 and isinstance(h, dict) else ""
+    if hid:
+        _LAST_HOST_ID["id"] = hid
+    return hid
 
 
 async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
@@ -1401,6 +1619,11 @@ async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
         from ..core.lab_waits import LEAF_ID
         inv.record_create(lab_id, owner=owner, origin=origin, template=template, label=a["label"] or "",
                           purpose=a["purpose"] or "", host_id=host_id, leaf=LEAF_ID.get())
+        for e in (d.get("evicted") or []):
+            # review 11-05 P-m5: an evicted (autopilot) lab is destroyed — its row says so, and by whom
+            eid = str(e.get("lab_id") if isinstance(e, dict) else e or "")
+            if eid and inv.get(eid) and not inv.get(eid).get("destroyed_at"):
+                inv.record_destroy(eid, by="the labs host (evicted to make room for the owner's lab)")
     pretty_log("Lab Created", f"{lab_id} {template} by {origin} {owner or ''}".rstrip(), icon=Icons.LAB_CREATE)
     # readiness: poll, never past the turn's remaining time
     left = _time_left_s()
@@ -1415,8 +1638,29 @@ async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
             break
         if st2 == 200:
             d = d2
-        elif st2 == 404:
-            return _service_reply(st2, d2, context, lab_id)
+        elif st2 == 404 and isinstance(d2, dict) and d2.get("error") == "unknown_lab":
+            # review 11-05 m9: gone WHILE STARTING is a failed build (or an owner create pre-empted it), not a TTL
+            _left, _known = None, False
+            try:                                   # r12: what a failed build left is asked, as `_settle_unlisted` does
+                _sd, _bd = await _call(context, "DELETE", f"/v1/labs/{lab_id}", origin=origin, timeout=30)
+                _bd = _bd if isinstance(_bd, dict) else {}
+                _left = _bd.get("leftovers") if _sd == 200 else None
+                # r13 R6: the record closes only on the host's answer (200 / unknown_lab), never on a guess
+                _known = _sd == 200 or (_sd == 404 and _bd.get("error") == "unknown_lab")
+            except (LabsUnreachable, LabsNoAnswer):
+                pass
+            if inv is not None:
+                if _left:                          # the row stays LIVE with its leftovers named (§4SX D2 r5)
+                    inv.mark_leftovers(lab_id, ", ".join(map(str, _left)))
+                elif _known:
+                    inv.record_destroy(lab_id, by="create_failed")
+            return ToolOutcome(f"LAB ERROR (create_failed): {lab_id} disappeared from the labs host while it was "
+                               "starting — its build failed or it was removed. Create a new lab (and read `lab "
+                               "templates` if the template may be wrong)."
+                               + (f" The labs host still holds {', '.join(map(str, _left))} of it." if _left else
+                                  " Nothing of it is left." if _known else
+                                  f" The labs host did not say what is left of it — `lab destroy {lab_id}` asks again."),
+                               status=OutcomeStatus.FAILED, reason_code="lab_create_failed", world_changed=True)
     state = str(d.get("state"))
     text = _render_lab(d)
     if state == "creating":

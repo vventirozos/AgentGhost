@@ -110,7 +110,8 @@ def test_firewall_missing_detects():
     assert net.firewall_missing("10.89.0.0/16", "10.88.0.0/24", "10.88.1.0/24", runner=ok) == []
     bad = runner_ok(fw_present=False)
     miss = net.firewall_missing("10.89.0.0/16", "10.88.0.0/24", "10.88.1.0/24", runner=bad)
-    assert len(miss) == 1 + 3 + 2 * len(net.PRIVATE_DSTS)
+    # jump + 3 source + 3 interface (review 11-05 #5) + raw + the mangle FORWARD rule
+    assert len(miss) == 1 + 3 + 3 + 2 * len(net.PRIVATE_DSTS) + 1
 
 
 def test_firewall_jump_must_be_first():
@@ -419,7 +420,7 @@ def test_extend_requires_positive_and_clamps(env):
         m.extend("lab_k", {"ttl_idle_s": 10}, "owner")
 
 
-def test_reconcile_keeps_kept_rows_and_unreadies_creating(env):
+def test_reconcile_keeps_kept_rows_and_reaps_half_built_creating(env):
     m = env
     add_lab(m, "lab_k", lifetime="kept")
     m.store.update_lab("lab_k", app_json=dumps({"name": "a", "state": "up"}))
@@ -428,7 +429,9 @@ def test_reconcile_keeps_kept_rows_and_unreadies_creating(env):
     m.reconcile()
     k = m.store.lab("lab_k")
     assert k and '"containers_missing"' in k["app_json"]
-    assert m.store.lab("lab_c")["state"] == "unready"
+    assert m.store.lab("lab_c")["state"] == "destroying"          # review 11-05 #15
+    m.reap_once()
+    assert m.store.lab("lab_c") is None
 
 
 def test_destroy_owner_continues_past_a_refusal(env):

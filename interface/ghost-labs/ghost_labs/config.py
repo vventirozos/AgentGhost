@@ -147,4 +147,8 @@ def host_id() -> str:
 
 
 def api_key() -> str:
-    return (CONFIG_DIR / "api_key").read_text().strip()
+    key = (CONFIG_DIR / "api_key").read_text().strip()
+    if not key:
+        # review 11-05 #11: an empty key must not open the API
+        raise RuntimeError(f"{CONFIG_DIR / 'api_key'} is empty; refusing to start")
+    return key

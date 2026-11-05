@@ -262,9 +262,11 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                     _b += " (checked " + _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(float(r["at"]))) + ")"
             lines.append(_b)
     if services:
-        lines.append("SERVICES (this project's registered services — ports "
-                     "are LEASED to them; check liveness / start / stop via "
-                     "`run`, never guess ports):")
+        # review 11-05 W-m: these are services NO run row covers (registered before `run`) — `run` refuses their
+        # names, so the line must not send the model there to stop them
+        lines.append("SERVICES (registered before `run` existed — ports are LEASED "
+                     "to them, never guess ports; `run` does not start, stop or "
+                     "restart these: tell the owner if one must change):")
         for s in services:
             _b = f"  - {s.get('name')}"
             if s.get("port") is not None:

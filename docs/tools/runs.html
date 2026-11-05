@@ -33,7 +33,7 @@
 
   <h2 id="actions">Actions</h2>
   <ul>
-    <li><code>start name command where lifetime [port]</code> &mdash; <code>where</code> is required (<code>workspace</code> or <code>lab_&lt;8 hex&gt;/&lt;member&gt;</code>; no default). <code>lifetime</code> is <code>job</code> (runs once) or <code>server</code> (keeps serving). <code>app</code> is refused until Phase D (kept machines). A start is never a result: the reply says "Still running: this is not a result".</li>
+    <li><code>start name command where lifetime [port]</code> &mdash; <code>where</code> is required (<code>workspace</code> or <code>lab_&lt;8 hex&gt;/&lt;member&gt;</code>; no default). <code>lifetime</code> is <code>job</code> (runs once) or <code>server</code> (keeps serving). <code>app</code> is refused: an app run is made by <code>lab keep</code> (&sect;4SX D3), and <code>run</code> then starts, stops and restarts it by name. A start is never a result: the reply says "Still running: this is not a result".</li>
     <li><code>status [name]</code> &mdash; every live run, or the newest of that name, <strong>probed now</strong> from its backend; the probe is written back to the registry.</li>
     <li><code>logs name [lines]</code>, <code>collect name</code> (a finished job: output plus <code>EXIT CODE</code>; <code>unresolved</code> while it runs), <code>stop name</code>, <code>restart name</code> (servers only; a job is started again), <code>url name</code>.</li>
   </ul>
@@ -219,6 +219,69 @@
     <li><code>outcome_heuristics.run_text_unresolved</code> reads that head and the collect head, or the status when a live outcome is passed. It is used by <code>is_unresolved_tool_result</code> (corpus flags, the failure census) and by the evidence gate's <code>run</code> branch, so a stored unanswered run is never booked as a success.</li>
     <li>The r8 evidence-gate branch for the old tool names was removed. It never ran, because <code>jobs</code>/<code>manage_services</code> are not evidence tools.</li>
   </ul>
+
+  <h2 id="4sx-r11">End-to-end review r11 <span class="tag">2026-11-05 &sect;4SX-u</span></h2>
+  <ul>
+    <li><strong>Workspace jobs run through <code>bash -c</code> with pipefail</strong> (<code>execute._bash_c</code>), like a promoted
+      <code>execute</code> job. The runner script is <code>#!/bin/sh</code> + <code>timeout … &lt;cmd&gt;</code>, so
+      <code>cd app &amp;&amp; pytest</code>, <code>FOO=1 x</code>, <code>source …</code> and loops exited 127, and only the first command
+      of <code>a &amp;&amp; b</code> was under the ceiling.</li>
+    <li><strong>The shell guards <code>execute</code> runs apply to a workspace <code>run</code></strong> (<code>runs._shell_guard_refusal</code>):
+      the destructive deny-list (fails closed), writes into a RELEASED project, YouTube downloads and detached
+      <code>… &amp;</code> servers are refused before anything starts.</li>
+    <li><strong>Autopilot runs only on its own project's disposable labs.</strong> <code>_start_lab</code> refuses another owner's lab and
+      any kept lab for the <code>autopilot</code> origin (the lab tool's rule).</li>
+    <li><strong>A job by id:</strong> <code>run status|collect|stop name=&lt;job id&gt;</code> and a bare <code>run collect</code> reach a background
+      job that has no run row (<code>runs._job_by_id</code>), also on an owned turn. Every result names <code>run</code>, never
+      <code>jobs</code>. A collected job that exited non-zero is FAILED, like the owned collect.</li>
+    <li><strong>Job wakes and project tasks run in their project</strong> (<code>main._unattended_project_scope</code>): the job's
+      <code>project_id</code>, or a scheduled task's <code>project:&lt;id&gt;</code> owner, pins the turn's project (origin unattended).
+      <em>(Superseded in r13: a gone or archived project's turn is skipped, see below.)</em></li>
+    <li><strong>The previous process's leaf work is ended at boot</strong> (<code>core/leaf_reaper.py</code>). The leaf ids are read
+      synchronously before the advancer starts. Then <code>stop_leaf_runs</code> and <code>destroy_leaf_labs</code> run for each, so
+      a deploy mid-build no longer leaves a server with no TTL. Leaf end gives the run stops and the lab destroys
+      separate bounds (90 s, 150 s).</li>
+    <li><strong>Registry:</strong> a live state never lands on an ended row (a stale probe wrote "running" over "stopped").
+      <code>revive=True</code> is only for a restart that could not stop the process. <code>run stop</code> waits for an
+      in-flight start of the name and is shielded.</li>
+    <li><strong>Gradings:</strong> a <code>run</code> start/stop/restart is a mutation in the evidence gate, not evidence. An
+      unanswered/unverified result (<code>run_no_answer</code>, <code>run_unreachable</code>, <code>run_unverified</code>,
+      <code>lab_no_answer</code>) gets its own MULTI-STEP line, not "STILL RUNNING". <code>jobs</code>/<code>manage_services</code> results are read
+      like <code>run</code> by <code>strikes.is_program_output</code>: a listing is content, and a job's collected result is program
+      output.</li>
+    <li><strong>The old names:</strong> <code>manage_services</code>/<code>jobs</code> carry <code>run</code>'s egress scrub, follow run's batch order,
+      and cannot be shadowed by an acquired skill. <code>manage_services port=0</code> means no port.</li>
+  </ul>
+  <p>Tests: <code>tests/test_4sx_r11_review.py</code>.</p>
+
+  <h2 id="4sx-r12">Reviews r12&ndash;r14 <span class="tag">2026-11-05 &sect;4SX-u</span></h2>
+  <ul>
+    <li><strong>A job by id reads ONE record</strong> (<code>runs._job_by_id</code>, r14): the jobs registry row, found by
+      EITHER id (<code>delegate._resolve_job</code>, which covers both the registry id that <code>run status</code> prints and the sandbox
+      id that the promotion banner quotes). The row's own status grades a collect: running is UNRESOLVED
+      (<code>run_still_running</code>), and anything but done (failed or cancelled, r15) is FAILED (<code>run_job_failed</code>). The landing already counts <code>| head</code>
+      SIGPIPE as done and expired/lost as failed. Text printed by the command counts for nothing. The r11&ndash;r13 layers
+      read the supervisor (one id namespace) and parsed the result text, so they are gone.</li>
+    <li><strong>&sect;4NS on the by-id path:</strong> <code>delegate.job_visible_to_caller</code> is one rule, read by both
+      <code>jobs</code> and <code>run</code>. A probe or another turn gets <code>run_not_allowed</code> for a job it did not start.
+      A build (leaf) never stops a job that has no run row of its own.</li>
+    <li><strong>Owned turns:</strong> a job id with a run row of this owner goes to that row (<code>_job_row_op</code>), and another
+      owner's row is <code>run_not_allowed</code>. A row is matched by EITHER of the job's ids (<code>runs._job_refs</code>, r15), so
+      another project's job cannot be reached by its registry id. A bare <code>run collect</code> names nothing (<code>run_name_required</code>), and so does
+      <code>jobs collect</code> with no id. <code>jobs status job_id=X</code> shows that job only, never every job.</li>
+    <li><strong>Egress before a start</strong> (<code>runs._egress_refusal</code>): a workspace start or restart checks the Tor gate.
+      It asks for enforcement when that has never been attempted, and fails closed. Autopilot/probe lab restarts check
+      <code>_lab_start_refusal</code> before the stop.</li>
+    <li><strong>Turn scope</strong> (<code>main._project_turn_scope</code>): a job wake or a scheduled task whose project is gone or
+      archived is SKIPPED (<code>[PROJECT TURN SKIPPED</code>). It no longer runs with no project. A store error is retried 3&times;.</li>
+    <li><strong>Kept apps of THIS agent only</strong> (r17, found at deploy): the labs host is shared. Its own integration tests
+      make kept <code>project:itest…</code> labs, and the down sweep's adopt step filed them as the owner's app runs.
+      <code>runs._adopt_app_rows</code> now adopts only labs whose project is in this agent's store
+      (<code>_is_own_project</code>, which fails closed). <code>app_down_sweep</code> ends an app row whose project the store POSITIVELY
+      lacks, and never probes it or pages the owner about it. A store that cannot answer changes nothing.</li>
+  </ul>
+  <p>Tests: <code>tests/test_4sx_r12_review.py</code>, <code>test_4sx_r13_review.py</code>, <code>test_4sx_r14_review.py</code>, <code>test_4sx_r15_review.py</code>,
+  <code>test_4sx_r17_review.py</code>, <code>test_4sx_r16_battery_pins.py</code>.</p>
 
   <h2 id="tests">Tests</h2>
   <p><code>tests/test_4sx_d5_review.py</code> (D5 review r1) drives each review finding through the real supervisors.</p>

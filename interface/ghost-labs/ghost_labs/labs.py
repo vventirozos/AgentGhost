@@ -34,6 +34,10 @@ ORIGINS = ("owner", "autopilot", "probe")
 CREATE_KEYS = ("template", "params", "members", "egress", "readiness", "env", "owner", "label", "purpose",
                "lineage", "ttl_idle_s")
 INFRA_IMAGES = ("ghost-lab/tor-gw:", "ghost-lab/agentapi:")
+HTTP_HEAD_BYTES = 16384
+MEM_HEADROOM_MB = 512       # MemAvailable a create leaves to the host
+STATS_DEADLINE_S = 5.0      # one overall budget for the eviction's docker stats calls (docker's own: 300 s)
+POOLS = ("disposable", "kept")
 READY_CHECKS: Dict[str, Callable[[str], bool]] = {}
 
 
@@ -88,7 +92,17 @@ class Manager:
         self.ports = ports or Ports(cfg, store, runner)
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        # review r15: (lab, member) pairs whose docker stats call is still running (a LEAF lock, held for a set op)
+        self._stats_inflight: set = set()
+        self._stats_inflight_lock = threading.Lock()
+        # Lock order (review r12 F4): [kept app lock] -> lab lock -> create_lock. /keep holds a lab lock and WAITS
+        # on create_lock; so whoever holds create_lock only ever TRIES a lab lock (non-blocking: eviction victims)
+        # or takes the lock of a lab id it just made. No create_lock holder waits for Tor (create waits first).
         self.create_lock = threading.Lock()
+        # review r13 E: a LEAF lock around get-or-create of the Tor gateway container. wait_tor runs outside
+        # create_lock (r12 F4), so two creates could both find no gateway and both run it (docker 409 -> 500).
+        # It may be taken with any other lock held or none; nothing else is acquired while it is held.
+        self.gateway_lock = threading.Lock()
         self.firewall_state = "unknown"
         self._reap_warned: set = set()          # agent D4 r6: (lab, code) said once, then debug
         self.actions = _NullActions()
@@ -148,11 +162,17 @@ class Manager:
         self.store.update_lab(lab_id, **fields)
 
     # ----------------------------------------------------------- budget
+    @staticmethod
+    def pool_of(lab: Dict[str, Any]) -> str:
+        """The RAM pool a lab counts in: kept labs, and the rehearsal twin (lifetime disposable, pool "kept",
+        review 11-05 #4: it was checked against the kept pool and then counted in the disposable one)."""
+        return "kept" if lab["lifetime"] == "kept" or (lab.get("pool") or "") == "kept" else "disposable"
+
     def _used(self) -> Dict[str, int]:
         used = {"kept": 0, "disposable": 0}
         for lab in self.store.labs():
             mem = sum(int(m["mem_mb"]) for m in self.store.members(lab["lab_id"]))
-            used["kept" if lab["lifetime"] == "kept" else "disposable"] += mem
+            used[self.pool_of(lab)] += mem
         return used
 
     def budgets(self) -> Dict[str, int]:
@@ -161,17 +181,127 @@ class Manager:
         return {"total": total, "kept": kept, "disposable": max(0, total - kept)}
 
     def _disposable_labs(self) -> List[Dict[str, Any]]:
-        return [l for l in self.store.labs() if l["lifetime"] != "kept"]
+        """The labs of the disposable pool (max_labs counts these; the twin is not one)."""
+        return [l for l in self.store.labs() if self.pool_of(l) == "disposable"]
+
+    def _mem_in_use_mb(self, lab_id: str) -> int:
+        """What evicting the lab gives back to MemAvailable, in MB (see _mem_in_use_many)."""
+        return self._mem_in_use_many([lab_id])[lab_id]
+
+    def _container_mem_bytes(self, lab_id: str, member: str) -> int:
+        """One container's cgroup usage less ALL its file page cache (active + inactive; review r13 A:
+        MemAvailable already counts the page cache as available, so only anon, shmem and kernel memory come
+        back — r12 subtracted only inactive_file and counted hot cache as freed). cgroup v2 names the keys
+        active_file / inactive_file, v1 total_active_file / total_inactive_file. Raises when unreadable."""
+        c = self.container(lab_id, member)
+        try:
+            st = c.stats(stream=False, one_shot=True)
+        except TypeError:             # an SDK without one_shot
+            st = c.stats(stream=False)
+        ms = (st or {}).get("memory_stats") or {}
+        usage = int(ms.get("usage") or 0)
+        s = ms.get("stats") or {}
+
+        def key(k: str) -> int:
+            return int(s.get(f"total_{k}", s.get(k, 0)) or 0)    # v1 hierarchical total, else v2
+        return max(0, usage - (key("active_file") + key("inactive_file")))
+
+    def _mem_in_use_many(self, lab_ids: List[str]) -> Dict[str, int]:
+        """What evicting each lab gives back to MemAvailable, in MB (review r12 F1: the eviction pre-check
+        counted the victims' LIMITS; an idle 1000 MB lab using 50 MB frees 50 MB).
+
+        Every container's stats call runs at once on its own daemon thread, all under ONE deadline of
+        STATS_DEADLINE_S: this runs under create_lock and the victims' lab locks, and the docker client
+        timeout is 300 s, so one wedged stats call blocked every create. A container whose usage did not come
+        back in time, or could not be read, counts 0 — an eviction is never planned on memory it may not free.
+        A late thread holds no lock and its answer is dropped (daemon threads: never joined at exit).
+        A container whose earlier stats call is STILL in flight is not asked again and counts 0 (review r15:
+        each create started one more wedged thread per member, up to docker's 300 s timeout)."""
+        jobs = [(lid, m["name"]) for lid in lab_ids for m in self.store.members(lid)]
+        got: Dict[int, int] = {}
+        inflight, guard = self._stats_inflight, self._stats_inflight_lock
+
+        def read(i: int, lid: str, member: str) -> None:
+            try:
+                got[i] = self._container_mem_bytes(lid, member)
+            except Exception:  # noqa: BLE001 — gone, stopped, or not readable: frees nothing we can count on
+                pass
+            finally:
+                with guard:
+                    inflight.discard((lid, member))
+        threads: Dict[int, threading.Thread] = {}
+        skipped = []
+        for i, (lid, mem) in enumerate(jobs):
+            with guard:
+                if (lid, mem) in inflight:
+                    skipped.append((lid, mem))
+                    continue
+                inflight.add((lid, mem))
+            try:
+                t = threading.Thread(target=read, args=(i, lid, mem), name=f"ghost-labs-stats-{lid}", daemon=True)
+                t.start()
+            except Exception:  # noqa: BLE001 — never leave the key marked in flight
+                with guard:
+                    inflight.discard((lid, mem))
+                raise
+            threads[i] = t
+        deadline = time.monotonic() + STATS_DEADLINE_S
+        for t in threads.values():
+            t.join(max(0.0, deadline - time.monotonic()))
+        done = dict(got)                  # a snapshot: a late answer lands in got, never here
+        late = [jobs[i] for i, t in threads.items() if t.is_alive() and i not in done]
+        if late:
+            log.warning("eviction: docker stats did not answer within %.1f s for %s; counted as 0 MB",
+                        STATS_DEADLINE_S, ", ".join(f"{lid}/{mem}" for lid, mem in late[:5]))
+        if skipped:
+            log.warning("eviction: an earlier docker stats call is still running for %s; not asked again, counted "
+                        "as 0 MB", ", ".join(f"{lid}/{mem}" for lid, mem in skipped[:5]))
+        total = {lid: 0 for lid in lab_ids}
+        for i, v in done.items():
+            total[jobs[i][0]] += v
+        return {lid: b // (1024 * 1024) for lid, b in total.items()}
 
     def _check_capacity(self, need_mb: int, origin: str) -> List[Dict[str, str]]:
         """Raise when the disposable pool can't take need_mb. An owner create
-        pre-empts the oldest autopilot disposable labs first (returns them)."""
+        pre-empts the oldest autopilot disposable labs first (returns them).
+
+        Lock order (review r12 F4): create_lock, THEN a lab's lock — and here a victim's lock is only ever
+        TRIED (non-blocking). /keep, switch etc. hold a lab lock and then wait on create_lock; a blocking wait
+        on that same lab's lock here would be the other half of an ABBA deadlock (it ended as a misleading
+        "busy" after 30 s, with earlier victims already evicted). A victim whose lock is held is skipped.
+        Every victim's lock is taken BEFORE anyone is evicted, so the plan is decided once: when the lockable
+        victims can't make room, nobody is evicted."""
+        held: List[str] = []
+        try:
+            return self._check_capacity_locked(need_mb, origin, held)
+        finally:
+            for lid in held:
+                self.lock(lid).release()
+
+    def _check_capacity_locked(self, need_mb: int, origin: str, held: List[str]) -> List[Dict[str, str]]:
         evicted: List[Dict[str, str]] = []
+        auto: List[Dict[str, Any]] = []
+        frees: Dict[str, int] = {}
+
+        def freed(l: Dict[str, Any]) -> int:     # measured once per victim, and only when memory is short
+            if l["lab_id"] not in frees:
+                # all unmeasured victims at once: one STATS_DEADLINE_S for the whole check, not one per victim
+                todo = [v["lab_id"] for v in auto if v["lab_id"] not in frees]
+                frees.update(self._mem_in_use_many(todo if l["lab_id"] in todo else [l["lab_id"]]))
+            return frees[l["lab_id"]]
         if origin == "owner":
             b, used, live = self.budgets(), self._used(), self._disposable_labs()
-            auto = [l for l in live if l["origin"] == "autopilot"]
+            for l in sorted((l for l in live if l["origin"] == "autopilot"), key=lambda l: l["created_at"]):
+                if self.lock(l["lab_id"]).acquire(blocking=False):
+                    held.append(l["lab_id"])
+                    auto.append(l)
             auto_mb = sum(m["mem_mb"] for l in auto for m in self.store.members(l["lab_id"]))
-            if used["disposable"] - auto_mb + need_mb > b["disposable"] or len(live) - len(auto) >= int(self.cfg.max_labs):
+            # MemAvailable too (review 11-05 #13; r12 F1): evicting gives back what the victims USE, not their
+            # limits; when even that leaves the host short, the create fails anyway and must not evict anybody
+            avail = C.meminfo().get("MemAvailable", 0)
+            if used["disposable"] - auto_mb + need_mb > b["disposable"] or len(live) - len(auto) >= int(self.cfg.max_labs) \
+                    or (avail < need_mb + MEM_HEADROOM_MB
+                        and avail + sum(freed(l) for l in auto) < need_mb + MEM_HEADROOM_MB):
                 auto = []        # evicting everything still wouldn't fit: evict nothing
         while True:
             b, used = self.budgets(), self._used()
@@ -179,36 +309,54 @@ class Manager:
             fits = used["disposable"] + need_mb <= b["disposable"]
             count_ok = len(live) < int(self.cfg.max_labs)
             avail = C.meminfo().get("MemAvailable", 0)
-            mem_ok = avail >= need_mb + 512
+            mem_ok = avail >= need_mb + MEM_HEADROOM_MB
             if fits and count_ok and mem_ok:
                 return evicted
-            victims = [l for l in live if l["origin"] == "autopilot" and any(a["lab_id"] == l["lab_id"] for a in auto)] \
-                if origin == "owner" else []
+            live_ids = {l["lab_id"] for l in live}
+            victims = [l for l in auto if l["lab_id"] in live_ids and not any(e["lab_id"] == l["lab_id"] for e in evicted)]
+            if not mem_ok and avail + sum(freed(l) for l in victims) < need_mb + MEM_HEADROOM_MB:
+                # re-checked after each eviction (r12 F1): the memory it gave back was less than measured, and
+                # the rest can't make room either — stop here rather than evict more labs for nothing
+                victims = []
+            if victims and fits and count_ok:
+                # only memory is short (review r13 B): a victim that frees ~0 MB is no help, and the ones that
+                # free the most come first so as few labs as possible go (budget/count short: oldest first, below)
+                victims = sorted((l for l in victims if freed(l) > 0), key=lambda l: -freed(l))
             if victims:
-                v = sorted(victims, key=lambda l: l["created_at"])[0]
-                self.destroy(v["lab_id"], reason="evicted", by="owner", origin="owner", _force=True)
+                v = victims[0]
+                self.destroy(v["lab_id"], reason="evicted", by="owner", origin="owner", _force=True, _have_lock=True)
                 evicted.append({"lab_id": v["lab_id"], "owner": v["owner"]})
                 continue
             labs = [{"lab_id": l["lab_id"], "template": l["template"],
                      "mem_mb": sum(m["mem_mb"] for m in self.store.members(l["lab_id"]))} for l in live]
             if not count_ok:
                 raise LabError("lab_limit", f"{len(live)} disposable labs live (max {self.cfg.max_labs})",
-                               hint="destroy a lab you no longer need", max_labs=self.cfg.max_labs, live_labs=labs)
+                               hint="destroy a lab you no longer need", max_labs=self.cfg.max_labs, live_labs=labs,
+                               **({"evicted": evicted} if evicted else {}))
             raise LabError("budget_exceeded",
                            f"needs {need_mb} MB; disposable pool has {b['disposable'] - used['disposable']} MB free, "
                            f"host MemAvailable {avail} MB", hint="destroy a lab or create a smaller one",
                            needed_mb=need_mb, available_mb=max(0, b["disposable"] - used["disposable"]),
-                           pool="disposable", live_labs=labs)
+                           pool="disposable", live_labs=labs, **({"evicted": evicted} if evicted else {}))
 
-    def check_kept_capacity(self, need_mb: int) -> List[Dict[str, str]]:
+    def check_kept_capacity(self, need_mb: int, new_containers: bool = True) -> List[Dict[str, str]]:
+        """The kept pool must take need_mb. new_containers: they don't exist yet, so the host's MemAvailable
+        must take them too (review 11-05 #4: the twin had no MemAvailable check). /keep passes False: its
+        members already run and are only recreated."""
         b, used = self.budgets(), self._used()
+        labs = [{"lab_id": l["lab_id"], "template": l["template"],
+                 "mem_mb": sum(m["mem_mb"] for m in self.store.members(l["lab_id"]))}
+                for l in self.store.labs() if self.pool_of(l) == "kept"]
         if used["kept"] + need_mb > b["kept"]:
-            labs = [{"lab_id": l["lab_id"], "template": l["template"],
-                     "mem_mb": sum(m["mem_mb"] for m in self.store.members(l["lab_id"]))}
-                    for l in self.store.labs() if l["lifetime"] == "kept"]
             raise LabError("budget_exceeded", f"needs {need_mb} MB; kept pool has {b['kept'] - used['kept']} MB free",
                            hint="retire an old version or raise kept_mb", needed_mb=need_mb,
                            available_mb=max(0, b["kept"] - used["kept"]), pool="kept", live_labs=labs)
+        if new_containers:
+            avail = C.meminfo().get("MemAvailable", 0)
+            if avail < need_mb + MEM_HEADROOM_MB:
+                raise LabError("budget_exceeded", f"needs {need_mb} MB; host MemAvailable is {avail} MB",
+                               hint="destroy a lab or retry when the host has more free memory", needed_mb=need_mb,
+                               available_mb=max(0, avail - MEM_HEADROOM_MB), pool="kept", live_labs=labs)
         return []
 
     def _check_disk(self) -> None:
@@ -242,23 +390,36 @@ class Manager:
                 labels={LABEL: "1", "ghost.labs.role": "infra"})
 
     def gateway(self, start: bool = True):
+        with self.gateway_lock:          # review r13 E: one get-or-create at a time (see __init__ lock order)
+            return self._gateway_locked(start)
+
+    def _gateway_locked(self, start: bool):
         try:
             c = self.docker.containers.get(net.GW_CONTAINER)
         except Exception:  # noqa: BLE001 — docker.errors.NotFound
             if not start:
                 return None
             self.ensure_infra()
-            c = self.docker.containers.run(
-                "ghost-lab/tor-gw:1", name=net.GW_CONTAINER, detach=True,
-                network=net.GW_NETWORK, cap_add=["NET_ADMIN"],
-                sysctls={"net.ipv4.ip_forward": "0", "net.ipv6.conf.all.disable_ipv6": "1"},
-                environment={"EGRESS_SUBNET": self.cfg.gw_subnet},
-                volumes={"ghost-labs-tor-data": {"bind": "/var/lib/tor", "mode": "rw"}},
-                restart_policy={"Name": "unless-stopped"}, mem_limit="256m", oom_score_adj=-500,
-                labels={LABEL: "1", "ghost.labs.role": "infra"})
+            try:
+                c = self._run_gateway()
+            except Exception as e:  # noqa: BLE001 — docker.errors.APIError 409: another process made it meanwhile
+                if getattr(getattr(e, "response", None), "status_code", None) != 409 \
+                        and getattr(e, "status_code", None) != 409:
+                    raise
+                c = self.docker.containers.get(net.GW_CONTAINER)
         if start and c.status != "running":
             c.start()
         return c
+
+    def _run_gateway(self):
+        return self.docker.containers.run(
+            "ghost-lab/tor-gw:1", name=net.GW_CONTAINER, detach=True,
+            network=net.GW_NETWORK, cap_add=["NET_ADMIN"],
+            sysctls={"net.ipv4.ip_forward": "0", "net.ipv6.conf.all.disable_ipv6": "1"},
+            environment={"EGRESS_SUBNET": self.cfg.gw_subnet},
+            volumes={"ghost-labs-tor-data": {"bind": "/var/lib/tor", "mode": "rw"}},
+            restart_policy={"Name": "unless-stopped"}, mem_limit="256m", oom_score_adj=-500,
+            labels={LABEL: "1", "ghost.labs.role": "infra"})
 
     TOR_CTL = ("c=$(od -An -tx1 /var/lib/tor/control_auth_cookie | tr -d ' \\n'); "
                "printf 'AUTHENTICATE %s\\r\\nGETINFO status/bootstrap-phase\\r\\nQUIT\\r\\n' \"$c\" "
@@ -333,6 +494,8 @@ class Manager:
         against the kept pool and is not counted toward max_labs."""
         if origin not in ORIGINS:
             raise LabError("bad_request", "bad origin", field="X-Labs-Origin")
+        if pool not in POOLS:
+            raise LabError("bad_request", "bad pool", field="pool")
         owner = str(body.get("owner") or "")
         if owner and not owner.startswith(OWNER_RE_PREFIXES):
             raise LabError("bad_request", "owner must be project:<id> or conversation:<key>", field="owner")
@@ -347,44 +510,61 @@ class Manager:
         if missing:
             raise LabError("firewall_missing", "the labs host firewall rules are missing",
                            hint="run ghost-labs-fw on the host (systemctl restart ghost-labs-fw)", missing=missing[:5])
+        if spec["egress"] == "tor":
+            # before any eviction (a failed create must not have evicted labs) and OUTSIDE create_lock (review
+            # r12 F4: up to 120 s of Tor bootstrap held every other create and every /keep behind it). The
+            # capacity check and the row/member writes that count it stay atomic under the lock below.
+            self.wait_tor()
+        # lock order: create_lock, then a lab lock (a victim's only TRIED, see _check_capacity; the new id's is
+        # uncontended). Never wait on create_lock while this process holds it.
         with self.create_lock:
             self._check_disk()
-            if spec["egress"] == "tor":
-                self.wait_tor()          # before any eviction: a failed create must not have evicted labs
             evicted = self._check_capacity(need, origin) if pool == "disposable" else self.check_kept_capacity(need)
             lab_id = "lab_" + uuid.uuid4().hex[:8]
-            used = [r["subnet"] for r in self.store.q("SELECT subnet FROM subnets")]
-            used += [cfg.get("Subnet", "") for n in self.docker.networks.list()
-                     for cfg in ((n.attrs.get("IPAM") or {}).get("Config") or [])]
-            subnet = net.allocate_subnet(self.cfg.pool(), used + [self.cfg.gw_subnet, self.cfg.api_subnet])
-            self.store.x("INSERT INTO subnets VALUES (?,?)", (subnet, lab_id))
-            now = time.time()
-            self.store.put_lab({
-                "lab_id": lab_id, "template": spec["template"], "label": label, "state": "creating",
-                "owner": owner, "origin": origin, "lineage": str(body.get("lineage") or ""), "lifetime": "disposable",
-                "purpose": purpose, "ttl_class": cls, "ttl_idle_s": idle, "ttl_max_s": ttl["max_s"],
-                "egress": spec["egress"], "subnet": subnet, "created_at": now, "last_used_at": now,
-                "last_owner_use_at": now if origin == "owner" else 0, "retire_at": None,
-                "spec_json": dumps({**spec, "create": {k: body[k] for k in CREATE_KEYS if k in body}}),
-                "readiness_json": dumps({}), "app_json": None, "agent_api_url": None, "lan": 0})
-            # member rows (and their mem_mb) are written while the create lock is held,
-            # so the next create's budget check sees them (r1 core #1)
-            used_ips: List[str] = []
-            for m in spec["members"]:
-                ip = net.next_member_ip(subnet, used_ips)
-                used_ips.append(ip)
-                self.store.put_member({"lab_id": lab_id, "name": m["name"], "ip": ip, "image": m["image"],
-                                       "mem_mb": m["mem_mb"], "cpus": m["cpus"], "cap_add": dumps(m["cap_add"]),
-                                       "ports_json": dumps(m["ports"]), "isolated": 0})
+            # held over the build (review 11-05 #14): a destroy landing between member() and ports.lease()
+            # left a port row and a forwarder on a deleted lab. A fresh id: never contended here
+            lab_lock = self.lock(lab_id)
+            lab_lock.acquire()
+            try:
+                used = [r["subnet"] for r in self.store.q("SELECT subnet FROM subnets")]
+                used += [cfg.get("Subnet", "") for n in self.docker.networks.list()
+                         for cfg in ((n.attrs.get("IPAM") or {}).get("Config") or [])]
+                subnet = net.allocate_subnet(self.cfg.pool(), used + [self.cfg.gw_subnet, self.cfg.api_subnet])
+                self.store.x("INSERT INTO subnets VALUES (?,?)", (subnet, lab_id))
+                now = time.time()
+                self.store.put_lab({
+                    "lab_id": lab_id, "template": spec["template"], "label": label, "state": "creating",
+                    "owner": owner, "origin": origin, "lineage": str(body.get("lineage") or ""), "lifetime": "disposable",
+                    "purpose": purpose, "ttl_class": cls, "ttl_idle_s": idle, "ttl_max_s": ttl["max_s"],
+                    "egress": spec["egress"], "subnet": subnet, "created_at": now, "last_used_at": now,
+                    "last_owner_use_at": now if origin == "owner" else 0, "retire_at": None,
+                    "spec_json": dumps({**spec, "create": {k: body[k] for k in CREATE_KEYS if k in body}}),
+                    "readiness_json": dumps({}), "app_json": None, "agent_api_url": None, "lan": 0,
+                    "pool": "" if pool == "disposable" else pool})
+                # member rows (and their mem_mb) are written while the create lock is held,
+                # so the next create's budget check sees them (r1 core #1)
+                used_ips: List[str] = []
+                for m in spec["members"]:
+                    ip = net.next_member_ip(subnet, used_ips)
+                    used_ips.append(ip)
+                    self.store.put_member({"lab_id": lab_id, "name": m["name"], "ip": ip, "image": m["image"],
+                                           "mem_mb": m["mem_mb"], "cpus": m["cpus"], "cap_add": dumps(m["cap_add"]),
+                                           "ports_json": dumps(m["ports"]), "isolated": 0})
+            except BaseException:
+                lab_lock.release()      # nothing was built: never leave the new id locked
+                raise
         try:
-            self._build(lab_id, spec, owner, origin)
-        except LabError:
-            self._rollback(lab_id)
-            raise
-        except Exception as e:  # noqa: BLE001
-            self._rollback(lab_id)
-            raise LabError("internal", f"create failed and was rolled back: {type(e).__name__}: {e}",
-                           hint="the lab was removed completely; retry or report")
+            try:
+                self._build(lab_id, spec, owner, origin)
+            except LabError:
+                self._rollback(lab_id)
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._rollback(lab_id)
+                raise LabError("internal", f"create failed and was rolled back: {type(e).__name__}: {e}",
+                               hint="the lab was removed completely; retry or report")
+        finally:
+            lab_lock.release()
         if body.get("wait", True):
             self.wait_ready(lab_id, spec)
         else:
@@ -412,6 +592,8 @@ class Manager:
             netname, driver="bridge", internal=True,
             ipam=IPAMConfig(pool_configs=[IPAMPool(subnet=subnet, gateway=net.host_in(subnet, 1),
                                                    iprange=net.ip_range(subnet))]),
+            # a fixed bridge name: the host firewall matches lab traffic by interface (review 11-05 #5)
+            options={net.BRIDGE_OPT: net.lab_bridge(lab_id)},
             labels=self._labels(lab_id, owner, origin))
         gw = None
         if spec["egress"] == "tor":
@@ -432,11 +614,15 @@ class Manager:
         netname = net.lab_network_name(lab_id)
         env = {**spec.get("env", {}), **m.get("env", {}), "GHOST_LAB_ID": lab_id, "GHOST_LAB_MEMBER": m["name"],
                **(extra_env or {})}
+        caps = list(m["cap_add"] or [])
         host_config = api.create_host_config(
             init=True, mem_limit=f"{m['mem_mb']}m", memswap_limit=f"{m['mem_mb']}m",
-            nano_cpus=int(float(m["cpus"]) * 1e9), pids_limit=1024, cap_add=m["cap_add"] or None,
+            nano_cpus=int(float(m["cpus"]) * 1e9), pids_limit=1024, cap_add=caps or None,
+            # no raw sockets unless the member asks (review 11-05 #5: forged source addresses); ping keeps
+            # working through ICMP datagram sockets (ping_group_range)
+            cap_drop=None if "NET_RAW" in caps else ["NET_RAW"],
             dns=[gw] if gw else None, dns_search=["lab.invalid"],
-            sysctls={"net.ipv6.conf.all.disable_ipv6": "1"},
+            sysctls={"net.ipv6.conf.all.disable_ipv6": "1", "net.ipv4.ping_group_range": "0 2147483647"},
             restart_policy={"Name": "unless-stopped"},
             binds={k: v for k, v in (volumes or {}).items()} or None)
         netcfg = api.create_networking_config({netname: api.create_endpoint_config(ipv4_address=ip, aliases=[m["name"]])})
@@ -444,9 +630,30 @@ class Manager:
         c = api.create_container(m["image"], name=name, hostname=m["name"], environment=env,
                                  labels=self._labels(lab_id, owner, origin, m["name"], lifetime, lineage),
                                  host_config=host_config, networking_config=netcfg, detach=True)
+        self._record_anon_volumes(c["Id"], lab_id, m["name"], set((volumes or {}).keys()))
         api.start(c["Id"])
         self.apply_route(lab_id, m["name"])
         return c
+
+    def _record_anon_volumes(self, cid: str, lab_id: str, member: str, named: set) -> None:
+        """The anonymous volumes Docker made for the image's VOLUME lines (mysql:8: /var/lib/mysql). They
+        go with the container (remove v=True, review 11-05 #3); recorded so that `gc` can remove one a failed
+        removal left behind — it can tell them from any other anonymous volume on the host only this way."""
+        try:
+            mounts = self.docker.api.inspect_container(cid).get("Mounts") or []
+        except Exception:  # noqa: BLE001
+            log.warning("could not inspect %s for anonymous volumes", cid[:12])
+            return
+        now = time.time()
+        for mt in mounts:
+            vname = mt.get("Name") or ""
+            if mt.get("Type") == "volume" and vname and vname not in named:
+                self.store.x("INSERT OR REPLACE INTO anon_volumes VALUES (?,?,?,?)", (vname, lab_id, member, now))
+
+    def remove_container(self, c) -> None:
+        """Every lab-made container goes with its anonymous volumes (review 11-05 #3). Named volumes
+        (/data, the Tor data) are never removed by this."""
+        c.remove(force=True, v=True)
 
     def apply_route(self, lab_id: str, member: str) -> bool:
         """(Re)point the member's default route at the gateway (tor labs) or
@@ -510,10 +717,10 @@ class Manager:
         removed = {"containers": 0, "networks": 0, "volumes": 0, "ports": 0}
         flt = {"label": [f"ghost.lab.id={lab_id}"]}
         for c in self.docker.containers.list(all=True, filters=flt):
-            c.remove(force=True)
+            self.remove_container(c)
             removed["containers"] += 1
         for c in self.docker.containers.list(all=True, filters={"label": [f"ghost.lab.sidecar_of={lab_id}"]}):
-            c.remove(force=True)
+            self.remove_container(c)
         if getattr(self, "kept", None):
             try:
                 self.kept.drop_sidecar_rule(lab_id)
@@ -659,9 +866,18 @@ class Manager:
         return out
 
     # ----------------------------------------------------------- exec
+    def _secret_pairs(self) -> List[Tuple[str, str]]:
+        # pairs, not a dict: one name (DB_PASSWORD) may hold a different value in every app
+        return [(r["name"], r["value"]) for r in self.store.q("SELECT name, value FROM secrets")]
+
     def redactor(self):
-        vals = self.store.q("SELECT name, value FROM secrets")
-        return redact.build({f"{r['name']}": r["value"] for r in vals})
+        return redact.build(self._secret_pairs())
+
+    def redactor_bytes(self):
+        return redact.build_bytes(self._secret_pairs())
+
+    def redact_text(self, text: str) -> str:
+        return redact.apply(text, self.redactor())
 
     def _exec(self, lab_id: str, member: str, cmd: str, timeout_s: int = 0, workdir: str = "/root",
               env: Optional[Dict[str, str]] = None, stdin: Optional[str] = None) -> Dict[str, Any]:
@@ -718,7 +934,8 @@ class Manager:
         out = redact.apply(b"".join(out_chunks).decode("utf-8", "replace"), rules)
         err = redact.apply(b"".join(err_chunks).decode("utf-8", "replace"), rules)
         out_tr, err_tr = len(out) > cap, len(err) > cap
-        return {"lab_id": lab_id, "member": member, "cmd": cmd, "exit_code": code,
+        # the command text is echoed redacted too (review 11-05 #17: `cmd` carried the secret back)
+        return {"lab_id": lab_id, "member": member, "cmd": redact.apply(cmd, rules), "exit_code": code,
                 "stdout": out[-cap:], "stderr": err[-cap:],
                 "stdout_truncated": out_tr or sizes["out"] > cap * 2, "stderr_truncated": err_tr or sizes["err"] > cap * 2,
                 "duration_s": round(time.time() - t0, 3), "timed_out": timed_out}
@@ -752,15 +969,23 @@ class Manager:
         if r.exit_code != 0:
             raise LabError("internal", "could not start the job", hint="check the member's logs")
         self.store.x("INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?)", (job_id, lab_id, member, cmd, time.time(), None, "running", None))
-        return {"lab_id": lab_id, "member": member, "job_id": job_id, "cmd": cmd}
+        return {"lab_id": lab_id, "member": member, "job_id": job_id, "cmd": self.redact_text(cmd)}
 
-    def job(self, lab_id: str, job_id: str, tail_bytes: int = 65536, kill: bool = False) -> Dict[str, Any]:
-        self.get(lab_id)
+    def job(self, lab_id: str, job_id: str, tail_bytes: int = 65536, kill: bool = False,
+            origin: str = "autopilot") -> Dict[str, Any]:
+        """kill=True is a mutation: a kept lab's job is killed by its owner only (review 11-05 #7). The
+        origin defaults to autopilot (fail closed) for a caller that does not say."""
+        row = self.get(lab_id)
+        if kill:
+            self.guard_kept_mutation(row, origin, "job kill")
         rows = self.store.q("SELECT * FROM jobs WHERE job_id=? AND lab_id=?", (job_id, lab_id))
         if not rows:
             raise LabError("unknown_job", f"no job {job_id} in {lab_id}", hint="list the lab's jobs")
         j = rows[0]
         d = f"/var/log/lab/jobs/{job_id}"
+        want = max(1, min(int(tail_bytes), int(self.cfg.output_cap_bytes)))
+        pairs = self._secret_pairs()
+        extra = redact.margin(pairs)
         try:
             c = self.container(lab_id, j["member"])
             if kill:
@@ -769,7 +994,10 @@ class Manager:
                                           f"kill -KILL -- -$p 2>/dev/null; sleep 0.3; true"])
             alive = c.exec_run(["sh", "-c", f"kill -0 $(cat {d}.pid) 2>/dev/null && echo yes || echo no"]).output.decode().strip()
             rc = c.exec_run(["sh", "-c", f"cat {d}.rc 2>/dev/null"]).output.decode().strip()
-            tail = c.exec_run(["sh", "-c", f"tail -c {max(1, min(int(tail_bytes), int(self.cfg.output_cap_bytes)))} {d}.log 2>/dev/null"]).output.decode("utf-8", "replace")
+            # fetched with a margin, redacted, THEN cut (review 11-05 #9: `tail -c` halved a secret at the cut)
+            raw = c.exec_run(["sh", "-c", f"tail -c {want + extra} {d}.log 2>/dev/null"]).output or b""
+            tail = redact.cut_tail(raw, want, redact.build_bytes(pairs), truncated=len(raw) >= want + extra) \
+                .decode("utf-8", "replace")
             # contract states only: running | exited | lost (a kill ends as exited, exit_code null, killed: true)
             state = "running" if alive == "yes" else ("exited" if (rc != "" or kill) else "lost")
         except Exception:  # noqa: BLE001
@@ -777,9 +1005,9 @@ class Manager:
         code = int(rc) if rc.lstrip("-").isdigit() else None
         if state != "running" and j["state"] == "running":
             self.store.x("UPDATE jobs SET state=?, exit_code=?, ended_at=? WHERE job_id=?", (state, code, time.time(), job_id))
-        return {"lab_id": lab_id, "job_id": job_id, "member": j["member"], "cmd": j["cmd"], "state": state,
-                **({"killed": True} if kill else {}),
-                "exit_code": code, "output_tail": redact.apply(tail, self.redactor()),
+        return {"lab_id": lab_id, "job_id": job_id, "member": j["member"], "cmd": self.redact_text(j["cmd"]),
+                "state": state, **({"killed": True} if kill else {}),
+                "exit_code": code, "output_tail": tail,
                 "started_at": j["started_at"], "ended_at": j["ended_at"] or (time.time() if state != "running" else None)}
 
     # ----------------------------------------------------------- files
@@ -842,11 +1070,8 @@ class Manager:
         self.touch(lab_id, origin)
         self.member(lab_id, member)
         data = self.read_raw(lab_id, member, path, int(self.cfg.file_max_bytes), "file_max_bytes")
-        text_rules = self.redactor()
-        try:
-            red = redact.apply(data.decode("utf-8"), text_rules).encode()
-        except UnicodeDecodeError:
-            red = data
+        # at the byte level, whatever the encoding (review 11-05 #8: one non-UTF-8 byte returned it all raw)
+        red = redact.apply_bytes(data, self.redactor_bytes())
         return {"lab_id": lab_id, "member": member, "path": path, "bytes": len(red),
                 "content_b64": base64.b64encode(red).decode()}
 
@@ -935,10 +1160,14 @@ class Manager:
         try:
             conn.request(method, path, headers={"Host": f"{m['name']}:{port}", "User-Agent": "ghost-labs-probe"})
             resp = conn.getresponse()
-            body_head = resp.read(16384).decode("utf-8", "replace")
+            pairs = self._secret_pairs()
+            # read past the 16 KB head by a margin, redact, then cut (review 11-05 #9)
+            raw = resp.read(HTTP_HEAD_BYTES + redact.margin(pairs))
+            body_head = redact.cut_head(raw, HTTP_HEAD_BYTES, redact.build_bytes(pairs)).decode("utf-8", "replace")
+            rules = redact.build(pairs)
             return {"lab_id": lab_id, "member": m["name"], "port": port, "path": path, "status": resp.status,
-                    "headers": {k: redact.apply(v, self.redactor()) for k, v in resp.getheaders()},
-                    "body_head": redact.apply(body_head, self.redactor())}
+                    "headers": {k: redact.apply(v, rules) for k, v in resp.getheaders()},
+                    "body_head": body_head}
         except OSError as e:
             return {"lab_id": lab_id, "member": m["name"], "port": port, "path": path, "status": None,
                     "error": f"{type(e).__name__}: {e}"}
@@ -974,7 +1203,7 @@ class Manager:
         api = self.docker.api
         name = f"ghost-labs-shot-{lab_id}-{uuid.uuid4().hex[:6]}"
         hc = api.create_host_config(init=True, mem_limit="768m", memswap_limit="768m", pids_limit=512,
-                                    shm_size="256m", dns=None, dns_search=["lab.invalid"],
+                                    shm_size="256m", dns=None, dns_search=["lab.invalid"], cap_drop=["NET_RAW"],
                                     sysctls={"net.ipv6.conf.all.disable_ipv6": "1"})
         ncfg = api.create_networking_config({netname: api.create_endpoint_config(ipv4_address=ip)})
         url = f"http://{m['ip']}:{port}{path}"
@@ -1001,7 +1230,7 @@ class Manager:
             raise LabError("internal", f"screenshot failed: {type(e).__name__}: {e}"[:300], hint="check the page with lab http")
         finally:
             try:
-                self.docker.containers.get(cid).remove(force=True)
+                self.remove_container(self.docker.containers.get(cid))
             except Exception:  # noqa: BLE001
                 pass
         if len(png) > 2 * 1024 * 1024:
@@ -1019,7 +1248,40 @@ class Manager:
             pruned["build_cache_reclaimed"] = int(r.get("SpaceReclaimed") or 0)
         except Exception as e:  # noqa: BLE001
             pruned["error"] = f"{type(e).__name__}: {e}"[:200]
+        pruned["anon_volumes_removed"] = self.gc_anon_volumes()
         return {"reaped": reaped, **pruned}
+
+    def gc_anon_volumes(self) -> List[str]:
+        """Remove the dangling anonymous volumes that lab containers had (review 11-05 #3). Only names this
+        service recorded at member create are candidates, and only while Docker reports them dangling (no
+        container, running or not, refers to them). Anonymous volumes leaked before this record existed can't
+        be told from other software's and are left alone."""
+        removed: List[str] = []
+        rows = self.store.q("SELECT name FROM anon_volumes")
+        if not rows:
+            return removed
+        try:
+            dangling = {v.name for v in self.docker.volumes.list(filters={"dangling": True})}
+        except Exception:  # noqa: BLE001
+            log.exception("gc: dangling volumes not listed")
+            return removed
+        try:
+            existing = {v.name for v in self.docker.volumes.list()}
+        except Exception:  # noqa: BLE001
+            existing = None
+        for r in rows:
+            name = r["name"]
+            if name in dangling:
+                try:
+                    self.docker.volumes.get(name).remove(force=False)
+                    removed.append(name)
+                except Exception as e:  # noqa: BLE001 — in use again, or gone meanwhile
+                    log.info("gc: anonymous volume %s kept: %s", name, e)
+                    continue
+                self.store.x("DELETE FROM anon_volumes WHERE name=?", (name,))
+            elif existing is not None and name not in existing:
+                self.store.x("DELETE FROM anon_volumes WHERE name=?", (name,))   # removed with its container
+        return removed
 
     def spec(self, lab_id: str) -> Dict[str, Any]:
         row = self.get(lab_id)
@@ -1107,17 +1369,24 @@ class Manager:
         objects, re-apply routes and forwarders (contract v1 §4 + v2 §11.18)."""
         log: List[str] = []
         seen: Dict[str, Dict[str, str]] = {}
+        built: Dict[str, set] = {}          # lab id -> the members that have a container
         for c in self.docker.containers.list(all=True, filters={"label": [f"{LABEL}=1"]}):
             lb = c.labels or {}
             lid = lb.get("ghost.lab.id")
-            if lid:
-                seen.setdefault(lid, lb)
+            if lid and lb.get("ghost.lab.member"):
+                built.setdefault(lid, set()).add(lb["ghost.lab.member"])
+            # the labels of the container that says what the lab IS (review 11-05 #12: a helper container
+            # without ghost.lab.lifetime listed first made a kept lab look like an orphan and destroyed it)
+            if lid and (lid not in seen or (lb.get("ghost.lab.lifetime") == "kept"
+                                            and seen[lid].get("ghost.lab.lifetime") != "kept")):
+                seen[lid] = lb
         for lid, lb in seen.items():
             if self.store.lab(lid):
                 continue
             if lb.get("ghost.lab.lifetime") == "kept":
                 log.append(f"adopt kept {lid} (unreadable metadata, flagged)")
-                self._adopt_members(lid)
+                # the row FIRST: _adopt_members reads it for the subnet (review 11-05 CRIT 1: adopting a kept
+                # lab whose members have an IP raised TypeError and the service never started)
                 self.store.put_lab({"lab_id": lid, "template": "", "label": "", "state": "ready",
                                     "owner": lb.get("ghost.lab.owner", ""), "origin": lb.get("ghost.lab.origin", "owner"),
                                     "lineage": lb.get("ghost.lab.lineage", ""), "lifetime": "kept", "purpose": "adopted_unreadable",
@@ -1127,6 +1396,7 @@ class Manager:
                                     "spec_json": dumps({}), "readiness_json": dumps({}),
                                     "app_json": dumps({"state": "stopped", "last_error": "secrets_lost"}),
                                     "agent_api_url": None, "lan": 0})
+                self._adopt_members(lid)
             else:
                 log.append(f"destroy orphan {lid} (no metadata)")
                 self._teardown(lid)
@@ -1144,10 +1414,24 @@ class Manager:
                 # the operation died with the old process; kept.recover_moves() puts the data back
                 self.store.update_lab(lid, state="ready")
                 log.append(f"{lid} was {lab['state']} at restart: marked ready")
-            if lab["state"] == "creating":
-                # the build finished or died with the old process; nobody is waiting on readiness any more
-                self.store.update_lab(lid, state="unready")
-                log.append(f"{lid} was creating at restart: marked unready")
+            if self.pool_of(lab) == "kept" and lab["lifetime"] != "kept" and lab["state"] != "destroying":
+                # a rehearsal twin: the thread that would destroy it died with the old process (review 11-05 #4)
+                self.store.update_lab(lid, state="destroying")
+                log.append(f"{lid} was a rehearsal twin at restart: handed to the reaper")
+                continue
+            if lab["state"] == "creating" or (lab["lifetime"] == "kept" and lab["state"] == "destroying"):
+                # (a kept lab is "destroying" only from the r11 restart path below; nothing ever reaps it: repair)
+                if lab["lifetime"] != "kept" and not self._build_complete(lid, lab, built.get(lid, set())):
+                    # the build died with the old process half-way (members or ports missing) and nothing re-runs
+                    # it: the reaper's next pass removes it as create_failed (review 11-05 #15)
+                    self.store.update_lab(lid, state="destroying")
+                    log.append(f"{lid} was creating at restart, half-built: handed to the reaper (create_failed)")
+                else:
+                    # review r12 F2: a KEPT lab (kept while still creating) is never reaped — "destroying" would
+                    # stick forever — and a fully built lab died only in its readiness wait: both are "unready",
+                    # as before r11, for the readiness path / the owner to decide
+                    self.store.update_lab(lid, state="unready")
+                    log.append(f"{lid} was {lab['state']} at restart ({lab['lifetime']}, built): marked unready")
             if lid not in seen:
                 log.append(f"drop row {lid} (no containers)")
                 self.store.delete_lab(lid)
@@ -1183,8 +1467,44 @@ class Manager:
             log += self.ports.reconcile_serve(wanted)
         except Exception as e:  # noqa: BLE001
             log.append(f"serve reconcile failed: {type(e).__name__}: {e}"[:200])
+        legacy = self.legacy_lab_networks()
+        if legacy:
+            log.append("lab networks without a glab-* bridge (made before review 11-05 #5; INPUT is matched by "
+                       f"source only and routing out of them is not blocked; recreate these labs): {', '.join(legacy)}")
         self.sweep_routes()
         return log
+
+    def _build_complete(self, lab_id: str, lab: Dict[str, Any], have: set) -> bool:
+        """Every member of the lab's spec has its member row and a container, and every published port its
+        lease (review r12 F2). A spec that names no members can't be checked: incomplete."""
+        spec_members = (loads(lab["spec_json"], {}) or {}).get("members") or []
+        if not spec_members:
+            return False
+        rows = {m["name"] for m in self.store.members(lab_id)}
+        leases = {(p["member"], int(p["cport"])) for p in self.ports.leases(lab_id)}
+        for m in spec_members:
+            name = m.get("name")
+            if name not in rows or name not in have:
+                return False
+            if any((name, int(cp)) not in leases for cp in (m.get("ports") or [])):
+                return False
+        return True
+
+    def legacy_lab_networks(self) -> List[str]:
+        """Lab ids whose network has Docker's default br-<id> bridge, not glab-<id>: the interface rules of the
+        host firewall don't cover them (review 11-05 #5). A network can't be renamed, and rebuilding a kept lab's
+        network is a migration with many states, so they are reported, never moved: the owner recreates them
+        (a kept app: keep a new version and switch to it)."""
+        out = []
+        try:
+            nets = self.docker.networks.list(filters={"label": [f"{LABEL}=1"]})
+        except Exception:  # noqa: BLE001
+            return out
+        for n in nets:
+            lid = (n.attrs.get("Labels") or {}).get("ghost.lab.id")
+            if lid and (n.attrs.get("Options") or {}).get(net.BRIDGE_OPT) != net.lab_bridge(lid):
+                out.append(lid)
+        return sorted(out)
 
 
 def job_script(d: str, workdir=None) -> str:

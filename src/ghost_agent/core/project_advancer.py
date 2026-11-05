@@ -962,6 +962,9 @@ LAB_WAIT_PREFIX = "code build waits for the labs host (task back to PENDING)"
 #: review r4 #1: a give-up is NOT a wait (it never restarts by itself) — its own prefix, so no lab-wait branch
 #: (the batch's stop reason, the no-progress scoring) can take it for one
 LAB_GAVE_UP_PREFIX = "code build gave up waiting for the labs host (task waits for the owner)"
+#: review 11-05 P-m4: no lab, and the claimed task was an OWNER HOLD — it went back to that hold. Its own prefix (the
+#: r4 rule): under LAB_WAIT_PREFIX the batch told the owner it "starts again by itself"
+LAB_NO_LAB_HELD_PREFIX = "code build got no lab (task back to its owner hold)"
 
 
 def _experiment_gate_build(store, project_id, nxt, cres):
@@ -1174,10 +1177,14 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                         {"tool": "code_executor", "code": _lw, "reason": (cres.summary or "")[:200]})
         _work_log_step(store, project_id, nxt, outcome="had_failures",
                        files=list(cres.files or []), tools={"code_executor": 1},
-                       note=f"{_lw}: back to PENDING until the labs host has room: {(cres.summary or '')[:200]}")
-        return AdvanceResult(True, nxt.id, "coding",
-                             f"{LAB_WAIT_PREFIX} [{_lw}]: {cres.summary}"
-                             + ("" if _back in ("PENDING", "READY") else f" (back to {_back})"), None)
+                       note=(f"{_lw}: back to PENDING until the labs host has room: {(cres.summary or '')[:200]}"
+                             if _back in ("PENDING", "READY") else
+                             # r12 m6: a claimed owner hold went back to its HOLD — not PENDING, no lab wait
+                             f"{_lw}: no lab; back to the owner's hold ({_back}): {(cres.summary or '')[:200]}"))
+        if _back not in ("PENDING", "READY"):
+            return AdvanceResult(True, nxt.id, "coding",
+                                 f"{LAB_NO_LAB_HELD_PREFIX} [{_lw}]: {cres.summary} (back to {_back})", None)
+        return AdvanceResult(True, nxt.id, "coding", f"{LAB_WAIT_PREFIX} [{_lw}]: {cres.summary}", None)
     plan.update_status(nxt.id, TaskStatus.FAILED,
                        failure_reason=f"code_executor: {cres.summary}")
     _increment_budget(store, project_id)
@@ -3018,6 +3025,12 @@ async def advance_many(
                              "status": (store.get_task(res.task_id) or {}).get("status"),
                              "summary": res.summary})
             stop_reason = "lab_capacity" if "[lab_capacity]" in res.summary[:120] else "labs_down"   # §4SX D4  (labs_no_answer → labs_down)
+            break
+        if res.task_id and res.summary.startswith(LAB_NO_LAB_HELD_PREFIX):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "lab_owner_hold"        # review 11-05 P-m4: it waits for the owner, not the labs host
             break
         if res.task_id and res.summary.startswith(LAB_GAVE_UP_PREFIX):
             advanced.append({"task_id": res.task_id, "classification": res.classification,

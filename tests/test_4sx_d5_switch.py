@@ -250,6 +250,8 @@ async def test_jobs_maps_onto_the_run_row_of_that_job(tmp_path, scope, monkeypat
         return "old jobs"
     import ghost_agent.tools.delegate as D
     monkeypatch.setattr(D, "tool_jobs", fake_jobs)
+    from test_4sx_c_run_tool import seed_job
+    seed_job(ctx, "job-99999999")
     assert await R.jobs_alias(context=ctx, action="collect", job_id="job-99999999") == "old jobs"
     assert old == [("collect", "job-99999999")]                     # promoted before the switch: still read
     out = await R.jobs_alias(context=ctx, action="spawn")
@@ -285,7 +287,7 @@ def test_the_banner_names_run_when_the_job_is_a_run():
     job = {"id": "job-1a2b3c4d", "log": "/workspace/.jobs/x.log"}
     b = _promotion_banner(job, 95, "job-1a2b3c4d")
     assert "run(action='collect', name='job-1a2b3c4d')" in b and "jobs(" not in b
-    assert "jobs(action='collect', job_id='job-1a2b3c4d')" in _promotion_banner(job, 95)
+    assert "run(action='collect', name='job-1a2b3c4d')" in _promotion_banner(job, 95)
     r = _promoted_result(job, 95, "", "job-1a2b3c4d")
     assert r.status is OutcomeStatus.UNRESOLVED and "run(action='status', name='job-1a2b3c4d')" in r
 
@@ -323,7 +325,8 @@ def test_the_landed_job_hint_names_run_collect(tmp_path, scope):
     scope(ctx)
     R.record_promoted_job(ctx, {"id": "job-1a2b3c4d"})
     assert _collect_hint({"id": "job-1a2b3c4d"}, ctx) == "run(action='collect', name='job-1a2b3c4d')"
-    assert _collect_hint({"id": "job-00000000"}, ctx) == "jobs(action='collect')"
+    assert _collect_hint({"id": "job-00000000"}, ctx) == "run(action='collect', name='job-00000000')"   # r12
+    assert _collect_hint({}, ctx) == "run(action='collect')"
     assert _collect_hint({"started_via": "run", "label": "bench"}) == "run(action='collect', name='bench')"
 
 

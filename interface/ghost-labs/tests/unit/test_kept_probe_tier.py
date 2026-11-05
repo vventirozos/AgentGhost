@@ -160,6 +160,8 @@ def test_the_reaper_retires_a_probe_kept_lab_with_its_lease_and_secrets_and_no_b
     make_kept(m, "lab_pq", lineage="pq")
     m.store.update_lab("lab_pq", origin="probe", retire_at=time.time() - 1)
     m.store.set_secret("pq", "web", "API", "x")
+    _probe_made(kept, "pq", "chess")
+    _probe_made(kept, "pq", "web")
     monkeypatch.setattr(kept, "_backup_locked", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no backup")))
     acted = m.reap_once()
     assert acted == [{"lab_id": "lab_pq", "reason": "retired"}]
@@ -186,6 +188,12 @@ def _vol(m, name, lineage="", app="chess", member="m1"):
                                           "ghost.data.member": member})
 
 
+def _probe_made(kept, lineage, app, lab_id="lab_x"):
+    """What a probe's /keep records (review 11-05 CRIT 2): retirement removes only a namespace a probe made."""
+    kept._claim("app", f"{lineage}/{app}", lab_id)
+    kept._claim("svc", app, lab_id)
+
+
 def _retiring(m, *lids):
     for lid in lids:
         m.store.update_lab(lid, origin="probe", retire_at=time.time() - 1)
@@ -198,6 +206,7 @@ def test_a_retired_probe_lab_drops_its_lease_and_its_shared_volume_as_the_last_v
     m = env
     make_kept(m, "lab_s1", lineage="pz", mounted=False)            # a staged last version
     _retiring(m, "lab_s1")
+    _probe_made(kept, "pz", "chess", "lab_s1")
     m.store.x("INSERT INTO ports VALUES (?,?,?,?,?,?)", (18999, "lab_s1", "m1", 8080, "pz/chess", 0))
     v = data_volume_name("pz", "chess", "m1", "")
     _vol(m, v, "pz")
@@ -231,6 +240,7 @@ def test_a_fresh_last_version_takes_every_data_volume_of_the_app(kept, env):  # 
     m = env
     make_kept(m, "lab_g2", lineage="pg", data="fresh")
     _retiring(m, "lab_g2")
+    _probe_made(kept, "pg", "chess", "lab_g2")
     for v, mem in ((data_volume_name("pg", "chess", "m1", ""), "m1"), (data_volume_name("pg", "chess", "db", ""), "db"),
                    (data_volume_name("pg", "chess", "m1", "lab_g2"), "m1")):
         _vol(m, v, "pg", member=mem)

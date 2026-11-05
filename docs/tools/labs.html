@@ -21,7 +21,7 @@
   </nav>
 </aside>
 <main>
-  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Read <a href="../ghost-labs.html">Labs: real machines</a> (how it works, with examples), or start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>tools / labs.py</h1>
   <p class="subtitle">The <code>lab</code> tool: disposable machines on the labs host, for the system under test. <span class="tag">2026-11-04 &sect;4SX Phase B</span></p>
@@ -48,7 +48,7 @@
       <tr><td><code>list</code></td><td><code>all_owners</code></td><td>Lists this owner's labs. Also lists inventory rows that are no longer on the host: "destroyed … by &lt;other owner&gt;"; "missing (host changed …)" when the row's <code>host_id</code> differs from the host's current one (the row is kept, never dropped); or "gone from the labs host" (expired; the row is marked <code>expired</code>). Each of these is said once: rows the tool itself retired (<code>expired</code>, <code>host_changed</code>) are not listed again, and a lab destroyed by another owner is named for 24&nbsp;h. Rows created after the host was asked (a <code>create</code> in the same batch) are skipped.</td></tr>
       <tr><td><code>status</code></td><td><code>lab_id</code></td><td>The detail: members, IPs, images, ports with the URLs <em>from the API</em>, and readiness.</td></tr>
       <tr><td><code>exec</code></td><td><code>lab_id</code>, <code>member</code>, <code>cmd</code>, <code>timeout_s</code> (default 120, at most 900), <code>workdir</code>, <code>stdin</code></td><td>Runs a command in the foreground (there is no detached exec in Phase B). See <a href="#result">the result</a>.</td></tr>
-      <tr><td><code>put</code> / <code>get</code></td><td><code>lab_id</code>, <code>member</code>, <code>path</code> (absolute, on the member), <code>sandbox_path</code></td><td>Copies a file between the workspace and a member. <code>sandbox_path</code> is project-relative (<code>project_scoped_sandbox</code>). A <code>/workspace/</code> prefix means the sandbox root. Any path that resolves outside the sandbox is refused. <code>put</code> sends at most 8&nbsp;MB. <code>get</code> refuses a folder as its target, and says when it REPLACED an existing file. A <code>get</code> clears the cached sandbox listing, like <code>execute</code>.</td></tr>
+      <tr><td><code>put</code> / <code>get</code></td><td><code>lab_id</code>, <code>member</code>, <code>path</code> (absolute, on the member), <code>sandbox_path</code></td><td>Copies a file between the workspace and a member. <code>sandbox_path</code> resolves exactly as <code>file_system</code> resolves it: in a project, <code>x</code>, <code>/x</code> and <code>/workspace/x</code> are all the project's <code>x</code> (r13&ndash;r15). The result shows where it landed (<code>/workspace/…</code>). Anything that resolves outside the workspace is refused. <code>put</code> sends at most 8&nbsp;MB. <code>get</code> refuses a folder as its target, and says when it REPLACED an existing file. A <code>get</code> clears the cached sandbox listing, like <code>execute</code>.</td></tr>
       <tr><td><code>member</code></td><td><code>lab_id</code>, <code>member</code>, <code>op</code></td><td>One of <code>stop start restart kill pause unpause isolate rejoin</code>. Isolate and rejoin are the network faults.</td></tr>
       <tr><td><code>logs</code></td><td><code>lab_id</code>, <code>member</code>, <code>tail</code></td><td>The member's logs (the service redacts them).</td></tr>
       <tr><td><code>http</code></td><td><code>lab_id</code>, <code>member</code>, <code>port</code>, <code>path</code>, <code>method</code> (GET or HEAD)</td><td>The service makes a GET or HEAD to the member's port. This is the only way to reach a lab's web port: the browser cannot.</td></tr>
@@ -153,6 +153,58 @@ PostgreSQL 18.1 …</pre>
 
   <h2 id="loop">Loop sets that include <code>lab</code></h2>
   <p>Verify tools for edit churn, external evidence, work tools, the batch wall, mutating tools (for the drop note and the idempotency guard), the evidence gate and task state, claim-binding source exclusion (program output is not a citation), and read/write loop exemption (<code>status</code> polls, then <code>exec</code>).</p>
+
+  <h2 id="4sx-r11">End-to-end review r11 <span class="tag">2026-11-05 &sect;4SX-u</span></h2>
+  <ul>
+    <li><strong><code>put</code>/<code>get</code> never follow a link.</strong> The file is opened component by component from the workspace
+      root with <code>O_NOFOLLOW</code> (<code>_read_inside</code>, <code>file_system.write_bytes_nofollow_rel</code>). A link planted
+      during the 120 s host call wrote lab bytes onto the Mac, and a <code>put</code> could send a host file to a lab.</li>
+    <li><strong><code>lab list</code> asks before it retires.</strong> A live row the host leaves out is asked about
+      (<code>_settle_unlisted</code>: GET, then the leftovers-only DELETE), and retired only when the host says it is gone
+      with nothing left. A row made on another labs host, or seen while <code>/v1/health</code> does not answer, is shown and
+      never retired, so project teardown still counts it. Only the owner's own <code>lab destroy</code> closes such a record,
+      and the reply says nothing was deleted there.</li>
+    <li><strong>A 404 is not "destroyed" for another host's lab</strong> (<code>lab_on_other_host</code>): the <code>unknown_lab</code> text
+      names the host it was made on. A run on it is <code>unknown</code>, not <code>lost</code>, and its stop is FAILED.</li>
+    <li><strong>Batch order:</strong> <code>put</code>/<code>get</code>/<code>deploy</code> move workspace files in written order across labs.
+      Lineage actions (keep, deploy, rehearse, switch, rollback, restore, destroy) of two labs run in order (two destroys
+      may still run side by side). <code>switch B from_lab=A</code> follows a call on A.</li>
+    <li><strong>Walls:</strong> autopilot is refused everything but <code>status</code> on a KEPT lab, even its own project's (exec, put,
+      get, logs, http). A probe touches only labs it made, for every action that names a lab. An ownership check that is not
+      200/404 says so, never "belongs to someone else".</li>
+    <li><strong>Truthful texts:</strong> a destroy whose status check got no answer says nothing was deleted. A lab gone while
+      starting is <code>create_failed</code>, not "expired". Evicted labs are recorded destroyed, and by whom. A kept destroy with
+      leftovers ends its app runs.</li>
+  </ul>
+  <p>The host side of the same review (probe claims, anonymous volumes, the twin's pool, interface-keyed firewall rules,
+  NET_RAW, keep races, byte-level redaction) is in <code>interface/ghost-labs/README.md</code> and
+  <code>tests/unit/test_review_r11.py</code> there.</p>
+  <p>Tests: <code>tests/test_4sx_r11_review.py</code>.</p>
+
+  <h2 id="4sx-r12">Reviews r12&ndash;r14 <span class="tag">2026-11-05 &sect;4SX-u</span></h2>
+  <ul>
+    <li><strong>Paths resolve as <code>file_system</code> resolves them</strong> (<code>_sandbox_path</code>). In a project turn,
+      <code>/workspace/x</code>, <code>projects/&lt;own&gt;/x</code>, <code>/x</code> and <code>x</code> are all the project's <code>x</code>. That
+      includes <code>/etc/passwd</code>, which becomes <code>&lt;project&gt;/etc/passwd</code>. Every reply shows where the file landed
+      (<code>shown_path</code>, <code>/workspace/…</code>) and never echoes the spelling given (r15). <code>..</code> out of the workspace is refused. An
+      unattended build moves files only inside its own project. A deleted project's folder is never recreated, and a
+      released project's is never written.</li>
+    <li><strong>The probe wall:</strong> the ownership check fails CLOSED when the host does not answer. A probe acts only on labs the
+      host marks <code>origin=probe</code> and that it owns. <code>lab list</code> for a probe is refused with
+      <code>all_owners</code> or with no owner, and otherwise shows only probe-made labs and inventory rows, even inside an
+      owner's project.</li>
+    <li><strong>Readiness:</strong> only a 404 <code>unknown_lab</code> while starting counts as a failed build. The record is closed
+      only after the DELETE says what is left (leftovers are recorded). With no answer, the row stays live and says so.</li>
+    <li><strong>A deploy reads each file blocking</strong> (r16, &sect;4SD): <code>_tar_walk</code> opens with O_NONBLOCK so a FIFO
+      cannot hang it, then switches a regular file back to blocking before reading. On the virtiofs mount, a non-blocking
+      read could otherwise ship a truncated file. <code>lab get</code>'s writer does the same.</li>
+    <li><strong>Batch order:</strong> every pair of lineage actions runs in order, two destroys included. <code>backup</code> is a
+      lineage action. A workspace <code>run</code> after a <code>put</code>/<code>get</code>/<code>deploy</code> waits for it.</li>
+  </ul>
+  <p>Host side (r12&ndash;r14): eviction measures real memory (usage minus file cache) within a 5 s total deadline, and a container whose stats call is still running is not asked again. Memory-only
+  shortfalls evict the largest first. <code>/keep</code> needs a built lab. The r12/r13 probe-claims backfill was REMOVED in r14:
+  it never fired, and the live host had no kept labs. See <code>interface/ghost-labs/README.md</code>.</p>
+  <p>Tests: <code>tests/test_4sx_r12_review.py</code>, <code>test_4sx_r13_review.py</code>, <code>test_4sx_r14_review.py</code>, <code>test_4sx_r15_review.py</code>.</p>
 
   <h2 id="tests">Tests</h2>
   <p><code>tests/test_4sx_b_lab_tool.py</code> runs every action against a scripted fake at the <code>_call</code> seam. It checks <code>_call</code> itself against an httpx MockTransport (headers, no proxy for a tailnet host, unreachable mapping), plus the registry walls and the wiring.</p>

@@ -335,6 +335,27 @@ async def tool_jobs(action: str = None, job_id=None, context=None, **kwargs):
     return ToolOutcome.ok(_t)
 
 
+def job_visible_to_caller(j) -> bool:
+    """§4NS: a turn that is NOT the owner's (a probe, a scheduled run, a job's
+    wake, a sub-agent) sees, collects and cancels only the jobs IT started
+    — a probe or a wake turn could cancel the owner's running job (never
+    reported) and read the owner's output. (One rule, read by `tool_jobs` and
+    by `run`'s by-id route — review 11-05 r14.)"""
+    try:
+        from ..utils.logging import request_id_context, request_kind
+        _caller = str(request_id_context.get() or "")
+        # no request context (a direct call, a test) keeps the old behaviour
+        _owner_turn = (not _caller) or request_kind(_caller) in ("owner", "system")
+    except Exception:  # noqa: BLE001
+        return True
+    if _owner_turn or str((j.meta or {}).get("started_by") or "") == _caller:
+        return True
+    # r1: a job's own WAKE turn (`job-<sid>`, `job-job-<sid>`,
+    # `sub-job-<sid>` …) owns that job — it was refused its full result
+    _sid = str((j.meta or {}).get("sandbox_job_id") or "")
+    return bool(_sid) and _caller.endswith(_sid) and request_kind(_caller) in ("job", "background")
+
+
 async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
                           **kwargs):
     action = str(action or kwargs.get("operation") or "status").strip().lower()
@@ -352,25 +373,7 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
     # not kill a job that already finished.
     await asyncio.to_thread(_sync_sandbox_jobs, reg, context)
 
-    # §4NS: a turn that is NOT the owner's (a probe, a scheduled run, a job's
-    # wake, a sub-agent) sees, collects and cancels only the jobs IT started
-    # — a probe or a wake turn could cancel the owner's running job (never
-    # reported) and read the owner's output
-    try:
-        from ..utils.logging import request_id_context, request_kind
-        _caller = str(request_id_context.get() or "")
-        # no request context (a direct call, a test) keeps the old behaviour
-        _owner_turn = (not _caller) or request_kind(_caller) in ("owner", "system")
-    except Exception:  # noqa: BLE001
-        _caller, _owner_turn = "", True
-
-    def _mine(j) -> bool:
-        if _owner_turn or str((j.meta or {}).get("started_by") or "") == _caller:
-            return True
-        # r1: a job's own WAKE turn (`job-<sid>`, `job-job-<sid>`,
-        # `sub-job-<sid>` …) owns that job — it was refused its full result
-        _sid = str((j.meta or {}).get("sandbox_job_id") or "")
-        return bool(_sid) and _caller.endswith(_sid) and request_kind(_caller) in ("job", "background")
+    _mine = job_visible_to_caller
 
     def _mark_sandbox_delivered(jobs_) -> None:
         # §4NS: a sandbox job the model COLLECTED is delivered — its wake turn
@@ -399,7 +402,7 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
         if finished:
             out.append(f"FINISHED ({len(finished)}):")
             out += [_fmt_job(j) for j in finished[-10:]]
-            out.append("Use jobs(action='collect', job_id='...') to read a "
+            out.append("Use run(action='collect', name='<job id>') to read a "
                        "finished job's full result.")
         return "\n".join(out)
 
@@ -427,11 +430,11 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
                 if seen:
                     return (f"No NEW results — all {len(seen)} finished "
                             f"job(s) were already collected. Re-read one "
-                            f"with jobs(action='collect', job_id='...') "
-                            f"(e.g. {seen[-1].id}); jobs(action='status') "
+                            f"with run(action='collect', name='<job id>') "
+                            f"(e.g. {seen[-1].id}); run(action='status') "
                             f"shows what's still running.")
                 return ("No finished jobs with results to collect "
-                        "(jobs(action='status') shows what's running).")
+                        "(run(action='status') shows what's running).")
             out = [f"Collected {len(done)} finished job(s):"]
             for j in done:
                 out.append(f"\n--- {j.id}: {j.label[:70]} ---\n{j.result}")
@@ -439,7 +442,7 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
             await asyncio.to_thread(_mark_sandbox_delivered, done)
             if _overflow:
                 out.append(f"\n\n[{_overflow} more finished job(s) not shown "
-                           f"— call jobs(action='collect') again to read the "
+                           f"— call run(action='collect') again to read the "
                            f"next batch]")
             return "\n".join(out)
         job = _resolve_job(reg, job_id)
@@ -496,7 +499,7 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
             if not killed:
                 return (f"Error: sandbox job {job_id} was NOT cancelled — "
                         f"{why} Nothing was killed and the job's own state "
-                        f"is unchanged; jobs(action='status') re-checks it.")
+                        f"is unchanged; run(action='status') re-checks it.")
             reg.finish(job.id, status=STATUS_CANCELLED,
                        error="cancelled (sandbox process killed)")
             return (f"Job {job_id} cancelled — the detached sandbox command "

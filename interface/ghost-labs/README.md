@@ -36,13 +36,16 @@ The agent side needs `GHOST_LABS_HOST=http://<tailnet IP>:8700` and the key from
 - Every API call needs `X-Labs-Key` (constant-time compare). `X-Labs-Origin: owner|autopilot|probe`; missing = autopilot.
   Autopilot can't touch kept machines (`owner_only`), can't destroy a lab the owner used in the last 30 min
   (`owner_active`), and never pre-empts. An owner create evicts the oldest autopilot disposable labs when the pool is full.
-- Containers: never privileged, no Docker socket, no host bind mounts, only `NET_ADMIN` may be added, pids 1024,
+- Containers: never privileged, no Docker socket, no host bind mounts, only `NET_ADMIN`/`NET_RAW` may be added (NET_RAW
+  is DROPPED unless the template lists it; unprivileged ping works through `ping_group_range`), pids 1024,
   memory = swap = `mem_mb`, IPv6 off, labelled `ghost.labs=1` + `ghost.lab.*`. Anything without `ghost.labs=1` is never touched.
 - Egress `tor` (default) or `none`. Each lab is an `internal` network with its own /24 from `address_pool`. The shared
   gateway `ghost-labs-tor` sits at `.2` with TransPort/DNSPort and `FORWARD DROP`, `ip_forward=0`. Members get static IPs
   `.10–.127`, DNS = the gateway, and a default route via it (applied on create/start/rejoin, on Docker start/connect
   events and swept every reaper tick). `none` labs have no route and no external DNS.
-- Host firewall (`ghost-labs-fw`, before Docker and tailscaled): INPUT DROP for the pool and both fixed subnets;
+- Host firewall (`ghost-labs-fw`, before Docker and tailscaled): INPUT DROP by source for the pool and both fixed subnets,
+  AND by input interface (`glab-+`, `glabs-gw0`, `glabs-api0` — a member that forges its source is still dropped);
+  `mangle FORWARD -i glab-+ ! -o glab-+ -j DROP` (a member never routes off its own bridge except via the gateway);
   `raw PREROUTING` DROP from the gateway and sidecar bridges toward 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16.
   The service refuses to start, and refuses creates (`firewall_missing`), while any rule is missing.
 - Published ports: a socat forwarder on `127.0.0.1:<port>` (+ the LAN IP only for `lan: true` kept apps) and
@@ -145,16 +148,66 @@ Reboot: `make itest-reboot-pre`, reboot, `make itest-reboot-post`.
 
 - `/screenshot` helper has **no default route** (it reaches lab members only). Pages that load resources from the internet
   render without them. Stricter than §11.19, chosen so the page can't make the helper fetch anything.
-- The rehearsal twin is checked against the kept pool, but while it lives it is stored as a disposable lab (it shows in
-  `disposable_mb_used` for its few minutes).
+- The rehearsal twin is created in the kept pool (`pool="kept"`, review 11-05): it never counts against, or evicts from,
+  the disposable pool.
 - Daily backups run from the app supervisor; the first one happens on the first tick after `/keep`.
 - Export/import (§7, §11.17) is Phase E and not built yet.
 - Daily backups cover the app member only; every member is snapshotted before switch / rehearse / delete-with-data.
 - Data volumes of a retired (switched-out, `fresh`) version are not removed automatically.
 
+## Review 11-05 (r11) — what changed on the host
+
+- `reconcile` writes a lab's row BEFORE adopting its members (a restart mid-adopt lost kept rows); a lab caught in
+  `creating` at restart is set `destroying` and reaped as `create_failed`; kept labels win over a twin's.
+- Probe-made kept apps record what they claim (`probe_claims`: app, svc, port); retiring a probe app releases ONLY its
+  own claims, never the owner's data volume, port or service name.
+- Members are removed with their anonymous volumes (`remove(v=True)`); `gc` removes recorded ones a failed create left.
+- Keep/switch re-check under the lab lock; one create lock covers the capacity check and the flip; eviction pre-checks
+  `MemAvailable`; a create holds the lab lock through the build (no destroy mid-build).
+- `jobs/{id}/kill` on a kept lab is owner-only like every kept mutation.
+- Redaction works on bytes (non-UTF-8 files too), runs BEFORE any cut, covers the shlex-quoted form, and applies to the
+  exec command echo and `actions.log`. An empty labs key refuses to start.
+- Daily backups run on their own thread (a slow backup no longer stalls the app supervisor).
+- Not migrated: networks made before r11 keep Docker's `br-*` bridge (`gc` lists them; recreate those labs), running
+  containers keep NET_RAW until recreated.
+- Probe kept apps made before r11 have no claims; none exist on the live host (0 kept labs at the r11 deploy) — if one ever appears, retire it by hand.
+- r12: owner-create eviction counts what the autopilot victims really USE (`docker stats`: cgroup usage less
+  file cache — since r13 active AND inactive; unreadable = 0), not their limits, and re-checks `MemAvailable` after each eviction: it stops
+  as soon as the remaining victims can't make room (an idle 1000 MB lab no longer gets evicted for nothing).
+- r12: a lab caught in `creating` at restart goes to the reaper only when it is disposable AND half-built (a spec
+  member without its row/container, or a spec port without its lease); a kept lab, or a fully built one that died in
+  its readiness wait, is `unready` (a kept lab is never reaped, so `destroying` stuck for ever; a kept lab r11 already
+  left `destroying` is repaired to `unready` at the next start).
+- r12: lock order is `[app lock] -> lab lock -> create_lock`. Eviction under `create_lock` only TRIES a victim's lock
+  (all of them before anyone is evicted; a held one is skipped), so `/keep` holding a lab and waiting for
+  `create_lock` no longer deadlocks an owner create into a 30 s `busy`; a create waits for Tor before taking
+  `create_lock` (the capacity check and the row writes stay atomic under it).
+- r12: app supervisor and switch texts for `actions.log` (crashloop, restart, interrupted move, reverse failed) are
+  redacted BEFORE the 200-character cut (a secret straddling the cut was logged half).
+- r13: eviction's "freed" estimate is cgroup usage less ALL file cache (`active_file` + `inactive_file`, v1
+  `total_*`), clamped at 0 — `MemAvailable` already counts hot cache, so victims that only held cache are no longer
+  evicted for a create that then fails anyway.
+- r13: when only `MemAvailable` is short (budget and lab count fine), eviction skips victims that free ~0 MB and
+  takes the largest users first; a budget/count shortfall still evicts the oldest first.
+- r13: `/keep` refuses a lab that is not `ready` or `unready` (`not_ready` 409, `state` in the body): a
+  `destroying`/`creating`/`failed` lab no longer becomes production.
+- r13: the Tor gateway container is got-or-created under its own leaf `gateway_lock` (nothing is taken while it is
+  held), and a docker 409 name conflict re-reads the gateway another process made — concurrent creates waiting for
+  Tor outside `create_lock` no longer race into a 500.
+- r14: eviction's `docker stats` calls run all at once under one overall deadline (`STATS_DEADLINE_S`, 5 s): they
+  run under `create_lock` and the victims' lab locks, and one wedged call (docker's client timeout is 300 s)
+  blocked every create. A container that does not answer in time, or errors, counts 0 MB freed.
+- r15: a container whose earlier stats call is still running is not asked again (counts 0 MB, logged as such);
+  each create used to start one more stuck thread per member.
+
 ## Known limitations
 
+- A wedged `docker stats` call counts that victim as 0 MB, so an owner create can answer `budget_exceeded` where
+  evicting it would have made room. A container whose earlier stats call is still running is not asked again
+  (r15: each create used to start one more stuck thread per member).
 - Redaction is hygiene, not a boundary (see above).
+- When both the budget and memory are short, eviction is oldest-first for the budget and may evict two labs where one
+  large one would have fixed both (extra churn, never a failure).
 - A Tailscale Service name works only after the owner defines it in the admin console (`tcp:443`, tag `tag:labs-app`).
   Until it answers, `app.name_state` is `pending`/`unreachable` with a hint, and the port URL works.
 - `apt`/`pip` deploy requirements install over Tor and can be slow; recreated members (rehearse/switch) reinstall them,

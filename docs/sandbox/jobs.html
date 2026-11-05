@@ -32,6 +32,11 @@
   a supervised job instead of blocking the turn — and the model is woken with
   its result when it lands.</p>
 
+  <p class="warn"><strong>&sect;4SX D5 (2026-11-05).</strong> A promoted job is recorded as a <code>job</code> run, and every
+  result names the <a href="../tools/runs.html"><code>run</code></a> tool. A job with no run row is reached by its id:
+  <code>run status|collect|stop name=&lt;job id&gt;</code>. The <code>jobs</code> tool is an unadvertised alias of
+  <code>run</code> (review 11-05: no result tells the model to call <code>jobs</code> any more).</p>
+
   <h2>Why</h2>
   <p>Hitting the execution budget used to be pure loss, three times over.
   A live example (2026-08-11) is the canonical shape: a <code>yt-dlp</code>
@@ -62,9 +67,9 @@ EXIT CODE: 0 (STILL RUNNING — promoted to background job job-1a2b3c4d, NOT fin
 STDOUT/STDERR:
 ▎ Still running at 600s — promoted to background job job-1a2b3c4d. Do NOT re-run
   this command — it was NOT killed and is still working.
-▎ Poll it with jobs(action='status', job_id='job-1a2b3c4d'); read its full result
-  with jobs(action='collect', job_id='job-1a2b3c4d') once it finishes. Cancel it
-  with jobs(action='cancel', job_id='job-1a2b3c4d').
+▎ Poll it with run(action='status', name='job-1a2b3c4d'); read its full result
+  with run(action='collect', name='job-1a2b3c4d') once it finishes. Stop it
+  with run(action='stop', name='job-1a2b3c4d').
 ▎ It keeps running in the sandbox (up to 44 more minutes, then it is reaped) and
   survives this turn; its live output is in '.jobs/job-1a2b3c4d.log'
   (file_system operation='read').

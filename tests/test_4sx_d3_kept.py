@@ -534,6 +534,7 @@ async def test_keep_secrets_must_be_a_list_of_names(ctx, fake, scope, secrets):
 async def test_the_sweep_adopts_a_kept_app_with_no_row_once(ctx, fake, monkeypatch):
     monkeypatch.setattr(R, "_ADOPT_SEEN", set())
     monkeypatch.setattr(R, "_notify_owner", lambda c, msg, ids: True)
+    ctx.project_store = _Store(False)                               # r17: adopted only for this agent's own project
     _serving(fake, "up")
     await R.app_down_sweep(ctx)
     rows = _reg(ctx).rows(OWN, live_only=True)

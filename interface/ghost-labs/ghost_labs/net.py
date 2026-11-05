@@ -16,8 +16,21 @@ MEMBER_FIRST, MEMBER_LAST = 10, 127   # static member addresses; .128/25 is Dock
 PRIVATE_DSTS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"]
 
 
+LAB_BRIDGE_PREFIX = "glab-"   # glab-<8 hex> (13 chars, under IFNAMSIZ 15); never matches glabs-gw0 / glabs-api0
+BRIDGE_OPT = "com.docker.network.bridge.name"
+
+
 def lab_network_name(lab_id: str) -> str:
     return f"ghost-lab-{lab_id}"
+
+
+def lab_bridge(lab_id: str) -> str:
+    """The fixed host-side bridge of a lab network (review 11-05 #5): the firewall matches lab traffic by
+    INPUT INTERFACE (glab-+), so a member that forges its source address is still dropped. Docker's
+    default name br-<network id> could not be matched without matching every Docker network."""
+    suffix = lab_id[4:] if lab_id.startswith("lab_") else lab_id
+    name = LAB_BRIDGE_PREFIX + "".join(ch for ch in suffix if ch.isalnum())[:10]
+    return name[:15]
 
 
 def allocate_subnet(pool: ipaddress.IPv4Network, used: Iterable[str]) -> str:
@@ -75,16 +88,33 @@ def default_route(pid: int, runner=subprocess.run) -> str:
 
 
 FW_CHAIN = "GHOST-LABS-IN"
+FW_TABLES = ("filter", "raw", "mangle")
+NEW_ONLY = "-m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP"
 
 
 def expected_fw_rules(pool: str, gw_subnet: str, api_subnet: str) -> List[List[str]]:
-    """The rules ghost-labs-fw installs (iptables -S form, table first)."""
+    """The rules ghost-labs-fw installs (iptables -S form, table first).
+
+    - filter GHOST-LABS-IN (jumped from INPUT position 1): NEW toward the host from the lab pool and the two
+      fixed subnets, by SOURCE and — review 11-05 #5, a member can forge its source — by INPUT INTERFACE
+      (every lab bridge glab-+, and glabs-gw0 / glabs-api0).
+    - raw PREROUTING: the gateway/sidecar bridges toward private ranges (before ts-forward and DOCKER-USER).
+    - mangle FORWARD: nothing is ROUTED out of a lab bridge (review 11-05 #5: a NET_ADMIN member routing via
+      the bridge's .1 reached the tailnet, because tailscaled's ts-forward ACCEPTs -o tailscale0 before
+      Docker's internal-network drop). mangle FORWARD runs before every filter FORWARD rule and only sees
+      packets the host routes; traffic inside a lab (to members and the gateway at .2) is bridged and leaves
+      by the same bridge, so `! -o glab-+` leaves it alone. The raw table can't be used here: before the
+      routing decision a bridged packet to the gateway and a routed one look alike."""
     rules: List[List[str]] = [["filter", f"-A INPUT -j {FW_CHAIN}"]]
     for src in (pool, gw_subnet, api_subnet):
-        rules.append(["filter", f"-A {FW_CHAIN} -s {src} -m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP"])
+        rules.append(["filter", f"-A {FW_CHAIN} -s {src} {NEW_ONLY}"])
+    for ifc in (LAB_BRIDGE_PREFIX + "+", GW_BRIDGE, API_BRIDGE):
+        rules.append(["filter", f"-A {FW_CHAIN} -i {ifc} {NEW_ONLY}"])
     for br in (GW_BRIDGE, API_BRIDGE):
         for dst in PRIVATE_DSTS:
             rules.append(["raw", f"-A PREROUTING -d {dst} -i {br} -j DROP"])  # iptables -S order
+    lb = LAB_BRIDGE_PREFIX + "+"
+    rules.append(["mangle", f"-A FORWARD -i {lb} ! -o {lb} -j DROP"])
     return rules
 
 
@@ -92,7 +122,7 @@ def firewall_missing(pool: str, gw_subnet: str, api_subnet: str, runner=subproce
     """Expected rules that are NOT present, plus the jump if it is not INPUT's FIRST rule
     (tailscaled puts ts-input on top, which ACCEPTs udp 41641 from anywhere). Empty = ok."""
     lines = {}
-    for table in ("filter", "raw"):
+    for table in FW_TABLES:
         r = runner(["iptables", "-t", table, "-S"], capture_output=True, text=True, timeout=10)
         lines[table] = r.stdout.splitlines() if r.returncode == 0 else []
     missing = []

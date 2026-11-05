@@ -191,6 +191,11 @@ async def _probe(context, row: Dict[str, Any], origin: str) -> Tuple[str, str, D
             return "unknown", f"the labs host did not answer ({e})", {}
         body = body if isinstance(body, dict) else {}
         if st == 404 and body.get("error") == "unknown_lab":
+            from .labs import lab_on_other_host
+            other = await lab_on_other_host(context, lab_id, origin)
+            if other:                                            # review 11-05 M3: not ours to call destroyed
+                from .labs import other_host_phrase
+                return "unknown", f"its lab was made on {other_host_phrase(other)}", {}
             return "lost", "its lab was destroyed", {}           # design r1 L1
         if st == 404 and body.get("error") == "unknown_job":
             return "lost", "the lab no longer knows the job", {}  # review r1 minor 3
@@ -379,6 +384,84 @@ async def tool_run(context=None, action: str = None, name: str = None, command: 
     return _headed(await _tool_run(context, action, name, command, where, lifetime, port, lines, **kwargs))
 
 
+_JOB_ID_RE = re.compile(r"job-[0-9a-f]{6,16}")
+
+
+def _job_refs(context, job_id: str) -> set:
+    """Every id a background job is known by: the one given plus, for a REGISTRY id, its sandbox id — the id its run
+    row is filed under (`backend_ref`). Review 11-05 r15 M1: the run-row ownership walls matched the sandbox id only,
+    so project B stopped/collected project A's job by its registry id (what `run status` prints)."""
+    out = {str(job_id or "")}
+    try:
+        from ..core.jobs import get_job_registry
+        j = get_job_registry(context).get(str(job_id or ""))
+        sid = str(((j.meta or {}) if j is not None else {}).get("sandbox_job_id") or "")
+        if sid:
+            out.add(sid)
+    except Exception:  # noqa: BLE001
+        logger.debug("job refs of %s not read", job_id, exc_info=True)
+    return out
+
+
+async def _job_by_id(context, action: str, job_id: str) -> ToolOutcome:
+    """`run status|collect|stop name=<job id>` (and a bare `run collect`, owner-less turns only) on a background job
+    with no run row of this caller, under the jobs tool's own rules (§4NS: the owner's turn, or the job's starter /
+    its wake).
+
+    Review 11-05 r14: ONE record decides — the jobs registry's row, found by EITHER id (`_resolve_job`: the registry
+    id `run status` prints, or the sandbox id the promotion banner quotes) and judged by its OWN status (the landing
+    already normalised the exit code: `… | head` SIGPIPE is DONE, exit≠0 is FAILED, expired/lost are FAILED). The r11–r13
+    layers read the supervisor (one id namespace only) and parsed the result text (a command could print the line)."""
+    from ..core.jobs import STATUS_DONE, STATUS_RUNNING, get_job_registry
+    from .delegate import _resolve_job, _sync_sandbox_jobs, job_visible_to_caller, tool_jobs
+    if not job_id:
+        return await tool_jobs(action="collect", context=context)
+    if action == "stop" and _leaf_meta().get("leaf"):
+        # r13 m4: a build stops only the runs IT started — a job with no run row is not one of them
+        return _refuse(f"{job_id} was not started by this build — a build reads it, never stops it", "run_not_allowed")
+    try:
+        reg = get_job_registry(context)
+        await asyncio.to_thread(_sync_sandbox_jobs, reg, context)
+        job = _resolve_job(reg, job_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("job %s not resolved", job_id, exc_info=True)
+        job = None
+    if job is None:
+        return _refuse(f"no background job {job_id} (finished jobs are kept for a while only; `run status` lists "
+                       "this conversation's/project's runs)", "run_unknown")
+    if not job_visible_to_caller(job):
+        return _refuse(f"job {job_id} was started by another request — it is not yours to read or stop",
+                       "run_not_allowed")
+    if action == "status":
+        sid = str((job.meta or {}).get("sandbox_job_id") or "")
+        return _out(f"[job {job.id}{f' (sandbox {sid})' if sid and sid != job.id else ''} {job.status}]: "
+                    f"{str(job.label or '')[:80]}"
+                    + (" — still running; collect it when it has ended" if job.status == STATUS_RUNNING else
+                       f" — `run collect name={job_id}` reads its result"), OutcomeStatus.OK, changed=False)
+    out = await tool_jobs(action={"stop": "cancel"}.get(action, action), job_id=job_id, context=context)
+    if action == "stop":
+        # review r2: a cancel stamps no report, so the reaper never ends the job's run row — end it here
+        try:
+            _, _jobs = _supervisors(context)
+            sid = str((job.meta or {}).get("sandbox_job_id") or job_id)
+            _e = await asyncio.to_thread(_jobs.get, sid) if _jobs is not None else None
+            if _e:
+                await asyncio.to_thread(end_landed_job_runs, context, [_e])
+        except Exception:  # noqa: BLE001
+            logger.debug("stop by id: run row not ended", exc_info=True)
+        return out
+    if getattr(out, "status", None) is not OutcomeStatus.OK:
+        return out
+    now = reg.get(job.id) or job
+    if now.status == STATUS_RUNNING:
+        return ToolOutcome(str(out), status=OutcomeStatus.UNRESOLVED, world_changed=False,
+                           reason_code="run_still_running")
+    if now.status != STATUS_DONE:
+        # failed, cancelled (r15 m2: the owned collect books anything but a clean exit as failed), or unknown
+        return ToolOutcome(str(out), status=OutcomeStatus.FAILED, world_changed=False, reason_code="run_job_failed")
+    return out
+
+
 async def _tool_run(context=None, action: str = None, name: str = None, command: str = None,
                     where: str = None, lifetime: str = None, port=None, lines=None, **kwargs) -> ToolOutcome:
     action = str(action or "").strip().lower()
@@ -387,27 +470,16 @@ async def _tool_run(context=None, action: str = None, name: str = None, command:
     origin, owner, refusal = _caller(context)
     if refusal:
         return _refuse(refusal, "run_not_allowed")
+    _jn = str(name or "").strip()
     if not owner:
         # review: a job's wake turn and a scheduled task run with no project and no conversation — they still read,
         # collect and cancel the workspace jobs THEY may reach (the jobs tool's own §4NS rule: the owner's turn, or
         # the job's starter / its wake), as `run status/collect/stop name=<job id>`
-        _jn = str(name or "").strip()
         if action == "status" and not _jn:
             from .delegate import tool_jobs
             return await tool_jobs(action="status", context=context)
-        if action in ("status", "collect", "stop") and re.fullmatch(r"job-[0-9a-f]{6,16}", _jn):
-            from .delegate import tool_jobs
-            out = await tool_jobs(action={"stop": "cancel"}.get(action, action), job_id=_jn, context=context)
-            if action == "stop":
-                # review r2: a cancel stamps no report, so the reaper never ends the job's run row — end it here
-                try:
-                    _, _jobs = _supervisors(context)
-                    _e = await asyncio.to_thread(_jobs.get, _jn) if _jobs is not None else None
-                    if _e:
-                        await asyncio.to_thread(end_landed_job_runs, context, [_e])
-                except Exception:  # noqa: BLE001
-                    logger.debug("owner-less stop: run row not ended", exc_info=True)
-            return out
+        if (action == "collect" and not _jn) or (action in ("status", "collect", "stop") and _JOB_ID_RE.fullmatch(_jn)):
+            return await _job_by_id(context, action, _jn)
         return _refuse("this request has no project and no conversation — runs are filed under one. A background "
                        "job's own result: `run collect name=<job id>`; a project's runs: switch to the project "
                        "first (manage_projects action=switch).", "run_no_owner")
@@ -416,6 +488,31 @@ async def _tool_run(context=None, action: str = None, name: str = None, command:
     if reg is None:
         return _out("RUN ERROR: the run registry is unavailable — nothing was started or changed.",
                     OutcomeStatus.FAILED, changed=False, code="run_registry_unavailable")
+    _by_ref = None
+    if (action in ("status", "collect", "stop", "logs") and _JOB_ID_RE.fullmatch(_jn)
+            and reg.latest_by_name(owner, _jn) is None):
+        _ids = _job_refs(context, _jn)
+        _refs = [r for r in reg.rows(None) if r["backend"] == "jobs" and r["backend_ref"] in _ids]
+        _mine = [r for r in _refs if r["owner"] == owner]
+        if _mine:
+            # review 11-05 r12 F1: a job THIS owner started with `run` (the jobs tool never adopts those — `stop` by
+            # id answered "not running" while it ran) is handled on its own run row, whatever its run name now is
+            _by_ref = _mine[-1]
+        elif _refs:
+            # review 11-05 r12 F4: filed under another owner — reached by id it was stopped / collected from here
+            return _refuse(f"{_jn} is a run of {_refs[-1]['owner']} — runs are read and stopped only from the "
+                           "conversation or project that started them", "run_not_allowed")
+        elif action != "logs":
+            # review 11-05 W-M2: a background job with no run row (promoted before the switch) is read and stopped by
+            # its job id through `run` — the one route the results name (never `jobs`)
+            return await _job_by_id(context, action, _jn)
+    if action == "collect" and not _jn:
+        # review 11-05 r12 F6: a bare collect in an owned turn names nothing — it was every project's unread jobs
+        # (each marked collected and its wake suppressed)
+        return _refuse("name the run to collect (`run status` lists this conversation's/project's runs; a background "
+                       "job by its id: `run collect name=job-…`)", "run_name_required")
+    if _by_ref is not None:
+        return await _job_row_op(context, reg, _by_ref, origin, action, lines)
     if action == "status":
         return await _status(context, reg, owner, origin, name)
     name = str(name or "").strip()
@@ -432,6 +529,11 @@ async def _tool_run(context=None, action: str = None, name: str = None, command:
                 return _refuse(_AUTOPILOT_APP, "run_not_allowed")
             return await _locked(owner, name, _app_op(context, reg, _app_row, origin, "start"))
         return await _locked(owner, name, _start(context, reg, owner, origin, name, command, where, lifetime, port))
+    if action == "stop":
+        # review 11-05 R-m9: a start of this name still in flight records its row AFTER this read — wait it out
+        # (the start lock), so the stop finds the run instead of answering "no run named" while it comes up
+        async with _start_lock(owner, name):
+            pass
     row = reg.live_by_name(owner, name) if action in ("stop", "restart", "url") else reg.latest_by_name(owner, name)
     if row is None and action == "restart":
         # review r2 minor 5: a crashed server restarts whether or not a status probed it first
@@ -472,8 +574,36 @@ async def _tool_run(context=None, action: str = None, name: str = None, command:
     if action == "url":
         return _url(row)
     if action == "stop":
-        return await _stop(context, reg, row, origin)
+        # shielded (review 11-05 R-m9): a cancelled turn still records what the backend stop did — unshielded, the row
+        # stayed "running" and the next probe booked "stopped outside `run`"
+        return await asyncio.shield(_stop(context, reg, row, origin))
     return await _locked(owner, name, _restart(context, reg, row, origin))
+
+
+async def _job_row_op(context, reg, row, origin, action, lines) -> ToolOutcome:
+    """`run status|collect|stop|logs name=<job id>` on the caller's own workspace-job row (r12 F1) — the named-row
+    rules (probe / build may stop only their own), whatever name the row has now."""
+    if action == "status":
+        if row["ended_at"] is not None:
+            return _out("RUNS:\n" + _line(row, row["state"], row["state_note"], {}), OutcomeStatus.OK, changed=False)
+        state, note, detail = await _probed(context, reg, row, origin)
+        return _out("RUNS (probed now):\n" + _line(row, state, note, detail), OutcomeStatus.OK, changed=False)
+    if action == "logs":
+        return await _logs(context, row, origin, lines)
+    if action == "collect":
+        return await _collect(context, reg, row, origin)
+    # stop
+    if row["ended_at"] is not None:
+        return _refuse(f"{row['backend_ref']} is not running — it is {row['state']}"
+                       + (f" ({row['state_note']})" if row["state_note"] else ""), "run_ended")
+    if origin == "probe" and row["origin"] != "probe":
+        return _refuse(f"{row['backend_ref']} was started by {row['origin'] or 'the owner'} — a probe changes only "
+                       "its own runs", "run_not_allowed")
+    _leaf = str(_leaf_meta().get("leaf") or "")
+    if _leaf and _leaf not in (_row_leaf(row), _row_started_leaf(row)):
+        return _refuse(f"{row['backend_ref']} was not started by this build — a build reads it, never stops it",
+                       "run_not_allowed")
+    return await asyncio.shield(_stop(context, reg, row, origin))
 
 
 #: §4SX D5: kept apps are production — unattended work reads them (status/logs/url), never starts/stops them
@@ -643,6 +773,9 @@ async def _start(context, reg, owner, origin, name, command, where, lifetime, po
         from .execute import _AGENT_PORT_PROBE_MSG, _command_probes_agent_port
         if _command_probes_agent_port(command):
             return _out(_AGENT_PORT_PROBE_MSG, OutcomeStatus.REJECTED, changed=False, code="run_agent_port")
+        _blocked = _shell_guard_refusal(context, owner, command) or await _egress_refusal(context)
+        if _blocked is not None:
+            return _blocked
         if lifetime == "server":
             return await _start_ws_server(context, reg, owner, origin, name, command, port)
         return await _start_ws_job(context, reg, owner, origin, name, command)
@@ -715,6 +848,58 @@ async def _start_ws_server(context, reg, owner, origin, name, command, port) -> 
                 f"{_cap(str(text))}", OutcomeStatus.OK, changed=True)
 
 
+async def _egress_refusal(context) -> Optional[ToolOutcome]:
+    """`execute`'s first gate (§4GI): the sandbox egress must be Tor-only or cut off (review 11-05 r12 F3: a `run`
+    job launches through the raw exec, which skips the check `sandbox.execute` makes — with egress neither enforced
+    nor blocked it left with the host's address). Enforcement not attempted yet (a fresh sandbox) is run now; still
+    not attempted = refused (fail closed)."""
+    from ..sandbox.egress_gate import network_refusal
+    sm = getattr(context, "sandbox_manager", None)
+    if sm is None or not getattr(sm, "tor_proxy", None):
+        return None
+    attempted = getattr(sm, "egress_enforcement_attempted", None)
+    try:
+        if callable(attempted) and not attempted():
+            await asyncio.to_thread(sm.ensure_running)
+            if not attempted():
+                return _out("RUN ERROR: SANDBOX EGRESS UNVERIFIED — the sandbox's Tor-only egress has not been set up "
+                            "yet, so nothing was started. Try again in a moment.", OutcomeStatus.FAILED,
+                            changed=False, code="egress_unavailable")
+    except Exception as e:  # noqa: BLE001
+        return _out(f"RUN ERROR: the sandbox could not be started ({type(e).__name__}) — nothing was started.",
+                    OutcomeStatus.FAILED, changed=False, code="sandbox_unavailable")
+    blk = network_refusal(sm)
+    if blk is not None:
+        return _out(f"RUN ERROR: {blk}", OutcomeStatus.FAILED, changed=False, code="egress_unavailable")
+    return None
+
+
+def _shell_guard_refusal(context, owner: str, command: str) -> Optional[ToolOutcome]:
+    """The guards `execute` runs on a sandbox shell command, for a workspace `run` (review 11-05 R-M3: a command
+    `execute` refused — the destructive deny-list, a write into a RELEASED project, a YouTube download, a detached
+    `… &` server — ran unrefused as a `run` job or server). None = allowed. Fail CLOSED on the deny-list (a crashing
+    validator never lets the command through)."""
+    from .execute import _daemonized_server_block, _released_shell_block, _youtube_download_block
+    from .validators import validate_shell
+    try:
+        ok, why = validate_shell(command)
+    except Exception as e:  # noqa: BLE001
+        ok, why = False, f"the shell validator failed ({type(e).__name__})"
+    if not ok:
+        return _out(f"RUN ERROR: SYSTEM BLOCK: the command was refused by the pre-execution validator: {why}. "
+                    "It was NOT started.", OutcomeStatus.REJECTED, changed=False, code="run_shell_blocked")
+    proj = _project_of(owner)
+    rb = _released_shell_block(getattr(context, "project_store", None), command,
+                               workdir=f"/workspace/projects/{proj}" if proj else "")
+    if rb:
+        return _out(f"RUN ERROR: {str(rb)}", OutcomeStatus.REJECTED, changed=False, code="run_released_blocked")
+    for blk, code in ((_youtube_download_block, "run_youtube_blocked"), (_daemonized_server_block, "run_daemon_blocked")):
+        m = blk(command)
+        if m:
+            return _out(f"RUN ERROR: {m}", OutcomeStatus.REJECTED, changed=False, code=code)
+    return None
+
+
 async def _start_ws_job(context, reg, owner, origin, name, command) -> ToolOutcome:
     _, jobs = _supervisors(context)
     if jobs is None:
@@ -726,7 +911,11 @@ async def _start_ws_job(context, reg, owner, origin, name, command) -> ToolOutco
         if _stop_asked():
             return None, "stopped by the user before it began", None
         try:
-            entry, reason = await asyncio.to_thread(jobs.start_detached, command, workdir=wd, label=name,
+            # through bash -c with pipefail, as a promoted `execute` job is (review 11-05 R-M1: the runner script is
+            # `#!/bin/sh` + `timeout … <cmd>`, so `cd app && pytest`, `FOO=1 x`, `source …`, loops ran as
+            # `timeout cd …` → exit 127, and only the first command of `a && b` was under the ceiling)
+            from .execute import _bash_c
+            entry, reason = await asyncio.to_thread(jobs.start_detached, _bash_c(command), workdir=wd, label=name,
                                                     project_id=proj)
         except Exception as e:  # noqa: BLE001 — e.g. a missing project folder (review r1 minor 7)
             return None, f"{type(e).__name__}: {e}", None
@@ -759,6 +948,23 @@ async def _start_ws_job(context, reg, owner, origin, name, command) -> ToolOutco
                 OutcomeStatus.OK, changed=True)
 
 
+def _lab_start_refusal(det: Dict[str, Any], origin: str, owner: str, lab_id: str) -> Optional[ToolOutcome]:
+    """Who may start a run on this lab (its host detail ``det``): a probe only on a probe's lab; unattended work
+    only on ITS OWN project's disposable labs (review 11-05 R-M2: the lab tool's rule — the host gets no owner, so it
+    cannot tell; a kept lab is production). None = allowed. Read BEFORE a restart's stop too (r12 F5)."""
+    theirs = str(det.get("owner") or "")
+    if origin == "probe" and str(det.get("origin") or "") != "probe":
+        return _refuse(f"{lab_id} is not a probe's lab — a probe starts runs only on its own labs", "run_not_allowed")
+    if origin == "autopilot":
+        if not owner or theirs != owner:
+            return _refuse(f"{lab_id} belongs to {theirs or 'someone else'} — unattended work runs only on its own "
+                           f"project's labs ({owner or 'no project'}); create one", "run_not_allowed")
+        if str(det.get("lifetime") or "") == "kept":
+            return _refuse(f"{lab_id} is KEPT (production) — unattended work never runs commands on a production "
+                           "machine; use a disposable lab of the project", "run_not_allowed")
+    return None
+
+
 async def _start_lab(context, reg, owner, origin, name, command, lab_id, member, lifetime, port,
                      meta: Optional[Dict[str, Any]] = None) -> ToolOutcome:
     from .labs import LabsNoAnswer, LabsUnreachable, _call, _service_reply, _unreachable, labs_configured
@@ -781,8 +987,9 @@ async def _start_lab(context, reg, owner, origin, name, command, lab_id, member,
         return _service_reply(st, det, context, lab_id)
     det = det if isinstance(det, dict) else {}
     theirs = str(det.get("owner") or "")
-    if origin == "probe" and str(det.get("origin") or "") != "probe":
-        return _refuse(f"{lab_id} is not a probe's lab — a probe starts runs only on its own labs", "run_not_allowed")
+    _no = _lab_start_refusal(det, origin, owner, lab_id)
+    if _no is not None:
+        return _no
     other = f" (this lab belongs to {theirs})" if theirs and theirs != owner else ""
     place = f"{lab_id}/{member}"
 
@@ -1078,6 +1285,13 @@ async def _stop(context, reg, row, origin) -> ToolOutcome:
                         "check with `run status`.", OutcomeStatus.UNRESOLVED, changed=None, code="run_no_answer")
         body = body if isinstance(body, dict) else {}
         if st == 404 and body.get("error") == "unknown_lab":
+            from .labs import lab_on_other_host
+            other = await lab_on_other_host(context, lab_id, origin)
+            if other:                                            # review 11-05 M3
+                from .labs import other_host_phrase
+                return _out(f"RUN ERROR: run {row['name']} is on a lab made on {other_host_phrase(other)} — it was "
+                            "NOT stopped.", OutcomeStatus.FAILED, changed=False,
+                            code="run_stop_failed")
             reg.set_state(row["run_id"], "lost", "its lab was destroyed")
             return _out(f"[run {row['name']}] already gone: its lab was destroyed.", OutcomeStatus.OK, changed=False)
         if st >= 300:
@@ -1116,6 +1330,11 @@ async def _restart(context, reg, row, origin) -> ToolOutcome:
         if svc is None:
             return _out("RUN ERROR: the sandbox is not running.", OutcomeStatus.FAILED, changed=False,
                         code="sandbox_unavailable")
+        # r12: a restart runs the stored command again — under the start's guards as they are NOW (a project
+        # released since the start, a deny-list rule added)
+        _blocked = _shell_guard_refusal(context, row["owner"], row["command"] or "") or await _egress_refusal(context)
+        if _blocked is not None:
+            return _blocked
         state, note, _ = await _probe(context, row, origin)
         if state in ("replaced", "lost"):
             reg.set_state(row["run_id"], state, note)
@@ -1154,7 +1373,7 @@ async def _restart(context, reg, row, origin) -> ToolOutcome:
             if not new_token and alive is True:
                 # r2 M1: the old process survived the kill — the run is still RUNNING, nothing changed
                 if row["ended_at"] is None:
-                    reg.set_state(row["run_id"], "running", "a restart could not stop it")
+                    reg.set_state(row["run_id"], "running", "a restart could not stop it", revive=True)
                 return "survived", text, None
             if alive is None:
                 return "unverified", text, None          # r4 minor 3: no answer is not "failed"
@@ -1183,6 +1402,20 @@ async def _restart(context, reg, row, origin) -> ToolOutcome:
         return _out(f"RUN ERROR: the restart did not come up.\n{_cap(str(text))}", OutcomeStatus.FAILED,
                     changed=None, code="run_start_failed")
     # a lab server: stop, then start the same command again
+    if origin in ("autopilot", "probe"):
+        # r12 F5: the start's own rule is checked BEFORE the stop — it was after, so a refused start left the
+        # server stopped ("The old server WAS stopped; starting it again failed: … KEPT")
+        from .labs import LabsNoAnswer, LabsUnreachable, _call
+        _lid = row["place"].partition("/")[0]
+        try:
+            _st, _det = await _call(context, "GET", f"/v1/labs/{_lid}", origin=origin)
+        except (LabsUnreachable, LabsNoAnswer) as e:
+            return _out(f"RUN ERROR (no_answer): the labs host did not answer ({e}) — nothing was stopped or "
+                        "started.", OutcomeStatus.FAILED, changed=False, code="run_no_answer")
+        if _st == 200 and isinstance(_det, dict):
+            _no = _lab_start_refusal(_det, origin, row["owner"], _lid)
+            if _no is not None:
+                return _no
     stopped = await _stop(context, reg, row, origin)
     if stopped.status is not OutcomeStatus.OK:
         return stopped
@@ -1311,6 +1544,26 @@ def _app_is_down(state: str, detail: Dict[str, Any]) -> bool:
 _ADOPT_SEEN: set = set()
 
 
+def _project_known(context, owner: str) -> Optional[bool]:
+    """True: the store has ``project:<id>``; False: the store POSITIVELY has no such row; None: cannot tell (no store,
+    an error, not a project owner)."""
+    pid = owner[len("project:"):] if owner.startswith("project:") else ""
+    get = getattr(getattr(context, "project_store", None), "get_project", None)
+    if not pid or not callable(get):
+        return None
+    try:
+        return bool(get(pid))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_own_project(context, owner: str) -> bool:
+    """True only when ``project:<id>`` is a project in THIS agent's store (fails closed: no store, an error or no row
+    → False). Review 11-05 r17: the labs host is shared (its own integration tests make kept `project:itest…` labs);
+    the adopt step filed them as the owner's app runs, and the down sweep would notify the owner about them."""
+    return _project_known(context, owner) is True
+
+
 async def _adopt_app_rows(context, reg) -> int:
     """code r1 #3: a keep the agent never heard back from (or whose row was not written) leaves the host's app
     unknown to `run`, the release gate and this sweep — record a row for each kept project lab whose app has no
@@ -1327,6 +1580,8 @@ async def _adopt_app_rows(context, reg) -> int:
             lid, owner = str(lab.get("lab_id") or ""), str(lab.get("owner") or "")
             if not lid or lid in _ADOPT_SEEN or not owner.startswith("project:"):
                 continue
+            if not await asyncio.to_thread(_is_own_project, context, owner):
+                continue                      # r17: not a project of this agent (another client of the host)
             st2, det = await _call(context, "GET", f"/v1/labs/{lid}", origin="autopilot")
             if st2 != 200 or not isinstance(det, dict):
                 continue
@@ -1358,6 +1613,21 @@ async def app_down_sweep(context) -> Dict[str, Any]:
     await _adopt_app_rows(context, reg)
     # code r1 #10: a probe's test app never pages the owner
     rows = [r for r in reg.rows(live_only=True) if r["backend"] == "labs_app" and r.get("origin") != "probe"]
+    # r17 (review): a row adopted before the adopt step checked the project (a shared host's test app filed as the
+    # owner's) is ended here, never probed or paged about
+    _known: Dict[str, Optional[bool]] = {}
+    keep = []
+    for r in rows:
+        o = str(r.get("owner") or "")
+        if o.startswith("project:"):
+            if o not in _known:
+                _known[o] = await asyncio.to_thread(_project_known, context, o)
+            if _known[o] is False:          # the store POSITIVELY has no such project: never ours — end the row
+                reg.set_state(r["run_id"], "lost", "not a project of this agent — its kept lab is another client's "
+                              "of the labs host")
+                continue
+        keep.append(r)                      # ours, or cannot tell (no store / store error): probed as before
+    rows = keep
     fresh = []
     now = time.time()
     for row in rows:
@@ -1540,6 +1810,8 @@ async def manage_services_alias(context=None, action: str = None, name: str = No
     name = name or kwargs.get("service") or kwargs.get("service_name")
     command = command or kwargs.get("cmd") or kwargs.get("script")
     port = port if port is not None else kwargs.get("service_port")
+    if str(port).strip() in ("0", ""):
+        port = None          # review 11-05 R-m10: manage_services' portless opt-out (port=0) — `run` assigns one
     lines = lines if lines is not None else (kwargs.get("tail") or kwargs.get("n"))
     if action in ("list", "ls", ""):
         action = "status"
@@ -1588,6 +1860,28 @@ async def jobs_alias(context=None, action: str = None, job_id=None, **kwargs) ->
         return _refuse(f"`jobs {action}` is gone — use the `run` tool (`run status`, `run collect name=…`, "
                        "`run stop name=…`).", "run_alias_refused")
     _o, _owner, _r = _caller(context)
+    if _owner and not _r and want == "collect" and not job_id:
+        # r13 M1: the `run collect` rule (r12 F6) — a bare collect in an owned turn took every project's results
+        return _refuse("name the job to collect (`run status` lists this conversation's/project's runs; a background "
+                       "job by its id: `run collect name=job-…`)", "run_name_required")
+    if _owner and not _r and job_id:
+        try:
+            from ..memory.run_registry import registry_for
+            _reg = registry_for(context)
+            _ids = _job_refs(context, job_id)       # r15 M1: the registry id names the same job
+            _theirs = [r for r in (_reg.rows(None) if _reg is not None else [])
+                       if r["backend"] == "jobs" and r["backend_ref"] in _ids and r["owner"] != _owner]
+            _mine_refs = [r["backend_ref"] for r in (_reg.rows(_owner) if _reg is not None else [])
+                          if r["backend"] == "jobs" and r["backend_ref"] in _ids]
+            _mine = bool(_mine_refs)
+            if _mine_refs:
+                job_id = _mine_refs[-1]               # this owner's row is filed under that id: act on IT
+        except Exception:  # noqa: BLE001
+            _theirs, _mine = [], False
+        if _theirs and not _mine:
+            # r13 M2: the r12 F4 rule — another owner's job is not reached through the old name either
+            return _refuse(f"{job_id} is a run of {_theirs[-1]['owner']} — runs are read and stopped only from the "
+                           "conversation or project that started them", "run_not_allowed")
     rn = run_name_for_job(context, job_id, _owner) if job_id and _owner and not _r else ""
     if not rn:
         row = _job_row(context, job_id, _owner) if job_id and _owner and not _r else None
@@ -1595,8 +1889,12 @@ async def jobs_alias(context=None, action: str = None, job_id=None, **kwargs) ->
             # review r4: the job's run name was REUSED by a newer job — act on THIS job's own row (the jobs tool
             # never held a `run`-started job, so the fallback below answered "no job …")
             return await _old_job_row_op(context, row, _o, want)
+        if job_id:
+            # r14: the same by-id route as `run … name=<job id>` (its rules, its grading) — the jobs tool's own
+            # status ignored the id and listed every job
+            return await _job_by_id(context, want, job_id)
         from .delegate import tool_jobs
-        return await tool_jobs(action=action, job_id=job_id or None, context=context, **kwargs)
+        return await tool_jobs(action=action, job_id=None, context=context, **kwargs)
     return _with_hint(await tool_run(context=context, action=want, name=rn),
                       f"(`jobs` is now `run` — this ran as `run {want} name={rn}`; use `run` next time.)")
 

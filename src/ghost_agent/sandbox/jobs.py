@@ -20,8 +20,8 @@ supervised job and tell the caller so:
 
     ▎ Still running at 600s — promoted to background job job-1a2b3c4d.
       Do NOT re-run this command — it was NOT killed and is still working.
-    ▎ Poll it with jobs(action='status', job_id='job-1a2b3c4d'); read its
-      full result with jobs(action='collect', …) once it finishes. …
+    ▎ Poll it with run(action='status', name='job-1a2b3c4d'); read its
+      full result with run(action='collect', …) once it finishes. …
 
 **The TOOL decides, not the model.** Promotion happens on OBSERVED duration
 and OBSERVED progress; nothing depends on the model predicting how long
@@ -1718,7 +1718,7 @@ class SandboxJobSupervisor:
                     "Job Cap Reached",
                     f"{len(live)}/{cap} promoted jobs already running — "
                     f"killing this one instead of detaching it (free a slot "
-                    f"with jobs(action='cancel')): {str(cmd)[:60]}",
+                    f"with run(action='stop', name=<job id>)): {str(cmd)[:60]}",
                     level="WARNING", icon=Icons.STOP)
                 return None
             now = time.time()

@@ -31,6 +31,12 @@
   agent start a web server or daemon that SURVIVES across turns — closing
   the "can build an app, can't host it" gap.</p>
 
+  <p class="warn"><strong>Not a tool any more (&sect;4SX D5, 2026-11-05).</strong> The model starts, stops and reads
+  servers with the <a href="../tools/runs.html"><code>run</code></a> tool (<code>lifetime=server</code>). This module is
+  still the workspace backend <code>run</code> uses. <code>manage_services</code> is an unadvertised alias that maps old
+  calls onto <code>run</code> (<code>runs.manage_services_alias</code>). The sections below describe the supervisor;
+  where they name <code>manage_services</code> actions, read <code>run</code>.</p>
+
   <h2>Why</h2>
   <p><code>execute</code> wraps every command in <code>timeout -k 5s</code>
   (600 s cap) and the container is PID-isolated, so anything the agent

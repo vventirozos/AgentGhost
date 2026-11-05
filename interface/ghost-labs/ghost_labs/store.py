@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS labs (
   egress TEXT, subnet TEXT,
   created_at REAL, last_used_at REAL, last_owner_use_at REAL,
   retire_at REAL,
-  spec_json TEXT, readiness_json TEXT, app_json TEXT, agent_api_url TEXT, lan INTEGER DEFAULT 0
+  spec_json TEXT, readiness_json TEXT, app_json TEXT, agent_api_url TEXT, lan INTEGER DEFAULT 0,
+  pool TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS members (
   lab_id TEXT, name TEXT, ip TEXT, image TEXT, mem_mb INTEGER, cpus REAL,
@@ -49,7 +50,14 @@ CREATE TABLE IF NOT EXISTS backups (
   backup_id TEXT PRIMARY KEY, lineage TEXT, app TEXT, member TEXT, ts REAL, path TEXT, kind TEXT
 );
 CREATE TABLE IF NOT EXISTS previews (name TEXT PRIMARY KEY, url TEXT, project TEXT, at REAL);
+CREATE TABLE IF NOT EXISTS anon_volumes (name TEXT PRIMARY KEY, lab_id TEXT, member TEXT, at REAL);
+CREATE TABLE IF NOT EXISTS probe_claims (kind TEXT, key TEXT, lab_id TEXT, at REAL, PRIMARY KEY (kind, key));
 """
+# columns added after a host already had a database (CREATE TABLE IF NOT EXISTS never adds them)
+MIGRATIONS = (
+    # review 11-05 #4: the pool a lab is counted in when it differs from its lifetime ("kept": the rehearsal twin)
+    ("labs", "pool", "TEXT DEFAULT ''"),
+)
 
 
 class Store:
@@ -61,6 +69,10 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        for table, col, decl in MIGRATIONS:
+            have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in have:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         # secrets live here: owner-only, whatever the umask was (r1 core #3)
         for f in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
             try:

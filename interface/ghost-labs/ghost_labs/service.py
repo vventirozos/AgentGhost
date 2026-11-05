@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from . import config as C
 from . import templates as T
@@ -19,18 +19,32 @@ log = logging.getLogger("ghost_labs")
 
 
 class ActionLog:
-    """JSON lines in /var/lib/ghost-labs/actions.log (contract v1 §10). Never output, never keys."""
+    """JSON lines in /var/lib/ghost-labs/actions.log (contract v1 §10). Never output, never keys.
+    Every text field passes the secret redactor BEFORE it is cut to 200 characters (review 11-05 #17:
+    an exec `cmd` carrying a secret went to this file and to journald as typed)."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, redactor: Optional[Callable[[str], str]] = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self.redactor = redactor
+
+    def _clean(self, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        if self.redactor:
+            try:
+                v = self.redactor(v)
+            except Exception:  # noqa: BLE001 — a broken redactor must not let the text through
+                return "<unredactable>"
+        return v
 
     def write(self, lab_id: str, action: str, outcome: str, duration_ms: int = 0, member: str = "",
               origin: str = "", **extra: Any) -> None:
         row = {"ts": round(time.time(), 3), "lab_id": lab_id, "action": action, "member": member,
-               "outcome": outcome, "duration_ms": duration_ms, "origin": origin}
+               "outcome": self._clean(outcome), "duration_ms": duration_ms, "origin": origin}
         for k, v in extra.items():
+            v = self._clean(v)
             row[k] = (v[:200] if isinstance(v, str) else v)
         line = json.dumps(row, sort_keys=True)
         log.info(line)
@@ -46,7 +60,7 @@ class Service:
         self.store = Store(Path(state_dir) / "labs.sqlite")
         self.templates = T.load_dir(templates_dir)
         self.mgr = Manager(cfg, self.store, client, self.templates, runner=runner or subprocess.run)
-        self.actions = ActionLog(Path(state_dir) / "actions.log")
+        self.actions = ActionLog(Path(state_dir) / "actions.log", redactor=self.mgr.redact_text)
         self.mgr.actions = self.actions
         self._stop = threading.Event()
         self.threads: Dict[str, threading.Thread] = {}
@@ -173,5 +187,7 @@ class Service:
                 "labs": len(self.mgr._disposable_labs()), "kept_labs": len(self.store.labs()) - len(self.mgr._disposable_labs()),
                 "max_labs": self.cfg.max_labs, "docker": docker, "tor": self.mgr.tor_state(),
                 "firewall": self.mgr.firewall_state,
+                # review 11-05 #5: labs whose bridge the interface rules don't cover (recreate them)
+                "legacy_lab_networks": self.mgr.legacy_lab_networks(),
                 "apps": self.kept.apps_health() if self.kept else [],
                 "url_host": self.cfg.resolved_dns_name}

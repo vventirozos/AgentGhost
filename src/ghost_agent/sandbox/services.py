@@ -1995,8 +1995,8 @@ class ServiceSupervisor:
             lines.append(
                 "⚠ WARNING: this file server is rooted at the sandbox root, so it "
                 "publishes EVERYTHING there — other projects and the service "
-                "registry (with service tokens). Restart it with workdir=<folder> "
-                "or --directory <folder> unless the user wants that.")
+                "registry (with service tokens). Stop it and start it again with "
+                "--directory <folder> (or `cd <folder> && …`) unless the user wants that.")
         lines.append(
             f"Logs: action='logs' name='{name}' · stop: action='stop'. "
             f"It survives across turns until stopped (or the sandbox "
@@ -2672,8 +2672,8 @@ class ServiceSupervisor:
             return ""
         if not orphans:
             return ""
-        lines = ["Unregistered listeners (started OUTSIDE manage_services — "
-                 "invisible to lifecycle/stop; adopt or kill):"]
+        lines = ["Unregistered listeners (started OUTSIDE `run` — invisible to "
+                 "lifecycle/stop; tell the owner, or stop the process with execute):"]
         for o in orphans:
             b = f"  :{o['port']}"
             if o.get("pid"):
@@ -2682,8 +2682,6 @@ class ServiceSupervisor:
                 b += f" `{o['cmdline'][:60]}`"
             if o.get("project_hint"):
                 b += f" · project {o['project_hint']}"
-            b += (f" — adopt: action='adopt' name='<name>' "
-                  f"port={o['port']}")
             lines.append(b)
         return "\n".join(lines)
 

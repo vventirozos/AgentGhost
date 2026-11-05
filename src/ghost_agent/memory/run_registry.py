@@ -91,9 +91,13 @@ class RunRegistry:
             logger.warning("run registry: start not recorded", exc_info=True)
             return None
 
-    def set_state(self, run_id: str, state: str, note: str = "", *, only_live: bool = False) -> None:
+    def set_state(self, run_id: str, state: str, note: str = "", *, only_live: bool = False,
+                  revive: bool = False) -> None:
         """Write a PROBED state back. An ended state stamps ``ended_at`` once. ``only_live``: never over a row
-        that already ended (review r2: a landed-job write-back racing a `run stop` turned "stopped" into "exited")."""
+        that already ended (review r2: a landed-job write-back racing a `run stop` turned "stopped" into "exited").
+        A LIVE state never lands on an ended row (review 11-05 R-m8: a probe that read before a concurrent stop wrote
+        "running" over "stopped", and the row was live by state, ended by timestamp) — except ``revive``: the caller
+        KNOWS the process runs again (a restart that could not stop it), which clears ``ended_at``."""
         try:
             now = time.time()
             with self._lock, contextlib.closing(self._connect()) as c, c:
@@ -102,9 +106,12 @@ class RunRegistry:
                               "ended_at=COALESCE(ended_at, ?) WHERE run_id=?"
                               + (" AND ended_at IS NULL" if only_live else ""),
                               (state, (note or "")[:300], now, now, run_id))
-                else:
-                    c.execute("UPDATE runs SET state=?, state_note=?, last_probe_at=? WHERE run_id=?",
+                elif revive:
+                    c.execute("UPDATE runs SET state=?, state_note=?, last_probe_at=?, ended_at=NULL WHERE run_id=?",
                               (state, (note or "")[:300], now, run_id))
+                else:
+                    c.execute("UPDATE runs SET state=?, state_note=?, last_probe_at=? WHERE run_id=? "
+                              "AND ended_at IS NULL", (state, (note or "")[:300], now, run_id))
         except Exception:  # noqa: BLE001
             logger.warning("run registry: state not recorded", exc_info=True)
 

@@ -521,10 +521,13 @@ async def test_a_probe_keeps_only_a_lab_of_its_own_probe_project(tmp_path, lfake
     tok = _scoped(ctx, "probe")
     try:
         lfake.on("GET", "/v1/labs/lab_0000aa04", (200, {"lab_id": "lab_0000aa04", "owner": "project:other",
+                                                        "origin": "probe",
                                                         "lifetime": "kept", "app": {"name": "a"}}))
         out = await L.tool_lab(ctx, action="keep", lab_id="lab_0000aa04",
                                params={"app": {"name": "a", "member": "m", "port": 80}})
-        assert "probe project in focus" in str(out) and not [c for c in lfake.calls if c.method == "POST"]
+        # r13: the probe wall answers first now (it belongs to another project) — the keep's own rule is behind it
+        assert ("probe project in focus" in str(out) or "a probe touches only labs it made" in str(out))
+        assert out.status is OutcomeStatus.REJECTED and not [c for c in lfake.calls if c.method == "POST"]
     finally:
         RS.reset(tok)
 

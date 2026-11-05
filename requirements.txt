@@ -4,8 +4,8 @@ python-multipart>=0.0.6
 httpx[socks]>=0.26.0
 PySocks>=1.7.1
 apscheduler>=3.11.0
-sqlalchemy>=2.0.0
-psycopg2-binary>=2.9.0
+# (§4SX E, review 11-05: sqlalchemy / psycopg2-binary removed — postgres_admin is gone; the SANDBOX image
+#  still ships them for the model's own code)
 docker>=7.1.0
 chromadb>=1.5.0
 networkx>=3.0

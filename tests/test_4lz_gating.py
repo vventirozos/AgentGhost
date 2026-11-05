@@ -62,7 +62,7 @@ async def test_a_job_wakes_as_its_starter(monkeypatch, starter, wakes, prefix):
     monkeypatch.setattr(T, "should_defer_scheduled_task", lambda llm: False)
     seen = []
 
-    async def fake_fg(ctx, body, rid):
+    async def fake_fg(ctx, body, rid, project_id=None):
         seen.append(rid)
         return "done", None, None
     monkeypatch.setattr(MAIN, "_handle_chat_foreground", fake_fg)

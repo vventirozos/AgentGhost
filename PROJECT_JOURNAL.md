@@ -58471,3 +58471,42 @@ D1 (delete chess-coach + jiu-jitsu-calendar through the teardown) move to the en
   probe project deleted (204).
   tool_probes_live.py: 15/16 PASS; scratchpad TOOL-ONLY = a probe may not write the owner's scratchpad (designed).
   No tracebacks/ERROR lines since the boot. Host: 0 labs, 0 kept. Services registry empty; one project left (41f7…).
+
+### §4SX-u — End-to-end re-review r11–r16 (2026-11-05, local; deploy below)
+- Operator: "re-review all the new functionality end to end" → "keep doing the reviewing - fixing loop until the reviews
+  come clean". Fresh-eye rounds, agent + host each time (repros written to FAIL-when-fixed, inverted into pins):
+  r11 (wide), r12 9 MAJOR, r13 4 MAJOR, r14 host 2 MAJOR + agent 1 MAJOR, r15 agent 1 MAJOR + host 1 MINOR,
+  r16 agent CLEAN + host MINOR only (2 fixed, 1 documented trade-off).
+- Agent (tests/test_4sx_r11…r15_review.py): by-id job path collapsed to ONE record — `runs._job_by_id` reads the jobs
+  registry row by EITHER id (`delegate._resolve_job`), §4NS via module-level `delegate.job_visible_to_caller`, collect
+  graded by the row's status (running → UNRESOLVED, anything but done → FAILED); `runs._job_refs` makes the run-row
+  ownership walls match both ids (r15 M1: project B stopped project A's job by its registry id); `_egress_refusal`
+  before workspace starts; turn scope skips gone/archived projects (`[PROJECT TURN SKIPPED`); lab `_sandbox_path`
+  resolves EVERY spelling via file_system `_get_safe_path`, replies show `shown_path` (`/workspace/…`); probe wall
+  fails closed, probe `lab list` filtered to origin=probe; lineage batch order incl. destroy–destroy and backup.
+- Host (interface/ghost-labs, tests/unit/test_review_r11.py, README "Review 11-05"): eviction measures real memory
+  (usage − file cache) with a 5 s TOTAL stats deadline (daemon threads; a call still in flight is not asked again);
+  memory-only shortfalls evict largest first; /keep needs a built lab; lock order app → lab → create_lock; the r12/r13
+  probe-claims BACKFILL REMOVED in r14 (three rounds of findings, never fired, live host had 0 kept labs).
+- Lessons: (1) a feature that keeps producing findings is deleted, not patched (backfill; the supervisor/regex grading
+  of r11–r13 replaced by the registry row). (2) Two id namespaces: EVERY wall that matches an id must match both — the
+  r15 M1 was the r14 fix's own neighbour. (3) A path special case drifted from file_system twice (r13, r14); one
+  resolver + show where it landed.
+- Battery scripts/mutate_4sx_r11.py: 74 killed, 13 survivors (no-op control aside). All 13 were pinned in
+  tests/test_4sx_r16_battery_pins.py and are now KILLED: L8 L16 R3 R12 P2 P3 X4 X11 Y9 Z7 V3 N7 N10. Y9 had survived
+  because its old test's fake service list was empty. All 87 killed, controls correct.
+- Full suite #1: 2 fails, both mine. (a) `write_bytes_nofollow_rel` never switched back to blocking (§4SD). The
+  review of that fix found the same gap in labs `_tar_walk`, a deploy that could ship a truncated file. The §4SD guard
+  test used a hand list of modules; it now finds every src module whose code names O_NONBLOCK. (b) A stale
+  log-title table, regenerated. Full suite #2: 29763 passed, lint OK.
+- HOST DEPLOYED 08:34 (backup /opt/ghost-labs-backups/4sx-u-20261105-083434). Healthy, fw rules in place. Integration
+  tests: 40 passed / 13 skipped (agentapi needs AGENT_API_UPSTREAM). test_kept failed 1/5 runs; that run's output
+  was lost. It overlapped the OLD agent adopting that run's itest lab, which r17 now stops; re-checked after deploy
+  (below). 7 dangling anonymous volumes (MySQL test data from 11-04) inspected and removed.
+- AGENT DEPLOYED 08:52 (gated, pid 27708 → 23055). Its boot log showed r17: "adopted kept app labs-test of
+  project:itest…". The SHARED labs host's integration tests make kept labs, and the agent filed them as the owner's
+  app runs, so the down sweep could page the owner. No notice was sent. r17 fix (runs._project_known /
+  _is_own_project): adopt only this agent's projects; the sweep ends rows whose project the store positively lacks.
+  Reviewed twice: the r17 review found that pre-fix rows were not cleaned; r18 CLEAN. Mutants N11–N13 killed.
+- Lesson: a SHARED backend has other clients. Every loop that iterates a host-wide listing must ask "is this mine"
+  against the agent's own store, not trust the host's owner string.

@@ -35,6 +35,10 @@
   LLM swarm pool) were removed: the operator no longer needed the swarm. tools/delegate.py now holds only
   the <code>jobs</code> tool. The <code>save_as</code> data-flow that used to be described here is on
   <a href="../tools/composed_skills.html">composed_skills</a>.</p>
+  <p class="warn"><strong>&sect;4SX D5 (2026-11-05).</strong> <code>jobs</code> is no longer advertised: it is an alias of the
+  <a href="../tools/runs.html"><code>run</code></a> tool. Its replies (below) now name <code>run</code>
+  (<code>run status</code>, <code>run collect name=&lt;job id&gt;</code>, <code>run stop name=&lt;job id&gt;</code>). The registry
+  described here is unchanged.</p>
 
   <h2>The job registry (<code>jobs</code>)</h2>
   <p><code>core.jobs.JobRegistry</code> is the status surface every

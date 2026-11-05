@@ -219,12 +219,15 @@ def test_daily_backup_retried_after_an_hour_not_every_tick(kept, env, monkeypatc
     monkeypatch.setattr(kept, "_backup_locked", fail)
     kept._last_daily = time.time()
     kept.tick()
+    kept.join_backups()          # the daily backup runs in its own thread (review 11-05 #16)
     kept.tick()
+    kept.join_backups()
     assert tries == ["daily"]
     a = app_of(env, "lab_a")
     a["last_backup_attempt_at"] = time.time() - 3700
     env.store.update_lab("lab_a", app_json=dumps(a))
     kept.tick()
+    kept.join_backups()
     assert tries == ["daily", "daily"]
 
 

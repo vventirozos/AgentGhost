@@ -3618,7 +3618,9 @@ async def download_file(request: Request, filename: str):
     # often emits a BARE link (`/api/download/plot.png`). If the bare path
     # isn't at the root, retry under the active project's scoped dir so the
     # link still resolves. Containment is re-checked below.
-    if (not file_path.exists() and "/" not in filename
+    # review 11-05 P-m7: the conversation's PROJECT first — a same-named file at the root (another conversation's,
+    # or an old one) was served over the one this conversation's link means
+    if ("/" not in filename
             and parse_requester_role(_hdrs.get("X-Ghost-Requester")) != "member"):   # never an owner project for a member (R9)
         # An explicit ?project_id=, else the named conversation's focus
         # (§4SX B0: no process-global project outside a request).
