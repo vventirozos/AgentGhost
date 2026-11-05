@@ -62,10 +62,12 @@ class TestAcquiredSkillsClosure:
 
         # Capture which filename `tool_execute` was invoked with each call.
         captured_filenames: list[str] = []
+        captured_ctx: list = []
 
         async def fake_tool_execute(*, sandbox_dir, sandbox_manager, memory_dir,
                                      filename, args, **_kw):
             captured_filenames.append(filename)
+            captured_ctx.append(_kw.get("run_context"))
             return f"--- EXECUTION RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n{filename}"
 
         monkeypatch.setattr(registry_mod, "tool_execute", fake_tool_execute)
@@ -83,6 +85,8 @@ class TestAcquiredSkillsClosure:
             "acquired_skills/alpha_skill.py",
             "acquired_skills/beta_skill.py",
         ], f"closure scope leaked: {captured_filenames}"
+        # 11-05 r19: the runner hands its context on, so the no-DB-server note knows whether labs exist
+        assert captured_ctx == [ctx, ctx]
 
 
 # ---------------------------------------------------------------------------

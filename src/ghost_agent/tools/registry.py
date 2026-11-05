@@ -1683,7 +1683,8 @@ def get_available_tools(context):
                                     memory_dir=getattr(context, "memory_dir", None),
                                     filename=f"acquired_skills/{name}.py",
                                     content=skill_src,
-                                    args=[args_str]
+                                    args=[args_str],
+                                    run_context=context,     # r19: the no-DB-server note knows the lab route
                                 )
                                 # Telemetry: tool_execute returns error
                                 # strings rather than raising, so classify

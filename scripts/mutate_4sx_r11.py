@@ -20,6 +20,7 @@ FS = 'src/ghost_agent/tools/file_system.py'
 EG = 'src/ghost_agent/memory/egress.py'
 EVG = 'src/ghost_agent/core/evidence_gate.py'
 TF = 'src/ghost_agent/tools/tool_failure.py'
+EX = 'src/ghost_agent/tools/execute.py'
 MUT = [
     ('CONTROL known-bad', LB, '        if action in KEPT_ACTIONS:                 # production: refused before any host call',
      '        if False:                 # production: refused before any host call'),
@@ -167,8 +168,25 @@ MUT = [
     ('N11 adopt-foreign-projects', R, '            if not await asyncio.to_thread(_is_own_project, context, owner):', '            if False:'),
     ('N12 sweep-pages-foreign', R, '            if _known[o] is False:', '            if False:'),
     ('N13 sweep-ends-on-error', R, '            if _known[o] is False:', '            if not _known[o]:'),
+    # 11-05 prod PG: the no-DB-server note on execute results
+    ('D1 dbnote-never', EX, '    if not _NO_DB_SERVER_RE.search(str(output or "")):', '    if True:'),
+    ('D2 dbnote-not-on-exit0', EX, '                f"STDOUT/STDERR:\\n{output}{_host_proc_note}{_cd_note}{_db_note}")',
+     '                f"STDOUT/STDERR:\\n{output}{_host_proc_note}{_cd_note}")'),
+    ('D3 dbnote-not-on-failure', EX, '                ), _host_proc_note + _cd_note + _db_note)', '                ), _host_proc_note + _cd_note)'),
+    ('D4 dbnote-not-in-scripts', EX, '        _db_note = _no_db_server_note(output, kwargs.get("run_context"))      # 11-05: a script',
+     '        _db_note = ""  # 11-05: a script'),
+    ('D5 dbnote-ignores-labs', EX, '            _labs = bool(labs_configured(context))', '            _labs = False'),
+    ('D6 dbnote-none-says-unconfigured', EX, '    if context is None:\n        # review r19', '    if False:\n        # review r19'),
+    ('D7 dbnote-any-line', EX, 'IGNORECASE | re.MULTILINE)', 'IGNORECASE | re.DOTALL)'),
+    ('D8 skill-runner-drops-context', 'src/ghost_agent/tools/registry.py', '                                    run_context=context,     # r19', '                                    # r19'),
+    ('D10 dbnote-any-reason', EX, 'failed: "\n    r"(?:No such file or directory|Connection refused|Cannot assign requested address)"', 'failed"\n    r"(?:)"'),
+    ('D11 dbnote-no-pytest-prefix', EX, '_DB_LINE_PREFIX = (r"^(?:E\\s+)?', '_DB_LINE_PREFIX = (r"^'),
+    ('D12 dbnote-raise-says-unconfigured', EX, '            _labs = None\n', '            _labs = False\n'),
+    ('D13 dbnote-no-mysql-tcp', EX, '|\\(?(?:ERROR )?200[23]', '|\\(?(?:ERROR )?200[23]XX'),
+    ('D14 dbnote-mysql-word-required', EX, "Can't connect to (?:MySQL )?server on '", "Can't connect to MySQL server on '"),
+    ('D9 dbnote-any-host', EX, '_LOOPBACK = r"(?:localhost|127\\.0\\.0\\.1|::1)"', '_LOOPBACK = r"[^\\"\'\\s]+"'),
 ]
-PINS = ["tests/test_4sx_r11_review.py", "tests/test_4sx_r14_review.py", "tests/test_4sx_r15_review.py", "tests/test_4sx_r17_review.py", "tests/test_4sx_r12_review.py", "tests/test_4sx_r13_review.py", "tests/test_4sx_b_lab_tool.py", "tests/test_4sx_c_run_tool.py",
+PINS = ["tests/test_4sx_r11_review.py", "tests/test_4sx_r14_review.py", "tests/test_4sx_r15_review.py", "tests/test_4sx_r17_review.py", "tests/test_execute_no_db_server_note.py", "tests/test_tools_audit_fixes.py", "tests/test_4sx_r12_review.py", "tests/test_4sx_r13_review.py", "tests/test_4sx_b_lab_tool.py", "tests/test_4sx_c_run_tool.py",
         "tests/test_4sx_d5_review.py", "tests/test_4sx_d4_autopilot_labs.py", "tests/test_4sx_r16_battery_pins.py"]
 
 

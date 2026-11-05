@@ -139,7 +139,7 @@ lab(action="exec", lab_id="lab_1b9cdae5", member="pg1",
 lab(action="destroy", lab_id="lab_1b9cdae5")
   → destroyed</code></pre>
   <p>The local Postgres the agent used to have is gone (&sect;4SX Phase E). A remembered call to <code>postgres_admin</code> or
-  <code>psql</code> is redirected to the <code>lab</code> tool. Nothing runs from that call; the tool answers with this route.</p>
+  <code>psql</code> is redirected to the <code>lab</code> tool. Nothing runs from that call; the tool answers with this route. If the model runs <code>psql</code> (or mysql, psycopg, asyncpg) in the sandbox anyway, the client finds no server and the result carries a <em>NO DATABASE SERVER HERE</em> note that names this same route (<a href="tools/execute.html#4sx-dbnote">details</a>).</p>
 
   <h3 id="ex-files">2. Load a SQL file from the workspace</h3>
   <blockquote>Write a schema file, load it into a fresh database, and save the result.</blockquote>

@@ -999,6 +999,58 @@ _HOST_PROCESS_RE = re.compile(
     r"\b(?:pkill|killall)\b|\bkill\s+(?:-\w+\s+)?\$?\(?\s*(?:pgrep|pidof)\b",
     re.IGNORECASE)
 
+#: a database CLIENT that found no server here: libpq (psql, psycopg, pg_dump…) and the MySQL client. 11-05 prod
+#: probe PG: told "postgres_admin" was gone, the model ran `psql` in the sandbox, read the socket error, then spent 6
+#: minutes trying to initdb/start its own server (su, rm -rf, rmtree guards) to the strike cap — the prompt's
+#: DATABASES line was in the prompt and did not stop it. The fact goes where the model is looking: on the result.
+#: Line-anchored to how the CLIENTS print it (review r19: a `grep`/`cat` of a log quoting the phrase, or two unrelated
+#: lines joined by DOTALL, fired it), and a TCP failure only on loopback (a user's REMOTE database is not "absent").
+#: Review r20: a pytest `E   ` line, SQLAlchemy's `(psycopg2.OperationalError) ` and psycopg 3's `connection failed: `
+#: prefixes count; the REASON must say nothing answered (a `FATAL: role/password` failure is a server that DID answer).
+_DB_LINE_PREFIX = (r"^(?:E\s+)?(?:psql: (?:error: )?|pg_\w+: (?:error: )?|[\w.]*(?:Error|Exception): "
+                   r"|\([\w.]*(?:Error|Exception)\) |- host: '(?:localhost|127\.0\.0\.1|::1)'[^\n]{0,80}?: "
+                   r"|connection failed: |Multiple exceptions: ){0,4}")
+_LOOPBACK = r"(?:localhost|127\.0\.0\.1|::1)"
+_NO_DB_SERVER_RE = re.compile(
+    _DB_LINE_PREFIX +
+    r"(?:connection to server (?:on socket [^\n]{0,160}?|at \"" + _LOOPBACK + r"\"[^\n]{0,80}?)failed: "
+    r"(?:No such file or directory|Connection refused|Cannot assign requested address)"
+    r"|could not connect to server: (?:No such file or directory|Connection refused)"
+    r"|(?:\[Errno 111\] )?Connect call failed \('" + _LOOPBACK + r"', (?:5432|3306)"
+    r"|(?:ERROR 2002 \(HY000\): |\(2002, \"?)Can't connect to local (?:MySQL )?server"
+    r"|(?:/[\w./-]+|" + _LOOPBACK + r"):\d+ - no response\s*$"
+    # review r21: MariaDB Connector/C drops "MySQL" and may say 2002 … (115) on TCP; mysqlclient prints it as a tuple
+    r"|\(?(?:ERROR )?200[23],? (?:\(HY000\): )?\"?Can't connect to (?:MySQL )?server on '" + _LOOPBACK +
+    r"(?::\d+)?' \((?:\[Errno (?:111|99)\]|111\b|115\b|10061\b)"
+    r"|connect ECONNREFUSED (?:127\.0\.0\.1|::1):(?:5432|3306)\b)",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _no_db_server_note(output, context=None) -> str:
+    """The note for a client that found no database server in the sandbox ("" when the output shows none)."""
+    if not _NO_DB_SERVER_RE.search(str(output or "")):
+        return ""
+    _lab_route = ("create a disposable machine with the `lab` tool — `lab create` template pg-single (PostgreSQL 18, "
+                  "member pg1, `psql -U postgres`) or mysql-single (member db1, `mysql -h127.0.0.1 -uroot -plab`) — and "
+                  "run the SQL there with `lab exec`")
+    if context is None:
+        # review r19: a caller with no context cannot tell — never state "not configured" as a fact
+        route = f"if the `lab` tool is available, {_lab_route}; if it is not, say that no database server is available"
+    else:
+        try:
+            from .labs import labs_configured
+            _labs = bool(labs_configured(context))
+        except Exception:  # noqa: BLE001  — review r20: unknown is not "not configured"
+            _labs = None
+        route = (_lab_route if _labs else
+                 f"if the `lab` tool is available, {_lab_route}; if it is not, say that no database server is available"
+                 if _labs is None else
+                 "no labs host is configured either, so a real PostgreSQL/MySQL server is not available here — say so")
+    return ("\n\n--- 💡 NO DATABASE SERVER HERE ---\n"
+            "There is no database server in this sandbox, by design. Do NOT try to install, initdb or start one here. "
+            f"To run SQL on a real server: {route}. Plain data work: sqlite3 or pandas in `execute`.\n")
+
+
 _HOST_PROCESS_NOTE = (
     "\n\n--- 💡 SANDBOX PID NAMESPACE ---\n"
     "You just tried to kill a process by name. The sandbox has its OWN pid "
@@ -1903,15 +1955,20 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 level="WARNING", icon=Icons.SHIELD,
             )
 
+        _db_note = _no_db_server_note(output, kwargs.get("run_context"))      # 11-05: also on exit 0 (`psql … || true`)
+        if _db_note:
+            pretty_log("Sandbox No DB", "a database client found no server — appended the lab route to the result",
+                       level="INFO", icon=Icons.SHIELD)
+
         if exit_code != 0:
             return _append_note(
                 _format_error(
                     output or f"Process failed (Exit {exit_code}) with no output.",
                     exit_code=exit_code, elapsed_s=_dt,
-                ), _host_proc_note + _cd_note)
+                ), _host_proc_note + _cd_note + _db_note)
 
         return (f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\n"
-                f"STDOUT/STDERR:\n{output}{_host_proc_note}{_cd_note}")
+                f"STDOUT/STDERR:\n{output}{_host_proc_note}{_cd_note}{_db_note}")
 
     is_ephemeral = False
     if content and not filename and not command:
@@ -2464,14 +2521,15 @@ if has_error:
             except Exception:  # noqa: BLE001
                 pass
 
+        _db_note = _no_db_server_note(output, kwargs.get("run_context"))      # 11-05: a script's psycopg/asyncpg/pymysql error too
         if exit_code != 0:
              return _append_note(
                  _format_error(output, hint=diagnostic_info,
                                exit_code=exit_code, elapsed_s=_dt),
-                 _probe_note + _proxyless_browser_note)
+                 _probe_note + _proxyless_browser_note + _db_note)
 
         return (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\n"
-                f"STDOUT/STDERR:\n{output}{_probe_note}{_proxyless_browser_note}")
+                f"STDOUT/STDERR:\n{output}{_probe_note}{_proxyless_browser_note}{_db_note}")
     except Exception as e:
         return _format_error(f"Error: {e}")
     finally:

@@ -58510,3 +58510,35 @@ D1 (delete chess-coach + jiu-jitsu-calendar through the teardown) move to the en
   Reviewed twice: the r17 review found that pre-fix rows were not cleaned; r18 CLEAN. Mutants N11–N13 killed.
 - Lesson: a SHARED backend has other clients. Every loop that iterates a host-wide listing must ask "is this mine"
   against the agent's own store, not trust the host's owner string.
+- PROD after r17 (09:16 deploy; prod_4sx_093138.json): 11/13 PASS (H J0 J1 SV AL2 GD LB LR MB KP LP; LP = the new
+  lab put/get path scenario). AL1 FAIL = test design (manage_services is unadvertised, as before). PG FAIL = REAL: told
+  postgres_admin is gone, the model ran `psql … || true` in the sandbox (exit 0), read the socket error and spent
+  ~6 min (9 execute calls) trying to install/initdb/start its own server up to the strike cap. Cleanup: probe files
+  removed, probe project 34e8f226ed8d deleted (204).
+- PG fix (operator: "go ahead with the psql hint fix"): `execute._no_db_server_note`. When a DB client's output says
+  no LOCAL server answered (libpq socket/loopback `connection to server … failed`, old libpq `could not connect to
+  server`, asyncpg `Connect call failed ('127.0.0.1', 5432|3306)`, MySQL/MariaDB `ERROR 2002 … local server`), the
+  result gets "--- 💡 NO DATABASE SERVER HERE ---": do not install/initdb/start one; use `lab create` pg-single (pg1,
+  `psql -U postgres`) / mysql-single (db1, `mysql -h127.0.0.1 -uroot -plab`). With no labs host it says to report no
+  server; a caller with no context gets neutral wording. Fires on exit 0 too (`|| true`), for command and script.
+  Review r19 (5 findings, all fixed): no-context callers were told "no labs host"; the regex matched grep/log content
+  and DOTALL joined lines (now line-anchored, client prefixes only); remote hosts were flagged (loopback only); asyncpg
+  + MariaDB missed; mysql advice lacked member/credentials. The acquired-skill runner now passes run_context.
+  Accepted gap: DNS failures (`could not translate host name "db"`). Pins tests/test_execute_no_db_server_note.py +
+  test_tools_audit_fixes.py (captured run_context); battery mutants D1–D13.
+  Review r20 (2 MAJOR, 4 MINOR, all fixed): pytest `E   ` lines were missed; a server that ANSWERED (`FATAL: role/
+  password`) was called absent — the reason must now be No such file / refused / cannot assign; psycopg 3, SQLAlchemy
+  `(psycopg2.OperationalError)`, MySQL 2003/pymysql/mysql-connector, pg_isready added; labs_configured raising →
+  hedged wording. Battery D7 (MULTILINE→DOTALL) SURVIVED — every pinned shape was line 1; pinned with a traceback above.
+  Review r21 (1 MAJOR): Debian's default mysql client is MariaDB, whose TCP wording drops "MySQL" (`Can't connect to
+  server on '127.0.0.1' (111|115)`, 2002 or 2003) — the note's own `mysql -h127.0.0.1` would have fired nothing; added
+  with mysqlclient tuples, pymysql Errno 99, node-postgres ECONNREFUSED :5432/:3306. Accepted MINORs: generic
+  pg_isready host:port, verbatim doc/test lines, asyncpg non-default port, -h 0.0.0.0.
+  Review r22 CLEAN (48 shapes, grouping/anchoring checked, worst 1 s per 5 MB). Battery D1–D14: all 14 killed, controls
+  correct (D11/D9 via fallback pins).
+- Full suite after r22: exit 0, lint OK (309 s). AGENT DEPLOYED ~10:20 (gated, foreground 0; pid 51971 → 59553).
+  PROD PG replay ×3 (prod_4sx_102202/102341/102412.json): 2/3 PASS — both runs that ran `psql` in the sandbox got the
+  note ("sandbox no db" logged) and went straight to `lab create` pg-single → `lab exec` → `?column?` in 98 s / 52 s
+  (was 394 s, 9 execute calls, strike cap). The 3rd never ran psql (honest "no postgres_admin tool" after listing
+  skills, 30 s) — nothing for the note to read; same observation as before, no rule (§4NH). The two probe labs were
+  left by the model (no destroy) and removed via the host API; host {"labs":[]}.
