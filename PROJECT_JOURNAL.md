@@ -58638,3 +58638,115 @@ D1 (delete chess-coach + jiu-jitsu-calendar through the teardown) move to the en
 - **Watch:** the diary going flat once replies that quote the sentence are in the pool (the banner marks
   "(unchanged)"); the morning greeting.
 
+## §4SY — the health check reports the stores and services behind the agent; "system ready" follows the labs and runs boot lines (2026-11-05, operator: "check the healthcheck tool, it seems pretty limited to system metrics only, nothing about the agents internals, memories, graphs, lessons, nothing about labs … how much work would it be" → three steps offered → "step 1 is enough. follow the usual verification protocol." → mid-work: "'system ready' should be last, after labs")
+
+- **Before.** `system_utility(check_health)`: machine, Docker, internet, Tor, one "Agent Internals" line. The owner's
+  turns called it 11× in 30 days (median 3.5 s, ~430 chars).
+- **Inventory first** (read-only sweep of 15 subsystems): ~25 status functions were ready to call, ~14 needed a thin
+  wrapper, ~12 parts have no instrument. Step 1 = compose what exists; steps 2 (new probes) and 3 (things other
+  processes must report) were offered and NOT taken.
+- **Shipped.** `tools/health_internals.py`: six lines (Models, Memory stores, Learning, Projects and schedule, Labs
+  and sandbox, Storage and safety), each part read on its own, the store sections side by side in threads with a 4 s
+  bound; `problems_line` printed third by `tool_check_health`, fed from every check including Docker/internet/Tor,
+  with a second list "could not be checked". `introspect._known_nodes` split out of `_overview_health` so both
+  surfaces name the model servers alike. The old internals line is kept; its graph count now excludes expired edges.
+- **Review r1 (independent reader, 116 own mutants): 4 MAJOR, 8 MINOR — all in this change's own code.**
+  1. MAJOR — stores that failed to load were not problems, and episodes / fact ledger / experience were not even
+     named. → `_Parts.store`: every store attribute goes through one reader that names a missing store and flags
+     it; an `ast` enumeration fails when a store is read through `getattr(context, …)` or `context.<attr>`
+     outside that reader (it cannot see a store reached through another object).
+  2. MAJOR — "read-only" was false on error paths: the stores' own readers RENAME a corrupt file aside and answer
+     empty, so the check moved `user_profile.json` / `skills_playbook.json` / the sandbox registries and then
+     reported them healthy. → JSON files are looked at first (`_damaged`) and a damaged one's reader is not called;
+     files set aside earlier were listed and flagged (REMOVED in r2, and the sandbox registries were not actually
+     covered until r2); a lab/run registry file that does not open is UNREADABLE, not zero.
+     Pinned on the REAL `ProfileMemory` with a file-tree comparison. The claim is now "repairs nothing, probes
+     nothing"; other reads still go through each store's reader.
+  3. MAJOR — a sandbox cut off from the network read "egress blocked", no problem ("blocked" is also the healthy
+     state); "container up" came from a handle that outlives a stopped container. → `_cut_off` is the flag;
+     the line says "started earlier (not probed now)".
+  4. MAJOR — my reworded prompt rule said check_health covers "your own parts" while the SELF SURFACE rule and the
+     `introspect` description still said `system_utility` is "the MACHINE, not you", and "cover EVERY section"
+     forced a 16-line recital. → all three reworded together: the health check of the machine and of the stores
+     and services the agent runs on; not how the agent is; problems first, then a line per section or the part asked.
+  5. MINOR, fixed: a slow reader blanked its whole line and counted as a problem → what was read is kept and the
+     rest is "could not be checked"; a slow Tor circuit likewise; `half_open` nodes are flagged and the problem
+     quotes the reading; the graph fault was counted twice; the backup age came from the folder mtime (a `.DS_Store`
+     reset it) → from the folder's name; the models line is read on the event loop (the breaker dict is written
+     there); tests no longer need a docker binary.
+  6. Boot order: `runs_boot_line` and the staleness audit could also follow the banner → `main._wait_boot_lines`
+     waits for the labs AND runs tasks (≤ 12 s) and the audit moved before the banner. NOT covered, said in the
+     docstring: the leaf reaper and the store-reconcile threads. The comment "only the LOG LINE waits, never the
+     socket" was false before this change and is corrected: the banner is awaited before the `yield`.
+- **Review r2 (second reader, on the r1 fixes): 4 MAJOR, 6 MINOR — again all inside the previous round's fixes.**
+  1. MAJOR — the set-aside listing printed a sandbox-writable file NAME raw: a name with newlines forged
+     "Problems found: none" and an instruction on the third line; a service named `fix-corrupt-db` was a false
+     alarm on every check.
+  2. MAJOR — the sandbox registries were still set aside by the check itself (`list_entries` → `_load` →
+     `registry_load_failed` renames), then reported as "0 jobs", no problem. Every sandbox test stubbed the
+     supervisors, so none could see it.
+  3. MAJOR — the listing missed the vector store's own names (`library_index.json.corrupt`, no dash) and counted
+     the memory directory twice (`chroma_dir` IS `memory_dir` in production; my test invented a `chroma/` folder).
+  4. MAJOR — "open / half_open node = problem" cried wolf: a keepalive failure trips the breaker and only a REAL
+     call closes it, so a node restarted 9 h ago, or an image node that failed once 3 days ago, was a standing
+     problem. r1 had asked for half_open to be flagged; r2 showed both states are last-known, not current.
+  → Two of the four came from ONE mechanism I had added in r1 (the lexical `corrupt-` listing), a third from a
+  rule that had already flipped once. Both were DELETED, not patched: no file name is printed anywhere, and a
+  failing last-known node state goes on the "could not be checked" list with its reading. The registries get the
+  same look-first treatment as the JSON stores, through the supervisors' own guarded reader (no link followed,
+  bounded). What the check cannot know (a store that lost data EARLIER) is written down as a limit.
+  MINOR, fixed: document index kind (a list; a zero-byte file is an empty catalogue); `--no-memory` no longer
+  excuses the project store and the scheduler; the cut-off problem no longer names one cause for three; prompt
+  wording no longer sends "whether something is working" / "lessons" to the health check; stale comments in
+  main.py and the boot-order test's docstring; tests now use the REAL supervisors over a temp workspace.
+- **Review r3 (third reader, on the r2 changes): 2 MAJOR, 5 MINOR.**
+  1. MAJOR — "a failing node is not checked" missed a node that is down NOW: a keepalive MISS is charged to the
+     breaker every 45 s (worker, critic), so for those `open` is at most ~2 min old; only `half_open` and the
+     un-pinged pools go stale. The rule had now flipped in every round (r1: flag half_open too; r2: flag
+     neither). → settled on the datum all three scenarios share, the AGE of the last failure: under 180 s =
+     problem ("failing now"), older = not checked. (REMOVED in r4: it was wrong too.)
+  2. MAJOR — the look-first check for the profile and the playbook could not fire in production: the turn that
+     calls check_health has already read both to build its prompt, and THAT read sets a torn file aside. → what
+     is left to see is used: each store creates its file at construction and writes atomically, so an ABSENT
+     file means set aside or removed → "file MISSING", a problem (profile, playbook, document index). The limit
+     is restated: a reset is invisible once the store has saved again.
+  3. MINOR, fixed: the registry look-first raced the supervisor's own read (the check set the file aside 87
+     times in 400 under a flipping file) → rows are COUNTED from the one guarded read and the supervisors'
+     loaders are never called; the backup folder's tag (a file name) was still printed → removed; project status
+     is printed only when it is a plain word; "call it only for a health check" was said of `system_utility`,
+     which is also the weather tool → the restriction names the `check_health` action, and "is everything
+     working?" is listed as a health-check phrasing; the "profile DEGRADED" branch could not be reached on the
+     real store (the check's own `load()` clears the flag) → deleted; the fact ledger is reported under
+     `--no-memory`; deep-nested JSON is DAMAGED instead of ending the section; a zero-byte playbook or ledger
+     reads as empty, as its store reads it.
+- **Review r4 (fourth reader, on the r3 changes): 1 MAJOR (narrow), 4 MINOR.** The MAJOR was the node rule
+  again: "failed in the last 180 s = failing now" was true of a node that had RECOVERED (the breaker stays open
+  until a real call succeeds; one missed ping re-stamps the failure), for 2–3 minutes — exactly when an operator
+  who saw the warning asks "is everything working?". Four rounds, four rules, four different faults on one
+  datum → the rule is REMOVED, as the flip-flop lesson says: a node is never judged; its last known state and
+  age are said on the third line under "could not be checked". KNOWN LIMIT, a decision left to the operator: a
+  node that is down right now is listed there, not under problems. A real fix needs a live probe or the breaker
+  recording ping successes (step-2 work, not taken). MINOR, fixed: registry wording says what it counts (rows a
+  sandbox-writable file holds: "N marked running, M other"); non-object rows are not counted; the status
+  word's length and ASCII clauses are pinned; the document-index MISSING text no longer blames a reader; the
+  part-timeout test's bound went from 0.2 s to 1 s (the storage section's cold import took 0.18 s).
+- **Convergence, stated honestly.** Four independent review rounds: MAJOR 4 · 4 · 2 · 1, every one after r1
+  INSIDE the previous round's fix. Three mechanisms I added while fixing were deleted (the set-aside listing,
+  the breaker-as-problem rule in three versions, `ServiceSupervisor.list_entries` by mistake). No fifth review
+  was run on the r4 changes: they are one deletion (back to a state r2 and r3 had read), wording, and pins.
+  Battery `scripts/mutate_4sy.py`: 130 mutants, see the deploy line for the score.
+- **Final checks + deploy.** Battery `scripts/mutate_4sy.py`: 128 mutants + known-bad all KILLED, no-op survived
+  (earlier runs: 96/100 → 3 pins; 106/107 → 1 pin). Full suite 29,972 passed, lint OK — its first run failed two
+  tests of mine: the new docs table had no scroll wrapper, and `test_lifespan_starts_and_cancels_biological_daemon`
+  used a fake daemon that died on its first loop turn and had passed only because startup never yielded (it does
+  now, while the banner waits for the boot lines). Deployed 16:17 (graceful SIGTERM at foreground_requests = 0,
+  pid 41504 → 61067). Boot log: runs line, labs line, warm-up done (2 min 40 s — the head changed, as the prompt
+  and description edits predicted), then "system ready" LAST. Probes (labelled): "do a health check" →
+  `check_health`, 3.6 s for the tool (3.5 s before), problems line first, each section summarised, what was not
+  probed said; "how's things today?" → `introspect overview`; "is everything working?" → `check_health`; "how
+  are your lessons doing?" → `introspect learning`. Seen on the first live report, not part of this change: the
+  agent's inventory holds 3 live labs while the lab host answered `labs=0` at boot.
+- **Found while building.** I added `ServiceSupervisor.list_entries` and it already existed 70 lines below (removed
+  mine; "grep a new name first" again). `asyncio.run` joins a stuck reader's thread, so the timeout test measures
+  inside the coroutine. The first unreadable-registry test failed because `inventory_for` answers None for a file
+  that does not open and I had read None as "no labs".

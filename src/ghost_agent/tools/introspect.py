@@ -844,34 +844,42 @@ def _same_server(a, b) -> bool:
     return bool(norm(a)) and norm(a) == norm(b)
 
 
+def _known_nodes(context) -> List[Tuple[str, object]]:
+    """[(name, breaker status or None)] — one entry per distinct SERVER the
+    agent calls besides the main model, in pool order. Shared by the overview
+    line below and `check_health`'s models line (§4SY), so the two name the
+    nodes the same way. No I/O; may raise on a broken client (callers guard)."""
+    llm = getattr(context, "llm_client", None)
+    get = getattr(getattr(llm, "circuit_breaker", None), "get_status", None)
+    status = get() if callable(get) else {}
+    if not isinstance(status, dict):
+        status = {}
+    # one reading per SERVER (r2: worker and critic share one URL — the
+    # breaker keys by URL, so two lines showed one entry twice)
+    names: Dict[str, List[str]] = {}
+    for pool, label in _HEALTH_POOLS:
+        clients = getattr(llm, f"{pool}_clients", None)
+        urls = [str(c.get("url") or "") for c in clients
+                if isinstance(c, dict) and c.get("url")] if isinstance(clients, (list, tuple)) else []
+        urls = list(dict.fromkeys(urls))          # r3: number the DISTINCT servers
+        for i, u in enumerate(urls):
+            name = label if len(urls) == 1 else f"{label} {i + 1}"
+            if _same_server(u, getattr(llm, "upstream_url", "")):
+                # r1: the vision pool IS the main server here — a trip
+                # means its picture calls failed (busy or slow), not that
+                # the server that writes this reply is down
+                name += " (picture calls to the main model's own server)"
+            names.setdefault(u, []).append(name)
+    return [("/".join(ns) + (" (one server)" if len(ns) > 1 else ""), status.get(u))
+            for u, ns in names.items()]
+
+
 def _overview_health(context) -> str:
     """§4QJ: what the agent already knows about its own parts, read from
     the circuit breaker of its own calls — instant, no live test. The
     live checks (internet, Tor, Docker) stay behind check_health."""
     try:
-        llm = getattr(context, "llm_client", None)
-        get = getattr(getattr(llm, "circuit_breaker", None), "get_status", None)
-        status = get() if callable(get) else {}
-        if not isinstance(status, dict):
-            status = {}
-        # one reading per SERVER (r2: worker and critic share one URL — the
-        # breaker keys by URL, so two lines showed one entry twice)
-        names: Dict[str, List[str]] = {}
-        for pool, label in _HEALTH_POOLS:
-            clients = getattr(llm, f"{pool}_clients", None)
-            urls = [str(c.get("url") or "") for c in clients
-                    if isinstance(c, dict) and c.get("url")] if isinstance(clients, (list, tuple)) else []
-            urls = list(dict.fromkeys(urls))          # r3: number the DISTINCT servers
-            for i, u in enumerate(urls):
-                name = label if len(urls) == 1 else f"{label} {i + 1}"
-                if _same_server(u, getattr(llm, "upstream_url", "")):
-                    # r1: the vision pool IS the main server here — a trip
-                    # means its picture calls failed (busy or slow), not that
-                    # the server that writes this reply is down
-                    name += " (picture calls to the main model's own server)"
-                names.setdefault(u, []).append(name)
-        nodes = [("/".join(ns) + (" (one server)" if len(ns) > 1 else "")
-                  + f" {_node_reading(status.get(u))}") for u, ns in names.items()]
+        nodes = [f"{name} {_node_reading(st)}" for name, st in _known_nodes(context)]
         if not nodes:
             return ""
         return ("Last known state of my parts (from my own recent calls — no live test was run now): "

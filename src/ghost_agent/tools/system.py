@@ -436,6 +436,13 @@ async def tool_check_health(context=None):
         _HCH,
         "System Status: Online"
     ]
+    # §4SY: what is WRONG, gathered where each check is made and printed as
+    # the third line — the report grew from 10 lines to 16, and a failure in
+    # line 14 must not depend on the reader getting that far. `unchecked`
+    # holds what did not ANSWER (a slow Tor circuit, a busy store): not a
+    # problem, and not "fine" either
+    problems: list = []
+    unchecked: list = []
     
     # 1. Platform Info
     health_status.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
@@ -487,8 +494,10 @@ async def tool_check_health(context=None):
             health_status.append(f"Docker: Active (Version {docker_res.stdout.strip()})")
         else:
             health_status.append("Docker: Inactive or Not Found")
+            problems.append("Docker is not running or not found")
     except Exception:
         health_status.append("Docker: Check Failed")
+        problems.append("Docker could not be checked")
 
     # 6. Connectivity (Internet & Tor)
     try:
@@ -531,14 +540,20 @@ async def tool_check_health(context=None):
                 _last_err = type(_e).__name__
                 if mode != "TOR":
                     health_status.append("Internet: Disconnected or Blocked")
+                    problems.append("the internet was not reached")
                     break
         else:
             health_status.append(
                 ("Internet: NOT reached via Tor within 10 s (" + (_last_err or "blocked exit")
                  + ") — the circuit may be slow; this is not proof the host is offline")
                 if mode == "TOR" else "Internet: Disconnected or Blocked")
+            if mode == "TOR":
+                unchecked.append("the internet through Tor (not reached this time; the circuit may be slow)")
+            else:
+                problems.append("the internet was not reached")
     except Exception:
         health_status.append("Internet: Disconnected or Blocked")
+        problems.append("the internet was not reached")
         
     if context and context.tor_proxy:
         check_proxy = context.tor_proxy.replace("socks5://", "socks5h://")
@@ -557,6 +572,7 @@ async def tool_check_health(context=None):
                             health_status.append("Tor: Connected (Anonymous)")
                         else:
                             health_status.append("Tor: Connected but Not Anonymous (Check Config)")
+                            problems.append("Tor answers but the connection is NOT anonymous")
                         break
                 else:
                     async with httpx.AsyncClient(proxy=check_proxy, timeout=10.0, verify=True) as client:
@@ -569,6 +585,7 @@ async def tool_check_health(context=None):
                             health_status.append("Tor: Connected (Anonymous)")
                         else:
                             health_status.append("Tor: Connected but Not Anonymous (Check Config)")
+                            problems.append("Tor answers but the connection is NOT anonymous")
                         break
             except Exception as e:
                 if mode == "TOR":
@@ -578,9 +595,11 @@ async def tool_check_health(context=None):
                     continue
                 else:
                     health_status.append(f"Tor: Connection Failed ({str(e)})")
+                    problems.append("the Tor check failed")
                     break
         else:
             health_status.append("Tor: Connection Failed (Retries exhausted)")
+            problems.append("Tor did not answer (retries exhausted)")
     else:
         health_status.append("Tor: Not Configured")
 
@@ -618,7 +637,9 @@ async def tool_check_health(context=None):
                 import sqlite3
                 with context.graph_memory._lock:
                     with sqlite3.connect(context.graph_memory.db_path) as conn:
-                        count = conn.execute("SELECT count(*) FROM triplets").fetchone()[0]
+                        # §4SY: CURRENT facts — the bare count included every expired
+                        # edge, so it disagreed with `count_edges()` and the graph line below
+                        count = conn.execute("SELECT count(*) FROM triplets WHERE valid_until IS NULL").fetchone()[0]
                 graph_status = f"Active ({count} edges)"
             except Exception:
                 graph_status = "Active (Count Error)"
@@ -628,7 +649,23 @@ async def tool_check_health(context=None):
             f"Graph={graph_status}, Sandbox={sandbox_status}, "
             f"Bus={bus_status}, Idle Scheduler={bio_status}"   # §4NN: was "Biological Daemon"
         )
-        
+        if bio_status != "Running":
+            problems.append(f"the idle scheduler is not running ({bio_status}): no background job runs")
+        if bus_status != "Active":
+            problems.append("the memory bus is not attached")
+        # (a graph that cannot be counted is named by the memory line below)
+
+        # §4SY: one line per group of the stores and services behind the
+        # agent (models, memory stores, learning, projects and schedule, labs
+        # and sandbox, storage and safety) — see tools/health_internals.py
+        from .health_internals import internals_report
+        _lines, _found, _unchecked = await internals_report(context)
+        health_status.extend(_lines)
+        problems.extend(_found)
+        unchecked.extend(_unchecked)
+
+    from .health_internals import problems_line
+    health_status.insert(2, problems_line(problems, unchecked))
     return "\n".join(health_status)
 
 #: The full WMO weather-interpretation table Open-Meteo uses (§4LV: 9 codes

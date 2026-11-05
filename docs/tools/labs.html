@@ -35,7 +35,7 @@
     <li><code>--labs-host</code> (env <code>GHOST_LABS_HOST</code>): the service's <code>host:port</code>. Unset means the tool is not advertised.</li>
     <li><code>--labs-key-file</code> (env <code>GHOST_LABS_KEY_FILE</code>, default <code>~/Data/AI/.ghost_labs_key</code>, mode 0600): the file holding the API key, which is a copy of the labs host's <code>/etc/ghost-labs/api_key</code>. The key itself is never an argument, because args are recorded in <code>last_config.json</code>.</li>
     <li><code>labs_configured(context)</code> requires a host <em>and</em> a non-empty key file. Only real strings count (a mocked args is "unset"). Visibility depends on <strong>configuration only</strong>. If the host is down, the tool stays listed and answers <code>labs_unreachable</code>: changing the schema would re-prefill the cached head.</li>
-    <li>At boot, one line is logged in the background: host, version, <code>ok</code>, lab count and RAM. A host that is set but has no key logs a warning that the tool is hidden. A host that cannot be reached logs a warning that the tool stays listed (<code>start_labs_boot_line</code>; the task never raises).</li>
+    <li>At boot, one line is logged in the background: host, version, <code>ok</code>, lab count and RAM. A host that is set but has no key logs a warning that the tool is hidden. A host that cannot be reached logs a warning that the tool stays listed (<code>start_labs_boot_line</code>; the task never raises). The <code>system ready</code> banner waits for this line for at most 12 s (<code>main._wait_boot_lines</code>, §4SY), so the banner follows it unless the host takes longer than that.</li>
   </ul>
 
   <h2 id="actions">Actions</h2>

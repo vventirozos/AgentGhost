@@ -886,9 +886,10 @@ async def _announce_ready_when_warm(warmup_task, timeout: float = PREFIX_WARMUP_
     """Emit the READY banner once boot has genuinely finished.
 
     The main-prefix warmup is spawned in the background (it prefills ~24k
-    tokens and must not hold up the socket), so it was the one boot step that
+    tokens while the rest of the boot goes on), so it was the one boot step that
     logged AFTER "system ready" — making the banner look like a lie in the
-    operator's stream. Now the banner waits for it.
+    operator's stream. Now the banner waits for it, and then for the other
+    boot lines that are written by background tasks (`_wait_boot_lines`).
 
     Two rails, because a log line must never be able to hide:
       * the wait is SHIELDED, so a timeout here cannot cancel the warmup;
@@ -908,8 +909,39 @@ async def _announce_ready_when_warm(warmup_task, timeout: float = PREFIX_WARMUP_
             raise
         except Exception:  # noqa: BLE001 — spawn_bg already logs the failure
             pass
+    try:
+        await _wait_boot_lines()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 — the banner must not depend on it
+        logger.debug("ready banner: boot-line wait skipped: %s", e)
     pretty_log("System Ready", "Listening for requests",
                icon=Icons.SYSTEM_READY)
+
+
+#: how long the READY banner waits for the background boot lines (the labs
+#: host call gives up after ~8 s; a run reconcile probes the sandbox)
+BOOT_LINES_WAIT_S = 12.0
+
+
+async def _wait_boot_lines(timeout: Optional[float] = None) -> None:
+    """Wait, at most ``timeout`` seconds (default BOOT_LINES_WAIT_S), for the
+    boot lines written by background tasks: the labs host line and the run
+    registry line. Operator 11-05: "labs host … ok=True" was logged 1.4 s
+    AFTER "system ready". The tasks are not cancelled by the wait; one that
+    is slower than the bound still logs after the banner.
+
+    ⚠ The banner is awaited BEFORE the lifespan's `yield`, so this also holds
+    the start of serving: about a second when the labs host answers, its
+    connect timeout (~8 s) when it does not, never more than the bound.
+
+    NOT covered — they have no bounded end to wait for: the leaf reaper
+    (up to 5 min) and the store-reconcile threads. Their lines can still
+    follow the banner."""
+    from .tools import labs as _labs, runs as _runs
+    pending = [t for t in (*_labs._BOOT_TASKS, *_runs._BOOT_TASKS) if not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=BOOT_LINES_WAIT_S if timeout is None else timeout)
 
 
 
@@ -1517,7 +1549,8 @@ async def lifespan(app):
     except Exception as e:  # noqa: BLE001
         logger.warning("leaf reaper skipped: %s: %s", type(e).__name__, e)
     # §4SX Phase B: one line naming the labs host, its version and health —
-    # in the background (a down host must not hold the boot for its timeout)
+    # in the background, so the rest of the boot goes on meanwhile (§4SY: the
+    # READY banner then waits for this line, at most BOOT_LINES_WAIT_S)
     try:
         from .tools.labs import start_labs_boot_line
         start_labs_boot_line(context)
@@ -2294,16 +2327,19 @@ async def lifespan(app):
         logger.debug("resolved-config dump skipped: %s", _cfge)
         app.state.resolved_config = {}
 
-    # READY IS ANNOUNCED LAST — after the prefix warmup's own two lines, so
-    # the banner means what it says. The server starts serving at the `yield`
-    # below either way: only the LOG LINE waits, never the socket.
-    await _announce_ready_when_warm(_warmup_task)
-
-    # R8 MAJOR-2: last thing before serving — did the PRM inertness hop
-    # actually run? A silenced hop emits nothing, so its absence is
-    # otherwise indistinguishable from a healthy box.
+    # R8 MAJOR-2: did the PRM inertness hop actually run? A silenced hop
+    # emits nothing, so its absence is otherwise indistinguishable from a
+    # healthy box.
     # R30 MAJOR-2: and say so if the source moved out from under us.
+    # (§4SY: before the banner — its line used to follow "system ready")
     audit_source_newer_than_process()
+
+    # READY IS ANNOUNCED LAST — after the prefix warmup's own two lines and
+    # the labs / runs boot lines, so the banner means what it says. ⚠ This is
+    # awaited before the `yield`, and the server starts serving at the
+    # `yield`: the socket waits with the banner (§4SY review — the earlier
+    # comment here said only the log line waits).
+    await _announce_ready_when_warm(_warmup_task)
 
     try:
         yield

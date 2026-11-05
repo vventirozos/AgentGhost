@@ -369,7 +369,12 @@ async def test_lifespan_starts_and_cancels_biological_daemon():
     mock_app.state.context = mock_context
 
     fake_agent = MagicMock()
-    fake_agent.biological_watchdog = AsyncMock(side_effect=asyncio.sleep)
+    # a daemon that RUNS until cancelled. (It was `side_effect=asyncio.sleep`, called with no delay: the
+    # task died with a TypeError on its first loop turn, and the test passed only because startup never
+    # yielded to the loop — §4SY: the READY banner now waits for the background boot lines, so it does.)
+    async def _daemon():
+        await asyncio.sleep(3600)
+    fake_agent.biological_watchdog = AsyncMock(side_effect=_daemon)
 
     with patch("ghost_agent.main.LLMClient") as MockLLM, \
          patch("ghost_agent.main.importlib.util.find_spec", return_value=False), \
