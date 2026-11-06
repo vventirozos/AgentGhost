@@ -134,6 +134,27 @@ def _note_unsupported(base: str, e: Exception, text: str) -> None:
         _unsupported.add(base)
 
 
+def recheck_supported(base: str, timeout: float = 3.0) -> bool:
+    """§4TJ: True when a server marked unsupported now takes slot actions (the
+    mark is lifted). Req c6751cb9: one llama without --slot-save-path at the
+    agent's boot left saves off through two llama restarts WITH the flag, and a
+    picture look cost a re-read of 80k tokens. An empty filename saves nothing:
+    without the flag llama answers 501 before it reads the name, with it 400
+    "Invalid filename" at once, even while the slot is busy (measured live). No
+    answer says nothing, so the mark stays."""
+    if base not in _unsupported:
+        return False
+    try:
+        _http(f"{base}/slots/{SLOT_ID}?action=save", {"filename": ""}, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    _unsupported.discard(base)
+    return True
+
+
 def server_identity(base: str) -> str:
     """Model file, build and chat template of the running server — part of the
     file key, so a model, build or template change never restores old state."""

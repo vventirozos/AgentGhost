@@ -18,7 +18,7 @@ try:
     from curl_cffi import requests as curl_requests
 except ImportError:
     curl_requests = None
-from ..utils.logging import Icons, pretty_log, request_id_context
+from ..utils.logging import Icons, pretty_log, request_elapsed_s, request_id_context, slot_session_context
 from ..utils.edit_ledger import record_edit
 from ..utils.helpers import request_new_tor_identity
 
@@ -5635,6 +5635,8 @@ _WRITTEN: "dict[tuple, int]" = {}
 #: view succeeded). Value: {"ranges": [(s, e)], "bytes": [(a, b)], "cov": float,
 #: "stamp": (mtime_ns, size)}.
 _READ: "dict[tuple, dict]" = {}
+#: §4TJ: files this request changed but did not write whole
+_MUTATED: "dict[tuple, bool]" = {}
 #: the share of a file's lines a request must have seen before it may discard the rest
 READ_COVERAGE_FLOOR = 0.80
 #: a file this big is never line-counted for coverage (a whole read is capped long before)
@@ -6083,7 +6085,7 @@ def forget_request_receipts(req_id) -> int:
     one 512-slot LRU across requests). Returns the number removed."""
     rid = str(req_id or "")
     n = 0
-    for table in (_READ, _WRITTEN, _IN_PROGRESS):
+    for table in (_READ, _WRITTEN, _IN_PROGRESS, _MUTATED):
         for k in [k for k in table if k and k[0] == rid]:
             table.pop(k, None)
             n += 1
@@ -6102,12 +6104,19 @@ def _note_mutation(path: Path) -> None:
     wrec = _WRITTEN.get(k)
     if isinstance(wrec, dict):
         wrec["stamp"] = _file_stamp(path)
+    else:
+        # §4TJ: not this request's file, whatever its birth time says from now on
+        # (the atomic append replaces the inode, so the file reads as just born)
+        if len(_MUTATED) >= _IN_PROGRESS_MAX and k not in _MUTATED:
+            for old in list(_MUTATED)[: _IN_PROGRESS_MAX // 4]:
+                _MUTATED.pop(old, None)
+        _MUTATED[k] = True
     rrec = _READ.get(k)
     if isinstance(rrec, dict):
         rrec["stamp"] = None
 
 
-def unread_rewrite_refusal(path: Path, filename: str, **_ignored) -> str:
+def unread_rewrite_refusal(path: Path, filename: str, *, count_in_progress: bool = True, **_ignored) -> str:
     """"" when a write over `path` is allowed, else the refusal TEXT (the
     caller wraps it in `ToolOutcome.rejected("REJECTED: …")`). A first PART
     over an existing unread file is as destructive as a plain write (the
@@ -6119,7 +6128,7 @@ def unread_rewrite_refusal(path: Path, filename: str, **_ignored) -> str:
     if not path.exists() or not path.is_file():
         return ""
     k = _progress_key(path)
-    if k in _IN_PROGRESS:
+    if count_in_progress and k in _IN_PROGRESS:
         return ""
     now = _file_stamp(path)
     size = now[1] if now else 0
@@ -6149,6 +6158,100 @@ def unread_rewrite_refusal(path: Path, filename: str, **_ignored) -> str:
     return (f"'{filename}' already exists ({size:,} bytes) and this request has not read it — a "
             f"whole-file write would discard everything you did not re-emit. Read it whole "
             f"(operation='read'), " + tail)
+
+
+#: §4TJ: (conversation, real path) -> (the refused request, the tree's fingerprint,
+#: when): a LATER request of that conversation may delete it within the hour — the
+#: refusal told the model to ask the user in between. The answer itself is not read
+#: (as with `forget`'s confirm: a later turn, never the same one).
+_DELETE_ASKED: "dict[tuple, tuple]" = {}
+_DELETE_ASK_TTL_S = 3600.0
+#: a tree with this many unread files is not walked to the end, and never deleted here
+_DELETE_WALK_MAX = 5000
+#: the system's own scratch files: made by `execute(filename=…)`, no read receipt,
+#: often in work with no tracked request (§4PG: the smoke gate removes its script)
+_SYSTEM_SCRATCH = frozenset({".smoke_gate.py"})
+
+
+def _delete_loses(path: Path) -> bool:
+    """§4TJ: deleting this regular file loses content the request never saw.
+    Empty, read or written whole (`unread_rewrite_refusal`, the one rule) or
+    created during this request (`execute` output: a tar, a screenshot) lose
+    nothing. An append in progress grants nothing here: 5 characters appended to
+    an unread file would otherwise unlock its delete (review r2), and a tool's
+    append or edit voids the birth exit (`_MUTATED`). Birth time, not mtime: an
+    in-place edit does not make a file the request's (a rename-based one in
+    `execute`, `sed -i`, does: accepted, as `rm` in `execute` is)."""
+    if path.name in _SYSTEM_SCRATCH:
+        return False
+    st = path.stat()
+    if st.st_size == 0 or not unread_rewrite_refusal(path, path.name, count_in_progress=False):
+        return False
+    if _progress_key(path) in _MUTATED:
+        return True
+    elapsed = request_elapsed_s(str(request_id_context.get() or ""))
+    return elapsed is None or getattr(st, "st_birthtime", st.st_mtime) < time.time() - elapsed
+
+
+def unread_delete_refusal(path: Path, filename: str) -> str:
+    """"" when deleting `path` is allowed, else the refusal text. Req c6751cb9:
+    refused a write over an unread 28 KB file, the model deleted the file to
+    save the read and wrote a new one. A directory is judged by its files.
+    The fingerprint covers every file, not the unread ones: receipts are per
+    request, so a file read in the refused request is unread in the next."""
+    import hashlib
+    lost, cut = [], False
+    sig = hashlib.sha1()
+
+    def _see(p: Path) -> None:
+        sig.update(f"{p}\0{_file_stamp(p)}\n".encode("utf-8", "surrogateescape"))
+        if _delete_loses(p):
+            lost.append(p)
+
+    if path.is_dir():
+        for root, dirs, names in os.walk(path):
+            dirs.sort()
+            for name in sorted(names):
+                p = Path(root) / name
+                if not p.is_symlink() and p.is_file():
+                    _see(p)
+                if len(lost) >= _DELETE_WALK_MAX:
+                    cut = True
+                    break
+            if cut:
+                break
+    else:
+        _see(path)
+    key = (str(slot_session_context.get() or ""), str(path.resolve()))
+    if not lost:
+        _DELETE_ASKED.pop(key, None)
+        return ""
+    rid = str(request_id_context.get() or "")
+    now = time.monotonic()
+    asked = _DELETE_ASKED.get(key)
+    if (asked and asked[0] != rid and asked[1] == sig.digest() and not cut
+            and now - asked[2] <= _DELETE_ASK_TTL_S):
+        _DELETE_ASKED.pop(key, None)
+        return ""
+    if key[0]:
+        if len(_DELETE_ASKED) >= _IN_PROGRESS_MAX and key not in _DELETE_ASKED:
+            for old in list(_DELETE_ASKED)[: _IN_PROGRESS_MAX // 4]:
+                _DELETE_ASKED.pop(old, None)
+        _DELETE_ASKED[key] = (rid, sig.digest(), now)
+    if cut:
+        return (f"'{filename}' holds at least {len(lost)} files this request has not read — too many "
+                f"to delete from here. Leave it and tell the user. Nothing was deleted.")
+    ask = ("ask the user whether to delete it, and delete it in a later turn if they agree"
+           if key[0] else "leave it and say so in your report")
+    if path.is_dir():
+        names = ", ".join(p.relative_to(path).as_posix() for p in lost[:3])
+        return (f"'{filename}' holds {len(lost)} file(s) this request has not read "
+                f"({names}{', …' if len(lost) > 3 else ''}) — deleting would lose content you have not seen. "
+                f"Read those files whole first (operation='read' on each), then delete the folder. If they "
+                f"cannot be read (binary, too big), {ask}. Nothing was deleted.")
+    return (f"'{filename}' ({lost[0].stat().st_size:,} bytes) is a file this request has not read — "
+            f"deleting would lose content you have not seen. Read it whole first (operation='read'), then "
+            f"delete it. If it cannot be read (binary, too big), {ask}. Nothing was deleted.")
 
 
 def _mark_written(path: Path) -> None:
@@ -7273,6 +7376,10 @@ async def tool_delete_file(filename: str, sandbox_dir: Path):
         _ref = _protected_dir_refusal(sandbox_dir, path, filename)
         if _ref is not None:
             return _ref
+        _unread = await asyncio.to_thread(unread_delete_refusal, path, filename)      # §4TJ
+        if _unread:
+            from .outcome import ToolOutcome
+            return ToolOutcome.rejected("REJECTED: " + _unread, world_changed=False, reason_code="unread_delete")
         if path.is_dir():
             await asyncio.to_thread(shutil.rmtree, path)
         else:

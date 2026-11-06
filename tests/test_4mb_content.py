@@ -322,6 +322,8 @@ async def test_a_project_directory_is_not_rmtree_d(tmp_path):
     from ghost_agent.tools.file_system import tool_rename_file
     out = await tool_rename_file("projects/48e0373aaab3", "gone", tmp_path)
     assert _rejected(out) and d.exists()                     # no move-then-delete
+    from ghost_agent.tools.file_system import _mark_read
+    _mark_read(d / "main.py", whole=True)                    # §4TJ: an unread file is refused
     out = await tool_delete_file("projects/48e0373aaab3/main.py", tmp_path)
     assert not (d / "main.py").exists()
     (tmp_path / "projects" / "notes").mkdir()                 # a user folder, not a project

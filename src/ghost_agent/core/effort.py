@@ -165,7 +165,7 @@ _WRITE_OPS = frozenset({"write", "append", "edit", "replace", "append_file", "wr
 #: Refusals of an edit that say the model's EDIT was wrong (file_system reason
 #: codes; r2: each checked against a real tool result). Guards and the world do
 #: not count: "already applied, nothing changed" (duplicate_append) is a
-#: success, file_in_progress / unread_rewrite / file_changed_underneath are the
+#: success, file_in_progress / unread_rewrite / unread_delete / file_changed_underneath are the
 #: tool's own steps, and a missing argument is a cut or malformed call.
 WRONG_EDIT_CODES = frozenset({
     "old_string_not_found", "old_string_ambiguous", "identical_edit", "envelope_on_edit",   # edit

@@ -321,6 +321,8 @@
     <li><strong>Disk use.</strong> <code>ls -la ~/Data/AI/Data/system/head_saves</code>; at most 3 owner heads, 3 members' heads and 6 conversations (each a <code>.bin</code> and a <code>.json</code>), the conversations also under <code>CONV_BYTES_MAX</code>. Deleting them is always safe: the next warm-up re-processes the head and saves it again.</li>
   </ul>
 
+  <p id="4tj"><strong>"head saves off" comes back on by itself (§4TJ, 2026-11-06).</strong> One 501 from a llama without <code>--slot-save-path</code> marks the server as unsupported. That mark used to last until the agent restarted. A later llama with the flag changed nothing: each plan came back empty, the only plan left was from the model before the swap, and <code>_conv_save</code> refused it without a log line (request c6751cb9 re-read 80k tokens after a picture look). While the mark is set, each idle tick now asks llama with an empty filename (<code>recheck_supported</code>): 501 keeps the mark, 400 "Invalid filename" lifts it and logs <code>head saves back on</code>, no answer keeps it. The empty name writes nothing. That tick's warm-up then installs the save hooks. The exits that lost a conversation silently now log <code>not saved before … </code> with the reason: no save hook, no save plan, a plan from another model, or a slot llama did not report.</p>
+
   <h2 id="limits">What it does not cover</h2>
   <ul>
     <li>The owner record and the effort level live in process memory and are not persisted. Since §4SA the shutdown saves the conversation that holds the slot (when no turn is running and no stream is open on it, within 25&nbsp;s), so after a restart that conversation's next request restores a file as new as its last turn; a turn in flight at shutdown is not saved, and such a conversation's file is as old as its last save. The boot warm-up restores the server-default level's head, whatever level was last in use, and the next request restores its conversation file over it. (§4RW-e: llama restarting under a live agent clears the record — <code>prompt_tokens_total</code> fell, or llama has served nothing.)</li>
@@ -349,6 +351,7 @@
   <p>The design notes, reviews and measurements for each step are in the <a href="llm.html">llm reference</a>:</p>
   <ul>
     <li><a href="llm.html#4ro">§4RO</a>: the head saved on disk.</li>
+    <li><a href="#4tj">§4TJ</a>: "head saves off" recovers without an agent restart.</li>
     <li><a href="llm.html#4ro-r5">§4RO r5</a>: a restore that cannot happen sends nothing.</li>
     <li><a href="llm.html#4rp">§4RP</a>: the slot belongs to a conversation.</li>
     <li><a href="llm.html#4rp-b">§4RP-b</a>: the follow-up label flip.</li>

@@ -67,6 +67,8 @@ class TestDestructiveRootGuard:
         assert (sandbox / "keep.txt").exists()
 
     async def test_delete_real_file_still_works(self, sandbox):
+        from ghost_agent.tools.file_system import _mark_read
+        _mark_read(sandbox / "keep.txt", whole=True)     # §4TJ: an unread file is refused
         out = await tool_delete_file("keep.txt", sandbox)
         assert out.startswith("SUCCESS")
         assert not (sandbox / "keep.txt").exists()

@@ -16125,7 +16125,11 @@ class GhostAgent:
             # the server and its identity — a key under a stale identity is
             # never restored (the next plan's key differs).
             hs = getattr(self, "_head_plan_last", None) or getattr(self, "_conv_plan_last", None)
-            if not owner or not isinstance(hs, dict):
+            if not owner:
+                return False
+            if not isinstance(hs, dict):
+                pretty_log("Conversation", f"not saved before {why} — no save plan yet; its next request "
+                           f"re-reads it", icon=Icons.HEAD_FAIL)                      # §4TJ: was silent
                 return False
             if hs is not getattr(self, "_head_plan_last", None):
                 try:
@@ -16133,7 +16137,12 @@ class GhostAgent:
                 except Exception:  # noqa: BLE001 — r3: /props down is not another model
                     ident = hs.get("identity")
                 if ident != hs.get("identity"):
-                    return False      # round 2: llama now runs another model — not under the old identity
+                    # round 2: llama now runs another model — not under the old
+                    # identity. §4TJ: req c6751cb9 lost 80k tokens here silently
+                    # (the only plan left was from the model before a swap)
+                    pretty_log("Conversation", f"not saved before {why} — llama runs another model than the "
+                               f"last save plan; its next request re-reads it", icon=Icons.HEAD_FAIL)
+                    return False
             used = getattr(llm, "_slot_session_used", None)
 
             def _still_it() -> bool:
@@ -16186,7 +16195,11 @@ class GhostAgent:
                 logger.info("conversation not saved before %s: %d tokens past the head, under the %d floor",
                             why, n - n_head, conv_min_past_tokens())
                 return False
-            if n is None or not still_it():
+            if n is None:
+                pretty_log("Conversation", f"not saved before {why} — llama did not report the slot; its next "
+                           f"request re-reads it", icon=Icons.HEAD_FAIL)              # §4TJ: was silent
+                return False
+            if not still_it():
                 return False
             # §4SA review: one file per conversation AND level — a flip between
             # levels must not overwrite the other level's state
@@ -16993,6 +17006,20 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001
             logger.debug("head save skipped: %s: %s", type(e).__name__, e)
 
+    async def _head_saves_back(self) -> bool:
+        """§4TJ: lift "head saves off" once llama takes slot actions again
+        (`head_saves.recheck_supported`). Asks llama only while the mark is
+        set, never raises past the probe's own handling."""
+        if not _head_saves.enabled():
+            return False
+        llm = getattr(getattr(self, "context", None), "llm_client", None)
+        base = _head_saves.server_base(getattr(llm, "upstream_url", ""))
+        if not await asyncio.to_thread(_head_saves.recheck_supported, base):
+            return False
+        pretty_log("Head Disk", "head saves back on: llama-server now has --slot-save-path",
+                   icon=Icons.HEAD_SAVE)
+        return True
+
     def _note_llama_restart(self, total: Optional[int]) -> None:
         """§4RW-e (review): llama's prompt_tokens_total only falls when it
         restarted. Its slot is then empty, but the record still named the
@@ -17183,6 +17210,10 @@ class GhostAgent:
             if await self._member_head_refresh():
                 last_total = None
                 continue
+            # §4TJ: saves marked off and llama now takes them — this tick's
+            # warm-up makes the plan and installs the save hooks
+            if await self._head_saves_back():
+                last_total = None
             # §4OT r3: a NAMED displacement skips the "nothing ran" check —
             # llama counts a prompt while it is still generating, so the
             # displacing call's tokens can already sit in `last_total`; a

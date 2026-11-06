@@ -3738,6 +3738,12 @@ class LLMClient:
         """§4RW-g: the agent's hook, bounded; it never fails the call."""
         hook = getattr(self, "before_side_main_dispatch", None)
         if not callable(hook):
+            if conv_keep_enabled():
+                # §4TJ: req c6751cb9 lost 80k tokens here without one log line
+                what = side_call_what() or "this request's picture look"
+                pretty_log("Conversation", f"not saved before {what} — no save hook (head saves off, or no "
+                           "warm-up yet); a conversation too big to park is re-read from token 0",
+                           icon=Icons.HEAD_FAIL)
             return
         try:
             from ..utils.aio import wait_for as _wait_for
