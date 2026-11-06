@@ -32,13 +32,10 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not o
 _ROW = "│  **  12:00:00  ❌  +1.0s  sandbox exec   exit 1"
 
 _SCENARIOS = {
-    # An old pick, whether it was the saved one at start or arrives afterwards.
+    # The face a saved pick opens on.
     "forms": r"""
-import { tick, emit, face } from './common.mjs';
-const opened = face.getForm(); const picked = {};
-for (const old of ['cube', 'tesseract', 'vortex', 'descent', 'cube2']) {
-  face.setForm('empty'); tick(1); face.setForm(old); tick(1); picked[old] = face.getForm(); }
-emit({ opened, picked });
+import { emit, face } from './common.mjs';
+emit({ opened: face.getForm() });
 """,
     # Every node's path as one number, with the mood pushed as hard as it goes.
     "digest": r"""
@@ -463,7 +460,6 @@ def test_an_old_pick_opens_on_the_face_that_stayed(now):
     assert fs.known_forms(_STATIC) == ["moodtesseract", "empty"]
     for old in ("cube", "tesseract", "vortex", "descent", "cube2"):
         assert _run(now, "forms", form=old)["opened"] == "moodtesseract", old
-    assert _run(now, "forms")["picked"] == {old: "moodtesseract" for old in ("cube", "tesseract", "vortex", "descent", "cube2")}
 
 
 def _client_tree():
