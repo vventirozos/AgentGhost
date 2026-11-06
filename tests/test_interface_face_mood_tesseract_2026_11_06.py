@@ -7,11 +7,16 @@ other form; the second is bring back the idle jitter fixed the same day (§4TF).
 """
 from __future__ import annotations
 
+import ast
+import asyncio
+import filecmp
 import json
 import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +32,14 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not o
 _ROW = "│  **  12:00:00  ❌  +1.0s  sandbox exec   exit 1"
 
 _SCENARIOS = {
+    # An old pick, whether it was the saved one at start or arrives afterwards.
+    "forms": r"""
+import { tick, emit, face } from './common.mjs';
+const opened = face.getForm(); const picked = {};
+for (const old of ['cube', 'tesseract', 'vortex', 'descent', 'cube2']) {
+  face.setForm('empty'); tick(1); face.setForm(old); tick(1); picked[old] = face.getForm(); }
+emit({ opened, picked });
+""",
     # Every node's path as one number, with the mood pushed as hard as it goes.
     "digest": r"""
 import { tick, emit, face, snapshot, scene } from './common.mjs';
@@ -342,41 +355,82 @@ def test_the_id_survives_the_prefs_and_the_handheld():
     """World: "mood tesseract" as an id — the server refuses it, the handheld's
     parser drops it, and the pick silently does not stick."""
     assert "moodtesseract" in fs.known_forms(_STATIC)
-    server = (_ROOT / "interface" / "server.py").read_text(encoding="utf-8")
-    pat = re.search(r'_FACE_FORM_RE = re\.compile\(r"([^"]+)"\)', server).group(1)
+    server = ast.parse((_ROOT / "interface" / "server.py").read_text(encoding="utf-8"))
+    pat = next(n.value.args[0].value for n in server.body if isinstance(n, ast.Assign)
+               and getattr(n.targets[0], "id", "") == "_FACE_FORM_RE")
     assert re.fullmatch(pat, "moodtesseract")
 
 
 # ── the button: animations enabled / disabled (operator, 2026-11-06) ──────────
-_APP = (_ROOT / "interface" / "static" / "app.js").read_text(encoding="utf-8")
-_HTML = (_ROOT / "interface" / "static" / "index.html").read_text(encoding="utf-8")
-_CSS = (_ROOT / "interface" / "static" / "style.css").read_text(encoding="utf-8")
 _HANDHELD = _ROOT / "interface" / "externals" / "clockwork_ghost"
 
-
-def _button_run(start):
-    """The button's real code, on a fake page and face: what a click changes."""
-    i = _APP.index("const ANIMATIONS_ON_FORM"); j = _APP.index("// Persist a pick SERVER-side")
-    k = _APP.index("function showAnimationsState()")
-    e = _APP.index("window.__ghostWorkspace.toast;", k); e = _APP.index("});", e); e = _APP.index("}", e + 3) + 1
-    js = """
-let form = %r; const saved = [], toasts = [], classes = new Set(), attrs = {}; let handler;
+_BUTTON_RUN = r"""
+const src = require('fs').readFileSync(process.argv[1], 'utf8');
+const i = src.indexOf('const ANIMATIONS_ON_FORM'), j = src.indexOf('// Persist a pick SERVER-side');
+const k = src.indexOf('function showAnimationsState()');
+let e = src.indexOf('window.__ghostWorkspace.toast;', k); e = src.indexOf('});', e); e = src.indexOf('}', e + 3) + 1;
+if (i < 0 || j < i || k < 0 || e <= k) throw new Error('the button code moved');
+new Function('start', `
+let form = start; const saved = [], toasts = [], classes = new Set(), attrs = {}; let handler;
 const animationsBtn0 = { classList: { toggle: (c, v) => v ? classes.add(c) : classes.delete(c) },
   setAttribute: (k, v) => { attrs[k] = v; }, addEventListener: (_, f) => { handler = f; }, title: '' };
 const document = { getElementById: (id) => id === 'animations-btn' ? animationsBtn0 : null };
 const window = { __ghostWorkspace: { toast: (t) => toasts.push(t) } };
 const activeFace = { getForm: () => form, setForm: (n) => (form = n) };
 const rememberFaceForm = (n) => saved.push(n);
-%s
-%s
+${src.slice(i, j)}
+${src.slice(k, e)}
 const snap = () => ({ form, saved: [...saved], toasts: [...toasts], off: classes.has('animations-off'),
   pressed: attrs['aria-pressed'], label: attrs['aria-label'], title: animationsBtn0.title });
 const out = [snap()]; handler(); out.push(snap()); handler(); out.push(snap());
 console.log(JSON.stringify(out));
-""" % (start, _APP[i:j], _APP[k:e])
-    r = subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=30)
+`)(process.argv[2]);
+"""
+
+
+def _button_run(start):
+    """The button's real code, on a fake page and face: what a click changes."""
+    r = subprocess.run(["node", "-e", _BUTTON_RUN, str(_STATIC / "app.js"), start],
+                       capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-800:]
     return json.loads(r.stdout)
+
+
+class _Page(HTMLParser):
+    """The page's element ids, and the classes inside the animations button."""
+
+    def __init__(self):
+        super().__init__()
+        self.ids, self.in_button, self._inside = set(), set(), False
+
+    def parse(self, text):
+        self.feed(text)
+        return self
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        self.ids.add(a.get("id"))
+        if a.get("id") == "animations-btn":
+            self._inside = True
+        elif self._inside:
+            self.in_button.update((a.get("class") or "").split())
+
+    def handle_endtag(self, tag):
+        if tag == "button":
+            self._inside = False
+
+
+class _Sheet:
+    """A stylesheet as {selector: {property: value}}."""
+
+    @staticmethod
+    def parse(text):
+        rules = {}
+        for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", re.sub(r"/\*.*?\*/", "", text, flags=re.S)):
+            props = dict((k.strip(), v.strip()) for k, _, v in (d.partition(":") for d in body.split(";")) if v)
+            for selector in selectors.split(","):
+                rules.setdefault(" ".join(selector.split()), {}).update(props)
+        return rules
 
 
 def test_the_button_switches_the_two_forms_and_says_so():
@@ -396,17 +450,43 @@ def test_the_button_opens_in_the_state_it_was_left_in():
 
 
 def test_the_menu_is_gone_and_the_off_state_is_visible():
-    assert 'id="animations-btn"' in _HTML and "face-form-btn" not in _HTML
-    assert "face-form-menu" not in _CSS and "buildFaceFormMenu" not in _APP
-    assert "#animations-btn.animations-off .animations-slash { display: inline; }" in _CSS
-    assert "#animations-btn .animations-slash { display: none; }" in _CSS
+    page = _Page().parse((_STATIC / "index.html").read_text(encoding="utf-8"))
+    assert "animations-btn" in page.ids and "face-form-btn" not in page.ids
+    assert "animations-slash" in page.in_button
+    sheet = _Sheet.parse((_STATIC / "style.css").read_text(encoding="utf-8"))
+    assert sheet["#animations-btn .animations-slash"]["display"] == "none"
+    assert sheet["#animations-btn.animations-off .animations-slash"]["display"] == "inline"
+    assert not [selector for selector in sheet if "face-form-menu" in selector]
 
 
-def test_an_old_pick_opens_on_the_face_that_stayed():
-    src = (_ROOT / "interface" / "static" / "matrix_graph.js").read_text(encoding="utf-8")
+def test_an_old_pick_opens_on_the_face_that_stayed(now):
+    assert fs.known_forms(_STATIC) == ["moodtesseract", "empty"]
     for old in ("cube", "tesseract", "vortex", "descent", "cube2"):
-        assert f"{old}: 'moodtesseract'" in src, old
-    assert "const FORMS = ['moodtesseract', 'empty'];" in src
+        assert _run(now, "forms", form=old)["opened"] == "moodtesseract", old
+    assert _run(now, "forms")["picked"] == {old: "moodtesseract" for old in ("cube", "tesseract", "vortex", "descent", "cube2")}
+
+
+def _client_tree():
+    return ast.parse((_HANDHELD / "client.py").read_text(encoding="utf-8"))
+
+
+def _window_methods(tree, *names):
+    """The named methods of the handheld's window, executed without PyQt6 (not
+    installed here; the client runs on the device)."""
+    found = [n for cls in tree.body if isinstance(cls, ast.ClassDef) for n in cls.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
+    assert sorted(n.name for n in found) == sorted(names)
+    return ast.Module(body=found, type_ignores=[])
+
+
+class _Button:
+    def __init__(self):
+        self.tip = self.name = None
+
+    def setIcon(self, *_): pass
+    def setIconSize(self, *_): pass
+    def setToolTip(self, word): self.tip = word
+    def setAccessibleName(self, word): self.name = word
 
 
 def test_the_handheld_opens_on_the_mood_tesseract_and_toggles():
@@ -415,15 +495,54 @@ def test_the_handheld_opens_on_the_mood_tesseract_and_toggles():
     import facestate
     assert facestate.FALLBACK_FORM == "moodtesseract"
     assert facestate.known_forms(_HANDHELD / "webface") == ["moodtesseract", "empty"]
-    src = (_HANDHELD / "client.py").read_text(encoding="utf-8")
-    assert '"Animations on"' in src and '"Animations off"' in src
-    assert 'self._show_animations(name != "empty")' in src and "self.web_face.cycle_form(_got)" in src
-    assert "loop.create_task(window.mood_loop())" in src and "switch_face_btn" not in src
-    assert "self.web_face.set_agent_mood(*mood)" in src
+
+    tree = _client_tree()
+    ns = {"icons": SimpleNamespace(icon=lambda *a: a), "T": SimpleNamespace(TEXT_DIM="dim"), "QSize": lambda *a: a}
+    exec(compile(_window_methods(tree, "_show_animations", "toggle_animations"), "client.py", "exec"), ns)
+    forms = iter(["empty", "moodtesseract", None])
+    win = SimpleNamespace(animations_btn=_Button(),
+                          web_face=SimpleNamespace(cycle_form=lambda got: got(next(forms))))
+    win._show_animations = lambda on: ns["_show_animations"](win, on)
+    ns["toggle_animations"](win)
+    assert win.animations_btn.tip == win.animations_btn.name == "Animations off"
+    ns["toggle_animations"](win)
+    assert win.animations_btn.tip == win.animations_btn.name == "Animations on"
+    ns["toggle_animations"](win)                                 # the face reported nothing: the chip stays
+    assert win.animations_btn.tip == "Animations on"
+
+    # the mood reaches the face, and main() starts the loop that carries it
+    told = []
+
+    class _Client:
+        def __init__(self, **_): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return False
+
+    class _Stop(Exception):
+        pass
+
+    async def fetch_mood(*_):
+        return ("irritable", 2)
+
+    async def stop(_):
+        raise _Stop
+
+    ns = {"MOOD_POLL_S": 60, "httpx": SimpleNamespace(AsyncClient=_Client), "AGENT_BASE": "a", "GHOST_API_KEY": "k",
+          "agentapi": SimpleNamespace(fetch_mood=fetch_mood), "asyncio": SimpleNamespace(sleep=stop)}
+    exec(compile(_window_methods(tree, "mood_loop"), "client.py", "exec"), ns)
+    win = SimpleNamespace(web_face=SimpleNamespace(set_agent_mood=lambda *m: told.append(m)))
+    with pytest.raises(_Stop):
+        asyncio.run(ns["mood_loop"](win))
+    assert told == [("irritable", 2)]
+    started = [ast.unparse(c.args[0]) for c in ast.walk(tree) if isinstance(c, ast.Call)
+               and isinstance(c.func, ast.Attribute) and c.func.attr == "create_task" and c.args]
+    assert "window.mood_loop()" in started
+    assert "switch_face_btn" not in {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+
     html = (_HANDHELD / "webface" / "face.html").read_text(encoding="utf-8")
     assert "case 'agentMood': fn('setMoodHue', arg[0], arg[1]); break;" in html
     # the copy deploy.sh sends is the web face
-    assert (_HANDHELD / "webface" / "matrix_graph.js").read_bytes() == (_ROOT / "interface" / "static" / "matrix_graph.js").read_bytes()
+    assert filecmp.cmp(_HANDHELD / "webface" / "matrix_graph.js", _STATIC / "matrix_graph.js", shallow=False)
 
 
 @pytest.mark.parametrize("body,want", [

@@ -40,6 +40,7 @@ EVIDENCE_TOOLS = frozenset({
     "recall", "knowledge_base", "browser", "file_system", "execute",
     "fact_check", "news_headlines", "system_utility",
     "lab",      # §4SX B
+    "portfolio",  # §4TI
     "run",      # §4SX D5: a run's logs / collected result
 })
 

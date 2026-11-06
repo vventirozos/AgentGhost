@@ -63,6 +63,9 @@ def test_the_full_static_set_is_advertised(mock_context, monkeypatch):
     key.write_text("k" * 64)
     mock_context.args.labs_host = "127.0.0.1:8700"
     mock_context.args.labs_key_file = str(key)
+    # §4TI: `portfolio` is advertised only when configured, too
+    monkeypatch.setenv("GHOST_PORTFOLIO_URL", "http://127.0.0.1:8095")
+    monkeypatch.setenv("GHOST_PORTFOLIO_KEY_FILE", str(key))
     names = {(t.get("function") or {}).get("name")
              for t in R.get_active_tool_definitions(mock_context, None, serve_tuned=False)}
     static = {(t.get("function") or {}).get("name") for t in R.TOOL_DEFINITIONS}

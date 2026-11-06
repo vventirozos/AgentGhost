@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.portfolio — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="labs.html">labs</a>
+    <a class="current" href="portfolio.html">portfolio</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers.</p>
+
+  <h1>tools / portfolio.py</h1>
+  <p class="subtitle">The <code>portfolio</code> tool: the owner's IBKR holdings, read from a separate service. <span class="tag">2026-11-06</span></p>
+
+  <h2 id="why">Why it is a separate service</h2>
+  <p>The agent stays on Tor and holds no keys for outside accounts. A brokerage connection is tied to the owner by nature, so it lives in <code>interface/ibkr-service</code>, on another machine, on the normal internet, by the operator's choice. The agent only reads text from it over the tailnet. See the service's <code>README.md</code> for setup and operation.</p>
+
+  <h2 id="config">Configuration and visibility</h2>
+  <ul>
+    <li><code>GHOST_PORTFOLIO_URL</code>: the service's address, such as <code>http://100.64.0.2:8095</code>. Unset means the tool isn't advertised.</li>
+    <li><code>GHOST_PORTFOLIO_KEY_FILE</code>, default <code>~/Data/AI/.ibkr_service_key</code>, mode 0600. An empty file also hides the tool. The key is redacted from stored text by value.</li>
+    <li>Members never get it: it's outside <code>_MEMBER_ALLOWED_TOOLS</code>, and the tool refuses a member by itself as well. Contained contexts have it in their forbidden set.</li>
+  </ul>
+
+  <h2 id="actions">Actions</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>action</th><th>Arguments</th><th>What it returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>summary</code></td><td>&mdash;</td><td>Value, cash, total, gain against cost, today's change, dividends, and one line per holding.</td></tr>
+      <tr><td><code>position</code></td><td><code>symbol</code></td><td>One holding with its average cost and recent trades.</td></tr>
+      <tr><td><code>health</code></td><td>&mdash;</td><td>Concentration, currency mix, and how today's mix would have behaved: volatility, worst fall, correlation, comparison with the benchmark.</td></tr>
+      <tr><td><code>forecast</code></td><td><code>symbol</code> (optional)</td><td>The range of past returns over 1 month, 3 months and 1 year. A horizon needs twice its length in history, or it's left out.</td></tr>
+      <tr><td><code>review</code></td><td>&mdash;</td><td>Prompts from fixed rules, each with its reason and the case against acting. Never a buy or sell instruction.</td></tr>
+      <tr><td><code>status</code></td><td>&mdash;</td><td>Whether the token and query are present, and when data last arrived. No holdings.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="results">Results</h2>
+  <p>Every figure is computed by the service, and the tool passes its text through unchanged. A failure starts with <code>Error:</code>, so the turn loop sees it through <code>result_is_failure</code>. Old or missing data is labelled inside a successful result, as <code>STALE</code> or <code>Data gap</code>, because the figures that remain are still usable.</p>
+
+  <h2 id="safety">What it can't do</h2>
+  <p>It can't trade. The service has no order code and accepts only GET, and Flex only hands out reports. The agent never sees the Flex token or the account id, which the service never stores.</p>
+</main>
+</body>
+</html>

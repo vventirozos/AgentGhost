@@ -818,6 +818,8 @@ REPLAY_FORBIDDEN_TOOLS = frozenset({
     # §4SX Phase B: real machines on the labs host; D5: `run` starts/stops real processes there and in the
     # live workspace
     "lab", "run",
+    # §4TI: the owner's holdings
+    "portfolio",
     # `jobs` reaches the shared registry directly (cancel/collect on the
     # operator's live delegates). The registry itself is detached — this
     # is the belt.

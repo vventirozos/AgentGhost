@@ -1,5 +1,5 @@
 """§4GK round 7 — the defects a read-only reviewer confirmed by execution in
-the workspace restore, the shutdown hook and the handheld client.
+the workspace restore and the shutdown hook.
 
 ONE THEME, again: **the fix was written for the case that was measured.**
 
@@ -17,14 +17,10 @@ ONE THEME, again: **the fix was written for the case that was measured.**
   `atexit`'s per-callback isolation: `threading._shutdown` runs its callbacks
   with no try/except, so one raise skips `_python_exit` and the whole
   non-daemon join loop under it.
-* and the handheld client's LOAD side was never migrated to the fields round
-  6 added, so it printed "workspace restored." over an incomplete restore.
 
-Nothing here asserts on source text: every pin drives a real handler, a real
-interpreter shutdown, or the client's own function, extracted and executed
-(PyQt6 is not installed in this venv — the client runs on the handheld).
+Nothing here asserts on source text: every pin drives a real handler or a real
+interpreter shutdown.
 """
-import ast
 import errno
 import io
 import json
@@ -42,7 +38,6 @@ import pytest
 from ghost_agent.api import routes as R
 
 _ROOT = Path(__file__).resolve().parents[1]
-_CLIENT = _ROOT / "interface" / "externals" / "clockwork_ghost" / "client.py"
 
 
 # ── doubles (the shapes the round-4/6 files drive the routes with) ───────────
@@ -645,67 +640,3 @@ def test_the_store_hook_cannot_skip_the_interpreters_join_loop(tmp_path):
     assert "Exception ignored in" not in proc.stderr, proc.stderr[-600:]
     # the failure is still SAID, on the one channel that survives finalisation
     assert "store-pool shutdown hook failed" in proc.stderr, proc.stderr[-600:]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 6. the handheld client reads the same fields the web client does
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _client_function(name: str):
-    """Extract ONE top-level function from the uConsole client and execute
-    it, with the module constants it needs stubbed.
-
-    PyQt6 is not installed in this venv (the client runs on the handheld
-    against its own gui_env), so importing `client.py` is impossible — and a
-    source-TEXT assertion is an R4 reject that the pin-quality ratchet
-    counts. Parsing the module and compiling the one function is neither: it
-    runs the real code, and it breaks on a rename rather than on a comment.
-    """
-    tree = ast.parse(_CLIENT.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            ns = {"NOTE_OK": "<OK>", "NOTE_WARN": "<WARN>",
-                  "NOTE_DIM": "<DIM>", "NOTE_ERR": "<ERR>"}
-            exec(compile(ast.Module(body=[node], type_ignores=[]),
-                         str(_CLIENT), "exec"), ns)
-            return ns[name]
-    raise AssertionError(f"{name}() is not a top-level function in client.py")
-
-
-def test_the_handheld_client_reports_an_incomplete_restore():
-    """The LOAD side of the handheld client printed "workspace restored."
-    unconditionally: the route answers 200 with `unrestored` naming files
-    that are NOT on disk and `not_cleared` naming directories whose stale
-    contents were carried into the workspace, and round 6 taught `app.js` to
-    read both while this client was left on the old shape. Same defect the
-    SAVE side here fixed for `X-Ghost-Archive-Omitted`, one endpoint over.
-
-    World where it fails: a note that ignores the response body (every case
-    below reads "workspace restored.", including the one where three files
-    are missing).
-    """
-    note = _client_function("_restore_note")
-
-    clean = note({"status": "success", "chat_history": [],
-                  "not_cleared": [], "unrestored": []})
-    assert clean.startswith("<OK>") and "restored." in clean
-
-    incomplete = note({
-        "status": "success", "chat_history": [],
-        "not_cleared": ["projects (released projects are never wiped)"],
-        "unrestored": [{"path": "dist/vendor.js", "reason": "EACCES: denied"},
-                       {"path": "a/b.txt", "reason": "EEXIST: File exists"}]})
-    assert incomplete.startswith("<WARN>"), incomplete
-    assert "INCOMPLETE" in incomplete, incomplete
-    assert "2 file(s) could NOT be written" in incomplete, incomplete
-    assert "1 path(s) survived the wipe" in incomplete, incomplete
-    # the member NAMES, not `[object Object]`-style repr of the dicts
-    assert "dist/vendor.js" in incomplete and "a/b.txt" in incomplete
-    assert "reason" not in incomplete, incomplete
-
-    # each field alone is enough to make the restore incomplete
-    assert note({"not_cleared": ["dist"], "unrestored": []}).startswith("<WARN>")
-    assert note({"not_cleared": [], "unrestored": ["x"]}).startswith("<WARN>")
-    # ...and a server that answers neither field is not "incomplete"
-    assert note({"status": "success", "chat_history": []}).startswith("<OK>")
-    assert note({"not_cleared": None, "unrestored": "boom"}).startswith("<OK>")

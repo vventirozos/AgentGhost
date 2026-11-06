@@ -924,7 +924,7 @@ def _gold_date(gdir: Path, date: Optional[str]) -> Optional[str]:
 
 #: tools whose result is evidence about the world: the owner's documents and
 #: files count, recall (owner facts) does not (r1 M3: transcripts, weather)
-_LOOKUP_TOOLS = _RESEARCH_TOOLS | {"knowledge_base", "file_system", "system_utility", "youtube_transcribe",
+_LOOKUP_TOOLS = _RESEARCH_TOOLS | {"knowledge_base", "file_system", "system_utility", "youtube_transcribe", "portfolio",
                                    "vision_analysis"}
 
 

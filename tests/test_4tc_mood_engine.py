@@ -1371,24 +1371,31 @@ def test_the_diarys_block_does_not_move_with_the_clock_or_with_a_boredom_level(t
     """Review: three diary calls for ONE quiet stretch — the block changed
     when a read showed bored 1, then bored 2. It is read off the journal's
     own events: the same text while the mood decays, while the quiet reaches
-    each level, and after the owner returns."""
+    each level, and after the owner returns. The one thing that may move it
+    is the "it wore off" row, a thing that happened to the mood: the first
+    read that sees the boredom writes it, dated when the mood wore off, so
+    it is on today's page or yesterday's depending on the hour this runs."""
+    wore_off = " → neutral (it wore off)"
     s = SelfStateThread(tmp_path)
     n = _diary(tmp_path)
     s.touch_session()
-    s.mark_owner_turn(now=T0)
-    s.set_owner_mood("content", M.ANCHOR_DIRECTION["content"], 2, now=T0)
-    s.state.mood.updated_at = (dt.datetime.now(UTC) - dt.timedelta(hours=20)).replace(tzinfo=None).isoformat() + "Z"
+    now = dt.datetime.now(UTC)
+    s.mark_owner_turn(now=now)
+    s.set_owner_mood("content", M.ANCHOR_DIRECTION["content"], 2, now=now)
+    s.state.mood.updated_at = (now - dt.timedelta(hours=20)).replace(tzinfo=None).isoformat() + "Z"
     s.state.last_owner_turn_at = s.state.mood.updated_at
     first = n._format_state_block(s)
-    query = n._derive_recall_query(s)
+    assert "content 2" in first
     assert "ago" not in first and "bored" not in first and "My mood:" not in first
     assert s.mood().label == "bored" and s.mood().intensity == 2       # a reader sees bored 2 right now …
     assert {r["kind"] for r in s.mood_history()} >= {"quiet"}          # … and its rows are in the journal
-    assert n._format_state_block(s) == first and n._derive_recall_query(s) == query
+    settled, query = n._format_state_block(s), n._derive_recall_query(s)
+    assert settled.replace(wore_off, "") == first                      # only that row can be new
+    assert s.mood().label == "bored"                                   # another read of the same quiet
+    assert n._format_state_block(s) == settled and n._derive_recall_query(s) == query
     s.owner_arrived()
     assert s.mood_history()[-1]["kind"] == "quiet_end"
-    # only the "it wore off" row — a thing that happened to the mood — is new
-    assert n._format_state_block(s).replace(" → neutral (it wore off)", "") == first
+    assert n._format_state_block(s) == settled and n._derive_recall_query(s) == query
 
 
 def test_the_diarys_timeline_is_bounded(tmp_path):

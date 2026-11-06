@@ -1514,7 +1514,14 @@ case "$*" in *py_compile*) exit {compile_rc} ;; *device_probe.py*) exit {probe_r
 exit 0
 """,
         "timeout": '#!/bin/bash\nshift\nexec "$@"\n',
-        "sleep": "#!/bin/bash\nexit 0\n",
+        # Real sleeps give the backgrounded launcher its time; this one returns at
+        # once, so `sleep 6` (the only one after the launch) waits for the fake
+        # launcher to finish writing, or a loaded machine reads the log before it.
+        "sleep": f"""#!/bin/bash
+[ "$1" = 6 ] || exit 0
+for _ in $(seq 400); do [ -e "{rec}/launched" ] && exit 0; /bin/sleep 0.05; done
+exit 0
+""",
         "pkill": f"""#!/bin/bash
 printf '%s\\n' "$*" >> "{rec}/pkill"
 exit 0
@@ -1522,6 +1529,7 @@ exit 0
         "setsid": f"""#!/bin/bash
 printf '%s\\n' "$*" >> "{rec}/setsid"
 printf '%s' "{crash_line}" >> "{log}"
+: > "{rec}/launched"
 exit 0
 """,
         "pgrep": f"""#!/bin/bash

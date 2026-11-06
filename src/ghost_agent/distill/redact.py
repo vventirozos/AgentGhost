@@ -619,6 +619,32 @@ def _labs_key_rule():
         return None
 
 
+# §4TI: the portfolio service's key travels in every `portfolio` call's header, like the labs key.
+_PORTFOLIO_KEY_CACHE: dict = {"source": None, "rule": None}
+
+
+def _portfolio_key_rule():
+    """A rule redacting the portfolio service key wherever it appears, or None."""
+    try:
+        import os as _os
+        from pathlib import Path as _Path
+        path = (_os.environ.get("GHOST_PORTFOLIO_KEY_FILE") or "~/Data/AI/.ibkr_service_key").strip()
+        try:
+            val = _Path(_os.path.expanduser(path)).read_text().strip()
+        except Exception:
+            val = ""
+        if len(val) < _MIN_KEY_LEN:
+            return None
+        if _PORTFOLIO_KEY_CACHE["source"] != val:
+            _PORTFOLIO_KEY_CACHE["source"] = val
+            _PORTFOLIO_KEY_CACHE["rule"] = (
+                "ibkr_service_key", re.compile(re.escape(val)),
+                "<REDACTED_PORTFOLIO_KEY>")
+        return _PORTFOLIO_KEY_CACHE["rule"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ── the owner's profile, by VALUE (§4MI) ─────────────────────────────────
 # Every stored system prompt carries the USER PROFILE block — the owner's
 # name, city, company, street address, the family's names and birth dates,
@@ -729,6 +755,9 @@ def redact_text(text: str, config: RedactionConfig | None = None) -> str:
     _lk = None if "ghost_labs_key" in disabled else _labs_key_rule()
     if _lk is not None:
         out = _lk[1].sub(_lk[2], out)
+    _pk = None if "ibkr_service_key" in disabled else _portfolio_key_rule()
+    if _pk is not None:
+        out = _pk[1].sub(_pk[2], out)
     # r2 review CRIT: the profile rule is NOT applied here. `redact_text`
     # also feeds the memory journal (smart-memory consolidation input) and
     # the episode store — a placeholder there became a "stated" owner fact

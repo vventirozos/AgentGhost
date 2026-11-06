@@ -2443,6 +2443,7 @@ _EXTERNAL_EVIDENCE_TOOLS = frozenset({
     "lab",      # §4SX B: program output from a lab machine
     "run",      # §4SX D5: a run's logs / collected output are program output
     "vision_analysis", "news_headlines", "query_document", "knowledge_base",
+    "portfolio",  # §4TI: the owner's holdings, computed by the service
     "recall", "system_utility",       # (§4SX E: `database` / postgres_admin is gone — review 11-05)
 })
 

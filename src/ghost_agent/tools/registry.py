@@ -2,6 +2,7 @@ from typing import Dict, Any, List, Callable
 from .search import tool_search, tool_deep_research, tool_fact_check
 from .darkweb_search import tool_darkweb_search, tool_darkweb_research
 from .labs import tool_lab
+from .portfolio import tool_portfolio
 from .file_system import tool_file_system
 from .tasks import tool_manage_tasks
 from .system import tool_system_utility
@@ -847,6 +848,11 @@ TOOL_DEFINITIONS.append({
 from .labs import LAB_TOOL_DEFINITION as _LAB_TOOL_DEFINITION  # noqa: E402
 TOOL_DEFINITIONS.append(_LAB_TOOL_DEFINITION)
 
+# §4TI: the owner's IBKR holdings, read from the separate ibkr-service. Advertised only when configured
+# (`portfolio.portfolio_configured`), and never to members or contained contexts.
+from .portfolio import PORTFOLIO_TOOL_DEFINITION as _PORTFOLIO_TOOL_DEFINITION  # noqa: E402
+TOOL_DEFINITIONS.append(_PORTFOLIO_TOOL_DEFINITION)
+
 # §4TA (2026-11-05): the macro engine (`manage_composed_skills`, tools/composed_skills.py) is removed.
 # `youtube_transcribe` was its one real entry — a ONE-step alias for the knowledge-base transcribe action —
 # and stays under the same name as a plain built-in. Its handler is in `get_available_tools`.
@@ -1188,6 +1194,9 @@ def get_active_tool_definitions(context, query: str = None, *,
     from .labs import labs_configured
     if not labs_configured(context):
         unconfigured.add("lab")
+    from .portfolio import portfolio_configured
+    if not portfolio_configured():
+        unconfigured.add("portfolio")
     active_tools = _intent_filter(active_tools, query,
                                   drop_unconfigured=unconfigured)
     # ⚠ DISABLED TOOLS COME OUT BEFORE SERVING, not after. Every caller
@@ -1445,6 +1454,7 @@ def get_available_tools(context):
         "manage_projects": lambda **kwargs: tool_manage_projects_for_model(context, **kwargs),
         "abort_attempt": _abort_attempt,
         "lab": lambda **kwargs: tool_lab(context=context, **kwargs),
+        "portfolio": lambda **kwargs: tool_portfolio(context=context, **kwargs),
         "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
         "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
         "youtube_transcribe": _youtube_transcribe,

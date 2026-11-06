@@ -125,14 +125,14 @@ def test_weather_direct_without_guard(monkeypatch):
 
 # ── download (file_system.py) ─────────────────────────────────────────────
 
-def test_download_failclosed_under_guard(monkeypatch):
+def test_download_failclosed_under_guard(monkeypatch, tmp_path):
     from ghost_agent.tools import file_system as fsmod
     u = egress_guard.install("socks5://127.0.0.1:9050")
     try:
         proxies = _proxies_from(
             monkeypatch, fsmod,
             lambda: fsmod.tool_download_file(
-                url="http://example.com/x", sandbox_dir=Path("/tmp"),
+                url="http://example.com/x", sandbox_dir=tmp_path,
                 tor_proxy=None, filename="x"),
         )
     finally:
@@ -141,13 +141,13 @@ def test_download_failclosed_under_guard(monkeypatch):
         f"download leaked cleartext under --mandatory-tor: proxies={proxies!r}"
 
 
-def test_download_direct_without_guard(monkeypatch):
+def test_download_direct_without_guard(monkeypatch, tmp_path):
     from ghost_agent.tools import file_system as fsmod
     assert not egress_guard.is_installed()
     proxies = _proxies_from(
         monkeypatch, fsmod,
         lambda: fsmod.tool_download_file(
-            url="http://example.com/x", sandbox_dir=Path("/tmp"),
+            url="http://example.com/x", sandbox_dir=tmp_path,
             tor_proxy=None, filename="x"),
     )
     assert proxies is None

@@ -59893,3 +59893,18 @@ Caught by the staged probe and by looking: the removal took `snap_shortcut.setAu
 Tests: local clockwork tests plus the device probe; no full suite (operator: localized testing).
 
 **§4TH addendum (operator: "make animations on/off much more discreet, without all that text").** Handheld only: 34 px icon, dim, no fill and no word; the state is the icon (sparkles / crossed out) and the tooltip. It sits in the bottom bar, left of the status readout. The web button was already icon-only.
+
+
+## §4TI — IBKR service and the `portfolio` tool (2026-11-06, operator: "make a small service that will connect to IBKR … pull any data it needs and feed it to the agent. the agent must remain under tor any other service i choose can run on normal internet and use an API key"; chose "Flex + public history"; earlier: "i'd like the agent to also provide trading suggestions, naive forecasting"; "make this service in nova, make sure it autostarts")
+
+**Rule change.** The agent and its sandbox stay Tor-only and keyless. Services the operator picks may use the normal internet and keys.
+
+**Built.** `interface/ibkr-service` runs on the worker node as LaunchDaemon `com.local.ibkr-service`, bound to the tailnet address only. It holds Flex statements (every 12 h), public Yahoo quotes (15 min) and 5-year history (20 h), computes every figure and serves text over GET only. `tools/portfolio.py` reads it, is hidden until configured and is closed to members and contained contexts.
+
+**Measured.** Yahoo's chart endpoint answers 429 to plain curl from the node for any user agent and 200 with browser TLS (`curl_cffi`), including `.DE`, `.AT` and FX. IBKR's real endpoint returned its Flex error 1020 for an invalid token. IBKR's docs site was unreachable from every route tried, so retry codes come from the widely used protocol; the first real fetch is the check.
+
+**Not built.** Backtested rules, scoring of past ranges, sector data, earnings dates, IB Gateway.
+
+**§4TI reviews (2026-11-06).** Three fresh readers. r1: contract multiplier ignored (CRITICAL), config base relabelling figures, "today" not being today, old quotes beating new marks. r2: futures notional in totals (CRITICAL), possible 100x bonds, confident zero dividends, any "429" text stopping refreshes. The multiplier logic was REMOVED rather than patched: shares are quantity x price, other assets use IBKR's Position Value, FUT/CFD stay out of totals, and every statement is checked against its own NAV. r3: no CRITICAL; a holding written differently read as not held, and absent positions read as none. The real statement reconciled to NAV at 1.00000. No mutation battery was run for this service.
+
+**§4TI verified live (2026-11-06).** Agent restarted idle; `portfolio` called on the real account through the chat route as probes. Owner replies named every holding, and all money figures came from the service (the unmatched numbers were a list number, a fund name and a rounded percentage). Member probe: tool not offered, no holdings or amounts in the reply. Suite before the last test-only fix: 30,241 tests, 7 failures. One was this change (fixed, its file passes). Two were a stray empty /tmp/x making `test_egress_failclosed_4p` download tests stop before any request (not a leak: an empty directory routes through Tor). Four are outside this change: test_4tc_mood_engine diary block, test_clockwork_ux deploy, test_pin_quality_ratchet on the mood tesseract test file, test_4gm_round7_routes handheld restore note. Boot autostart is by launchd RunAtLoad; nova was not rebooted to prove it.
