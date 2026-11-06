@@ -8,7 +8,6 @@ def mock_context():
     ctx.llm_client.chat_completion = AsyncMock()
     ctx.memory_system = MagicMock()
     ctx.profile_memory = MagicMock()
-    ctx.skill_memory = MagicMock()
     ctx.args = MagicMock()
     ctx.args.smart_memory = 0.5
     ctx.args.max_context = 4000
@@ -86,7 +85,6 @@ async def test_run_smart_memory_task_string_profile_update(mock_context):
 async def test_intent_driven_skill_recall(mock_context):
     agent = GhostAgent(mock_context)
     
-    mock_context.skill_memory.get_playbook_context.return_value = "React playbok"
     
     mock_context.profile_memory.get_context_string = MagicMock(return_value="Profile context")
     mock_context.args.temperature = 0.5
@@ -117,13 +115,6 @@ async def test_intent_driven_skill_recall(mock_context):
         
         await agent.handle_chat(body, MagicMock())
         
-        # It should have called get_playbook_context with the intent format for the required tool
-        call_args = mock_context.skill_memory.get_playbook_context.call_args
-        if call_args:
-             query_used = call_args.kwargs.get("query", "")
-             # Depending on if it successfully parsed the tool json in previous turn, it will use that for intent.
-             # Since our previous turn was an assistant turn with json:
-             assert "Context:" in query_used or "Write me a react component" in query_used
              
 
 

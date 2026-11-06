@@ -99,15 +99,10 @@ class TestChallengeOutputPrefixes:
 # (3. Calibration map_status honesty — removed with the calibration refit, §4PJ)
 
 
-
 # ──────────────────────────────────────────────────────────────────────
 # 4. Skill store — reworded-twin bump + orphan self-heal + reconcile
 #    (§4NM: written as the live writer, learn_skill)
 # ──────────────────────────────────────────────────────────────────────
-
-from ghost_agent.memory.skills import (
-    SkillMemory, _dup_trigger_from_vector_text,
-)
 
 
 class _FakeCollection:
@@ -147,98 +142,6 @@ class _FakeMemorySystem:
 
 _REAL_MISTAKE = "Used a relative path inside the Docker sandbox."
 _FIX = "Always use absolute paths inside the Docker sandbox."
-
-
-class TestVectorDedupTwinLookup:
-    def test_reworded_twin_bumps_under_the_stored_trigger(self, tmp_path):
-        """The 'no JSON twin' log was mostly this: the bump searched the
-        playbook under the INCOMING trigger while the twin sat under its
-        own (reworded) trigger, recoverable from the vector metadata."""
-        sm = SkillMemory(tmp_path)
-        stored_trigger = "Relative path errors in Docker sandbox execution"
-        assert sm.learn_lesson(stored_trigger, _REAL_MISTAKE, _FIX, source="learn_skill") == "written"
-
-        hit = {"id": "vec-1", "distance": 0.05, "trigger": stored_trigger,
-               "text": f"SITUATION: {stored_trigger}\nMISTAKE: x\nSOLUTION: y"}
-        ms = _FakeMemorySystem(_FakeCollection(query_hit=hit))
-        out = sm.learn_lesson(
-            "Docker sandbox failing on relative file paths",  # reworded
-            _REAL_MISTAKE, _FIX, memory_system=ms, source="learn_skill")
-        assert out == "reinforced"
-        lesson = sm.list_lessons(scope="all", limit=10)[0]
-        assert int(lesson.get("frequency", 1)) == 2
-        assert ms.collection.deleted_ids == []
-
-    def test_true_orphan_is_dropped_and_lesson_written_fresh(self, tmp_path):
-        """Vector hit with NO playbook entry under either trigger: the old
-        path skipped the write forever; now it deletes the orphan and
-        writes the lesson."""
-        sm = SkillMemory(tmp_path)
-        hit = {"id": "orphan-7", "distance": 0.05,
-               "trigger": "Completely unrelated stored trigger",
-               "text": "SITUATION: Completely unrelated stored trigger\n"
-                       "MISTAKE: m\nSOLUTION: s"}
-        ms = _FakeMemorySystem(_FakeCollection(query_hit=hit))
-        out = sm.learn_lesson(
-            "Relative path errors in Docker sandbox execution",
-            _REAL_MISTAKE, _FIX, memory_system=ms, source="learn_skill")
-        assert out == "written"
-        assert ms.collection.deleted_ids == ["orphan-7"]
-        assert len(sm.list_lessons(scope="all", limit=10)) == 1
-
-    def test_dup_trigger_recovered_from_document_text(self):
-        txt = "SITUATION: Parse JSON safely\nMISTAKE: none\nSOLUTION: use json"
-        assert _dup_trigger_from_vector_text(txt) == "Parse JSON safely"
-        assert _dup_trigger_from_vector_text("") == ""
-        assert _dup_trigger_from_vector_text("garbage") == ""
-
-
-class TestReconcileVectorOrphans:
-    def test_deletes_only_clear_orphans(self, tmp_path):
-        sm = SkillMemory(tmp_path)
-        live_trigger = "Relative path errors in Docker sandbox execution"
-        sm.learn_lesson(live_trigger, _REAL_MISTAKE, _FIX, source="learn_skill")
-        coll = _FakeCollection(get_result={
-            "ids": ["keep-1", "drop-1", "skip-1"],
-            "metadatas": [
-                {"trigger": live_trigger},              # has twin → keep
-                {"trigger": "Ancient scrubbed lesson about tor circuits"},
-                {},                                     # unidentifiable → keep
-            ],
-            "documents": ["", "", ""],
-        })
-        ms = _FakeMemorySystem(coll)
-        n = sm.reconcile_vector_orphans(ms)
-        assert n == 1
-        assert coll.deleted_ids == ["drop-1"]
-
-    def test_truncated_metadata_trigger_still_matches_twin(self, tmp_path):
-        """A 200-char-truncated metadata trigger must match its full JSON
-        twin (token-subset), not be deleted as an orphan."""
-        sm = SkillMemory(tmp_path)
-        long_trigger = ("Repeated timeout failures when scraping paginated "
-                        "vendor catalogs through the anonymous Tor circuit "
-                        "pool with per-engine racing and adaptive circuit "
-                        "selection enabled for resilient onion searches "
-                        "across multiple engines simultaneously")
-        assert len(long_trigger) > 200
-        sm.learn_lesson(long_trigger, _REAL_MISTAKE, _FIX, source="learn_skill")
-        coll = _FakeCollection(get_result={
-            "ids": ["v-long"],
-            "metadatas": [{"trigger": long_trigger[:200]}],
-            "documents": [""],
-        })
-        n = sm.reconcile_vector_orphans(_FakeMemorySystem(coll))
-        assert n == 0
-        assert coll.deleted_ids == []
-
-    def test_no_collection_is_a_noop(self, tmp_path):
-        sm = SkillMemory(tmp_path)
-        assert sm.reconcile_vector_orphans(None) == 0
-        assert sm.reconcile_vector_orphans(SimpleNamespace(collection=None)) == 0
-
-    def test_wired_into_the_store_hygiene_idle_phase(self):
-        assert "reconcile_vector_orphans" in AGENT_SRC
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -316,46 +219,6 @@ class TestQuotedMarkerMention:
 # ──────────────────────────────────────────────────────────────────────
 # 9. Trivial tool-routing floor
 # ──────────────────────────────────────────────────────────────────────
-
-from ghost_agent.memory.lesson_quality import (
-    is_actionable_lesson, _is_actionable_heuristic,
-)
-
-
-class TestTrivialToolRoutingFloor:
-    def test_the_live_minted_skill_is_now_rejected(self):
-        assert is_actionable_lesson(
-            "None",
-            "When asked about the weather, use the system_utility tool.",
-            "When asked about the weather") is False
-
-    @pytest.mark.parametrize("rule", [
-        "When asked about the weather, use the system_utility tool.",
-        "If asked for the current time, call system_utility",
-        "Whenever the user asks about disk space, use the `system` tool.",
-        "When asked to search the web, always use the search tool.",
-    ])
-    def test_bare_routing_shapes_rejected(self, rule):
-        assert _is_actionable_heuristic(rule) is False
-
-    @pytest.mark.parametrize("rule", [
-        # Qualifiers past the tool name carry real content — keep.
-        "When asked about the weather, use the system_utility tool and "
-        "include humidity and wind speed.",
-        "When asked about the weather, use system_utility with "
-        "location defaulting to Athens.",
-        # Non-routing heuristics unaffected.
-        "Always use absolute paths in Docker.",
-        "When a tool fails twice, escalate to the operator instead of retrying.",
-    ])
-    def test_substantive_rules_still_pass(self, rule):
-        assert _is_actionable_heuristic(rule) is True
-
-    def test_real_mistake_lessons_unaffected(self):
-        assert is_actionable_lesson(
-            "Called the tool with a relative path and it failed.",
-            "Use absolute paths.",
-            "Docker sandbox path errors") is True
 
 
 # ──────────────────────────────────────────────────────────────────────

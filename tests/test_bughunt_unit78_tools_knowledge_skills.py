@@ -3,9 +3,7 @@
 See BUGHUNT.md. Fixed bugs pinned here:
 
 Unit 8 (skills):
- - composed: step success classified from the RESULT string (tools return error
-   strings, not raises) — an all-failed macro is no longer recorded as success;
-   unresolved $var → "" not "$var"; branch-loop execution cap; name-shadow reject
+ - (composed: removed with the macro engine, §4TA 2026-11-05)
  - acquired: save_skill returns a status; tool_create_skill no longer reports a
    LIVE tool when the save was rejected; retire_degraded_skills is now wired
  - (swarm: removed with the tool, §4SI)
@@ -23,98 +21,6 @@ import base64
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Unit 8 — composed skills
-# ══════════════════════════════════════════════════════════════════════
-
-from ghost_agent.tools.composed_skills import (
-    _step_result_ok,
-    ComposedSkillRegistry,
-    ComposedSkill,
-    SkillStep,
-)
-
-
-class TestComposedStepClassification:
-    def test_step_result_ok_classifies_error_strings(self):
-        assert _step_result_ok("here are the results") is True
-        assert _step_result_ok("") is True
-        assert _step_result_ok("[error] step tool 'x' is not available.") is False
-        assert _step_result_ok("Error: something broke") is False
-        assert _step_result_ok("[SYSTEM ERROR]: Process failed") is False
-        assert _step_result_ok("EXIT CODE: 1\nboom") is False
-        assert _step_result_ok("EXIT CODE: 0\nok") is True
-
-    async def test_all_failed_macro_is_not_recorded_as_success(self, tmp_path):
-        reg = ComposedSkillRegistry(storage_dir=tmp_path)
-        reg.skills["m"] = ComposedSkill(
-            name="m", trigger_description="t",
-            steps=[SkillStep(tool_name="web_search", description="s1")],
-            execution_mode="sequential",
-        )
-
-        async def _executor(tool, args):
-            return "[error] step tool 'web_search' is not available."
-
-        out = await reg.execute("m", _executor, {})
-        # Pre-fix: success=True (the executor didn't raise). Now: False.
-        assert out["success"] is False
-        assert reg.skills["m"].success_count == 0
-        assert reg.skills["m"].usage_count == 1
-
-    async def test_unresolved_var_becomes_empty(self, tmp_path):
-        reg = ComposedSkillRegistry(storage_dir=tmp_path)
-        step = SkillStep(tool_name="weather", description="w",
-                         param_template={"location": "$city"})
-        got = {}
-
-        async def _executor(tool, args):
-            got.update(args)
-            return "sunny"
-
-        reg.skills["m"] = ComposedSkill(name="m", trigger_description="t",
-                                        steps=[step], execution_mode="sequential")
-        await reg.execute("m", _executor, {})  # no 'city' param
-        # Pre-fix: location="$city". Now: "".
-        assert got["location"] == ""
-
-
-class TestComposedRegistry:
-    def test_define_rejects_name_shadowing_builtin(self, tmp_path):
-        import asyncio
-        from ghost_agent.tools.composed_skills import tool_manage_composed_skills
-
-        ctx = MagicMock()
-        ctx.sandbox_dir = str(tmp_path)
-        ctx.memory_dir = str(tmp_path)
-        out = asyncio.run(tool_manage_composed_skills(
-            context=ctx, action="define", name="execute",
-            description="d", steps=[{"tool": "web_search", "params": {}}],
-            known_tools={"execute", "web_search"},
-        ))
-        assert "already a built-in" in out or "shadow" in out.lower()
-
-    def test_atomic_save_leaves_no_tmp(self, tmp_path):
-        reg = ComposedSkillRegistry(storage_dir=tmp_path)
-        reg.skills["m"] = ComposedSkill(name="m", trigger_description="t",
-                                        steps=[SkillStep(tool_name="x", description="s")])
-        reg.save()
-        assert (tmp_path / "composed_skills.json").exists()
-        assert not list(tmp_path.glob("*.tmp"))
-
-    def test_reregister_at_capacity_does_not_evict(self, tmp_path):
-        reg = ComposedSkillRegistry(storage_dir=tmp_path)
-        reg.MAX_SKILLS = 3
-        for i in range(3):
-            reg.register(ComposedSkill(name=f"s{i}", trigger_description="t",
-                                       steps=[SkillStep(tool_name="x", description="d")]))
-        assert len(reg.skills) == 3
-        # Re-register an existing name at capacity — must NOT evict a bystander.
-        reg.register(ComposedSkill(name="s1", trigger_description="updated",
-                                   steps=[SkillStep(tool_name="x", description="d")]))
-        assert len(reg.skills) == 3
-        assert set(reg.skills) == {"s0", "s1", "s2"}
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -13,7 +13,6 @@ def mock_context():
     context.sandbox_dir = "/tmp/sandbox"
     context.memory_system = None
     context.profile_memory = None
-    context.skill_memory = None
     # Mock scratchpad to avoid AttributeError
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = "Mock Scratchpad Content"

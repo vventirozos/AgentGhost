@@ -179,8 +179,10 @@ async def test_tool_manage_skills_list(temp_dirs):
 
 @pytest.mark.asyncio
 async def test_manage_skills_list_is_complete_and_compact(temp_dirs, tmp_path):
-    """The list must be the COMPLETE custom inventory (acquired + composed) and
-    steer the model away from re-tabulating every built-in tool (2026-07-15)."""
+    """The list must be the COMPLETE custom inventory and steer the model away
+    from re-tabulating every built-in tool (2026-07-15). Since §4TA (2026-11-05)
+    the inventory is the acquired skills only: a macro registry left on disk
+    from before the macro engine was removed is not listed."""
     from ghost_agent.tools.acquired_skills import tool_manage_skills
     sandbox_dir = temp_dirs["sandbox"]
     mem = tmp_path / "memory"
@@ -192,9 +194,8 @@ async def test_manage_skills_list_is_complete_and_compact(temp_dirs, tmp_path):
 
     result = await tool_manage_skills(sandbox_dir=sandbox_dir, memory_dir=mem,
                                       memory_system=None, action="list")
-    # Both custom categories present in one call.
     assert "acq1" in result and "an acquired one" in result
-    assert "deploy_and_verify" in result and "deploy then check health" in result
+    assert "deploy_and_verify" not in result and "deploy then check health" not in result
     # The footer steers away from the verbose built-in-tool dump.
     assert "BUILT-IN" in result
     assert "full schema" in result

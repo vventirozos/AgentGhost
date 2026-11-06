@@ -201,44 +201,6 @@ class TestReadOnlyVectorMemoryWhitelist_M1:
             ro.some_future_mutator
 
 
-class TestBiologicalHookCooldownAnchor_C3:
-    @pytest.mark.asyncio
-    async def test_anchor_updates_even_when_self_play_raises(self, tmp_path):
-        import datetime
-        import ghost_agent.core.agent as agent_mod
-
-        # Minimal context with a frontier_tracker + llm_client stub.
-        ctx = MagicMock()
-        ctx.memory_system = MagicMock()
-        ctx.memory_system.collection.get = MagicMock(return_value={"ids": []})
-        ctx.llm_client = MagicMock(foreground_tasks=0, foreground_requests=0)
-        ctx.frontier_tracker = FrontierTracker(tmp_path)
-        ctx.last_activity_time = datetime.datetime.now() - datetime.timedelta(hours=2)
-        ctx.args = MagicMock(model="default")
-
-        agent = agent_mod.GhostAgent.__new__(agent_mod.GhostAgent)
-        agent.context = ctx
-
-        # Simulate ~2h idle to pass the idle_secs > 3600 gate.
-        far_past = datetime.datetime.now() - datetime.timedelta(hours=3)
-        agent._last_dream_at = far_past
-        agent._last_selfplay_at = far_past
-        agent._current_selfplay_cooldown = 3600
-
-        # Force the random gate to always fire.
-        with patch("ghost_agent.core.agent.random.random", return_value=0.0):
-            # The self-play slot body explodes mid-flight (§4NM: the slot
-            # is the failure-replay / regression step now, not
-            # Dreamer.synthetic_self_play; the anchor contract is the same).
-            agent._self_play_slot_body = AsyncMock(
-                side_effect=RuntimeError("self-play slot died"))
-            with pytest.raises(RuntimeError):
-                await agent._biological_tick()
-
-        # C3: even though the call raised, the cooldown anchor moved.
-        assert agent._last_selfplay_at > far_past
-
-
 class TestIsolatedContextNulling_C4:
     """The C4 secondary modules moved into the shared detach inventory
     (`core/isolation.ISOLATION_NULLED_ATTRS`, §4CL S1). The pin moved with

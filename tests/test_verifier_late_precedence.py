@@ -64,8 +64,6 @@ def agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.cached_sandbox_state = None
     ctx.sandbox_dir = "/tmp/sandbox"
@@ -91,7 +89,6 @@ def test_the_live_chain_is_withheld(agent):
     agent._note_strong_verdict("traj-97b4", _v(VerifyVerdict.CONFIRMED, 0.92, "upheld"))
     agent._backfill_trajectory_outcome = MagicMock()
     agent._record_withheld_verdict = MagicMock()
-    agent.context.skill_memory = MagicMock()
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_bg") as spawn:
         agent._record_late_verdict(
@@ -111,7 +108,6 @@ def test_a_strong_adjudicated_refute_still_applies(agent):
     """
     agent._note_strong_verdict("t2", _v(VerifyVerdict.CONFIRMED, 0.92, "upheld"))
     agent._backfill_trajectory_outcome = MagicMock()
-    agent.context.skill_memory = MagicMock()
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_bg"):
         agent._record_late_verdict(
@@ -128,7 +124,6 @@ def test_no_prior_strong_verdict_leaves_todays_behaviour(agent):
     is still the only verdict there is, and it applies as before.
     """
     agent._backfill_trajectory_outcome = MagicMock()
-    agent.context.skill_memory = MagicMock()
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_bg"):
         agent._record_late_verdict(
@@ -145,7 +140,6 @@ def test_a_prior_strong_REFUTED_does_not_shield_a_late_refute(agent):
     """
     agent._note_strong_verdict("t4", _v(VerifyVerdict.REFUTED, 0.9, "upheld"))
     agent._backfill_trajectory_outcome = MagicMock()
-    agent.context.skill_memory = MagicMock()
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_bg"):
         agent._record_late_verdict(

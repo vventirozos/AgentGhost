@@ -176,7 +176,7 @@ def _ts(**over):
         msg={"role": "assistant", "content": ""}, ui_content="",
         parse_failure_reason="", model="test-model",
         last_user_content="do the thing", char_budget=4000,
-        strikes=StrikeLedger(), task_tree=MagicMock(), _user_batch_intent=None,
+        strikes=StrikeLedger(), _user_batch_intent=None,
         _request_constraints=[], repeated_action_steered=set(), messages=[],
         seen_tools=set(), executed_idempotent=set(), raw_tools_called=set(),
         tool_usage={}, tools_run_this_turn=[], request_state=MagicMock(),

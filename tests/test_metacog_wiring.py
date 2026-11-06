@@ -103,7 +103,6 @@ class TestMetacogBundleConstruction:
     ("database", "sql"),
     ("web_search", "fetch"),
     ("file_system", "fs"),
-    ("skill_memory", "memory"),
     ("vision", "vision"),
     ("image_generation", "vision"),
     ("totally_unknown_tool_xyz", "other"),

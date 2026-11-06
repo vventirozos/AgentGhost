@@ -21,12 +21,12 @@ def _obj_from_module(module_name: str):
 
 
 def test_accepts_the_test_import_shape():
-    assert _is_real_component(_obj_from_module("ghost_agent.memory.skills"))
+    assert _is_real_component(_obj_from_module("ghost_agent.memory.profile"))
 
 
 def test_accepts_the_PRODUCTION_import_shape():
     """The whole point. This is the shape `bin/start-ghost-agent.sh` produces."""
-    assert _is_real_component(_obj_from_module("src.ghost_agent.memory.skills"))
+    assert _is_real_component(_obj_from_module("src.ghost_agent.memory.profile"))
 
 
 def test_rejects_test_doubles():

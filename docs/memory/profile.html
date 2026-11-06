@@ -168,7 +168,7 @@ Value := str                      # LEGACY — as_of unknown
     in <code>profile_prompt_policy.json</code> (<code>{"on_demand": [...]}</code>). The model reaches them through
     <code>recall</code> (the identity mirror rows).</li>
     <li><strong>Egress (r2, <code>memory/egress.py</code>):</strong> one detector for every outbound path — the dispatch
-    hook AND the tool callables themselves (a composed-skill macro or a delegate calls them directly). It folds the text
+    hook AND the tool callables themselves (a tool that calls another tool reaches them directly: <code>youtube_transcribe</code> calls <code>knowledge_base</code>). It folds the text
     (lower case, accents off, Greek transliterated, URL-decoded; a JSON string is parsed, so \u-escaped Greek is seen) and
     matches the street + house number in either order, with "street/st/odos" between and the street by its stem
     (Καλεδονίας / Kaledonias), the number bounded (83 ≠ 830; 83A is 83), and the postcode with or without the Greek space.

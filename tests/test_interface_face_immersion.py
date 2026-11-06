@@ -58,15 +58,6 @@ def test_near_fade_present_in_both_shaders(graph_js):
     assert "vNearFade" in graph_js and "vLineNear" in graph_js
 
 
-def test_bloom_damped_while_inside(graph_js):
-    # Inside the cloud the reply is being READ on top of near, bright
-    # quads — bloom must scale down with the dive, not up. Deepened
-    # 0.35→0.5 plus per-line diveDim after operator feedback
-    # ("too bright"): additive line stacking was the brightness driver.
-    assert "(1.0 - 0.5 * camDive)" in graph_js   # camDive: the camera-static forms opt out (2026-09-21)
-    assert "float diveDim = 1.0 - 0.30 * uDive;" in graph_js
-
-
 def test_lookat_singularity_handled(graph_js):
     # Near the origin, lookAt(0,0,0) turns parallax into wild rotation;
     # the target must blend forward through the cloud with the dive.
@@ -78,9 +69,7 @@ def test_lookat_singularity_handled(graph_js):
     # 2026-10-17 (§4PR): the branch sets the TARGET (_lookTarget) and
     # _applySceneBlend applies it — eased from the old form's target for
     # the 1.4 s after a form switch, exact at steady state.
-    assert re.search(
-        r"_lookTarget\(gazeX, gazeY \* \(1\.0 - dive\) - _lookDrop \* dive, \(_partial \? -[\d.]+ : -3\.5\) \* dive\)",
-        graph_js)
+    assert "_lookTarget(gazeX, gazeY * (1.0 - dive), -3.5 * dive);" in graph_js
     assert "camera.lookAt(_lookNow.x, _lookNow.y, _lookNow.z);" in graph_js
     assert "camera.lookAt(0, 0, 0);" not in graph_js
 
@@ -92,17 +81,3 @@ def test_debug_hook_exported_for_headless_verification(graph_js):
 
 
 
-
-def test_interior_enrichment_present(graph_js):
-    # Operator feedback: "fully zoomed it looks kind of empty". Three
-    # compensators, all gated on the dive so the resting view is
-    # untouched: interior motes (shader-drifted, zero per-frame CPU,
-    # skipped entirely at rest), a thicker proximity web, and faster
-    # data pulses inside.
-    assert "MOTE_COUNT = IS_MOBILE ? 150 : 400" in graph_js
-    assert "motesMesh.visible = camDive > 0.01" in graph_js
-    assert "PROXIMITY_SQ * (1.0 + camDive * 0.15)" in graph_js
-    assert "const tStep = 0.005 * (1.0 + camDive * 0.6)" in graph_js   # dt-scaled since 2026-09-20; camDive since 09-21
-    # Scale boost deliberately trimmed — the swell dilutes local density
-    # exactly when the camera is closest (the original emptiness bug).
-    assert "dive * 0.55" in graph_js

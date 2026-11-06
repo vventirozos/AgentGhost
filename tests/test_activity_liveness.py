@@ -104,7 +104,7 @@ def test_an_unknown_phase_never_manufactures_an_alarm():
 def test_a_mechanism_that_never_wrote_still_appears(tmp_path):
     """THE DEFECT ITSELF. `dream` never wrote here; before the registry it
     simply was not in the output."""
-    lv = activity_liveness(_ledger(tmp_path, ["self_play"]))
+    lv = activity_liveness(_ledger(tmp_path, ["workspace_tidy"]))      # maintenance never wrote
     phases = {r["phase"] for r in lv["rows"]}
     assert "maintenance" in phases, "a silent mechanism vanished from the report"
     assert set(PHASE_EXPECTATION) <= phases, "the report is not registry-driven"
@@ -113,9 +113,9 @@ def test_a_mechanism_that_never_wrote_still_appears(tmp_path):
 def test_zeros_sort_FIRST(tmp_path):
     """The old renderer sorted by count descending and cut to 8 — the dead
     loop was structurally the first row dropped."""
-    lv = activity_liveness(_ledger(tmp_path, ["self_play"] * 40))
+    lv = activity_liveness(_ledger(tmp_path, ["maintenance"] * 40))
     assert lv["rows"][0]["n_alarm_window"] == 0
-    assert lv["rows"][-1]["phase"] == "self_play"
+    assert lv["rows"][-1]["phase"] == "maintenance"
 
 
 def test_an_unregistered_phase_in_the_ledger_is_shown_and_flagged(tmp_path):
@@ -139,7 +139,9 @@ def test_a_dead_periodic_loop_ALARMS(tmp_path, victim):
     and building one to detect that class while not testing that it fires
     would be the purest form of the mistake.
     """
-    alive = [p for p in PERIODIC if p != victim]
+    # (§4SZ: with the replay slot gone there is ONE periodic loop, so "the agent was running" is shown
+    #  by another job's row — without it the agent-down guard rightly withholds the alarm)
+    alive = [p for p in PERIODIC if p != victim] + ["workspace_tidy"]
     lv = activity_liveness(_ledger(tmp_path, alive * 3))
     assert lv["alarms"] == [victim], (
         f"silencing {victim} did not raise exactly one alarm: {lv['alarms']}")
@@ -153,14 +155,13 @@ def test_a_live_periodic_loop_does_not_alarm(tmp_path):
 
 
 @pytest.mark.parametrize("phase,exp", [
-    ("open_questions", EXPECT_ON_OUTPUT),
     ("workspace_tidy", EXPECT_ON_OUTPUT),
     ("native_tool_repair", EXPECT_ON_OUTPUT),
     ("scheduled_task", EXPECT_ON_DEMAND),
 ])
 def test_a_BENIGN_zero_never_alarms(tmp_path, phase, exp):
     """⚠ THE OTHER HALF, and the one that keeps the monitor usable. These
-    sit at zero BY DESIGN: `open_questions` records `if stale:`,
+    sit at zero BY DESIGN:
     `workspace_tidy` records `if _tidy_deleted:`, `native_tool_repair` is
     ~0 by design and each occurrence is news. Alarming on them teaches the operator to scroll past the
     section — rebuilding by hand the blindness this exists to remove.
@@ -184,7 +185,7 @@ def test_an_ageing_loop_alarms_on_24h_while_the_7d_column_shows_it_ran(tmp_path)
     p = tmp_path / "autonomous_activity.jsonl"
     now = time.time()
     with p.open("w") as fh:
-        for ph in [x for x in PERIODIC if x != "maintenance"]:
+        for ph in [x for x in PERIODIC if x != "maintenance"] + ["workspace_tidy"]:
             fh.write(json.dumps({"ts": now - 3600.0, "phase": ph}) + "\n")
         fh.write(json.dumps({"ts": now - 72 * 3600.0, "phase": "dream"}) + "\n")   # §4NM: a pre-rename row, read as "maintenance"
     lv = activity_liveness(p)
@@ -268,7 +269,7 @@ def test_the_guard_does_not_swallow_a_REAL_dead_loop(tmp_path):
 def test_truncation_is_reported_rather_than_silent(tmp_path):
     """A tail-read cap that bites must not leave the report confident."""
     from ghost_agent.core import learning_health as LH
-    led = _ledger(tmp_path, ["self_play"] * 30)
+    led = _ledger(tmp_path, ["maintenance"] * 30)
     assert activity_liveness(led)["read_truncated"] is False
     orig = LH._ACTIVITY_READ_LIMIT
     try:
@@ -297,8 +298,8 @@ def test_the_background_line_no_longer_cuts_to_the_top_N():
 def test_the_renderer_marks_a_dead_loop_visibly(tmp_path, monkeypatch):
     """Structural: the alarm has to reach the SCREEN, not just the dict."""
     from ghost_agent.core import learning_health as LH
-    lv = activity_liveness(_ledger(tmp_path, [p for p in PERIODIC
-                                              if p != "maintenance"] * 3))
+    lv = activity_liveness(_ledger(tmp_path, ([p for p in PERIODIC
+                                               if p != "maintenance"] + ["workspace_tidy"]) * 3))
     monkeypatch.setattr(LH, "collect_learning_health",
                         lambda md: {"liveness": lv})
     out = LH.render_learning_health(tmp_path)

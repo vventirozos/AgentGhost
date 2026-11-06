@@ -437,8 +437,8 @@ def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 
 
 
 #: Tools that both READ and MUTATE through a single dispatch name, with the
-#: action chosen by an argument (e.g. ``manage_composed_skills(action="list"``
-#: vs ``"define")``, ``file_system(operation="read"`` vs ``"write")``). A
+#: action chosen by an argument (e.g. ``manage_tasks(action="list"`` vs
+#: ``"create")``, ``file_system(operation="read"`` vs ``"write")``). A
 #: no-progress loop on one of these is almost always the agent re-READING to
 #: orient itself before performing the WRITE it was actually asked to do.
 #:
@@ -447,7 +447,8 @@ def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 
 #: as text-only. For an ordinary re-observation loop (re-screenshot, re-read
 #: the same file with nothing left to do) that is correct. For a read/write
 #: tool it is destructive: it bars the pending mutation forever, so the agent
-#: "finishes" having silently done nothing. Observed failure: a request to
+#: "finishes" having silently done nothing. Observed failure (on the macro
+#: manager, removed with the macro engine in §4TA, 2026-11-05): a request to
 #: reconfigure a composed skill looped on ``action="list"``, got
 #: force-finalised at 3x, and the model's subsequent ``action="define"`` was
 #: scrubbed by the final-generation stream guard — the change never landed.
@@ -456,7 +457,6 @@ def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 
 #: but leaves tools available so the write can land. The
 #: :data:`READWRITE_HARD_STOP` backstop fires if it genuinely keeps thrashing.
 READWRITE_LOOP_TOOLS = frozenset({
-    "manage_composed_skills",
     "manage_tasks",
     # `manage_projects` is the SAME read-then-write shape (2026-07-11): the
     # agent orients with action=status/list/task_next and mutates with
@@ -468,7 +468,7 @@ READWRITE_LOOP_TOOLS = frozenset({
     # scrub consumed the entire response → the user got a fallback message
     # instead of their project status; (b) a task_update blocked twice by the
     # constraint gate → force-stop → the task could never be closed. Exactly
-    # the "reconfigure-a-composed-skill" bug this set exists to prevent.
+    # the read-then-write bug this set exists to prevent.
     "manage_projects",
     "file_system",
     # `knowledge_base` was already here for the read/write reason; e0f4a8bd

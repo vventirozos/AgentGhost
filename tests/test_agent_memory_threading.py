@@ -16,7 +16,6 @@ async def test_agent_smart_updates_thread_offload():
         args=MagicMock(model="test")
     )
     context.memory_system = MagicMock()
-    context.skill_memory = MagicMock()
     context.profile_memory = profile_memory
     
     agent = GhostAgent(context)

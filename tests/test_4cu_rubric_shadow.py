@@ -587,7 +587,7 @@ class _Traj:
 
 class _Ctx:
     def __init__(self, sim=False, label=None):
-        self.skill_memory = type("S", (), {"is_read_only": sim})()
+        self.simulated = sim
         if label:
             self.turn_origin_label = label
 
@@ -727,9 +727,9 @@ class TestTheProductionCallSiteIsDriven:
         ctx = MagicMock()
         ctx.trajectory_collector = TrajectoryCollector(
             root=tmp_path / "system" / "trajectories", session_id="s")
-        ctx.skill_memory = type("S", (), {"is_read_only": sim})()
         ctx.turn_origin_label = None
         del ctx.turn_origin_label          # let turn_origin derive it
+        ctx.simulated = sim
         agent = GhostAgent.__new__(GhostAgent)
         agent.context = ctx
         return agent, ctx

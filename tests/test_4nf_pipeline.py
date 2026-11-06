@@ -54,7 +54,7 @@ def _uncertain_with_facts():
 
 def _late_agent(monkeypatch):
     a = GhostAgent.__new__(GhostAgent)
-    a.context = SimpleNamespace(skill_memory=None, memory_system=None, trajectory_collector=None)
+    a.context = SimpleNamespace(memory_system=None, trajectory_collector=None)
     for name in ("_backfill_trajectory_outcome", "_emit_late_outcome_correction",
                  "_relabel_episode", "_file_refute_followup_tasks"):
         monkeypatch.setattr(a, name, lambda *x, **k: None, raising=False)
@@ -148,17 +148,13 @@ async def test_no_planner_snapshot_even_with_the_old_flag(monkeypatch, tmp_path)
 def test_no_post_mortem_item_is_queued():
     """§4NF found the item written on every complex turn while its consumer
     discarded it; §4NM removed both. No `post_mortem` journal append exists
-    in agent.py, and the writer gate admits no producer but learn_skill and
-    the operator's repairs."""
+    in agent.py."""
     import ast, inspect
-    from ghost_agent.memory.skills import producer_may_write
     tree = ast.parse(inspect.getsource(A))
     kinds = [c.args[0].value for c in ast.walk(tree) if isinstance(c, ast.Call)
              and getattr(c.func, "attr", "") == "_journal_append_safe"
              and c.args and isinstance(c.args[0], ast.Constant)]
     assert kinds and "post_mortem" not in kinds, kinds
-    assert producer_may_write("learn_skill") is True
-    assert producer_may_write("dream") is False and producer_may_write("post_mortem") is False
 
 
 async def test_the_episode_record_does_not_hold_the_reply(monkeypatch, tmp_path):

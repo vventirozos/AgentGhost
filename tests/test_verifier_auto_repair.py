@@ -9,8 +9,9 @@ of shipping a noted-but-wrong answer. These tests drive the real
 the bound, the single-verifier-pass cost on the clean path, and that
 error/abort answers are never repaired.
 """
-
 from __future__ import annotations
+
+import asyncio
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -34,8 +35,6 @@ def agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None
@@ -72,6 +71,17 @@ def _final(text):
     return {"choices": [{"message": {"content": text, "tool_calls": []}}]}
 
 
+async def _settled(vmock, n):
+    """The verdict of the shipped answer runs as a late background task; give
+    it the loop before counting (a bound, then whatever the count is)."""
+    for _ in range(200):
+        if vmock.await_count >= n:
+            break
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.01)
+    return vmock.await_count
+
+
 async def _run(agent, user, llm_side_effects):
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=list(llm_side_effects))
     body = {"messages": [{"role": "user", "content": user}], "model": "Qwen-Test"}
@@ -100,7 +110,7 @@ async def test_refuted_then_repaired_ships_corrected_answer(agent):
 
     assert "42" in result          # shipped the repaired answer
     assert "The answer is 7." not in result  # not the refuted one
-    assert vmock.await_count == 2  # one verdict per finalisation, no double-call
+    assert await _settled(vmock, 2) == 2  # one verdict per finalisation, no double-call
 
 
 async def test_repair_injects_critique_into_conversation(agent):
@@ -173,7 +183,7 @@ async def test_repair_budget_is_bounded(agent):
 
     # Exactly one repair: the 2nd finalisation (turn 3) does not repair
     # (budget spent), so the post-loop gate verifies it → 2 verifier passes.
-    assert vmock.await_count == 2
+    assert await _settled(vmock, 2) == 2
     assert "Attempt two: 8." in result   # the single repaired answer ships
     assert "Attempt three" not in result
     assert agent._MAX_VERIFIER_REPAIRS == 1
@@ -266,7 +276,7 @@ async def test_web_confirmed_without_exec_is_capped_and_repaired(
     assert "renders cleanly" in result
     # Two verifier passes: the capped finalisation verdict + the post-loop
     # recompute after the repair invalidated the cache.
-    assert vmock.await_count == 2
+    assert await _settled(vmock, 2) == 2
 
 
 # --------------------------------------------------------------------------

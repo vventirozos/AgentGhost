@@ -697,9 +697,10 @@ def strip_system_notes(text: str) -> str:
 # What counts as an unparsed CALL: the call dialects (`<tool_call>`, the
 # bare `<function=…>` / `<function name="…">`, and `<tool …>`), not
 # `<tool_response>` (an echoed RESULT — the tool ran). Not preceded by a
-# backtick (inline code: the user asked about the syntax). Not the
-# cognitive watchdog's own synthetic `replan` call, which is appended to
-# the durable text on purpose and replayed by the trajectory machinery.
+# backtick (inline code: the user asked about the syntax). (Until §4TB,
+# 2026-11-05, the cognitive watchdog's synthetic `replan` call was exempt:
+# the watchdog now appends a plain note and the tool is removed, so a
+# `replan` call written in a reply is an unparsed call like any other.)
 # Fences: only BALANCED pairs are fences (an unclosed ``` must not shield
 # everything after it); a match that starts inside one is documentation.
 # The call dialects only (review §4IY: "Run `ghost <tool name> --help`" and a
@@ -772,8 +773,6 @@ def close_open_calls(text: str) -> str:
     return text + "\n" + _CALL_CLOSERS[tag]
 
 
-_PRESERVED_CALL_RE = re.compile(
-    r"<function(?:=|\s+name=[\"']?)replan\b", re.IGNORECASE)
 _BALANCED_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 #: §4MM turn 47: worded for BOTH causes — a malformed call, and a
 #: well-formed one written into a final report that runs no tools (the
@@ -801,15 +800,13 @@ def _fence_spans(text: str) -> List[tuple]:
 
 def _call_markup_matches(text: str) -> List[re.Match]:
     """The unparsed-call blocks in `text`: not inline code, not fenced
-    documentation, not the watchdog's replan marker."""
+    documentation."""
     if not text or "<" not in text:
         return []
     fences = _fence_spans(text)
     out = []
     for m in _call_markup_spans(text):
         if any(a <= m.start() < b for a, b in fences):
-            continue
-        if _PRESERVED_CALL_RE.search(m.group(0)):
             continue
         out.append(m)
     return out
@@ -1468,7 +1465,7 @@ def delivery_view(text: str, tools_run, pre_tool_segments=None) -> str:
 
 def count_real_tools(tools_run) -> int:
     """Tool records that actually ran — the synthetic ones the loop
-    fabricates (plan markers, watchdog replans) do not open the smoothing
+    fabricates (refusals, guard notices) do not open the smoothing
     gate. Shared so a caller cannot spell the gate differently."""
     return sum(1 for t in (tools_run or [])
                if t and not (t or {}).get("_synthetic"))

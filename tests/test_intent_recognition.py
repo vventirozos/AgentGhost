@@ -17,7 +17,6 @@ def mock_agent():
     ctx.scratchpad.list_all.return_value = "None."
     ctx.memory_system = MagicMock()
     ctx.memory_system.search.return_value = ""
-    ctx.skill_memory = MagicMock()
     ctx.llm_client = MagicMock()
     ctx.cached_sandbox_state = None  # Explicitly set to avoid AttributeError
     ctx.sandbox_dir = "/tmp/sandbox"

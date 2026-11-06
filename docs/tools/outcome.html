@@ -41,7 +41,7 @@
     <li><strong>15 turns reporting a non-zero exit as SUCCEEDED</strong> under the MULTI-STEP OUTCOME
       banner, the one message that tells the model "this live outcome is AUTHORITATIVE".</li>
     <li><strong>219 calls</strong> where the turn loop and the trajectory corpus disagreed about whether
-      the same call failed &mdash; and the corpus is what the learning loop trains on.</li>
+      the same call failed &mdash; and the corpus was what the learning passes of the time read.</li>
   </ul>
   <p>Five review rounds had answered by adding prefixes to predicates, and each addition created the
   next round's split. A string cannot say <em>"this REFUSED and touched nothing"</em> or <em>"this
@@ -134,7 +134,7 @@
       <tr><td><code>registry._acquired_skill_result_class</code></td><td>skill-graduation <code>success_rate</code> (removed 2026-10-11, §4NM)</td><td>82 / 82</td></tr>
       <tr><td><code>coding_executor._looks_like_write_error</code> / <code>_op_ok</code></td><td>whether a coding leaf records the file as written</td><td>36</td></tr>
       <tr><td><code>file_system._batch_result_failed</code></td><td>per-path outcomes inside a batch envelope (removed with the batch macro, 2026-10-11)</td><td>22 / 82</td></tr>
-      <tr><td><code>composed_skills._step_result_ok</code></td><td>macro <code>success_rate</code></td><td>&mdash; (was missing <code>CRITICAL ERROR:</code>)</td></tr>
+      <tr><td><code>composed_skills._step_result_ok</code> (removed with the macro engine, &sect;4TA)</td><td>macro <code>success_rate</code></td><td>&mdash; (was missing <code>CRITICAL ERROR:</code>)</td></tr>
       <tr><td><code>outcome_heuristics._looks_like_tool_error</code></td><td>the shared sniffer &mdash; the trajectory corpus label</td><td>61 / 82</td></tr>
       <tr><td><code>outcome_heuristics.tool_failure_flags</code></td><td>the turn-level shape rule (lesson corpus, episode store; calibration until its removal in &sect;4PJ, 2026-10-16)</td><td>61 / 82</td></tr>
       <tr><td><code>agent._bookkeeping_call_failed</code></td><td>whether the verifier RUNS at all, and the unverified-mutation guard</td><td>15 / 22 failed bookkeeping calls</td></tr>

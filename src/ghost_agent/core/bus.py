@@ -3,13 +3,16 @@
 Native, in-memory pub/sub between the agent and its memory subsystems.
 Two responsibilities:
 
-* `hydrate_context(query)` — fan-out reads to Vector / Graph / Skill memories
-  in parallel, fuse the disparate result lists with Reciprocal Rank Fusion,
-  and return a single token-capped Markdown block ready to splice into a
-  prompt.
+* `hydrate_context(query)` — fan-out reads to the hydrating tiers (the
+  owner's facts in the graph, the experience store, the fact ledger) in
+  parallel, fuse the result lists with Reciprocal Rank Fusion, and return a
+  single token-capped Markdown block ready to splice into a prompt.
 * `publish_fact(event_type, fact_data)` — fan-out writes from a tool/event
-  source into Vector + Graph + Profile + Skill in parallel, so callers
-  never touch the underlying stores directly.
+  source into Vector + Graph + Profile in parallel, so callers never touch
+  the underlying stores directly.
+
+(§4TD, 2026-11-06: the lesson tier — `skill` — is removed from both sides
+with the lesson store.)
 
 No external broker (Redis/RabbitMQ/etc.) — pure asyncio.
 """
@@ -21,7 +24,6 @@ import hashlib
 import json
 import logging
 import re
-import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,7 +42,6 @@ class MemoryBus:
     def __init__(self,
                  vector_memory: Any = None,
                  graph_memory: Any = None,
-                 skill_memory: Any = None,
                  profile_memory: Any = None,
                  episodic_memory: Any = None,
                  session_store: Any = None,
@@ -48,7 +49,6 @@ class MemoryBus:
                  fact_ledger: Any = None):
         self.vector = vector_memory
         self.graph = graph_memory
-        self.skill = skill_memory
         self.profile = profile_memory
         self.episodic = episodic_memory
         # §4QL: human-graded past owner turns (memory/experience.py) — hydrates
@@ -60,13 +60,6 @@ class MemoryBus:
         # Raw-conversation tier (2026-07-14): stored sessions were durable
         # but unreachable by retrieval — replay-only. Fifth hydration source.
         self.sessions = session_store
-        # hydrate_context stashes this turn's surviving items here (read by
-        # the finalize path's foreign-stash check in core/agent.py).
-        self.last_hydration: Optional[Dict[str, Any]] = None
-        # §4MJ: one stash PER TURN — a single slot let an overlapping turn's
-        # hydration take the stash before the first turn's judge (staggered
-        # up to 90 s) read it; 96 of 318 real turns had another hydrating
-        # turn start inside that window
         # LRU of recently-published fact signatures, used by publish_fact to
         # short-circuit duplicate writes from looping callers.
         self._publish_lru: "OrderedDict[str, bool]" = OrderedDict()
@@ -118,19 +111,18 @@ class MemoryBus:
 
     # Per-intent source weights for weighted RRF: classify the query and
     # boost the source most likely to have the answer. §4NN: restricted to
-    # the two sources that hydrate a prompt (graph = the owner's facts,
-    # skill = lessons; §4NM retired the vector/episodic/session tiers), and
-    # the ONLY weights — the learned matrix (core/rrf_weights.py,
+    # the sources that hydrate a prompt (graph = the owner's facts; §4NM
+    # retired the vector/episodic/session tiers, §4TD removed the lesson
+    # tier), and the ONLY weights — the learned matrix (core/rrf_weights.py,
     # system/rrf/weights.json) was removed. A source not listed fuses at 1.0.
-    # The values ARE the last learned ones (system/rrf/weights.json, 10-11):
-    # §4NN review — equal contextual weights tied graph and skill, and the tie
-    # put owner facts before lessons on ~41% of default-intent prompts.
+    # The graph values ARE the last learned ones (system/rrf/weights.json,
+    # 10-11), unchanged by the lesson tier's removal.
     _INTENT_WEIGHTS = {
         # §4QL/§4QM: experience and history fuse at an explicit 1.0 (review:
         # an unlisted source defaulted to 1.0 silently)
-        "factual":    {"graph": 2.03, "skill": 0.5, "experience": 1.0, "history": 1.0},
-        "procedural": {"graph": 0.464, "skill": 1.969, "experience": 1.0, "history": 1.0},
-        "contextual": {"graph": 0.927, "skill": 0.994, "experience": 1.0, "history": 1.0},
+        "factual":    {"graph": 2.03, "experience": 1.0, "history": 1.0},
+        "procedural": {"graph": 0.464, "experience": 1.0, "history": 1.0},
+        "contextual": {"graph": 0.927, "experience": 1.0, "history": 1.0},
     }
 
     # Keyword-based intent classifier (no LLM call needed)
@@ -221,12 +213,12 @@ class MemoryBus:
                               max_chars: int = 6000,
                               rrf_k: int = 0,
                               context_budget: int = 0,
-                              turn_id: str = "",
                               raw_user_text: str = "",
                               exclude_session_id: str = "") -> str:
         """Concurrently query the hydrating tiers — the owner's facts (graph)
-        and the lessons (skill); §4NM retired the vector, episodic and session
-        tiers from prompts — and fuse the results with Reciprocal Rank Fusion.
+        and, behind their switches, the experience and fact-history tiers;
+        §4NM retired the vector, episodic and session tiers from prompts and
+        §4TD removed the lesson tier — and fuse the results with Reciprocal Rank Fusion.
         Returns a Markdown block (or an empty string when nothing is
         available). ``exclude_session_id`` is accepted for callers and unused
         since the session tier went.
@@ -246,20 +238,6 @@ class MemoryBus:
         """
         if not query or not str(query).strip():
             return ""
-
-        # ⚠ Turn-scoped reset (§4L R2 NEW-3): `last_bus_triggers` was set
-        # only on turns WITH skill survivors and never cleared, so a turn
-        # without any inherited the previous turn's list into its
-        # trajectory attribution stamp. Reset here — the start of the
-        # turn's hydration — with the turn key that gates every consumer.
-        try:
-            if self.skill is not None:
-                self.skill.last_bus_triggers = []
-                from ..utils.logging import request_id_context
-                self.skill._bus_delivered_turn_key = str(
-                    request_id_context.get() or "")
-        except Exception:
-            pass
 
         # Adaptive budget: the caller's budget is the BASE and scales UP with
         # query complexity. The old form was `min(max(context_budget, 6000),
@@ -281,18 +259,18 @@ class MemoryBus:
 
         # §4NQ: the Nova decomposition (RAG-Fusion) was removed — on 118 real
         # owner requests it changed the block on 20, mostly by adding
-        # off-topic lessons, for 1-4 s before the first token. Only the free
+        # off-topic rows, for 1-4 s before the first token. Only the free
         # keyword split remains.
         sub_queries = self._split_query(query)
         # §4FB (2026-09-06): the fan-out queries were invisible — one INFO
-        # line per hydration so a lesson admitted by a sub-query is
+        # line per hydration so a row admitted by a sub-query is
         # attributable.
         if len(sub_queries) > 1:
             logger.info("memory bus sub-queries (%d): %s", len(sub_queries) - 1,
                         " | ".join(str(q)[:80] for q in sub_queries[1:]))
 
-        # Fan-out retrieval for each sub-query in parallel. Request-scoped
-        # lessons are judged against the USER's request, not the sub-query
+        # Fan-out retrieval for each sub-query in parallel. The request-level
+        # tiers are judged against the USER's request, not the sub-query
         # (§4KW): `raw_user_text` when the caller gave it, else the query.
         _scope_request = str(raw_user_text or query or "")
         fetch_coros = []
@@ -325,44 +303,12 @@ class MemoryBus:
         )
         out, survivors = self._format_markdown_with_survivors(fused, max_chars=max_chars)
         self._log_hydration(ranked_lists, survivors, intent, max_chars)
-        # Reinforcement credit AFTER fusion: only memories/lessons that
-        # actually entered the prompt earn spaced-repetition / retrieval
-        # credit. The fetchers deliberately skip their internal bumps
-        # (search_items / get_playbook_items), so without this call the
-        # loop would be credit-free; with it, credit is one deduped write
-        # per store per turn instead of ~20 rewrites for candidates the
-        # model never saw.
-        try:
-            await asyncio.to_thread(self._credit_surfaced, survivors)
-        except Exception as e:
-            logger.debug(f"MemoryBus surfaced-credit failed (non-critical): {e}")
-        # Stash this turn's injected items for the lesson-outcome credit
-        # (`_surfaced_lesson_triggers` reads the skill survivors; the
-        # post-turn usefulness judge that also read it was removed in §4NM,
-        # and with it the per-turn `_hydration_by_turn` map — written every
-        # turn and read by nothing, retrieval review 2026-10-31). Timestamped so a turn that dies before finalization can't
-        # leak stale survivors into the next turn's judgment, and stamped
-        # with the turn id so an overlapping turn's judge (or a turn that
-        # skipped hydration) can't consume another turn's stash and
-        # misattribute usefulness observations (found 2026-07-15).
-        if survivors:
-            self.last_hydration = {
-                "intent": intent, "survivors": survivors, "ts": time.time(),
-                "turn_id": str(turn_id or ""),
-            }
-        else:
-            # Survivor-less hydration: clear only OUR OWN (or an unstamped)
-            # stash. Blindly writing None here destroyed an overlapping
-            # turn's stash before its judge consumed it — the turn_id stamp
-            # guarded consumption but not clobbering.
-            prev = self.last_hydration
-            if not (isinstance(prev, dict) and prev.get("turn_id")
-                    and str(prev.get("turn_id")) != str(turn_id or "")):
-                self.last_hydration = None
+        # (§4TD: no retrieval credit after fusion — the one tier that earned
+        # it was the lesson tier, removed with the lesson store.)
         return out
 
     # Short tags for the per-hydration instrumentation line, in fetch order.
-    _TIER_TAGS = (("vector", "v"), ("graph", "g"), ("skill", "s"),
+    _TIER_TAGS = (("vector", "v"), ("graph", "g"),
                   ("episodic", "e"), ("session", "sess"), ("experience", "x"), ("history", "h"))
     #: §4NM: tiers that no longer hydrate a prompt (recall still searches them)
     _RETIRED_TIERS = frozenset({"vector", "episodic", "session"})
@@ -381,7 +327,7 @@ class MemoryBus:
         WARNING+ console/pretty stream."""
         try:
             stores = {"vector": self.vector, "graph": self.graph,
-                      "skill": self.skill, "episodic": self.episodic,
+                      "episodic": self.episodic,
                       "session": self.sessions, "experience": self.experience,
                       "history": self.ledger}
             cands: Dict[str, set] = {}
@@ -409,43 +355,6 @@ class MemoryBus:
         except Exception as e:  # instrumentation must never break hydration
             logger.debug(f"hydration instrumentation failed: {e}")
 
-    def _credit_surfaced(self, survivors: List[Dict[str, Any]]) -> None:
-        """One deduped retrieval-credit pass for the items injected this turn."""
-        if not survivors:
-            return
-        # (§4NM: only lessons earn credit here — the episodic and vector tiers,
-        # whose items carried episode / Chroma ids, no longer hydrate.)
-        triggers = [it.get("trigger") for it in survivors
-                    if it.get("source") == "skill" and it.get("trigger")]
-        bulk = getattr(self.skill, "record_retrievals_bulk", None) if self.skill else None
-        if triggers and callable(bulk):
-            try:
-                bulk(triggers)
-                # Attribution stamp for the trajectory record (§4L
-                # Lens-D MINOR-2: `hydrated_lessons` recorded only the
-                # playbook surface — bus-tier lessons were invisible).
-                # §4N MAJOR-1: stamp the REAL store, not the wrapper. On
-                # self-play `self.skill` is dream's ReadOnlySkillMemory
-                # whose `get_playbook_context` DELEGATES to `real_sm` and
-                # reads the dedup keys off THAT object — so a stamp on the
-                # wrapper was invisible to the read and the §4L delivery
-                # dedup failed open on 89/89 self-play turns (the
-                # highest-volume prompt path). The stamp is turn-key gated
-                # at every reader, so routing it to the real store cannot
-                # leak the sim's lessons into a later user turn.
-                try:
-                    _target = (getattr(self.skill, "real_sm", None)
-                               or getattr(self.skill, "_real", None)
-                               or self.skill)
-                    _target.last_bus_triggers = list(triggers)
-                    from ..utils.logging import request_id_context
-                    _target._bus_delivered_turn_key = str(
-                        request_id_context.get() or "")
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.debug(f"skill record_retrievals_bulk failed: {e}")
-
     async def _fetch_all_tiers(self, query: str, scope_request: str = "", extras: bool = True):
         """Fetch from the hydrating memory tiers for a single query.
         ``extras``: the request-level tiers (experience, history) too — only
@@ -455,15 +364,15 @@ class MemoryBus:
         # on the store lock, and under a held lock 8 turns filled the
         # 14-worker default executor — every to_thread in the process then
         # stalled. Unbounded, only the turn waiting on the lock waits.
-        # §4NM: two tiers hydrate a prompt — the owner's facts (graph) and the
-        # lessons (skill). The vector, episodic and session tiers were off in
-        # production (§4MJ / §4NC / §4NG: "off in prompts, keep recall") and
-        # their fetchers were deleted; `recall` still searches all of them.
+        # §4NM: the owner's facts (graph) hydrate a prompt. The vector,
+        # episodic and session tiers were off in production (§4MJ / §4NC /
+        # §4NG: "off in prompts, keep recall") and their fetchers were
+        # deleted; `recall` still searches all of them. §4TD: the lesson tier
+        # (skill) is removed with the lesson store.
         async def _none():
             return []
         return await asyncio.gather(
             self._fetch_graph(query),
-            self._fetch_skill(query, scope_request=scope_request),
             self._fetch_experience(scope_request or query) if extras else _none(),
             self._fetch_history(scope_request or query) if extras else _none(),
         )
@@ -619,45 +528,6 @@ class MemoryBus:
         return any(m.group(0).lower() not in cls._NOT_A_VERB
                    for m in cls._GREEK_FIRST_PERSON_VERB.finditer(_q))
 
-    async def _fetch_skill(self, query: str, scope_request: str = "") -> List[Dict[str, Any]]:
-        if not self.skill:
-            return []
-        # Prefer the per-item API: one RRF item per LESSON. The old
-        # whole-playbook blob was a single item — always rank 1 regardless
-        # of per-lesson relevance, immune to the per-item relevance floor
-        # and _PER_SOURCE_CAP, and duplicated (near-identically) by every
-        # sub-query without collapsing in exact-text dedup. Per-item also
-        # defers retrieval credit to _credit_surfaced (post-fusion).
-        get_items = getattr(self.skill, "get_playbook_items", None)
-        if callable(get_items):
-            try:
-                items = await asyncio.to_thread(
-                    get_items, query, self.vector,
-                    **({"scope_request": scope_request} if scope_request else {}),
-                )
-                return [
-                    {"source": "skill", "text": it.get("text", ""), "trigger": it.get("trigger", "")}
-                    for it in (items or [])
-                    if isinstance(it, dict) and it.get("text")
-                ]
-            except Exception as e:
-                logger.warning(f"MemoryBus skill fetch failed: {type(e).__name__}: {e}")
-                return []
-        try:
-            playbook = await asyncio.to_thread(
-                self.skill.get_playbook_context,
-                query=query,
-                memory_system=self.vector,
-            )
-        except Exception as e:
-            logger.warning(f"MemoryBus skill fetch failed: {type(e).__name__}: {e}")
-            return []
-        if not playbook or not isinstance(playbook, str):
-            return []
-        if playbook.strip() in {"", "No lessons learned yet."}:
-            return []
-        return [{"source": "skill", "text": playbook.strip()}]
-
     # ----------------------------------------------------------------- RRF
 
     @classmethod
@@ -670,8 +540,8 @@ class MemoryBus:
         """Weighted RRF: score(d) = sum_r weight_r / (k + rank_r(d)).
 
         When ``intent`` is provided, source-specific weights scale each
-        ranker's contribution so factual queries boost graph results and
-        procedural queries boost skill results. ``weight_overrides`` (an
+        ranker's contribution so factual queries boost graph results.
+        ``weight_overrides`` (an
         intent→source matrix) supersedes ``_INTENT_WEIGHTS`` when supplied;
         production passes none (§4NN).
 
@@ -781,7 +651,6 @@ class MemoryBus:
         headers = {
             "graph": "### TOPOLOGICAL KNOWLEDGE GRAPH:",
             "vector": "### MEMORY CONTEXT:",
-            "skill": "### SKILL PLAYBOOK (lessons from prior runs — follow to avoid repeats):",
             # Episodes are now emitted one-per-item, so the anti-confusion
             # framing that used to live inside the tier blob rides the
             # section header instead.
@@ -908,7 +777,6 @@ class MemoryBus:
             metadata:       dict — vector metadata; defaults to {type=event_type}
             triplets:       List[{subject,predicate,object}] for the Graph store
             profile_update: {category, key, value} for ProfileMemory
-            skill:          {task, mistake, solution} for SkillMemory
 
         Returns a small report dict mapping subsystem name to outcome
         (`"ok"`, `"skip"`, `"dedup"`, or an error message). Exceptions are
@@ -930,7 +798,7 @@ class MemoryBus:
         # repeats without touching the underlying stores.
         sig = self._fact_signature(event_type, fact_data)
         if self._seen_recently(sig):
-            return {"vector": "dedup", "graph": "dedup", "profile": "dedup", "skill": "dedup"}
+            return {"vector": "dedup", "graph": "dedup", "profile": "dedup"}
 
         async def _vector():
             if not self.vector:
@@ -1039,43 +907,8 @@ class MemoryBus:
             except Exception as e:
                 results["profile"] = f"error: {e}"
 
-        async def _skill():
-            lesson = fact_data.get("skill")
-            if not self.skill or not lesson:
-                results["skill"] = "skip"
-                return
-            try:
-                # the model's own lesson (learn_skill): tagged, and a GENERAL
-                # rule must not restate the request in hand (producers review:
-                # "Count lines in a specific file path provided by the user.")
-                from ..memory.lesson_scope import current_request as _cur_req
-                _written = await asyncio.to_thread(
-                    self.skill.learn_lesson,
-                    lesson.get("task"),
-                    lesson.get("mistake"),
-                    lesson.get("solution"),
-                    memory_system=self.vector,
-                    source="learn_skill",
-                    generality_context=str(_cur_req.get() or ""),
-                )
-                # `learn_lesson` returns "written"/"reinforced" on a real
-                # write and None on every drop path (quality gate, dedup that
-                # neither wrote nor bumped, internal exception it swallows
-                # itself) — "so callers can tell a real write from a silent
-                # drop", per its own docstring. Discarding it made this leg
-                # report ok whenever nothing escaped, which made the caller's
-                # failure branch unreachable.
-                results["skill"] = ("ok" if _written
-                                    else "error: lesson was not written "
-                                         "(dropped by the playbook)")
-                if _written:
-                    # where it applies, per call (r8 review)
-                    results["skill_scope"] = str(getattr(_written, "scope", "") or "general")
-            except Exception as e:
-                results["skill"] = f"error: {e}"
-
         await asyncio.gather(
-            _vector(), _graph(), _profile(), _skill(),
+            _vector(), _graph(), _profile(),
             return_exceptions=True,
         )
         # §4M (Lens C MAJOR-3): per-target failures were report-only — the

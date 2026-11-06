@@ -76,7 +76,7 @@ def _bus(sessions=None):
 
 
 # (TestHydrationStashIdentity went with `MemoryBus.judge_hydration_usefulness`,
-# removed in §4NM; the `last_hydration` stash itself stays.)
+# removed in §4NM; the `last_hydration` stash went in §4TD, it had no reader.)
 
 
 class TestRRFConsensus:

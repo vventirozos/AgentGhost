@@ -102,7 +102,7 @@ async def test_leaf_turn_hides_and_blocks_everything_but_the_allowlist(monkeypat
             return "ok", None, None
     monkeypatch.setattr(agent_mod, "GhostAgent", FakeAgent)
     base = SimpleNamespace(sandbox_dir="/tmp/sb", current_project_id=None, memory_system=object(),
-                           skill_memory=object(), graph_memory=None, scratchpad=None,
+                           graph_memory=None, scratchpad=None,
                            args=SimpleNamespace(perfect_it=True, smart_memory=0.5, native_tools=False),
                            workspace_model=object(), journal=object(), llm_client=object())
     await cl.run_leaf_turn(base, leaf_id="L", prompt="p", is_background=False, project_id="p1")
@@ -126,7 +126,7 @@ async def test_leaf_turn_fails_closed(monkeypatch):
             ran.append(1); return "ok", None, None
     monkeypatch.setattr(agent_mod, "GhostAgent", FakeAgent)
     base = SimpleNamespace(sandbox_dir="/tmp/sb", current_project_id=None, memory_system=object(),
-                           skill_memory=object(), graph_memory=None, scratchpad=None,
+                           graph_memory=None, scratchpad=None,
                            args=SimpleNamespace(perfect_it=True, smart_memory=0.5, native_tools=False),
                            workspace_model=object(), journal=object(), llm_client=object())
     with patch("ghost_agent.tools.registry.TOOL_DEFINITIONS", new=[{"function": {}}]):
@@ -138,7 +138,9 @@ async def test_leaf_turn_fails_closed(monkeypatch):
 def test_replay_list_keeps_the_old_subagent_denials():
     """Fails where the replay denylist loses a name the removed sub-agent list denied."""
     from ghost_agent.core.isolation import REPLAY_FORBIDDEN_TOOLS
-    assert {"manage_tasks", "manage_services", "manage_projects", "self_state", "update_profile"} <= REPLAY_FORBIDDEN_TOOLS
+    # (§4TB: `self_state` was in this set until the tool was removed; its one surviving write,
+    # introspect(action="set_mood"), refuses itself in a contained context — tests/test_4tb_set_mood.py)
+    assert {"manage_tasks", "manage_services", "manage_projects", "update_profile"} <= REPLAY_FORBIDDEN_TOOLS
 
 
 def test_a_zero_parameter_tool_is_still_detected_as_a_pure_trigger():

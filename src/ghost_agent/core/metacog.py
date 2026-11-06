@@ -79,7 +79,6 @@ _TOOL_DOMAIN: dict = {
     "write_file": "fs",
     "search_filesystem": "fs",
     # memory
-    "skill_memory": "memory",
     "episodic_memory": "memory",
     "graph_memory": "memory",
     "vector_memory": "memory",

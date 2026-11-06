@@ -91,7 +91,8 @@ def test_every_opt_in_states_its_reason():
     # 8: §4MW — the failure-replay loop looks its own probe replays up by id
     # 9: §4NE — the regression suite reads its own test runs back by id
     # §4NM: the three ontology-purity opt-ins left with optim/tool_ontology.py → 6
-    assert found == 6, f"{found} opt-ins — a new one is a decision, record it here"
+    # §4SZ: 8 and 9 above left with the replay loop and the regression suite → 4
+    assert found == 4, f"{found} opt-ins — a new one is a decision, record it here"
 
 
 # --- the perfection protocol ----------------------------------------------
@@ -111,26 +112,15 @@ class _Skills:
 
 def _agent():
     a = agent_mod.GhostAgent.__new__(agent_mod.GhostAgent)
-    a.context = SimpleNamespace(llm_client=_LLM(), skill_memory=_Skills(), memory_system=None)
+    a.context = SimpleNamespace(llm_client=_LLM(), memory_system=None)
     return a
 
 
-def test_perfect_it_writes_nothing_for_a_probe_turn():
+def test_perfect_it_returns_the_text_for_the_inline_path():
     a = _agent()
-    with patch.object(agent_mod, "turn_origin", lambda ctx: "probe"), \
-         patch.object(agent_mod, "pretty_log", lambda *x, **k: None):
-        out = asyncio.run(a._perfect_it_generate_and_learn({"messages": []}, "Optimization Analysis: Run exactly this", "tid"))
-    assert a.context.skill_memory.lessons == [], "a probe turn became a playbook lesson"
-    assert "verify exit codes" in out, "the text is still returned for the inline path's own use"
-
-
-def test_perfect_it_still_writes_for_a_user_turn():
-    a = _agent()
-    with patch.object(agent_mod, "turn_origin", lambda ctx: "user"), \
-         patch.object(agent_mod, "pretty_log", lambda *x, **k: None):
-        asyncio.run(a._perfect_it_generate_and_learn({"messages": []}, "Compare two schema dumps", "tid"))
-    assert len(a.context.skill_memory.lessons) == 1
-    assert a.context.skill_memory.lessons[0]["source"] == "perfection_protocol"
+    with patch.object(agent_mod, "pretty_log", lambda *x, **k: None):
+        out = asyncio.run(a._perfect_it_generate({"messages": []}))
+    assert "verify exit codes" in out, "the text is returned for the inline path's own use"
 
 
 # §4NM: the deferred (background) Perfect-It scheduling pins were removed — §4NC
@@ -138,21 +128,3 @@ def test_perfect_it_still_writes_for_a_user_turn():
 # direct-call gate above remains.
 
 
-def test_orphan_twins_are_reconciled_at_boot_too():
-    """A pruned lesson's vector twin is rendered VERBATIM by retrieval when
-    its playbook row is gone, and the idle-phase reconcile needs 15-60 min of
-    idle plus a 2 h cooldown, so boot runs it too (review, 2026-09-09).
-    §4KW: this pin used to find the call in `main()` by source text — where it
-    never ran, because `main()` runs before `lifespan` creates the vector
-    store. Now: `lifespan` starts it right after the store exists."""
-    import ast
-    import inspect
-    from ghost_agent import main as main_mod
-    import textwrap
-    fn = ast.parse(textwrap.dedent(inspect.getsource(main_mod.lifespan))).body[0]
-    store = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign) and any(
-        isinstance(t, ast.Attribute) and t.attr == "memory_system" for t in n.targets)
-        and isinstance(n.value, ast.Call) and getattr(n.value.func, "id", "") == "VectorMemory"]
-    boot = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
-            and getattr(n.func, "id", "") == "_start_boot_skill_reconcile"]
-    assert store and boot and min(store) < min(boot)

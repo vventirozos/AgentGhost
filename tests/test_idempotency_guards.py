@@ -10,9 +10,7 @@ import pytest
 
 from ghost_agent.core.bus import MemoryBus
 from ghost_agent.core.agent import GhostAgent, GhostContext
-from ghost_agent.tools.memory import (
-    tool_remember, tool_update_profile, tool_learn_skill,
-)
+from ghost_agent.tools.memory import tool_remember, tool_update_profile
 
 
 # ============================================================ bus dedup LRU
@@ -101,27 +99,6 @@ async def test_tool_remember_skips_existing_text():
     vec.add.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_tool_learn_skill_skips_duplicate_lesson(tmp_path):
-    """Identical (task, mistake, solution) triplet must not be re-learned."""
-    import json
-    file_path = tmp_path / "skills_playbook.json"
-    file_path.write_text(json.dumps([{
-        "task": "parse json", "mistake": "missing key", "solution": "use .get()"
-    }]))
-
-    skill = MagicMock()
-    skill.file_path = file_path
-    skill.learn_lesson = MagicMock()
-
-    res = await tool_learn_skill(
-        task="parse json", mistake="missing key", solution="use .get()",
-        skill_memory=skill,
-    )
-    assert "NOOP" in res
-    skill.learn_lesson.assert_not_called()
-
-
 # ===================================================== agent loop guard
 
 
@@ -142,8 +119,6 @@ def _make_agent_for_loop_test():
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.graph_memory = MagicMock()
     ctx.graph_memory.get_neighborhood = MagicMock(return_value=[])
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value="")
     ctx.sandbox_dir = "/tmp/sandbox"
     return GhostAgent(ctx)
 

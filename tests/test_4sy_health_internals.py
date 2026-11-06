@@ -16,7 +16,7 @@ import pytest
 
 from ghost_agent.tools import health_internals as H
 
-LABELS = ["Models", "Memory stores", "Learning", "Projects and schedule", "Labs and sandbox", "Storage and safety"]
+LABELS = ["Models", "Memory stores", "Rules", "Projects and schedule", "Labs and sandbox", "Storage and safety"]
 
 
 # ── stand-ins with the real readers' names (a MagicMock answers everything; these answer what they hold) ──
@@ -62,14 +62,6 @@ class _Counted:
         return self.n
 
 
-class _Skills:
-    def count_lessons(self):
-        return 48
-
-    def all_owner_rule_rows(self):
-        return [{"origin": "owner_rule"}] * 3
-
-
 class _Projects:
     def list_projects(self):
         return [{"status": "DONE"}, {"status": "ACTIVE"}, {"status": "DONE"}, {"status": "PAUSED"}]
@@ -93,7 +85,7 @@ def _ctx(tmp_path, **over):
     base = dict(
         llm_client=_llm(), memory_system=_Vec(), graph_memory=_Graph(), profile_memory=_Profile(),
         fact_ledger=_Counted(57), episodic_memory=SimpleNamespace(count=lambda: 3, db_path=""),
-        experience_memory=_Counted(310), skill_memory=_Skills(),
+        experience_memory=_Counted(310), 
         project_store=_Projects(), scheduler=_Sched(), sandbox_manager=None, memory_dir=str(md),
         args=SimpleNamespace(no_memory=False, mandatory_tor=False, labs_host="", labs_key_file=""))
     base.update(over)
@@ -157,7 +149,7 @@ def test_singular_counts_read_as_singular(tmp_path):
 _STORES = [("memory_system", "Memory stores", "vector memory"), ("graph_memory", "Memory stores", "graph"),
            ("profile_memory", "Memory stores", "profile"), ("fact_ledger", "Memory stores", "fact ledger"),
            ("episodic_memory", "Memory stores", "episodes"), ("experience_memory", "Memory stores", "experience"),
-           ("skill_memory", "Learning", "lesson playbook"), ("project_store", "Projects and schedule", "project store"),
+           ("project_store", "Projects and schedule", "project store"),
            ("scheduler", "Projects and schedule", "task scheduler")]
 
 
@@ -183,7 +175,7 @@ def test_every_store_attribute_the_module_reads_is_in_that_table():
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr"
               and len(n.args) >= 2 and isinstance(n.args[0], ast.Name) and n.args[0].id == "context"
               and isinstance(n.args[1], ast.Constant)}
-    assert direct == {"args", "llm_client", "memory_dir", "sandbox_manager", "profile_memory", "skill_memory",
+    assert direct == {"args", "llm_client", "memory_dir", "sandbox_manager", "profile_memory",
                       "fact_ledger"}
     # and nothing reaches into the context by plain attribute (`context.graph_memory`), which the two
     # sets above would not see
@@ -247,11 +239,11 @@ def test_a_reader_that_raises_is_named_and_the_rest_still_reports(tmp_path):
 def test_a_test_double_is_never_printed_as_a_number(tmp_path):
     """A MagicMock answers every call; "N rows" with a mock for N is a report nobody can read."""
     by, problems, _ = _run(_ctx(tmp_path, memory_system=MagicMock(), graph_memory=MagicMock(),
-                                fact_ledger=MagicMock(), skill_memory=MagicMock(), project_store=MagicMock(),
+                                fact_ledger=MagicMock(), project_store=MagicMock(),
                                 scheduler=MagicMock()))
     text = " ".join(by.values())
     assert "MagicMock name=" not in text and "<Mock" not in text
-    for part in ("vector memory", "graph", "fact ledger", "lesson playbook", "project store", "task scheduler"):
+    for part in ("vector memory", "graph", "fact ledger", "project store", "task scheduler"):
         assert f"{part} UNREADABLE (" in text, part
         assert any(p.startswith(f"{part} could not be read") for p in problems), part
 
@@ -347,7 +339,7 @@ def test_the_models_line_is_read_on_the_event_loop_and_the_stores_in_threads(tmp
         return fn
     monkeypatch.setattr(H, "SECTIONS", tuple((lab, spy(lab), th) for lab, _fn, th in H.SECTIONS))
     _report(_ctx(tmp_path))
-    assert seen == {"Models": True, "Memory stores": False, "Learning": False, "Projects and schedule": False,
+    assert seen == {"Models": True, "Memory stores": False, "Rules": False, "Projects and schedule": False,
                     "Labs and sandbox": False, "Storage and safety": False}
 
 
@@ -361,24 +353,38 @@ def test_no_model_client_is_a_problem(tmp_path):
     assert by["Models"] == "no model client attached" and "no model client is attached" in problems
 
 
-# ── learning ────────────────────────────────────────────────────────────────
+# ── rules ────────────────────────────────────────────────────────────────
 
-def test_learning_line_counts_lessons_owner_rules_and_rules_waiting_for_the_owner(tmp_path):
+def test_rules_line_counts_the_owners_rules_and_no_lessons(tmp_path):
+    """§4SZ: the rules are the owner's own, in one file beside the memory dir (core/owner_rules.py)."""
+    from ghost_agent.core import owner_rules as R
     ctx = _ctx(tmp_path)
-    sp = tmp_path / "system" / "selfplay"
-    sp.mkdir(parents=True)
-    from ghost_agent.core import failure_replay as fr
-    cases = [{"rule": "say the version you read", "stage": "done"},                       # proposed
-             {"rule": "name the file", "stage": "done"},                                 # proposed
-             {"rule": "quote the log", "stage": "done", "adopted_at": 10.0},             # adopted
-             {"rule": "old", "stage": "done", "dismissed_at": 5.0},                      # dismissed
-             {"rule": "", "stage": "replaying"}]                                         # not a candidate yet
-    assert [fr.is_proposed(c) for c in cases] == [True, True, False, False, False]
-    (sp / fr.LEDGER).write_text(json.dumps(cases))
+    system = tmp_path / "system"
+    assert _run(ctx)[0]["Rules"] == "0 owner rules (of at most 10, shown on every turn)"
+    R.rule_command("learn this rule: answer in English", system)
+    R.rule_command("learn this rule: give five headlines for the news", system)
     by, problems, _ = _run(ctx)
-    assert by["Learning"] == ("48 lessons in the playbook, of them 3 owner rules; "
-                              "2 proposed rules waiting for the owner's decision, 1 adopted from replays")
+    assert by["Rules"] == "2 owner rules (of at most 10, shown on every turn)"
     assert not [p for p in problems if "lesson" in p or "rule" in p]
+
+
+@pytest.mark.parametrize("text,why", [
+    ("{torn", "is not readable JSON"), ("[]", "holds a JSON list, not an object"),
+    # what only the store itself knows is damage (§4SZ r1: the check asks `owner_rules.damaged`)
+    ('{"rules": [{"n": 1, "rule": "a"}, {"n": 1, "rule": "b"}]}', "holds two rules numbered 1"),
+    ('{"rules": [{"n": "1", "rule": "a"}]}', "holds a row that is not a rule"),
+])
+def test_a_damaged_rules_file_is_named_and_left_as_it_is(tmp_path, text, why):
+    """The rules store shows no rule from a file it cannot use and refuses every command; the check
+    says why, in the store's own words."""
+    ctx = _ctx(tmp_path)
+    f = tmp_path / "system" / "owner_rules.json"
+    f.write_text(text)
+    before = _tree(tmp_path)
+    by, problems, _ = _run(ctx)
+    assert _tree(tmp_path) == before
+    assert by["Rules"].endswith(f"owner rules file DAMAGED ({why})")
+    assert f"the owner rules file is damaged ({why}); it was left as it is" in problems
 
 
 # ── projects and schedule ───────────────────────────────────────────────────
@@ -603,7 +609,7 @@ def test_a_memory_dir_that_is_not_a_directory_reads_nothing_under_it(tmp_path):
     lines, problems, _ = _report(ctx)
     by = {ln.split(": ", 1)[0]: ln.split(": ", 1)[1] for ln in lines}
     assert by["Storage and safety"] == "Tor-only mode off"
-    assert "proposed rule" not in by["Learning"] and not (tmp_path / "gone").exists()
+    assert "proposed rule" not in by["Rules"] and not (tmp_path / "gone").exists()
 
 
 @pytest.mark.parametrize("installed,problem", [(True, False), (False, True)])
@@ -647,18 +653,18 @@ def test_a_part_that_does_not_answer_is_not_checked_and_what_was_read_before_it_
     # the problem found BEFORE the slow part is kept; the slow part is not a problem
     assert [p for p in problems if "backup" not in p] == [
         "vector memory has no embedding model loaded (nothing can be stored or searched by meaning)"]
-    assert [ln.split(": ", 1)[0] for ln in lines] == LABELS and by["Learning"].startswith("48 lessons")
+    assert [ln.split(": ", 1)[0] for ln in lines] == LABELS and by["Rules"].startswith("0 owner rules")
 
 
 def test_a_section_that_raises_is_named_with_what_it_read(tmp_path, monkeypatch):
     def boom(context, out):
         out.parts.append("first part")
         raise RuntimeError("x")
-    monkeypatch.setattr(H, "SECTIONS", tuple((lab, boom if lab == "Learning" else fn, th) for lab, fn, th in H.SECTIONS))
+    monkeypatch.setattr(H, "SECTIONS", tuple((lab, boom if lab == "Rules" else fn, th) for lab, fn, th in H.SECTIONS))
     lines, problems, unchecked = _report(_ctx(tmp_path))
     by = {ln.split(": ", 1)[0]: ln.split(": ", 1)[1] for ln in lines}
-    assert by["Learning"] == "first part; the rest UNREADABLE (RuntimeError)"
-    assert "learning could not be read (RuntimeError)" in problems and unchecked == []
+    assert by["Rules"] == "first part; the rest UNREADABLE (RuntimeError)"
+    assert "rules could not be read (RuntimeError)" in problems and unchecked == []
     assert by["Memory stores"].startswith("vector 120 rows")
 
 
@@ -740,33 +746,6 @@ def test_a_profile_file_a_reader_already_set_aside_is_reported_missing(tmp_path)
     assert any(p.startswith("the owner profile file is missing: a reader set a damaged copy aside") for p in problems)
 
 
-def test_a_playbook_file_a_reader_already_set_aside_is_reported_missing(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-    ctx = _ctx(tmp_path)
-    sm = SkillMemory(Path(ctx.memory_dir))
-    assert sm.file_path.is_file(), "the store no longer creates its file at construction"
-    sm.file_path.write_text("{torn")
-    sm.all_owner_rule_rows()                                   # the prompt build's read
-    assert not sm.file_path.exists(), "the store no longer sets a torn file aside"
-    ctx.skill_memory = sm
-    by, problems, _ = _run(ctx)
-    assert by["Learning"].startswith("lesson playbook file MISSING; ")
-    assert any(p.startswith("the lesson playbook file is missing") for p in problems)
-
-
-def test_a_fresh_real_playbook_and_an_empty_one_are_fine(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-    ctx = _ctx(tmp_path)
-    sm = SkillMemory(Path(ctx.memory_dir))
-    ctx.skill_memory = sm
-    for text in (None, ""):                                    # as created; then zero bytes (the store reads it as empty)
-        if text is not None:
-            sm.file_path.write_text(text)
-        by, problems, _ = _run(ctx)
-        assert by["Learning"].startswith("0 lessons in the playbook, of them 0 owner rules")
-        assert not [p for p in problems if "playbook" in p]
-
-
 def test_a_healthy_real_profile_is_counted_through_its_own_reader(tmp_path):
     from ghost_agent.memory.profile import ProfileMemory
     ctx = _ctx(tmp_path)
@@ -775,42 +754,6 @@ def test_a_healthy_real_profile_is_counted_through_its_own_reader(tmp_path):
     ctx.profile_memory = pm
     by, problems, _ = _run(ctx)
     assert "profile 3 fields" in by["Memory stores"] and not [p for p in problems if "profile" in p]
-
-
-@pytest.mark.parametrize("text,why", [("{not json", "not readable JSON"),
-                                      ('{"a": 1}', "holds a JSON dict, not a list"),
-                                      ("[" * 100000, "nested too deeply to read")])
-def test_a_damaged_playbook_is_named_and_its_reader_is_not_called(tmp_path, text, why):
-    class _Sk(_Skills):
-        called = False
-
-        def count_lessons(self):
-            type(self).called = True
-            return 0
-    ctx = _ctx(tmp_path)
-    sk = _Sk()
-    sk.file_path = Path(ctx.memory_dir) / "skills_playbook.json"
-    sk.file_path.write_text(text)
-    ctx.skill_memory = sk
-    by, problems, _ = _run(ctx)
-    assert by["Learning"].startswith(f"lesson playbook file DAMAGED ({why}); ")
-    assert f"the lesson playbook file is damaged ({why}); it was left as it is" in problems
-    assert _Sk.called is False and "0 lessons" not in by["Learning"]
-
-
-def test_a_damaged_rule_ledger_is_not_zero_proposed_rules(tmp_path):
-    from ghost_agent.core import failure_replay as fr
-    ctx = _ctx(tmp_path)
-    sp = tmp_path / "system" / "selfplay"
-    sp.mkdir(parents=True)
-    (sp / fr.LEDGER).write_text("[{")
-    by, problems, _ = _run(ctx)
-    assert by["Learning"].endswith("rule ledger file DAMAGED (not readable JSON)")
-    assert "proposed rule" not in by["Learning"] and any(p.startswith("the rule ledger file is damaged") for p in problems)
-    (sp / fr.LEDGER).write_text("{}")
-    assert _run(ctx)[0]["Learning"].endswith("rule ledger file DAMAGED (holds a JSON dict, not a list)")
-    (sp / fr.LEDGER).write_text("")                            # the store reads a zero-byte ledger as empty
-    assert _run(ctx)[0]["Learning"].endswith("0 proposed rules waiting for the owner's decision, 0 adopted from replays")
 
 
 def test_a_damaged_document_index_is_not_zero_documents(tmp_path):

@@ -382,6 +382,9 @@ ASK_REASONS = frozenset({"forget_not_confirmed", "reset_not_confirmed"})
 #: repeated fetch (served or failed), a disabled or unknown tool, an empty
 #: write, a constraint breach are the call's real result or the model's own
 #: error (`_STRUCK_BLOCK_CODES`), not a guard.
+#: (`lesson_channel_blocked` and, below, `list_lessons` name parts removed in
+#: §4TD: nothing writes them any more, the census still reads the stored rows
+#: of the turns that did)
 GUARD_REASONS = frozenset({"idempotency_guard", "owner_data_blocked", "lesson_channel_blocked", "status_only",
                            "search_cap", "preflight_block", "deadline_wait"})
 TOOL_CLASSES = ("ok", "failed", "guard", "asked_user", "partial", "unresolved")
@@ -627,7 +630,7 @@ def _history_contexts(turns: List[dict], standing: str) -> Dict[str, str]:
 
 # ── §4PM: the gold sample — a blind grade every fortnight ───────────────────
 
-#: the reaction judge's verdicts on NO-TOOL turns (owner_seeds writes it) —
+#: the reaction judge's verdicts on NO-TOOL turns (written by owner_seeds until §4SZ removed the judge) —
 #: a separate file so the failure-replay seeds, which read the tool-turn
 #: cache, are unchanged
 REACTIONS_NOTOOL_FILENAME = "reaction_verdicts_notool.json"
@@ -1279,9 +1282,11 @@ def build(home=None, days: float = 14.0, today: Optional[datetime.date] = None,
     try:
         from ..tools.file_system import read_text_nofollow
         standing += read_text_nofollow(sysd / "memory" / "user_profile.json")
-        pb = json.loads(read_text_nofollow(sysd / "memory" / "skills_playbook.json"))
-        standing += " ".join(str(x.get("lesson") or x.get("text") or "") for x in pb
-                             if isinstance(x, dict) and x.get("origin") == "owner_rule")
+    except Exception:  # noqa: BLE001
+        pass
+    try:        # on its own: a missing profile used to skip the rules with it
+        from .owner_rules import rules as _owner_rules      # §4SZ: the rules moved out of the playbook
+        standing += " " + " ".join(str(x.get("rule") or "") for x in _owner_rules(sysd))
     except Exception:  # noqa: BLE001
         pass
     hist = _history_contexts(turns, standing)
@@ -1397,7 +1402,8 @@ def render(report: dict) -> str:
              f"{report['no_tool_turns']} with no tool, {report['live_rows']} with a live row",
              f"labels: yours {ss['human']['labelled']} ({ss['human']['negative']} 👎, {ss['human']['no_tool_labelled']} on no-tool turns); "
              f"reaction judge {ss['judge']['labelled']} ({ss['judge']['negative']} negative, "
-             f"{ss['judge']['no_tool_labelled']} on no-tool turns — an LLM, not you)",
+             f"{ss['judge']['no_tool_labelled']} on no-tool turns — an LLM, not you; removed 2026-11-05, "
+             f"these are its old verdicts)",
              f"{'detector':<24}{'fired':>11}{'rate':>8}  {'of all':>7}   yours 👎 fired|quiet    judge − fired|quiet"]
     for name, d in report["detectors"].items():
         wf, wq = d["when_fired"], d["when_quiet"]

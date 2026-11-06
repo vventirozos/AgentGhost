@@ -12,8 +12,8 @@ plus two escape values:
 * **generation_control** — sampling, token budgets, LLM timeouts.
 * **orchestration** — verifier route, loop-breaker, strikes, dispatch,
   planning.
-* **memory** — recall, lessons, knowledge base, project store (wrong or
-  stale retrieval, poisoned lessons).
+* **memory** — recall, knowledge base, project store (wrong or
+  stale retrieval).
 * **output_processing** — parsers, scrub, schema validation (e.g. the
   fail-open SEARCH/REPLACE parser).
 * **model** — a genuine base-model reasoning error, i.e. NOT the harness.
@@ -25,8 +25,8 @@ parser fail-open read as bad code edits). An explicit dimension on every
 failure record institutionalizes "audit the harness before blaming the
 model", and gives the dream-side distillation pass its group key.
 
-This module is a dependency-free leaf: ``memory/skills.py`` imports it
-inside the write chokepoint, so it must never import from ``ghost_agent``
+This module is a dependency-free leaf: its record-time callers import it
+inside their write paths, so it must never import from ``ghost_agent``
 at module level (the one lazy import lives inside
 :func:`adjudicate_dimension`).
 """
@@ -65,7 +65,7 @@ DIMENSION_DEFINITIONS = {
     DIM_TOOL_INTERACTION: "tool routing/arguments, browser, search, network, sandbox access",
     DIM_GENERATION_CONTROL: "decoding: sampling params, token budgets, LLM call timeouts, empty/cut-off completions",
     DIM_ORCHESTRATION: "workflow control: verifier route, loop-breaker, strikes, dispatch, planning/replanning",
-    DIM_MEMORY: "cross-call state: recall, lessons/playbook, knowledge base, project store (wrong/stale/poisoned retrieval)",
+    DIM_MEMORY: "cross-call state: recall, knowledge base, project store (wrong/stale/poisoned retrieval)",
     DIM_OUTPUT_PROCESSING: "post-call handling: parsers, SEARCH/REPLACE blocks, scrub/redaction, schema validation",
     DIM_MODEL: "a base-model reasoning error despite correct context and tooling (hallucination, miscalculation, refusal)",
     DIM_UNKNOWN: "no attributable signal",

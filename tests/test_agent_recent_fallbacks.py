@@ -24,7 +24,6 @@ def mock_context():
     context.memory_system = MagicMock()
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string = lambda: ""
-    context.skill_memory = MagicMock()
     
     # Create an actual temp dir so list_files works properly
     temp_dir = tempfile.mkdtemp()

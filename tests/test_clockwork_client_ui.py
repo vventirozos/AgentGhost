@@ -11,6 +11,7 @@ transcript_not_its_container for the numbers.
 """
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -48,58 +49,6 @@ def test_client_file_exists():
     assert _CLIENT.exists(), "the uConsole client moved — update these guards"
 
 
-def test_fullscreen_toggle_hides_the_whole_overlay():
-    """"Hide UI" must hide ALL the glass UI, not one panel of it.
-
-    `self.overlay` is the single translucent sheet carrying the top chips, the
-    transcript and the bottom bar. Two narrower targets were tried and both
-    left controls on screen:
-
-      * `left_widget`  — the transcript's container. Also carries the main
-        column's ONLY stretch factor, so hiding it handed the freed space to
-        the bottom bar, which grew from 25px to 659px tall and vertically
-        centred its fixed-height chips. Measured on-device at the panel's real
-        1280x720 (XWAYLAND0, a 720x1280 display rotated right), Qt 6.4.2:
-        bottom bar y=683 h=25 (96% down) -> y=49 h=659 (52% down, dead centre).
-      * `chat_display` — fixed that placement but the chips and bar stayed up,
-        so the button still did not hide the UI.
-    """
-    body = _statements("toggle_fullscreen_face")
-
-    assert "self.overlay.hide()" in body, (
-        "the toggle must hide the whole overlay — hiding a panel inside it "
-        "leaves the top chips and the bottom bar on screen"
-    )
-    assert "self.left_widget.hide()" not in body, (
-        "hiding left_widget releases the main column's only stretch factor — "
-        "the bottom bar grows into the freed space and its chips centre "
-        "vertically, landing mid-deck"
-    )
-
-
-def test_hidden_overlay_has_at_least_two_ways_back():
-    """A frameless always-on-top kiosk with the UI hidden has NO visible
-    control to restore it. Losing the way back is worse than the bug this
-    fixes, so the escape hatch is redundant by design: an F11
-    ApplicationShortcut *and* an any-key fallback in keyPressEvent."""
-    src = _CLIENT.read_text()
-
-    assert "Key_F11" in src, "the documented F11 restore shortcut is gone"
-    assert "self.fullscreen_shortcut.activated.connect(self.toggle_fullscreen_face)" in src
-
-    # ApplicationShortcut, not the default WindowShortcut: with the overlay
-    # hidden the QWebEngineView is all that is left to hold focus.
-    fs = src[src.find("self.fullscreen_shortcut = QShortcut"):][:400]
-    assert "ShortcutContext.ApplicationShortcut" in fs, (
-        "a window-scoped shortcut can be swallowed by the focused web view"
-    )
-
-    key_body = _statements("keyPressEvent")
-    assert "self.overlay.isVisible()" in key_body and "_restore_overlay" in key_body, (
-        "keyPressEvent must restore the UI on any key while it is hidden"
-    )
-
-
 def test_face_never_takes_focus():
     """If the decorative web view could take focus it would swallow key
     presses, and the any-key escape from fullscreen mode would never fire."""
@@ -122,23 +71,6 @@ def test_stretch_carrying_container_is_documented_as_such():
     assert "stretch" in context.lower(), (
         "left_widget's stretch role must stay documented at its definition"
     )
-
-
-def test_toggle_uses_the_chip_glyph_set_not_emoji():
-    """Every other control is a geometric glyph (◇ ◈ ◐ ◉ ● ◌) rendered in the
-    chip style. The toggle used to swap in 📖/👁️ on first press, so the button
-    left the design language and never came back — the initial ◐ was
-    unreachable after one click."""
-    body = _statements("toggle_fullscreen_face")
-    for emoji in ("📖", "👁"):
-        assert emoji not in body, f"{emoji} breaks the chip glyph set"
-
-
-@pytest.mark.parametrize("name", ["toggle_fullscreen_face"])
-def test_toggle_is_reachable_from_its_button(name):
-    """A layout fix is worthless if the button stops being wired to it."""
-    src = _CLIENT.read_text()
-    assert f"self.fs_btn.clicked.connect(self.{name})" in src
 
 
 # ── webface.py ──────────────────────────────────────────────────────────────
@@ -226,3 +158,41 @@ def test_a_NON_RESOLVING_host_is_announced_at_startup():
     assert "[tls]" in text, "the preflight is not greppable in ghost_ui.log"
     # …and it must name the escape hatch, since the device is often remote.
     assert "GHOST_VOICE_VERIFY_TLS=0" in text
+
+
+# ── the modern interface (operator, 2026-11-06) ───────────────────────────────
+def test_save_load_and_the_face_only_mode_are_gone():
+    src = (Path(__file__).resolve().parent.parent / "interface/externals/clockwork_ghost/client.py").read_text(encoding="utf-8")
+    for gone in ("load_btn", "workspace_btn", "save_workspace", "load_workspace", "/api/workspace",
+                 "fs_btn", "toggle_fullscreen_face", "_restore_overlay", "fullscreen_shortcut", "Key_F11",
+                 "self.overlay.hide"):
+        assert not re.search(r"(?<![a-z])" + re.escape(gone), src), gone   # upload_btn is not load_btn
+
+
+def test_no_control_is_a_capitalised_glyph_any_more():
+    src = (Path(__file__).resolve().parent.parent / "interface/externals/clockwork_ghost/client.py").read_text(encoding="utf-8")
+    assert not re.search(r'QPushButton\("[^"]+"\)', src), "a button text bypasses set_chip"
+    assert not re.search(r'set(?:Text)?\("[◉◆◈◐◇○◌●■▲▼✕]', src)
+    for word in ("Good", "Bad", "Animations on", "Animations off", "Camera", "Talk", "Voice on", "Voice off", "Stop"):
+        assert f'"{word}"' in src, word
+
+
+def test_the_icons_parse_to_real_shapes_and_theme_colours_read():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "interface/externals/clockwork_ghost"))
+    import icons
+    for name, paths in icons.PATHS.items():
+        for d in paths:
+            segs = icons.parse(d)
+            assert segs[0][0] == "M", (name, d)
+            for s in segs:
+                assert all(-1 <= v <= 25 for v in s[1:]), (name, s)     # stays on the grid
+    assert icons.rgba("rgba(236, 235, 246, 0.82)") == (236, 235, 246, 209)     # QColor would draw black
+    assert icons.rgba("#c9a6ff") == (201, 166, 255, 255)
+    # a half-circle arc ends where it says, through the far side
+    arc = icons.parse("M15 13a3 3 0 1 1-6 0")
+    assert arc[-1][-2:] == pytest.approx((9, 13))
+
+
+def test_deploy_ships_the_icons():
+    assert "icons.py" in (Path(__file__).resolve().parent.parent / "interface/externals/clockwork_ghost/deploy.sh").read_text(encoding="utf-8")

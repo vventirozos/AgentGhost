@@ -1,14 +1,16 @@
 """Tool failure classification and routing.
 
-Categorises tool execution errors into three buckets so the agent loop
-can decide whether to retry, replan, or self-correct:
+Categorises tool execution errors into three buckets, each of which tells
+the model something different — try once more, stop repeating this call,
+or read the error and fix it:
 
 * **RETRYABLE** — transient infrastructure errors (timeout, rate-limit,
   connection reset, sandbox busy). The loop should retry with exponential
   back-off (up to a cap).
 * **FATAL** — permanent errors that no retry will fix (permission denied,
-  invalid arguments, tool not found). The loop should mark the task FAILED
-  and trigger a replan.
+  invalid arguments, tool not found). The model is told "PERMANENT ERROR —
+  do NOT retry this tool call" (an argument error instead names the
+  argument to correct). Nothing re-plans for it.
 * **DIAGNOSTIC** — errors that contain useful debugging information the LLM
   can reason about (assertion failures, runtime errors, syntax errors).
   The error message is injected into context so the LLM can self-correct.
@@ -309,8 +311,9 @@ _FAILURE_PREFIX_RE = re.compile(
 #: marking the file modified in the work log, and teaching the foresight
 #: model that the call succeeds.
 #:
-#: Deliberately NOT folded into `result_is_failure`: the composed-skill and
-#: acquired-skill success_rate readers exempt steering SYSTEM INSTRUCTIONs
+#: Deliberately NOT folded into `result_is_failure`: the acquired-skill
+#: success_rate reader (and the composed-skill one, until §4TA removed the
+#: macro engine) exempts steering SYSTEM INSTRUCTIONs
 #: on purpose. This is consumed only where the question is "did this call
 #: change anything?".
 #: ANCHORED. The second arm used to be `\s*[^\n]*\bREJECTED\b` — any first
@@ -361,8 +364,8 @@ _REJECTION_RE = re.compile(
     #     if _is_idem_setter and _outcome.may_record_as_applied:
     #         executed_idempotent.add(a_hash)
     #
-    # The three idempotent setters — `update_profile`, `learn_skill`,
-    # `knowledge_base insert_fact` — are PRECISELY the three producers of
+    # The idempotent setters — `update_profile` and
+    # `knowledge_base insert_fact` (and, until §4TD, `learn_skill`) — are PRECISELY the producers of
     # `NOOP:`. Their no-op reply means "the state you asked for is already
     # there", which is the successful end state. Marked as a rejection, the
     # DURABLE ledger was never written, the guard never armed, and the model
@@ -401,8 +404,8 @@ def result_is_rejection(text) -> bool:
 # ── the exit code of an execute-SHAPED result ─────────────────────────────
 #
 # Five readers ran an UNANCHORED `EXIT CODE:\s*(\d+)` over the whole body
-# (distill/outcome_heuristics, project_advancer ×2, registry,
-# composed_skills) while the turn loop's own rule (core/agent.py, the
+# (distill/outcome_heuristics, project_advancer ×2, registry, and
+# composed_skills — removed §4TA) while the turn loop's own rule (core/agent.py, the
 # "Process finished successfully." fix) already demanded a LINE-ANCHORED
 # banner with execution framing. Measured 2026-09-20 (R4-1): a
 # `manage_projects` status payload that QUOTES a past build — one JSON line

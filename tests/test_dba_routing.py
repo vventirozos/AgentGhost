@@ -23,7 +23,6 @@ def mock_context():
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     context.memory_system = MagicMock()
-    context.skill_memory = MagicMock()
     context.cached_sandbox_state = None
     return context
 

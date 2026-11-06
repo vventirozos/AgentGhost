@@ -10,18 +10,54 @@
 > had already labelled. See `docs/algorithms/selfhood.html`, section
 > "The diary follows the corpus".
 
-> **Current state (2026-10-11, §4NM).** The selfhood package, the
+> **Current state (2026-11-06, §4TC).** The mood is no longer a label
+> derived from verifier verdicts. It is two numbers — pleasantness and
+> energy, each in [-1, 1] — that halve every two hours and are moved by
+> events: failed tool calls and loop guards in the owner's turns, clean
+> multi-tool turns, research turns, very long turns, the owner's thumbs,
+> corrections and thanks, and the owner saying so in chat
+> (`introspect(action="set_mood", mood=…, intensity=1–3, manner=…)` — the
+> owner's own request only). A long quiet moves nothing: after 6 quiet hours
+> a neutral mood READS as bored (1; after 12 hours, 2) to every reader but
+> the owner — never stored, measured from a persisted owner stamp.
+> A label (cheerful, content, calm, restless, bored, irritable, down, tired,
+> curious) and an intensity 1–3 are read off the pair; ONE line in the
+> per-turn state block — after the cached head, never in the system prompt
+> or a tool description — makes the mood audible in every reply; every
+> change of label or intensity is a row in `mood.history.jsonl`, read back
+> by `introspect(action="mood")`. Removed: `derive_mood`,
+> `update_derived_mood`, the six-hour hold of a self-set label, the 48-hour
+> staleness flag, `SelfStateThread.set_mood` / `clear_mood`,
+> `recent_verdicts`. A mood stored before §4TC is ignored (the mood starts
+> neutral). Sections below that describe the derived mood are the record.
+> The full account, with every constant:
+> `docs/algorithms/selfhood.html#mood`.
+
+> **State as of 2026-11-05 (§4TB).** The `self_state` tool is removed.
+> Of what it authored only the mood is kept, as one action of
+> `introspect`: `set_mood` (`mood`, required; optional `evidence`; the word
+> `clear` or `none` takes a self-set mood off, a missing or empty mood
+> is an argument error). Open questions, unfinished
+> threads and operating principles are gone, with everything that only
+> served them: their lists in `state.json` (an old file still loads; the
+> lists are ignored), `selfhood/values.py` and `values.json`, the idle
+> "stale questions" job, the `curious` rule of the derived mood, the
+> question input of the diary prompt, and `--principle-gate` (still
+> accepted, ignored). Sections below that describe them are the record.
+> The full account: `docs/algorithms/selfhood.html#agent-callable-tools`.
+
+> **State as of 2026-10-11 (§4NM).** The selfhood package, the
 > `self_state` tool and the `introspect` surfaces stay. Two pieces were
 > removed: the **wake-up prefix** (the first-person block spliced into the
 > system prompt at session start — gated off since §4EU, deleted now) and
 > the **derived-mood idle job** (phase 2.8c). The post-turn derivation
-> stays: after each real owner turn `update_derived_mood` applies
-> `selfhood/mood.py` to the verdict streak and context pressure, and
-> `self_state` shows the result with its age. The agent reads its own past
+> stayed until §4TC replaced it: after each real owner turn
+> `update_derived_mood` applied `selfhood/mood.py` to the verdict streak
+> and context pressure, and `self_state` showed the result with its age. The agent reads its own past
 > on demand through `introspect`. Sections below that describe the prefix
 > or the idle job are the record of how they worked.
 
-> **2026-08-20 mood rework (the idle half removed 2026-10-11, §4NM; the post-turn half is live):** mood is DERIVED from live signals
+> **2026-08-20 mood rework (the idle half removed 2026-10-11, §4NM; the post-turn half removed 2026-11-06, §4TC):** mood WAS derived from live signals
 > (verdict streaks, context pressure, open-question freshness, and — until
 > the idle job went — the idle clock; `selfhood/mood.py`) with provenance (`source="self"|"derived"`),
 > a 6 h grace window for self-authored moods, a 48 h staleness TTL on
@@ -29,7 +65,7 @@
 > retirement. Sections of this page that predate the rework (e.g.
 > "every `set_mood` appends to the history") describe the old
 > behaviour — see `docs/algorithms/selfhood.html`, section
-> "Derived mood + staleness", for the record of that mechanism.
+> "Derived mood + staleness — removed", for the record of that mechanism.
 
 A five-component module that stitches the agent's episodic instances
 into one continuous first-person self. Each new process boot reads
@@ -190,7 +226,7 @@ Phase positioning is deliberate:
 |---|---|---|---|
 | 1: Journal | >120 s | journal queue | smart-memory |
 | 2: Maintenance (logged as `maintenance`, formerly `dream`) | 600–3600 s | stores | snapshot, digests, archive retention; graph prune/merge, reconcile every ~6 h |
-| **2.8: Narrative** | **900–3600 s** | **autobio + state + SkillMemory failures** | **narrative.md** |
+| **2.8: Narrative** | **900–3600 s** | **autobio + state** | **narrative.md** |
 | 3: Failure replay (listed as `self-play`) | >3600 s | the owner's failed turns | replay stages, candidate rules, regression-test runs (§4MW/§4NE) |
 
 The narrative phase is CPU-cheap (one LLM round-trip on a small
@@ -282,7 +318,7 @@ by a unit test in `tests/test_selfhood_enhancements.py` and (for the
 probe wrapper) `tests/test_run_selfhood_probes_script.py`.
 
 * **Verdict backfill on user corrections** — `core/agent.py` user-correction path now calls `self_model.record_outcome` alongside `collector.update_outcome`. Prior memory was verdict-blind on this branch even though the trajectory log already knew the user pushed back.
-* **Diary sanitiser** — `narrative.sanitise_meta_insights()` strips tracebacks, abort markers (`[ATTEMPT_ABORTED_THINKING_LOOP]`), file paths, and system banners before the LLM diary prompt sees them. Stops the LLM from echoing raw machine noise into the first-person diary.
+* **Diary sanitiser** — removed 2026-11-06 (§4TD), together with its only input, the lesson store's failure patterns.
 * **Template-prompt rollup** — `### SYNTHETIC TRAINING EXERCISE`, `SYSTEM JUDGE REJECTION`, `AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR`, and self-repeating-loop alerts now collapse into a single counter-bumping record. 5 turns → 1 record with `template_count: 5`.
 * **`utcnow()` replaced** — `_utcnow_iso` now uses `datetime.now(UTC)`; the trailing `Z` is preserved so existing records stay parse-compatible.
 * **`user_handle` wired** — pulled from `profile_memory.root.name` at capture time. Previously a schema field that nothing ever populated.
@@ -306,7 +342,9 @@ genuinely paid off before rank higher than ones that merely share
 vocabulary — the relevance prior the design always intended. Covered by
 `tests/test_quick_wins.py`.
 
-## Operating principles (normative substrate)
+## Operating principles (normative substrate) — removed 2026-11-05 (§4TB)
+
+*What follows is the record: principles had one writer, the `self_state` tool, and went with it.*
 
 Selfhood originally tracked only *episodic* continuity. The functional
 tests found that mood / open-questions fed only the (since removed)

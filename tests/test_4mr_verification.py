@@ -82,7 +82,7 @@ def test_every_store_writing_repair_script_refuses_beside_a_writer():
     """Lens 5 MAJOR: the §4MN claim held only for §4MJ+ scripts; three older
     ones opened chroma on the live store directly — the two-writer segfault."""
     found = _store_writing_apply_scripts()
-    assert len(found) >= 26
+    assert len(found) >= 24   # §4TD: nine one-shots that needed the lesson store are gone
     assert [n for n, ok in found if not ok] == []
 
 
@@ -93,7 +93,7 @@ def test_an_old_repair_script_refuses_to_run_beside_the_agent(tmp_path):
     acquire_writer_lock(mem, "the agent")
     try:
         env = {**os.environ, "GHOST_HOME": str(tmp_path) + "/", "PYTHONPATH": str(ROOT / "src")}
-        p = subprocess.run([sys.executable, str(SCRIPTS / "memory_repair_4kw.py"), "--apply"],
+        p = subprocess.run([sys.executable, str(SCRIPTS / "memory_repair_4la.py"), "--apply"],
                            env=env, capture_output=True, text=True, timeout=120)
     finally:
         release_writer_lock(mem)

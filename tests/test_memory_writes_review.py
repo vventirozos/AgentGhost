@@ -184,7 +184,7 @@ def test_the_dedup_check_reads_the_canonical_field(tmp_path):
 @pytest.mark.parametrize("request_text", ["wipe all your memory", "Don't wipe all your memory!", "clean up the sandbox"])
 def test_reset_all_never_wipes_in_the_call_that_asks(request_text):
     """Fails in the world where one model call wiped every store."""
-    from ghost_agent.memory.lesson_scope import current_request
+    from ghost_agent.memory.request_text import current_request
     vec = MagicMock()
     vec.collection.get.return_value = {"ids": ["a"]}
     tok = current_request.set(request_text)

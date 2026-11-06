@@ -155,11 +155,11 @@ class TestEpisodicInRRF:
                 assert isinstance(result, str)
 
     def test_intent_weights_cover_only_the_live_sources(self):
-        """§4NN: the weight table lists the hydrating sources only — graph and
-        skill, plus the §4QL experience and §4QM history tiers (explicit 1.0)."""
+        """§4NN: the weight table lists the hydrating sources only — graph,
+        plus the §4QL experience and §4QM history tiers (explicit 1.0)."""
         from ghost_agent.core.bus import MemoryBus
         for intent in ["factual", "procedural", "contextual"]:
-            assert set(MemoryBus._INTENT_WEIGHTS[intent]) == {"graph", "skill", "experience", "history"}
+            assert set(MemoryBus._INTENT_WEIGHTS[intent]) == {"graph", "experience", "history"}
 
     def test_episodic_tier_is_formatted(self):
         # The fixed per-section _SECTION_BUDGETS map was removed in favour of

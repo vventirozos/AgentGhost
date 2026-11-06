@@ -2057,60 +2057,9 @@ body.zen-mode #rail-scrim {
 
 /* Face-form picker: same glass-panel language as #msg-menu, anchored
    under the header button by app.js. */
-#face-form-menu {
-    position: fixed;
-    z-index: 160;
-    min-width: 230px;
-    /* Phone guards: never wider than the viewport, and 10 items don't fit
-       a landscape phone — scroll inside the menu instead of off-screen.
-       app.js clamps the anchor position on BOTH axes to match. */
-    max-width: calc(100vw - 16px);
-    max-height: min(60dvh, calc(100dvh - 90px));
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    -webkit-overflow-scrolling: touch;
-    background: var(--panel-bg);
-    border: 1px solid var(--panel-border);
-    border-radius: 10px;
-    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.7);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    padding: 6px;
-}
-#face-form-menu.hidden { display: none; }
-.face-form-item {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 14px;
-    width: 100%;
-    background: none;
-    border: none;
-    border-radius: 8px;
-    padding: 9px 12px;
-    cursor: pointer;
-    text-align: left;
-}
-.face-form-item:hover { background: rgba(123, 98, 196, 0.16); }
-.face-form-item.active { background: rgba(123, 98, 196, 0.22); }
-.face-form-name {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    letter-spacing: 0.5px;
-    color: rgba(255, 255, 255, 0.85);
-}
-.face-form-item.active .face-form-name { color: #fff; }
-.face-form-item.active .face-form-name::before {
-    content: '● ';
-    color: #9b7fe8;
-    font-size: 0.6rem;
-}
-.face-form-hint {
-    font-family: var(--font-main);
-    font-size: 0.68rem;
-    color: rgba(158, 170, 192, 0.55);
-    white-space: nowrap;
-}
+#animations-btn .animations-slash { display: none; }
+#animations-btn.animations-off { opacity: 0.55; }
+#animations-btn.animations-off .animations-slash { display: inline; }
 #rail-note.hidden { display: none; }
 
 
@@ -2845,7 +2794,7 @@ body.restoring .message { animation: none !important; }
 /* ── Keyboard focus (visible, theme-consistent) ────────────────────
    This was an ENUMERATION of ten selectors, and the two controls a
    keyboard user reaches first — #send-btn and #mic-btn, the primary
-   actions — were not on it, along with #palette-input, .face-form-item
+   actions — were not on it, along with #palette-input
    and #delete-all-sessions-btn. That is the failure mode of a hand-kept
    list: every control added after it was written starts with no focus
    ring, and nothing says so.

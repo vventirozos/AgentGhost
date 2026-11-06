@@ -17,8 +17,6 @@ class MockContext:
         self.llm_client = Mock()
         self.llm_client.chat_completion = AsyncMock()
         self.memory_system = Mock()
-        self.skill_memory = Mock()
-        self.skill_memory.get_playbook_context = Mock(return_value="")
         self.profile_memory = Mock()
         self.profile_memory.get_context_string = Mock(return_value="")
         self.last_activity_time = datetime.datetime.now()

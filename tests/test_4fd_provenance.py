@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from ghost_agent.core import agent as agent_mod
-from ghost_agent.memory import skills as sk
 from ghost_agent.tools import projects as tp
 from ghost_agent.utils.logging import request_id_context
 
@@ -39,7 +38,6 @@ def test_constraint_origin_is_auto_for_sim_probe_and_internal_turns(monkeypatch)
     """World where it fails: a scheduled turn's constraints are stamped as
     the user's (the class this exists to close)."""
     class Ctx:
-        skill_memory = SimpleNamespace(is_read_only=False)
         turn_origin_label = None
     tok = request_id_context.set("abc12345")
     try:
@@ -67,7 +65,7 @@ def test_constraint_origin_is_auto_for_sim_probe_and_internal_turns(monkeypatch)
             request_id_context.reset(tok)
 
     class Sim(Ctx):
-        skill_memory = SimpleNamespace(is_read_only=True)
+        simulated = True
     tok = request_id_context.set("abc12345")
     try:
         assert tp._constraint_origin(Sim()) == "auto"
@@ -166,55 +164,14 @@ def test_legacy_unstamped_constraints_still_count_as_user():
     ("probe-1234abcd", "probe"),
     ("1234abcd", "user"),
 ])
-def test_lesson_origin_is_derived_from_the_request_id_contextvar(rid, expected):
+def test_write_origin_is_derived_from_the_request_id_contextvar(rid, expected):
     """World where it fails: the default "SYSTEM" id is read as a user turn,
-    so every idle-loop lesson is stamped as the user's."""
+    so every idle-loop write is stamped as the user's."""
+    from ghost_agent.memory.population import write_origin
     tok = request_id_context.set(rid)
     try:
-        assert sk._derive_lesson_origin() == expected
+        assert write_origin() == expected
     finally:
         request_id_context.reset(tok)
 
 
-def test_learn_lesson_stamps_origin_and_an_explicit_origin_wins(tmp_path):
-    """World where it fails: the record builder drops `origin`, or the
-    chokepoint does not derive it when the caller passes none."""
-    store = sk.SkillMemory(tmp_path)
-    tok = request_id_context.set("SYSTEM")
-    try:
-        store.learn_lesson("When asked for a codename with no evidence",
-                           "invented a name", "say it was not found and offer to search", source="learn_skill")
-        store.learn_lesson("When the page text is empty",
-                           "answered anyway", "extract again or report the empty page",
-                           origin="user", source="learn_skill")
-    finally:
-        request_id_context.reset(tok)
-    rows = store.playbook if hasattr(store, "playbook") else store._load_playbook()
-    origins = {r.get("trigger") or r.get("task"): r.get("origin") for r in rows}
-    assert origins["When asked for a codename with no evidence"] == "auto"
-    assert origins["When the page text is empty"] == "user"
-
-
-def test_learning_health_counts_lessons_by_origin(tmp_path):
-    """Through the REAL collector and renderer over a playbook on disk.
-    World where it fails: the counts are not collected, no line renders
-    them (a dead instrument), or a probe leak renders silently."""
-    from ghost_agent.core import learning_health as lh
-    store = sk.SkillMemory(tmp_path)
-    tok = request_id_context.set("abc12345")
-    try:
-        store.learn_lesson("When asked for a codename with no evidence", "invented a name",
-                           "say it was not found and offer to search", source="learn_skill")           # user
-        store.learn_lesson("When the page text is empty", "answered anyway",
-                           "extract again or report the empty page", origin="auto", source="learn_skill")
-        store.learn_lesson("When a probe asks for PONG", "ran tools", "reply PONG only",
-                           origin="probe", source="learn_skill")
-    finally:
-        request_id_context.reset(tok)
-    rep = lh.collect_learning_health(tmp_path)
-    assert rep["lessons"]["by_origin"]["user"] == 1
-    assert rep["lessons"]["by_origin"]["auto"] == 1
-    assert rep["lessons"]["by_origin"]["probe"] == 1
-    out = lh.render_learning_health(tmp_path)
-    assert "origin: user 1, auto 1" in out
-    assert "⚠ probe 1" in out

@@ -141,17 +141,13 @@ class TestSuppressMetaTaskNudges:
         assert suppress_idx < nudge_idx
 
     def test_readonly_meta_tools_discharge_nudge(self):
-        """`list_lessons` / `recall` are READ-ONLY surface tools — when
-        the user asks "what have you learned today" the agent should
-        call `list_lessons` and the nudge must treat that as meta-task
-        satisfied. Without this exemption the nudge kept firing in
+        """`recall` and the like are READ-ONLY surface tools — the nudge
+        must treat calling one as meta-task satisfied. Without this exemption the nudge kept firing in
         production and the model eventually wrote a noop deduplicated
         skill to silence it (trace 15:17, request 5C)."""
         import inspect
         from ghost_agent.core.agent import GhostAgent
         src = inspect.getsource(GhostAgent)
-        # The exemption set must mention at least `list_lessons`.
-        assert "list_lessons" in src
         # And it must be used to set meta_tools_called = True before
         # the nudge check. We assert the read-only exemption lines
         # appear textually before the nudge log line.

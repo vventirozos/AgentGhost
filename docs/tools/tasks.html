@@ -81,7 +81,7 @@
   wake-up copied the contextvars of whichever turn last added a job into every later fire — one task created in a Slack
   channel made all scheduled runs PUBLIC replies.</li>
   <li><strong>Idle phases:</strong> an internal turn is not activity (<code>GhostAgent._heartbeat</code>): a task every
-  &lt;15 min no longer starves the maintenance cycle and the failure-replay slot (reflection and post-mortems, which this fixed at the time, were removed on 2026-10-11, §4NM).</li>
+  &lt;15 min no longer starves the maintenance cycle and the other idle jobs (reflection and post-mortems, which this fixed at the time, were removed on 2026-10-11, §4NM; the failure-replay slot on 2026-11-05, §4SZ).</li>
   <li><strong>Results:</strong> a task's result pages at most <code>SCHEDULED_NOTIFY_PER_HOUR</code> (4) times an hour; a
   failure pages once on the transition into failure, and again on recovery — never every cycle.</li>
 </ul>

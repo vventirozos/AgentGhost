@@ -181,30 +181,6 @@ class TestDreamerStampsTheSurface:
 
 # ── B-M3: the load-bearing phase-3 idle-clock reset, executed ────────────────
 
-class TestPhase3ClockReset:
-    @pytest.mark.asyncio
-    async def test_selfplay_finally_reopens_the_mid_window(self):
-        # Deleting `ctx.last_activity_time = now` from phase 3's finally
-        # survived 226+ tests (lens B). This is the executed pin: after a
-        # deep-idle self-play, the user-idle clock MUST be reset so the
-        # (900, 3600] window can re-open during a long AFK stretch.
-        agent = _make_agent(idle_seconds=4000, memory_ids=4)
-        before = agent.context.last_activity_time
-        mock_dreamer = MagicMock()
-        mock_dreamer.synthetic_self_play = AsyncMock(return_value="x")
-        mock_dreamer.last_self_play_status = None
-        with patch("ghost_agent.core.dream.Dreamer",
-                   return_value=mock_dreamer), \
-             patch("ghost_agent.core.agent.random.random", return_value=0.1):
-            await agent._biological_tick()
-        assert agent.context.last_activity_time > before, (
-            "phase 3's finally is the ONLY idle-time writer of the "
-            "user-idle clock; without it every mid phase starves past "
-            "3600s idle (exactly what --no-self-play ablates)")
-        assert (datetime.datetime.now()
-                - agent.context.last_activity_time).total_seconds() < 60
-
-
 # ── A-F2: preamble raises can no longer starve the cooldowns ────────────────
 
 def _raise_on_biological_hook(real_pretty_log=None):

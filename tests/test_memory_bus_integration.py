@@ -7,9 +7,7 @@ import pytest
 
 from ghost_agent.core.agent import GhostAgent, GhostContext
 from ghost_agent.core.bus import MemoryBus
-from ghost_agent.tools.memory import (
-    tool_remember, tool_update_profile, tool_learn_skill,
-)
+from ghost_agent.tools.memory import tool_remember, tool_update_profile
 
 
 # =============================================================== fixtures
@@ -39,8 +37,6 @@ def _make_agent_context():
     ctx.graph_memory.get_neighborhood = MagicMock(
         return_value=["- (Neo) -[HACKS]-> (Matrix)"]
     )
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value="")
     ctx.sandbox_dir = "/tmp/sandbox"
     return ctx
 
@@ -84,7 +80,6 @@ async def test_agent_uses_explicit_bus_when_set_on_context():
     bus = MemoryBus(
         vector_memory=ctx.memory_system,
         graph_memory=ctx.graph_memory,
-        skill_memory=ctx.skill_memory,
         profile_memory=ctx.profile_memory,
     )
     bus.hydrate_context = AsyncMock(return_value="### MEMORY CONTEXT:\nExplicit bus used\n\n")
@@ -100,23 +95,6 @@ async def test_agent_uses_explicit_bus_when_set_on_context():
         if m["role"] == "user"
     )
     assert "Explicit bus used" in user_msg
-
-
-@pytest.mark.asyncio
-async def test_agent_skips_bus_on_fact_check_query():
-    """should_fetch_memory bypass remains: fact-check queries skip the bus."""
-    ctx = _make_agent_context()
-    agent = GhostAgent(ctx)
-
-    body = {
-        "messages": [{"role": "user", "content": "Please fact-check this claim about X."}],
-        "model": "test",
-    }
-    await agent.handle_chat(body, MagicMock())
-
-    # No memory subsystem should have been touched.
-    ctx.memory_system.search.assert_not_called()
-    ctx.graph_memory.get_neighborhood.assert_not_called()
 
 
 # ========================================================= tools → bus path
@@ -225,40 +203,6 @@ async def test_tool_update_profile_legacy_path_still_works():
     )
     assert "SUCCESS" in res
     profile.update.assert_called_once_with("root", "name", "Vasilis")
-
-
-@pytest.mark.asyncio
-async def test_tool_learn_skill_routes_through_bus():
-    bus = MagicMock()
-    bus.publish_fact = AsyncMock()
-
-    res = await tool_learn_skill(
-        task="parse JSON",
-        mistake="forgot to handle null",
-        solution="check with .get()",
-        memory_bus=bus,
-    )
-    assert "SUCCESS" in res
-    bus.publish_fact.assert_awaited_once()
-    event_type, fact_data = bus.publish_fact.await_args.args
-    assert event_type == "learn_skill"
-    assert fact_data["skill"] == {
-        "task": "parse JSON",
-        "mistake": "forgot to handle null",
-        "solution": "check with .get()",
-    }
-
-
-@pytest.mark.asyncio
-async def test_tool_learn_skill_legacy_path_still_works():
-    skill = MagicMock()
-    skill.learn_lesson = MagicMock()
-    res = await tool_learn_skill(
-        task="t", mistake="m", solution="s",
-        skill_memory=skill,
-    )
-    assert "SUCCESS" in res
-    skill.learn_lesson.assert_called_once()
 
 
 # ============================================================= GhostContext

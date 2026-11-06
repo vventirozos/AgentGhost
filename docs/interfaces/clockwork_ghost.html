@@ -59,10 +59,7 @@
     <code>overlay</code> above it.
   </p>
   <ul>
-    <li><strong>Top row</strong>: rate the last reply (<code>▲ GOOD</code> / <code>▼ BAD</code>) on
-      the left; on the right <code>◇ LOAD</code> and <code>◆ SAVE</code> (two chips — the single
-      one flipped from load to save and could not load once anything had been said),
-      <code>◈ FORM</code>, <code>◐ FACE</code>. Every chip carries a word since 2026-10-01.</li>
+    <li><strong>Top row</strong>: rate the last reply (<strong>Good</strong> / <strong>Bad</strong>) the left. Animations on / off is a small faint icon in the bottom bar (the state is in its tooltip). Save, Load and the face-only mode were removed on 2026-11-06 (operator). Every chip carries a word since 2026-10-01.</li>
     <li><strong>Middle</strong>: <code>left_widget</code> → the transcript, as real
       <code>QLabel</code> bubbles (operator right, agent left). <strong>This is the only item in
       the column with a stretch factor.</strong></li>
@@ -70,54 +67,6 @@
       <code>■ STOP</code> (shown only while a turn runs), camera snap, push-to-talk, TTS toggle
       and the status readout.</li>
   </ul>
-
-  <h3 id="fullscreen">Fullscreen face (<code>◐</code> / F11)</h3>
-  <p>
-    Hides <strong><code>self.overlay</code> — the entire glass sheet</strong>, leaving nothing but
-    the face. Verified on-device against the real <code>MainWindow</code>: 9 of 9 controls visible
-    normally, <strong>0 of 9</strong> while hidden, face still rendering.
-  </p>
-  <p>
-    <strong>Getting back.</strong> This is a frameless, always-on-top kiosk, so with the overlay
-    hidden there is no visible control to restore it — losing the way back would be worse than the
-    bug. Two independent paths, deliberately redundant:
-  </p>
-  <ul>
-    <li><strong>F11</strong> — an <code>ApplicationShortcut</code>, not the default
-      <code>WindowShortcut</code>: with the overlay gone the <code>QWebEngineView</code> is all
-      that is left to hold focus, and a window-scoped shortcut could be swallowed by it. The face
-      is also <code>NoFocus</code> for the same reason.</li>
-    <li><strong>Any other key</strong> — <code>keyPressEvent</code> restores the UI before its
-      normal type-to-focus handling.</li>
-  </ul>
-  <p>
-    The Esc family (Esc, Shift+Esc, Alt+Esc, Ctrl+Esc) never reach <code>keyPressEvent</code> (they are QShortcuts
-    and fire first), so <strong>push-to-talk, TTS and SNAP keep working while the UI is hidden</strong>
-    — face-only voice mode rather than a dead end.
-  </p>
-
-  <div class="note warn">
-    <strong>Two wrong targets, both shipped before the right one (2026-08-03).</strong>
-    "Hide the UI" looks like it should hide a panel; it has to hide the sheet.
-    <div class="scroll"><table>
-      <thead><tr><th>Hiding…</th><th>Result</th></tr></thead>
-      <tbody>
-        <tr><td><code>left_widget</code></td><td>Chips and bar stayed up, <strong>and the bar jumped
-          to mid-screen</strong> — it carries the main column's only stretch factor, so hiding it
-          handed the freed space to the bottom row, which grew from 25px to 659px tall and
-          vertically centred its fixed-height children. Measured at the panel's real
-          1280&times;720 (<code>XWAYLAND0</code>, a 720&times;1280 display rotated right), Qt 6.4.2:
-          <code>y=683 h=25</code> (96% down) → <code>y=49 h=659</code> (52% down, dead centre).</td></tr>
-        <tr><td><code>chat_display</code></td><td>Placement correct, but the chips and the bar were
-          still on screen — the button still did not hide the UI.</td></tr>
-        <tr><td><code>overlay</code> ✓</td><td>Everything goes, and the stretch trap cannot fire at
-          all because nothing <em>inside</em> the layout changes.</td></tr>
-      </tbody>
-    </table></div>
-    <strong>General rule for this file: never hide a widget that carries a stretch factor — hide
-    its contents, or hide the whole sheet.</strong> Guarded by
-    <code>tests/test_clockwork_client_ui.py</code>.
-  </div>
 
   <h3 id="turn-status">Live turn status — what replaced "cogitating" (2026-08-03)</h3>
   <p>
@@ -143,7 +92,7 @@
       <code>deploy.sh</code>) holds the caption logic and the socket reader. It is deliberately
       Qt-free, so unlike the rest of the client it is unit-tested for real:
       <code>tests/test_clockwork_turnstatus.py</code>.</li>
-    <li><strong>Corridor filtering.</strong> Dreams, self-play and other clients stream over the same
+    <li><strong>Corridor filtering.</strong> Background turns (scheduled tasks and jobs; dreams and self-play when this was written, both since removed) and other clients stream over the same
       socket. The ticker adopts the id of the first <code>request started</code> corridor to open
       <em>after</em> the operator sends and ignores every line that does not carry it — otherwise the
       handheld narrates the agent's dreams while the operator waits on their own question. A corridor
@@ -219,7 +168,6 @@
     <li><em>Swapped 2026-10-17 at the operator's request: talking was <code>Esc</code> and stopping <code>Shift+Esc</code>. Both are window-scoped shortcuts, so inside the camera dialog <code>Esc</code> still closes the dialog.</em></li>
     <li><code>PgUp</code> / <code>PgDn</code>, or <code>Shift+↑</code> / <code>Shift+↓</code> — scroll the transcript.</li>
     <li><code>Ctrl+↑</code> / <code>Ctrl+↓</code> — rate the last reply good / bad.</li>
-    <li><code>F11</code> — face only (any key returns).</li>
     <li>Slash commands — <code>/help</code> lists them: <code>/new</code> (<code>/clear</code>),
       <code>/stop</code>, <code>/sessions</code>, <code>/open N</code>, <code>/good</code>,
       <code>/bad [why]</code>, <code>/bright</code>, <code>/vol</code>, <code>/tts</code>,
@@ -241,18 +189,18 @@
     The three QPainter faces below were <strong>removed</strong>. The handheld now runs the
     <em>same</em> <code>matrix_graph.js</code> the browser does (<code>webface.py</code> +
     <code>webface/</code>), so it gets the thermal two-pole palette, every form the browser has
-    (cube · tesseract · vortex · descent · empty since 2026-09-22; eight different ones when this
-    shipped), the immersion
+    (the mood tesseract, and the empty form when animations are off, since 2026-11-06), the immersion
     dive, pulses and error flinches — and future work on the web face lands here for free instead
-    of the two drifting into forks. The <code>◈</code> chip now cycles <em>forms</em> rather than
-    swapping renderers.
+    of the two drifting into forks. The Animations button turns them on and off, like the web UI's button. <code>client.py</code>'s <code>mood_loop</code> reads the agent's mood from <code>/api/health</code> every 25 s (<code>GHOST_MOOD_POLL_S</code>) and hands it to the face; a failed poll keeps the look it has.
   </p>
+  <h3 id="modern-ui">Modern interface (2026-11-06, §4TH)</h3>
+  <p>Noto Sans throughout (Fira Code only for code), soft rounded controls with no outlines, and an icon with a sentence-case word on every button: Good, Bad, Camera, Talk, Voice, Stop; animations is an icon alone. A fill still means "on". Icons are Lucide paths drawn with QPainter by <code>icons.py</code>, because QtSvg is not on the device. Chat bubbles are soft tinted cards.</p>
   <h3 id="face-memory">The face opens on the last form you chose (2026-08-03)</h3>
   <p>
-    A <code>◈</code> press is remembered and applied at the next start. Precedence:
+    A press of Animations is remembered and applied at the next start. Precedence:
     <code>GHOST_FACE_FORM</code> (explicit, this run only) &gt; the remembered form &gt;
-    <code>facestate.FALLBACK_FORM</code> = <code>descent</code> on a device that has never been
-    cycled.
+    <code>facestate.FALLBACK_FORM</code> = <code>moodtesseract</code> on a device that has never been
+    toggled, or that remembers a form that was removed.
   </p>
   <div class="note warn">
     <strong>Why <code>localStorage</code> could not do this.</strong> <code>matrix_graph.js</code>
@@ -651,7 +599,7 @@
     <li>A reply that lands on a dark panel wakes it (<code>wlopm --on</code>), and chimes if the
       turn took 20&nbsp;s or more or the panel was off (<code>GHOST_CHIME_AFTER_S</code>, 0 = off;
       never when replies are spoken).</li>
-    <li><code>▲ GOOD</code> / <code>▼ BAD</code> (<code>Ctrl+↑/↓</code>, <code>/good</code>,
+    <li><strong>Good</strong> / <strong>Bad</strong> (<code>Ctrl+↑/↓</code>, <code>/good</code>,
       <code>/bad why</code>) rate the last reply through <code>/api/feedback</code>. Off while a
       new reply is arriving, and for a reply the agent filed no trajectory for.</li>
     <li>What the agent did while nobody was asking

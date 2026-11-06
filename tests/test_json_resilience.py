@@ -3,7 +3,7 @@ import pytest
 import asyncio
 import json
 from unittest.mock import MagicMock, AsyncMock
-from ghost_agent.core.agent import GhostAgent, TaskTree
+from ghost_agent.core.agent import GhostAgent
 
 @pytest.fixture
 def mock_agent():

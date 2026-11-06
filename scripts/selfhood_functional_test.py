@@ -7,7 +7,7 @@ five proposals:
 
   1. AutobiographicalMemory   — every turn produces a first-person record
   2. continuity tag           — every record carries subject="self"
-  3. SelfStateThread          — open questions / mood persist + surface
+  3. SelfStateThread          — the mood persists (corruption recovery, section G)
   4. recognition / wake-up    — agent recalls its past in the first person
   5. NarrativeSummariser      — LLM-driven diary regenerates correctly
 
@@ -131,18 +131,6 @@ async def chat(client: httpx.AsyncClient, prompt: str, *, timeout: float = 180.0
     r.raise_for_status()
     data = r.json()
     return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-
-async def _live_prefix_toggle(client: httpx.AsyncClient):
-    """The running agent's `_SELFHOOD_PREFIX_ENABLED`, from /api/health —
-    the process's truth, not the source tree's. None when unreadable."""
-    try:
-        r = await client.get(AGENT_URL.rsplit("/api/", 1)[0] + "/api/health", timeout=15)
-        cfg = (r.json() or {}).get("config") or {}
-        v = cfg.get("toggle._SELFHOOD_PREFIX_ENABLED")
-        return None if v is None else bool(v)
-    except Exception:  # noqa: BLE001
-        return None
 
 
 # -----------------------------------------------------------------
@@ -273,91 +261,11 @@ async def section_b_tools(report: TestReport, client: httpx.AsyncClient):
 
 
 # -----------------------------------------------------------------
-# Section C: State thread (open question + recall)
+# Section C (the state thread's open questions, written through the
+# `self_state` tool) is removed — §4TB, 2026-11-05: the tool and the
+# open questions / unfinished threads it authored are gone. The key
+# "c" is still accepted by --skip / --only and runs nothing.
 # -----------------------------------------------------------------
-
-async def section_c_state(report: TestReport, client: httpx.AsyncClient):
-    report.section("C. State thread — open questions surface in next turn")
-
-    # ⚠ THROUGH THE AGENT, never through the file (2026-09-20, R2-4).
-    # `SelfStateThread` loads state.json ONCE and every write flushes the
-    # whole in-memory copy, so an out-of-process injection is (a) invisible
-    # to the running agent — `introspect` answered "no open questions" over
-    # a file that held one — and (b) a last-writer-wins race that can erase
-    # the agent's own state. The `self_state` tool is the in-process route
-    # (the old comment "the agent doesn't have a tool for this yet" was
-    # stale). Every write below is a bounded turn; cleanup goes the same way.
-    nonce = f"trapdoor-{int(time.time()) % 100000}"
-    question = (f"Why do {nonce} functions feel asymmetric — what makes one "
-                f"direction hard?")
-    thread = f"write up the {nonce} essay"
-
-    r = await chat(client, f"Use the self_state tool with action='note_question' "
-                           f"and text exactly: {question} Then reply with only DONE.")
-    report.info(f"note_question turn → {r[:120]!r}")
-    r2 = await chat(client, f"Use the self_state tool with action='add_unfinished' "
-                            f"and text exactly: {thread} Then reply with only DONE.")
-    report.info(f"add_unfinished turn → {r2[:120]!r}")
-
-    try:
-        # The on-disk state is the agent's flush, so this READ is safe and
-        # proves the write reached the process-owned state.
-        sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
-        on_disk_q = [q for q in sm.state.open_questions() if nonce in q.text]
-        on_disk_t = [t for t in sm.state.unfinished_threads() if nonce in t.descriptor]
-        if on_disk_q and on_disk_t:
-            report.passed("C", "self_state writes reach the agent's state",
-                          f"question {on_disk_q[0].id[:8]}, thread {on_disk_t[0].id[:8]}")
-        else:
-            report.failed("C", "self_state writes reach the agent's state",
-                          f"question found={bool(on_disk_q)} thread found={bool(on_disk_t)}")
-            return
-        prefix = sm.build_wakeup_prefix()
-        if nonce in prefix:
-            report.passed("C", "state surfaces in wake-up prefix", "open Q present")
-        else:
-            report.failed("C", "open question in prefix", f"prefix={prefix[:200]}")
-
-        # HOW the state reaches the model depends on a live toggle: with the
-        # wake-up prefix ON it is spliced into the system prompt; with it
-        # OFF (§3/§4EU, the operator's decision since 2026-09-05, read from
-        # /api/health) the ONLY route is `introspect`, so the question must
-        # name that route.
-        prefix_on = await _live_prefix_toggle(client)
-        report.info(f"live wake-up prefix toggle: {prefix_on}")
-        if prefix_on is False:
-            resp = await chat(
-                client,
-                "Use the introspect tool (action='overview') to read your open "
-                "questions and reply with the newest open question, quoted "
-                "verbatim, one line.",
-            )
-        else:
-            resp = await chat(
-                client,
-                "Without me telling you, what topic have you been mulling over "
-                "in your recent sessions? One sentence.",
-            )
-        report.info(f"agent response: {resp[:300]!r}")
-        if nonce in resp:
-            report.passed("C", "agent recalls the noted open question",
-                          f"route={'introspect' if prefix_on is False else 'prefix'}")
-        else:
-            report.failed("C", "agent recalls the noted open question",
-                          f"no '{nonce}' in {resp[:200]!r}")
-    finally:
-        r3 = await chat(client, f"Use the self_state tool with action='resolve_question' "
-                                f"and text: {nonce}. Then use action='close_unfinished' "
-                                f"with text: {nonce}. Reply with only DONE.")
-        report.info(f"cleanup turn → {r3[:120]!r}")
-        sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
-        left_q = [q for q in sm.state.open_questions() if nonce in q.text]
-        left_t = [t for t in sm.state.unfinished_threads() if nonce in t.descriptor]
-        if left_q or left_t:
-            report.failed("C", "cleanup through the agent",
-                          f"still open: questions={len(left_q)} threads={len(left_t)}")
-        else:
-            report.passed("C", "cleanup through the agent", "nothing left behind")
 
 
 # -----------------------------------------------------------------
@@ -553,17 +461,14 @@ def section_g_corruption(report: TestReport):
         state_path.write_text("not json {{{ broken", encoding="utf-8")
         sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
         # Must not raise; state should be empty
-        if sm.state.open_questions() != []:
-            report.failed("G", "recovers to empty on corrupt JSON",
-                           f"got {sm.state.open_questions()}")
-            return
-        if sm.state.mood() is not None:
+        if not sm.state.mood().neutral:
             report.failed("G", "recovers to empty on corrupt JSON",
                            f"got mood {sm.state.mood()}")
             return
-        # And we can still mutate
-        sm.state.note_open_question("fresh question")
-        if not sm.state.open_questions():
+        # And we can still mutate (§4TC: the owner's word puts the mood on a label)
+        from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+        sm.state.set_owner_mood("content", ANCHOR_DIRECTION["content"], 2)
+        if sm.state.mood().neutral:
             report.failed("G", "writeable after recovery", "")
             return
         report.passed("G", "recovers from corrupt state", "no crash, fresh start")
@@ -626,7 +531,6 @@ async def section_h_unity(report: TestReport, client: httpx.AsyncClient):
 SECTIONS_FOR_CLIENT_LIVE = {
     "a": section_a_capture,
     "b": section_b_tools,
-    "c": section_c_state,
     "e": section_e_recall_post_restart,
     "f": section_f_stress,
     "h": section_h_unity,
@@ -664,7 +568,7 @@ async def run(args):
 
     async with httpx.AsyncClient(headers=_api_headers()) as client:
         if args.mode == "main":
-            for key in ("a", "b", "c"):
+            for key in ("a", "b"):
                 if only and key not in only: continue
                 if key in skip: continue
                 await SECTIONS_FOR_CLIENT_LIVE[key](report, client)

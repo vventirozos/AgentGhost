@@ -363,9 +363,8 @@
     (a leaf, a sub-agent) keeps the value at copy time as its own.</li>
     <li><b>Who reads and writes a row.</b> Only an owner request that carries a session id (<code>persist=True</code>), and it reads
     the row inside the turn lock (<code>begin_request_focus</code>). Everyone else gets a <em>request-only</em> scope: they may switch
-    for the request, but nothing is stored. That covers members, failure replays and regression runs (<code>probe-fr-</code>,
-    <code>probe-rt-</code>), probes, unattended requests (<code>sched-</code>/<code>sub-</code>/<code>job-</code> and every non-<code>user</code>
-    population) and a client with no session id (keyed by its first-message hash for previews and late corrections only).</li>
+    for the request, but nothing is stored. That covers members, probes, unattended requests (<code>sched-</code>/<code>sub-</code>/<code>job-</code> and every non-<code>user</code>
+    population) and a client with no session id (keyed by its first-message hash for previews and late corrections only). (Until 2026-11-05 it also covered failure replays and regression runs, ids <code>probe-fr-</code> / <code>probe-rt-</code>; those requests no longer exist, §4SZ.)</li>
     <li><b>Leaves.</b> <code>run_leaf_turn</code> passes <code>handle_chat(scope=RequestScope(project_id=pin, origin="leaf"))</code>,
     and its after-turn check reads that object. <code>_leaf_pinned_project</code> is gone.</li>
     <li><b>No activation by wording.</b> When a message names another project (id, 8-character id prefix, or whole-word title of 5+

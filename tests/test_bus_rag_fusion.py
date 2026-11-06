@@ -12,7 +12,6 @@ def bus():
     return MemoryBus(
         vector_memory=MagicMock(),
         graph_memory=MagicMock(),
-        skill_memory=MagicMock(),
         episodic_memory=MagicMock(),
     )
 
@@ -69,7 +68,6 @@ class TestHydrateContextRAGFusion:
         """hydrate_context runs with the tiers mocked (no model call, §4NQ)."""
         bus.vector.search = MagicMock(return_value="Memory: test fact")
         bus.graph.get_neighborhood = MagicMock(return_value=["(User) -[LIKES]-> (Python)"])
-        bus.skill.get_playbook_context = MagicMock(return_value="")
         bus.episodic.search_similar = MagicMock(return_value=[])
 
         result = await bus.hydrate_context("test query")
@@ -86,15 +84,14 @@ class TestHydrateContextRAGFusion:
 
 
 class TestFetchAllTiers:
-    async def test_fetch_all_tiers_returns_the_four_hydrating_tiers(self, bus):
-        """§4NM: the owner's facts (graph) and the lessons (skill); §4QL added
-        the human-graded experience tier and §4QM the owner's fact history
-        (both empty here: no store, switch off)."""
+    async def test_fetch_all_tiers_returns_the_three_hydrating_tiers(self, bus):
+        """§4NM: the owner's facts (graph); §4QL added the human-graded
+        experience tier and §4QM the owner's fact history (both empty here:
+        no store, switch off). §4TD removed the lesson tier."""
         bus.graph.owner_facts_matching = MagicMock(return_value=["edge1"])
-        bus.skill.get_playbook_context = MagicMock(return_value="lesson1")
         result = await bus._fetch_all_tiers("test query")
-        assert len(result) == 4  # graph (owner facts), skill, experience, history (§4QM)
-        assert result[2] == [] and result[3] == []
+        assert len(result) == 3  # graph (owner facts), experience, history (§4QM)
+        assert result[1] == [] and result[2] == []
 
 
 class TestExistingBusFunctionality:

@@ -9,7 +9,6 @@ def mock_context():
     ctx.llm_client.chat_completion = AsyncMock()
     ctx.memory_system = MagicMock()
     ctx.profile_memory = MagicMock()
-    ctx.skill_memory = MagicMock()
     # Mock args for agent init
     ctx.args = MagicMock()
     return ctx
@@ -69,7 +68,6 @@ async def test_dream_is_housekeeping_only(mock_context):
 
     result = await dreamer.dream("test-model")
 
-    mock_context.skill_memory.learn_lesson.assert_not_called()
     mock_context.llm_client.chat_completion.assert_not_called()
     assert "Housekeeping cycle done" in result
     assert dreamer.last_dream_outcome["phase"] == "skipped"

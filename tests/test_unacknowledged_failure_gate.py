@@ -287,7 +287,7 @@ def _agent():
     agent.context = types.SimpleNamespace(
         trajectory_collector=col, self_model=None, profile_memory=None,
         _recent_trajectories_for_correction={},
-        _surfaced_triggers_by_traj=None, skill_memory=None)
+        _surfaced_triggers_by_traj=None)
     return agent, col
 
 
@@ -413,36 +413,6 @@ class TestStreamedFinalizePath:
         agent.context._recent_trajectories_for_correction = {"k": traj}
         _backfill(agent, "f78c8b33", P)
         assert traj.outcome == P
-
-    def test_withheld_pass_does_not_tick_a_lesson_success(self):
-        """The stashed-lesson drain runs before the direction guard (so a
-        legitimate pass is never lost); it must book the RESOLVED outcome,
-        not the raw verdict."""
-        agent, col = _agent()
-        self._record_streamed(
-            agent, reply="0", results=[_FS_ERR], names=["file_system"],
-            request=_LIVE_REQUEST)
-        traj = col.appended[0]
-        agent.context._recent_trajectories_for_correction = {"k": traj}
-        booked = []
-        agent._flush_stashed_lesson_outcome = (
-            lambda tid, success: booked.append(success))
-        _backfill(agent, "f78c8b33", P)
-        assert booked == [False]
-
-    def test_cache_miss_still_drains_the_stash_as_a_success(self):
-        """Deliberate: the shape rule cannot be evaluated without the
-        record, so a cache-evicted trajectory keeps the pre-2026-08-04
-        behaviour. Ordering matters — the flush must stay AHEAD of the
-        cache-miss return (2026-07-26 lost-success-tick bug); a first draft
-        of this change moved the return earlier and re-opened it."""
-        agent, _col = _agent()
-        agent.context._recent_trajectories_for_correction = {}
-        booked = []
-        agent._flush_stashed_lesson_outcome = (
-            lambda tid, success: booked.append(success))
-        _backfill(agent, "gone", P)
-        assert booked == [True]
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -174,17 +174,6 @@ class TestTheUnattendedPathReadsTheStatus:
         assert _op_ok("SUCCESS: Wrote 10 chars") is True
         assert _looks_like_write_error("SYSTEM INSTRUCTION: not found") is True
 
-    def test_a_composed_skill_step_sees_the_search_module_head(self):
-        """`CRITICAL ERROR:` was added to `_FAILURE_PREFIX_RE` and to none
-        of the five other prefix banks, so a `deep_research` that never ran
-        scored a composed-skill step SUCCESS."""
-        from ghost_agent.tools.composed_skills import _step_result_ok
-        from ghost_agent.tools.outcome import ToolOutcome
-
-        assert _step_result_ok("CRITICAL ERROR: no research was run") is False
-        assert _step_result_ok(
-            ToolOutcome.rejected("SYSTEM INSTRUCTION: bad args")) is False
-        assert _step_result_ok("SUCCESS: done") is True
 
     def test_the_shared_sniffer_reads_the_status_too(self):
         """One place closes the remaining callers — `tool_failure_flags`,

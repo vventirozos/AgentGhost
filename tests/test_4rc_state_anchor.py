@@ -341,7 +341,7 @@ async def test_an_isolate_starts_without_the_parents_blocks(on):
     for attr in REPLAY_NULLED_ATTRS:
         setattr(ctx, attr, MagicMock(name=attr))
     ctx.sandbox_dir = "/nonexistent/live-workspace"
-    ctx.memory_system, ctx.skill_memory, ctx.graph_memory, ctx.llm_client = (MagicMock() for _ in range(4))
+    ctx.memory_system, ctx.graph_memory, ctx.llm_client = (MagicMock() for _ in range(3))
     ctx.args = MagicMock()
     ctx.args.native_tools = False
     ctx._state_anchors = {"live-req": {"blocks": [(2, "f", "b")]}}
@@ -408,11 +408,11 @@ def test_sections_join_to_the_old_text_and_scrub_each_part(tmp_path):
     assert root not in "".join(secs.values()) and "/workspace/a.py" in secs["scrapbook"]
 
 
-def test_pinned_sections_carry_the_directive_and_the_playbook_first():
-    secs = A._state_sections_pinned({"time": "T\n"}, "### FINAL NOW", "### PLAYBOOK\nuse x\n")
-    assert list(secs) == ["final_directive", "playbook", "time"]
-    assert "".join(secs.values()) == "### FINAL NOW\n" + "### PLAYBOOK\nuse x\n" + "T\n"
-    assert A._state_sections_pinned({"t": "T"}, "", None) == {"final_directive": "", "playbook": "", "t": "T"}
+def test_pinned_sections_carry_the_directive_first():
+    secs = A._state_sections_pinned({"time": "T\n"}, "### FINAL NOW")
+    assert list(secs) == ["final_directive", "time"]
+    assert "".join(secs.values()) == "### FINAL NOW\n" + "T\n"
+    assert A._state_sections_pinned({"t": "T"}, "") == {"final_directive": "", "t": "T"}
 
 
 def test_the_turn_loop_uses_the_section_helpers():

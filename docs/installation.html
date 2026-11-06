@@ -106,7 +106,6 @@
         ├── projects.db           # Project / task / artifact / event log
         ├── memory_journal.json   # Short-term work queue
         ├── user_profile.json     # Profile facts
-        ├── skills_playbook.json  # Lessons (verified + utility-ranked)
         ├── adaptive_threshold.json
         ├── contradiction_log.json   # left over from belief versioning (removed §4NN); nothing reads it
         ├── self_play_frontier.json + .lock
@@ -121,7 +120,7 @@
     <li>Make sure <code>GHOST_HOME/sandbox</code> and <code>GHOST_HOME/system/memory</code> exist.</li>
     <li><code>setup_logging()</code> wires colourised structured logs (<code>utils/logging.py</code>).</li>
     <li><code>load_tokenizer()</code> grabs / downloads the Qwen3 tokenizer for token budgeting.</li>
-    <li>Build <code>GhostContext</code> with <code>Scratchpad</code>, <code>MemoryJournal</code>, <code>SkillMemory</code>, <code>FrontierTracker</code>.</li>
+    <li>Build <code>GhostContext</code> with <code>Scratchpad</code>, <code>MemoryJournal</code>, <code>FrontierTracker</code>.</li>
     <li>Construct the FastAPI app and attach the lifespan coroutine.</li>
     <li>Lifespan startup:
       <ul>

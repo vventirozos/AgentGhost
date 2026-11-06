@@ -87,7 +87,7 @@ def current_source(via: str = "", value=None, field=None) -> Dict[str, str]:
     if value is None:
         return out
     try:
-        from .lesson_scope import current_request
+        from .request_text import current_request
         from .attribution import owner_clause_for, cue_for_field
         from ..utils.provenance import added_user_messages
         cue = cue_for_field(*(field or ("", ""))) if field else None

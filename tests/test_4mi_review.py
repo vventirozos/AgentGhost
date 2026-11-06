@@ -13,8 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ghost_agent.memory.skills import (SkillMemory, _bm25_tokens, _records_a_mistake,
-                                       _required_shared_words, iter_teachable, trajectory_may_teach)
+from ghost_agent.memory.population import iter_teachable, trajectory_may_teach
 from ghost_agent.distill.schema import ToolCall, Trajectory
 
 
@@ -60,132 +59,6 @@ def _stamp_source(sm, trigger, source):
                 if isinstance(rb, dict):
                     rb["source"] = source
     sm.save_playbook(pb)
-
-
-# ── B-1 / B-2: admission and credit on a long request ────────────────────────
-def test_the_shared_word_bar_rises_with_the_querys_length():
-    """Fails where two generic verbs admitted a lesson on a 119-word request
-    (five unrelated lessons on one migration plan)."""
-    assert _required_shared_words("show me all projects") == 2
-    assert _required_shared_words(" ".join(f"word{i}" for i in range(20))) == 3
-    assert _required_shared_words(_LONG) == 4
-
-
-def test_credit_on_a_long_request_needs_more_than_two_shared_words(tmp_path):
-    """Fails where a 119-word request credited 'Verify the content written
-    to the target location' as helpful on ['verify', 'write']."""
-    sm = SkillMemory(tmp_path)
-    _learn(sm, task="Verify the report format carefully", fix="Read it back.", source="learn_skill")
-    pb = sm._load_playbook()
-    for r in pb:
-        r["last_retrieved_at"] = dt.datetime.now().isoformat()
-    sm.save_playbook(pb)
-    assert sm.credit_recent_retrievals(query=_LONG) == 0           # three shared tokens, bar is four
-    assert sm.credit_recent_retrievals(query="verify the report format") == 1
-
-
-def test_admission_on_a_long_request_needs_more_than_two_shared_words(tmp_path):
-    """Fails where the vector path admitted on two shared words whatever the
-    query's length (the migration plan pulled five unrelated lessons)."""
-    trig = "Verify the report format carefully before writing"
-    sm, vm = _vector_sm(tmp_path, trig)
-    assert "nginx -t" not in sm.get_playbook_context(query=_LONG, memory_system=vm)
-    assert "nginx -t" in sm.get_playbook_context(query="verify the report format before writing it", memory_system=vm)
-
-
-def test_folded_stop_words_are_not_content_words():
-    """Fails where 'because', 'which', 'back' survived the fold as content
-    words and could make up the two shared words."""
-    assert _bm25_tokens("because which back each once such can") == set()
-
-
-# ── B-3: retraction keeps the corrective ─────────────────────────────────────
-def test_retracting_a_refuted_turn_keeps_its_reflection_corrective(tmp_path):
-    """Fails where a second retraction of the refuted turn's id deleted the
-    reflection lesson written to FIX that turn (25 live rows), and where the
-    vector pass deleted its twin by id."""
-    sm = SkillMemory(tmp_path)
-    _learn(sm, task="When the user asks for the 2003 bus accident", fix="Search for it first.",
-           source="learn_skill", source_trajectory_id="t-refuted")
-    _stamp_source(sm, "When the user asks for the 2003 bus accident", "reflection")   # a legacy corrective
-    _learn(sm, task="Learned during the refuted turn", fix="A wrong rule.",
-           source="learn_skill", source_trajectory_id="t-refuted")
-    coll = MagicMock(); ms = MagicMock(); ms.collection = coll
-    assert sm.retract_lessons_from_trajectory("t-refuted", memory_system=ms) == 1
-    rows = _rows(sm)
-    assert [r["trigger"] for r in rows] == ["When the user asks for the 2003 bus accident"]
-    wheres = [c.kwargs.get("where") for c in coll.delete.call_args_list]
-    assert {"source_trajectory_id": "t-refuted"} not in wheres          # the twin of the corrective survives
-    assert any(w and "trigger" in w and "Learned during the refuted turn" in w["trigger"]["$in"] for w in wheres)
-    # a turn later found to have been FINE takes the corrective with it
-    assert sm.retract_lessons_from_trajectory("t-refuted", memory_system=ms, include_correctives=True) == 1
-    assert _rows(sm) == []
-
-
-def test_a_retraction_that_removes_nothing_says_so(tmp_path, caplog):
-    import logging
-    sm = SkillMemory(tmp_path)
-    with caplog.at_level(logging.INFO):
-        assert sm.retract_lessons_from_trajectory("nobody") == 0
-    assert any("removed nothing" in r.getMessage() for r in caplog.records)
-
-
-# ── B-5 / B-6: the undo restores what the reinforcement changed ──────────────
-def test_undoing_a_verified_reinforcement_restores_the_confidence(tmp_path):
-    """Fails where the undo reset `verified` and left the +0.2 bump."""
-    sm = SkillMemory(tmp_path)
-    trig = "When extracting text from a scanned PDF page"
-    fix = "Use vision_analysis to OCR the page image before parsing it."
-    _learn(sm, task=trig, fix=fix, source="learn_skill", source_trajectory_id="t-a")
-    conf0 = float(_rows(sm)[0]["confidence"])
-    _learn(sm, task=trig, fix=fix, source="learn_skill", source_trajectory_id="t-b", verified=True)
-    assert float(_rows(sm)[0]["confidence"]) > conf0
-    sm.retract_lessons_from_trajectory("t-b")
-    assert float(_rows(sm)[0]["confidence"]) == conf0
-
-
-def test_a_second_replacement_archives_the_version_it_pushes_out(tmp_path):
-    """Fails where chain A → B → C lost A's text with no record anywhere."""
-    sm = SkillMemory(tmp_path)
-    trig = "When extracting text from a scanned PDF page"
-    _learn(sm, task=trig, fix="Run tesseract on the page.", source="learn_skill", source_trajectory_id="t-a")
-    _learn(sm, task=trig, fix="Run tesseract on the page, then check the language pack.",
-           source="learn_skill", source_trajectory_id="t-b")
-    _learn(sm, task=trig, fix="Run tesseract on the page, then check the language pack and the DPI.",
-           source="learn_skill", source_trajectory_id="t-c")
-    arch = (tmp_path / "skills_pruned_archive.jsonl")
-    rows = [json.loads(l) for l in arch.read_text().splitlines() if l.strip()]
-    assert any(r.get("reason", "").startswith("replaced-chain:t-c")
-               and "Run tesseract on the page." == (r.get("lesson") or r).get("solution", r.get("solution"))
-               for r in rows) or any("Run tesseract on the page." in l for l in arch.read_text().splitlines())
-
-
-# ── G-10: the diary's recent mistakes ────────────────────────────────────────
-def test_the_no_query_fallback_skips_rows_that_record_no_mistake(tmp_path):
-    """Fails where 'MISTAKE: None observed' and a self-play row were narrated
-    as the agent's own recent failures."""
-    sm = SkillMemory(tmp_path)
-    _learn(sm, task="When restarting nginx", fix="Run nginx -t first.", source="learn_skill",
-           mistake="restarted without testing the config")
-    rows = sm._load_playbook()
-    rows.append(dict(rows[0], trigger="Group rows with SQL", task="Group rows with SQL", source="self_play",
-                     mistake="None observed; the solution correctly used SQL GROUP BY",
-                     anti_pattern="None observed; the solution correctly used SQL GROUP BY"))
-    rows.append(dict(rows[0], trigger="Episode strategy", task="Episode strategy", source="episode",
-                     mistake="none", anti_pattern="none"))
-    rows.append(dict(rows[0], trigger="Bench item", task="Bench item", source="bench"))
-    sm.save_playbook(rows)
-    assert not _records_a_mistake({"mistake": "None observed; the solution correctly used GROUP BY"})
-    assert not _records_a_mistake({"mistake": "none"})
-    assert _records_a_mistake({"mistake": "restarted without testing the config"})
-    # r2: the DIARY reads `get_recent_failures` (the recency fallback is the
-    # empty-query injection, where positive rules belong)
-    diary = sm.get_recent_failures(limit=5)
-    assert "When restarting nginx".lower() in diary.lower()
-    assert "None observed" not in diary and "Episode strategy" not in diary
-    assert not _records_a_mistake({"mistake": "none."}) and _records_a_mistake({"mistake": "None of the files were verified"})
-    items, branch = sm._playbook_items_and_branch(None, None)
-    assert branch == "recency" and len(items) == 4                       # the injection keeps positive rules
 
 
 # ── E-1 / C-4 / D-3: task kinds per consumer ─────────────────────────────────
@@ -301,7 +174,6 @@ async def test_the_recorder_marks_a_designed_stop_and_stamps_the_project(tmp_pat
     monkeypatch.setenv("GHOST_HOME", str(tmp_path))
     ctx = MagicMock()
     ctx.trajectory_collector = TrajectoryCollector(root=tmp_path / "system" / "trajectories", session_id="s")
-    ctx.skill_memory = SimpleNamespace(is_read_only=False)
     del ctx.turn_origin_label
     ctx._recent_trajectories_for_correction = OrderedDict()
     ctx.self_model = None
@@ -574,19 +446,22 @@ def test_a_stale_project_agnostic_event_leaves_a_projects_prefix():
 # ── F-2 / F-9: who books a skill use ─────────────────────────────────────────
 @pytest.mark.parametrize("rid,booked", [("abcd1234", True), ("job-1", True), ("sim-1", False),
                                         ("probe-1", False), ("bench-1", False)])
-def test_only_the_owners_turns_book_a_macro_use(tmp_path, rid, booked):
-    """Fails where a self-play solver's run of the owner's approved macro
-    moved its usage_count / success_count in the production store."""
-    from ghost_agent.tools.composed_skills import ComposedSkillRegistry, ComposedSkill, SkillStep
+def test_only_the_owners_turns_book_a_skill_use(tmp_path, rid, booked):
+    """Fails where a self-play solver's run of the owner's skill moved its
+    usage_count in the production store. (Written for the macro store, which
+    shared this rule — `_usage_is_bookable`; the macro engine is removed,
+    §4TA, and the rule lives on for acquired skills.)"""
+    from ghost_agent.tools.acquired_skills import AcquiredSkillManager
     from ghost_agent.utils.logging import request_id_context
-    reg = ComposedSkillRegistry(tmp_path)
-    reg.skills["m"] = ComposedSkill(name="m", trigger_description="d", steps=[SkillStep(tool_name="recall", description="s")])
+    mgr = AcquiredSkillManager(tmp_path, memory_system=None)
+    assert mgr.save_skill("news", "desc", {}, "def run(args):\n    return 1\n")
     tok = request_id_context.set(rid)
     try:
-        reg.record_usage("m", True)
+        mgr.log_telemetry("news", success=True)
     finally:
         request_id_context.reset(tok)
-    assert (reg.skills["m"].usage_count == 1) is booked
+    used = AcquiredSkillManager(tmp_path, memory_system=None).get_all_skills()["news"]["usage_count"]
+    assert (used == 1) is booked
 
 
 def test_a_self_play_run_does_not_move_acquired_skill_telemetry(tmp_path):
@@ -602,29 +477,6 @@ def test_a_self_play_run_does_not_move_acquired_skill_telemetry(tmp_path):
             assert lr.call_count == 0
     finally:
         request_id_context.reset(tok)
-
-
-@pytest.mark.asyncio
-async def test_a_promoted_step_is_not_a_failed_use(tmp_path):
-    """Fails where a macro whose step was promoted to a background job was
-    booked as a FAILED use while its result said STILL RUNNING."""
-    from ghost_agent.tools.composed_skills import ComposedSkillRegistry, ComposedSkill, SkillStep, _any_step_still_running
-    from ghost_agent.sandbox.jobs import PROMOTED_RESULT_BANNER
-    assert _any_step_still_running([{"success": False, "result": PROMOTED_RESULT_BANNER + " job 1"}])
-    assert not _any_step_still_running([{"success": False, "result": "Error: boom"}])
-    reg = ComposedSkillRegistry(tmp_path)
-    reg.skills["m"] = ComposedSkill(name="m", trigger_description="d",
-                                    steps=[SkillStep(tool_name="execute", description="s")])
-
-    async def _promoted(tool, args):
-        return PROMOTED_RESULT_BANNER + " job 7 still running"
-    await reg.execute("m", _promoted, {})
-    assert reg.skills["m"].usage_count == 0
-
-    async def _failed(tool, args):
-        return "Error: boom"
-    await reg.execute("m", _failed, {})
-    assert reg.skills["m"].usage_count == 1 and reg.skills["m"].success_count == 0
 
 
 # ── r2 (re-review of the §4MI fixes) ─────────────────────────────────────────
@@ -684,17 +536,19 @@ def test_r2_a_future_anchor_is_not_adopted(tmp_path):
 
 
 @pytest.mark.parametrize("rid,booked", [("sched-1", True), ("sub-1", True), ("sim-1", False)])
-def test_r2_the_owners_scheduled_work_books_a_macro_use(tmp_path, rid, booked):
-    from ghost_agent.tools.composed_skills import ComposedSkillRegistry, ComposedSkill, SkillStep
+def test_r2_the_owners_scheduled_work_books_a_skill_use(tmp_path, rid, booked):
+    # (the macro store's twin of this pin went with the macro engine, §4TA)
+    from ghost_agent.tools.acquired_skills import AcquiredSkillManager
     from ghost_agent.utils.logging import request_id_context
-    reg = ComposedSkillRegistry(tmp_path)
-    reg.skills["m"] = ComposedSkill(name="m", trigger_description="d", steps=[SkillStep(tool_name="recall", description="s")])
+    mgr = AcquiredSkillManager(tmp_path, memory_system=None)
+    assert mgr.save_skill("news", "desc", {}, "def run(args):\n    return 1\n")
     tok = request_id_context.set(rid)
     try:
-        reg.record_usage("m", True)
+        mgr.log_telemetry("news", success=True)
     finally:
         request_id_context.reset(tok)
-    assert (reg.skills["m"].usage_count == 1) is booked
+    used = AcquiredSkillManager(tmp_path, memory_system=None).get_all_skills()["news"]["usage_count"]
+    assert (used == 1) is booked
 
 
 def test_r2_profile_values_match_whole_words(tmp_path, monkeypatch):
@@ -706,33 +560,6 @@ def test_r2_profile_values_match_whole_words(tmp_path, monkeypatch):
     assert R.redact_profile_values("Marketing by Mark; Markus") == "Marketing by <REDACTED_PROFILE>; Markus"
 
 
-def test_r2_the_diary_skips_one_request_plans(tmp_path):
-    sm = SkillMemory(tmp_path)
-    _learn(sm, task="give me a morning briefinf", fix="Do the plan.", source="learn_skill",
-           mistake="it skipped the calendar", scope="request", source_request="give me a morning briefinf")
-    assert "morning briefinf" not in sm.get_recent_failures(limit=5)
-
-
-def test_r2_greek_function_words_are_not_content_words():
-    """Fails where 'για τις' admitted a lesson on two shared 'content' words."""
-    assert _bm25_tokens("για τις του την των") == set()
-    assert _bm25_tokens("πώς κάνω backup της βάσης") == {"bakkup", "vasis"}   # the fold rewrites c→k on both sides
-
-
-def test_r2_a_correctives_reinforcement_survives_the_retraction(tmp_path):
-    sm = SkillMemory(tmp_path)
-    trig = "When parsing the app log"
-    fix = "List the directory first, then read the located file."
-    _learn(sm, task=trig, fix=fix, source="learn_skill", source_trajectory_id="F0")
-    _learn(sm, task=trig, fix=fix, source="learn_skill", source_trajectory_id="F1", verified=True)
-    _stamp_source(sm, trig, "reflection")                          # a legacy corrective and its reinforcement
-    assert _rows(sm)[0].get("verified") is True
-    sm.retract_lessons_from_trajectory("F1")
-    assert _rows(sm)[0].get("verified") is True                     # kept with its corrective
-    sm.retract_lessons_from_trajectory("F1", include_correctives=True)
-    assert _rows(sm)[0].get("verified") is False
-
-
 def test_r2_a_probe_turns_reflection_copy_never_teaches():
     assert not trajectory_may_teach(Trajectory(task_kind="reflection", extra={"source_task_kind": "probe"}))
 
@@ -742,21 +569,6 @@ def test_r2_a_dream_error_keeps_the_dead_alarm_armed():
     from ghost_agent.core.autonomous_activity import _SUPPRESSING_RESULTS
     assert idle_attempt_result_for_dream({"phase": "error", "side_output": False}) not in _SUPPRESSING_RESULTS
     assert idle_attempt_result_for_dream({"phase": "skipped", "side_output": False}) in _SUPPRESSING_RESULTS
-
-
-def test_r2_the_idle_tick_records_those_results():
-    import ast, inspect
-    from ghost_agent.core import agent as A
-    tree = ast.parse(inspect.getsource(A))
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-             and getattr(n.func, "attr", "") == "_record_idle_attempt" and n.args
-             and isinstance(n.args[0], ast.Constant) and n.args[0].value in ("maintenance", "self_play")]
-    by = {}
-    for c in calls:
-        by.setdefault(c.args[0].value, []).append(c.args[1])
-    assert any(isinstance(a, ast.Call) and a.func.id == "idle_attempt_result_for_dream" for a in by["maintenance"])
-    # §4NM: the slot with no replay case and no test due records a declined heartbeat
-    assert any(isinstance(a, ast.Constant) and a.value == "declined" for a in by["self_play"])
 
 
 def test_r2_a_refused_fragment_does_not_fall_to_the_fuzzy_tier(tmp_path):

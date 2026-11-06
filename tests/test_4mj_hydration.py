@@ -117,17 +117,13 @@ def test_the_intent_classifier_reads_how_and_punctuation(q, intent):
 
 @pytest.mark.asyncio
 async def test_a_turns_stash_survives_an_overlapping_turns_hydration():
-    """The stash belongs to the newest hydrating turn (the per-turn
-    `_hydration_by_turn` map had no reader and was removed, retrieval review
-    2026-10-31)."""
+    """No per-turn stash is kept on the bus: `_hydration_by_turn` had no
+    reader (retrieval review 2026-10-31), nor had `last_hydration` (§4TD)."""
     bus = MemoryBus()
     bus._fetch_all_tiers = AsyncMock(return_value=[[{"source": "graph", "text": "- (A) -[R]-> (B)"}]])
     bus._log_hydration = lambda *a, **k: None
-    bus._credit_surfaced = lambda s: None
-    await bus.hydrate_context("first question about A", turn_id="t1")
-    await bus.hydrate_context("second question about A", turn_id="t2")
-    assert bus.last_hydration["turn_id"] == "t2" and bus.last_hydration["survivors"]
-    assert not hasattr(bus, "_hydration_by_turn")
+    assert "(A)" in await bus.hydrate_context("first question about A")
+    assert not hasattr(bus, "_hydration_by_turn") and not hasattr(bus, "last_hydration")
 
 
 def test_the_active_session_is_excluded_before_the_limit(tmp_path):

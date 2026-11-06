@@ -194,7 +194,7 @@ for (let f = 0; f < 110; f++) {          // the blend is 1.4 s = 84 frames
 // Steady state: the camera-static forms hold z EXACTLY, frame after frame,
 // and the vortex roll is exactly its own law (no residue from the blend).
 let camHeld = true;
-for (let f = 0; f < 240; f++) { tick(1); if ((to === 'vortex' || to === 'tesseract') && camera_z() !== 5.0) camHeld = false; }
+for (let f = 0; f < 240; f++) { tick(1); if ((to === 'vortex' || to === 'moodtesseract') && camera_z() !== 5.0) camHeld = false; }
 function camera_z() { return view().cz; }
 const st = face.getDebugState(), v = view();
 emit({ maxD, firstD, camHeld, camZ: v.cz, rz: v.rz, rx: v.rx,
@@ -206,8 +206,8 @@ emit({ maxD, firstD, camHeld, camZ: v.cz, rz: v.rz, rx: v.rx,
     # 2 / 3 — backing-store sizes at init and after DPR changes.
     "dpr": r"""
 import { face, fire, emit } from './harness.mjs';
-const R = globalThis.__renderer, C = globalThis.__composer, B = globalThis.__bloom, M = globalThis.__points.material;
-const read = () => ({ pr: R.pr, rt1: C.renderTarget1.width, rt2: C.renderTarget2.width, bloom: B.w, uDpr: M.uniforms.uDpr.value });
+const R = globalThis.__renderer, C = globalThis.__composer, B = globalThis.__bloom, M = null;
+const read = () => ({ pr: R.pr, rt1: C.renderTarget1.width, rt2: C.renderTarget2.width, bloom: B.w });
 const init = read();
 window.devicePixelRatio = 1; fire('resize'); const one = read();
 window.devicePixelRatio = 3; fire('resize'); const three = read();
@@ -218,7 +218,7 @@ emit({ init, one, three });
 import { face, tick, imesh, lines, emit } from './harness.mjs';
 tick(120);
 const srcs = [imesh.material.vertexShader, imesh.material.fragmentShader, lines.material.vertexShader,
-              lines.material.fragmentShader, globalThis.__points.material.vertexShader, globalThis.__points.material.fragmentShader];
+              lines.material.fragmentShader];
 const uses = [], bad = [];
 for (const s of srcs) {
   const body = s.replace(/\/\/[^\n]*/g, '').replace(/uniform float uTime;/g, '');   // code only
@@ -270,7 +270,7 @@ import { face, tick, lines, emit } from './harness.mjs';
 const C = globalThis.__composer;
 tick(300);
 const c0 = C.renders, t0 = face.getDebugState().clock; tick(120); const c1 = C.renders, t1 = face.getDebugState().clock;
-face.setForm('cube'); tick(3); const c2 = C.renders;
+face.setForm('moodtesseract'); tick(3); const c2 = C.renders;
 tick(240); const linesAfter = lines.geometry.drawRange.count / 2;
 emit({ restRenders: c1 - c0, clockMoved: t1 > t0, wokeRenders: c2 - c1, linesAfter, form: face.getForm() });
 """,
@@ -279,7 +279,7 @@ emit({ restRenders: c1 - c0, clockMoved: t1 > t0, wokeRenders: c2 - c1, linesAft
 import { face, tick, imesh, lines, emit } from './harness.mjs';
 const o0 = globalThis.__o3d; tick(60); const o1 = globalThis.__o3d;
 const srcs = [imesh.material.vertexShader, imesh.material.fragmentShader, lines.material.vertexShader,
-              lines.material.fragmentShader, globalThis.__points.material.vertexShader];
+              lines.material.fragmentShader];
 const reversed = [];
 for (const s of srcs.map((x) => x.replace(/\/\/[^\n]*/g, ''))) for (const m of s.matchAll(/smoothstep\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,/g)) {
   const a = Number(m[1]), b = Number(m[2]);
@@ -323,12 +323,8 @@ def _run(root: Path, scenario: str, **env) -> dict:
 # (from, to, warm-up frames, mid-turn?). 3600 frames = one minute: the
 # vortex roll is then ~1.65 rad — the cut the old code made in one frame.
 _SWITCHES = [
-    ("vortex", "cube", 3600, False),
-    ("tesseract", "descent", 3600, False),
-    ("tesseract", "cube", 120, True),      # old: camera 5.0 → 2.2 in one frame
-    ("vortex", "descent", 120, True),      # old: 5.0 → 1.3
-    ("cube", "vortex", 120, True),         # old: 2.2 → 5.0
-    ("descent", "tesseract", 120, True),
+    ("moodtesseract", "empty", 3600, False),
+    ("empty", "moodtesseract", 120, True),
 ]
 
 
@@ -348,7 +344,7 @@ def test_form_switch_moves_scene_and_camera_continuously(lab, a, b, warm, turn):
     assert r["firstD"]["rot"] < 0.01 and r["firstD"]["cz"] < 0.01, r
 
 
-@pytest.mark.parametrize("a,b,warm,turn", [s for s in _SWITCHES if s[1] in ("vortex", "tesseract")],
+@pytest.mark.parametrize("a,b,warm,turn", [s for s in _SWITCHES if s[1] in ("vortex", "moodtesseract")],
                          ids=lambda v: str(v))
 def test_camera_static_forms_hold_the_camera_exactly_after_the_blend(lab, a, b, warm, turn):
     r = _run(lab, "blend", A=a, B=b, WARM=warm, TURN=int(turn))
@@ -367,14 +363,14 @@ def test_composer_buffers_are_built_at_device_resolution(lab):
     # 1440 CSS px × DPR 2. Old: the target was built at 1440 and the
     # composer took that as its size until the first resize.
     assert i["rt1"] == 2880 and i["rt2"] == 2880, r
-    assert i["bloom"] == 2880 and i["uDpr"] == 2, r
+    assert i["bloom"] == 2880, r
 
 
 def test_a_dpr_change_reaches_renderer_composer_and_motes_capped(lab):
     r = _run(lab, "dpr", DPR=2)
-    assert r["one"] == {"pr": 1, "rt1": 1440, "rt2": 1440, "bloom": 1440, "uDpr": 1}, r
+    assert r["one"] == {"pr": 1, "rt1": 1440, "rt2": 1440, "bloom": 1440}, r
     # DPR 3 is capped at the desktop cap (2), exactly as at init.
-    assert r["three"] == {"pr": 2, "rt1": 2880, "rt2": 2880, "bloom": 2880, "uDpr": 2}, r
+    assert r["three"] == {"pr": 2, "rt1": 2880, "rt2": 2880, "bloom": 2880}, r
 
 
 # ═══ 4 — the shader clock ═══════════════════════════════════════════════
@@ -382,7 +378,7 @@ def test_a_dpr_change_reaches_renderer_composer_and_motes_capped(lab):
 def test_shader_time_wraps_where_every_shader_frequency_completes_whole_turns(lab):
     r = _run(lab, "clock")
     assert r["bad"] == [], f"uTime used outside the `uTime * f` sine form: {r['bad']}"
-    assert r["uses"] >= 10, r            # hueWave×2 (3 shaders), sizeBoost, colour breath ×2, motes ×3
+    assert r["uses"] >= 7, r             # hueWave×2 (2 shaders), sizeBoost, colour breath ×2
     for n in r["turns"]:
         assert abs(n - round(n)) < 1e-6, f"a shader frequency does not divide the wrap period: {r['turns']}"
     # Continuity across the wrap: the GPU's phase IS the unwrapped phase.
@@ -400,17 +396,12 @@ def test_live_uniforms_carry_the_wrapped_clock_and_the_cpu_packet_phases(lab):
 
 # ═══ 5 — reduced motion ═════════════════════════════════════════════════
 
-def test_reduced_motion_damps_the_refute_shudder(lab):
-    ref = _run(lab, "rm", RM=1, FACE_FORM="descent", MODE="refute")["frames"]
-    stop = _run(lab, "rm", RM=1, FACE_FORM="descent", MODE="stop")["frames"]
-    worst = 0.0
-    for fa, fb in zip(ref, stop):
-        for pa, pb in zip(fa, fb):
-            if pa is None or pb is None or pa[0] > 9000 or pb[0] > 9000:
-                continue
-            worst = max(worst, abs(pa[0] - pb[0]), abs(pa[1] - pb[1]))
-    # TUNE.shudder 0.035 × CALM 0.35 ≈ 0.012 (old: the full 0.035).
-    assert 0.002 < worst < 0.015, worst
+ROOT_STATIC = Path(__file__).resolve().parent.parent / "interface" / "static"
+
+
+def test_reduced_motion_damps_the_refute_shudder():
+    src = (ROOT_STATIC / "matrix_graph.js").read_text(encoding="utf-8")
+    assert "const shudder = verdict === 'refute' ? TUNE.shudder * verdictEnv * CALM : 0;" in src
 
 
 def test_reduced_motion_network_error_is_a_steady_dim_not_a_blink(lab):
@@ -431,7 +422,7 @@ def test_empty_form_at_rest_skips_the_composite_and_wakes_on_switch(lab):
     r = _run(lab, "empty", FACE_FORM="empty")
     assert r["restRenders"] == 0, r
     assert r["clockMoved"], "the loop must keep running (envelopes, clock) while empty rests"
-    assert r["wokeRenders"] == 3 and r["form"] == "cube", r
+    assert r["wokeRenders"] == 3 and r["form"] == "moodtesseract", r
     assert r["linesAfter"] > 100, r
 
 

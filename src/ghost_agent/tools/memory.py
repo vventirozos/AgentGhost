@@ -134,8 +134,13 @@ class _NullCM:
 
 # Types the `forget` sweeps must NEVER delete as collateral: ingested
 # document chunks (deleting one guts a manual the library index still
-# lists) and episode/skill/acquired-skill twins (deleting one orphans its
-# JSON-side record and breaks that store's semantic recall). Conversational
+# lists) and episode/acquired-skill twins (deleting one orphans its
+# JSON-side record and breaks that store's semantic recall). "skill" rows are
+# the vector copies of the removed lesson store (§4TD), purged at deploy by
+# scripts/lesson_purge_4td.py; the entry stays so that a restored backup's rows
+# are left for that script to export, not lost one by one to a sweep (no read
+# path serves them, so a forget's reply stays true of what can be read).
+# Conversational
 # fact types (auto/identity/manual/synthesis/…) remain forgettable — that
 # is the tool's job.
 _FORGET_PROTECTED_TYPES = [
@@ -229,7 +234,7 @@ def _target_word_coverage(fact: str, target: str):
     """Share of the target's DISTINCTIVE content words found in ``fact``
     (exact or inflected), or None when the target has none."""
     try:
-        from ..memory.lesson_scope import content_words
+        from ..memory.request_text import content_words
         tw = {w for w in content_words(target) if len(w) >= 3 and not w.isdigit() and w not in _FORGET_HUB_WORDS}
         if not tw:
             return None
@@ -260,9 +265,8 @@ def _names_an_entity(target: str) -> bool:
 
 def _current_request_text() -> str:
     try:
-        from ..memory.lesson_scope import current_request
-        # §4RZ s4-r3: the request alone — this text also decides "the user
-        # DICTATED this lesson" (a keyword test a mid-turn note would open)
+        from ..memory.request_text import current_request
+        # §4RZ s4-r3: the request alone, never a note added mid-turn
         return str(current_request.get() or "")
     except Exception:  # noqa: BLE001
         return ""
@@ -271,7 +275,7 @@ def _current_request_text() -> str:
 def _distinct_words(target: str) -> set:
     """The target's words that can name a particular fact (not hub words)."""
     try:
-        from ..memory.lesson_scope import content_words
+        from ..memory.request_text import content_words
         return {w for w in content_words(target) if w not in _FORGET_HUB_WORDS and len(w) >= 2}
     except Exception:  # noqa: BLE001
         return set()
@@ -296,7 +300,7 @@ def _is_the_value(value, target_lc: str) -> bool:
 
 def _ordered_words(text: str) -> list:
     try:
-        from ..memory.lesson_scope import normalize_request
+        from ..memory.request_text import normalize_request
         return [w for w in normalize_request(text).split() if w not in _FORGET_HUB_WORDS]
     except Exception:  # noqa: BLE001
         return str(text).lower().split()
@@ -332,7 +336,7 @@ def _qualifiers_of(target: str) -> list:
     """The attribute nouns that qualify the entity: AFTER it ("Elena's
     birthday", "Kosmas birthdate") or joined by "of" ("the birthday of
     Elena") — not a category before it ("my old car Tesla" is the car)."""
-    from ..memory.lesson_scope import normalize_request
+    from ..memory.request_text import normalize_request
     words = _ordered_words(target)
     ent = set(normalize_request(_entity_of(target)).split())
     first = next((i for i, w in enumerate(words) if w in ent), None)
@@ -542,8 +546,8 @@ def _bus_write_failures(report) -> list:
 #: indexes are best-effort secondary writes; these are the canonical stores.
 #: Which bus leg is the CANONICAL store — per operation, because it differs.
 #:
-#: `MemoryBus.publish_fact` can emit exactly four keys: vector | graph |
-#: profile | skill. An earlier flat tuple listed `fact`, `memory` and
+#: `MemoryBus.publish_fact` can emit exactly three keys: vector | graph |
+#: profile (§4TD: the `skill` leg went with the lesson store). An earlier flat tuple listed `fact`, `memory` and
 #: `episodic`, none of which the bus can emit — three dead entries that made
 #: the rule look broader than it was — and it omitted `vector`, which IS the
 #: canonical store for `insert_fact`. So a fact that was never stored emitted
@@ -556,7 +560,6 @@ def _bus_write_failures(report) -> list:
 _CANONICAL_BUS_LEGS = {
     "insert_fact": ("vector",),
     "update_profile": ("profile",),
-    "learn_skill": ("skill",),
 }
 
 
@@ -1542,7 +1545,7 @@ async def tool_query_document(filename: str = None, question: str = None,
         f"a passage answers, over {_DIST_WEAK:.2f} it is unrelated; LOWER IS "
         f"CLOSER):",
     ]
-    from ..memory.skills import _mostly_non_latin
+    from ..memory.request_text import mostly_non_latin as _mostly_non_latin
     if best >= _DIST_WEAK and _mostly_non_latin(question):
         # KB review 10-30: the bands are the ENGLISH embedder's. Greek questions
         # whose answer was ranked 1st/2nd measured 0.35–0.40 and got the
@@ -1968,7 +1971,7 @@ _RECALL_FORGE_RE = re.compile(
 
 
 _PUBLIC_RECALL_BLOCK = ("SYSTEM: this reply is posted in a PUBLIC channel, so the owner's stored memory "
-                        "(facts, past requests, lessons) is not searched for it. Answer without it, or say "
+                        "(facts, past requests) is not searched for it. Answer without it, or say "
                         "the owner can ask in a direct message.")
 
 
@@ -2146,8 +2149,8 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
     pretty_log("Memory Recall", query, icon=Icons.MEM_READ)
     if not memory_system: return "Error: Memory system is disabled."
     # KB review 10-30: an owner turn whose reply is PUBLIC keeps the owner's
-    # private context out of the prompt (§4LB: profile, past requests,
-    # lessons), and recall served all of it anyway — health, address, family
+    # private context out of the prompt (§4LB: profile, past requests),
+    # and recall served all of it anyway — health, address, family
     # birthdates into a channel reply
     from ..utils.logging import reply_is_public as _public
     if _public():
@@ -2171,7 +2174,7 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
     shown_ids = []
     best_relevance = None
     from ..core.bus import MemoryBus as _MB0
-    from ..memory.skills import _mostly_non_latin
+    from ..memory.request_text import mostly_non_latin as _mostly_non_latin
     # r5: NOT widened to "user"/"owner" — the commonest noun of this owner's
     # postgres/linux questions ("postgres user home directory" printed the
     # street address); a third-person query keeps the pre-review behaviour
@@ -2830,7 +2833,7 @@ class _PlanVector(_Passthrough):
 
 
 async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_memory=None, graph_memory=None,
-                         project_store=None, episodic_memory=None, skill_memory=None):
+                         project_store=None, episodic_memory=None):
     """Run the forget sweep in PLAN mode and return the numbered list plus a
     confirmation token. Nothing is deleted."""
     import time as _t
@@ -2841,23 +2844,17 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
                                           project_store=project_store, episodic_memory=episodic_memory)
     finally:
         _FORGET_PLAN.reset(tok)
-    # §4LC: the lessons that mention it (a request-scoped plan stores the
-    # owner's request verbatim) — listed, and removed when confirmed
-    if skill_memory is not None and hasattr(skill_memory, "lessons_mentioning"):
-        try:
-            for trig, scoped in await asyncio.to_thread(skill_memory.lessons_mentioning, target):
-                plan.add("lesson", {"trigger": trig},
-                         f"lesson {trig[:80]!r}" + (" (one request's plan)" if scoped else ""))
-        except Exception as e:  # noqa: BLE001
-            notes = f"{notes}\n⚠️ Lessons could not be searched: {e}"
     # §4OR r2: an ADOPTED rule that mentions it is named, never removed here
-    if skill_memory is not None and hasattr(skill_memory, "owner_rules_mentioning"):
+    # (§4SZ: the rules are core/owner_rules.py's one file, beside the memory dir)
+    _pf = getattr(profile_memory, "file_path", None)
+    if isinstance(_pf, (str, Path)):
         try:
-            _rules = await asyncio.to_thread(skill_memory.owner_rules_mentioning, target)
+            from ..core.owner_rules import rules_mentioning
+            _rules = await asyncio.to_thread(rules_mentioning, Path(_pf).parent.parent, target)
             for _r in _rules:
-                notes = (f"{notes}\n⚠️ One of your adopted rules mentions “{target}”: "
-                         f"“{str(_r.get('solution') or '')[:120]}”. This forget does not remove rules — say "
-                         f"“show all rules”, then “forget rule N”.")
+                notes = (f"{notes}\n⚠️ Rule {_r['n']} of your rules mentions “{target}”: "
+                         f"“{str(_r.get('rule') or '')[:120]}”. This forget does not remove rules — say "
+                         f"“forget rule {_r['n']}”.")
         except Exception:  # noqa: BLE001
             pass
     if not isinstance(notes, str):
@@ -2878,9 +2875,9 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
         rid = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
         rid = ""
-    # §4MM turn 18: number ONCE, defaults first — lessons were appended after
-    # the episodes, so the list read 1, 2, 15 and the model renumbered it: its
-    # "remove 1, 2, 3" would have deleted an episode, not the lesson it showed
+    # §4MM turn 18: number ONCE, defaults first — a group appended after
+    # another read 1, 2, 15 and the model renumbered it: its "remove 1, 2, 3"
+    # would have deleted a different item from the one it showed
     items = [it for it in plan.items if it["default"]] + [it for it in plan.items if not it["default"]]
     plan.items[:] = items
     token = _store_plan({"target": str(target), "items": plan.items, "rid": rid, "ts": _t.time(), "kind": "forget"})
@@ -2899,7 +2896,7 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
     return "\n".join(lines)
 
 
-def _reset_preview(memory_system, graph_memory, episodic_memory=None, skill_memory=None) -> str:
+def _reset_preview(memory_system, graph_memory, episodic_memory=None) -> str:
     import time as _t
     try:
         rows = memory_system.collection.count()
@@ -2922,17 +2919,10 @@ def _reset_preview(memory_system, graph_memory, episodic_memory=None, skill_memo
         rid = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
         rid = ""
-    req_lessons = "?"
-    try:
-        if skill_memory is not None and hasattr(skill_memory, "request_scoped_count"):
-            req_lessons = skill_memory.request_scoped_count()
-    except Exception:  # noqa: BLE001
-        pass
     token = _store_plan({"kind": "reset_all", "rid": rid, "ts": _t.time(), "items": []})
     return (f"PREVIEW — nothing was deleted. reset_all would erase the WHOLE vector memory ({rows} rows: every "
-            f"fact, document and stored search copy), the knowledge graph ({edges} facts), the past-conversation "
-            f"episodes ({eps}) and the one-request lessons that quote your requests ({req_lessons}) — not the "
-            f"profile or the general lessons. Ask the user to "
+            f"fact, document and stored search copy), the knowledge graph ({edges} facts) and the past-conversation "
+            f"episodes ({eps}) — not the profile. Ask the user to "
             f"confirm. Only after the USER says yes in their next message, call "
             f"knowledge_base(action='reset_all', confirm='{token}') (or confirm='yes' if you no longer see "
             f"the token). To remove something specific instead, use "
@@ -3254,7 +3244,7 @@ def _pick(items: list, selection):
 
 
 async def forget_execute(token, selection="all", sandbox_dir=None, memory_system=None, profile_memory=None,
-                         graph_memory=None, project_store=None, episodic_memory=None, skill_memory=None):
+                         graph_memory=None, project_store=None, episodic_memory=None):
     """Delete exactly the confirmed items of a preview."""
     token, plan = _resolve_plan(token, "forget")
     if plan is None:
@@ -3282,7 +3272,7 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
     for it in chosen:
         try:
             report.append(await asyncio.to_thread(_execute_item, it, memory_system, profile_memory, graph_memory,
-                                                  project_store, episodic_memory, skill_memory))
+                                                  project_store, episodic_memory))
         except Exception as e:  # noqa: BLE001
             report.append(f"⚠️ {it['label']}: {e}")
         if it.get("kind") in ("profile_field", "profile_item", "profile_previous"):
@@ -3312,14 +3302,8 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
     return ToolOutcome.partial(text, world_changed=True, reason_code="forget_items_partial")
 
 
-def _execute_item(it, memory_system, profile_memory, graph_memory, project_store, episodic_memory,
-                  skill_memory=None) -> str:
+def _execute_item(it, memory_system, profile_memory, graph_memory, project_store, episodic_memory) -> str:
     k, r = it["kind"], it["ref"]
-    if k == "lesson":
-        if skill_memory is None:
-            return f"⚠️ {it['label']}: the lesson store is not available"
-        ok = skill_memory.remove_by_trigger(r["trigger"], memory_system=memory_system)
-        return f"✅ Removed {it['label']} (archived)" if ok else f"ℹ️ {it['label']} was already gone"
     if k == "file":
         root, path = Path(r["root"]), Path(r["path"])
         if path.is_symlink() or not _is_within_root(path.resolve(), root.resolve()):
@@ -3812,7 +3796,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                 # deletes regardless of distance — forgetting a word that
                 # appears in a manual silently gutted the document (library
                 # index still listed it; dedup then refused re-ingest), and
-                # episode/skill twins deleted here orphan their JSON side.
+                # episode twins deleted here orphan their JSON side.
                 cand = memory_system.collection.query(
                     # normalised, like every other sweep — the raw string
                     # embedded `./` / `sandbox/` into the query vector
@@ -3879,7 +3863,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                 # fact ("forget user" deleted all four owner facts), and an
                 # attribute noun named by several facts is a choice ("address":
                 # home and email) — fourth review
-                from ..memory.lesson_scope import content_words
+                from ..memory.request_text import content_words
                 _distinct = {w for w in content_words(sweep_target_lc)
                              if w not in _FORGET_HUB_WORDS and len(w) >= 2}
                 if literal_hits and (not _distinct or (
@@ -4525,77 +4509,6 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         )
     return f"SUCCESS: Profile updated.{_was_note}"
 
-async def tool_learn_skill(task: str = None, mistake: str = None, solution: str = None, skill_memory=None, memory_system=None, memory_bus=None, **kwargs):
-    """Save a learned lesson. Bus-aware path emits a `learn_skill` event
-    so SkillMemory + VectorMemory commits flow through the bus."""
-    if not task or not mistake or not solution:
-        return "SYSTEM ERROR: 'task', 'mistake', and 'solution' parameters are MANDATORY."
-    # a lesson is replayed as "follow to avoid repeats" into later turns:
-    # after content from outside, only a lesson the USER dictated (§4MB)
-    from ..utils.provenance import untrusted_seen, user_message, content_refusal
-    _src = untrusted_seen()
-    if _src:
-        from ..memory.skills import user_dictates_lesson
-        if not user_dictates_lesson(user_message()):      # §4RZ s4-r3: the request alone (a keyword gate)
-            return ToolOutcome.rejected(content_refusal("the lesson", _src),
-                                        world_changed=False, reason_code="untrusted_content")
-
-    # --- DEDUP: refuse to re-learn an identical (task, mistake, solution)
-    # triplet. Without this the playbook bloats with duplicates and the
-    # vector store re-embeds the same lesson text every time.
-    skill_for_check = skill_memory
-    if skill_for_check is None and memory_bus is not None:
-        skill_for_check = getattr(memory_bus, "skill", None)
-    if skill_for_check is not None:
-        try:
-            import json as _json
-            file_path = getattr(skill_for_check, "file_path", None)
-            if file_path is not None and file_path.exists():
-                playbook = _json.loads(file_path.read_text() or "[]")
-                if isinstance(playbook, list):
-                    for entry in playbook:
-                        if (entry.get("task") == task
-                                and entry.get("mistake") == mistake
-                                and entry.get("solution") == solution):
-                            return "NOOP: Identical lesson already in the Skill Playbook. No duplicate written."
-        except Exception:
-            pass
-
-    # --- BUS-AWARE PATH ---
-    if memory_bus is not None:
-        _report = await memory_bus.publish_fact("learn_skill", {
-            "skill": {"task": task, "mistake": mistake, "solution": solution},
-        })
-        _fails = _bus_write_failures(_report)
-        if _fails:
-            _canon = _bus_canonical_failed(_report, "learn_skill")
-            _mk = ToolOutcome.failed if _canon else ToolOutcome.partial
-            _head = "FAILED" if _canon else "PARTIAL"
-            return _mk((f"{_head}: lesson write had failures — "
-                    f"{'; '.join(_fails)}. It may not be in the playbook."),
-                    reason_code="lesson_write_partial")
-        return _learn_skill_success((_report or {}).get("skill_scope") if isinstance(_report, dict) else "")
-
-    # --- LEGACY DIRECT PATH ---
-    if not skill_memory: return "Error: Skill memory not active."
-    _w = skill_memory.learn_lesson(task, mistake, solution, memory_system=memory_system, source="learn_skill",
-                                   generality_context=_current_request_text())
-    if _w is None:
-        # (r8 review) a dropped lesson was reported as saved
-        return ToolOutcome.failed("FAILED: the lesson was not written (dropped by the playbook's quality gates).",
-                                  reason_code="lesson_write_partial")
-    return _learn_skill_success(getattr(_w, "scope", ""))
-
-
-def _learn_skill_success(scope) -> str:
-    """Say WHERE the lesson applies (re-review: a lesson scoped to this one
-    request was reported as a plain SUCCESS). ``scope`` is THIS call's."""
-    if isinstance(scope, str) and scope == "request":
-        return ("SUCCESS: Lesson saved — for THIS request only: it restates the request's own details, so it "
-                "will be recalled when this request comes up again, not for other tasks. To make it a general "
-                "rule, phrase it without this request's names, files and numbers.")
-    return "SUCCESS: Lesson learned and saved to the Skill Playbook and Vector Memory."
-
 #: Every kwarg name the `knowledge_base` dispatcher accepts as the SUBJECT of
 #: an action — the fact to store, the file to ingest, the topic to forget.
 #: The tuple is the FALLBACK order; `_kb_tried_names` hoists the action's own
@@ -4618,7 +4531,7 @@ def _learn_skill_success(scope) -> str:
 #: drops is not a bad message — it is an unbreakable loop.
 _KB_TARGET_ALIASES = (
     "filename", "fact", "content", "source", "path", "topic", "target",
-    "url", "link",       # §4PI (R1-m6): the macro teaches `url`
+    "url", "link",       # §4PI (R1-m6): `youtube_transcribe` teaches `url`
 )
 
 def _video_retention_note(memory_system, res, had_before) -> str:
@@ -4884,8 +4797,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             return await forget_execute(kwargs.get("confirm"), kwargs.get("items") or "all", sandbox_dir,
                                         memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"),
                                         project_store=kwargs.get("project_store"),
-                                        episodic_memory=kwargs.get("episodic_memory"),
-                                        skill_memory=kwargs.get("skill_memory"))
+                                        episodic_memory=kwargs.get("episodic_memory"))
         subject, err = _kb_target_or_error(
             kwargs, action_as_called, "target",
             "pass the topic, entity or filename to erase",
@@ -4904,12 +4816,10 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                        f"{_tok0} — running it (items={_sel0})", icon=Icons.BRAIN_PLAN)
             return await forget_execute(_tok0, _sel0, sandbox_dir, memory_system, kwargs.get("profile_memory"),
                                         kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
-                                        episodic_memory=kwargs.get("episodic_memory"),
-                                        skill_memory=kwargs.get("skill_memory"))
+                                        episodic_memory=kwargs.get("episodic_memory"))
         return await forget_preview(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"),
                                     kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
-                                    episodic_memory=kwargs.get("episodic_memory"),
-                                    skill_memory=kwargs.get("skill_memory"))
+                                    episodic_memory=kwargs.get("episodic_memory"))
 
     elif action == "query":
         return await tool_query_document(
@@ -5035,7 +4945,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             _tok0, _plan0 = confirmed_earlier_preview("reset_all")
             if _plan0 is None:
                 return await asyncio.to_thread(_reset_preview, memory_system, kwargs.get("graph_memory"),
-                                               kwargs.get("episodic_memory"), kwargs.get("skill_memory"))
+                                               kwargs.get("episodic_memory"))
             pretty_log("Confirm Lookup", f"reset_all: the user's yes answers the earlier preview {_tok0} — "
                        f"running it", icon=Icons.BRAIN_PLAN)
             _tok = _tok0
@@ -5130,7 +5040,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                         raise RuntimeError(f"could not keep a copy of the rows first ({_de}) — NOTHING was "
                                            f"wiped") from _de
                 # What this wipe ORPHANS, counted from the SAME snapshot.
-                # `reset_all` deletes the `document` / `episode` / `skill` /
+                # `reset_all` deletes the `document` / `episode` /
                 # `acquired_skill` rows `_FORGET_PROTECTED_TYPES` protects,
                 # because each has a record in ANOTHER store this does not
                 # touch. `forget` refuses to create that asymmetry;
@@ -5147,6 +5057,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                     m = metas[i] if i < len(metas) else None
                     types.append(m.get("type") if isinstance(m, dict) else None)
                 incomplete = len(metas) < len(all_ids)
+                from ..memory.vector import RETIRED_ROW_TYPES as _RETIRED_ROW_TYPES
 
                 for i in range(0, len(all_ids), 500):
                     batch = all_ids[i:i + 500]
@@ -5159,7 +5070,9 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                         # reported "this removed the vector rows for 600
                         # document…" having removed nothing.
                         for t in types[i:i + 500]:
-                            if t in _FORGET_PROTECTED_TYPES:
+                            # (§4TD: a lesson twin has no record in a live
+                            # store any more — nothing is orphaned by it)
+                            if t in _FORGET_PROTECTED_TYPES and t not in _RETIRED_ROW_TYPES:
                                 orphaned[t] = orphaned.get(t, 0) + 1
                     except Exception as e:
                         failed_batches += 1
@@ -5221,15 +5134,6 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                 orphaned.pop("episode", None)
             except Exception as e:  # noqa: BLE001
                 __import__("logging").getLogger("GhostAgent").warning(f"reset_all episode wipe failed: {e}")
-        # §4LC: the one-request lessons quote the owner's requests verbatim —
-        # they go too (the boot reconcile re-indexed them after the vector wipe)
-        _sk = kwargs.get("skill_memory")
-        _req_gone = 0
-        if _sk is not None and hasattr(_sk, "remove_request_scoped"):
-            try:
-                _req_gone = await asyncio.to_thread(_sk.remove_request_scoped, memory_system)
-            except Exception as e:  # noqa: BLE001
-                __import__("logging").getLogger("GhostAgent").warning(f"reset_all lesson wipe failed: {e}")
         # §4LK: the queued corrections quote the owner's conversations
         _ag = kwargs.get("owner_agent")
         if _ag is not None and hasattr(_ag, "clear_pending_corrections"):
@@ -5237,7 +5141,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                 _ag.clear_pending_corrections()
             except Exception as e:  # noqa: BLE001
                 __import__("logging").getLogger("GhostAgent").warning(f"reset_all correction-queue wipe failed: {e}")
-        note = (f" Removed {_req_gone} one-request lesson(s) (archived)." if _req_gone else "")
+        note = ""
         if report_note_incomplete:
             note += (" NOTE: the store returned fewer metadata rows than ids,"
                     " so the list of orphaned records below is incomplete.")
@@ -5279,97 +5183,3 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         return _kb_unknown_action_error("update_profile")
 
     return _kb_unknown_action_error(action)
-
-_VALID_LESSON_SCOPES = {"today", "week", "all", "self_play_only"}
-
-
-LESSON_LEGEND = ("(✓ = verified lesson, · = unverified lesson. These are LESSONS, numbered by position in this "
-                 "list — not the owner's rules. The owner's rules — proposed, adopted, dismissed or forgotten — "
-                 "are shown and changed only by the owner's own messages: “show all rules”, “show me all proposed "
-                 "rules”, “learn rule N”, "
-                 "“dismiss rule N”, “forget rule N”.)")
-
-
-async def tool_list_lessons(context, scope: str = "today", limit: int = 20, **kwargs):
-    """Surface the lessons currently in the skill playbook for the user.
-
-    `scope`:
-      - "today"           — lessons with `timestamp >= local midnight`
-      - "week"            — lessons from the last 7 days (local)
-      - "all"             — every lesson in the playbook
-      - "self_play_only"  — every lesson with `source == "self_play"`,
-                            no time filter.
-    """
-    skill_memory = getattr(context, "skill_memory", None)
-    if skill_memory is None:
-        return "SYSTEM: Skill memory is not available in this context."
-
-    scope_norm = (scope or "today").strip().lower()
-    if scope_norm not in _VALID_LESSON_SCOPES:
-        return (
-            f"SYSTEM: Unknown scope '{scope}'. "
-            f"Allowed: {sorted(_VALID_LESSON_SCOPES)}."
-        )
-    try:
-        limit_int = max(1, min(100, int(limit)))
-    except Exception:
-        limit_int = 20
-
-    if scope_norm == "self_play_only":
-        _q = dict(scope="all", source="self_play")
-        header_scope = "self-play lessons"
-    else:
-        _q = dict(scope=scope_norm, source="")
-        header_scope = {
-            "today": "lessons learned today",
-            "week":  "lessons learned in the last 7 days",
-            "all":   "all lessons learned so far",
-        }[scope_norm]
-    lessons = skill_memory.list_lessons(limit=limit_int, **_q)
-
-    if not lessons:
-        return f"No {header_scope} yet."
-
-    # R2-6 (2026-09-20): the header printed the PAGE length as the count —
-    # "## 100 all lessons learned so far:" over a 198-lesson store, and the
-    # agent answered "how many lessons do you have?" with 100. A truncated
-    # listing must say so and say of what; `count_lessons` is the total
-    # behind the same filter. (`getattr`: a stub memory may predate it.)
-    _count_fn = getattr(skill_memory, "count_lessons", None)
-    try:
-        total = int(_count_fn(**_q)) if callable(_count_fn) else len(lessons)
-    except Exception:  # noqa: BLE001 — a header must never fail the tool
-        total = len(lessons)
-    if total > len(lessons):
-        lines = [f"## {total} {header_scope} — showing the {len(lessons)} most "
-                 f"recent (limit={limit_int}, max 100; the total is {total}):"]
-    else:
-        lines = [f"## {len(lessons)} {header_scope}:"]
-    # §4PY: "·" was read as "proposed" and the numbers as the owner's rule numbers (e85e344a)
-    lines.append(LESSON_LEGEND)
-    for i, lesson in enumerate(lessons, 1):
-        ts = lesson.get("timestamp") or ""
-        when = ""
-        try:
-            from datetime import datetime as _dt
-            when = _dt.fromisoformat(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
-        except Exception:
-            when = ts[:16] if ts else ""
-        verified = "✓" if lesson.get("verified") else "·"
-        source = lesson.get("source") or "?"
-        trigger = (lesson.get("trigger") or lesson.get("task") or "").strip() or "(no trigger)"
-        domains = ", ".join(lesson.get("domains") or []) or "-"
-        retrievals = int(lesson.get("retrievals") or 0)
-        helpful = int(lesson.get("helpful_retrievals") or 0)
-        fix = (lesson.get("correct_pattern") or lesson.get("solution") or "").strip()
-        # Keep each entry short — the agent can paraphrase the full detail
-        # back to the user if asked. One line of meta + one of fix snippet.
-        fix_preview = fix.replace("\n", " ⏎ ")
-        if len(fix_preview) > 180:
-            fix_preview = fix_preview[:177] + "..."
-        lines.append(
-            f"{i}. [{when}] ({verified} src={source}) {trigger}\n"
-            f"   domains: {domains} | retrievals: {retrievals} (helpful: {helpful})\n"
-            f"   fix: {fix_preview}"
-        )
-    return "\n".join(lines)

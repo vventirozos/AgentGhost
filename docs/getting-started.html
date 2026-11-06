@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -125,11 +125,13 @@ export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
     <dt>sandbox/</dt>
     <dd>The working directory shared with the Docker container. Files the agent creates for you land here.</dd>
     <dt>system/memory/</dt>
-    <dd>All six memory stores — the vector database, the graph, your profile, learned lessons, the journal, past episodes.</dd>
+    <dd>All the memory stores — the vector database, the graph, your profile, your rules, the journal, past episodes.</dd>
     <dt>system/ghost-agent.log</dt>
     <dd>The durable log. The live console shows a cleaner version of the same thing.</dd>
     <dt>system/trajectories/</dt>
-    <dd>A record of each turn. The learning loop reads it to find your failed turns to replay and to draft regression tests. Safe to delete; you just lose that history.</dd>
+    <dd>A record of each turn. <code>introspect</code> and the failure census read it. Safe to delete; you just lose that history.</dd>
+    <dt>system/owner_rules.json</dt>
+    <dd>Your rules ("learn this rule: …"). Deleting it deletes them. See <a href="learning-loop.html">Owner rules</a>.</dd>
   </dl>
 
   <h2>Start it</h2>
@@ -157,7 +159,7 @@ export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
     <dt>memory_system_loaded</dt>
     <dd>Must be <code>true</code>. If it's <code>false</code>, Ghost booted without memory — it will still answer you, but it remembers nothing and every background pass is silently disabled.</dd>
     <dt>biological_watchdog_alive</dt>
-    <dd>Must be <code>true</code>. This is the idle scheduler (the key keeps its old name) — the background loop that runs maintenance, replays your failures and re-runs your regression tests while idle. If it's <code>false</code>, that loop died and Ghost has stopped its background work. At boot it logs <code>Idle Scheduler — started; jobs: …</code> with the jobs it will run.</dd>
+    <dd>Must be <code>true</code>. This is the idle scheduler (the key keeps its old name) — the background loop that runs maintenance and the other housekeeping jobs while idle. If it's <code>false</code>, that loop died and Ghost has stopped its background work. At boot it logs <code>Idle Scheduler — started; jobs: …</code> with the jobs it will run.</dd>
     <dt>nodes</dt>
     <dd>Which extra LLM machines are wired up, by role. An empty list for a role means that work runs on your main model instead. Not a problem — just worth knowing.</dd>
   </dl>
@@ -179,7 +181,7 @@ export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
   <p>Slack, voice and the desktop client are also separate processes. The <a href="interfaces.html">Interfaces</a> page covers all of them, including which ports they use and what each one is good for.</p>
 
   <h2>Keeping it running</h2>
-  <p>Ghost is meant to run continuously — the maintenance and failure-replay passes only fire when it's been idle for a while, so an agent you start and stop never gets to do them. On macOS that means a <code>launchd</code> job; on Linux, a systemd unit.</p>
+  <p>Ghost is meant to run continuously — the maintenance passes only fire when it's been idle for a while, so an agent you start and stop never gets to do them. On macOS that means a <code>launchd</code> job; on Linux, a systemd unit.</p>
 
   <div class="note warn">
     <strong>If you use launchd with <code>KeepAlive</code>:</strong> a plain <code>kill</code> restarts the process (that's how you deploy a change), and only <code>launchctl bootout</code> actually stops it. Make sure <code>GHOST_HOME</code> is exported inside the job definition — a launchd process doesn't inherit your shell profile, and without it Ghost quietly starts on a brand-new empty memory at the default path.

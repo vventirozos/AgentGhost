@@ -630,3 +630,162 @@ def test_a_crlf_answer_commits():
     _frames(tap)
     closing = tap.finish(crlf.replace("\r", "") + "\n\nNote.")
     assert tap.outcome == "committed" and _retracts(closing) == 0
+
+
+# --- §4TE (req 0cbbc995): only smoothing's reported trim skips the reprint ---
+
+BODY = ("## 1. Weather\nPartly cloudy, 13.6°C, and no rain is due.\n\n"
+        "## 2. News\n- World: a president resigned after a bank collapse.\n\n"
+        "## 3. Health\nAll services are answering. " + "More detail on the check. " * 10).strip()
+NARRATION = "Let me put the report together now."
+SHOWN = NARRATION + "\n\n" + BODY
+
+
+def _trim_frames(shown, final, trim=None, quote_view=False):
+    tap = ReplyTap("r1", "m", 1)
+    tap.quote_view = quote_view
+    tap.begin_generation()
+    _feed_stream(tap, shown)
+    _frames(tap)
+    if trim:
+        tap.note_trim(*trim)
+    return tap, tap.finish(final)
+
+
+def _ghost(closing):
+    return _parse(closing)[0]["ghost"]
+
+
+def test_smoothings_reported_trim_is_flagged_and_the_whole_reply_still_follows():
+    """The web and ClockworkPi clients ignore the flag: they drop and replace."""
+    tap, closing = _trim_frames(SHOWN, BODY, trim=(SHOWN, BODY))
+    assert _ghost(closing) == {"retract": True, "trimmed": True, "tail_chars": 0}
+    assert _text(closing) == BODY
+    assert tap.outcome == "retracted" and tap.retracts == ["narration trimmed"]
+
+
+def test_text_added_after_the_trim_is_the_tail():
+    tap, closing = _trim_frames(SHOWN, BODY + "\n\n_closing line._", trim=(SHOWN, BODY))
+    assert _ghost(closing)["tail_chars"] == len("\n\n_closing line._")
+    assert _text(closing).endswith("\n\n_closing line._")
+
+
+def test_without_a_reported_trim_a_removal_is_a_rewrite():
+    """The review's cases: each reads exactly like removed narration."""
+    for shown, final in ((BODY + " 3 failed.", BODY),
+                         ("WARNING: this deletes all rows.\n\n" + BODY, BODY),
+                         (SHOWN, BODY)):
+        tap, closing = _trim_frames(shown, final)
+        assert _ghost(closing) == {"retract": True}
+        assert tap.retracts == ["the reply was rewritten"]
+
+
+@pytest.mark.parametrize("final", [
+    BODY.replace("no rain is due", "rain is due"),         # changed after smoothing
+    "**Correction:** that was wrong.\n\n" + BODY,          # text added at the head
+    BODY.replace("## 2. News", "Added.\n\n## 2. News"),    # text added mid-reply
+    BODY[:40],                                             # the final is shorter
+])
+def test_any_change_beyond_the_trim_is_a_rewrite(final):
+    tap, closing = _trim_frames(SHOWN, final, trim=(SHOWN, BODY))
+    assert _ghost(closing) == {"retract": True} and _text(closing) == final
+
+
+def test_a_change_before_smoothing_is_a_rewrite():
+    """Smoothing did not receive what was shown, so its trim explains nothing."""
+    tap, closing = _trim_frames("Something else was shown here. " * 10, BODY, trim=(SHOWN, BODY))
+    assert _ghost(closing) == {"retract": True}
+
+
+def test_an_empty_final_is_a_rewrite():
+    _, closing = _trim_frames(SHOWN, "", trim=(SHOWN, ""))
+    assert _ghost(closing) == {"retract": True}
+    _, closing = _trim_frames(SHOWN, "  \n", trim=(SHOWN, "  \n"))
+    assert _ghost(closing) == {"retract": True}
+
+
+def test_a_trim_to_nothing_explains_no_final():
+    """Else the whole final would count as new text after an empty reply."""
+    _, closing = _trim_frames(SHOWN, BODY, trim=(SHOWN, ""))
+    assert _ghost(closing) == {"retract": True}
+
+
+def test_a_tail_starting_inside_an_open_fence_is_a_rewrite():
+    open_fence = BODY + "\n```py\nx = 1"
+    shown = NARRATION + "\n\n" + open_fence
+    _, closing = _trim_frames(shown, open_fence + "\n```\n\nAfter.", trim=(shown, open_fence))
+    assert _ghost(closing) == {"retract": True}
+
+
+def test_the_compare_uses_the_view_the_client_saw():
+    """The live shape: 21 hidden quote markers, trim reported on the raw text."""
+    from ghost_agent.core.quote_bound import MarkerFilter
+    raw = BODY.replace("no rain is due.", 'no rain is due [src: "rain 0%"].')
+    raw_shown = NARRATION + "\n\n" + raw
+    f = MarkerFilter()
+    f.feed(raw)
+    f.finish()
+    final = f.text()
+    assert "[src:" not in final
+    tap, closing = _trim_frames(raw_shown, final, trim=(raw_shown, raw), quote_view=True)
+    assert "[src:" not in tap.sent or tap.sent == ""
+    assert _ghost(closing) == {"retract": True, "trimmed": True, "tail_chars": 0}
+    assert _text(closing) == final
+
+
+def test_two_trims_in_a_row_chain():
+    """Req 9fca34d5: text beside tool calls dropped, then narration trimmed."""
+    extra = "Text written beside a tool call."
+    first = extra + "\n\n" + SHOWN
+    tap = ReplyTap("r1", "m", 1)
+    tap.begin_generation()
+    _feed_stream(tap, first)
+    _frames(tap)
+    tap.note_trim(first, SHOWN)
+    tap.note_trim(SHOWN, BODY)
+    assert _ghost(tap.finish(BODY))["trimmed"] is True
+
+
+def test_the_pre_tool_text_need_not_have_been_on_screen():
+    """The earlier generation was retracted at its call: the screen shows the
+    reply as of the second trim."""
+    tap = ReplyTap("r1", "m", 1)
+    tap.begin_generation()
+    _feed_stream(tap, SHOWN)
+    _frames(tap)
+    tap.note_trim("Earlier text.\n\n" + SHOWN, SHOWN)
+    tap.note_trim(SHOWN, BODY)
+    assert _ghost(tap.finish(BODY))["trimmed"] is True
+
+
+def test_an_unreported_edit_between_trims_breaks_the_chain():
+    edited = SHOWN.replace("13.6", "99")
+    tap = ReplyTap("r1", "m", 1)
+    tap.begin_generation()
+    _feed_stream(tap, SHOWN)
+    _frames(tap)
+    tap.note_trim("Earlier text.\n\n" + SHOWN, SHOWN)
+    tap.note_trim(edited, BODY)
+    assert _ghost(tap.finish(BODY)) == {"retract": True}
+
+
+def test_crlf_in_the_shown_text_does_not_hide_a_trim():
+    shown = SHOWN.replace("\n", "\r\n")
+    _, closing = _trim_frames(shown, BODY, trim=(shown, BODY))
+    assert _ghost(closing)["trimmed"] is True
+
+
+def test_the_other_retracts_carry_no_trim_flag():
+    tap = ReplyTap("r1", "m", 1)
+    tap.begin_generation()
+    _feed_stream(tap, ANSWER)
+    _frames(tap)
+    tap.note_trim(ANSWER, ANSWER[:50])
+    assert _parse(tap.retract_before_stream())[0]["ghost"] == {"retract": True}
+    tap = ReplyTap("r1", "m", 1)
+    tap.begin_generation()
+    _feed_stream(tap, ANSWER)
+    _frames(tap)
+    tap.note_trim(ANSWER, ANSWER[:50])
+    tap.tool_call_seen()
+    assert _parse(_frames(tap))[0]["ghost"] == {"retract": True}

@@ -42,14 +42,15 @@ class TestSelfStateSchemaDrift:
             "schema_version": "9.9",
             "open_questions": [{"id": "q1", "text": "why", "priority": "high"}],
             "unfinished_threads": [{"id": "t1", "descriptor": "d", "extra": 1}],
-            "mood": {"label": "curious", "evidence": "e", "future_field": True},
+            "mood": {"p": 0.6, "e": 0.45, "updated_at": "2026-07-04T00:00:00Z", "label": "cheerful",
+                     "intensity": 2, "future_field": True},
             "last_session_at": "2026-07-04T00:00:00Z",
             "brand_new_top_level_key": 123,
         }
         st = SelfState.from_dict(d)
-        assert st.open_questions[0].text == "why"
-        assert st.unfinished_threads[0].descriptor == "d"
-        assert st.mood is not None and st.mood.label == "curious"
+        # §4TB: the two lists are removed fields now — ignored like any unknown key
+        assert not hasattr(st, "open_questions") and not hasattr(st, "unfinished_threads")
+        assert st.mood is not None and st.mood.label == "cheerful" and not hasattr(st.mood, "future_field")
         assert st.last_session_at == "2026-07-04T00:00:00Z"
 
 

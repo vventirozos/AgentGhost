@@ -17,7 +17,7 @@
     <h3>Algorithms</h3>
     <a class="current" href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
-    <a href="dream_cycle.html">Maintenance &amp; failure replay</a>
+    <a href="dream_cycle.html">Maintenance cycle</a>
     <a href="skill_acquisition.html">Skill acquisition</a>
     <a href="circuit_breaker.html">Circuit breaker</a>
     <a href="selfhood.html">Selfhood (unified self)</a>
@@ -45,10 +45,10 @@
       <text x="500" y="165" text-anchor="middle" fill="#e6e9ef">[3] GhostAgent.handle_chat — classify thinking budget, sampling profile</text>
 
       <rect x="40" y="200" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
-      <text x="500" y="225" text-anchor="middle" fill="#e6e9ef">[4] MemoryBus.hydrate_context — lessons (skill) + owner facts (graph), fused by RRF with hand-tuned intent weights</text>
+      <text x="500" y="225" text-anchor="middle" fill="#e6e9ef">[4] MemoryBus.hydrate_context — owner facts (graph), experience, history, fused by RRF with hand-tuned intent weights</text>
 
       <rect x="40" y="260" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
-      <text x="500" y="285" text-anchor="middle" fill="#e6e9ef">[5] tools.registry.get_active_tool_definitions — base tools + dynamic acquired/composed skills</text>
+      <text x="500" y="285" text-anchor="middle" fill="#e6e9ef">[5] tools.registry.get_active_tool_definitions — base tools + dynamic acquired skills</text>
 
       <rect x="40" y="320" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
       <text x="500" y="345" text-anchor="middle" fill="#e6e9ef">[6] ContextManager.compress_if_needed — L0..L4 progressive compression as required</text>
@@ -90,7 +90,7 @@
   <ol>
     <li><strong>HTTP entry</strong> — <a href="../api/routes.html">routes.py</a> validates the <code>X-Ghost-Key</code> header. Streaming responses set the <code>X-Request-ID</code> response header for correlation with the agent log.</li>
     <li><strong>Context setup</strong> — the request_id is bound to a <code>contextvars.ContextVar</code> so log lines from inside tool calls inherit it.</li>
-    <li><strong>Sampling decision</strong> — <a href="../core/agent.html"><code>get_sampling_params</code></a> picks coding vs general profile; <a href="../core/agent.html"><code>classify_thinking_budget</code></a> picks tight / extended / selfplay.</li>
+    <li><strong>Sampling decision</strong> — <a href="../core/agent.html"><code>get_sampling_params</code></a> picks coding vs general profile; <a href="../core/agent.html"><code>classify_thinking_budget</code></a> picks tight or extended (the <code>selfplay</code> budget no longer exists).</li>
     <li><strong>Hydration</strong> — see <a href="memory_hydration.html">memory hydration (RRF)</a>.</li>
     <li><strong>Tool list</strong> — built per-turn so semantic skill routing reflects the current query.</li>
     <li><strong>Compression</strong> — <a href="../core/context_manager.html">ContextManager</a> decides how aggressively to summarise, only escalating beyond L0 if the budget is &gt; 60 % full.</li>
@@ -108,15 +108,10 @@
   <code>X-Ghost-Origin: probe</code>: the route prefixes the request id with
   <code>probe-</code> (keeping a client-supplied id under it, never doubling an existing
   prefix), <code>turn_origin</code> answers <code>"probe"</code>, and the turn runs the
-  full live path without minting lessons, crediting retrievals or
+  full live path without teaching, crediting retrievals or
   being reflected on. Use it for every operator/Claude probe &mdash; a probe that taught
   once became playbook lesson 49.</p>
-  <p>Companion endpoint: <code>POST /api/lessons/quarantine</code> with
-  <code>{"trigger": &lt;exact trigger&gt;, "reason": &lt;why&gt;}</code> quarantines a playbook
-  lesson <em>inside the live process</em> (the playbook is single-writer and launchd respawns
-  the agent immediately on exit, so an external script never has a safe window). 400 without a
-  reason &mdash; it is written on the record; 503 on a read-only or missing skill memory;
-  <code>ok:false</code> when nothing matched.</p>
+  <p>The companion endpoint <code>POST /api/lessons/quarantine</code> was removed with the lesson store on 2026-11-06 (§4TD).</p>
 
 </main>
 </body>

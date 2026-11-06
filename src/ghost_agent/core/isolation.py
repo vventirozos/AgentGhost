@@ -11,7 +11,9 @@ every one of the comments below is a defect somebody already shipped.
 Two things live here:
 
 * **The read-only memory façades.** Deny-by-default whitelists over the
-  vector / skill / graph stores. Moved VERBATIM out of
+  vector / graph stores (§4TD: the lesson-store façade went with that store;
+  what it also did — mark the context as simulated — is the explicit
+  ``simulated`` flag below). Moved VERBATIM out of
   ``Dreamer.synthetic_self_play`` (they were method-local classes), so
   their behaviour — and every hard-won comment explaining why a method is
   on or off the whitelist — is unchanged. These are the STRICT pair to
@@ -69,128 +71,46 @@ logger = logging.getLogger("GhostAgent")
 # Read-only memory façades (moved verbatim from core/dream.py, 2026-08-22)
 # ---------------------------------------------------------------------------
 
-class ReadOnlySkillMemory:
-    # Marker: any callsite that wants to skip an expensive
-    # write-oriented code path during self-play can check
-    # `getattr(ctx.skill_memory, 'is_read_only', False)`. The
-    # Perfect-It follow-up LLM call does this so it doesn't
-    # burn ~15s per self-play cycle generating optimisation
-    # suggestions whose write lands in /dev/null anyway.
-    is_read_only = True
+#: THE marker of a simulated context (§4TD, 2026-11-06): a detached copy of
+#: the live context that runs a turn which is not the owner's own — an
+#: isolated replay (:func:`isolated_replay_context`) or a coding leaf
+#: (``core/coding_loop.build_leaf_context``). Until §4TD the marker was the
+#: read-only wrapper of the lesson store (``context.skill_memory.is_read_only``);
+#: the lesson store is removed and the marker is this one explicit flag, set
+#: at the two places that wrapper was installed and read through
+#: :func:`is_simulated_context` by every guard that used to read the wrapper.
+SIMULATED_ATTR = "simulated"
 
-    # Whitelist of read-only attributes that may legitimately pass
-    # through to the real playbook. Same M1 fix as
-    # ReadOnlyVectorMemory below: the previous `__getattr__`
-    # forwarded EVERYTHING, so the temp agent's fresh MemoryBus
-    # called record_retrievals_bulk on the PRODUCTION store —
-    # synthetic turns bumped real retrieval counters with no
-    # matching helpful-credit, pushing real lessons toward
-    # prune_low_utility eligibility.
-    # §4BF 1c (R5 review): `last_playbook_triggers` REMOVED from the
-    # passthrough — the sim read path deliberately stamps nothing
-    # (`stamp_triggers=False` below), so a passthrough read served
-    # the LAST REAL USER TURN's lesson set, and bench finalizes
-    # stamped it into `extra["hydrated_lessons"]` on bench
-    # trajectories (real lessons creditable for MBPP solves) and
-    # into the shared surfaced-triggers stash under bench ids. The
-    # wrapper's own doctrine is deny-by-default; the sim-side
-    # attribution channel is `hydrated_triggers`/`last_sim_triggers`.
-    _SAFE_PASSTHROUGH = frozenset({
-        "get_playbook_items", "get_recent_failures", "list_lessons",
-        "find_by_trigger", "file_path",
-        "_load_playbook", "_get_lock", "_playbook_items_and_branch",
-        "_filter_quarantined",
-        "owner_rules",          # §4NA r1: replays and self-play see the owner's adopted rules too
-    })
 
-    def __init__(self, real_sm):
-        self.real_sm = real_sm
-        # Triggers hydrated INSIDE this sim. The sim's own snapshot
-        # (last_selfplay_hydrated_triggers) is
-        # built from this — NOT from the shared
-        # skill_memory.last_playbook_triggers attribute, which a
-        # concurrent user turn can re-stamp mid-replay.
-        self.hydrated_triggers = []
+def mark_simulated(context) -> None:
+    """Stamp ``context`` as simulated. FAIL CLOSED: a context that will not
+    take the flag (or does not read it back) raises — the caller must not run
+    a turn on a copy that every simulation guard would take for the live
+    context."""
+    try:
+        setattr(context, SIMULATED_ATTR, True)
+        stamped = getattr(context, SIMULATED_ATTR, None) is True
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"isolation: the context could not be marked simulated ({type(exc).__name__}: {exc}) "
+            "— refusing to run on it") from exc
+    if not stamped:
+        raise RuntimeError("isolation: the context did not keep the simulated mark — refusing to run on it")
 
-    def _note_triggers(self, triggers):
-        if not isinstance(triggers, (list, tuple)):
-            return
-        for trig in triggers:
-            if trig and trig not in self.hydrated_triggers:
-                self.hydrated_triggers.append(trig)
 
-    def get_playbook_context(self, *args, **kwargs):
-        if self.real_sm:
-            # Reads must stay pure: the real method bumps retrieval
-            # counters by default (keyword-only flag), and the
-            # attribution stamp must go to the SIM side-channel —
-            # stamping last_playbook_triggers here leaked the idle
-            # sim's lesson set into the next user turn's outcome
-            # attribution whenever that turn's own retrieval was
-            # empty.
-            kwargs["record_retrievals"] = False
-            kwargs["stamp_triggers"] = False
-            out = self.real_sm.get_playbook_context(*args, **kwargs)
-            self._note_triggers(
-                getattr(self.real_sm, "last_sim_triggers", None))
-            return out
-        return ""
+def is_simulated_context(context) -> bool:
+    """Is ``context`` a simulated one (see :data:`SIMULATED_ATTR`)?
 
-    # Explicitly block all mutation methods. record_retrievals_bulk
-    # still CAPTURES the triggers it was asked to credit — that is
-    # the MemoryBus's post-fusion "these lessons entered the
-    # prompt" signal, i.e. exactly what "hydrated in this sim"
-    # means for the bus path.
-    def learn_lesson(self, *args, **kwargs):
-        pass
-
-    def save_playbook(self, *args, **kwargs):
-        pass
-
-    def record_retrieval(self, *args, **kwargs):
-        pass
-
-    def record_retrievals_bulk(self, triggers=None, *args, **kwargs):
-        self._note_triggers(list(triggers) if triggers else [])
-        return 0
-
-    def record_helpful_retrieval(self, *args, **kwargs):
-        pass
-
-    def credit_recent_retrievals(self, *args, **kwargs):
-        return 0
-
-    def record_surfaced_outcomes(self, *args, **kwargs):
-        return 0
-
-    def retract_lessons_from_trajectory(self, *args, **kwargs):
-        return 0
-
-    def quarantine_lesson(self, *args, **kwargs):
-        return 0
-
-    def mark_verified(self, *args, **kwargs):
-        pass
-
-    def remove_by_trigger(self, *args, **kwargs):
+    ``True`` only for the stamp itself (``is True``): the live context
+    carries a plain ``False``, and a test double's auto-made attribute is
+    not a stamp. A flag that cannot be READ counts as set — fail closed."""
+    if context is None:
         return False
+    try:
+        return getattr(context, SIMULATED_ATTR, False) is True
+    except Exception:  # noqa: BLE001
+        return True
 
-    def _update_lesson_fields(self, *args, **kwargs):
-        return 0
-
-    def _save_playbook_unlocked(self, *args, **kwargs):
-        pass
-
-    def __getattr__(self, name):
-        # Only forward whitelisted read attributes; everything else
-        # raises so a future SkillMemory mutation method can't
-        # silently bypass this wrapper during self-play.
-        if name in type(self)._SAFE_PASSTHROUGH and self.real_sm is not None:
-            return getattr(self.real_sm, name)
-        raise AttributeError(
-            f"{type(self).__name__}: attribute {name!r} is not in the "
-            "read-only passthrough whitelist"
-        )
 
 class SafeCollection:
     def __init__(self, real_collection):
@@ -361,7 +281,7 @@ class BackgroundOnlyLLM:
 #:   profile_memory          — operator profile store.
 #:   scheduler               — the live APScheduler.
 #:   journal                 — fake post-mortems reaching the Hippocampus.
-#:   trajectory_collector    — synthetic turns mined for macros / PRM.
+#:   trajectory_collector    — synthetic turns mined for the PRM.
 #:   episodic_memory         — episodic store (defence in depth).
 #:   memory_bus              — an inherited bus reaches the REAL stores
 #:                             straight past the read-only façades.
@@ -888,9 +808,12 @@ REPLAY_FORBIDDEN_TOOLS = frozenset({
     "browser", "vision_analysis", "image_generation",
     "youtube_transcribe", "news_headlines",
     # production state outside the fork
-    "manage_projects", "manage_services", "manage_tasks", "self_state",
-    "update_profile", "learn_skill", "create_skill", "manage_skills",
-    "manage_composed_skills", "system_utility",
+    # (§4TB: `self_state` was here until the tool was removed. Its one
+    # surviving write, `introspect(action="set_mood")`, refuses itself in a
+    # contained context — `is_contained_context` below; the read actions stay.)
+    "manage_projects", "manage_services", "manage_tasks",
+    "update_profile", "create_skill", "manage_skills",
+    "system_utility",
     "rotate_secrets", "knowledge_base",
     # §4SX Phase B: real machines on the labs host; D5: `run` starts/stops real processes there and in the
     # live workspace
@@ -900,6 +823,17 @@ REPLAY_FORBIDDEN_TOOLS = frozenset({
     # is the belt.
     "jobs",
 })
+
+
+def is_contained_context(context) -> bool:
+    """Is ``context`` a contained copy (an isolated replay context)?
+
+    The marker is the forbidden-tools record :func:`isolated_replay_context`
+    stamps on the copy. For a tool that is allowed on a contained surface
+    but has ONE action that must not run there (§4TB:
+    ``introspect(action="set_mood")`` — the tool that held that write,
+    ``self_state``, was on the forbidden list as a whole)."""
+    return isinstance(getattr(context, "_replay_forbidden_tools", None), (frozenset, set))
 
 
 def restrict_tool_surface(agent, forbidden=None) -> frozenset:
@@ -934,20 +868,16 @@ def restrict_tool_surface(agent, forbidden=None) -> frozenset:
         forbidden = getattr(ctx, "_replay_forbidden_tools", None)
     forbidden = set(forbidden or REPLAY_FORBIDDEN_TOOLS)
     try:
-        # Composed macros are forbidden as a class (§4LS M3): a macro's steps
-        # dispatch through the FULL tool dict captured at registration, so a
-        # macro name kept here ran `web_search` / `notify_operator` from a
-        # contained replay. Only names that ARE macros — a stored macro that
-        # shadows a built-in is never registered under it, and the built-in
-        # stays (fix review N4). Best-effort: an unreadable registry adds
-        # nothing (no macro runner was registered from it either).
-        from ..tools.composed_skills import _registry_from_context
-        from ..tools.registry import TOOL_DEFINITIONS as _TD
-        _builtin = {t["function"]["name"] for t in _TD}
-        _reg = _registry_from_context(ctx) if ctx is not None else None
-        if _reg is not None:
-            forbidden |= set(getattr(_reg, "skills", {}) or {}) - _builtin
-        from ..tools.registry import TOOL_DEFINITIONS
+        # §4LS M3 forbade composed macros here as a class: a macro's steps
+        # dispatched through the FULL tool dict captured at registration, so
+        # a macro name kept here ran a forbidden tool from a contained
+        # replay. The macro engine is removed (§4TA, 2026-11-05) and no macro
+        # is registered any more; the one tool that still calls another
+        # through that dict is the built-in `youtube_transcribe`, so it is
+        # forbidden wherever the tool it calls is.
+        from ..tools.registry import TOOL_DEFINITIONS, YOUTUBE_TRANSCRIBE_INNER_TOOL
+        if YOUTUBE_TRANSCRIBE_INNER_TOOL in forbidden:
+            forbidden.add("youtube_transcribe")
         advertised = {t["function"]["name"] for t in TOOL_DEFINITIONS}
         advertised |= set(agent.available_tools or {})
         keep = advertised - forbidden
@@ -1165,6 +1095,10 @@ async def isolated_replay_context(
                          exc)
 
         iso = copy.copy(context)
+        # §4TD: FIRST, before anything that can fail — every simulation
+        # guard reads this flag (it was the read-only lesson-store wrapper
+        # installed further down). Raises when the copy will not take it.
+        mark_simulated(iso)
         iso.sandbox_dir = workspace
 
         # ── Detach. `nulled` is what the helper reports it CLEARED, not
@@ -1186,8 +1120,6 @@ async def isolated_replay_context(
         # Read-only memory: an isolated run researches, it never rewrites.
         iso.memory_system = ReadOnlyVectorMemory(
             getattr(context, "memory_system", None))
-        iso.skill_memory = ReadOnlySkillMemory(
-            getattr(context, "skill_memory", None))
         iso.graph_memory = ReadOnlyGraphMemory(
             getattr(context, "graph_memory", None))
 
@@ -1205,10 +1137,7 @@ async def isolated_replay_context(
                       "_census_ctx",          # §4PL: per-request prompt stash
                       "_po_carries",          # §4PO: per-request carried answers
                       "_effort_due",          # §4RB: booked xhigh notes
-                      "_state_anchors",       # §4RC: anchored state blocks
-                      "_surfaced_triggers_by_traj",
-                      "_flushed_triggers_by_traj",
-                      "_composed_skill_registry"):
+                      "_state_anchors"):      # §4RC: anchored state blocks
             try:
                 setattr(iso, _ring, _OD())
             except Exception:  # noqa: BLE001
@@ -1349,7 +1278,7 @@ async def isolated_replay_context(
 
 def _fork_memory_dir(context, workspace: Path) -> Path:
     """A fork-local ``memory_dir``, seeded with the read-only content a
-    replay legitimately needs (acquired skills, composed skills) so the
+    replay legitimately needs (acquired skills) so the
     isolate keeps the shape of the real one without being able to write
     to it. Both legs of a paired replay get the same seeded copy, so the
     comparison stays valid."""
@@ -1358,11 +1287,11 @@ def _fork_memory_dir(context, workspace: Path) -> Path:
         md.mkdir(parents=True, exist_ok=True)
         real = getattr(context, "memory_dir", None)
         if real:
-            for sub in ("acquired_skills", "composed_skills"):
+            for sub in ("acquired_skills",):
                 src = Path(str(real)) / sub
                 if src.is_dir():
-                    # §4GJ round 3: `symlinks=False` FOLLOWS — and these two
-                    # directories are model-writable, so a planted link
+                    # §4GJ round 3: `symlinks=False` FOLLOWS — and this
+                    # directory is model-writable, so a planted link
                     # seeded a fork with host bytes.
                     from ..tools.file_system import copytree_nofollow
                     _sk = copytree_nofollow(src, md / sub, src,
@@ -1376,15 +1305,16 @@ def _fork_memory_dir(context, workspace: Path) -> Path:
 
 
 __all__ = [
-    "ReadOnlySkillMemory", "SafeCollection", "ReadOnlyVectorMemory",
+    "SafeCollection", "ReadOnlyVectorMemory",
     "ReadOnlyGraphMemory", "BackgroundOnlyLLM",
+    "SIMULATED_ATTR", "mark_simulated", "is_simulated_context",
     "ISOLATION_NULLED_ATTRS", "REPLAY_EXTRA_NULLED_ATTRS",
     "REPLAY_NULLED_ATTRS", "null_production_state",
     "fork_workspace", "ForkResult", "sweep_fork_workspaces",
     "sweep_own_forks",
     "OWNER_STAMP",
     "FORK_PREFIX", "fork_prefix", "FORK_EXCLUDE", "FORK_MAX_BYTES",
-    "REPLAY_FORBIDDEN_TOOLS", "restrict_tool_surface",
+    "REPLAY_FORBIDDEN_TOOLS", "restrict_tool_surface", "is_contained_context",
     "IsolatedRun", "IsolationUnavailable", "isolated_replay_context",
     "reset_backoff_for_tests",
 ]

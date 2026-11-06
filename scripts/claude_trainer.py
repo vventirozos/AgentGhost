@@ -10,11 +10,11 @@ teacher/supervisor. For each task in a curriculum it:
   3. If wrong, sends a **correction** crafted to fire the agent's
      ``classify_user_correction`` predicate (BOTH the anchored
      correction-phrase signal AND the token-rephrase signal), which is
-     what promotes the prior turn to FAILED and schedules a reflection
-     that distils a lesson into ``SkillMemory``.
-  4. After a short delay (so the fire-and-forget reflection lands), it
-     re-asks the same question in a **fresh** conversation and has Claude
-     score whether the agent retained the lesson.
+     what promotes the prior turn to FAILED (a label on the turn; nothing
+     is written that a later turn reads, and the lesson store is gone, §4TD).
+  4. After a short delay it re-asks the same question in a **fresh**
+     conversation and has Claude score the answer. With nothing taught, a
+     better score is not retention by the agent's own learning.
 
 Why the correction is built so carefully
 ----------------------------------------
@@ -466,17 +466,16 @@ def train_one(
 
     section(
         "CORRECT",
-        f"learning-trigger={'YES ✅' if triggers else 'NO ⚠️ (lesson may not be recorded)'}",
+        f"label-trigger={'YES ✅' if triggers else 'NO ⚠️ (the turn will not be labelled)'}",
     )
     detail(f"teach: {(j.teaching or task.reference)[:200]}")
     if not triggers:
         res.notes.append(
             "correction did NOT satisfy classify_user_correction — the "
-            "agent likely will not record a lesson from this turn"
+            "agent will not label this turn failed"
         )
 
-    # Send the correction. The agent promotes the prior turn to FAILED
-    # and schedules a fire-and-forget reflection that writes a lesson.
+    # Send the correction. The agent promotes the prior turn to FAILED.
     convo.append({"role": "user", "content": correction})
     follow = ghost.chat(convo)
     convo.append({"role": "assistant", "content": follow})
@@ -485,9 +484,9 @@ def train_one(
     res.post_correction_score = pj.score
     section("RE-JUDGE", f"in-context score={pj.score:.2f}")
 
-    # --- Retention: fresh conversation after reflection lands --------
+    # --- Retest: a fresh conversation --------
     if do_retention:
-        section("WAIT", f"{retention_delay:.0f}s for reflection to distil a lesson…")
+        section("WAIT", f"{retention_delay:.0f}s before the retest")
         time.sleep(retention_delay)
         section("RETEST", "fresh conversation, same question")
         fresh = ghost.chat([{"role": "user", "content": task.question}])

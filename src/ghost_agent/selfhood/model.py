@@ -22,29 +22,40 @@ from .autobiographical import (
     AutobiographicalMemory,
     _derive_cluster,
     answer_gist,
-    detect_referenced_experiences,
     redact_pii,
     summarise_turn_first_person,
 )
-from .mood import (
-    SELF_MOOD_GRACE_HOURS,
-    STREAK_MAX_AGE_DAYS,
-    STREAK_WINDOW,
-    MoodSignals,
-    age_seconds,
-    derive_mood,
-    mood_is_stale,
-)
+from . import mood as M
 from .narrative import NarrativeSummariser
 from .recognition import build_wakeup_prefix
 from .schema import Experience
-from .state import SelfStateThread
-from .values import ValuesThread
+from .state import MoodView, SelfStateThread
 
 logger = logging.getLogger("GhostSelfhood")
 
 
 CritiqueFn = Callable[[str], Awaitable[str]]
+
+
+def owner_quiet_seconds(context, now=None) -> Optional[float]:
+    """How long the owner has been quiet, from the clock the agent already
+    keeps (``context.last_owner_activity_time`` — written by the turn loop's
+    heartbeat for an owner request, read by the quiet-hours hold). None when
+    the clock was never set (e.g. since a restart): an unknown quiet is no
+    boredom. This only READS the clock. It is the FALLBACK: the mood
+    measures a quiet from the owner stamp in its own state file
+    (``SelfStateThread.quiet_seconds``) and asks this only while there is
+    none."""
+    import datetime as _dt
+    last = getattr(context, "last_owner_activity_time", None)
+    if not isinstance(last, _dt.datetime):
+        return None
+    try:
+        if last <= _dt.datetime.min:
+            return None
+        return max(0.0, ((now or _dt.datetime.now()) - last).total_seconds())
+    except Exception:  # noqa: BLE001 — an aware/naive mix is an unknown quiet
+        return None
 
 
 class SelfModel:
@@ -77,33 +88,27 @@ class SelfModel:
                 max_recent_experiences=max_recent_experiences_for_narrative,
                 enabled=True,
             )
-            # Normative substrate (operating principles) — the values
-            # layer that moves selfhood from episodic-only to
-            # behaviour-shaping. Surfaced in the wake-up prefix every turn.
-            self.values: Optional[ValuesThread] = ValuesThread(
-                self.root, enabled=True,
-            )
         else:
             self.autobio = None
             self.state = None
             self.narrative = None
-            self.values = None
-        # Ids of the experiences the most recent wake-up prefix surfaced.
-        # note_referenced_experiences unions these into its candidate pool
-        # — the IDF-retrieved entries in the prefix are precisely the ones
-        # likely older than the recent(50) window it scans.
-        self._last_prefix_experience_ids: tuple = ()
 
     # -----------------------------------------------------------------
-    # Hot-path APIs (called by handle_chat per turn)
+    # The wake-up text (no longer spliced into any prompt — §4NM)
     # -----------------------------------------------------------------
 
     def build_wakeup_prefix(
         self, *, recent_experiences_n: int = 3, query: Optional[str] = None,
     ) -> str:
-        """Compose the first-person wake-up text the prompt assembly
-        path splices into the system prompt. Empty string when there's
-        nothing to remember (no prior experiences AND no state).
+        """Compose the first-person wake-up text. Nothing on the request path
+        calls this since the prefix left the prompt (§4NM); the functional
+        harness (`scripts/selfhood_functional_test.py`) still renders it to
+        inspect what the stores hold. Empty string when there's nothing to
+        remember (no prior experiences AND no state).
+
+        (§4TB: its companion `note_referenced_experiences` — which credited
+        the experiences a reply echoed from this text — had no caller left
+        and is removed, with the id stamp it read.)
 
         When ``query`` (the current user request) is supplied, the prefix
         also surfaces past experiences *relevant* to it — not just the
@@ -112,116 +117,13 @@ class SelfModel:
         if not self.enabled:
             return ""
         narrative_text = self.narrative.latest() if self.narrative is not None else ""
-        prefix = build_wakeup_prefix(
+        return build_wakeup_prefix(
             autobio=self.autobio,
             state=self.state,
             narrative=narrative_text,
-            values=self.values,
             recent_experiences_n=recent_experiences_n,
             query=query,
         )
-        self._last_prefix_experience_ids = self._prefix_experience_ids(
-            recent_experiences_n=recent_experiences_n, query=query,
-        )
-        return prefix
-
-    def _prefix_experience_ids(
-        self,
-        *,
-        recent_experiences_n: int,
-        query: Optional[str],
-        relevant_experiences_n: int = 3,
-    ) -> tuple:
-        """Ids of the experiences the wake-up prefix surfaces — mirrors
-        the recent+relevant retrieval in ``recognition.build_wakeup_prefix``
-        (which renders text, not ids). Cheap: ``recent`` is a bounded tail
-        read and the search rides the (mtime, size)-keyed index cache the
-        prefix build just warmed. Never raises."""
-        if self.autobio is None:
-            return ()
-        ids: list = []
-        try:
-            if recent_experiences_n > 0:
-                ids = [e.id for e in self.autobio.recent(limit=recent_experiences_n)]
-            if query and query.strip() and relevant_experiences_n > 0:
-                seen = set(ids)
-                relevant = [
-                    e for e in self.autobio.search_my_past(
-                        query, limit=relevant_experiences_n + len(seen),
-                    )
-                    if e.id not in seen
-                ][:relevant_experiences_n]
-                ids.extend(e.id for e in relevant)
-        except Exception as e:
-            logger.debug("prefix experience-id stamp skipped: %s", e)
-        return tuple(ids)
-
-    # -----------------------------------------------------------------
-    # Values / principles (normative substrate)
-    # -----------------------------------------------------------------
-
-    def note_principle(self, text: str):
-        """Author an operating principle. Returns the Principle (or None
-        when disabled / empty). Surfaced in the wake-up prefix every turn."""
-        if not self.enabled or self.values is None:
-            return None
-        try:
-            return self.values.note_principle(text)
-        except Exception as e:
-            logger.debug("note_principle skipped: %s", e)
-            return None
-
-    def principles(self):
-        """Current operating principles (list of Principle). Empty when
-        disabled / none authored."""
-        if not self.enabled or self.values is None:
-            return []
-        try:
-            return self.values.principles()
-        except Exception:
-            return []
-
-    def principles_text(self) -> str:
-        """Bulleted principle list for a self-critique gate prompt."""
-        if not self.enabled or self.values is None:
-            return ""
-        try:
-            return self.values.as_text()
-        except Exception:
-            return ""
-
-    async def evaluate_response_alignment(self, response: str, *, critique_fn):
-        """Independent check that ``response`` doesn't contradict a stated
-        operating principle. Returns ``(aligned, note)``. ``aligned`` is
-        True when there are no principles, no response, or no critique_fn
-        (fail-open — the gate must never block a turn on its own absence).
-
-        ``critique_fn`` is an async ``str -> str`` (the same shape the
-        narrative summariser uses); it is given the principles
-        and the response and asked for an ALIGNED/VIOLATION verdict."""
-        principles = self.principles_text()
-        if not principles or not (response or "").strip() or critique_fn is None:
-            return True, ""
-        prompt = (
-            "You are auditing whether a response honours the agent's own "
-            "stated operating principles.\n\nPRINCIPLES:\n"
-            f"{principles}\n\nRESPONSE:\n{str(response)[:2000]}\n\n"
-            "Does the response CONTRADICT any principle? Reply on the first "
-            "line with exactly 'VERDICT: ALIGNED' or 'VERDICT: VIOLATION', "
-            "then one sentence naming the principle if violated."
-        )
-        try:
-            out = await critique_fn(prompt)
-            up = (out or "").upper()
-            v_pos = up.find("VIOLATION")
-            a_pos = up.find("ALIGNED")
-            violated = v_pos != -1 and (a_pos == -1 or v_pos < a_pos)
-            lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-            note = (lines[0] if lines else "")[:200]
-            return (not violated), note
-        except Exception as e:
-            logger.debug("evaluate_response_alignment skipped: %s", e)
-            return True, ""
 
     def recall_relevant(self, query: str, *, limit: int = 5):
         """Relevance-ranked search over my own autobiographical past.
@@ -311,68 +213,6 @@ class SelfModel:
         except Exception as e:
             logger.debug("mark_session_boot skipped: %s", e)
 
-    def note_referenced_experiences(
-        self, *, prefix_text: str, response_text: str,
-    ) -> int:
-        """Detect which experiences from the wake-up prefix were
-        actually echoed in the agent's response, and bump their
-        reference counters. Returns the number of experiences whose
-        counter was incremented (0 when disabled / no match).
-
-        The detector is a pure function — see
-        ``autobiographical.detect_referenced_experiences``. Reference
-        counts get persisted to ``reference_counts.json`` so the
-        signal survives process restarts."""
-        if not self.enabled or self.autobio is None:
-            return 0
-        if not prefix_text or not response_text:
-            return 0
-        try:
-            recent_pool = self.autobio.recent(limit=50)
-        except Exception:
-            recent_pool = []
-        # Union in the experiences the wake-up prefix actually surfaced:
-        # the IDF-retrieved ones are exactly the entries likely older than
-        # the newest 50, and a recall-surfaced memory the model echoed
-        # must be creditable too.
-        stamped = getattr(self, "_last_prefix_experience_ids", ())
-        if stamped:
-            try:
-                pool_ids = {e.id for e in recent_pool}
-                missing = [i for i in stamped if i not in pool_ids]
-                if missing:
-                    recent_pool = recent_pool + self.autobio.get_by_ids(missing)
-            except Exception as e:
-                logger.debug("prefix-id pool union skipped: %s", e)
-        try:
-            ids = detect_referenced_experiences(
-                prefix_text=prefix_text,
-                response_text=response_text,
-                experiences=recent_pool,
-            )
-        except Exception as e:
-            logger.debug("ref-detection failed: %s", e)
-            return 0
-        for eid in ids:
-            try:
-                self.autobio.record_reference(eid)
-            except Exception:
-                continue
-        return len(ids)
-
-    def stale_open_questions(self, *, max_age_days: float = 3.0):
-        """Surface open questions that have been carrying for more than
-        ``max_age_days``. Used by an idle hook to prompt the agent to
-        revisit, refile, or resolve them so the open-questions list
-        doesn't become write-only."""
-        if not self.enabled or self.state is None:
-            return []
-        try:
-            return self.state.stale_open_questions(max_age_days=max_age_days)
-        except Exception as e:
-            logger.debug("stale_open_questions skipped: %s", e)
-            return []
-
     def record_outcome(
         self, trajectory_id: str, outcome: str, *, failure_reason: str = "",
     ) -> bool:
@@ -392,294 +232,88 @@ class SelfModel:
             logger.debug("record_outcome skipped: %s", e)
             return False
 
-    def update_derived_mood(
-        self,
-        *,
-        pressure_lockdown: bool = False,
-        idle_seconds: float = 0.0,
-        operator_turn: bool = False,
-        now=None,
-    ) -> Optional["object"]:
-        """Recompute the functional mood from live signals and persist
-        it when unambiguous (mood rework 2026-08-20).
+    # -----------------------------------------------------------------
+    # The mood (§4TC) — read, and the ONLY writers besides set_mood
+    # -----------------------------------------------------------------
 
-        Called from two sites, both origin-gated to REAL traffic
-        (``turn_origin == "user"`` — checked inline at the post-turn
-        site and at the phase gate for 2.8c):
-          - the post-turn capture path (after ``capture_turn``, inside
-            ``_record_turn_trajectory`` — so it requires a wired
-            trajectory collector, and on STREAMED turns the verifier
-            verdict lands late, meaning the streak can lag one turn),
-            with this turn's context-pressure lockdown flag;
-          - biological-watchdog phase 2.8c, with the idle clock — the
-            only path that can derive "idle", and what keeps the
-            staleness TTL honest across quiet stretches.
-
-        Contract:
-          - ambiguous signals → no write at all (the prior mood stands
-            and its staleness clock keeps running — never fabricate a
-            neutral);
-          - a self-authored mood younger than ``SELF_MOOD_GRACE_HOURS``
-            is respected, not clobbered (otherwise the ``set_mood``
-            tool action would survive at most one turn);
-          - a derived ACUTE mood ("idle"/"overloaded") is only replaced
-            or retired by a caller entitled to falsify it (acute-hold +
-            retirement rules; ``operator_turn`` distinguishes real
-            operator turns from scheduled/job-resume turns via
-            ``is_internal_request`` at the hook);
-          - re-deriving the same label refreshes ``set_at`` without a
-            history append (``SelfStateThread.set_mood`` dedup);
-          - transitions are pretty-logged (🪞) so the operator sees
-            mood changes in the live stream.
-
-        Returns the persisted Mood on write, None otherwise. Never
-        raises — mood is a gauge, secondary to everything."""
+    def mood(self, *, now=None, quiet_s=None) -> MoodView:
+        """The mood NOW (a pure read). A neutral view when selfhood is
+        disabled or the read fails — a reader never has to branch."""
         if not self.enabled or self.state is None:
+            return MoodView()
+        try:
+            return self.state.mood(now=now, quiet_s=quiet_s)
+        except Exception as e:
+            logger.debug("mood read skipped: %s: %s", type(e).__name__, e)
+            return MoodView()
+
+    def attach_owner_clock(self, quiet_fn) -> None:
+        """How long the owner has been quiet (seconds, or None) — the clock
+        is the agent's; the mood only reads it, and only while its own
+        state file holds no owner stamp yet (boredom)."""
+        if self.enabled and self.state is not None:
+            self.state.attach_owner_clock(quiet_fn)
+
+    def _apply(self, ev: Optional["M.Event"], *, now=None) -> Optional[MoodView]:
+        """Put one event through ``SelfStateThread.nudge``. Never raises —
+        the mood is secondary to everything."""
+        if ev is None or not self.enabled or self.state is None:
             return None
         try:
-            # Normalize ONCE (review R5): derive, retirement, and the
-            # acute-hold must all read the same coerced value — a
-            # caller passing None would otherwise get post-turn
-            # semantics in one check and tick semantics in another.
-            idle_seconds = float(idle_seconds or 0.0)
-            pressure_lockdown = bool(pressure_lockdown)
-            operator_turn = bool(operator_turn)
-            # Signal gathering needs no lock — the streak and questions
-            # are inputs, not the record being read-modified.
-            outcomes: list = []
-            if self.autobio is not None:
-                # Verdict-bearing back-scan, NOT a raw-tail read: the
-                # raw tail is boot markers + unknown-verdict turns
-                # almost everywhere (live mix ≈ 19% verdicts, newest
-                # verdict observed 78 records back) — a recent(16) read
-                # starved the streak to zero and made stuck/satisfied
-                # unreachable (review R2). Age-bounded so a streak of
-                # weeks-old verdicts can't keep minting a "fresh" mood
-                # via the heartbeat set_at refresh (review R3).
-                outcomes = self.autobio.recent_verdicts(
-                    limit=STREAK_WINDOW,
-                    max_age_days=STREAK_MAX_AGE_DAYS,
-                    now=now,
-                )
-
-            open_qs = self.state.open_questions()
-            newest_age_h = None
-            ages = [
-                a for a in (
-                    age_seconds(q.opened_at, now=now) for q in open_qs
-                ) if a is not None
-            ]
-            if ages:
-                newest_age_h = min(ages) / 3600.0
-
-            verdict = derive_mood(MoodSignals(
-                outcomes=outcomes,
-                pressure_lockdown=pressure_lockdown,
-                open_question_count=len(open_qs),
-                newest_question_age_hours=newest_age_h,
-                idle_seconds=idle_seconds,
-            ))
-            if verdict is None:
-                # Acute-state retirement (review R2): "idle" and
-                # "overloaded" are one-observation states. When the
-                # very signal that minted them is now absent — a user
-                # turn just completed (so not idle), a turn ended
-                # cleanly (so not locked down) — the reading is
-                # FALSIFIED, not merely unrefreshed; letting it stand
-                # for the 48h TTL re-creates the stale-label defect at
-                # smaller scale. Streak states (stuck/satisfied) and
-                # curious are standing assessments and age out
-                # normally. Retiring is not fabricating a neutral —
-                # it's clearing a gauge whose basis is gone.
-                self._maybe_retire_acute_mood(
-                    pressure_lockdown=pressure_lockdown,
-                    idle_seconds=idle_seconds,
-                    operator_turn=operator_turn,
-                )
-                return None
-            label, evidence = verdict
-
-            # Prior-read → grace check → transition detection → write,
-            # all under the state's RLock (re-entrant: set_mood takes it
-            # again). Today every mood writer runs on the event-loop
-            # thread, but that invariant is one asyncio.to_thread
-            # refactor away from false (the neighboring selfhood calls
-            # already run off-thread) — an unlocked read-modify-write
-            # here would let a concurrent tool set_mood land between
-            # read and write, clobbering the grace window and
-            # mislabelling the logged transition (review R1).
-            with self.state.lock:
-                prior = self.state.mood()
-                if (prior is not None
-                        and getattr(prior, "source", "self") == "self"
-                        and not mood_is_stale(prior.set_at, now=now)):
-                    age = age_seconds(prior.set_at, now=now)
-                    if (age is not None
-                            and age < SELF_MOOD_GRACE_HOURS * 3600.0):
-                        return None
-                # Acute-hold (review R4/R5): a FRESH derived ACUTE mood
-                # may only be REPLACED by a caller entitled to falsify
-                # it — otherwise the lockdown-blind idle tick overwrote
-                # "overloaded" with a streak label 40 minutes after the
-                # mint, with zero new events. Rules:
-                #   - a STALE acute prior no longer deserves the hold
-                #     (it is already dropped/flagged everywhere; letting
-                #     it veto a live decisive derivation left the gauge
-                #     dark indefinitely — R5);
-                #   - "overloaded": only a completed turn may act on it,
-                #     and only an OPERATOR turn may mint the replacement
-                #     label; an internal clean turn instead RETIRES it
-                #     (it falsifies "the last turn ended under lockdown"
-                #     but must not launder an operator-facing standing
-                #     label into place — R5: idle→overloaded→satisfied
-                #     via two internal turns displaced "idle" with the
-                #     operator away all night);
-                #   - "idle": an operator turn may replace it, and a
-                #     fresher acute "overloaded" from any completed turn
-                #     outranks it.
-                # Same-label re-derivation (heartbeat) always allowed.
-                retired_over_label = ""
-                if (prior is not None
-                        and getattr(prior, "source", "self") == "derived"
-                        and prior.label in ("idle", "overloaded")
-                        and label != prior.label
-                        and not mood_is_stale(prior.set_at, now=now)):
-                    if prior.label == "overloaded":
-                        if idle_seconds != 0.0:
-                            return None
-                        if not operator_turn:
-                            retired_over_label = prior.label
-                            self.state.clear_mood()
-                    elif (prior.label == "idle"
-                            and not (idle_seconds == 0.0
-                                     and (operator_turn
-                                          or label == "overloaded"))):
-                        return None
-                if retired_over_label:
-                    mood = None
-                    transition = False
-                else:
-                    transition = not (
-                        prior is not None and prior.label == label
-                        and getattr(prior, "source", "self") == "derived"
-                    )
-                    mood = self.state.set_mood(
-                        label, evidence, source="derived")
-            if retired_over_label:
-                # Internal clean turn falsified "overloaded": retired,
-                # nothing minted (see the acute-hold comment above).
-                try:
-                    from ..utils.logging import Icons, pretty_log
-                    pretty_log(
-                        "Selfhood",
-                        f"mood {retired_over_label} retired — its basis "
-                        "no longer holds",
-                        icon=Icons.SELF_STATE,
-                    )
-                except Exception:
-                    pass
-                return None
-            if mood is not None and transition:
-                # Guarded separately: the write above already happened,
-                # and a logging hiccup must not turn "wrote" into the
-                # caller seeing None.
-                try:
-                    from ..utils.logging import Icons, pretty_log
-                    if prior is not None and prior.label == label:
-                        # Provenance flip (self→derived on the same
-                        # label): "mood curious → curious" reads as a
-                        # bug in the live stream — say what happened.
-                        msg = (f"mood {label} re-derived from live "
-                               f"signals (was self-noted): {evidence}")
-                    else:
-                        prior_label = (prior.label if prior is not None
-                                       else "(none)")
-                        msg = f"mood {prior_label} → {label}: {evidence}"
-                    pretty_log("Selfhood", msg, icon=Icons.SELF_STATE)
-                except Exception:
-                    pass
-            return mood
+            _before, after = self.state.nudge(ev.dp, ev.de, ev.cause, ev.kind,
+                                             novelty=ev.novelty, now=now)
         except Exception as e:
-            logger.debug("update_derived_mood skipped: %s: %s",
-                         type(e).__name__, e)
+            logger.debug("mood event skipped: %s: %s", type(e).__name__, e)
             return None
+        return after
 
-    def _maybe_retire_acute_mood(
-        self, *, pressure_lockdown: bool, idle_seconds: float,
-        operator_turn: bool = False,
-    ) -> bool:
-        """Clear a derived acute mood whose basis is falsified (see the
-        call site in ``update_derived_mood``). Only ever touches
-        ``source="derived"`` moods — a self-authored label is the
-        agent's own statement and ages out via grace + TTL instead.
-
-        Retirement happens ONLY on the post-turn path (idle_seconds ==
-        0.0, i.e. a turn just completed). "overloaded" is turn-scoped:
-        ANY cleanly-completed turn falsifies "the last turn ended under
-        lockdown". "idle" is operator-scoped and additionally requires
-        ``operator_turn`` — scheduled tasks and job resumes run this
-        same hook at 3am while the operator is genuinely away, and
-        letting them retire "idle" re-created the retire→re-derive
-        flap (review R4; the hook derives operator_turn from
-        ``is_internal_request(req_id)``). The idle tick can NEVER
-        retire: its clock is saw-toothed by phase 3's
-        last_activity_time reset in the self-play finally, so a small
-        idle reading there does not prove the operator returned
-        (probe-proven flap, review R3).
-        Returns True when a mood was cleared. Never raises."""
+    def note_owner_turn(self, signals: "M.TurnSignals", *, now=None) -> Optional[MoodView]:
+        """The end of an OWNER's turn: what happened in it moves the mood
+        (``mood.turn_events``), as one move. The caller decides that the turn
+        was the owner's — this method does not know who asked. A plain chat
+        turn changes nothing. Returns the mood after, or None when nothing
+        moved."""
         try:
-            if self.state is None:
-                return False
-            if idle_seconds != 0.0:
-                return False
-            with self.state.lock:
-                prior = self.state.mood()
-                if (prior is None
-                        or getattr(prior, "source", "self") != "derived"):
-                    return False
-                # The lockdown guard is unreachable from the current
-                # call site (derive_mood returns "overloaded" whenever
-                # the flag is set, so the verdict-None branch implies
-                # it's off) but is part of this helper's OWN contract —
-                # a caller passing lockdown=True must not retire the
-                # reading it just confirmed. Pinned by a direct test.
-                falsified = (
-                    (prior.label == "idle" and operator_turn)
-                    or (prior.label == "overloaded"
-                        and not pressure_lockdown)
-                )
-                if not falsified:
-                    return False
-                cleared = self.state.clear_mood()
-            if cleared:
-                try:
-                    from ..utils.logging import Icons, pretty_log
-                    pretty_log(
-                        "Selfhood",
-                        f"mood {prior.label} retired — its basis no "
-                        "longer holds",
-                        icon=Icons.SELF_STATE,
-                    )
-                except Exception:
-                    pass
-            return cleared
+            ev = M.merge_events(M.turn_events(signals))
         except Exception as e:
-            logger.debug("acute-mood retirement skipped: %s: %s",
-                         type(e).__name__, e)
-            return False
+            logger.debug("mood turn events skipped: %s: %s", type(e).__name__, e)
+            return None
+        return self._apply(ev, now=now)
+
+    def note_owner_reaction(self, kind: str, *, now=None) -> Optional[MoodView]:
+        """A thumbs-up / thumbs-down, a correction of the last reply, thanks
+        (``mood.KIND_*``). The caller decides that it was the OWNER's."""
+        return self._apply(M.reaction_event(str(kind or "")), now=now)
+
+    def owner_arrived(self, *, now=None) -> None:
+        """An owner's request has arrived. Writes down what time did to the
+        mood, closes a boredom the journal holds ("the quiet ended"), and
+        stamps the owner's presence in the state file. The caller decides
+        that the request is the OWNER's. Never raises."""
+        if not self.enabled or self.state is None:
+            return
+        try:
+            self.state.owner_arrived(now=now)
+        except Exception as e:
+            logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
+
+    def owner_turn_ended(self, *, now=None) -> None:
+        """An owner's turn has ended: the next quiet is measured from here
+        (persisted, so a restart does not change it). Never raises."""
+        if not self.enabled or self.state is None:
+            return
+        try:
+            self.state.mark_owner_turn(now=now)
+        except Exception as e:
+            logger.debug("mood owner-turn stamp skipped: %s: %s", type(e).__name__, e)
 
     # -----------------------------------------------------------------
     # Idle-path APIs (called by biological watchdog phase 2.8)
     # -----------------------------------------------------------------
 
-    async def consolidate_narrative(self, *, meta_insights: str = "") -> str:
+    async def consolidate_narrative(self) -> str:
         """Re-generate the running first-person narrative. Called by
         the biological watchdog phase 2.8 during idle windows.
-
-        ``meta_insights`` lets the caller fold in cross-phase learning —
-        heuristics the dream phase consolidated, failure patterns the
-        reflection phase found — so the diary becomes self-knowledge,
-        not just an experience log.
 
         Returns the new narrative text (or empty string when the
         consolidation was skipped — e.g. no experiences yet)."""
@@ -688,7 +322,6 @@ class SelfModel:
         try:
             return await self.narrative.regenerate(
                 autobio=self.autobio, state=self.state,
-                meta_insights=meta_insights,
             )
         except Exception as e:
             logger.warning("narrative consolidation failed: %s", e)
@@ -704,7 +337,7 @@ class SelfModel:
         scripts and for log-line summaries."""
         if not self.enabled:
             return {"enabled": False}
-        _mood = self.state.mood() if self.state else None
+        _mood = self.mood()
         return {
             "enabled": True,
             "root": str(self.root),
@@ -714,21 +347,17 @@ class SelfModel:
             # noise rendered as what the agent thinks about.
             "session_boots": (self.autobio.boot_count()
                               if self.autobio else 0),
-            "open_questions": len(self.state.open_questions()) if self.state else 0,
-            "unfinished_threads": len(self.state.unfinished_threads()) if self.state else 0,
-            "last_mood": _mood.label if _mood else "",
-            # Provenance + freshness (mood rework 2026-08-20) so the
-            # introspection surfaces can render honest age/stale flags
-            # instead of presenting an old label as current.
-            "last_mood_source": (getattr(_mood, "source", "self")
-                                 if _mood else ""),
-            "last_mood_set_at": (_mood.set_at if _mood else ""),
-            # The falsifiable half of a derived mood ("my last 5
-            # verdict-bearing turns all passed") — the label alone is an
-            # unfalsifiable vibe, which is the defect derive_mood replaced.
-            "last_mood_evidence": (_mood.evidence if _mood else ""),
+            # §4TC: the mood as it is NOW — "" for a neutral one — with its
+            # intensity (0–3), who set it ("auto" | "owner"), since when and
+            # the latest cause; and the manner the owner set, if any.
+            "last_mood": "" if _mood.neutral else _mood.label,
+            "last_mood_intensity": _mood.intensity,
+            "last_mood_source": _mood.source,
+            "last_mood_set_at": _mood.set_at,
+            "last_mood_cause": _mood.cause,
+            "manner": _mood.manner,
+            "manner_intensity": _mood.manner_intensity,
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),
-            "principle_count": len(self.values.principles()) if self.values else 0,
         }

@@ -359,16 +359,14 @@ def _int(v) -> int:
         return 0
 
 
-_SYSTEM_COMMAND_RE = re.compile(
-    r"^\s*(?:show|list|learn|forget|dismiss|keep|confirm|replace)\b[^\n]{0,60}\b(?:rules?|tests?)\b"
-    r"|^\s*(?:show|list)\s+(?:me\s+)?(?:all\s+|my\s+)?(?:proposed|candidate)\s+rules?"
-    r"|^\s*/?mirror\s*[.!?]*\s*$", re.IGNORECASE)   # §4SV
-
-
 def is_system_command(request: str) -> bool:
-    """A rule/test command the system answers without the model (§4PY/§4PZ):
-    its reply is a listing of THEN, never an answer worth repeating."""
-    return bool(_SYSTEM_COMMAND_RE.search(str(request or "")))
+    """A command the system answers without the model (§4PY): its reply is a
+    listing of THEN, never an answer worth repeating. §4SZ: the commands'
+    OWN matchers — the loose pattern that stood here ("show … tests",
+    "list … rules") also took "show me the failing tests" for one."""
+    from ..core.owner_rules import is_rule_command
+    from ..selfhood.mirror import is_mirror_command
+    return is_rule_command(request) or is_mirror_command(request)
 
 
 def _jsonl(path: Path) -> Iterable[dict]:
@@ -695,7 +693,7 @@ def sync_experience_index(context=None, *, store: Optional["ExperienceMemory"] =
     if system_dir is None or not Path(system_dir).is_dir():
         return {}
     from ..distill.collector import TrajectoryCollector
-    from .skills import iter_teachable
+    from .population import iter_teachable
     col = TrajectoryCollector(root=Path(system_dir) / "trajectories", enabled=False)
     labels = load_labels(system_dir)
     # the ONE filter every learner reads the corpus through (members, probes,

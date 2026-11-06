@@ -12,7 +12,7 @@ Pinned findings:
     `<tool_call>`) must NOT be routed into the XML healer and drop the real
     native calls. (lens B)
   * MAJOR M2 — batch-dedup collapse denylist gap: byte-identical
-    side-effecting calls (postgres_admin / jobs / manage_composed_skills) in
+    side-effecting calls (postgres_admin / jobs / a custom skill's runner) in
     one batch must NOT collapse to a single execution. (lens A)
   * MAJOR M1 / MD7,MD8,MD9 — the live pre-flight repeat-failure guard's
     block / record / world-changed-reset wiring, previously pinned only by
@@ -149,7 +149,6 @@ def _ts(**over):
         last_user_content="do the thing",
         char_budget=4000,
         strikes=StrikeLedger(),
-        task_tree=MagicMock(),
         _user_batch_intent=None,
         _request_constraints=[],
         repeated_action_steered=set(),
@@ -213,18 +212,20 @@ class TestBatchCollapseSideEffectingTools:
         assert calls["n"] == 2
 
     @pytest.mark.asyncio
-    async def test_duplicate_composed_skill_runs_not_collapsed(self):
+    async def test_duplicate_custom_skill_runs_not_collapsed(self):
+        # (pinned on the macro manager's `run` until the macro engine was removed, §4TA;
+        # a runtime-registered acquired skill is the same case)
         agent = _dispatch_agent()
         calls = {"n": 0}
 
-        async def macro(**kwargs):
+        async def skill(**kwargs):
             calls["n"] += 1
-            return "ran macro"
+            return "ran skill"
 
-        agent.available_tools = {"manage_composed_skills": macro}
+        agent.available_tools = {"deploy_and_verify": skill}
         args = {"action": "run", "name": "deploy"}
-        tc = [_call("manage_composed_skills", args),
-              _call("manage_composed_skills", args)]
+        tc = [_call("deploy_and_verify", args),
+              _call("deploy_and_verify", args)]
         tc[0]["id"], tc[1]["id"] = "s0", "s1"
         ts = _ts(tool_calls=tc)
         await agent._dispatch_and_process_tool_batch(ts)

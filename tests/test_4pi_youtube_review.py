@@ -188,7 +188,7 @@ def test_the_title_is_one_clean_line_and_the_sidecar_records_a_stop():
 
 
 def test_url_is_an_accepted_argument_name():
-    """R1-m6: the macro teaches `url`, the tool refused it."""
+    """R1-m6: `youtube_transcribe` (a macro then, a built-in since §4TA) teaches `url`, the tool refused it."""
     assert "url" in mem._KB_TARGET_ALIASES and "link" in mem._KB_TARGET_ALIASES
 
 

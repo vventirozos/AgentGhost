@@ -278,8 +278,6 @@ async def test_memory_correct_runs_the_store_off_the_loop_and_answers():
 @pytest.mark.parametrize("route,body,attr,method", [
     ("memory_correct", {"match": "a", "replacement": "b"}, "memory_system", "correct_fragment"),
     ("memory_delete", {"match": "a"}, "memory_system", "delete_fragment"),
-    ("memory_delete_skill_twin", {"triggers": ["t"]}, "memory_system", "delete_skill_twins"),
-    ("lessons_quarantine", {"trigger": "t", "reason": "r"}, "skill_memory", "quarantine_lesson"),
 ])
 async def test_a_store_that_never_returns_yields_504_within_the_bound(monkeypatch, route, body, attr, method):
     monkeypatch.setattr(R, "_STORE_CALL_TIMEOUT_S", 0.2)
@@ -289,7 +287,7 @@ async def test_a_store_that_never_returns_yields_504_within_the_bound(monkeypatc
         started.set()
         time.sleep(2.0)
         return True, {}
-    store = SimpleNamespace(**{method: stuck, "is_read_only": False})
+    store = SimpleNamespace(**{method: stuck})
     agent = MagicMock()
     setattr(agent.context, attr, store)
     t0 = time.monotonic()

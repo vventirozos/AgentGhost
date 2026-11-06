@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -96,8 +96,7 @@
     <a class="card" href="core/request_scope.html"><h3>request_scope</h3><p>The request's project and conversation, carried in a ContextVar (&sect;4SX B0).</p></a>
     <a class="card" href="core/evidence_gate.html"><h3>evidence_gate</h3><p>The evidence-sufficiency check on a turn's tool results (its steer was removed in §4NN).</p></a>
     <a class="card" href="core/feedback.html"><h3>feedback</h3><p>Human 👍/👎 outcome labels.</p></a>
-    <a class="card" href="core/regression.html"><h3>regression</h3><p>The owner's regression suite: approved tests from real failures, re-run after each deploy and daily.</p></a>
-    <a class="card" href="core/isolation.html"><h3>isolation</h3><p>Detached context, forked workspace, no-network sandbox &mdash; the substrate for failure replay.</p></a>
+    <a class="card" href="core/isolation.html"><h3>isolation</h3><p>Detached context, forked workspace, no-network sandbox. No live consumer since the failure replay was removed (2026-11-05).</p></a>
     <a class="card" href="core/objection.html"><h3>objection</h3><p>Settling a judge's objections by arithmetic before spending a model call. Idle while the LLM judge is off (§4OW).</p></a>
     <a class="card" href="core/strikes.html"><h3>strikes</h3><p>Error-strike accounting.</p></a>
     <a class="card" href="core/code_claims.html"><h3>code_claims</h3><p>Did this turn RUN what it wrote? The claim-keyed arm of the unverified-write guard.</p></a>
@@ -123,7 +122,7 @@
     <a class="card" href="memory/profile.html"><h3>profile</h3><p>Durable facts about the user.</p></a>
     <a class="card" href="memory/temporal.html"><h3>temporal</h3><p>Anchoring facts that decay: store the birth date, derive the age.</p></a>
     <a class="card" href="memory/attribution.html"><h3>attribution</h3><p>Who said it: a fact about the owner needs the owner's own first-person statement.</p></a>
-    <a class="card" href="memory/skills.html"><h3>skills</h3><p>The lesson playbook.</p></a>
+    <a class="card" href="memory/skills.html"><h3>skills (removed)</h3><p>The lesson playbook, removed 2026-11-06: what it was and what replaced it.</p></a>
     <a class="card" href="memory/journal.html"><h3>journal</h3><p>The short-term queue.</p></a>
     <a class="card" href="memory/episodes.html"><h3>episodes</h3><p>Action sequences and outcomes.</p></a>
     <a class="card" href="memory/experience.html"><h3>experience</h3><p>Human-graded past turns: steps and sources. Built, off in production (§4QL).</p></a>
@@ -159,7 +158,7 @@
     <a class="card" href="tools/workspace.html"><h3>workspace</h3><p>Reading the world model.</p></a>
     <a class="card" href="tools/workspace_track.html"><h3>workspace_track</h3><p>Writing to the world model.</p></a>
     <a class="card" href="tools/acquired_skills.html"><h3>acquired_skills</h3><p>Tools Ghost wrote for itself.</p></a>
-    <a class="card" href="tools/composed_skills.html"><h3>composed_skills</h3><p>Chaining skills together.</p></a>
+    <a class="card" href="tools/composed_skills.html"><h3>composed_skills</h3><p>Removed (&sect;4TA): macros are gone.</p></a>
     <a class="card" href="tools/tool_failure.html"><h3>tool_failure</h3><p>Failure classification.</p></a>
     <a class="card" href="tools/outcome.html"><h3>outcome</h3><p>What a call did, as data.</p></a>
     <a class="card" href="tools/fallback_chains.html"><h3>fallback_chains</h3><p>What to try when a tool fails.</p></a>
@@ -194,12 +193,12 @@
       <tr><td><code>optim/</code></td><td>The prompt loader, signatures and gate contract that render tool descriptions. (The optimizer, its autonomy loop and the A/B evaluator were removed on 2026-10-11, §4NM.)</td></tr>
       <tr><td><code>eval/</code></td><td>The evaluation suite and baselines. (The bench banks were removed on 2026-10-11, §4NM.)</td></tr>
       <tr><td><code>utils/</code></td><td>Logging, redaction, the egress guard, tokenisation, constraint handling.</td></tr>
-      <tr><td>~20 <code>core/</code> modules</td><td>Including <code>metacog</code>, <code>turns</code>, <code>jobs</code>, <code>failure_replay</code>, <code>learning_health</code>, <code>stream_guards</code>.</td></tr>
+      <tr><td>~20 <code>core/</code> modules</td><td>Including <code>metacog</code>, <code>turns</code>, <code>jobs</code>, <code>owner_rules</code>, <code>learning_health</code>, <code>stream_guards</code>.</td></tr>
     </tbody>
   </table>
   </div>
 
-  <p>The learning stack that used to sit beside these packages — <code>reflection/</code>, <code>skills_auto/</code>, <code>prm/</code>, <code>router/</code>, <code>evolve/</code>, the optimizer half of <code>optim/</code> — was removed on 2026-10-11 (§4NM); <a href="learning-loop.html">The learning loop</a> describes what replaced it.</p>
+  <p>The learning stack that used to sit beside these packages — <code>reflection/</code>, <code>skills_auto/</code>, <code>prm/</code>, <code>router/</code>, <code>evolve/</code>, the optimizer half of <code>optim/</code> — was removed on 2026-10-11 (§4NM). The failure-replay loop and the regression suite that replaced it (<code>core/failure_replay.py</code>, <code>core/regression.py</code>) were removed on 2026-11-05 (§4SZ). What is left is the owner's rules, <code>core/owner_rules.py</code>: see <a href="learning-loop.html">Owner rules</a> and <a href="core/agent.html#4sz">§4SZ on the agent page</a>.</p>
 
   <div class="note">
     <strong>Two pages describe modules that no longer exist:</strong> <a href="core/workspace_model.html">core/workspace_model</a> (the code now lives in <code>workspace/model.py</code>) and <a href="tools/qwen_bridge.html">tools/qwen_bridge</a> (removed). <a href="core/agent_qwen.html">core/agent_qwen</a> is an intentional tombstone. They're kept so existing links don't break — treat their contents as historical.

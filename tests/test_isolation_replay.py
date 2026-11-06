@@ -44,8 +44,9 @@ from ghost_agent.core.isolation import (
     BackgroundOnlyLLM,
     IsolatedRun,
     ReadOnlyGraphMemory,
-    ReadOnlySkillMemory,
     ReadOnlyVectorMemory,
+    is_simulated_context,
+    mark_simulated,
     fork_workspace,
     isolated_replay_context,
     null_production_state,
@@ -68,7 +69,6 @@ def _live_context(**extra):
     ctx.sandbox_dir = "/nonexistent/live-workspace"
     ctx.tor_proxy = "socks5://127.0.0.1:9050"
     ctx.memory_system = MagicMock()
-    ctx.skill_memory = MagicMock()
     ctx.graph_memory = MagicMock()
     ctx.llm_client = MagicMock()
     ctx.args = MagicMock()
@@ -179,45 +179,6 @@ def test_vector_facade_raises_on_unlisted_attribute():
     ro = ReadOnlyVectorMemory(MagicMock())
     with pytest.raises(AttributeError, match="passthrough whitelist"):
         ro.a_future_mutator
-
-
-def test_skill_facade_blocks_every_write_and_records_sim_triggers():
-    real = MagicMock()
-    real.get_playbook_context.return_value = "ctx"
-    real.last_sim_triggers = ["trigger-a"]
-    ro = ReadOnlySkillMemory(real)
-
-    assert ro.is_read_only is True
-    assert ro.get_playbook_context("q") == "ctx"
-    kw = real.get_playbook_context.call_args.kwargs
-    assert kw["record_retrievals"] is False and kw["stamp_triggers"] is False
-    assert ro.hydrated_triggers == ["trigger-a"]
-
-    ro.learn_lesson("t", "a", "c")
-    ro.quarantine_lesson("t")
-    ro.retract_lessons_from_trajectory("id")
-    real.learn_lesson.assert_not_called()
-    real.quarantine_lesson.assert_not_called()
-    real.retract_lessons_from_trajectory.assert_not_called()
-
-
-def test_skill_facade_bulk_credit_captures_but_never_credits():
-    real = MagicMock()
-    ro = ReadOnlySkillMemory(real)
-    assert ro.record_retrievals_bulk(["t1", "t2"]) == 0
-    assert ro.hydrated_triggers == ["t1", "t2"]
-    real.record_retrievals_bulk.assert_not_called()
-
-
-def test_skill_facade_does_not_leak_the_last_real_turns_triggers():
-    """`last_playbook_triggers` is OFF the whitelist on purpose: the sim
-    stamps nothing, so a passthrough read served the LAST REAL USER
-    TURN's lesson set."""
-    real = MagicMock()
-    real.last_playbook_triggers = ["a-real-users-lesson"]
-    ro = ReadOnlySkillMemory(real)
-    with pytest.raises(AttributeError, match="passthrough whitelist"):
-        ro.last_playbook_triggers
 
 
 def test_graph_facade_blocks_mutations():
@@ -396,27 +357,75 @@ async def test_replay_context_detaches_every_production_handle():
 
 async def test_replay_context_wraps_memory_read_only():
     ctx = _live_context()
-    real_vm, real_sm = ctx.memory_system, ctx.skill_memory
+    real_vm, real_gm = ctx.memory_system, ctx.graph_memory
     async with isolated_replay_context(ctx, with_sandbox=False) as run:
         iso = run.context
         assert isinstance(iso.memory_system, ReadOnlyVectorMemory)
-        assert isinstance(iso.skill_memory, ReadOnlySkillMemory)
         assert isinstance(iso.graph_memory, ReadOnlyGraphMemory)
         iso.memory_system.add("x")
-        iso.skill_memory.learn_lesson("t", "a", "c")
+        iso.graph_memory.add_triplets([("a", "b", "c")])
         real_vm.add.assert_not_called()
-        real_sm.learn_lesson.assert_not_called()
+        real_gm.add_triplets.assert_not_called()
     assert ctx.memory_system is real_vm
 
 
 async def test_replay_isolate_reads_as_a_simulation():
     """The simulation gates decide "this is a sim" by asking
-    ``context.skill_memory.is_read_only`` — that is what keeps replayed
-    turns out of the production stores (§4J). Pinned at the property the
-    gates actually read."""
+    ``is_simulated_context(context)`` — the context's ``simulated`` flag
+    (§4TD; it was the read-only lesson-store wrapper) — and that is what
+    keeps replayed turns out of the production stores (§4J). Pinned at the
+    property the gates actually read; the LIVE context it was copied from
+    is not marked."""
     ctx = _live_context()
+    ctx.simulated = False
     async with isolated_replay_context(ctx, with_sandbox=False) as run:
-        assert getattr(run.context.skill_memory, "is_read_only", False) is True
+        assert run.context.simulated is True
+        assert is_simulated_context(run.context) is True
+        assert ctx.simulated is False and is_simulated_context(ctx) is False
+
+
+async def test_a_copy_that_will_not_take_the_mark_is_never_handed_out():
+    """FAIL CLOSED (§4TD): a context that refuses the ``simulated`` stamp
+    must not come out of the recipe looking like the live one."""
+    import copy as _copy
+
+    class _Stubborn:
+        def __init__(self):
+            self.__dict__["args"] = None
+        def __setattr__(self, name, value):
+            if name == "simulated":
+                return                       # swallowed: the flag never lands
+            self.__dict__[name] = value
+        def __copy__(self):
+            new = type(self)()
+            new.__dict__.update(self.__dict__)
+            return new
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        mark_simulated(_Stubborn())
+    entered = False
+    with pytest.raises(RuntimeError, match="simulated"):
+        async with isolated_replay_context(_Stubborn(), with_sandbox=False):
+            entered = True
+    assert entered is False
+
+
+def test_the_simulated_mark_is_the_stamp_itself_and_an_unreadable_flag_counts_as_set():
+    """``is True`` — a test double's auto-made attribute, a string or a 1 is
+    not the stamp; a flag whose read raises is treated as SET."""
+    from types import SimpleNamespace as _NS
+    assert is_simulated_context(None) is False
+    assert is_simulated_context(_NS()) is False
+    assert is_simulated_context(_NS(simulated=False)) is False
+    assert is_simulated_context(_NS(simulated=True)) is True
+    assert is_simulated_context(MagicMock()) is False
+    assert is_simulated_context(_NS(simulated=1)) is False
+
+    class _Raises:
+        @property
+        def simulated(self):
+            raise OSError("cannot read")
+    assert is_simulated_context(_Raises()) is True
 
 
 async def test_replay_context_copies_args_instead_of_sharing_them():
@@ -713,8 +722,9 @@ async def test_containment_denies_the_union_of_both_precedents():
     dream.py's self-play denylist — were removed in §4SI/§4NM; the names they
     denied are pinned literally in test_4si_containment_pins.)"""
     # …plus the tools NEITHER sibling denies, found by the S1 review.
-    for gap in ("manage_composed_skills", "notify_operator", "deploy",
-                "rotate_secrets", "knowledge_base"):
+    # (`manage_composed_skills` was on this list until the tool was removed, §4TA)
+    for gap in ("notify_operator", "deploy",
+                "rotate_secrets", "knowledge_base", "youtube_transcribe"):
         assert gap in REPLAY_FORBIDDEN_TOOLS
 
 
@@ -810,9 +820,7 @@ async def test_shared_lru_rings_are_rebound():
     ctx = _live_context()
     rings = {}
     for name in ("_turn_facts_recent", "_recent_turn_outcome",
-                 "_recent_trajectories_for_correction",
-                 "_surfaced_triggers_by_traj", "_flushed_triggers_by_traj",
-                 "_composed_skill_registry"):
+                 "_recent_trajectories_for_correction"):
         od = OrderedDict()
         od[f"live-{name}"] = object()
         setattr(ctx, name, od)
@@ -829,7 +837,7 @@ async def test_shared_lru_rings_are_rebound():
 async def test_the_isolate_reads_as_a_sim_to_turn_origin():
     """`turn_origin` is the single derivation that arms roughly eight
     `$GHOST_HOME` write gates at once. Nothing pinned it on this path,
-    and it is one `iso.skill_memory = <something>` away from opening all
+    and it is one dropped `mark_simulated(iso)` away from opening all
     of them."""
     from ghost_agent.core.agent import turn_origin
     ctx = _live_context()
@@ -1024,22 +1032,21 @@ _DELIBERATE_KEEPERS = {
     # process a replay exists to reproduce
     "metacog",
     # replaced (not nulled) by the isolation recipe itself
-    "memory_system", "skill_memory", "graph_memory", "sandbox_manager",
+    "memory_system", "graph_memory", "sandbox_manager",
     "scratchpad", "llm_client", "memory_dir", "sandbox_dir", "args",
     # process/host state a turn cannot reach outward through
     "tor_proxy", "_tor_guard_uninstall", "last_activity_time",
     "cached_sandbox_state", "last_user_content",
     "biological_task",   # §4PJ: the confidence/entropy/calibration stashes went
-    # containment markers this module sets
-    "_replay_forbidden_tools", "_subagent_allowed_tools",
+    # containment markers this module sets (§4TD: `simulated` — False on
+    # the live context, stamped True on the copy)
+    "_replay_forbidden_tools", "_subagent_allowed_tools", "simulated",
     # per-turn labels the recipe clears explicitly
     "trajectory_task_kind", "turn_origin_label", "trajectory_extra_static",
     "trajectory_user_request_override",
     # shared rings the recipe REBINDS (fresh object, not None)
     "_turn_facts_recent", "_recent_turn_outcome",
     "_recent_trajectories_for_correction",
-    "_surfaced_triggers_by_traj", "_flushed_triggers_by_traj",
-    "_composed_skill_registry",
 }
 
 
@@ -1090,10 +1097,8 @@ def test_the_keeper_list_stays_honest():
     # isolation-local markers (fine) or dead names.
     unknown = sorted(_DELIBERATE_KEEPERS - attached - {
         "_replay_forbidden_tools", "_subagent_allowed_tools",
-        "_flushed_triggers_by_traj",
-        "_composed_skill_registry", "_turn_facts_recent",
+        "_turn_facts_recent",
         "_recent_turn_outcome", "_recent_trajectories_for_correction",
-        "_surfaced_triggers_by_traj",
         "trajectory_task_kind",
         "turn_origin_label", "trajectory_extra_static",
         "trajectory_user_request_override",

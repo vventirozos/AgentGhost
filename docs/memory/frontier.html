@@ -33,7 +33,7 @@
 
   <h1>memory / frontier.py — FrontierTracker</h1>
   <p class="subtitle">Per-cluster self-play telemetry: mastery, brittleness, difficulty tiers, saturation.</p>
-  <p class="note warn"><strong>Idle since 2026-10-11 (§4NM).</strong> Synthetic self-play — the pipeline that recorded runs here and chose the next cluster from them — was removed, together with the PRM-weighted <code>pick_frontier_seed</code> path (<code>core/frontier_selection.py</code>), the challenge templates whose tiers this store scaled, and the reflection phase that marked hot clusters. The idle slot now replays the owner's real failures (<code>core/failure_replay.py</code>) and does not pick clusters. The JSON file stays on disk with its recorded telemetry and the class is kept for reading it (and for the idle slot's adaptive cooldown); nothing records a new run. The sections below are the record of the mechanism as built.</p>
+  <p class="note warn"><strong>Idle since 2026-10-11 (§4NM).</strong> Synthetic self-play — the pipeline that recorded runs here and chose the next cluster from them — was removed, together with the PRM-weighted <code>pick_frontier_seed</code> path (<code>core/frontier_selection.py</code>), the challenge templates whose tiers this store scaled, and the reflection phase that marked hot clusters. The idle slot that followed it replayed the owner's real failures (<code>core/failure_replay.py</code>) and did not pick clusters; that slot, and the adaptive cooldown that read this store, were removed on 2026-11-05 (§4SZ). The JSON file stays on disk with its recorded telemetry and the class is kept for reading it; nothing records a new run. The sections below are the record of the mechanism as built.</p>
 
   <h2>Storage</h2>
   <ul>

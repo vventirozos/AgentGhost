@@ -14,7 +14,7 @@ exist, steps in an unsafe order, a contradiction with what the user supplied.
 SHADOW toward the owner. It writes ``system/verifier/knowledge_shadow.jsonl``;
 no reply, label or lesson reads it. §4NH (operator: "yes, factual ones only"):
 an "errors" verdict is ONE consumer's input — the failure replay's seed list
-(`owner_seeds.knowledge_errors`, read only by `failure_replay.pick_case`), which only picks a turn to REPLAY;
+(read by the failure-replay picker until §4SZ removed it), which only picked a turn to REPLAY;
 nothing is adopted without the owner. Its precision is measured
 against later human signals before anything acts on it — the verifier's own
 history (§4KK: 42 of 104 refutes were false) is why. Off-main: the critic or

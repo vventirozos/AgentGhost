@@ -188,7 +188,6 @@ async def test_lazy_bus_built_from_readonly_wrappers_does_not_touch_production()
 
     isolated_ctx.memory_system = ReadOnlyVec(real_vector)
     isolated_ctx.graph_memory = ReadOnlyGraph(real_graph)
-    isolated_ctx.skill_memory = None
     isolated_ctx.profile_memory = None
 
     # Call _get_memory_bus directly without instantiating a full GhostAgent

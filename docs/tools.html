@@ -22,7 +22,7 @@
     <a class="current" href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -110,7 +110,7 @@
   <p>That means a lot of "Ghost picked the wrong tool" problems are description problems, and they're fixed by editing text rather than code. The descriptions live in <code>src/ghost_agent/tools/registry.py</code>.</p>
 
   <div class="note">
-    <strong>If it reaches for the wrong tool repeatedly,</strong> tell it directly in the moment ("use the document search, not general recall"). To make it stick, give it a 👎: that starts the <a href="learning-loop.html">learning loop</a>, which replays the question and proposes a rule; say "learn rule N" and the rule is in every prompt from then on. A lesson you dictate yourself ("remember: for my documents, use the document search") is saved and found when it looks relevant, but it is not one of those every-prompt rules.
+    <strong>If it reaches for the wrong tool repeatedly,</strong> tell it directly in the moment ("use the document search, not general recall"). To make it stick, state a rule: "learn this rule: for my documents, use the document search, not general recall". Ghost stores the sentence itself and it is in every prompt of yours from then on (<a href="learning-loop.html">Owner rules</a>). The rule command is the only way to save one (the old lesson tools were removed on 2026-11-06, §4TD).
   </div>
 
   <h2>The full toolbox</h2>
@@ -141,7 +141,7 @@
     <tbody>
       <tr><td><code>web_search</code></td><td>Web search over Tor. The default for simple factual questions.</td></tr>
       <tr><td><code>deep_research</code></td><td>Searches several sources and synthesises a report. Slower — for genuinely complex topics.</td></tr>
-      <tr><td><code>fact_check</code></td><td>Verifies a specific claim against external sources.</td></tr>
+      <tr><td><code>fact_check</code></td><td>Verifies a specific claim against external sources: a verdict, followed by the pages it rested on (address, title and the evidence taken from each).</td></tr>
       <tr><td><code>darkweb_search</code> / <code>darkweb_research</code></td><td>Searches Tor hidden services. Results are unverified by definition — Ghost is told to treat them as such.</td></tr>
       <tr><td><code>vision_analysis</code></td><td>Looks at an image or PDF page.</td></tr>
       <tr><td><code>system_utility</code></td><td>Weather, your location, and a full health check of Ghost's own subsystems.</td></tr>
@@ -158,7 +158,7 @@
       <tr><td><code>knowledge_base</code></td><td>Ingests documents and recordings, asks a question against <em>one</em> document, records a fact, or forgets a topic.</td></tr>
       <tr><td><code>update_profile</code></td><td>Saves or deletes a durable fact about you.</td></tr>
       <tr><td><code>scratchpad</code></td><td>Parks a note for the current conversation only. Expires after a day.</td></tr>
-      <tr><td><code>learn_skill</code> / <code>list_lessons</code></td><td>Records a mistake-and-fix, and reads the lesson list back.</td></tr>
+      <tr><td><code>learn_skill</code> / <code>list_lessons</code> (removed)</td><td>Recorded a mistake-and-fix in the lesson store and read the list back. Removed with the store on 2026-11-06 (§4TD, <a href="memory/skills.html">what it was</a>). To give Ghost a standing instruction, use <a href="learning-loop.html">"learn this rule: …"</a>.</td></tr>
     </tbody>
   </table>
   </div>
@@ -171,7 +171,7 @@
       <tr><td><code>manage_projects</code></td><td>Durable projects with tasks, dependencies and status.</td></tr>
       <tr><td><code>manage_tasks</code></td><td>Scheduled tasks (a clock) and reactive watchers (a condition).</td></tr>
       <tr><td><code>workspace</code> / <code>workspace_track</code></td><td>Watches files for changes and records what happened in your world while Ghost was away.</td></tr>
-      <tr><td><code>notify_operator</code></td><td>Pushes you a notification when something needs you.</td></tr>
+      <tr><td><code>notify_operator</code></td><td>Queues a notification for you on your own channels (Slack DM, the web console; phone push only when configured). Its reply says which of them are connected right now.</td></tr>
     </tbody>
   </table>
   </div>
@@ -181,9 +181,8 @@
   <table>
     <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
     <tbody>
-      <tr><td><code>introspect</code></td><td>Reads back its mood, open questions, diary, recent experiences (with what it answered), what ran in the background, and what it learned. The honest answer to "how are you?", "tell me about yourself" and "what did you do while I was away?" — its <code>overview</code> action is the one-call briefing.</td></tr>
-      <tr><td><code>self_state</code></td><td>Records open questions and unfinished threads to carry into the next session.</td></tr>
-      <tr><td><code>replan</code> / <code>abort_attempt</code></td><td>Rethinks the approach, or declares a task impossible as specified rather than spiralling.</td></tr>
+      <tr><td><code>introspect</code></td><td>Reads back its mood, diary, recent experiences (with what it answered), what ran in the background, and what it learned. The honest answer to "how are you?", "tell me about yourself" and "what did you do while I was away?" — its <code>overview</code> action is the one-call briefing. Its mood runs by itself — it moves with what happens in your turns and with your thumbs, wears off by half every two hours, and is audible in how Ghost phrases its replies (since 2026-11-06). The <code>mood</code> action tells you why it is in the mood it is in. One action writes, and only in a message of your own: <code>set_mood</code> puts the mood where you tell it ("cheer up", "be neutral") at an intensity 1&ndash;3, and sets a manner ("be more sarcastic"); the separate <code>self_state</code> tool is gone.</td></tr>
+      <tr><td><code>abort_attempt</code></td><td>Declares a task impossible as specified rather than spiralling. (The <code>replan</code> tool listed here until 2026-11-05 was removed: it did nothing and was never called. Re-planning a project is <code>manage_projects</code> with <code>action="replan"</code>.)</td></tr>
     </tbody>
   </table>
   </div>
@@ -194,7 +193,7 @@
     <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
     <tbody>
       <tr><td><code>create_skill</code> / <code>manage_skills</code></td><td>Writes a new reusable tool for itself, test-first, and manages the ones it has.</td></tr>
-      <tr><td><code>manage_composed_skills</code></td><td>Chains existing skills into a bigger one.</td></tr>
+      <tr><td><em>(removed)</em></td><td><code>manage_composed_skills</code> (macros: named sequences of tool calls) was removed on 2026-11-05 (§4TA). <code>youtube_transcribe</code> is a built-in tool now. For a recurring bundle such as a daily report, dictate an <a href="learning-loop.html#macros">owner rule</a>.</td></tr>
       <tr><td><code>jobs</code></td><td>Tracks background work: a long <code>execute</code> command that outran its 10-minute budget: rather than being killed, a command still doing work is moved to the background and reported there.</td></tr>
       <tr><td><em>(removed)</em></td><td><code>delegate</code>, <code>delegate_to_swarm</code> and <code>dream_mode</code> were removed on 2026-10-30 (§4SI). Memory upkeep still runs on its own while idle. (The <code>self_play</code> practice tool went on 2026-10-11, §4NM.) <a href="self-improvement.html">More →</a></td></tr>
     </tbody>

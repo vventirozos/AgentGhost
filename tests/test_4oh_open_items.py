@@ -273,19 +273,6 @@ def test_our_notes_hand_nothing_over_and_are_stripped_for_the_judges():
     assert strip_system_notes("Answer text." + note) == "Answer text."
 
 
-def test_the_off_shadow_seeds_nothing(tmp_path, monkeypatch):
-    """Reader m6: its old rows (measured false) kept seeding the replay."""
-    import json, time
-    from ghost_agent.core.owner_seeds import knowledge_errors
-    (tmp_path / "verifier").mkdir()
-    (tmp_path / "verifier" / "knowledge_shadow.jsonl").write_text(json.dumps(
-        {"ts": time.time(), "trajectory_id": "t1", "verdict": "errors", "issues": [{"quote": "q", "why": "w"}]}) + "\n")
-    monkeypatch.setenv("GHOST_KNOWLEDGE_SHADOW", "0")
-    assert knowledge_errors(tmp_path, 14) == set()
-    monkeypatch.setenv("GHOST_KNOWLEDGE_SHADOW", "1")
-    assert knowledge_errors(tmp_path, 14) == {"t1"}
-
-
 @pytest.mark.asyncio
 async def test_the_streamed_source_check_reaches_the_record(tmp_path):
     """Battery P6 / reader M1: a note appended to full_content only was absent

@@ -699,12 +699,12 @@ async def test_probe_refuses_bad_input_before_any_call(tmp_path, kw):
     assert out.startswith("REJECTED") and ctx.llm_client.calls == []
 
 
-def test_probe_model_is_closed_to_members_replays_and_macros():
+def test_probe_model_is_closed_to_members_and_replays():
+    # (and to macro steps, until the macro engine was removed — §4TA)
     from ghost_agent.core.agent import _MEMBER_ALLOWED_TOOLS
     from ghost_agent.core.isolation import REPLAY_FORBIDDEN_TOOLS
-    from ghost_agent.tools.composed_skills import MACRO_FORBIDDEN_STEP_TOOLS
     assert "probe_model" not in _MEMBER_ALLOWED_TOOLS
-    assert "probe_model" in REPLAY_FORBIDDEN_TOOLS and "probe_model" in MACRO_FORBIDDEN_STEP_TOOLS
+    assert "probe_model" in REPLAY_FORBIDDEN_TOOLS
 
 
 GOAL = ("Test the hypothesis that 3-layer recursive thinking culminates in self-affirming "

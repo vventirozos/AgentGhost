@@ -41,6 +41,8 @@
   <h2>What a row is</h2>
   <p>One row per past <strong>owner</strong> turn with a <strong>human</strong> label: the request, the grade and the grader's reason, the tool steps it took (<code>web_search("…") → browser(postgresql.org)</code>), the sources that answered it (URLs the browser opened without error), the ones that failed (host plus the failure's own words, never the page's), and — only for a graded RIGHT answer to a question whose answer does not move — a short gist of the answer. Rows are built by <code>ExperienceMemory.sync</code> from the trajectory collector and the label files; the request's embedding (the vector store's own model) is kept beside the row, so similarity is a brute-force cosine over a few hundred vectors and the chroma collection is never touched.</p>
 
+  <p><strong>No answer gist for a system command.</strong> A command the system answers without the model (§4PY) is never stored with an answer gist: its reply is a listing of that moment, not an answer worth repeating. The test is <code>is_system_command(request)</code>, which since 2026-11-05 (§4SZ) is exactly <code>owner_rules.is_rule_command(request) or selfhood.mirror.is_mirror_command(request)</code> — the commands' own matchers. The loose pattern that stood there before ("show … tests", "list … rules") also took "show me the failing tests" for a command and was removed. The replay loop's old commands ("learn rule 3", "show me all proposed rules") are not system commands: nothing matches them any more, the model answers them, and they are treated like any other request here. <code>core/queued_messages.route</code> uses the same function to queue a system command sent while a turn is running (<a href="../core/sessions.html">core.sessions</a>).</p>
+
   <h3>Labels, in precedence</h3>
   <div class="scroll"><table>
     <thead><tr><th>Source</th><th>File</th><th>Grade</th></tr></thead>
@@ -50,7 +52,7 @@
       <tr><td>thumb</td><td>the corrections sidecar: <code>human_feedback:cli|web|slack:owner</code>, <code>user_correction</code></td><td>👍 = RIGHT, 👎 or a correction = WRONG</td></tr>
     </tbody>
   </table></div>
-  <p>A Slack <em>requester</em>'s reaction may be a member's and is not used. Judge verdicts (<code>verifier_late</code>, the reaction judge) are never labels: they were wrong on 9 of 17 refusals on real traffic (§4OW). A thumb is coarser than a grade ("satisfied", not "every specific right"), so a thumb-labelled case renders its steps and sources but never its answer text.</p>
+  <p>A Slack <em>requester</em>'s reaction may be a member's and is not used. Judge verdicts (<code>verifier_late</code>, and the reaction judge until it was removed on 2026-11-05) are never labels: they were wrong on 9 of 17 refusals on real traffic (§4OW). A thumb is coarser than a grade ("satisfied", not "every specific right"), so a thumb-labelled case renders its steps and sources but never its answer text.</p>
 
   <h3>Who is never indexed</h3>
   <p>A probe's turn, a member's turn, an undelivered reply, an ungraded turn, a request under two content words ("ok", "yes do it"), and any trajectory held out in the <code>excluded</code> table (an experiment's own cases, so a replay is leave-one-out).</p>
@@ -77,7 +79,7 @@
   <p>Boot: <code>Experience Memory — N human-graded past turns indexed; OFF in prompts …</code>. Per hydration the bus line carries the tier as <code>x=</code> (<code>x=-</code> when no store is wired, <code>x=0</code> when it found nothing).</p>
 
   <h2>Tests</h2>
-  <p><code>tests/test_4ql_experience.py</code> (36); battery <code>scripts/mutate_4ql.py</code> (54 mutants, 54 killed, no-op control survives, known-bad dies).</p>
+  <p><code>tests/test_4ql_experience.py</code> (36); <code>tests/test_4sz_system_commands.py</code> (<code>is_system_command</code> and the queue routing); battery <code>scripts/mutate_4ql.py</code> (54 mutants, 54 killed, no-op control survives, known-bad dies).</p>
 </main>
 </body>
 </html>

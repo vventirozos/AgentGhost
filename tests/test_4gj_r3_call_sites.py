@@ -55,7 +55,7 @@ def test_the_workspace_snapshot_never_hashes_through_a_planted_link(tmp_path):
     ("ghost_agent.core.isolation", None, "copytree_nofollow"),
 ])
 def test_the_model_writable_copies_go_through_the_nofollow_helper(module_name, func_name, needle):
-    """`acquired_skills` / `composed_skills` are model-writable, so the
+    """`acquired_skills` is model-writable (as `composed_skills` was until §4TA), so the
     isolated self-play copy and the fork's memory seed must not follow.
     (isolation passed `symlinks=False`, which FOLLOWS — the flag reads like
     a refusal and is the opposite.) Fails in the pre-fix world, where both

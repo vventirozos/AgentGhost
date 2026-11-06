@@ -8,7 +8,7 @@ from ghost_agent.core.agent import GhostAgent, GhostContext
 def mock_context():
     ctx = MagicMock(spec=GhostContext)
     ctx.memory_system = MagicMock()
-    ctx.skill_memory = MagicMock()
+    ctx.graph_memory = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
     ctx.scratchpad = MagicMock()
@@ -38,45 +38,21 @@ async def test_memory_search_is_async(mock_context):
         
         # Trigger handle_chat
         # "Hello" is a trivial trigger, preventing memory fetch. Use something else.
-        body = {"messages": [{"role": "user", "content": "Please remember this important fact"}]}
+        body = {"messages": [{"role": "user", "content": "what is my dog called and where does he sleep"}]}
         await agent.handle_chat(body, background_tasks=MagicMock())
         
         # Verify to_thread was called with the hydration's fetch entry point
-        # (§4NM: the lessons — the vector tier is retired from hydration).
+        # (§4NM: the owner's facts — the vector tier is retired from hydration).
         found_call = False
         offload_targets = (
-            mock_context.skill_memory.get_playbook_items,
+            mock_context.graph_memory.owner_facts_matching,
         )
         for call in mock_to_thread.call_args_list:
             # Check if the FIRST argument is the function we expect
             if call.args and call.args[0] in offload_targets:
-                assert call.args[1] == "Please remember this important fact"
+                assert call.args[1] == "what is my dog called and where does he sleep"
                 found_call = True
                 break
 
         assert found_call, f"the hydration fetch was not offloaded to thread. Calls: {mock_to_thread.call_args_list}"
 
-@pytest.mark.asyncio
-async def test_playbook_context_is_async(mock_context):
-    """Verify skill_memory.get_playbook_context is called via to_thread"""
-    agent = GhostAgent(mock_context)
-    
-    # Setup mocks
-    mock_context.memory_system.search.return_value = None # Skip memory search to isolate check or just ensure flow continues
-    mock_context.skill_memory.get_playbook_context.return_value = "Playbook Context"
-
-    with patch('asyncio.to_thread', new_callable=AsyncMock) as mock_to_thread:
-        mock_to_thread.return_value = "Playbook Context"
-        
-        body = {"messages": [{"role": "user", "content": "Help me code"}]}
-        await agent.handle_chat(body, background_tasks=MagicMock())
-        
-        # Verify to_thread was called with skill_memory.get_playbook_context
-        found_call = False
-        for call in mock_to_thread.call_args_list:
-            if call.args and call.args[0] == mock_context.skill_memory.get_playbook_context:
-                assert call.kwargs['query'] == "Help me code"
-                found_call = True
-                break
-        
-        assert found_call, "skill_memory.get_playbook_context was not offloaded to thread"

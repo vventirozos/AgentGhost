@@ -77,23 +77,6 @@ def test_recursive_split_text_nested_order():
 # memory/skills.py — _delete_lesson_twin Chroma where clause
 # ---------------------------------------------------------------------------
 
-def test_delete_lesson_twin_uses_and_operator():
-    from ghost_agent.memory.skills import _delete_lesson_twin
-
-    coll = MagicMock()
-    memory_system = MagicMock()
-    memory_system.collection = coll
-
-    _delete_lesson_twin(memory_system, {"trigger": "use venv python"})
-
-    assert coll.delete.called
-    where = coll.delete.call_args.kwargs.get("where") or coll.delete.call_args.args[0]
-    # Multi-key filters MUST be wrapped in $and — a flat two-key dict makes
-    # Chroma raise ValueError, which the helper swallows (silent no-op).
-    assert "$and" in where
-    assert {"type": "skill"} in where["$and"]
-    assert {"trigger": "use venv python"} in where["$and"]
-
 
 def test_delete_lesson_twin_flat_dict_rejected_by_chroma(tmp_path):
     """Empirical guard: the installed chromadb version rejects the old flat
@@ -111,36 +94,6 @@ def test_delete_lesson_twin_flat_dict_rejected_by_chroma(tmp_path):
 # ---------------------------------------------------------------------------
 # memory/skills.py — duplicate merge re-locates by key under the lock
 # ---------------------------------------------------------------------------
-
-def test_learn_lesson_merges_correct_entry_after_concurrent_prepend(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    # §4NC/§4NM: only approved-rule / dictation sources may write a lesson
-    sm.learn_lesson("target task", "old mistake", "old solution", source="learn_skill")
-
-    # Simulate a concurrent writer prepending a lesson AFTER the duplicate
-    # check found "target task" at index 0: the merge must land on the
-    # matching lesson, not on whatever now sits at the stale index.
-    original_find = sm._find_duplicate_lesson
-
-    def find_then_prepend(*args, **kwargs):
-        dup = original_find(*args, **kwargs)
-        playbook = sm._load_playbook()
-        playbook.insert(0, {"task": "interloper", "mistake": "x", "solution": "y",
-                            "trigger": "interloper", "frequency": 1})
-        sm.save_playbook(playbook)
-        return dup
-
-    sm._find_duplicate_lesson = find_then_prepend
-    sm.learn_lesson("target task", "old mistake", "a much longer and richer solution text",
-                    source="learn_skill")
-
-    playbook = sm._load_playbook()
-    by_task = {p.get("task") or p.get("trigger"): p for p in playbook}
-    assert int(by_task["target task"]["frequency"]) == 2
-    assert int(by_task["interloper"].get("frequency", 1)) == 1
-    assert "richer solution" in by_task["target task"]["solution"]
 
 
 # ---------------------------------------------------------------------------
@@ -171,40 +124,6 @@ def test_smart_update_query_excludes_protected_types():
     vm.collection.query.reset_mock()
     vm.smart_update("User location is Athens", "identity")
     assert vm.collection.query.call_args.kwargs["where"] == {"type": "identity"}
-
-
-# ---------------------------------------------------------------------------
-# selfhood/state.py — _cap evicts resolved entries before open ones
-# ---------------------------------------------------------------------------
-
-def test_cap_evicts_resolved_before_open():
-    from ghost_agent.selfhood.state import SelfStateThread
-
-    class Q:
-        def __init__(self, name, resolved=None):
-            self.name = name
-            self.resolved_at = resolved
-
-    seq = [Q("open-oldest")] + [Q(f"resolved-{i}", resolved="2026-01-01") for i in range(10)]
-    SelfStateThread._cap(seq, 10)
-
-    names = [q.name for q in seq]
-    assert "open-oldest" in names, "the only OPEN question must survive the cap"
-    assert len(seq) == 10
-
-
-def test_cap_still_bounds_all_open():
-    from ghost_agent.selfhood.state import SelfStateThread
-
-    class Q:
-        def __init__(self, name):
-            self.name = name
-            self.resolved_at = None
-
-    seq = [Q(f"open-{i}") for i in range(12)]
-    SelfStateThread._cap(seq, 10)
-    assert len(seq) == 10
-    assert seq[0].name == "open-2"  # oldest evicted when everything is open
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +352,6 @@ async def test_tool_remember_keeps_graph_task_reference(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-
 async def test_eval_suite_keeps_string_contract_for_non_template():
     """Non-template tasks must still validate on the output STRING even if
     the runner dict happens to carry a `passed` key."""
@@ -528,48 +446,6 @@ def test_main_gates_persistent_stores_under_no_memory():
 # crossed the watchdog's 120s idle threshold and woke the hippocampus
 # mid-request, piling consolidation LLM calls onto the same upstream)
 # ---------------------------------------------------------------------------
-
-async def test_perfect_it_helper_learns_with_provenance():
-    from ghost_agent.core.agent import GhostAgent
-
-    agent = GhostAgent.__new__(GhostAgent)
-    agent.context = MagicMock()
-    agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {"content": "<tool_call>x</tool_call> Use a Makefile."}}]
-    })
-    sm = MagicMock()
-    agent.context.skill_memory = sm
-    agent.context.memory_system = None
-
-    p_msg = await agent._perfect_it_generate_and_learn(
-        {"messages": []}, "Optimization Analysis: run tests...", "T-123"
-    )
-
-    assert p_msg == "Use a Makefile."  # tool_call stripped
-    kwargs = sm.learn_lesson.call_args.kwargs
-    assert kwargs["source_trajectory_id"] == "T-123"
-    assert kwargs["source"] == "perfection_protocol"
-    assert kwargs["solution"] == "Use a Makefile."
-    # The background path must be requested so the call yields to any
-    # foreground (e.g. verifier) completion.
-    cc_kwargs = agent.context.llm_client.chat_completion.call_args.kwargs
-    assert cc_kwargs.get("is_background") is True
-
-
-async def test_perfect_it_helper_skips_lesson_on_empty_output():
-    from ghost_agent.core.agent import GhostAgent
-
-    agent = GhostAgent.__new__(GhostAgent)
-    agent.context = MagicMock()
-    agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {"content": "<tool_call>only a hallucinated call</tool_call>"}}]
-    })
-    sm = MagicMock()
-    agent.context.skill_memory = sm
-
-    p_msg = await agent._perfect_it_generate_and_learn({"messages": []}, "label", "T-1")
-    assert p_msg == ""
-    sm.learn_lesson.assert_not_called()
 
 
 # (test_perfect_it_is_deferred_when_flag_off went with the deferred,

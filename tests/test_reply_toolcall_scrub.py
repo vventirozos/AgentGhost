@@ -183,12 +183,24 @@ def test_executed_the_delivered_reply_says_the_call_did_not_run():
     assert "The initial diff conflated tables and indexes." in out
 
 
-def test_executed_the_watchdogs_replan_marker_is_not_a_leak():
-    """The cognitive watchdog appends its own synthetic replan call to the
-    durable text on purpose; it must not be reported as a failed call."""
-    text = "Here is the analysis so far.\n</think>\n<tool_call>\n<function=replan>\n<parameter=reason>\nloop\n</parameter>\n</function>\n</tool_call>"
+def test_executed_the_watchdogs_note_is_not_a_leak():
+    """The cognitive watchdog appends a plain note to the durable text
+    (§4TB: no longer a synthetic `replan` call); it must not be reported as
+    a failed call."""
+    from ghost_agent.core.agent import WATCHDOG_BREAK_NOTE
+    text = "Here is the analysis so far." + WATCHDOG_BREAK_NOTE
     out = _finalize(text, tools=[])
     assert UNPARSED_TOOL_CALL_NOTE not in out, out
+    assert "SYSTEM OVERRIDE" in out
+
+
+def test_executed_a_replan_call_in_a_reply_is_an_unparsed_call_like_any_other():
+    """§4TB: the tool is removed and the watchdog no longer writes this
+    shape, so nothing exempts it from the scrub and its note."""
+    text = "Here is the analysis so far.\n\n<tool_call>\n<function=replan>\n<parameter=reason>\nloop\n</parameter>\n</function>\n</tool_call>"
+    out = _finalize(text, tools=[])
+    assert "<function=replan>" not in out and "<tool_call>" not in out, out
+    assert out.count(UNPARSED_TOOL_CALL_NOTE) == 1, out
 
 
 def test_executed_inline_code_about_the_syntax_is_content():
@@ -232,11 +244,25 @@ def test_a_tool_response_block_is_not_a_call():
     assert strip_unparsed_tool_calls(text) == text
 
 
-def test_the_replan_marker_is_preserved_in_the_record():
+def test_the_watchdog_note_is_preserved_in_the_record():
+    from ghost_agent.core.agent import WATCHDOG_BREAK_NOTE
     from ghost_agent.core.reply_smoothing import unparsed_call_markup_present
-    text = "text\n</think>\n<tool_call>\n<function=replan>\n<parameter=reason>\nx\n</parameter>\n</function>\n</tool_call>"
+    text = "text" + WATCHDOG_BREAK_NOTE
     assert not unparsed_call_markup_present(text)
     assert strip_unparsed_tool_calls(text) == text
+
+
+@pytest.mark.parametrize("call", [
+    "<tool_call>\n<function=replan>\n<parameter=reason>\nx\n</parameter>\n</function>\n</tool_call>",
+    '<function name="replan">\n<parameter name="reason">x</parameter>\n</function>',
+])
+def test_a_replan_call_is_not_exempt_from_the_scrub(call):
+    """§4TB: it was (the watchdog's marker had this shape). Both dialects."""
+    from ghost_agent.core.reply_smoothing import unparsed_call_markup_present
+    text = "text\n\n" + call
+    assert unparsed_call_markup_present(text)
+    out = strip_unparsed_tool_calls(text)
+    assert "replan" not in out and UNPARSED_TOOL_CALL_NOTE in out
 
 
 def test_whitespace_is_collapsed_only_at_the_seam():

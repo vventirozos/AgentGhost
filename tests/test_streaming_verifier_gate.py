@@ -58,8 +58,6 @@ def agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None
@@ -78,7 +76,6 @@ def _refuted(conf=0.9, issues=None):
 
 def test_force_correction_queues_banner_outside_async_mode(member_turn, agent, monkeypatch):
     monkeypatch.delenv("GHOST_CRITIC_ASYNC", raising=False)
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
@@ -98,7 +95,6 @@ def test_default_still_does_not_queue_outside_async_mode(agent, monkeypatch):
     (the non-streaming inline path already appended a Verifier note; a
     banner on top would double-report)."""
     monkeypatch.delenv("GHOST_CRITIC_ASYNC", raising=False)
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
@@ -110,7 +106,6 @@ def test_default_still_does_not_queue_outside_async_mode(agent, monkeypatch):
 
 def test_low_confidence_refuted_never_queues_even_forced(agent, monkeypatch):
     monkeypatch.delenv("GHOST_CRITIC_ASYNC", raising=False)
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
@@ -130,7 +125,6 @@ def test_identical_correction_is_not_stacked(member_turn, agent, monkeypatch):
     led the next turn and drove more 'corrective' grinding. An identical
     (note, conversation) pair must queue at most once."""
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
@@ -144,7 +138,6 @@ def test_identical_correction_is_not_stacked(member_turn, agent, monkeypatch):
 
 def test_distinct_corrections_still_queue(member_turn, agent, monkeypatch):
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
@@ -166,7 +159,6 @@ def test_distinct_corrections_still_queue(member_turn, agent, monkeypatch):
 
 async def test_attach_handler_threads_force_correction(member_turn, agent, monkeypatch):
     monkeypatch.delenv("GHOST_CRITIC_ASYNC", raising=False)
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
 
     async def _verdict_coro():

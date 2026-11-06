@@ -353,9 +353,6 @@ class TestTheStoresReadTheStatusWITHOUTshadowingTheProse:
             "update_profile") is False
         assert _bus_canonical_failed(
             {"vector": "error: store down"}, "insert_fact") is True
-        assert _bus_canonical_failed(
-            {"skill": "error: dropped by the playbook"},
-            "learn_skill") is True
         assert _bus_canonical_failed({}, "insert_fact") is False
 
     def test_compression_does_not_fabricate_a_failure_label(self):

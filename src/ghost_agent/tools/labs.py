@@ -24,7 +24,7 @@ Rules this module keeps (UNIFIED §11, §12, §13; PLAN §5):
 * **Origin and owner come from the request scope** (§4SX B0): owner turns are
   ``owner``, probes ``probe``, unattended/leaf work ``autopilot``; the owner key
   is ``project:<id>`` when the request has a project, else
-  ``conversation:<key>``. Members and replays never reach a lab.
+  ``conversation:<key>``. A member never reaches a lab.
 """
 from __future__ import annotations
 
@@ -205,16 +205,15 @@ def with_lab_id_note(kwargs: Any, result: Any) -> Any:
 # ------------------------------------------------------------------ who is asking
 
 def _caller(context) -> Tuple[Optional[str], str, str]:
-    """(origin header, owner key, refusal). Members and replays get a refusal."""
+    """(origin header, owner key, refusal). A member gets a refusal."""
     try:
         from ..core.request_scope import current_scope
         sc = current_scope(context)
     except Exception:  # noqa: BLE001
         sc = None
     origin = getattr(sc, "origin", "") if sc is not None else ""
-    if origin in ("member", "replay"):
-        return None, "", ("labs are the owner's machines — not available on this channel"
-                          if origin == "member" else "a replay never creates or touches real labs")
+    if origin == "member":
+        return None, "", "labs are the owner's machines — not available on this channel"
     hdr = {"owner": "owner", "probe": "probe"}.get(origin, "autopilot")
     if sc is None:
         hdr = "autopilot"          # no request scope = background work (fail closed)

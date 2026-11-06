@@ -674,7 +674,7 @@ def _schedule_refusal(action, scheduler, task_name, cron_expression, interval_se
 async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, check_command: str = None, interval_secs=None, project_owned=None, _ctx_project_id=None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
-    # Normalise like the sibling tools (self_state, introspect, uncertainty):
+    # Normalise like the sibling tools (introspect, …):
     # the dispatcher passes arg VALUES through raw, so "Create"/" list " would
     # otherwise fall through to "unknown action" and silently no-op.
     action = str(action or "").strip().lower()

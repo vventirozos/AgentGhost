@@ -29,8 +29,9 @@ import tempfile
 from pathlib import Path
 
 # Used when nothing has been remembered yet — a fresh device, or the first boot
-# after this file was added. Operator pick, 2026-08-03.
-FALLBACK_FORM = "descent"
+# after this file was added: animations on. A form remembered from before the
+# other faces went (2026-11-06) is no longer in FORMS and lands here too.
+FALLBACK_FORM = "moodtesseract"
 
 STATE_PATH = os.environ.get("GHOST_FACE_STATE", "~/.ghost_face_form")
 

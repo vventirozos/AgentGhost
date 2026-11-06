@@ -167,7 +167,7 @@ def test_a_later_call_in_the_same_batch_hands_back():
     write after the refused confirm in the same batch must be reported."""
     batch = [("knowledge_base", TO.ok(_pv())), ("file_system", TO.ok("SUCCESS: Wrote 9 chars"))]
     assert _confirm_wait_reply(WAIT, [], {"confirm": "yes"}, batch=batch) == ""
-    ran_silent = [("knowledge_base", TO.ok(_pv())), ("my_macro", None)]      # r3 m1: None = it RAN
+    ran_silent = [("knowledge_base", TO.ok(_pv())), ("my_skill", None)]      # r3 m1: None = it RAN
     assert _confirm_wait_reply(WAIT, [], {"confirm": "yes"}, batch=ran_silent) == ""
     assert _confirm_wait_reply(WAIT, [], {"confirm": "yes"},
                                batch=[("knowledge_base", TO.ok(_pv()))]).startswith("Nothing has been")

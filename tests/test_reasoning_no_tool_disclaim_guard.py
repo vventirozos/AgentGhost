@@ -51,8 +51,6 @@ def _make_agent(*, native_tools=False):
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.graph_memory = MagicMock()
     ctx.graph_memory.get_neighborhood = MagicMock(return_value=[])
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value="")
     ctx.sandbox_dir = "/tmp/sandbox"
     return GhostAgent(ctx)
 

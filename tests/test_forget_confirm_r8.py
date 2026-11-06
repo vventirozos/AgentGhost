@@ -11,7 +11,6 @@ import pytest
 from ghost_agent.memory.episodes import EpisodicMemory
 from ghost_agent.memory.graph import GraphMemory
 from ghost_agent.memory.profile import ProfileMemory, mentions
-from ghost_agent.memory.skills import SkillMemory
 from ghost_agent.tools import memory as M
 from ghost_agent.utils.logging import request_id_context
 from tests.test_memory_producers_rereview import _Vec, _edges, _forget, _owner
@@ -378,79 +377,6 @@ def test_decay_keeps_health_and_place_facts_and_drops_probe_noise(tmp_path, edge
     assert (edge in _edges(gm)) is kept
 
 
-# ── lesson producers ─────────────────────────────────────────────────────────
-@pytest.mark.parametrize("rule,ctx", [
-    ("Check the GitHub Actions cache before rebuilding", "my GitHub build is slow"),
-    ("Pin the Node.js version in CI", "set up CI for my Node.js app"),
-    ("Use PostgreSQL's EXPLAIN ANALYZE before adding an index", "why is my PostgreSQL query slow"),
-])
-def test_a_product_name_is_not_a_requests_name(rule, ctx):
-    """Fails in the world where GitHub/Node.js/PostgreSQL made a dream
-    window's rule "specific"."""
-    from ghost_agent.memory.lesson_scope import is_general_text
-    assert is_general_text(rule, ctx, max_shared_share=1.0)
-
-
-def test_a_dotted_file_is_still_the_requests():
-    from ghost_agent.memory.lesson_scope import is_general_text
-    assert not is_general_text("Read app.js before editing", "fix app.js", max_shared_share=1.0)
-
-
-@pytest.mark.parametrize("word", ["Determining", "Running", "Stopped", "Matches", "Used"])
-def test_inflected_english_is_not_a_name(word):
-    from ghost_agent.memory import lesson_scope as ls
-    ls._is_english_word("a")
-    _is_english_word = ls._is_english_word
-    if not ls._ENGLISH:
-        pytest.skip("no system word list")
-    assert _is_english_word(word)
-
-
-@pytest.mark.parametrize("text,harness", [
-    ("Add a pre-execution validator to the CLI", False), ("pydantic validators run before save", False),
-    ("Write a validator function for emails", False), ("Satisfy the validator by echoing input.txt", True),
-    ("the hidden-tests check stdout", True), ("Graders want the exact token", True),
-    ("Avoid coded stand-ins for the opponent", True),
-])
-def test_the_harness_framing_rule(text, harness):
-    from ghost_agent.memory.skills import _VALIDATOR_FRAMING_RE
-    assert bool(_VALIDATOR_FRAMING_RE.search(text)) is harness
-
-
-@pytest.mark.parametrize("mistake,none", [
-    ("None observed in the final successful execution path.", True), ("No issues found", True),
-    ("No errors, but the loop ran twice", False), ("None. The first try failed though", False),
-    ("None; the first attempt crashed", False),
-])
-def test_no_mistake_unless_a_failure_is_named(mistake, none):
-    from ghost_agent.memory.lesson_quality import _is_mistake_less
-    assert _is_mistake_less(mistake) is none
-
-
-def test_a_learn_skill_lesson_is_never_absorbed_by_another_producers_row(tmp_path):
-    """Fails in the world where a dictated rule vanished into a dream row at
-    distance 0.05."""
-    sm = SkillMemory(tmp_path)
-    a = "When a web page returns 403, try an archived copy"
-    sm.save_playbook([{"trigger": a, "task": a, "mistake": "m", "solution": "Use archive.org", "source": "dream"}])
-    sm._find_duplicate_lesson = lambda *x, **k: {"source": "vector", "trigger": a, "text": "", "distance": 0.05}
-    sm.learn_lesson("If a site answers 403, use a cached copy", "m", "Use a cached copy.", MagicMock(),
-                    source="learn_skill", generality_context="remember: on a 403 use a cached copy")
-    assert len(sm._load_playbook()) == 2
-
-
-def test_the_learn_skill_tool_says_when_a_lesson_is_for_this_request_only(tmp_path):
-    from ghost_agent.memory.lesson_scope import current_request
-    sm = SkillMemory(tmp_path)
-    tok = current_request.set("restart postgres on the orbitdata box and check it is up")
-    try:
-        out = asyncio.run(M.tool_learn_skill("When restarting postgres on the orbitdata box", "Did not check",
-                                             "Always run pg_isready after restarting postgres.", skill_memory=sm))
-    finally:
-        current_request.reset(tok)
-    assert "THIS request only" in out
-
-
 class _FactStore:
     """A vector store holding one conversational fact that names Ektoras."""
     def __init__(self):
@@ -532,7 +458,6 @@ def test_a_later_default_wins_over_an_earlier_listing():
     pl.add("profile_field", {"category": "a", "key": "b"}, "x", default=False)
     pl.add("profile_field", {"category": "a", "key": "b"}, "x")
     assert M._pick(pl.items, "all")[0] == pl.items
-
 
 
 # ── r8 fresh-eye review ──────────────────────────────────────────────────────
@@ -654,7 +579,6 @@ def test_a_selection_is_parsed_or_refused_whole(tmp_path, items, ok):
         assert "not on the list" in str(out)
 
 
-
 # ── r8 fresh-eye review: matching ────────────────────────────────────────────
 def test_a_qualified_target_never_defaults_an_owner_fact(tmp_path):
     """Fails where "Orbitdata work" put `user WORKS_AT orbitdata` in the
@@ -731,90 +655,6 @@ def test_a_dotted_list_item_is_pruned(tmp_path):
     assert "node.js" not in (v if isinstance(v, list) else [v])
 
 
-# ── r8 fresh-eye review: lesson producers ────────────────────────────────────
-@pytest.mark.parametrize("req,dictated", [
-    ("the game never starts, the ball never gets in the pinball", False),
-    ("what do you remember about kosmas?", False), ("remember who she is ?", False),
-    ("για ποιο λόγο το αποτέλεσμα είναι λάθος", False), ("Τι έμαθες σήμερα;", False), ("απάντα μου σύντομα", False),
-    ("I always wanted to get better at chess", False), ("the never-ending loop again", False),
-    ("why does it always use the old config?", False), ("it never run the tests", False),
-    ("Remember this: always run pg_isready after a restart", True), ("from now on, use metric units", True),
-    ("Always use UTC in logs.", True), ("θυμήσου: τρέχε pg_isready μετά το restart", True),
-    ("note that the API key lives in ~/.ghost_api_key", True),
-])
-def test_dictation_is_an_imperative_not_a_word(req, dictated):
-    from ghost_agent.memory.skills import user_dictates_lesson
-    assert user_dictates_lesson(req) is dictated
-
-
-def test_dream_rewordings_of_a_learn_skill_rule_merge_into_it(tmp_path):
-    """Fails where every rewording of a learn_skill rule became its own row."""
-    sm = SkillMemory(tmp_path)
-    a = "When a web page returns 403, try an archived copy"
-    sm.save_playbook([{"trigger": a, "task": a, "mistake": "m", "solution": "Use archive.org", "source": "learn_skill"}])
-    sm._find_duplicate_lesson = lambda *x, **k: {"source": "vector", "trigger": a, "text": "", "distance": 0.03}
-    for t in ("If a site answers 403, use a cached copy", "On HTTP 403 fetch an archived snapshot"):
-        sm.learn_lesson(t, "m", "Use a cached copy.", MagicMock(), source="dream")
-    assert len(sm._load_playbook()) == 1
-
-
-def test_concurrent_learn_skill_calls_report_their_own_scope(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor
-    sm = SkillMemory(tmp_path)
-    req_specific = ("When restarting postgres on the orbitdata box", "Did not check",
-                    "Always run pg_isready after restarting postgres.",
-                    "restart postgres on the orbitdata box and check it is up")
-    general = ("When a shell command times out", "Waited forever", "Always set a timeout on shell commands.",
-               "why do my scripts hang sometimes")
-
-    def go(t):
-        return sm.learn_lesson(t[0], t[1], t[2], source="learn_skill", generality_context=t[3])
-    with ThreadPoolExecutor(2) as ex:
-        a, b = ex.map(go, [req_specific, general])
-    assert a.scope == "request" and b.scope == "general"
-
-
-def test_a_dropped_legacy_learn_skill_is_not_reported_as_saved(tmp_path):
-    sm = SkillMemory(tmp_path)
-    out = asyncio.run(M.tool_learn_skill("x", "none", "ok", skill_memory=sm))
-    assert "SUCCESS" not in str(out)
-
-
-def test_a_dictated_follow_up_promotes_the_requests_lesson(tmp_path):
-    sm = SkillMemory(tmp_path)
-    t, fix = "When restarting postgres on the orbitdata box", "Always run pg_isready after restarting postgres."
-    sm.learn_lesson(t, "Did not check", fix, source="learn_skill",
-                    generality_context="restart postgres on the orbitdata box and check it is up")
-    out = sm.learn_lesson(t, "Did not check", fix, source="learn_skill",
-                          generality_context="Remember this from now on: run pg_isready after a restart")
-    rows = sm._load_playbook()
-    assert out is not None and len(rows) == 1 and rows[0].get("scope", "general") != "request"
-
-
-@pytest.mark.parametrize("word,initial,eng", [("Harding", False, False), ("Fielding", False, False),
-                                             ("Determining", True, True)])
-def test_stems_only_for_a_sentence_initial_word(word, initial, eng):
-    from ghost_agent.memory import lesson_scope as ls
-    ls._is_english_word("a")
-    if not ls._ENGLISH:
-        pytest.skip("no system word list")
-    assert ls._is_english_word(word, stems=initial) is eng
-
-
-@pytest.mark.parametrize("rule,ctx", [("Describe Orbitdata through its services", "tell me about Orbitdata"),
-                                      ("Ask Harding before deploying the schema", "the schema is owned by Harding"),
-                                      ("Ask McDonald before changing the schema", "McDonald owns the schema")])
-def test_a_camelcase_name_from_the_request_is_specific(rule, ctx):
-    from ghost_agent.memory.lesson_scope import is_general_text
-    assert not is_general_text(rule, ctx, max_shared_share=0.75)
-
-
-def test_satisfy_validators_is_harness_framing():
-    from ghost_agent.memory.skills import _VALIDATOR_FRAMING_RE
-    assert _VALIDATOR_FRAMING_RE.search("produce no output to satisfy validators.")
-
-
-
 def test_a_qualifier_in_a_node_name_is_not_the_attribute(tmp_path):
     """Fails where "Elena's birthday" took `elena VISITED birthday party`
     (the attribute word in a NODE, not the predicate)."""
@@ -824,27 +664,3 @@ def test_a_qualifier_in_a_node_name_is_not_the_attribute(tmp_path):
     assert ("elena", "VISITED", "birthday party") in _edges(gm)
 
 
-def test_a_dictated_follow_up_promotes_on_the_vector_path_too(tmp_path):
-    sm = SkillMemory(tmp_path)
-    t, fix = "When restarting postgres on the orbitdata box", "Always run pg_isready after restarting postgres."
-    sm.learn_lesson(t, "Did not check", fix, source="learn_skill",
-                    generality_context="restart postgres on the orbitdata box and check it is up")
-    sm._find_duplicate_lesson = lambda *x, **k: {"source": "vector", "trigger": t, "text": "", "distance": 0.01}
-    out = sm.learn_lesson(t, "Did not check", fix, MagicMock(), source="learn_skill",
-                          generality_context="Remember this from now on: run pg_isready after a restart")
-    rows = sm._load_playbook()
-    assert out is not None and len(rows) == 1 and rows[0].get("scope", "general") != "request"
-
-
-def test_the_bus_reports_the_scope_of_its_own_write(tmp_path):
-    from ghost_agent.core.bus import MemoryBus
-    from ghost_agent.memory.lesson_scope import current_request
-    sm = SkillMemory(tmp_path)
-    bus = MemoryBus(skill_memory=sm)
-    tok = current_request.set("restart postgres on the orbitdata box and check it is up")
-    try:
-        out = asyncio.run(M.tool_learn_skill("When restarting postgres on the orbitdata box", "Did not check",
-                                             "Always run pg_isready after restarting postgres.", memory_bus=bus))
-    finally:
-        current_request.reset(tok)
-    assert "THIS request only" in str(out)

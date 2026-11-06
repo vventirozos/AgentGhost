@@ -1,7 +1,7 @@
 """§4LB r2 — the owner's street address never leaves the machine.
 
 One detector for every outbound path (the dispatch hook, the tool wrappers a
-macro or a delegate calls, the weather lookup). The first cut matched the
+tool that calls another tool reaches, the weather lookup). The first cut matched the
 profile's exact Latin substrings: the review found the postcode alone, the
 Greek spelling ("Καλεδονίας 83"), a \\u-escaped JSON string, "Kaledonias
 street 83", a double space and a URL-encoded maps link all went out, and a

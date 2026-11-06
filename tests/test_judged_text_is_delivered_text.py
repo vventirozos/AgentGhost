@@ -119,3 +119,47 @@ async def test_finalize_smooths_only_behind_the_real_tool_gate(monkeypatch):
     out, _, _ = await agent.handle_chat(
         {"messages": [{"role": "user", "content": "Use web search: when was the Tzaneio hospital founded?"}]}, FakeBgTasks())
     assert "Let me check the second source" in out
+
+
+# --- §4TE: finalize reports its trims to the reply tap ---------------------------
+
+async def test_finalize_reports_the_smoothing_trim_to_the_tap(monkeypatch):
+    """The wiring, through the real finalize: without it the CLI prints every
+    trimmed reply twice, and no unit test of the tap would notice."""
+    from ghost_agent.core.reply_tap import ReplyTap, reply_tap_context
+    tap = ReplyTap("r1", "m", 1)
+    token = reply_tap_context.set(tap)
+    try:
+        out, _ = await _run(monkeypatch)
+    finally:
+        reply_tap_context.reset(token)
+    assert "Let me check" not in out
+    assert tap._trims[0] == NARRATED and tap._trims[-1] == out
+    tap.sent = NARRATED                 # what the stream showed
+    closing = b"".join(tap.finish(out)).decode()
+    assert '"trimmed": true' in closing
+
+
+async def test_finalize_reports_the_text_beside_tool_calls_as_a_trim_too(monkeypatch):
+    """Req 9fca34d5: dropped beside-call text, then trimmed narration."""
+    from ghost_agent.core.reply_tap import ReplyTap, reply_tap_context
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "0")
+    monkeypatch.setenv("GHOST_EVIDENCE_GATE", "0")
+    beside = "The register lists two founding dates for this building, 1873 and 1875."   # no beat: only the pre-tool drop removes it
+    ctx = make_context()
+    agent = GhostAgent(ctx)
+    agent.available_tools = {"web_search": AsyncMock(return_value="### 1. x\nFounded 1873.\n")}
+    ctx.llm_client.chat_completion = AsyncMock(side_effect=[
+        _resp(beside, [_tc("c0", "web_search", {"query": "a"}), _tc("c1", "web_search", {"query": "b"})]),
+        _resp(beside + "\n\n" + NARRATED + " " + "The building stands on its original site. " * 8),
+        _resp("(unreachable)")])     # long enough to stand as an answer without the beside text
+    tap = ReplyTap("r1", "m", 1)
+    token = reply_tap_context.set(tap)
+    try:
+        out, _, _ = await agent.handle_chat(
+            {"messages": [{"role": "user", "content": "Use web search: when was the Tzaneio hospital founded?"}]},
+            FakeBgTasks())
+    finally:
+        reply_tap_context.reset(token)
+    assert beside not in out and "Let me check" not in out and "1873" in out
+    assert len(tap._trims) >= 3 and beside in tap._trims[0] and tap._trims[-1] == out

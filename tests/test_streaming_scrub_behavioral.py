@@ -59,7 +59,6 @@ async def test_empty_scrub_output_produces_fallback(forced_final, monkeypatch):
     ctx.scratchpad = MagicMock()
     ctx.scratchpad.list_all.return_value = ""
     ctx.memory_system = None
-    ctx.skill_memory = None
     ctx.journal = None
 
     call_log = {"chat_completion": 0}

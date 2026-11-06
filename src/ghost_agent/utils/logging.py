@@ -36,10 +36,6 @@ conversation_key_context = contextvars.ContextVar("conversation_key", default=""
 #: §4PF: WHO is doing the work, for the ledgers — "" = derive from the request
 #: kind; the project advancer pins "autopilot" for an unattended tick
 event_origin_context = contextvars.ContextVar("event_origin", default="")
-#: the trajectory id of the turn in flight (§4LC): every lesson written
-#: during the turn — `learn_skill`, the bus, the post-mortem — is stamped
-#: with it, so a refuted or corrected turn's retraction finds them all
-trajectory_id_context = contextvars.ContextVar("trajectory_id", default="")
 #: §4JP: how many seconds the CLIENT will wait for this request before it
 #: closes the connection (the web interface's GHOST_CHAT_TIMEOUT, sent as
 #: `X-Ghost-Client-Timeout`); 0.0 = unknown / no deadline. The turn loop
@@ -60,8 +56,8 @@ active_session_context = contextvars.ContextVar("active_session_id", default="")
 #: ``fp:`` + the first-user-message fingerprint; "" outside a request
 slot_session_context = contextvars.ContextVar("slot_session", default="")
 #: §4MV measured `hyd_tail` (not adopted) and `tools_trim` (baked into the
-#: tool sources). §4NA: `no_lessons` — the lesson-compliance control arm
-#: (every playbook lesson withheld; probes only).
+#: tool sources). §4NA: `no_lessons` — the compliance control arm: no owner
+#: rule is shown (probes only; the lessons it also withheld are gone, §4TD).
 #: §4NH measured a `presend` arm (claim check + repair before shipping) and
 #: removed it: worse on the pilot (2 of 4 turns), about twice the latency.
 #: §4NI measured `temp_low` (temperature 0.3) and `read_first` (open a page

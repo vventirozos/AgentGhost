@@ -27,7 +27,7 @@
 // object whose `step(dt, nowMs)` returns the outputs the renderer reads.
 // Executed under node by tests/test_interface_face_temperament.py.
 
-export const TEMPERAMENT_VERSION = '1.3';
+export const TEMPERAMENT_VERSION = '1.6';
 export const DEFAULT_INTENSITY = 1.5;
 
 // v1.2 (operator: "can't say i saw a huge difference"): v1.1 kept every
@@ -37,6 +37,19 @@ export const DEFAULT_INTENSITY = 1.5;
 // a coil while waiting that releases on the first words, sinking into a
 // doze, brightness flares — scaled by one knob, `intensity` (default 1;
 // localStorage `ghost_face_intensity`, 0 = the v1.1 face, 3 = theatrical).
+
+// v1.4 (operator, 2026-11-06: the tesseract is "gittery and erratic, mostly
+// while idle"). Measured on the real loop: with this body and the twitch off,
+// idle is smooth; with them on, whole-scene turns of ~25° every ~14 s. Reactions
+// to real events keep their strength; what happens on its own at rest does not:
+//   * IDLE_BODY — the wander and the idle actions move the body at a third;
+//   * BODY_TAU — every slow body channel is eased, so no input can step the
+//     whole scene in one frame (a cancelled action, a restarted tilt, a focus
+//     nudge, a re-synced clock). Only the startle's shake and flare stay
+//     instant: they are meant to be sudden.
+export const IDLE_BODY = 1 / 3;
+const BODY_TAU = 0.25;          // s
+const CURIOUS_TILT_S = 2.5;     // a head tilt's length; a later cue does not restart it
 
 // Log-line icons (src/ghost_agent/utils/logging.py `Icons`) → what kind of
 // work, or what outcome, the line reports.
@@ -53,18 +66,26 @@ const OUTCOME_BY_ICON = {
     '📀': 'restore', '📛': 'cachefail', '🌙': 'dream', '🌀': 'dream', '📨': 'queued',
 };
 
-// Every icon the line carries, in order (a line can name a work kind AND an
-// outcome: "🐍 Sandbox Exec … ❌"). Pure.
-export function classifyLogLine(content, isError) {
-    const s = String(content || '');
-    const out = [];
-    for (const ch of s.match(/\p{Extended_Pictographic}/gu) || []) {
-        if (WORK_BY_ICON[ch]) out.push('work:' + WORK_BY_ICON[ch]);
-        else if (OUTCOME_BY_ICON[ch]) out.push('outcome:' + OUTCOME_BY_ICON[ch]);
-    }
-    if (isError && !out.includes('outcome:fail')) out.push('outcome:fail');
-    // one line, one reaction per event kind
-    return [...new Set(out)];
+// The icon of one row of the agent's log — "│  tag  [HH:MM:SS]  ICON  title  …"
+// (with ANSI colour on the wire) — or null for anything else. Only this column
+// is the system reporting: everything after it, and every continuation line,
+// is free text. In the live log all 49 rows with a second icon were the model's
+// thinking or reply. Of the 415 lines the server flags as errors (the words
+// ERROR/Exception), 157 were continuation text and 33 thoughts, such as one about
+// psql's ON_ERROR_STOP; 211 were 🔶 warning rows, which report as a warning. Pure.
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const LOG_ROW_RE = /^│\s+\S+\s+(?:\d\d:\d\d:\d\d\s+)?(\p{Extended_Pictographic})/u;
+export function logRowIcon(content) {
+    const m = String(content || '').replace(ANSI_RE, '').trim().match(LOG_ROW_RE);
+    return m ? m[1] : null;
+}
+
+// What one log line reports: its row icon → a work kind or an outcome. Pure.
+export function classifyLogLine(content) {
+    const ch = logRowIcon(content);
+    if (WORK_BY_ICON[ch]) return ['work:' + WORK_BY_ICON[ch]];
+    if (OUTCOME_BY_ICON[ch]) return ['outcome:' + OUTCOME_BY_ICON[ch]];
+    return [];
 }
 
 // How strongly each event nudges each drive, before gain. Drives are 0..1
@@ -149,6 +170,10 @@ export function createTemperament(opts = {}) {
     let now = opts.now != null ? opts.now : Date.now();
     // default 1.5 (operator, v1.1 → v1.2: "can't say i saw a huge difference")
     const K = clamp(opts.intensity != null && isFinite(opts.intensity) ? +opts.intensity : DEFAULT_INTENSITY, 0, 3);
+    const body = { yaw: 0, pitch: 0, roll: 0, offY: 0, scale: 1, bright: 1 };   // eased, see BODY_TAU
+    // The agent's mood on the form that shows it (setMoodBias): how often idle
+    // actions come, how likely a doze, how strongly events land. Neutral changes nothing.
+    let moodBias = { gap: 1, doze: 0, react: 1 };
     let reliefAt = -1e12, wakeAt = -1e12, startleAt = -1e12, curiousAt = -1e12, curiousSign = 1;
     let syllable = 0;           // a glow kick per streamed chunk, decays ~120 ms
 
@@ -192,7 +217,9 @@ export function createTemperament(opts = {}) {
         }
         if (kind === 'wake') wakeAt = now;
         if (kind === 'stream:first') reliefAt = now;
-        if (kind === 'recall' || kind === 'work:web' || kind === 'work:image') { curiousAt = now; curiousSign = rnd() < 0.5 ? -1 : 1; }   // a head tilt, one side or the other
+        // a head tilt, one side or the other; a cue during a tilt joins it
+        if ((kind === 'recall' || kind === 'work:web' || kind === 'work:image')
+            && now - curiousAt >= CURIOUS_TILT_S * 1000) { curiousAt = now; curiousSign = rnd() < 0.5 ? -1 : 1; }
         if (STARTLE[kind]) {
             startleAt = now;
             const s = STARTLE[kind] * g;
@@ -215,7 +242,7 @@ export function createTemperament(opts = {}) {
         const h = hab[kind] || 0;
         const surprise = 1 / (1 + 0.35 * rate[kind]);          // rare → ~1, frequent → small
         const noise = Math.exp(0.18 * gauss());                // ~[0.7, 1.4]
-        const g = clamp((1 - 0.72 * h) * (0.55 + 0.75 * surprise) * noise * (0.8 + 0.5 * d.arousal), 0.25, 1.8);
+        const g = clamp((1 - 0.72 * h) * (0.55 + 0.75 * surprise) * noise * (0.8 + 0.5 * d.arousal) * moodBias.react, 0.25, 1.8);
         hab[kind] = Math.min(1, h + 0.22);
         if (kind === 'turn:start') {
             const away = t - lastTurnEndAt;
@@ -230,8 +257,8 @@ export function createTemperament(opts = {}) {
         return g;
     }
 
-    function ingestLog(content, isError) {
-        const kinds = classifyLogLine(content, isError);
+    function ingestLog(content) {
+        const kinds = classifyLogLine(content);
         for (const k of kinds) event(k);
         return kinds;
     }
@@ -256,7 +283,7 @@ export function createTemperament(opts = {}) {
         const night = nightness(new Date(now));
         const w = {
             glance: 3, stretch: 1.4, sigh: 1.4, twitch: 2, lookaround: 1.2,
-            doze: 0.25 + 2.5 * Math.max(d.fatigue, night),
+            doze: 0.25 + 2.5 * Math.max(d.fatigue, night) + moodBias.doze,
         };
         if (lastIdle) w[lastIdle] = 0;                        // never the same twice running
         let sum = 0;
@@ -320,7 +347,7 @@ export function createTemperament(opts = {}) {
             idle = { name, t0: now, dur: IDLE_DUR[name] * (0.75 + 0.5 * rnd()), gx: Math.cos(a), gy: Math.sin(a) * 0.6 };
             if (name === 'twitch') twitch = true;
             // mean gap 14 s, longer when tired or at night
-            nextIdleAt = now + (7000 + rnd() * 14000) * (1 + d.fatigue + 0.6 * night);
+            nextIdleAt = now + (7000 + rnd() * 14000) * (1 + d.fatigue + 0.6 * night) * moodBias.gap;
         }
         if (!resting && now > nextIdleAt) nextIdleAt = now + 6000 + rnd() * 6000;
 
@@ -351,8 +378,8 @@ export function createTemperament(opts = {}) {
             gy += 0.10 * Math.sin(p * Math.PI * 4) * idleEnv;
         }
         if (doze) gy -= 0.12 * doze;                        // head drops
-        gy += 0.02 * speech * Math.sin(now / 1000 * 7.0);   // a faint nod while it talks
-        out.gazeX = gx; out.gazeY = gy;
+        const nod = 0.02 * speech * Math.sin(now / 1000 * 7.0);   // a faint nod while it talks
+        out.gazeX = gx; out.gazeY = gy + nod;
         out.hueShift = clamp(-0.025 * d.valence + 0.03 * d.strain + 0.012 * d.curiosity + ou.hue, -0.05, 0.06);
         out.stillness = clamp(0.30 * thinking * (1 - speech) + 0.5 * doze
             + (N === 'sigh' ? 0.35 * idleEnv : 0) + 0.15 * anticipation, 0, 0.85);
@@ -363,21 +390,33 @@ export function createTemperament(opts = {}) {
         syllable *= Math.exp(-dt / 0.12);
         const shake = startle * Math.sin(now * 0.044) ;                      // ~7 Hz, fades with the startle
         const wake = pulse(wakeAt, 3.0), relief = pulse(reliefAt, 1.6), cur = pulse(curiousAt, 2.5);
-        let yaw = 1.6 * gx, pitch = 1.4 * gy;                                // the gaze, as a head turn
-        if (N === 'stretch') pitch -= 0.10 * idleEnv;
-        if (doze) pitch += 0.20 * doze;                                      // the head drops
+        const G = IDLE_BODY;
+        let yaw = 1.6 * G * gx, pitch = 1.4 * G * gy;                        // the gaze, as a head turn
+        if (N === 'stretch') pitch -= 0.10 * G * idleEnv;
+        if (doze) pitch += 0.20 * G * doze;                                  // the head drops
         yaw += 0.06 * Math.sin(now / 1000 * 0.9) * thinking;                 // a slow pondering sway
-        let roll = 0.10 * cur * curiousSign + 0.03 * shake + 0.05 * Math.sin(now / 1000 * 0.37) * d.curiosity;
-        out.yaw = K * yaw; out.pitch = K * pitch; out.roll = K * roll;
-        out.offX = K * (0.05 * shake);
-        out.offY = K * (-0.16 * doze - 0.04 * (N === 'sigh' ? idleEnv : 0) + 0.05 * wake + 0.03 * relief);
-        out.scaleMul = 1 + K * (0.012 * out.breath * 2.5
+        const tilt = 0.10 * cur * curiousSign + 0.05 * Math.sin(now / 1000 * 0.37) * d.curiosity;
+        const breathBody = Math.sin(breathPhase) * (0.4 + 0.6 * d.fatigue)   // out.breath, with the idle actions at G
+            + G * (out.breath - Math.sin(breathPhase) * (0.4 + 0.6 * d.fatigue));
+        const ease = 1 - Math.exp(-dt / BODY_TAU);
+        body.yaw += (K * yaw - body.yaw) * ease;
+        body.pitch += (K * pitch - body.pitch) * ease;
+        body.roll += (K * tilt - body.roll) * ease;
+        body.offY += (K * (G * (-0.16 * doze - 0.04 * (N === 'sigh' ? idleEnv : 0)) + 0.05 * wake + 0.03 * relief) - body.offY) * ease;
+        body.scale += (1 + K * (0.012 * breathBody * 2.5
             - 0.10 * anticipation * (1 - relief)                             // coils while it waits…
             + 0.08 * relief                                                  // …and lets go on the first words
-            + 0.09 * (N === 'stretch' ? idleEnv : 0) - 0.05 * (N === 'sigh' ? idleEnv : 0)
-            + 0.08 * wake - 0.05 * doze + 0.025 * speech);
-        out.bright = clamp(1 + K * (0.35 * startle + 0.35 * wake + 0.18 * speech + 0.10 * cur
-            - 0.35 * doze - 0.12 * thinking * (1 - speech) + 0.12 * relief), 0.45, 1.9);
+            + G * (0.09 * (N === 'stretch' ? idleEnv : 0) - 0.05 * (N === 'sigh' ? idleEnv : 0) - 0.05 * doze)
+            + 0.08 * wake + 0.025 * speech) - body.scale) * ease;
+        body.bright += (1 + K * (0.35 * wake + 0.18 * speech + 0.10 * cur
+            - 0.35 * G * doze - 0.12 * thinking * (1 - speech) + 0.12 * relief) - body.bright) * ease;
+        out.yaw = body.yaw;
+        out.pitch = body.pitch + K * 1.4 * nod;                              // smooth already; easing would halve it
+        out.roll = body.roll + K * 0.03 * shake;                             // the startle stays instant
+        out.offX = K * (0.05 * shake);
+        out.offY = body.offY;
+        out.scaleMul = body.scale;
+        out.bright = clamp(body.bright + K * 0.35 * startle, 0.45, 1.9);
         out.glow = K * Math.min(1, syllable * speech + 0.4 * syllable);      // text rhythm on the bloom
         out.startleKick = startleQueued; startleQueued = 0;
         out.twitch = twitch;
@@ -390,5 +429,7 @@ export function createTemperament(opts = {}) {
                  anticipation, speech, thinking, idle: idle ? idle.name : null, nextIdleAt, now };
     }
 
-    return { event, ingestLog, ingestChunk, step, debug, DRIVES };
+    function setMoodBias(b) { moodBias = b; }
+
+    return { event, ingestLog, ingestChunk, step, debug, setMoodBias, DRIVES };
 }

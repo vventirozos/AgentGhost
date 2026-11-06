@@ -12,7 +12,6 @@ import pytest
 
 from ghost_agent.memory.graph import GraphMemory
 from ghost_agent.memory.profile import ProfileMemory
-from ghost_agent.memory.skills import SkillMemory
 from ghost_agent.tools import memory as M
 
 
@@ -262,130 +261,9 @@ def test_the_reset_all_preview_says_what_it_would_erase_and_erases_nothing():
     gm.wipe_all.assert_not_called()
 
 
-# ── producers ────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("source,written", [("dream", False), ("learn_skill", True)])
-def test_harness_framing_is_refused_from_unattended_producers_only(tmp_path, source, written):
-    """A user's own lesson about an input.txt or a validator is legitimate
-    (§4NM: the unattended producers no longer write at all — the writer gate
-    refuses them before the framing check)."""
-    sm = SkillMemory(tmp_path)
-    out = sm.learn_lesson("When the user's script reads input.txt", "Assumed the file exists",
-                          "Check that input.txt exists before reading it.", source=source)
-    assert (out == "written") is written
-
-
-def test_a_self_play_framed_rule_is_refused(tmp_path):
-    sm = SkillMemory(tmp_path)
-    assert sm.learn_lesson("When executing self-play tasks", "none",
-                           "When executing self-play tasks, always state the findings.", source="dream") is None
-
-
-@pytest.mark.parametrize("rule,ctx,share,general", [
-    ("When parsing JSON lines, always wrap json.loads in try/except.", "FIRST_ERROR: json.loads raised", 1.0, True),
-    ("When a page returns 403, always switch to the browser tool.", "HTTP 403 Forbidden", 1.0, True),
-    ("Use a shared threading.Event to signal consumers to stop.", "a producer with threading.Event", 0.5, True),
-    ("If Jan is 30 now, two years ago he was 28.", "Jan is 30 years old now", 0.5, False),
-    ("Always copy report.txt to backup.txt first.", "copy report.txt to backup.txt", 0.5, False),
-    ("When an HTTP request times out, always retry with backoff.", "the HTTP request to the api timed out", 0.5, True),
-    ("Kosmas-style age questions: verify the date", "how old is kosmas now ?", 0.5, False),
-])
-def test_generality_names_files_and_numbers(rule, ctx, share, general):
-    from ghost_agent.memory.lesson_scope import is_general_text
-    assert is_general_text(rule, ctx, max_shared_share=share) is general
-
-
-def test_learn_skill_keeps_a_request_shaped_lesson_for_that_request(tmp_path):
-    """(§4KX r8) only the model's OWN lesson; a dictated one stays general."""
-    sm = SkillMemory(tmp_path)
-    req = "restart postgres on the orbitdata box and check it is up"
-    out = sm.learn_lesson("When restarting postgres on the orbitdata box", "Did not check readiness",
-                          "Always run pg_isready after restarting postgres.", source="learn_skill",
-                          generality_context=req)
-    row = sm._load_playbook()[0]
-    assert out == "written" and row["scope"] == "request" and row["source_request"] == req
-    assert out.scope == "request"
-
-
-@pytest.mark.parametrize("req", ["Learn this: when you restart postgres on the orbitdata box, run pg_isready after",
-                                 "remember: restart postgres on the orbitdata box, then run pg_isready",
-                                 "θυμήσου: μετά το restart του postgres στο orbitdata box τρέξε pg_isready"])
-def test_a_lesson_the_user_dictates_is_kept_general(tmp_path, req):
-    """Fails in the world where 7 of 10 dictated lessons were silently
-    scoped to the one request that taught them."""
-    sm = SkillMemory(tmp_path)
-    out = sm.learn_lesson("When restarting postgres on the orbitdata box", "Did not check readiness",
-                          "Always run pg_isready after restarting postgres.", source="learn_skill",
-                          generality_context=req)
-    row = sm._load_playbook()[0]
-    assert out == "written" and row.get("scope", "general") != "request" and out.scope == "general"
-
-
 def _archive(tmp_path, trigger, reason, rotated=False):
     name = "skills_pruned_archive.jsonl" + (".1" if rotated else "")
     with open(tmp_path / name, "a") as fh:
         fh.write(json.dumps({"reason": reason, "lesson": {"trigger": trigger}}) + "\n")
 
 
-@pytest.mark.parametrize("reason,blocked", [("removed_by_trigger", True), ("retract:abc", False),
-                                            ("prune:low_utility", False), ("duplicate_trigger_r5", False)])
-def test_only_an_operator_retraction_is_a_tombstone(tmp_path, reason, blocked):
-    sm = SkillMemory(tmp_path)
-    _archive(tmp_path, "When parsing dates from logs", reason)
-    out = sm.learn_lesson("When parsing dates from logs", "guessed", "Use ISO 8601.", source="learn_skill")
-    assert (out is None) is blocked
-
-
-def test_a_rotated_archive_still_tombstones(tmp_path):
-    sm = SkillMemory(tmp_path)
-    _archive(tmp_path, "When parsing dates from logs", "removed_by_trigger", rotated=True)
-    assert sm.learn_lesson("When parsing dates from logs", "guessed", "Use ISO 8601.", source="learn_skill") is None
-
-
-def test_a_new_tombstone_takes_effect_without_a_restart(tmp_path):
-    import os
-    import time
-    sm = SkillMemory(tmp_path)
-    _archive(tmp_path, "unrelated", "removed_by_trigger")
-    sm._tombstones()
-    time.sleep(0.01)
-    _archive(tmp_path, "When parsing dates from logs", "removed_by_trigger")
-    os.utime(tmp_path / "skills_pruned_archive.jsonl")
-    assert sm.learn_lesson("When parsing dates from logs", "guessed", "Use ISO 8601.", source="learn_skill") is None
-
-
-def test_a_live_row_is_reinforced_despite_a_tombstone_and_a_plan_is_never_blocked(tmp_path):
-    sm = SkillMemory(tmp_path)
-    t = "Parallel processing with strict output ordering requirements"
-    sm.save_playbook([{"trigger": t, "task": t, "mistake": "m", "solution": "Map results back to input order.",
-                       "source": "learn_skill", "frequency": 1}])
-    _archive(tmp_path, t, "removed_by_trigger")
-    assert sm.learn_lesson(t, "m", "Map results back to input order.", source="learn_skill") == "reinforced"
-    req = "copy the notes to the backup folder"
-    _archive(tmp_path, req, "removed_by_trigger")
-    assert sm.learn_lesson(req, "m", "cp notes backup/", trigger=req, scope="request", source_request=req,
-                           source="learn_skill") == "written"
-
-
-@pytest.mark.parametrize("mistake,none", [
-    ("None observed; the solution was direct", True), ("No mistakes were made", True), ("N/A - no mistake", True),
-    ("No error handling around json.loads", False), ("None of the paths were quoted", False),
-    ("Nothing was flushed", False), ("There was no retry after the 429", False),
-])
-def test_no_mistake_means_the_whole_statement(mistake, none):
-    from ghost_agent.memory.lesson_quality import _is_mistake_less
-    assert _is_mistake_less(mistake) is none
-
-
-def test_the_fix_and_mistake_stay_a_pair_even_when_the_new_mistake_is_none(tmp_path):
-    sm = SkillMemory(tmp_path)
-    t = "When handling tool/files paths"
-    sm.learn_lesson(t, "Assuming paths exist", "Check the path exists.", trigger=t, source="learn_skill")
-    sm.learn_lesson(t, "", "Always validate every path against the filesystem before reading it.",
-                    trigger=t, source="learn_skill")
-    row = sm._load_playbook()[0]
-    assert row["mistake"] == "none" and row["solution"].startswith("Always validate")
-
-
-def test_the_same_text_ignores_case_and_punctuation():
-    from ghost_agent.memory.lesson_quality import is_actionable_lesson
-    assert is_actionable_lesson("Use ISO-8601.", "use iso 8601", "Dates") is False

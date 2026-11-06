@@ -76,116 +76,10 @@ class TestSplitterSeparatorPreservation:
         assert recursive_split_text("abc", 100, 10) == ["abc"]
 
 
-# --------------------------------------------------------------------------
-# last_playbook_triggers hygiene (SkillMemory)
-# --------------------------------------------------------------------------
-
-@pytest.fixture
-def skill_memory(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-    d = tmp_path / "mem"
-    d.mkdir()
-    return SkillMemory(d)
-
-
-class TestTriggerStampHygiene:
-    def test_empty_retrieval_resets_stale_triggers(self, skill_memory, monkeypatch):
-        skill_memory.last_playbook_triggers = ["stale-1", "stale-2"]
-        monkeypatch.setattr(
-            skill_memory, "_playbook_items_and_branch",
-            lambda *a, **k: ([], "vector_empty"))
-        out = skill_memory.get_playbook_context("hello", memory_system=MagicMock())
-        assert out == ""
-        assert skill_memory.last_playbook_triggers == []
-
-    def test_nonempty_retrieval_stamps_fresh(self, skill_memory, monkeypatch):
-        skill_memory.last_playbook_triggers = ["stale"]
-        items = [{"text": "1. x", "trigger": "fresh-trigger"}]
-        monkeypatch.setattr(
-            skill_memory, "_playbook_items_and_branch",
-            lambda *a, **k: (items, "vector"))
-        monkeypatch.setattr(
-            skill_memory, "_filter_quarantined", lambda it: it)
-        skill_memory.get_playbook_context("q", memory_system=MagicMock(),
-                                          record_retrievals=False)
-        assert skill_memory.last_playbook_triggers == ["fresh-trigger"]
-
-    def test_stamp_triggers_false_uses_sim_channel(self, skill_memory, monkeypatch):
-        skill_memory.last_playbook_triggers = ["operator-turn"]
-        items = [{"text": "1. x", "trigger": "sim-trigger"}]
-        monkeypatch.setattr(
-            skill_memory, "_playbook_items_and_branch",
-            lambda *a, **k: (items, "vector"))
-        monkeypatch.setattr(
-            skill_memory, "_filter_quarantined", lambda it: it)
-        skill_memory.get_playbook_context(
-            "q", memory_system=MagicMock(),
-            record_retrievals=False, stamp_triggers=False)
-        # Operator record untouched; sim channel carries the sim's set.
-        assert skill_memory.last_playbook_triggers == ["operator-turn"]
-        assert skill_memory.last_sim_triggers == ["sim-trigger"]
-
-
-# --------------------------------------------------------------------------
-# ReadOnlySkillMemory façade
-# --------------------------------------------------------------------------
-
-class TestReadOnlySkillFacade:
-    def test_quarantine_lesson_blocked(self):
-        from ghost_agent.memory.readonly import ReadOnlySkillMemory
-        real = MagicMock()
-        ro = ReadOnlySkillMemory(real)
-        ro.quarantine_lesson("some trigger")
-        real.quarantine_lesson.assert_not_called()
-
-    def test_get_playbook_context_forces_pure_read(self):
-        from ghost_agent.memory.readonly import ReadOnlySkillMemory
-        real = MagicMock()
-        real.get_playbook_context.return_value = "## LESSONS"
-        ro = ReadOnlySkillMemory(real)
-        out = ro.get_playbook_context("query", memory_system=None)
-        assert out == "## LESSONS"
-        kwargs = real.get_playbook_context.call_args.kwargs
-        assert kwargs["record_retrievals"] is False
-        assert kwargs["stamp_triggers"] is False
-
 
 # --------------------------------------------------------------------------
 # helpful-retrieval credit idempotency
 # --------------------------------------------------------------------------
-
-class TestHelpfulCreditIdempotency:
-    def _lesson(self, skill_memory, trigger="deploy fails on port bind"):
-        skill_memory.learn_lesson(
-            trigger, "killed wrong pid", "use lsof -ti :8000", source="learn_skill")
-        return trigger
-
-    def _helpful(self, skill_memory, trigger):
-        pb = skill_memory._load_playbook()
-        for p in pb:
-            if (p.get("trigger") or "").lower() == trigger.lower():
-                return int(p.get("helpful_retrievals") or 0)
-        return None
-
-    def test_judge_after_inline_credit_no_double(self, skill_memory):
-        trig = self._lesson(skill_memory)
-        skill_memory.record_retrieval(trig)
-        # Inline pass credits first (legacy credit-everything form).
-        assert skill_memory.credit_recent_retrievals(300) == 1
-        assert self._helpful(skill_memory, trig) == 1
-        # Async judge lands seconds later — must be a no-op now.
-        assert skill_memory.record_helpful_retrieval(trig) is False
-        assert self._helpful(skill_memory, trig) == 1
-
-    def test_new_retrieval_reopens_credit(self, skill_memory):
-        trig = self._lesson(skill_memory)
-        skill_memory.record_retrieval(trig)
-        assert skill_memory.record_helpful_retrieval(trig) is True
-        assert self._helpful(skill_memory, trig) == 1
-        # A NEW retrieval re-arms the credit.
-        skill_memory.record_retrieval(trig)
-        assert skill_memory.record_helpful_retrieval(trig) is True
-        assert self._helpful(skill_memory, trig) == 2
 
 
 # --------------------------------------------------------------------------
@@ -204,81 +98,12 @@ def agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None
     ctx.sandbox_dir = "/tmp/sandbox"
     ctx.verifier = None
     return GhostAgent(ctx)
-
-
-class TestPassedFlushOrdering:
-    @pytest.mark.asyncio
-    async def test_passed_verdict_drains_stash_even_without_cached_traj(self, agent):
-        """A CONFIRMED (PASSED) late verdict whose trajectory fell out of the
-        correction cache used to return before the stash drained — the
-        success tick was silently lost while FAILED always got through."""
-        agent.context.trajectory_collector = MagicMock()
-        agent.context._recent_trajectories_for_correction = {}  # evicted
-        agent.context._surfaced_triggers_by_traj = OrderedDict(
-            {"traj-1": ["lesson-a", "lesson-b"]})
-        rec = MagicMock()
-        agent.context.skill_memory.record_surfaced_outcomes = rec
-
-        agent._backfill_trajectory_outcome("traj-1", "passed")
-        # The flush schedules record_surfaced_outcomes via spawn_bg +
-        # to_thread; give the loop a tick to run it.
-        for _ in range(20):
-            if rec.call_count:
-                break
-            await asyncio.sleep(0.02)
-
-        rec.assert_called_once_with(["lesson-a", "lesson-b"], True)
-        assert "traj-1" not in agent.context._surfaced_triggers_by_traj
-
-
-class TestSurfacedTriggerMerge:
-    def test_merges_playbook_and_bus_skill_tier(self, agent):
-        sm = MagicMock()
-        sm.last_playbook_triggers = ["pb-1", "shared"]
-        sm._playbook_turn_key = "T1"          # §4L R3 turn-key guards
-        sm.last_bus_triggers = []
-        sm._bus_delivered_turn_key = ""
-        agent.context.memory_bus = MagicMock()
-        agent.context.memory_bus.last_hydration = {
-            "turn_id": "T1",
-            "survivors": [
-                {"source": "skill", "trigger": "bus-1"},
-                {"source": "skill", "trigger": "shared"},
-                {"source": "vector", "trigger": "not-a-lesson"},
-            ],
-        }
-        got = agent._surfaced_lesson_triggers(sm, turn_id="T1")
-        assert got == ["pb-1", "shared", "bus-1"]
-
-    def test_foreign_turn_stash_excluded(self, agent):
-        sm = MagicMock()
-        sm.last_playbook_triggers = ["pb-1"]
-        sm._playbook_turn_key = "T1"
-        sm.last_bus_triggers = []
-        sm._bus_delivered_turn_key = ""
-        agent.context.memory_bus = MagicMock()
-        agent.context.memory_bus.last_hydration = {
-            "turn_id": "OTHER",
-            "survivors": [{"source": "skill", "trigger": "bus-1"}],
-        }
-        assert agent._surfaced_lesson_triggers(sm, turn_id="T1") == ["pb-1"]
-
-    def test_no_bus_no_crash(self, agent):
-        sm = MagicMock()
-        sm.last_playbook_triggers = ["pb-1"]
-        sm._playbook_turn_key = "T1"
-        sm.last_bus_triggers = []
-        sm._bus_delivered_turn_key = ""
-        agent.context.memory_bus = None
-        assert agent._surfaced_lesson_triggers(sm, turn_id="T1") == ["pb-1"]
 
 
 class TestProbePurity:
@@ -509,38 +334,6 @@ class TestFrontierDuplicateStats:
 # --------------------------------------------------------------------------
 # Skill-store cluster
 # --------------------------------------------------------------------------
-
-class TestComposedMintSafety:
-    def _registry(self, tmp_path):
-        from ghost_agent.tools.composed_skills import ComposedSkillRegistry
-        return ComposedSkillRegistry(storage_dir=tmp_path / "composed")
-
-    def test_compile_from_pattern_sanitizes_dotted_names(self, tmp_path):
-        reg = self._registry(tmp_path)
-        sk = reg.compile_from_pattern(
-            "auto.generic.manage_services_manage_services.c73e69",
-            [{"tool": "workspace", "description": "", "params": {}}],
-            "desc")
-        assert "." not in sk.name
-        import re
-        assert re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$", sk.name)
-
-    def test_reminting_does_not_demote_approved_macro(self, tmp_path):
-        reg = self._registry(tmp_path)
-        sk = reg.compile_from_pattern(
-            "auto_seq_x",
-            [{"tool": "workspace", "description": "", "params": {}}],
-            "first mint")
-        sk.status = "active"
-        sk.usage_count = 7
-        reg.save()
-        again = reg.compile_from_pattern(
-            "auto_seq_x",
-            [{"tool": "workspace", "description": "", "params": {}}],
-            "re-mint after re-graduation")
-        assert again is reg.skills["auto_seq_x"]
-        assert reg.skills["auto_seq_x"].status == "active"
-        assert reg.skills["auto_seq_x"].usage_count == 7
 
 
 class TestAcquiredResultClassification:
@@ -855,8 +648,6 @@ class TestEpisodeFieldPopulation:
         ctx.llm_client = MagicMock()
         ctx.profile_memory = MagicMock()
         ctx.profile_memory.get_context_string.return_value = ""
-        ctx.skill_memory = MagicMock()
-        ctx.skill_memory.get_context_string.return_value = ""
         ctx.memory_system = MagicMock()
         ctx.cached_sandbox_state = None
         ctx.sandbox_dir = "/tmp/sandbox"

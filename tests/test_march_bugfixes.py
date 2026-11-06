@@ -46,8 +46,6 @@ def agent():
 
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value="")
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None

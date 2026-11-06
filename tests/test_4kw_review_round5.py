@@ -9,7 +9,6 @@ import pytest
 
 from ghost_agent.tools import file_system as FS
 from ghost_agent.tools.execute import _bulk_destructive, _released_shell_block, _rerun_unsafe
-from ghost_agent.memory.lesson_quality import prescribes_destruction
 
 RELEASED = "aaaaaaaaaaaa"
 DEV = "bbbbbbbbbbbb"
@@ -179,31 +178,6 @@ def test_the_rerun_guard_sees_verbs_behind_options(cmd, unsafe):
     assert _rerun_unsafe(cmd) is unsafe
 
 
-# ── the lesson destruction screen ────────────────────────────────────────────
-@pytest.mark.parametrize("fix", [
-    "Use execute with command='rm -rf *' to clear old outputs.", 'execute(command="rm -rf ./*")',
-    'file_system(operation="delete", path="/workspace/projects")', "bash -c 'rm -rf projects'",
-    "find /workspace -mindepth 1 -delete", "Remove every file in /workspace.", "Wipe /workspace clean.",
-    "Clean up with rm -rf *", "shutil.rmtree('projects')", "delete path=projects/aaaaaaaaaaaa",
-])
-def test_a_lesson_written_as_a_tool_call_is_screened(fix):
-    """Fails in the world where a command inside a quoted tool argument was
-    one opaque token — the original incident's own form."""
-    assert prescribes_destruction(fix) is True
-
-
-@pytest.mark.parametrize("fix", [
-    "Remove the node_modules folder and reinstall: rm -rf node_modules && npm install",
-    "Clean pycache: find . -type d -name __pycache__ -exec rm -rf {} +",
-    "Delete the files you created in /tmp after testing", "Clear the cache directory.",
-    "Delete the directory you just created (rm -r out).", "Do not use rm -rf . to clean up; delete files by name.",
-])
-def test_a_targeted_cleanup_lesson_is_not_screened(fix):
-    """Fails in the world where any named folder, a narrowed find that does
-    not LEAD the line, or a negation followed by a period was refused."""
-    assert prescribes_destruction(fix) is False
-
-
 # ── forget ───────────────────────────────────────────────────────────────────
 def _forget_ms(rows):
     from unittest.mock import MagicMock
@@ -265,108 +239,6 @@ def test_forget_words_match_by_inflection_not_by_prefix(a, b, same):
     assert _word_matches(a, b) is same
 
 
-# ── same request ─────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("a,b", [
-    ("install nginx on the server", "uninstall nginx on the server"),
-    ("compress the logs folder", "decompress the logs folder"),
-    ("activate the venv for the bot", "deactivate the venv for the bot"),
-    ("archive the old projects", "unarchive the old projects"),
-    ("are there any services up ?", "is the service up ?"),
-    ("Hello, how are you?", "how's the"),
-    ("delete this project", "delete this project"), ("redo", "redo"),
-])
-def test_requests_that_differ_in_meaning_are_not_the_same(a, b):
-    """Fails in the world where a prefix that inverts a verb, a plural, or a
-    lone shared word passed as a typo/the same request."""
-    from ghost_agent.memory.lesson_scope import same_request
-    assert same_request(a, b) is False
-
-
-@pytest.mark.parametrize("a,b", [
-    ("show me all projects", "show me all projets"), ("who am I ?", "Who am I?"),
-    ("Create a photorealistic image that looks like a cat in Athens",
-     "create a photorealistic image that looks like a cat in athens"),
-    ("Build me a small tool logslow.py that reads the log", "build me a small tool logslow.py that reads the log"),
-])
-def test_a_resent_request_is_the_same(a, b):
-    """Fails in the world where any "that"/"it" or a single content word made
-    a request unmatchable — 13 of 70 live scoped lessons never matched even
-    their own request."""
-    from ghost_agent.memory.lesson_scope import same_request
-    assert same_request(a, b) is True
-
-
-@pytest.mark.skipif(not os.path.exists("/usr/share/dict/words"), reason="needs the system word list")
-def test_a_name_opening_the_trigger_is_specific():
-    """Fails in the world where `(?<!^)` exempted the first word: a lesson
-    about one team was stored as a general rule."""
-    from ghost_agent.memory.lesson_scope import is_general_trigger
-    req = "do you know panerithraikos?"
-    assert is_general_trigger("Panerithraikos questions: verify the team's league standing", req) is False
-    assert is_general_trigger("Verify the league standings before answering sports questions",
-                              "verify the panerithraikos league") is True
-
-
-# ── dedup keeps plans for different requests apart ───────────────────────────
-def test_plans_for_different_requests_do_not_merge(tmp_path):
-    """Fails in the world where "copy A to B" and "copy B to A" merged into one
-    row (same sorted key) and one request was served the other's plan."""
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    a, b = "copy report.txt to backup.txt on the server", "copy backup.txt to report.txt on the server"
-    sm.learn_lesson(a, "m", "cp report.txt backup.txt", trigger=a, scope="request", source_request=a,
-                    source="learn_skill")
-    out = sm.learn_lesson(b, "m", "cp backup.txt report.txt and verify", trigger=b, scope="request",
-                          source_request=b, source="learn_skill")
-    rows = sm._load_playbook()
-    row_a = next(r for r in rows if r.get("source_request") == a)
-    assert row_a["solution"] == "cp report.txt backup.txt"
-    assert out is None or any(r.get("source_request") == b for r in rows)
-
-
-def test_a_vector_twin_for_another_request_is_its_own_row(tmp_path):
-    from unittest.mock import MagicMock
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    a, b = "restart the chess service now", "stop the chess service now"
-    sm.save_playbook([{"trigger": a, "task": a, "mistake": "m", "solution": "systemctl restart chess",
-                       "scope": "request", "source_request": a, "source": "learn_skill"}])
-    sm._find_duplicate_lesson = lambda *x, **k: {"source": "vector", "trigger": a, "text": "", "distance": 0.08}
-    ms = MagicMock()
-    sm.learn_lesson(b, "m", "systemctl stop chess and check", ms, trigger=b, scope="request",
-                    source_request=b, source="learn_skill")
-    rows = sm._load_playbook()
-    assert {r["source_request"] for r in rows} == {a, b}
-    assert next(r for r in rows if r["source_request"] == a)["solution"] == "systemctl restart chess"
-
-
-# ── retrieval ────────────────────────────────────────────────────────────────
-def test_an_orphaned_twin_of_a_scoped_plan_is_not_served(tmp_path):
-    """Fails in the world where a twin with no row skipped the scope check and
-    the raw one-request plan reached every request."""
-    from unittest.mock import MagicMock
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook([{"trigger": "When asked about a person, search first", "solution": "search",
-                       "mistake": "m"}])
-    ms = MagicMock()
-    ms.embedding_fn = None
-    ms.collection.query.return_value = {
-        "documents": [["SITUATION: copy the files to the server\nSOLUTION: rsync -a x y"]],
-        "distances": [[0.1]], "metadatas": [[{"trigger": "copy the files to the server", "scope": "request"}]]}
-    assert sm.get_playbook_items("copy the files to the server please", ms) == []
-
-
-def test_a_malformed_distance_setting_keeps_the_default(monkeypatch):
-    """Fails in the world where `GHOST_LESSON_TRIGGER_DISTANCE=0,3` raised at
-    import and the agent could not boot."""
-    from ghost_agent.memory import skills
-    monkeypatch.setenv("GHOST_LESSON_TRIGGER_DISTANCE", "0,3")
-    assert skills._env_distance("GHOST_LESSON_TRIGGER_DISTANCE", 0.30) == 0.30
-    monkeypatch.setenv("GHOST_LESSON_TRIGGER_DISTANCE", "0.25")
-    assert skills._env_distance("GHOST_LESSON_TRIGGER_DISTANCE", 0.30) == 0.25
-
-
 def test_a_job_wake_runs_once_under_its_own_id_and_records_its_conclusion(monkeypatch):
     from unittest.mock import MagicMock
     from ghost_agent import main as M
@@ -395,7 +267,7 @@ def test_the_trajectory_kind_follows_the_origin(origin_id, ctx_kind, expect):
     from types import SimpleNamespace
     from ghost_agent.core.agent import trajectory_task_kind
     from ghost_agent.utils.logging import request_id_context
-    ctx = SimpleNamespace(skill_memory=SimpleNamespace(is_read_only=False))
+    ctx = SimpleNamespace()
     if ctx_kind:
         ctx.trajectory_task_kind = ctx_kind
     tok = request_id_context.set(origin_id)
@@ -422,37 +294,9 @@ def test_a_thumb_reaches_the_diary_only_for_a_user_row(tmp_path, kind, credited)
     sm = MagicMock(spec=SelfModel)
     sm.enabled = True
     agent = SimpleNamespace(context=SimpleNamespace(trajectory_collector=c, _recent_trajectories_for_correction={},
-                                                    self_model=sm,
-                                                    skill_memory=SimpleNamespace(is_read_only=False)),
-                            _flush_stashed_lesson_outcome=lambda *a: None)
+                                                    self_model=sm))
     assert apply_human_label(agent, "r1", "positive")["ok"]
     assert sm.record_outcome.called is credited
-
-
-def test_the_credit_helper_credits_only_a_clean_teaching_turn_with_a_request():
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-    from ghost_agent.core import agent as A
-    from ghost_agent.utils.logging import request_id_context
-    agent = A.GhostAgent.__new__(A.GhostAgent)
-    sm = MagicMock()
-    agent.context = SimpleNamespace(skill_memory=sm)
-    tok = request_id_context.set("chatcmpl-1")
-    try:
-        asyncio.run(agent._credit_turn_lessons(0, "restart the chess service"))
-        assert sm.credit_recent_retrievals.call_args.kwargs == {"query": "restart the chess service"}
-        sm.reset_mock()
-        asyncio.run(agent._credit_turn_lessons(1, "restart the chess service"))
-        asyncio.run(agent._credit_turn_lessons(0, "👍"))
-        assert not sm.credit_recent_retrievals.called
-    finally:
-        request_id_context.reset(tok)
-    tok = request_id_context.set("probe-deadbeef")
-    try:
-        asyncio.run(agent._credit_turn_lessons(0, "restart the chess service"))
-        assert not sm.credit_recent_retrievals.called
-    finally:
-        request_id_context.reset(tok)
 
 
 def _calls_named(fn_node, name):
@@ -460,34 +304,6 @@ def _calls_named(fn_node, name):
     return [n for n in ast.walk(fn_node) if isinstance(n, ast.Call) and (
         (isinstance(n.func, ast.Attribute) and n.func.attr == name)
         or (isinstance(n.func, ast.Name) and n.func.id == name))]
-
-
-def test_both_turn_paths_credit_through_the_helper():
-    """Both the finalize and the streamed path call the one helper (AST call
-    nodes, not source text)."""
-    import ast
-    import inspect
-    from ghost_agent.core import agent as A
-    tree = ast.parse(inspect.getsource(A))
-    assert len(_calls_named(tree, "_credit_turn_lessons")) == 2
-    direct = [c for c in _calls_named(tree, "to_thread")
-              if c.args and isinstance(c.args[0], ast.Attribute) and c.args[0].attr == "credit_recent_retrievals"]
-    assert len(direct) == 1          # only inside the helper
-
-
-def test_the_trajectory_record_reads_this_turns_lessons_only():
-    """The recorder asks the turn-keyed helper (with the turn id), never the
-    unguarded `last_playbook_triggers` attribute (AST nodes)."""
-    import ast
-    import inspect
-    from ghost_agent.core import agent as A
-    tree = ast.parse(inspect.getsource(A))
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_record_turn_trajectory")
-    calls = _calls_named(fn, "_surfaced_lesson_triggers")
-    assert calls and all(any(k.arg == "turn_id" for k in c.keywords) for c in calls)
-    # neither getattr(…, "last_playbook_triggers") nor ….last_playbook_triggers
-    assert not any((isinstance(n, ast.Constant) and n.value == "last_playbook_triggers")
-                   or (isinstance(n, ast.Attribute) and n.attr == "last_playbook_triggers") for n in ast.walk(fn))
 
 
 def test_hydration_judges_scoped_lessons_against_the_users_request():
@@ -527,7 +343,6 @@ class _AngleEmb:
 
 def _gate(tmp_path, rows, dist, query="alpha beta gamma"):
     from unittest.mock import MagicMock
-    from ghost_agent.memory.skills import SkillMemory
     sm = SkillMemory(tmp_path)
     sm.save_playbook([dict(r, mistake="m", solution="s", timestamp="2026-09-01T00:00:00") for r in rows])
     ms = MagicMock()
@@ -536,48 +351,6 @@ def _gate(tmp_path, rows, dist, query="alpha beta gamma"):
         "documents": [[f"SITUATION: {r['trigger']}\nSOLUTION: s" for r in rows]],
         "distances": [[0.2] * len(rows)], "metadatas": [[{"trigger": r["trigger"]} for r in rows]]}
     return [it["trigger"] for it in sm.get_playbook_items(query, ms)]
-
-
-def test_the_trigger_gate_threshold_is_030(tmp_path):
-    """Kills 0.30 → 0.6 and 0.30 → 0.05: a no-overlap trigger at 0.2 enters,
-    one at 0.4 does not."""
-    rows = [{"trigger": "zebra quokka lantern"}, {"trigger": "violet marble harbor"}]
-    got = _gate(tmp_path, rows, {"zebra quokka lantern": 0.2, "violet marble harbor": 0.4})
-    assert got == ["zebra quokka lantern"]
-
-
-def test_shared_terms_admit_a_distant_trigger(tmp_path):
-    """Kills "distance only": keyword overlap alone admits — TWO shared
-    content words since §4LC (one shared word admitted "address factual
-    queries" for "what is my address")."""
-    rows = [{"trigger": "gamma ray spectroscopy notes"}]
-    assert _gate(tmp_path, rows, {"gamma ray spectroscopy notes": 0.9},
-                 query="gamma ray burst") == [rows[0]["trigger"]]
-    assert _gate(tmp_path, rows, {"gamma ray spectroscopy notes": 0.9}) == []     # "gamma" alone
-
-
-def test_the_gate_measures_against_the_query_not_the_turn_request(tmp_path):
-    from ghost_agent.memory.lesson_scope import current_request
-    rows = [{"trigger": "zebra quokka lantern"}]
-    tok = current_request.set("something else entirely")
-    try:
-        got = _gate(tmp_path, rows, {"zebra quokka lantern": 0.1, "something else entirely": 0.0})
-    finally:
-        current_request.reset(tok)
-    assert got == ["zebra quokka lantern"]
-
-
-def test_the_gate_fails_open_with_no_embedder(tmp_path):
-    from unittest.mock import MagicMock
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    row = {"trigger": "zebra quokka lantern", "mistake": "m", "solution": "s"}
-    sm.save_playbook([row])
-    ms = MagicMock()
-    ms.embedding_fn = None
-    ms.collection.query.return_value = {"documents": [["SITUATION: zebra quokka lantern\nSOLUTION: s"]],
-                                        "distances": [[0.2]], "metadatas": [[{"trigger": row["trigger"]}]]}
-    assert [it["trigger"] for it in sm.get_playbook_items("alpha beta", ms)] == [row["trigger"]]
 
 
 class _Coll:
@@ -613,60 +386,6 @@ class _Vec:
         return "stored"
 
 
-def test_a_replaced_fix_is_re_embedded_exactly_once(tmp_path):
-    """Kills: the refresh not deleting the old twin (the heal then sees it and
-    skips), refreshing on every merge, and no refresh on the vector path."""
-    from ghost_agent.memory.skills import SkillMemory, lesson_embedding_text, _normalize_lesson
-    sm = SkillMemory(tmp_path)
-    vec = _Vec()
-    sm.learn_lesson("When parsing dates from logs", "guessed", "use ISO", vec, source="learn_skill")
-    assert len(vec.collection.rows) == 1
-    sm.learn_lesson("When parsing dates from logs", "guessed", "use ISO 8601 and the log's own timezone", vec,
-                    source="learn_skill")
-    docs = [d for _m, d in vec.collection.rows.values()]
-    row = sm._load_playbook()[0]
-    assert docs == [lesson_embedding_text(_normalize_lesson(row))]
-    n = vec.n
-    sm.learn_lesson("When parsing dates from logs", "guessed", "short", vec, source="learn_skill")
-    assert vec.n == n                      # nothing replaced: no re-embed
-
-
-def test_heal_writes_one_twin_for_rows_sharing_a_trigger(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook([{"trigger": "Parallel processing with ordering", "mistake": "a", "solution": "x"},
-                      {"trigger": "Parallel processing with ordering", "mistake": "b", "solution": "y"}])
-    vec = _Vec()
-    assert sm.heal_missing_twins(vec) == 1 and len(vec.collection.rows) == 1
-
-
-def test_heal_skips_a_row_removed_since_its_snapshot(tmp_path, monkeypatch):
-    """Kills the per-lesson re-check under the lock (fourth review m5)."""
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook([{"trigger": "When the row is gone", "mistake": "a", "solution": "x"}])
-    first = sm._load_playbook()
-    calls = {"n": 0}
-    real = sm._load_playbook
-
-    def _load():
-        calls["n"] += 1
-        return first if calls["n"] == 1 else []
-    monkeypatch.setattr(sm, "_load_playbook", _load)
-    vec = _Vec()
-    assert sm.heal_missing_twins(vec) == 0 and not vec.collection.rows
-
-
-@pytest.mark.parametrize("a,b,same", [
-    ("show the logs folder", "show the lgos folder", False),        # 4-letter words: exact only
-    ("delete that file", "delete that file", False),                  # short + deictic
-    ("restart restart the chess service", "restart the chess service", True),
-])
-def test_same_request_edges(a, b, same):
-    from ghost_agent.memory.lesson_scope import same_request
-    assert same_request(a, b) is same
-
-
 @pytest.mark.parametrize("rows,gone", [
     ([("f", 0.85, "The colour the user picks as favourite is green")], set()),     # full cover, past 0.8
     ([("f", 0.75, "The colour the user picks as favourite is green")], {"f"}),
@@ -678,60 +397,6 @@ def test_forget_word_coverage_bounds(tmp_path, rows, gone):
     ms, deleted = _forget_ms(rows)
     asyncio.run(tool_unified_forget("favourite colour", tmp_path / "nosb", ms))
     assert set(deleted) == gone
-
-
-def test_a_legacy_row_without_a_producer_merges_as_evidence_only(tmp_path):
-    """JSON path: a row with no recorded producer is foreign — its fix and
-    verified flag stay; only its frequency moves."""
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook([{"trigger": "When copying between hosts", "task": "When copying between hosts",
-                       "mistake": "m", "solution": "old fix", "frequency": 1, "verified": False}])
-    sm.learn_lesson("When copying between hosts", "m", "a much longer replacement fix text here", source="learn_skill",
-                    verified=True)
-    row = sm._load_playbook()[0]
-    assert row["solution"] == "old fix" and row.get("verified") is not True and row["frequency"] == 2
-
-
-def test_a_request_naming_a_home_path_matches_its_redacted_record():
-    """Fails in the world where the stored request carried `/Users/<user>`
-    (redacted on record) and the live one the real home folder."""
-    from ghost_agent.memory.lesson_scope import same_request
-    rec = "Using the file system tool, count the lines in /Users/<user>/Data/AI/Agent/PROJECT_JOURNAL.md"
-    live = "Using the file system tool, count the lines in /Users/vasilis/Data/AI/Agent/PROJECT_JOURNAL.md"
-    assert same_request(rec, live)
-    assert not same_request(rec, live.replace("PROJECT_JOURNAL", "README"))
-
-
-@pytest.mark.parametrize("a,b", [
-    ("restart the service now", "restart the services now"),          # one vs many
-    ("show any errors in the log", "show errors in the log"),          # a quantity word is content
-    ("summarise the present situation report", "summarise the president situation report"),
-    ("show the listing of open files", "show the listening of open files"),
-])
-def test_close_words_that_differ_are_not_typos(a, b):
-    """Fails in the world where a plural, a dropped quantity word, or a
-    ratio-similar word two edits away passed as the same request."""
-    from ghost_agent.memory.lesson_scope import same_request
-    assert same_request(a, b) is False
-
-
-def test_heal_marks_its_own_writes_when_the_recheck_cannot_read(tmp_path):
-    """The in-run mark is the fallback when the per-lesson re-check fails:
-    two rows with one trigger still get ONE twin."""
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook([{"trigger": "Parallel processing with ordering", "mistake": "a", "solution": "x"},
-                      {"trigger": "Parallel processing with ordering", "mistake": "b", "solution": "y"}])
-    vec = _Vec()
-    _get = vec.collection.get
-
-    def _get_or_fail(where=None, **kw):
-        if where and "$and" in where:
-            raise RuntimeError("store busy")
-        return _get(where=where, **kw)
-    vec.collection.get = _get_or_fail
-    assert sm.heal_missing_twins(vec) == 1 and len(vec.collection.rows) == 1
 
 
 def test_an_absolute_glob_matching_the_projects_folder_is_bulk():

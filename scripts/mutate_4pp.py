@@ -33,7 +33,7 @@ MUT = [
     ("T18 keep of an unknown doc", KB, "        if _name not in _lib:\n            return ToolOutcome.rejected", "        if False:\n            return ToolOutcome.rejected"),
     ("T19 list shows no TEMPORARY", KB, "                    facts.append(f\"TEMPORARY — removed on {_TD.expiry_note(_te['expires_at'])}\")", "                    pass"),
     ("T20 keep not advertised", KB, "    \"expand\", \"forget\", \"list_docs\", \"reset_all\", \"keep\",", "    \"expand\", \"forget\", \"list_docs\", \"reset_all\","),
-    ("T21 idle job never sweeps", AG, "                            _tds = await asyncio.to_thread(_TD.sweep, _ms)", "                            _tds = {\"removed\": [], \"marked\": [], \"dropped\": []}"),
+    ("T21 idle job never sweeps", AG, "                        _tds = await asyncio.to_thread(_TD.sweep, _ms)", "                        _tds = {\"removed\": [], \"marked\": [], \"dropped\": []}"),
     ("T22 slack key reaches the store", RT, "    if is_conversation_key_only(_session_id):", "    if False:"),
     ("T23 every key skips the store", RT, "    return isinstance(session_id, str) and session_id.startswith(_CONVERSATION_KEY_PREFIXES)", "    return isinstance(session_id, str)"),
     ("T5 filename heuristics mark owner files", TD, "    return bool(str(rec.get(\"video_id\") or \"\").strip())", "    return bool(str(rec.get(\"video_id\") or \"\").strip()) or str(filename).startswith(\"yt-\")"),

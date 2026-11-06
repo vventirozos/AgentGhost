@@ -17,39 +17,34 @@ logger = logging.getLogger("GhostAgent")
 #
 # Prior behaviour wrote `<skills_dir>/../../escaped.py` when the LLM
 # hallucinated a name containing `..`, which landed the file OUTSIDE
-# the sandbox. Confirmed exploitable: a `learn_skill(name="../../pwn",
+# the sandbox. Confirmed exploitable: a `create_skill(name="../../pwn",
 # python_code="...")` call would write to the sandbox's parent dir on
 # disk. The validation below makes any such name raise before it
 # touches the filesystem.
 _SAFE_SKILL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
-def _list_composed_skills(memory_dir) -> list:
-    """(name, description, status) for each composed skill (a named macro),
-    read from the ComposedSkillRegistry's JSON so a single
-    ``manage_skills(action=list)`` returns the COMPLETE custom-skill
-    inventory (acquired + composed), not just acquired (2026-07-15).
-    Status is included so proposed (non-dispatchable) macros aren't
-    presented as callable in the authoritative inventory. Best-effort:
-    returns [] on any problem."""
-    if not memory_dir:
-        return []
+def _usage_is_bookable() -> bool:
+    """§4MI: THE request populations whose acquired-skill runs are booked
+    into the production skill store. Never raises (an unknown kind books,
+    like before). (Moved here from the macro engine when it was removed,
+    §4TA 2026-11-05 — this module was its other caller.)"""
     try:
-        path = Path(memory_dir) / "composed_skills" / "composed_skills.json"
-        if not path.exists():
-            return []
-        data = json.loads(path.read_text()) or {}
-        out = []
-        for name, sd in data.items():
-            if not isinstance(sd, dict):
-                continue
-            out.append((str(name),
-                        str(sd.get("trigger_description")
-                            or sd.get("description") or ""),
-                        str(sd.get("status") or "active")))
-        return out
-    except Exception:
-        return []
+        from ..utils.logging import request_kind
+        # the populations that must NOT book — a probe, a member, a
+        # background turn (sched-/sub-/sim- self-play) and a bench/replay
+        # run; no request at all ("system": a script, a test) books
+        from ..utils.logging import request_id_context
+        _k = request_kind()
+        if _k in ("probe", "member", "test"):
+            return False
+        if _k == "background":
+            # r2 review: the owner's scheduled task (sched-) and sub-agent
+            # (sub-) are the owner's work; only self-play (sim-) is not
+            return not str(request_id_context.get() or "").startswith("sim-")
+        return True
+    except Exception:  # noqa: BLE001
+        return True
 
 
 class SkillNameError(ValueError):
@@ -438,12 +433,8 @@ class AcquiredSkillManager:
     def log_telemetry(self, name: str, success: bool):
         # §4MI: a self-play / probe / bench / member run must not move the
         # owner's skill telemetry (three failures RETIRE a skill)
-        try:
-            from .composed_skills import _usage_is_bookable
-            if not _usage_is_bookable():
-                return
-        except Exception:  # noqa: BLE001
-            pass
+        if not _usage_is_bookable():
+            return
         try:
             with self._lock:
                 registry = self._load_registry()
@@ -860,11 +851,11 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     import json
     from .execute import tool_execute
 
-    # Cross-namespace shadow check (the composed-skill `define` path has
-    # had the mirror-image check for months — this side was missing). A
-    # builtin-named skill is persisted fine but permanently shadow-skipped
-    # on both defs and runners, while the tool reports "It is now LIVE" —
-    # false; a macro-named skill silently steals the macro's dispatch.
+    # Shadow check. A builtin-named skill is persisted fine but permanently
+    # shadow-skipped on both defs and runners, while the tool reports "It is
+    # now LIVE" — false. (The check against the macro registry went with the
+    # macro engine, §4TA 2026-11-05: a name an old macro had is free again,
+    # except `youtube_transcribe`, which is a built-in now.)
     try:
         from .registry import TOOL_DEFINITIONS as _BUILTIN_DEFS
         _builtin = {d.get("function", {}).get("name") for d in _BUILTIN_DEFS}
@@ -872,18 +863,6 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
             return ToolOutcome.rejected((f"Skill creation failed: '{name}' is a BUILT-IN tool name. "
                     f"A skill with this name would never be advertised or "
                     f"dispatched. Pick a distinct name."), reason_code="skill_creation_refused")
-        from .composed_skills import _registry_from_context as _creg
-        class _Ctx:  # minimal context shim for the registry cache helper
-            pass
-        _c = _Ctx()
-        _c.memory_dir = memory_dir
-        _c.sandbox_dir = sandbox_dir
-        _reg = _creg(_c)
-        if _reg is not None and name in getattr(_reg, "skills", {}):
-            return ToolOutcome.rejected((f"Skill creation failed: '{name}' is an existing COMPOSED "
-                    f"skill (macro). Creating an acquired skill with the same "
-                    f"name would advertise one tool and execute another. Pick "
-                    f"a distinct name or delete the macro first."), reason_code="skill_creation_refused")
     except Exception as _shadow_err:
         logger.debug("skill shadow check skipped: %s", _shadow_err)
     
@@ -1075,7 +1054,6 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
     mgr.backfill_missing_skill_embeddings()
     if action == "list":
         skills = mgr.get_all_skills()
-        composed = _list_composed_skills(memory_dir)
 
         parts = []
         if skills:
@@ -1088,14 +1066,8 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
                 _status = info.get("status", "active")
                 _tag = "" if _status == "active" else f" [{_status.upper()} — not callable]"
                 parts.append(f"- {name}{_tag}: {info.get('description', '')}")
-        if composed:
-            parts.append("Composed skills (named macros):")
-            for name, desc, cstatus in composed:
-                _tag = ("" if cstatus == "active"
-                        else " [PROPOSED — approve via manage_composed_skills before use]")
-                parts.append(f"- {name}{_tag}: {desc}")
         if not parts:
-            body = "No custom skills have been acquired or composed yet."
+            body = "No custom skills have been acquired yet."
         else:
             body = "\n".join(parts)
         # Compact footer so the model answers "list all your skills" from THIS

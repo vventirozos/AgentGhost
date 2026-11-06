@@ -17,7 +17,7 @@
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration</a>
-    <a href="dream_cycle.html">Maintenance &amp; failure replay</a>
+    <a href="dream_cycle.html">Maintenance cycle</a>
     <a href="skill_acquisition.html">Skill acquisition</a>
     <a href="circuit_breaker.html">Circuit breaker</a>
     <a href="selfhood.html">Selfhood</a>
@@ -124,7 +124,7 @@
     for). Requiring the identical <em>error</em> to recur means a post-fix
     re-run that now succeeds, or fails a <em>new</em> way, never trips the
     guard &mdash; only a genuinely stuck loop does. Idempotent setters
-    (<code>update_profile</code>, <code>learn_skill</code>,
+    (<code>update_profile</code>,
     <code>knowledge_base</code> insert/forget) are exempt entirely, since the
     idempotency guard above already covers them.
   </p>
@@ -159,8 +159,9 @@
     legal. (3)&nbsp;<strong>request scoping</strong> — the guard resets at
     request start; entries no longer leak from a previous request's world.
     Cross-request pathology is no longer mined by anything since the
-    post-mortem engine was removed (§4NM); the activity ledger and the
-    <a href="../learning-loop.html">learning loop</a> are where repeated failures surface.
+    post-mortem engine was removed (§4NM); the activity ledger and the failure census are where repeated failures surface (the
+    failure-replay loop, which also read them, was removed on 2026-11-05; see
+    <a href="../learning-loop.html#removed">Owner rules</a>).
   </p>
   <p>
     The guard is <strong>independent of <code>--enable-metacog</code></strong>:

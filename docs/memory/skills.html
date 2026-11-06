@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>memory.skills — Ghost Agent</title>
+<title>memory.skills (removed) — Ghost Agent</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
     <a href="graph.html">graph</a>
     <a href="profile.html">profile</a>
     <a href="temporal.html">temporal</a>
-    <a class="current" href="skills.html">skills</a>
+    <a class="current" href="skills.html">skills (removed)</a>
     <a href="journal.html">journal</a>
     <a href="scratchpad.html">scratchpad</a>
     <a href="episodes.html">episodes</a>
@@ -31,637 +31,58 @@
 <main>
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
-  <h1>memory / skills.py — SkillMemory</h1>
-  <p class="subtitle">Lessons learned from past mistakes. Vector-backed retrieval with BM25 re-rank; verified-first pinning.</p>
-  <p class="note warn"><strong>Current state (2026-10-11, §4NM).</strong> Lessons are written by exactly two sources: <code>learn_skill</code> (the owner's dictation and "learn rule N") and <code>operator_repair</code>. Every background producer that used to write here — dream/REM heuristics and patterns, episode consolidation, failure distillation, synthetic self-play, bench, reflection, post-mortems, skills-auto graduation — was removed from the code on 2026-10-11, together with utility pruning (<code>prune_low_utility</code>, <code>GHOST_SKILL_PRUNE</code>), the counterfactual replay's quarantine and the <code>GHOST_PRODUCER_LESSONS</code> switch. The dated sections below are the engineering record of those producers and of the gates built against them; where they describe a producer, they describe code that no longer exists. Retrieval, owner rules, quarantine, retraction, provenance and the write gate are current.</p>
+  <h1>skills &mdash; the lesson store (removed)</h1>
+  <p class="lede"><span class="tag">2026-11-06 &sect;4TD</span> The lesson store is gone: <code>memory/skills.py</code> (<code>SkillMemory</code>, the playbook <code>skills_playbook.json</code>), <code>memory/lesson_scope.py</code>, <code>memory/lesson_quality.py</code>, and the two model tools <code>learn_skill</code> and <code>list_lessons</code>. The page keeps its file name so old links still work.</p>
+  <p class="note">"Skills" in this file name meant <strong>lessons</strong>: a mistake and its fix, written down and put back into later prompts. It never meant the custom tools the agent writes for itself. Those are <a href="../tools/acquired_skills.html">acquired skills</a> (<code>create_skill</code>, <code>manage_skills</code>), and they are unchanged.</p>
 
-  <h2>Storage</h2>
+  <h2>What it was</h2>
+  <p>A JSON playbook of lessons under the memory directory, each one a trigger ("when &hellip;"), the mistake and the fix. Every lesson also had a copy in the vector store (its "twin", a row of type <code>skill</code>) so it could be found by meaning. Lessons were written by reflection, by the idle "dream" pass, by post-mortems and by the model's own <code>learn_skill</code> call; they were scored by how often they were shown and whether the turn that saw them went well; and the best matches were put into the prompt as a "SKILL PLAYBOOK" block. The store had its own dedup, quarantine, pruning, retraction after a refuted turn, and a scope rule (a plan for one request was shown only when that request came back).</p>
+
+  <h2>Why it was removed</h2>
+  <p>Measured on 27 days of live data (journal &sect;4SZ):</p>
   <ul>
-    <li>JSON at <code>memory_dir/skills_playbook.json</code>.</li>
-    <li>Vector embeddings stored alongside in <a href="vector.html">VectorMemory</a> with <code>metadata.type = "skill"</code>.</li>
-    <li><code>threading.RLock</code> for JSON reads/writes; lazy-init fallback for tests.</li>
+    <li>The automatic lessons had been <strong>out of every prompt since 2026-10-13</strong> (&sect;4ON): a blind comparison on real owner requests found they added nothing, and replies were about 45&nbsp;% slower with them.</li>
+    <li>26 lessons were still in the store. <code>list_lessons</code> still listed them and the learning report still described them as live.</li>
+    <li><code>learn_skill</code> had <strong>0 calls in 30 days</strong>.</li>
+    <li>The idle producers were removed in &sect;4NM (2026-10-11) and the replay loop in &sect;4SZ (2026-11-05), so nothing wrote a lesson any more except the model's own call.</li>
+    <li>The two tool definitions and the prompt rule that routed to them were part of the cached head of every request.</li>
   </ul>
 
-  <h3>Atomic save (cross-process)</h3>
-  <p><code>_save_playbook_unlocked</code> writes to a temp file and then <code>os.replace</code>s it over the live playbook (atomic on POSIX). Two problems the in-process <code>RLock</code> alone could not solve — Slack, web and CLI each run their own process — are now closed:</p>
+  <h2>What replaced it</h2>
   <ul>
-    <li><strong>Torn temp file.</strong> The temp path was FIXED (<code>skills_playbook.tmp</code>), so two processes writing at once interleaved into one corrupt temp that <code>os.replace</code> then promoted. The temp name now carries the writer's PID (<code>skills_playbook.&lt;pid&gt;.tmp</code>), so each process promotes only its <em>own</em> fully-written file. Any leftover temp on the error path is unlinked in a <code>finally</code>.</li>
-    <li><strong>Concurrent promotion.</strong> The write + replace is wrapped in an <code>fcntl</code> advisory lock (<code>_crossproc_lock</code>) on a sibling <code>skills_playbook.lock</code> file — mirroring <a href="frontier.html">FrontierTracker</a> — so at most one writer (across processes, or two <code>SkillMemory</code> instances in one process) is inside the critical section at a time. On platforms without <code>fcntl</code> the lock degrades to a graceful no-op (the PID-unique temp still prevents cross-process tearing). Covered by <code>tests/test_memory_crossproc_locking.py</code>.</li>
+    <li><strong>Owner rules.</strong> What changes the agent's behaviour is a rule the owner states: <em>learn this rule: &hellip;</em>. The rules are shown on every owner turn. See <a href="../learning-loop.html">Owner rules</a>.</li>
+    <li><strong>Custom tools</strong> for things the agent should be able to do again: <code>create_skill</code> / <code>manage_skills</code>. See <a href="../tools/acquired_skills.html">acquired_skills</a>.</li>
+    <li><strong>The experience store</strong> (human-graded past turns) is unchanged. See <a href="experience.html">experience</a>.</li>
   </ul>
 
-  <h2>Lesson schema (v2)</h2>
-  <pre><code>{
-  "schema_version":      2,
-  "timestamp":           "ISO",
-  "task":                str,
-  "trigger":             str,
-  "mistake":             str,
-  "anti_pattern":        str,
-  "solution":            str,
-  "correct_pattern":     str,
-  "code_example":        str,
-  "domains":             list[str],
-  "confidence":          float (0-1),
-  "source_challenge_hash": str,
-  "verified":            bool,
-  "verification_attempted": bool,
-  "retrievals":          int,
-  "helpful_retrievals":  int,
-  "succeeded_retrievals": int,
-  "failed_retrievals":   int,
-  "last_retrieved_at":   "ISO",
-  "source":              str,
-  "source_trajectory_id": str,
-  "source_refs":         list[str] (max 20),
-  "dimension":           str,
-  "frequency":           int,
-  "graduated":           bool
-}</code></pre>
-  <p><strong>source_refs (2026-07-14):</strong> evidence handles the lesson was generalized FROM — e.g. <code>["ep:12", "ep:15"]</code> for the episode rows behind a dream episode-strategy. Unioned (deduped, capped 20) when a duplicate lesson is merged/reinforced; mirrored onto the vector twin as a comma-joined <code>source_refs</code> metadata string so <code>tool_recall</code> hits can print an <code>EVIDENCE REFS:</code> line. Distinct from <code>source</code> (free-form origin tag) and <code>source_trajectory_id</code> (retraction key). Tests: <code>tests/test_memory_provenance.py</code>.</p>
-  <p><strong>dimension (2026-07-19):</strong> the harness layer the recorded failure was attributed to — see <a href="../core/failure_dimension.html">failure_dimension</a>. Auto-classified at the write chokepoint for real-mistake lessons (heuristic regex over <code>trigger + anti_pattern</code>; kill switch <code>GHOST_FAILURE_DIM=0</code>); empty for mistake-less rules, legacy rows, and unclassifiable records (the dream distillation pass adjudicates those offline via the worker). An explicit <code>dimension=</code> kwarg wins. Back-filled onto an existing row on dedup merge; mirrored onto the vector twin metadata. <code>source="distilled"</code> marks the cross-case pattern lessons the dream-side <a href="../core/failure_dimension.html">failure_distill</a> pass writes — their <code>distilled(&lt;dim&gt;/&lt;cluster&gt;):</code> trigger prefix is a dedup contract: re-distillation reuses the trigger verbatim so frequency accumulates on one row. Tests: <code>tests/test_lesson_dimension.py</code>.</p>
-
-  <h2>Lesson-quality gate at the write chokepoint (2026-07-16)</h2>
-  <p>The dream heuristics loop had an actionability gate since 2026-07-13, but it lived <em>inside</em> dream — so self-play and other producers bypassed it, and observations still leaked in. Measured on the live playbook: 23 of 50 lessons were mistake-less pseudo-entries and they drew <strong>28% of all retrievals</strong> — the single most-retrieved item being a dream chess-persona note (<em>"When playing live chess against Vasilis, provide continuous coaching commentary"</em>, 84 retrievals), alongside self-play observations (<em>"On a regex_parse task that has a familiar shape…"</em>) and user preferences (<em>"The user prefers ripgrep"</em>) that match no real query.</p>
-  <p>The gate now runs at <code>learn_lesson</code> — the single write chokepoint, so it covered <em>every</em> producer at the time (dream, self-play, reflection, episode consolidation — all removed on 2026-10-11, §4NM; today it gates <code>learn_skill</code> and <code>operator_repair</code>). The logic (<code>memory/lesson_quality.py</code>, a leaf module shared with <code>core.dream</code> to avoid an import cycle): a lesson that records a <strong>real mistake</strong> is a genuine correction and always passes; a <strong>mistake-less</strong> entry is a rule/observation, so its <code>solution</code> must read as an actionable heuristic (<code>_is_actionable_heuristic</code> — imperative starter, or conditional + modal). <code>verified</code> gets no bypass — it would only ever exempt a verified <em>observation</em> (a verified fix has a mistake; a verified actionable rule passes anyway). The 11 non-actionable lessons on the live playbook were pruned retroactively (50 → 39; backup at <code>skills_playbook.json.pre-quality-prune-20260716</code>), and their orphaned vector twins were then deleted in-process via <code>VectorMemory.delete_skill_twins</code> (POST <code>/api/memory/delete_skill_twin</code> — a second PersistentClient against the live Chroma dir risks HNSW corruption, so the delete must run inside the owning process; 11 twins removed, 7315 → 7304 docs, verified idempotent). This is the content-quality complement to the 2026-07-15 retrieval-<em>routing</em> fix: routing now surfaces lessons (mediation ~1% → ~85% in B4), and this stops ~a quarter of what surfaces from being noise. Tests: <code>tests/test_lesson_quality_gate.py</code>, <code>tests/test_delete_skill_twins.py</code>.</p>
-
-  <p><strong>Trivial tool-routing floor (2026-07-29):</strong> a mistake-less rule whose entire content is
-  a bare topic→tool mapping — <em>"When asked about the weather, use the system_utility tool."</em>, minted by
-  REM from a single one-shot success — is rejected by <code>_TRIVIAL_TOOL_ROUTING_RE</code> inside
-  <code>_is_actionable_heuristic</code>. The tool registry / router already encodes that mapping (the agent
-  routed the minting turn correctly WITHOUT the lesson, which is exactly how the lesson got minted); such
-  entries dilute retrieval without adding behaviour. Rules that add anything past the tool name
-  (<em>"…use system_utility with location defaulting to Athens"</em>) still pass, and real-mistake lessons are
-  untouched. Tests: <code>tests/test_log_audit_fixes_2026_07_29.py::TestTrivialToolRoutingFloor</code>.</p>
-
-  <h2>Conversational-trigger gate (2026-07-18)</h2>
-  <p>The 2026-07-16 gate waved through <em>any</em> lesson carrying a real mistake. The 2026-07-17 overnight REM cycle showed the gap: genuine mistakes attached to TRIGGERS lifted verbatim from user chat — <em>"proceed with the next task"</em>, <em>"it still does the same. the game never starts, notify me in slack when…"</em>. A trigger is the lesson's retrieval key; raw conversation fragments are keys no future query will match, so such entries are permanent playbook noise however real the mistake was.</p>
-  <p><code>_is_conversational_trigger</code> (in <code>memory/lesson_quality.py</code>) now also gates mistake-bearing lessons. Default-ACCEPT — only unambiguous chat tells reject: pronoun-initial fragments with no antecedent (<em>"it still does…"</em>, <em>"that didn't work…"</em>), short bare turn-level commands (<em>"proceed"</em>, <em>"try again"</em>, ≤&nbsp;60 chars), and direct-address phrases (<em>"notify me in slack"</em>, <em>"let me know"</em>). Deliberately NOT rejected: user-question triggers (<em>"How do I parse JSON?"</em>, <em>"Please parse JSON!"</em>) — the paraphrase-normalised dedup counts on them recurring — and "you"-phrasing, which is legitimate rule language addressed to the agent. Tests: <code>tests/test_lesson_quality_gate.py::TestConversationalTrigger</code>.</p>
-
-  <h2>Retention &amp; eviction</h2>
-  <p><code>PLAYBOOK_MAX = 300</code> under ACE (<code>GHOST_PLAYBOOK_MAX</code>; the historical default was 50). Trim policy:</p>
-  <ol>
-    <li>Newest lesson is always kept (head pin).</li>
-    <li>Verified lessons pinned next.</li>
-    <li>Remaining slots filled by unverified, ranked by utility.</li>
-  </ol>
-
-  <h3>Utility formula</h3>
-  <pre><code>utility = confidence·0.5 + hit_rate·0.8 + (0.3 if verified) + log(freq)·0.1 + stale_penalty
-        × outcome_mult   # 2026-07-24, once ≥ _OUTCOME_MIN_OBS decisive outcomes accrue</code></pre>
-  <p><strong>outcome_mult (2026-07-24):</strong> <code>hit_rate</code> above is relevance-gated <em>success</em> credit only — a lesson can lose rank by not being credited but never by being <em>present when a turn failed</em>. The outcome arms close that gap: <code>out_rate = (succeeded_retrievals + 1) / (succeeded + failed + 2)</code> (Beta(1,1)-smoothed present-on-success fraction), and <code>outcome_mult = 0.4 + 0.75·out_rate</code> — <code>×0.40</code> for a lesson present only on failures (sinks it below the prune cutoff), <code>×1.15</code> for one present only on passes. Cold-start-safe: neutral until <code>_OUTCOME_MIN_OBS = 4</code> decisive outcomes accrue, so a fresh lesson is never punished for one unlucky co-occurring failure. Kill switch <code>GHOST_LESSON_OUTCOME_UTILITY=0</code> makes the arms record-only (bookkeeping without the ranking effect). See <em>Outcome-gated learning loop</em> below.</p>
-
-  <h2>Retrieval (three-tier, picked by <code>query</code> + <code>memory_system</code> presence)</h2>
-  <p><code>get_playbook_context(query, memory_system, distance_threshold=0.45, limit, record_retrievals)</code> dispatches to one of three paths:</p>
-  <ol>
-    <li><strong>Vector path</strong> — <code>memory_system</code> AND <code>query</code> both present. Runs a Chroma query over <code>type="skill"</code> docs, tightens by <code>DEFAULT_RETRIEVAL_DISTANCE = 0.45</code>, then re-ranks with a BM25-lite keyword-overlap bonus. Best path; used whenever the bus wires a vector tier. <strong>Domain rescue (2026-07-09):</strong> the 0.45 floor demands near-verbatim similarity (~cosine 0.78 on the L2-normalised MiniLM embeddings), which a GENERALIZED lesson can never reach against a concrete task prompt — measured live on the B4 run: the arm's real self-play lesson sat at distance 1.056 from a matching probe, so the skill tier filtered it on all 96 probe turns and the learning loop was <em>write-only</em> (mediation ≈ 0). A candidate past the strict floor is now admitted up to <code>_DOMAIN_RELAXED_DISTANCE = 1.25</code> when its <code>domains</code> metadata contains the query's cluster per <code>_explicit_query_cluster()</code> — which requires an explicit <code>CLUSTER_KEYWORDS</code> hit (NOT <code>classify_cluster</code>, whose python_general fallback would let every small-talk turn "match"). Untagged lessons (e.g. reflection writes) derive a domain from their trigger text. Semantic near-match OR domain match — never a blind dump. Tests: <code>tests/test_lesson_retrieval_domain_gate.py</code> (incl. the forensic B4 reproduction).</li>
-    <li><strong>BM25 fallback</strong> — <code>query</code> is present but <code>memory_system</code> is <code>None</code> (vector store offline, init failed, or a bus is wired without a vector tier). Scores each lesson's <code>trigger</code> by <strong>IDF-weighted coverage</strong> of the query and admits it only above <code>_BM25_MIN_SCORE</code>. Returns <code>""</code> if nothing clears the floor — <strong>never</strong> falls through to recency.
-      <div class="note"><strong>⚠ Fixed 2026-08-11 (§4AP) — it used to match almost anything.</strong> The score was the raw fraction of query tokens present in the trigger, with no IDF and no stopword filter, and the gate was <code>score &gt; 0</code>. One shared <code>the</code> scores 1/9, so on the live 50-lesson playbook <em>"what year did the treaty of westphalia end the thirty years war"</em>, <em>"describe the mating rituals of the emperor penguin in antarctica"</em> and <em>"how do i bake a sourdough loaf"</em> each retrieved <strong>5 tool-use lessons</strong>; only literal gibberish scored 0. This branch is reachable in production — <code>main.py</code> assigns <code>context.memory_system</code> inside a <code>try/except</code> that logs and continues, so a VectorMemory init failure routes every turn through it.
-      <br><br>The fix is a stopword filter plus standard BM25 IDF built from the playbook's own triggers, <code>ln((N−df+0.5)/(df+0.5)+1)</code>, scoring coverage of the query's <em>information mass</em>. IDF is what makes it self-calibrating — no hand-written list can track which words are boilerplate <em>in this playbook</em>, but the corpus always knows. Both guards are needed: a stopword appearing in exactly one trigger would otherwise earn a high IDF and become the strongest match. The same IDF corpus feeds the vector path's re-ranker, so a term is worth the same on both paths.
-      <br><br><strong>The floor is calibrated, not chosen.</strong> On the live playbook: unrelated queries score <strong>0.00–0.20</strong>, genuine paraphrases <strong>0.26–0.54</strong>, near-verbatim task queries <strong>0.66–1.00</strong>. <code>_BM25_MIN_SCORE = 0.30</code> (override with <code>GHOST_BM25_MIN_SCORE</code>) clears every unrelated query by 50%. The two paraphrases it drops were both matching a <em>wrong</em> lexically-similar trigger — "shut down the chess server" pulling a chess <em>post-mortem</em> lesson — so dropping them is correct. Precision over recall is deliberate here: this branch only runs when the vector store is already down, so a missing lesson costs what the outage already costs, while an irrelevant one actively pollutes the prompt. Pinned by <code>tests/test_bm25_fallback_relevance.py</code>, where every rejection case is paired with a must-still-retrieve case.</div>
-    </li>
-    <li><strong>Recency fallback</strong> — no query supplied (system-prompt-injection usage). Returns the N most recent lessons regardless of content, under the <code>## RECENT LESSONS</code> header.</li>
-  </ol>
-  <p>Before the fix, the recency fallback fired <em>whenever</em> the vector path was unavailable — including on a real query. A question like <em>"what's the capital of France?"</em> would surface an unrelated Python-syntax lesson just because it happened to be the most recent entry, polluting context with junk. The new three-tier dispatch preserves the recency path ONLY for the no-query case (the <code>SYSTEM_PROMPT</code> cold-inject). Covered by <code>tests/test_skills_bm25_fallback.py</code>.</p>
-  <p>When a lesson is surfaced, <code>record_retrieval</code> increments the counter and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — so the "is this self-play lesson ever actually used?" question has data to answer.</p>
-
-  <h2>Dedup</h2>
-  <p>Vector similarity check (distance &lt; 0.20; <strong>&lt; 0.21 for mistake-less rules</strong> — recalibrated 2026-08-08 (§4M): the live corridor between "reworded twin" and "distinct rule" shrank to [0.192, 0.213] (rewordings reach 0.1921, distinct rules come as close as 0.2134), leaving the original 2026-07-20 pair 0.15/0.25 outside it from both ends — reworded twins re-saved AND a distinct-rule pair sat inside the admit zone. The metric is chroma-default squared-L2 on normalized embeddings (= 2× cosine distance). Override with <code>GHOST_RULE_DEDUP_DIST</code>, tests <code>tests/test_skill_dedup.py::TestMistakeLessWideThreshold</code> + the §4M corridor pin) or a <strong>normalized trigger match</strong> merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate. The JSON fallback no longer requires an exact lowercased string: <code>_normalize_trigger()</code> lowercases, strips punctuation, drops stopwords and sorts the remaining significant tokens, so paraphrased triggers (<em>"How do I parse JSON?"</em> ≡ <em>"parse JSON"</em>) collapse onto the same key and <code>frequency</code> actually accumulates toward graduation.</p>
-  <p><strong>Vector-hit twin lookup + orphan self-heal (2026-07-29):</strong> the vector-dedup bump used to
-  search the playbook under the <em>incoming</em> trigger only — but a reworded near-duplicate's JSON twin is
-  stored under <em>its own</em> trigger, so every reworded re-learn logged "no JSON twin to bump" and silently
-  dropped, starving the frequency counter. The bump now retries under the stored duplicate's own trigger
-  (recovered from the vector hit's <code>trigger</code> metadata, falling back to the document's
-  <code>SITUATION:</code> line via <code>_dup_trigger_from_vector_text</code>). When NEITHER trigger matches a
-  playbook row, the vector entry is a TRUE orphan (residue of a partial scrub) — previously it vetoed that
-  lesson on every future attempt; now the orphan is deleted and the lesson written fresh
-  (<code>learn_lesson</code> returns <code>"written"</code>), leaving both stores consistent. A bulk sweep,
-  <code>reconcile_vector_orphans(memory_system, limit=2000)</code>, runs as a rider on the skills-auto idle
-  cooldown (wired in <code>agent.py</code>): it scans <code>type="skill"</code> vector entries and deletes those
-  with no playbook twin — the twin test is token-<em>subset</em> so a metadata trigger truncated at 200 chars
-  still matches its full twin, and entries with no recoverable trigger are never deleted blind.
-  Tests: <code>tests/test_log_audit_fixes_2026_07_29.py</code>, <code>tests/test_skill_dedup.py</code>.</p>
-  <p><strong>§4M twin-destruction fix + heal (2026-08-08):</strong> the twin's metadata stores the row's
-  <em>trigger</em>, but both cleaners above keyed the playbook <em>task</em>-first — self-play/dream rows have
-  <code>task ≠ trigger</code> by design, so their <em>healthy</em> twins tested as orphans and were deleted
-  (~1 per idle cycle live; 36/50 lessons went dark to bus retrieval, which has no BM25 fallback when the
-  vector branch answers). Three facets fixed: the reconcile now indexes <strong>both fields</strong> per
-  lesson; an <em>untruncated</em> metadata trigger must cover ≥ half of the matched field's token set
-  (a bare subset let a TRUE orphan hide forever behind any unrelated lesson containing its few tokens);
-  and the reworded-twin re-locate gained the <code>or trigger ==</code> clause the primary lookups already
-  had. The inverse pass, <code>heal_missing_twins(memory_system, limit=2000)</code>, runs on the same idle
-  cooldown: it re-embeds playbook lessons whose vector twin is missing (matched by normalized
-  trigger-or-task at the write's own <code>[:200]</code> truncation), preserving the lesson's original
-  timestamp so healed twins don't jump the eviction queue. Idempotent — the stores converge from both
-  directions. Pins: <code>tests/test_learning_stack_audit.py</code> (§4M block).</p>
-
-  <h2>Listing lessons (user-facing surface)</h2>
-  <p><code>list_lessons(scope, source, limit)</code> returns lessons filtered by time window and source, most-recent first. Boundaries use <strong>local wall-clock</strong>:</p>
+  <h2>What went with it</h2>
   <ul>
-    <li><code>scope="today"</code> — since local midnight.</li>
-    <li><code>scope="week"</code> / <code>"7d"</code> — last 7 days.</li>
-    <li><code>scope="all"</code> — entire playbook.</li>
-    <li><code>source="self_play"</code> (etc.) — filter by provenance.</li>
-  </ul>
-  <p>Surfaced to the LLM via the <code>list_lessons</code> tool (see <a href="../tools/memory_tools.html">tools / memory</a>). Phrases like <em>"what did you learn today?"</em> / <em>"what have you learned so far?"</em> are routed to this tool via <a href="../core/prompts.html">SYSTEM_PROMPT</a>.</p>
-
-  <h2>Public methods</h2>
-  <div class="scroll"><table>
-    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
-    <tbody>
-      <tr><td><code>build_lesson(task, trigger, anti_pattern, correct_pattern, domains, confidence, source_challenge_hash, verified, source) → dict</code></td><td>Factory.</td></tr>
-      <tr><td><code>learn_lesson(task, mistake, solution, memory_system=None, **structured)</code></td><td>Write lesson with dedup, merge, trim.</td></tr>
-      <tr><td><code>list_lessons(scope="all", source="", limit=20) → list</code></td><td>Time-window + source filter; local-time boundaries; most-recent first.</td></tr>
-      <tr><td><code>count_lessons(scope="all", source="") → int</code></td><td>The total behind a page &mdash; what <code>list_lessons</code> would return with no limit, same filter. Added 2026-09-20 (R2-6) so the <code>list_lessons</code> tool's header can say &ldquo;of N&rdquo; instead of presenting a truncated page as the count.</td></tr>
-      <tr><td><code>record_retrieval(trigger)</code> / <code>record_helpful_retrieval(trigger)</code></td><td>Hit-rate accounting (success-only). <code>record_retrieval</code> emits a debug log with <code>source_challenge_hash</code> for observability.</td></tr>
-      <tr><td><code>record_surfaced_outcomes(triggers, success)</code></td><td>Outcome-gated feedback (2026-07-24) — the FAILURE arm. Bulk one-write: attributes a turn's <em>verified</em> outcome to every surfaced lesson, incrementing <code>succeeded_retrievals</code> or <code>failed_retrievals</code>. Call only with a decisive outcome. See below.</td></tr>
-      <tr><td><code>credit_recent_retrievals(window_seconds=300, *, query="", top_triggers=None, min_token_overlap=2)</code></td><td>Discriminative bulk credit (idempotent per window). Credits a recently-retrieved lesson only when it is relevant to the succeeding <code>query</code> (≥ <code>min_token_overlap</code> significant-token overlap) or its trigger is in <code>top_triggers</code>. With no <code>query</code>/<code>top_triggers</code> it falls back to the legacy "credit everything" behaviour.</td></tr>
-      <tr><td><code>prune_low_utility</code></td><td>Removed on 2026-10-11 (§4NM) together with skill pruning; it had been off since §4AO (below) measured that label noise decided half its victims.</td></tr>
-      <tr><td><code>get_recent_failures(limit) → str</code></td><td>Format for LLM injection.</td></tr>
-      <tr><td><code>find_by_trigger(trigger)</code> / <code>mark_verified</code> / <code>remove_by_trigger</code></td><td>Index helpers (the verification-grounded self-play lesson flow that used them was removed on 2026-10-11, §4NM).</td></tr>
-    </tbody>
-  </table></div>
-
-
-  <h2>Audit fixes (2026-07-26)</h2>
-  <p><strong>Attribution side-channel hygiene:</strong> <code>get_playbook_context</code> resets <code>last_playbook_triggers</code> UP FRONT (the empty branches returned before the stamp, so a turn with empty retrieval inherited the previous turn's lesson set — the outcome arms then booked success/failure against lessons never in its prompt), and grew <code>stamp_triggers=False</code> for non-turn callers: the dream sim and the read-only sub-agent façade now publish to a separate <code>last_sim_triggers</code> channel instead of contaminating the operator turn's record mid-turn. <strong>Credit idempotency both orderings:</strong> <code>record_helpful_retrieval</code> (async judge, lands seconds AFTER the inline pass) now honors <code>last_credited_at ≥ last_retrieved_at</code> — the guard existed only in the inline direction, so production's judge-second order double-credited (+2 helpful/turn, hit_rate inflation past the stale/prune gates). Tests: <code>::TestTriggerStampHygiene</code>, <code>::TestHelpfulCreditIdempotency</code>.</p>
-
-  <footer><a href="../index.html">← Back to index</a></footer>
-  <h2>Lesson quarantine + hydration side-channel (2026-07-17)</h2>
-  <p><code>quarantine_lesson(trigger, reason)</code> marks matching playbook entries
-  <code>quarantined</code> — excluded from BOTH retrieval surfaces
-  (<code>get_playbook_context</code> and <code>get_playbook_items</code> share the
-  <code>_filter_quarantined</code> chokepoint, covering the vector branch too) but kept on
-  disk with reason + timestamp for operator review/reinstatement. Written for
-  the counterfactual replay's regression verdicts (that replay was removed on 2026-10-11, §4NM; the quarantine API stays for operator use) — a false
-  regression must never silently delete a good lesson. Additionally,
-  <code>get_playbook_context</code> stashes <code>last_playbook_triggers</code> (the lessons
-  that actually entered the prompt this turn; turns are globally serialized) and
-  <code>_record_turn_trajectory</code> stamps them into the trajectory's
-  <code>extra.hydrated_lessons</code> — the attribution set a future regression points at.</p>
-
-  <h2>Outcome-gated learning loop (2026-07-24)</h2>
-  <p><strong>The gap it closes.</strong> The retrieval-feedback loop was <em>credit-only</em>: <code>record_helpful_retrieval</code> and <code>credit_recent_retrievals</code> increment <code>helpful_retrievals</code> when a turn succeeds and the lesson is relevant, but nothing ever debited a lesson for being <em>surfaced on a turn that FAILED</em>. So <code>hit_rate = helpful/(retrievals)</code> conflated two very different populations — "present on a success it wasn't credited for" and "present on a failure" — and a genuinely harmful lesson could ride along on failing turns invisibly, its retrievals climbing while nothing marked it as a liability. This is the <em>experience-following</em> failure mode (a retrieved memory is reproduced whether or not it is appropriate; good and bad lessons transfer with equal fidelity). The prior scrub path (<code>retract_lessons_from_trajectory</code>) only removes lessons <em>authored in</em> a failed turn — never lessons <em>retrieved into</em> one.</p>
-  <p><strong>The mechanism.</strong> Two new arms — <code>succeeded_retrievals</code> / <code>failed_retrievals</code> — record, per lesson, the <em>verified</em> outcome of the turns it was surfaced into (fed by <code>record_surfaced_outcomes</code>). <code>compute_lesson_utility</code> folds the ratio in via <code>outcome_mult</code> (above), so a lesson persistently present when turns fail loses utility and becomes a <code>prune_low_utility</code> candidate — the loop closes through the <em>existing</em>, bounded prune machinery (≤ 25%/pass, verified pinned, needs ≥ 5 retrievals). No new destructive path.</p>
-  <p><strong>Grounding — it uses the real outcome, not an LLM judge.</strong> The separate <code>judge_hydration_usefulness</code> path (in <a href="../core/bus.html">MemoryBus</a>) credits via a worker LLM's opinion of whether a snippet <em>looked</em> used in the reply; that is a surface signal and LLM-judge-based curation silently fails to retire bad items. The outcome arms instead key off <code>resolve_turn_outcome</code> (passed/failed) — a structural execution failure or a real verifier verdict. Only <em>decisive</em> outcomes are recorded; a turn that never earns a verdict contributes nothing, so the arms never fill from mere absence-of-failure.</p>
-  <p><strong>Wiring (both finalize paths + the async-critic late path).</strong> <code>Agent._record_lesson_outcomes</code> runs at finalize on <em>both</em> outcome classes (outside the success-only credit gate). When the outcome is decisive at finalize (a structural execution failure, or an inline verifier verdict) it records immediately. When it is undecided — a clean turn whose async-critic verdict has not yet landed (the production case) — it stashes the surfaced triggers by <code>trajectory_id</code> in a bounded map; <code>_backfill_trajectory_outcome</code> drains that stash via <code>_flush_stashed_lesson_outcome</code> when the late verdict arrives. This gives the late-verdict path a second consumer and captures the verifier's REFUTED signal (the strongest "this answer was wrong") that a finalize-only hook would miss.</p>
-  <p><strong>Observability.</strong> Per-turn recording emits one <code>logger.info</code> line to the
-  grep-friendly FileHandler log (<code>$GHOST_HOME/system/ghost-agent.log</code>, the same sink as
-  <code>Hydration tiers</code> and other per-turn diagnostics — NOT the pretty console stream at
-  <code>Logs/ghost-agent.log</code>, which is WARNING+ only): <code>lesson-outcome: N surfaced lesson(s) -&gt;
-  present-on-{FAILURE|success}</code>, plus <code>… stashed N surfaced trigger(s) for traj … (await late verdict)</code>
-  on the async-defer path. Routine per-turn ticks stay off the operator's pretty stream by design. The one
-  <em>actionable</em> event — the loop retiring a lesson that kept riding along on failures — DOES go to the pretty
-  stream, named: <code>SKILL PRUNE … K outcome-gated (present-on-failure): '&lt;trigger&gt;' (succ=…,fail=…)</code> (the prune itself was removed on 2026-10-11, §4NM; the outcome arms stay as telemetry), so a
-  prune driven by the failure arm is legible (not buried as generic "low-utility"). Audit grep:
-  <code>grep lesson-outcome $GHOST_HOME/system/ghost-agent.log</code>.</p>
-  <p><strong>Defaults &amp; safety.</strong> Recording is always on (pure bookkeeping, zero behaviour change). The ranking/prune <em>effect</em> is cold-start-neutral until <code>_OUTCOME_MIN_OBS = 4</code> decisive outcomes accrue and is governed by <code>GHOST_LESSON_OUTCOME_UTILITY</code> (default on; set <code>0</code> for record-only, so the operator can watch the arms fill before letting them prune). Verified lessons remain pinned regardless — verification outranks co-occurrence statistics. The read-only skill proxies (<a href="readonly.html">ReadOnlySkillMemory</a>, dream's sim proxy) block <code>record_surfaced_outcomes</code> so idle simulations never mutate the production playbook. Tests: <code>tests/test_lesson_outcome_utility.py</code>.</p>
-
-  <h2>§4AO — why the prune stays off: three measured defects (2026-08-11)</h2>
-  <p class="note"><em>History:</em> the prune this section argued against was removed on 2026-10-11 (§4NM). The measurements stand.</p>
-  <p><code>scripts/label_noise_audit.py</code> (read-only, no LLM; the script and its tests were deleted with the prune on 2026-10-11, §4NM) asked whether the per-turn outcome label is wrong often enough to explain the prune's behaviour. It is a contributor, but not the only one, and <strong>fixing the judge alone would not make this ranking safe.</strong></p>
-  <ol>
-    <li><strong>Label noise decides about half the victim set.</strong> Measured against the oracle bench: false-REFUTE <strong>0.121</strong>, false-CONFIRM <strong>0.242</strong>. Simulating both worlds from the same true rates — ticks recorded perfectly vs passed through those rates, sampling noise held fixed — the kill list differs in <strong>96.2%</strong> of 2000 replicates, and <strong>51.9%</strong> of the victim set is decided by the label alone.</li>
-    <li><strong>The ranking is not identifiable at this evidence level.</strong> χ²=38.23, dof=29, <strong>p=0.117</strong> across the 30 lessons carrying any decisive outcome: the spread is consistent with every lesson sharing <em>one</em> true success rate, and 61% of the observed variance in per-lesson rates is what binomial noise alone predicts. Separating a lesson 6pp below the pool at 80% power needs <strong>~418 decisive outcomes per lesson</strong>; the median today is <strong>3</strong>, and the whole playbook holds 324.</li>
-    <li><strong>The multiplier is mis-centred, so having evidence is a penalty.</strong> <code>0.4 + 0.75·out_rate</code> crosses 1.0 at out_rate <strong>0.80</strong>, but the live playbook pools at <strong>0.7407</strong>. A lesson at the population mean is multiplied by 0.9556 (a 4.4% demotion) while a lesson with fewer than <code>_OUTCOME_MIN_OBS</code> decisive outcomes is multiplied by 1.0 and pays nothing. Measured rank movement from the multiplier alone, all downward: <strong>↓15, ↓15, ↓13, ↓10, ↓9, ↓6</strong>. That is why the kill list is headed by the four <em>most-measured</em> lessons in the playbook (297, 217, 27, 17 retrievals, 64–75% success) — they are condemned <em>for</em> having been measured.</li>
-  </ol>
-  <div class="note"><strong>⚠ Bias is not the same as variance, and only one of them matters here.</strong> The first version of this audit de-attenuated each lesson's observed rate to its noise-corrected truth and found the same victims — and concluded label noise was exonerated. That was an artifact: <code>(observed − FCR)/(1 − FRR − FCR)</code> is <em>monotone</em>, so removing the label's systematic bias cannot reorder a rank-based prune. A bottom-quartile cutoff is structurally immune to bias; what corrupts it is variance. An audit built the first way can only ever exonerate.</div>
-  <div class="note"><strong>⚠ A rank cutoff is decided only by the lessons adjacent to the boundary.</strong> Population-level separation is irrelevant — the boundary has to fall in a <em>gap</em>. Identical lessons tie exactly and the cutoff slices arbitrarily through the tie; lessons spaced closer than the standard error of their own counts are ordered by noise. Both are pinned in <code>tests/test_label_noise_audit.py</code>, whose load-bearing pair is two-sided: the counterfactual must <em>convict</em> where noise decides the victims and <em>exonerate</em> where the evidence is ample.</div>
-  <p><strong>What would have to change.</strong> Re-centring the multiplier on the playbook's own pooled rate, and replacing the relative-quartile cutoff with an absolute one, are both necessary and neither is sufficient — at a median of 3 decisive outcomes per lesson no cutoff ranks lessons rather than noise. Note that <code>compute_lesson_utility</code> also drives the <em>live</em> cap-trim (<code>_trim_playbook_by_utility</code>, which fires on every write once the playbook is full), so re-centring it is an operator-visible retention decision, not a silent fix.</p>
-  <h2>&sect;4EG &mdash; ACE grow-and-refine: the cap no longer sheds proven lessons (2026-09-03)</h2>
-  <p>The playbook cap is <strong>free on prompt budget</strong> &mdash; injection is a top-k
-  retrieval under the bus governor, so store size never reaches the prompt. A low cap therefore
-  only shed knowledge: measured 2026-09-03 the store sat at 50/50 and cap-trim had dropped 664
-  lessons, <strong>50 of them with positive net outcome credit</strong> (one at 28 retrievals,
-  7&nbsp;succ&nbsp;/&nbsp;4&nbsp;fail). Retrofitting <a href="https://arxiv.org/abs/2510.04618">ACE</a>'s
-  grow-and-refine discipline: <code>GHOST_ACE_PLAYBOOK=1</code> (default) raises the cap
-  (<code>GHOST_PLAYBOOK_MAX</code>, default 300) and pins a lesson that is <em>verified OR has
-  positive net outcome credit</em> (<code>succeeded_retrievals &gt; failed_retrievals</code>).
-  <code>_trim_playbook_by_utility</code> then keeps the store oversized rather than ever evict a
-  protected lesson (fail-open, like the archive path); the cap can only target unproven or
-  proven-harmful lessons, which also sink in retrieval ranking and are never injected.
-  <code>prune_low_utility</code> skips protected lessons too. Kill switch
-  <code>GHOST_ACE_PLAYBOOK=0</code> restores the exact legacy cap=50 + drop-lowest-utility rule.
-  <strong>Archive replay:</strong> of the 50 usefully-dropped lessons, grow-and-refine retains
-  50/50 vs 2/50 under the legacy cap. Pinned in <code>tests/test_4eg_ace_playbook.py</code>
-  including the kill-switch differential.</p>
-  <h2>Probe lessons and the reflection kind filter (§4FB, 2026-09-06)</h2>
-  <p class="note"><em>History:</em> reflection was removed on 2026-10-11 (§4NM); the <code>origin</code> field and the probe rule below are current.</p>
-  <p>Reflection now mints only from trajectories whose <code>task_kind</code> is in
-  <code>admitted_task_kinds("reflection")</code> (today: <code>user_request</code>), so bench,
-  self-play, reflection and <em>probe</em> rows never become lessons. The one probe lesson
-  already in the store (entry 49, <em>"Use deep_research ONCE on the query &hellip;"</em>) was
-  quarantined through <code>quarantine_lesson</code> with the reason on the record, via the
-  in-process <code>POST /api/lessons/quarantine</code> endpoint (an external writer would
-  violate the store's single-writer contract).</p>
-
-  <h2 id="lesson-origin">Lesson provenance (§4FD, 2026-09-07)</h2>
-  <p>Every lesson record now carries <code>origin</code>: <code>"user"</code> (written during a real user request), <code>"auto"</code> (idle machinery — reflection, dream, post-mortem, distillation — or an internal sched-/job-/sub- turn), <code>"probe"</code> (a diagnostic; must never teach, stamped so a leak is visible), <code>"bench"</code>, or <code>""</code> for legacy rows. It is derived ONCE inside the write chokepoint (<code>_derive_lesson_origin</code>, from the request-id contextvar the turn loop sets first thing — the default <code>"SYSTEM"</code> outside any request is "auto"), so no caller has to know; an explicit <code>learn_lesson(..., origin=)</code> wins. The learning-health report counts lessons by origin and flags any probe-origin lesson. Motivation: HEARTBEAT (arXiv 2603.23064) — background activity promoted into long-term memory 91% of the time; this agent's idle loop writes lessons from web-derived content, and §4FB found a diagnostic probe sitting in the playbook as lesson 49. No retrieval filter is applied yet: the operator's B3 ablation showed idle-loop lessons earn their keep, so this ships as observability first. Tests: <code>tests/test_4fd_provenance.py</code>.</p>
-
-  <!-- 4KS:evidence -->
-  <h2 id="4ks">A frequency bump needs new evidence <span class="tag">2026-09-30 &sect;4KS</span></h2>
-  <p>
-    <code>frequency</code> is read as "how many independent times this lesson was learned": it lifts the utility score and, at three,
-    makes a lesson eligible for graduation. Both dedup branches (exact trigger and vector match) bumped it on every re-learn,
-    whatever the re-learn was derived from. In one day's log a distilled lesson stood at <strong>84 "from 5 cases"</strong>
-    (re-synthesised each time its cluster changed), a dream heuristic went 13&nbsp;&rarr;&nbsp;16 by re-reading a 60-fragment window
-    of which 57 were unchanged, and a replay of the same self-play challenge bumped its lesson again.
-  </p>
-  <p>
-    A re-learn now names what it was derived from &mdash; the trajectory id, the challenge hash, <code>source_refs</code>, and the new
-    <code>evidence_refs</code> &mdash; which is digested and remembered on the lesson (<code>evidence_keys</code>, newest 240). A dedup
-    hit counts only if it brings a key the lesson has not seen (<code>evidence_is_new</code>). For a window a caller re-reads, the
-    caller asks for a share: the dream passes its fragment window with <code>evidence_min_new_fraction=0.5</code>, so a re-derived
-    heuristic counts again only once half the window is fragments it has not been derived over; a re-detected
-    <code>[Pattern]</code> names the pattern and its support, so it counts again only when the support changed. A re-learn that
-    names no evidence bumps as before &mdash; unknown provenance is not stale provenance. Rows written before this carry no keys;
-    their own provenance fields count as seen.
-  </p>
-  <p>
-    <strong>What this costs.</strong> Replayed over four days of dream cycles, 29 bumps become 2. A period with only self-play
-    traffic adds few fresh fragments, so dream heuristics stop climbing during it &mdash; that is the intent, but it also means a
-    rule that is genuinely re-confirmed by the same material gains nothing.
-  </p>
-  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (block H, both dedup branches), with an AST enumeration
-  that every <code>frequency</code> assignment in <code>learn_lesson</code> sits under the evidence test.</p>
-  <!-- /4KS:evidence -->
-
-  <h2 id="4kw-review4">Credit, admission and merge <span class="tag">2026-10-02 &sect;4KW</span></h2>
-  <ul>
-    <li><strong>A lesson is credited for being relevant, not for being in the prompt.</strong> Both credit sites passed every surfaced
-    lesson as <code>top_triggers</code>, which <code>credit_recent_retrievals</code> counts as relevance: every lesson in the prompt
-    got helpful +1 and confidence +0.05 on every clean turn (154 of 290 lessons at confidence 1.0; helpful rate vs verified outcome
-    r = 0.28), and the hydration judge's later "used" verdict was then blocked as a double credit. Credit is now word overlap with
-    the request or the judge's verdict, and never on a turn that must not teach (probe, member, internal).</li>
-    <li><strong>No lesson may prescribe bulk or irreversible destruction</strong> (<code>lesson_quality.prescribes_destruction</code>
-    at the single write point): wildcard/root deletes, recursive removes of the workspace, <code>DROP TABLE</code>, force-push,
-    <code>git reset --hard</code>. Only the fix is screened; a negated warning ("never run rm -rf /") passes.</li>
-    <li><strong>A reflection plan the judge rejected is not a lesson</strong> (it was written with <code>verified=False</code>;
-    "delete path=/*" came in this way, from a refute of a correct cleanup).</li>
-    <li><strong>A vector twin from another producer does not rewrite a lesson.</strong> Dream rules about verifying a cleanup were
-    merged into the reflection "delete path=/*" lesson (frequency 1 &rarr; 17), a reflected deploy-check script replaced a dream
-    rule's fix (verified inherited). Word overlap cannot separate these from reworded twins; the producer can.</li>
-    <li>Known, not changed at the time: request-keyed reflection lessons are injected into unrelated turns (1,592 injections,
-    5 on the same request) &mdash; <em>fixed since</em> by the lesson scope (<a href="#4kw-scope">above</a>); retrieval ranking ignores the credit signals; late REFUTED verdicts do not reverse credit.</li>
-  </ul>
-  <h2 id="4kw-scope">A lesson for one request stays with that request <span class="tag">2026-10-02 &sect;4KW</span></h2>
-  <p><strong>The defect.</strong> Reflection, the post-mortem engine and the journal post-mortem keyed their lessons on the
-  failed request's own text, and the fix was a corrected plan for THAT request ("1. Directly answer 'Yes' to the user's
-  question regarding knowledge of Professor Spiros Denaxas…"). Retrieval embeds the whole lesson, so these plans matched almost
-  any request: on the recorded traffic, 40 request-keyed lessons were injected 927 times, 20 of them on their own request (or a
-  rewording). The Spiros Denaxas plan reached "what is my name?" 117 times.</p>
-  <p><strong>Two kinds of lesson</strong> (<code>memory/lesson_scope.py</code>):</p>
-  <ul>
-    <li><code>scope="request"</code> &mdash; one request's corrected plan, with its <code>source_request</code>. It enters a prompt
-    only when the new request IS that request (<code>same_request</code>; <em>superseded</em> &mdash; the current rule is in
-    <a href="#4kw-r4">the fourth review</a>): character similarity &ge; 0.85, or the shorter
-    request's content words all in the longer one and at least half its size. Calibrated on the 927 injections: it admits the 20
-    retries/rewordings ("show me your projects", "how old is kosmas ?") and refuses every template with a different payload
-    ("Use deep_research ONCE on: &lt;other topic&gt;"). Applied in every retrieval branch (vector, keyword, recency) &mdash; both
-    the volatile block and the bus skill tier.</li>
-    <li>a general lesson &mdash; its trigger names a SITUATION CLASS. Retrieved by relevance, as before.</li>
-  </ul>
-  <p><strong>How triggers are made now.</strong> The reflection prompt asks, besides the plan, for a GENERAL LESSON block
-  (SITUATION / MISTAKE / RULE in general terms, or NONE). The plan is written request-scoped; the rule is written as a general
-  lesson only when the plan judge CONFIRMED the plan and <code>is_general_trigger</code> / <code>is_general_text</code> pass (no
-  URL, path, @-mention, quote or number from the request; at most half its content words the request's). The post-mortem engine
-  (a SITUATION line) and the journal post-mortem (a <code>situation</code> field in place of <code>task</code>, now with
-  <code>source="journal_postmortem"</code>) write general lessons when the situation is general, and scope to the request
-  otherwise. A vector twin from the other scope is written fresh, never merged.</p>
-  <p><strong>Measured.</strong> The final prompt replayed on 8 real failures against the live model: 8/8 plans parse, 8/8
-  general lessons, all pass the generality check and the write gate. The two plan-parse misses of the first replay were the
-  thinking cap (empty content), as frequent with the old prompt. One replay generalised a WRONG refute into "clear the entire
-  directory" &mdash; why a rule requires a confirmed plan, and why the destruction screen now covers clear/purge/empty. On a
-  copy of the live store, the real retrieval over 400 recorded requests: request-keyed lessons on ANOTHER request 93 &rarr; 0,
-  on their own request 25 &rarr; 25.</p>
-  <p class="note">Migration: <code>scripts/lesson_scope_migrate_4kw.py</code> tagged the 40 live request-keyed lessons
-  (nothing rewritten or deleted). Pins: <code>tests/test_4kw_lesson_scope.py</code>,
-  <code>tests/test_lesson_scope_migrate_script.py</code>.</p>
-  <h2 id="4kw-scope-r2">Lesson scope, second review <span class="tag">2026-10-02 &sect;4KW</span></h2>
-  <ul>
-    <li><strong>"Same request" is the same content words</strong> (order, punctuation, accents, function words and per-word
-    typos of 5+ letter words aside; numbers exact, single digits included), at least two of them. The first rule (character
-    similarity &ge; 0.85, or containment) matched different tasks: "start/stop the chess service", "my name is vasilis" ~ "what is
-    my name", "Redo this" ~ every redo. Anaphoric requests ("redo this", "proceed") never admit a scoped lesson. A retry that adds
-    or drops a word is not admitted (fail-closed). On the 1,608 recorded requests, every typo-only match was read.</li>
-    <li>The scope test sees the <strong>user's request</strong>, never the bus's sub-queries (<code>scope_request</code>).</li>
-    <li>A trigger cut to 200 chars in the vector metadata resolves by unique prefix; an unresolvable one is dropped while scoped
-    lessons exist (it skipped its scope check). The vector candidate pool grows by the number of scoped lessons.</li>
-    <li>A new scoped plan with the trigger of a stored row scopes that row; <code>source_request</code> keeps 4,000 chars (and a
-    legacy 400-char copy matches the same-length head).</li>
-    <li>A general lesson needs a general SITUATION, MISTAKE <em>and</em> RULE/fix, in all three producers. A twin from another
-    producer is written separately, never refused.</li>
-    <li>Data: 11 more request-keyed lessons scoped (prefix/truncated triggers, probe requests, six paraphrases read one by one);
-    general copies generated from confirmed reflection plans and from post-mortem/journal lessons (whose fix is already a rule),
-    each through every write gate (<code>scripts/lesson_generalize_legacy_4kw.py</code>, a one-off deleted on 2026-10-11, §4NM).</li>
-    <li>Usage counters (lesson <code>retrievals</code>, episode <code>access_count</code>, vector <code>retrieval_count</code>) are
-    not bumped on probe, member or internal turns (<code>usage_credit_blocked</code>).</li>
-  </ul>
-  <h2 id="4kw-r3">Relevance gate, producers, scope — third review <span class="tag">2026-10-02 &sect;4KW</span></h2>
-  <ul>
-    <li><strong>Relevance gate.</strong> On 546 real (request, lesson) pairs labelled by the main model, the whole-lesson
-    vector distance barely separated relevant from irrelevant (7% of the delivered top-5 relevant). A candidate now enters only
-    when its TRIGGER shares a weighted term with the request or sits within cosine 0.30 of it on its own
-    (<code>TRIGGER_CLOSE_DISTANCE</code>, override with env <code>GHOST_LESSON_TRIGGER_DISTANCE</code>): delivered lessons &minus;66%, precision 0.07 &rarr; 0.18, 84% of the relevant kept.
-    Fails open without a real embedder.</li>
-    <li><strong>Same request</strong> is the same content words <em>in order</em>; negation, quantity, direction and question
-    words count; a request pointing at "this"/"it" never matches; dotted names stay whole; only a copy of exactly 400/4,000 chars
-    is taken as truncated. The turn's request is carried in <code>lesson_scope.current_request</code>, so planner/volatile
-    queries are judged against it too. A name from the request (even misspelled) makes a "general" text specific.</li>
-    <li><strong>Producers never overwrite each other.</strong> Same trigger from another producer: evidence only, the fix and
-    <code>verified</code> stay; a different-trigger twin from another known producer is a separate row; a producer-less legacy
-    row merges as evidence. A merge that replaces a fix re-embeds the twin. A 200-char metadata trigger resolves by prefix in the
-    twin retry (it deleted live twins as "orphans").</li>
-    <li>Data (<code>scripts/lesson_repair_4kw_r3.py</code>): 27 rows retracted (13 harmful/duplicate generated rules, 14 junk
-    incl. the sandbox <code>delete path=/*</code> lesson), 25 request-shaped lessons scoped, 3 used lessons restored.</li>
-  </ul>
-  <h2 id="4kw-r4">Fourth review: request matching, dedup, retrieval, data <span class="tag">2026-10-02 &sect;4KW</span></h2>
-  <ul>
-    <li><strong>Same request</strong> (<code>same_request</code>): a typo is one edit (two for words of 8+ letters) at similarity
-    &ge; 0.86 &mdash; never a word with a prefix added (<code>un</code>, <code>de</code>, <code>re</code>, <code>dis</code> &hellip;:
-    "install" vs "uninstall", "compress" vs "decompress"), never a plural ("service" vs "services"). "any"/"some" count. The
-    "this/that/it" rule applies only to requests of up to 3 content words (it made 13 of 70 scoped lessons unreachable: "an image
-    <em>that</em> looks like &hellip;"). A one-word request must match its whole wording; a request of anaphoric words only
-    ("redo", "proceed", "hello ghost") never matches. A home path is compared in its recorded, redacted form
-    (<code>/Users/&lt;user&gt;</code>).</li>
-    <li><strong>General text</strong>: a file or dotted name from the request (<code>report.txt</code>) makes it specific; so does a
-    capitalised first word that is no English word (<code>/usr/share/dict/words</code>, "Panerithraikos questions: &hellip;").</li>
-    <li><strong>Dedup</strong>: two request-scoped plans for different requests never merge (a reordered copy of the same words is
-    refused, a close vector twin becomes its own row); the same trigger in the other scope follows the JSON path's rule.</li>
-    <li><strong>Retrieval</strong>: an orphaned twin whose metadata says <code>scope=request</code> is never served; an item carries
-    its row's FULL trigger (credit, quarantine and attribution match it); trigger embeddings are cached across turns; a malformed
-    <code>GHOST_LESSON_TRIGGER_DISTANCE</code> keeps 0.30 instead of failing the import.</li>
-    <li><strong>Twins</strong>: a replaced fix re-embeds that lesson only (<code>_refresh_twin</code>, no full heal under the lock);
-    the heal re-checks each lesson under the lock (still in the playbook, twin still missing) before writing.</li>
-    <li><strong>Reflection</strong>: the sink is <code>reflection/sink.make_reflection_sink</code> and the plan judge's reply is parsed
-    by <code>parse_plan_verdict</code>, both driven by tests instead of source-text pins.</li>
-    <li><strong>Data</strong> (<code>scripts/lesson_repair_4kw_r4.py</code>): 25 harmful/junk general lessons retracted ("report only
-    the count", validator-gaming self-play rules, "print 'Let me…' first", one-off bench arithmetic, stale introspect lists,
-    duplicates); 23 request-scoped lessons keyed on a model restatement no trajectory traces retracted (they could never match);
-    2 re-keyed to the user's actual request; 14 rewritten without the request's entities; 3 general rules added from retired plans.</li>
-  </ul>
-  <h2 id="4kw-r5">Fifth review <span class="tag">2026-10-03 &sect;4KW</span></h2>
-  <ul>
-    <li><strong>Same request</strong>: two different dictionary words are never a typo (<code>/usr/share/dict/words</code>;
-    "present"/"president"); one prefix swapped for another is another word ("encoding"/"decoding"); a change of person or tense where
-    both requests state one is another request ("my name"/"your name", "did"/"will"); a request is compared in its recorded REDACTED
-    form only when the stored side carries a redaction mark; courtesy and filler words don't count in a one-word request.</li>
-    <li><strong>Dedup</strong>: a reordered request's plan becomes its own row on the JSON path too; a close twin with ANOTHER trigger
-    adds evidence only &mdash; it never replaces the row's fix; a row re-scoped by a merge gets a fresh twin.</li>
-    <li><strong>General text</strong>: each part of a hyphenated name counts; "e.g."/"i.e." are no file names.</li>
-    <li><strong>Data</strong> (<code>scripts/lesson_repair_4kw_r5.py</code>): 37 rows retracted (unmatchable scoped plans, harmful or
-    wrong rules and plans, duplicates, mismatched triggers), 5 rewritten, the twins of every scoped row restamped
-    <code>scope=request</code>; backups skip the older <code>*.bak</code> copies.</li>
-  </ul>
-  <h2 id="producers-review">Lesson producers <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
-  <p class="note"><em>History:</em> this review and the two that follow fixed producers that were switched off a week later (§4NC) and removed on 2026-10-11 (§4NM). The write-gate rules they added to <code>learn_lesson</code> still apply to the two remaining sources.</p>
-  <ul>
-    <li><strong>Write gate</strong>: "None observed …", "N/A – no mistake", "No mistakes were made" count as NO mistake (the fix must
-    then be an actionable rule); a fix identical to its mistake is refused; a rule about the self-play harness (validator,
-    hidden test, <code>input.txt</code>, "satisfy the checker") is refused.</li>
-    <li><strong>Generality</strong>: producers pass their source text as <code>generality_context</code> — self-play/bench the
-    challenge, dream the fragment window, episode consolidation the episodes, <code>learn_skill</code> the request in hand — and a
-    general rule restating its names, numbers or files is refused (window-sized contexts check only those markers).</li>
-    <li><strong>Tombstones</strong>: a trigger the operator retracted (archive reasons other than cap-trim) is never re-learned.
-    The dream window cache is persisted (<code>dream_fragment_cache.json</code>), so a restart does not re-dream the same window.</li>
-    <li><strong>Merges</strong>: a replaced fix brings its mistake (a pair); a cross-producer twin closer than 0.08 is the same lesson
-    (evidence only) rather than a second row.</li>
-    <li><strong>Producers</strong>: journal-mined challenges write no lesson, pass or fail; self-play mistakes are stored without the
-    harness's own lines; a half LLM lesson is not patched with a template; pattern lessons are counted only when written; the
-    episode prompt labels the request "REQUEST".</li>
-    <li><strong>Data</strong> (<code>scripts/lesson_repair_4kw_r6.py</code>): 10 retracted, 4 rules rephrased to pass the gate, 29
-    dream/episode rows re-keyed to their fix's own head.</li>
-  </ul>
-  <h2 id="producers-rereview">Producers re-review <span class="tag">2026-10-03 re-review</span></h2>
-  <ul>
-    <li>Harness framing (validator, input.txt, self-play, coded stand-in, final turn …) is refused from UNATTENDED producers only
-    (self_play, bench, dream, episode, distilled); a user's own lesson about an input.txt is fine.</li>
-    <li>Generality: a name is a capitalised word that is neither ALL CAPS nor an English word; only file-like dotted tokens and
-    addresses are request-specific (<code>json.loads</code> is not); against a whole window, numbers do not count. A
-    <code>learn_skill</code> lesson that restates its request is written request-scoped instead of dropped.</li>
-    <li>Tombstones: only an operator retraction (<code>removed_by_trigger</code>), rotated archives included; never against a live row
-    or a request-scoped plan.</li>
-    <li>No-mistake means the whole statement ("None observed", "No mistakes were made"), not "No error handling…"; a replaced fix
-    always brings its mistake, even "none".</li>
-    <li><code>_strip_harness</code> removes any fragment of the injected directives (final-turn, constraint check, participant steer).</li>
-  </ul>
-  <h2 id="r8">Dictated lessons, harness framing, "no mistake" <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
-  <ul>
-    <li>A <code>learn_skill</code> lesson whose request dictates it (<code>user_dictates_lesson</code>: remember, learn, note that,
-    from now on, always, never, θυμήσου, μάθε, στο εξής …) is general with no generality check. Otherwise a request-shaped one is
-    kept for that request; <code>learn_lesson</code> returns a <code>LessonWrite</code> carrying the scope of THAT call, so the tool says so (a shared attribute raced under <code>gather</code> — r8 review).</li>
-    <li>A <code>learn_skill</code> lesson is never absorbed into another producer's row, however close.</li>
-    <li>Harness framing (autonomous sources only) is the CHALLENGE's validator — "the validator", "validator expects…", hidden-tests,
-    graders, test harnesses, coded stand-ins — not "a pre-execution validator" or "pydantic validators".</li>
-    <li><code>_is_mistake_less</code>: "None observed in the final path", "No issues found" are no mistake; a failure named after it
-    ("No errors, but the loop ran twice", "None. The first try failed") is one.</li>
-    <li>Generality (<code>lesson_scope.is_general_text</code>): a word with an inner capital (GitHub, YouTube, PostgreSQL) is a
-    product, not a name; <code>node.js</code>-style libraries are not files; "-ing"/"-ed" inflections are English
-    ("Determining", "stopped").</li>
-  </ul>
-  <h2 id="r8-review">Producers — fresh-eye review fixes <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
-  <ul>
-    <li>Dictation is an IMPERATIVE at a clause start ("Remember this:", "from now on, use…", "Always use UTC", "θυμήσου") with
-    word boundaries in Greek — measured: 17 of 30 real requests matched the first rule falsely ("the game never starts", "what do
-    you remember about…", αποτέλεσμα ⊃ ποτέ).</li>
-    <li>A dictated follow-up PROMOTES the request's own lesson to general instead of being refused.</li>
-    <li>Only an INCOMING learn_skill lesson is kept apart; other producers' rewordings of a learn_skill row merge into it.</li>
-    <li>The scope travels with the return value (<code>LessonWrite</code>) and the bus report (<code>skill_scope</code>); a dropped
-    legacy write reports FAILED.</li>
-    <li>Generality: the inner-capital (product) skip applies only to a dream WINDOW; inflection stems only to a sentence-initial
-    word ("Harding", "McDonald", "Orbitdata" from a request stay names). Framing also catches "satisfy validators".</li>
+    <li>the tool definitions, handlers and dispatch entries of <code>learn_skill</code> and <code>list_lessons</code>; the system prompt's LESSONS SURFACE rule; the pointers to <code>list_lessons</code> in the <code>manage_skills</code> and <code>introspect</code> descriptions;</li>
+    <li>in the turn loop: the "SKILL PLAYBOOK" prompt block and its per-request cache, the retrieval credit and the outcome credit after a turn (with their two rings on the context), the retraction of a turn's lessons after a refute, a correction or a thumbs-down, the refusal of <code>learn_skill</code> on a probe's or a member's turn, and every list that named the two tools;</li>
+    <li>the lesson tier of the memory bus (<code>skill</code>): its fetch, its credit after fusion, its fan-out leg on a write. See <a href="../core/bus.html">bus</a>;</li>
+    <li>the lesson credit that ran when a thumb was recorded (<code>/api/feedback</code>). The label, the hint after a thumbs-down and the mood hook are unchanged. See <a href="../core/feedback.html">feedback</a>;</li>
+    <li>the operator routes <code>POST /api/lessons/quarantine</code> and <code>POST /api/memory/delete_skill_twin</code>;</li>
+    <li>the two lesson passes of the idle store-hygiene job (drop orphaned twins, re-embed missing ones) and the same pair at boot. The job still removes expired temporary video transcripts;</li>
+    <li>the lessons block of the learning report, the <code>lessons.playbook</code> row of the loop-yield report, and the lesson count on the health check (the line is now "Rules"). See <a href="../tools/introspect.html">introspect</a> and <a href="../tools/system.html">system</a>;</li>
+    <li>the lesson rows of the privacy <code>forget</code> preview and the lesson step of <code>reset_all</code>;</li>
+    <li>the "recent mistakes" the diary rewrite read from the store;</li>
+    <li>the read-only wrappers of the store (<code>ReadOnlySkillMemory</code> in <a href="../core/isolation.html">isolation</a> and in <a href="readonly.html">readonly</a>).</li>
   </ul>
 
-  <h2 id="4kd-slack">A member never teaches <span class="tag">2026-09-24 &sect;4KD, de-Slacked in &sect;4KJ</span></h2>
-  <p><strong>Superseded the same evening:</strong> the rule below was first keyed on the <code>slack-</code> request-id
-  prefix. The agent no longer knows any client's name — <code>is_slack_request_id</code>, <code>SLACK_REQUEST_PREFIX</code>,
-  <code>ORIGIN_SLACK</code> and <code>LESSON_ORIGIN_SLACK</code> are gone; the same gates now read
-  <code>utils.logging.requester_is_member()</code> (the <code>X-Ghost-Requester</code> header) and the lesson origin is
-  <code>LESSON_ORIGIN_MEMBER</code>. Read "Slack turn" below as "a member's turn on any client".</p>
-  <p>Open-channel Slack mode feeds channel members' prompts into a single-tenant playbook: on 2026-09-23, 4 of 257
-  lessons had a stranger's Slack message as their <code>task</code>. The rule is the probe rule's shape: the bot mints
-  its request ids with the <code>slack-</code> prefix (the same id its feedback reactions correlate on, so nothing
-  server-side rewrites it; <code>X-Ghost-Origin: slack</code> is the fallback for any other Slack-side caller), and
-  <code>is_slack_request_id</code> is the one predicate. The population stays <code>user</code> — Slack is real
-  traffic — but the turn may not TEACH: <code>turn_may_teach(context)</code> (false for probe and slack) gates the
-  outcome attribution, Perfect-It (deferred and foreground) and the post-mortem — which is simply not queued, because
-  the queue consumer runs under the "SYSTEM" request id and could not know; the model's explicit
-  <code>learn_skill</code> is refused at dispatch (<code>lesson_channel_blocked</code>); and the writer itself,
-  <code>SkillMemory</code>, refuses EVERY playbook mutation when the derived lesson origin is <code>slack</code>
-  (<code>playbook_writes_blocked()</code> as the first statement of all eleven mutators — an enumeration pin walks the
-  class and fails when a new mutator lacks it). Per-requester scoping of autobio/recall for Slack — the tenant-bleed
-  root cause — is a separate design; its minimum cut landed in §4KJ (below).</p>
+  <h2 id="simulated">The simulated-context marker</h2>
+  <p>The read-only wrapper did a second job: its <code>is_read_only</code> attribute was how about ten guards recognised a <em>simulated</em> context (an isolated replay, a coding leaf). With the store gone, the marker is one explicit flag on the context, <code>simulated</code>. It is stamped by <code>mark_simulated</code> at the two places the wrapper was installed and read through <code>is_simulated_context</code>. A copy that will not take the stamp is refused. The table of guards is on the <a href="../core/isolation.html#simulated">isolation</a> page.</p>
 
-  <h2 id="4kj-member">The idle phases, and the member rule <span class="tag">2026-09-24 &sect;4KJ</span></h2>
-  <p><strong>The idle-phase gap.</strong> §4KD's gates read the request-id contextvar, which the idle phases
-  (reflection, dream seeds, macro mining, distillation, post-mortem) run WITHOUT — under <code>"SYSTEM"</code>, which
-  <code>_derive_lesson_origin</code> calls <code>auto</code>. Nine hours after the request-time gate had blocked a channel
-  member's turn, the reflection cycle acquired a playbook skill from that same trajectory ("create schematics for…").
-  The trajectory carries its own request id as <code>session_id</code>, so <code>trajectory_may_teach(traj)</code>
-  (Slack session ids never teach; task KINDS stay with <code>core.admissibility</code>) and
-  <code>iter_teachable(trajectories)</code> now sit in every trajectory-reading lesson producer:
-  <code>Reflector._is_reflectable</code>, <code>dream.trajectory_dream_fragments</code>,
-  <code>Dreamer._propose_macros_sync</code>, and the post-mortem and skills-auto sources in
-  <code>GhostAgent._biological_tick</code>. An enumeration pin (<code>tests/test_trajectory_may_teach.py</code>) walks every
-  <code>.iter_trajectories()</code> consumer under <code>src/</code>: each is either a classified teacher that names the
-  filter or on an explicit non-teaching allowlist (router/PRM training, bench, health, fingerprints); a new consumer fails
-  the pin until classified.</p>
-  <p><strong>The member rule.</strong> The Slack bot now sends <code>X-Ghost-Requester: owner | member</code>
-  (<code>requester_role_header(requester, OWNER_ID)</code> — fail-closed: an unresolved owner makes everyone a member);
-  the API parses it (<code>parse_requester_role</code>) into <code>handle_chat(…, requester_role=)</code>, which sets
-  <code>requester_role_context</code> for the request. <code>utils.logging.requester_is_member()</code> is the one predicate:
-  role <code>member</code> → yes; <code>owner</code> → no; unknown → yes iff the request id is a <code>slack-</code> id. Three
-  consumers in the agent read it (the USER PROFILE block becomes <code>(not available for this channel)</code>, the
-  autobiographical handle is withheld, both <code>smart_memory</code> writers skip; since §4KL the placeholder also carries <code>_MEMBER_CAPABILITY_NOTICE</code>, which names what the member's turn can and cannot do), and two here:
-  <code>turn_may_teach</code> and the writer backstop <code>playbook_writes_blocked</code> are false for a member on ANY
-  client; and on the tool side (R3 review) <code>update_profile</code>, <code>unified_forget</code> and
-  the location readers refuse or withhold for a member. Pins: <code>tests/test_requester_role.py</code>. The
-  enumeration pin over trajectory readers now sees any call shape — a kwargs call, a bare-attribute alias, a
-  <code>getattr</code> — matches wrappers by exact name, and exempts a training read only when its receiver is bound
-  to a <code>…Trainer(...)</code> in the same function.</p>
-  <p><strong>De-Slacked (the same evening).</strong> The operator: a client "might not exist tomorrow", so the agent
-  keeps no code for it. The one multi-user signal is the role header; <strong>no header means the owner</strong>
-  (the API key is the owner's credential), and a client that serves other people must send <code>member</code> per
-  request — the Slack bot's request code is the template. The idle-phase filter (<code>trajectory_may_teach</code>)
-  reads <code>extra["requester_role"]</code>, which <code>_record_turn_trajectory</code> stamps on every trajectory,
-  not the id's spelling. <strong>The member data wall.</strong> Live that evening two channel members asked "what is
-  my name?" and were told the owner's: the profile block was withheld, but <code>introspect overview</code> (the
-  self-model names the owner), the memory-bus recall and a silent placeholder let the model assume the asker was
-  him. Now: the placeholder <em>states the boundary</em> ("this request comes from a channel MEMBER… any profile,
-  memory, autobiography or project context you hold describes the OWNER and must never be presented as this
-  user's"), on both prompt paths. <strong>A member's turn carries none of the owner's context</strong>: no memory-bus
-  recall, no playbook (execution AND planner), no scratchpad, no recurring-uncertainty block (removed for everyone in §4NN), no auto-learned skills,
-  no workspace/activity prefix, no selfhood block, and no project (the turn runs with no project bound; the owner's
-  binding is untouched). <strong>A member may use only an ALLOWLIST of tools</strong>
-  (<code>core/agent._MEMBER_ALLOWED_TOOLS</code>: web_search, darkweb_search, image_generation, vision_analysis,
-  abort_attempt, replan) — everything else in the dispatch table is refused (one REJECTED row, reason
-  <code>owner_data_blocked</code>). An allowlist because the first blocklist of 17 names left file_system, execute,
-  browser, manage_projects, workspace, jobs, manage_services, create_skill, delegate… open: a member could
-  <code>cat</code> the owner's project maps or delete a project (R4 review). <code>vision_analysis</code> may target
-  only an http(s) URL or an image generated for a member, and <code>image_generation</code> may reference only such
-  images (<code>_member_tool_refusal</code>). The deterministic "dream mode" / "self play" shortcut is off for members.
-  <strong>Nothing a member does is written into the owner's stores</strong>: no smart memory, no episodic memory, no
-  context-prune archive, no autobiography capture, no playbook or post-mortem (streamed path included), no promotion
-  footer. <strong>Files:</strong> a member's reply may link only images generated for a member (every other
-  <code>/api/download/…</code> link is replaced by "[file not available]" — a client downloads every link in a reply
-  with the owner's key), and <code>/api/download</code> refuses a member-role request for anything else. The
-  conversation identity includes the role, so a member never inherits the owner's queued corrections. Belts inside
-  introspect/recall/remember/knowledge_base/update_profile/unified_forget remain for any caller that bypasses
-  dispatch. <strong>Data cleanup:</strong> <code>scripts/member_data_cleanup_4kj.py</code> stamped the 20 legacy
-  <code>slack-</code> trajectories (recorded before the role field) as member and retracted the three playbook lessons
-  (and their vector copies) whose task was a member's request. <strong>Known limit:</strong> a member's own
-  attachments land in the shared sandbox and cannot be read back on a member turn (only their generated images can).</p>
+  <h2>What still holds</h2>
+  <ul>
+    <li><strong>Old data is purged at deploy.</strong> <code>scripts/lesson_purge_4td.py</code>, run with the agent stopped, exports the vector rows of type <code>skill</code> to a backup dir, reads the export back, deletes exactly those rows and moves <code>skills_playbook.json</code>, its lock file and <code>skills_pruned_archive.jsonl</code> to the same dir. Without the purge <code>forget</code> would answer "Nothing stored matches" while those rows and files still quoted the name. Nothing reads, rewrites or creates these files any more. A row deleted this way stays in the bytes of <code>chroma.sqlite3</code> (its write-ahead queue and free pages) until the file is compacted.</li>
+    <li><strong>The lesson copies in the vector store are never served.</strong> They are the rows whose metadata <code>type</code> is <code>skill</code>. Only the purge above deletes them, and no search returns one, purge or not: every read path asks the store to leave that type out and drops any such row that comes back (<code>RETIRED_ROW_TYPES</code> in <a href="vector.html">vector</a>). The privacy <code>forget</code> neither lists nor deletes them; <code>reset_all</code> erases the whole collection, these rows included.</li>
+    <li><strong>A model that still calls <code>learn_skill</code> or <code>list_lessons</code></strong> (from old conversation history) gets the ordinary unknown-tool reply with the list of tools. Neither name is ever mapped onto a similar tool, whatever custom tool exists.</li>
+    <li><strong>Small helpers other code used</strong> moved: the turn's request text and the word-folding used by <code>forget</code> are in <code>memory/request_text.py</code>; "which population is writing" and "may this stored turn be learned from" are in <code>memory/population.py</code>.</li>
+    <li><strong>The probe arm <code>no_lessons</code></strong> still exists: a labelled probe sent with it is shown no owner rule.</li>
+  </ul>
 
-<h2 id="4lc">Lessons: written, shown, taken back <span class="tag">2026-10-03 &sect;4LC</span></h2>
-<p>Three fresh reviewers measured the playbook (184 lessons) and 40 real owner turns. Fixed:</p>
-<ul>
-  <li><strong>Provenance.</strong> Every lesson written during a turn carries the turn's trajectory id
-  (<code>utils.logging.trajectory_id_context</code>, set where the id is minted): <code>learn_skill</code>, the bus and the
-  post-mortem wrote <code>""</code>, so a refuted or corrected turn's retraction removed 0 of their lessons.</li>
-  <li><strong>Retraction undoes what the turn did.</strong> A turn that REPLACED a lesson's text leaves
-  <code>previous_version</code>; retracting it restores that version instead of deleting the row and its earlier good
-  fix. A turn that only REINFORCED a lesson (+1 frequency, <code>verified</code>) is recorded in
-  <code>reinforced_by</code>, and retracting it takes the +1 and the <code>verified</code> back (a verified lesson is
-  protected from the cap, so a refuted turn made it permanent). Restored rows get their vector twin rewritten.</li>
-  <li><strong>The owner's dictated lesson wins.</strong> A <code>learn_skill</code> lesson the owner dictates ("from now on
-  …") replaces another producer's text under the same trigger, on both merge paths (it was folded into dream's opposite
-  rule and reported saved).</li>
-  <li><strong>Episodes:</strong> when §4LA relabels an episode as failed, the lessons citing it
-  (<code>source_refs</code> <code>ep:N</code>) are quarantined (<code>quarantine_citing</code>).</li>
-  <li><strong>Triggers</strong> from dream and episode strategies are cut at a word within 160 characters
-  (<code>trigger_text</code>), not at 80 mid-word — the trigger is the dedup key and what retrieval scores.</li>
-  <li><strong>Admission.</strong> A lesson enters a prompt with TWO shared content words (folded, Greek transliterated),
-  or one/none and a trigger that sits close on its own; a mostly non-Latin query never relies on the English embedder
-  (Greek queries sat closer to arbitrary lessons than relevant English pairs). One shared word ("what is my address"
-  → "address factual queries") no longer admits. The empty playbook injects nothing (the placeholder was a block).</li>
-  <li><strong>Credit</strong> goes only to lessons retrieved for THIS request (<code>last_retrieved_req</code>); the 300 s
-  window credited the previous turn's lessons.</li>
-  <li><strong>Forget</strong> lists and removes (archived) the lessons that mention the target
-  (<code>lessons_mentioning</code>; a request-scoped plan keeps the request verbatim). <code>reset_all</code> also
-  removes (archived) every ONE-REQUEST lesson — they quote the owner's requests — and its preview counts them; general
-  lessons stay (operator 2026-10-04). <code>remove_request_scoped</code> is blocked on the read-only façade.</li>
-  <li><strong>Archive</strong> rotation numbers each file (<code>.jsonl.1</code>, <code>.2</code>, …) — the second rotation
-  used to overwrite <code>.1</code> and with it the operator's "never re-learn" retractions.</li>
-  <li>The post-mortem drops a reply that IS null, not one that contains the word (lessons about null handling).</li>
-</ul>
-<h2 id="4li">After the final review <span class="tag">2026-10-04 &sect;4LI</span></h2>
-<ul>
-  <li>Tombstones are read from EVERY rotated archive (<code>.jsonl.1</code>, <code>.2</code>, …, probed by number).
-  The reader used to open only <code>.1</code>, so from the second rotation on, "never re-learn" markers were lost
-  again.</li>
-  <li>Retracting a turn also drops any saved <code>previous_version</code> that the turn's text became. With
-  t-a → t-b → t-c, retracting t-b and then t-c deletes the row; it no longer brings back t-b's refuted text. The saved
-  frequency is the value from before that turn's +1.</li>
-  <li><code>forget</code> also finds a name in a lesson's code example and saved previous version.</li>
-</ul>
-  <h2 id="4na">Do lessons reach and change the turns they are for? <span class="tag">2026-10-10 &sect;4NA</span></h2>
-  <p><strong>Measured</strong> on the owner's 86 real requests from 14 days (store copy; applicability labelled blind by three independent readers on each request's 12 nearest lessons plus whatever was retrieved):</p>
-  <ul>
-    <li><strong>Reach:</strong> 67 applicable (request, lesson) pairs, 12 found (18%); 60% of what surfaced applied. Short requests (≤ 6 words): 4 of 32 applicable pairs found. 52 of the 55 misses fall to the trigger gate (shared words / trigger distance, §4KW–§4MI).</li>
-    <li><strong>Simulated gate settings:</strong> one fewer shared word required doubles reach (28%) at about the same precision (46%). Looser whole-lesson distance gives 39–43% reach at 35–38% precision. <em>Not adopted</em>: see the next point.</li>
-    <li><strong>Effect:</strong> 20 live probe pairs, each request with every lesson withheld (the probe-only <code>X-Ghost-Arm: no_lessons</code>, <code>_lessons_withheld</code>) against one applicable lesson injected, judged blind.
-      <ul>
-        <li>The lesson changed the reply in 3. All three were the two owner-approved rules: the health check ran before a greeting answer, and the version rules turned a wrong "PostgreSQL 17" into 18.</li>
-        <li>In 11 the model did it anyway. 3 were slightly worse with the lesson, and 3 were followed in neither run.</li>
-      </ul>
-      More reach would mostly deliver lessons that change nothing.</li>
-    <li><strong>The store:</strong> 26 of 130 lessons applied to anything; 56 were judged bad (1 harmful, 29 test-harness drills, 14 vague, 12 stale one-request scripts). Retired on the operator's approval (<code>scripts/lesson_retire_4na.py</code>, archived and tombstoned): 130 → 74.</li>
-  </ul>
-  <p><strong>Shipped: the owner's adopted rules are standing, not retrieved.</strong></p>
-  <ul>
-    <li><code>SkillMemory.owner_rules()</code> returns the rows with <code>origin: owner_rule</code> (adopted with "learn rule N", or approved by the operator), verified and general, at most <code>OWNER_RULES_MAX</code> = 6.</li>
-    <li>The agent renders them as <code>### OWNER RULES</code> in the per-request state block on every turn that may see the owner's private context (<code>_owner_rules_block</code>: not a member, not a public reply, not an isolated delegate, not the <code>no_lessons</code> arm).</li>
-    <li>They are still <em>retrieved</em> as before, so retrieval credit, attribution and the planner's lesson list keep working; the block comes in addition (r1 review: dropping them from retrieval broke all three). A quarantined rule is not shown. The playbook read is cached by modification time. <code>owner_rules</code> passes the read-only wrapper, so replays and self-play see the rules too. The trigger and the rule are both defused.</li>
-    <li><strong>Known and left:</strong> the pure-greeting fast path ("good morning ghost") builds no state block, so it carries its own "do not mention internal state" line instead of the rules. (Moot since §4RP-c: the fast path was removed and greetings take the full turn.)</li>
-  </ul>
-  <p>Pins: <code>tests/test_4na_lesson_reach.py</code>.</p>
-  <h2 id="4nc">Only approved rules and dictation create lessons <span class="tag">2026-10-10 &sect;4NC</span></h2>
-  <p><strong>Operator decision</strong> ("Only approved rules"), after the producer review measured 14 days of output. <em>On 2026-10-11 (§4NM) the producers named below, the <code>GHOST_PRODUCER_LESSONS</code> switch and <code>GHOST_POSTMORTEM_ENGINE</code> were deleted from the code; this section records the switch-off that preceded the removal.</em></p>
-  <ul>
-    <li><strong>The six background lesson writers</strong> (dream heuristics and patterns, failure distillation, self-play, bench, reflection, post-mortems) wrote about 131 lessons. About 80% were removed by hand.</li>
-    <li><strong>Dream's 44 remaining lessons</strong> surfaced 3 times in 86 replayed requests, with no relevant hit.</li>
-    <li><strong>The lessons that changed replies</strong> were approved rules (§4NA).</li>
-  </ul>
-  <p>The changes:</p>
-  <ul>
-    <li><code>learn_lesson</code> writes only for <code>LESSON_SOURCES_ALLOWED</code> = <code>learn_skill</code> (the owner's dictation and "learn rule N") and <code>operator_repair</code>. (The <code>GHOST_PRODUCER_LESSONS</code> switch that re-opened every source was removed on 2026-10-11, §4NM.)</li>
-    <li>The phases that only write lessons no longer spend model time: dream's episode consolidation, failure distillation and REM (81 REM cycles were 78 minutes of Nova), idle reflection, and the journal post-mortem. Dream's daily store care and backups still run.</li>
-    <li>The 46 dream and distilled lessons were retired (<code>scripts/lesson_retire_4nc.py</code>, archived and tombstoned): 74 → 28.</li>
-    <li>The test suite runs with producer lessons ON (<code>tests/conftest.py</code>), so the producers' own tests keep exercising their code; <code>tests/test_4nc_producers.py</code> pins the production defaults.</li>
-    <li><strong>r1 review:</strong>
-      <ul>
-        <li>The store maintenance that lived only in REM's tail now runs from the REM-skip path too, at most every <code>STORE_MAINTENANCE_EVERY_S</code> (6 h). That covers graph stale-edge pruning (the only uncapped tier), node compression, the cross-store reconcile and the RRF refit (<code>Dreamer._store_maintenance</code>).</li>
-        <li>The journal post-mortem consumer, deferred Perfect-It and post-turn correction reflection no longer make their model call when their lesson would be refused.</li>
-        <li>Perfect-It logs "saved" only on a real write. A self-play run says "No lesson saved" rather than "Learned trigger".</li>
-        <li>The <code>dream_mode</code>, <code>self_play</code> and SLEEP/REST texts no longer promise lesson-making.</li>
-        <li>PostMortemEngine is off unless <code>GHOST_POSTMORTEM_ENGINE=1</code>. skills-auto skips when the trajectory store is unchanged. The macro-mint skip line is at DEBUG.</li>
-      </ul>
-    </li>
-  </ul>
+  <h2>Tests</h2>
+  <p><code>tests/test_4td_lesson_store_removed.py</code>. Journal: <code>PROJECT_JOURNAL.md</code> &sect;4TD (and &sect;4SZ for the evaluation that decided it).</p>
 </main>
-
-<h2 id="4mi">§4MI (2026-10-08) — admission, credit and retraction</h2>
-<ul>
-  <li><strong>Length-aware shared-word bar.</strong> The keyword branch (vector path, BM25 fallback and <code>credit_recent_retrievals</code>) needs <code>_required_shared_words(query)</code> shared content words: 2 for a query of ≤12 content words, 3 up to 40, 4 beyond. Measured on the live playbook, a 119-word migration plan collided with eight triggers on two generic verbs and credited five unrelated lessons as helpful 27 s before the turn was refuted. The close-trigger alternative is unchanged.</li>
-  <li><strong>Stop words are folded.</strong> <code>_bm25_tokens</code> folds before filtering, so the stop list is folded once at import ("because"→"bekause", "which", "back" …).</li>
-  <li><strong>Retraction keeps the corrective.</strong> A <code>source="reflection"</code> lesson tagged with the refuted turn's id is the lesson written to FIX that turn; <code>retract_lessons_from_trajectory</code> keeps it unless <code>include_correctives=True</code>, and when one is kept the vector pass scrubs only the removed triggers (never by id). A retraction that removes nothing logs so. Undoing a verified reinforcement also restores the confidence it lifted (<code>reinforced_by[].conf_before</code>); a second replacement archives the <code>previous_version</code> it pushes out (<code>replaced-chain:&lt;tid&gt;</code>).</li>
-  <li><strong>The no-query fallback</strong> (the selfhood diary's RECENT MISTAKES) returns only rows that record a real mistake and are not <code>self_play</code> / <code>bench</code> rows.</li>
-  <li><strong><code>iter_teachable(trajectories, consumer=)</code></strong> applied the admissibility matrix's task kinds for the named consumer (router/PRM: <code>user_request</code>+<code>bench</code>; post-mortem, skills-auto, REM seeds, macro mining: <code>user_request</code> only — every one of those consumers and <code>core/admissibility.py</code> itself were removed on 2026-10-11, §4NM; the function now serves failure replay and <code>introspect</code>) and judges a reflection COPY by its source's role (<code>extra.source_requester_role</code>). Fails closed for a named consumer.</li>
-</ul>
-
-
-<h2 id="4ms">§4MS: usage counters and readers</h2>
-<ul>
-  <li>Every lesson counter (<code>record_retrieval</code>, <code>record_helpful_retrieval</code>, <code>credit_recent_retrievals</code>, <code>record_retrievals_bulk</code>) checks <code>usage_credit_blocked()</code>, which covers probes, members and internal turns. Three of them checked members only, and probe turns had credited lessons that pruning and graduation read.</li>
-  <li>Every trajectory reader passes its consumer key to <code>iter_teachable</code> (foresight, frontier seeding, dream replay, GEPA tool fixtures): only member turns had been filtered, and probe turns got through.</li>
-  <li><code>trajectory_may_teach</code> refuses an interrupted turn (<code>[TURN_INTERRUPTED]</code>).</li>
-  <li>One-off cleanup <code>scripts/idle_cleanup_4ms.py</code> (operator-confirmed). It retracts three wrong idle lessons as operator tombstones (<code>removed_by_trigger</code>, so they are never re-learned), resets the retrieval and helpful counters of three probe-inflated rows (the outcome counters stay), deletes one misread memory, and retires an unused self-play skill. It is idempotent: a re-run changes nothing. A planned backfill of 36 dream triggers cut at 80 characters was dropped: each row's vector twin and <code>task</code> are keyed by the old trigger, so a new trigger would have orphaned the row from retrieval.</li>
-</ul>
-
-<h2 id="4mt">§4MT: seed-linked retrieval</h2>
-<ul>
-  <li>A proven owner-practice lesson (<code>proof: kept</code>, not quarantined, carrying <code>seed_embedding</code>) also enters the vector branch when the user's request has a cosine of at least <code>SEED_SIM_MIN = 0.78</code> with the request it was learnt from (<code>_seed_linked_matches</code>, BGE query embeddings). Its trigger describes a practice drill, so trigger distance alone almost never admitted one: self-play lessons reached 1 of 311 owner turns (distance 0.45 against a 0.30 gate). Calibration used 30 days of owner requests (143 distinct, tool-using, Latin-script). At 0.78 or above, 86% of pairs were the same kind of task (same tool family), against a 40% base rate, with about 3 matching requests per request in a month. The web-research family is weaker, at 61%. A mostly non-Latin request abstains. Request-scoped rules still apply.</li>
-  <li>Since §4NC no self-play lesson is written, and synthetic self-play itself was removed on 2026-10-11 (§4NM), so no new practice lesson reaches this path; rows already kept still can.</li>
-  <li>Lessons under proof are quarantined (<code>quarantine_reason</code> <code>proof_pending</code>, <code>proof_failed</code>, <code>proof_inconclusive</code> or <code>proof_withdrawn</code>) and never reach a prompt.</li>
-</ul>
 </body>
 </html>

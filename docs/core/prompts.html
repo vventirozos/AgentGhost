@@ -38,7 +38,7 @@
       <tr><td><code>QWEN_TOOL_PROMPT_NATIVE</code> (2026-07-31)</td><td>NATIVE-path tool header: think-discipline rules + the parallel-execution invitation, with <strong>zero XML format instruction</strong> — the chat template owns the call format. See "Native tool_call corruption root cause" below.</td></tr>
       <tr><td><code>THINK_BUDGET_TIGHT</code> (line 610)</td><td>≤5 sentences; no brainstorming alternatives.</td></tr>
       <tr><td><code>THINK_BUDGET_EXTENDED</code> (line 624)</td><td>~15 sentences for debugging / SQL / algorithm work; forbid drafting code in the think block.</td></tr>
-      <tr><td><code>THINK_BUDGET_SELFPLAY</code> (line 652)</td><td>≤6 bullet points for the bounded failure-replay runs (the idle slot still logged as self-play).</td></tr>
+      <tr><td><code>THINK_BUDGET_SELFPLAY</code></td><td><em>Removed.</em> The constant no longer exists in <code>core/prompts.py</code>. Was: ≤6 bullet points for the bounded self-play, later failure-replay, runs; those runs are gone since 2026-11-05 (§4SZ).</td></tr>
     </tbody>
   </table></div>
 
@@ -217,8 +217,8 @@
   <ul>
     <li><em>The <code>SLEEP / REST</code> → <code>dream_mode</code> and <code>SWARM DELEGATION</code> rows were removed with those tools on 2026-10-30 (§4SI).</em></li>
     <li><em>The <code>SELF-PLAY</code> routing rows (<code>self_play</code> / <code>self_play_loop</code> / <code>stop_self_play</code>) were removed with synthetic self-play on 2026-10-11 (§4NM).</em></li>
-    <li><code>LESSONS SURFACE</code> → <code>list_lessons</code> — for "what have you learned today/so far/this week", "show me your lessons", "show me the lesson playbook". Picks <code>scope</code> ∈ <code>{today, week, all}</code> from phrasing. A LESSON is a mistake-and-fix the agent has internalized — distinct from a SKILL (a tool).</li>
-    <li><code>SKILLS SURFACE</code> → <code>manage_skills(action="list")</code> — for "show me your skills", "list your skills", "what skills do you have", "show me your custom skills". A SKILL is a TOOL or set of tools, NOT a lesson. The historical "skill playbook" wording was the conflation that misrouted skill queries to <code>list_lessons</code>; both the tool description and this rule now disambiguate.</li>
+    <li><code>LESSONS SURFACE</code> — <strong>removed 2026-11-06 (§4TD)</strong> with the <code>list_lessons</code> tool and the lesson store (504 characters of the system prompt).</li>
+    <li><code>SKILLS SURFACE</code> → <code>manage_skills(action="list")</code> — for "show me your skills", "list your skills", "what skills do you have", "show me your custom skills". A SKILL is a TOOL or set of tools. (Until §4TD the rule also sent lesson questions to <code>list_lessons</code>.)</li>
     <li><code>KNOWLEDGE &amp; RAG</code> → <code>knowledge_base(action="query", filename=…)</code> for a question about one ingested document; <code>recall</code> for past conversations or general memory.</li>
     <li><code>WEB FACTS</code> → <code>web_search</code> first; <code>fact_check</code> / <code>deep_research</code> only for complex verification.</li>
     <li><code>SYNTHESIS OVER LARGE DATA FILES</code> → <code>execute</code> a digest script, not whole-file <code>file_system(read)</code> (see below).</li>

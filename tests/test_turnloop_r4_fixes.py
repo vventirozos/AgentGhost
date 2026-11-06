@@ -1,7 +1,7 @@
 """Turn-loop review, Round 4 (§ turn-loop R4, 2026-08-19) — behavioral pins.
 
 R4's converging findings: the static `_PURE_TRIGGER_TOOLS` was blind to
-RUNTIME-registered tools (a dynamic no-arg macro's native call lost to an
+RUNTIME-registered tools (a dynamic no-arg tool's native call lost to an
 echoed tag — the recurring proxy class, fixed via `_STATIC_TOOL_NAMES`), one
 unadvertised kb action dodged `is_mutating`, and four R3-diff sites were
 unpinned. All pins drive the REAL methods; each mutation-verified.
@@ -50,18 +50,21 @@ _XML_RECALL = ('<tool_call><function name="recall">'
 
 
 class TestDynamicNoArgToolsUsable:
-    """MAJOR (lens A+C): a runtime-registered tool (composed macro / acquired
-    skill) is never in the static trigger set, but its empty-args native call
+    """MAJOR (lens A+C): a runtime-registered tool (an acquired skill; a
+    composed macro until §4TA) is never in the static trigger set, but its empty-args native call
     must still win over an echoed tag — dispatching it errors recoverably at
     worst; executing an echo (possibly mutating) is unrecoverable."""
 
     def test_static_names_set_is_populated(self):
         assert "execute" in _STATIC_TOOL_NAMES
         assert "web_search" in _STATIC_TOOL_NAMES
-        # a runtime macro name is, by construction, not static
+        # a runtime-registered skill's name is, by construction, not static
         assert "morning_briefing" not in _STATIC_TOOL_NAMES
+        # §4TA: `youtube_transcribe` is a built-in now — static, so its empty-args
+        # native call no longer wins over a competing XML call
+        assert "youtube_transcribe" in _STATIC_TOOL_NAMES
 
-    def test_dynamic_no_arg_macro_wins_over_echoed_tag(self):
+    def test_dynamic_no_arg_skill_wins_over_echoed_tag(self):
         agent = _parser_agent()
         msg = {"content": _ECHO, "tool_calls": [{
             "id": "n", "type": "function",
@@ -144,7 +147,7 @@ def _ts(**over):
         msg={"role": "assistant", "content": ""}, ui_content="",
         parse_failure_reason="", model="test-model",
         last_user_content="do the thing", char_budget=4000,
-        strikes=StrikeLedger(), task_tree=MagicMock(), _user_batch_intent=None,
+        strikes=StrikeLedger(), _user_batch_intent=None,
         _request_constraints=[], repeated_action_steered=set(), messages=[],
         seen_tools=set(), executed_idempotent=set(), raw_tools_called=set(),
         tool_usage={}, tools_run_this_turn=[], request_state=MagicMock(),
@@ -210,30 +213,28 @@ class TestActionHealingAndStrikePins:
     """Two guards in the same block that still read a raw value."""
 
     @pytest.mark.asyncio
-    async def test_a_padded_define_still_invalidates_the_tool_cache(self):
-        """⚠ REPLACES `test_composed_skill_define_is_case_healed`, which
-        could not fail on its stated subject: it counted dispatches of
-        `manage_composed_skills`, and that tool is not in
-        `_COLLAPSE_READSAFE`, so a collapse was impossible regardless of
-        `is_mutating`. `assert == 2` was satisfied by the allowlist alone
-        and its causal docstring was false.
-
-        The observable that DOES depend on healing the action is the
+    async def test_a_padded_delete_still_invalidates_the_tool_cache(self):
+        """The observable that depends on healing the action is the
         tool-definition cache: `invalidate_tool_defs` lowered the action
-        without stripping it, so `action=" define "` registered the macro
+        without stripping it, so a padded action changed the registry
         and left the cache stale — the model then narrates "now invoking X"
-        against a schema that does not carry X.
+        against a schema that does not match.
+
+        (Written for `manage_composed_skills(action=" define ")`; that tool
+        went with the macro engine, §4TA 2026-11-05. The same comparison
+        serves `manage_skills(action='delete')`, the registry change that is
+        left.)
         """
-        for action in ("define", " define ", " approve \n", "DELETE"):
+        for action in ("delete", " delete ", " Delete \n", "DELETE"):
             agent = _dispatch_agent()
             invalidated = {"n": 0}
-            agent.available_tools = {"manage_composed_skills": _ok_tool()}
+            agent.available_tools = {"manage_skills": _ok_tool()}
             agent._rebuild_available_tools = lambda *a, **k: None
             ts = _ts(tool_calls=[{
                 "id": "c0", "type": "function",
-                "function": {"name": "manage_composed_skills",
+                "function": {"name": "manage_skills",
                              "arguments": json.dumps({"action": action,
-                                                      "name": "s"})}}])
+                                                      "skill_name": "s"})}}])
             rs = getattr(ts, "request_state", None)
             if rs is not None and hasattr(rs, "invalidate_tool_defs"):
                 orig = rs.invalidate_tool_defs
@@ -246,7 +247,7 @@ class TestActionHealingAndStrikePins:
             await agent._dispatch_and_process_tool_batch(ts)
             if rs is not None and hasattr(rs, "invalidate_tool_defs"):
                 assert invalidated["n"] == 1, (
-                    f"action={action!r} registered the macro without "
+                    f"action={action!r} changed the skill registry without "
                     f"invalidating the tool-definition cache"
                 )
 

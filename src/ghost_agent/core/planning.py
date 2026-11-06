@@ -921,7 +921,7 @@ class TaskTree:
     def generate_retrospective(self) -> Dict[str, Any]:
         """Generate a structured retrospective of the plan execution.
 
-        Returns a dict suitable for feeding to learn_lesson with:
+        Returns a dict with:
         - what worked (DONE tasks)
         - what failed (FAILED tasks with reasons)
         - tool usage patterns

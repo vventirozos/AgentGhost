@@ -24,8 +24,6 @@ from ghost_agent.core.agent import (COSTLY_TOOLS, _clarify_first_block,
                                     _is_low_information_message,
                                     _previous_turn_asked_a_question,
                                     turn_may_teach)
-from ghost_agent.memory import skills as skills_mod
-from ghost_agent.memory.skills import SkillMemory
 from ghost_agent.utils.logging import (requester_role_context,
                                        request_id_context)
 
@@ -134,14 +132,6 @@ def test_the_dispatch_loop_calls_the_guard_with_the_users_message_and_the_histor
             assert not struck, "the clarify-first block strikes the turn"
 
 
-def test_the_dispatch_loop_refuses_learn_skill_when_the_turn_may_not_teach():
-    tree = _dispatch_tree()
-    consts = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)}
-    assert "lesson_channel_blocked" in consts
-    assert any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "turn_may_teach"
-               for n in ast.walk(tree))
-
-
 def test_finalize_records_a_costly_turn():
     """The costly record is written from the tools that ran. (§4NM: the
     `post_mortem` journal item this gate once guarded is gone — nothing in
@@ -178,7 +168,6 @@ def _as(role):
 def test_turn_may_teach_by_population():
     ctx = MagicMock()
     ctx.turn_origin_label = None
-    ctx.skill_memory.is_read_only = False
     tok = request_id_context.set("slack-1a2b3c4d"); rt = _as("member")
     try:
         assert turn_may_teach(ctx) is False
@@ -209,66 +198,16 @@ def _playbook(tmp_path, lessons):
     return SkillMemory(tmp_path)
 
 
-def test_the_writer_itself_refuses_every_playbook_mutation_for_a_member_turn(tmp_path):
-    """The backstop: a writer nobody enumerated still cannot write. Fails in
-    the world where only the call sites are gated."""
-    sm = _playbook(tmp_path, [{"trigger": "parse json", "correct_pattern": "use json.loads"}])
-    before = (tmp_path / "skills_playbook.json").read_text()
+def test_the_write_origin_derivation_names_the_member():
+    from ghost_agent.memory import population as P
     tok = request_id_context.set("web-1a2b3c4d"); rt = _as("member")
     try:
-        assert skills_mod.playbook_writes_blocked() is True
-        assert sm.learn_lesson("a stranger's task", "mistake", "solution") is None
-        assert sm.record_surfaced_outcomes(["parse json"], success=True) == 0
-        assert sm.record_retrievals_bulk(["parse json"]) == 0
-        assert sm.record_retrieval("parse json") is None
-        assert sm.record_helpful_retrieval("parse json") is None
-    finally:
-        requester_role_context.reset(rt); request_id_context.reset(tok)
-    assert (tmp_path / "skills_playbook.json").read_text() == before
-    # the owner's turn writes as before
-    tok = request_id_context.set("1a2b3c4d")
-    try:
-        assert skills_mod.playbook_writes_blocked() is False
-        assert sm.record_surfaced_outcomes(["parse json"], success=True) == 1
-    finally:
-        request_id_context.reset(tok)
-    assert (tmp_path / "skills_playbook.json").read_text() != before
-
-
-def test_every_playbook_mutator_carries_the_backstop():
-    """Enumeration by the class: every SkillMemory method that WRITES the
-    playbook (calls save_playbook or the unlocked saver) starts with the
-    backstop — a new mutator without it fails here."""
-    cls = next(n for n in ast.walk(ast.parse(inspect.getsource(skills_mod)))
-               if isinstance(n, ast.ClassDef) and n.name == "SkillMemory")
-    writers, guarded = [], []
-    for fn in cls.body:
-        if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("_save_playbook") \
-                or fn.name in ("save_playbook", "__init__"):   # __init__ = load-time migration
-            continue
-        calls = {getattr(c.func, "attr", "") for c in ast.walk(fn) if isinstance(c, ast.Call)}
-        if not ({"save_playbook", "_save_playbook_unlocked"} & calls):
-            continue
-        writers.append(fn.name)
-        body = fn.body[1:] if (fn.body and isinstance(fn.body[0], ast.Expr)) else fn.body
-        first = body[0] if body else None
-        if isinstance(first, ast.If) and isinstance(first.test, ast.Call) \
-                and getattr(first.test.func, "id", "") == "playbook_writes_blocked":
-            guarded.append(fn.name)
-    assert writers, "no playbook writers found — the enumeration is broken"
-    missing = sorted(set(writers) - set(guarded))
-    assert not missing, f"playbook writers without the member backstop: {missing}"
-
-
-def test_the_lesson_origin_derivation_names_the_member():
-    tok = request_id_context.set("web-1a2b3c4d"); rt = _as("member")
-    try:
-        assert skills_mod._derive_lesson_origin() == skills_mod.LESSON_ORIGIN_MEMBER
+        assert P.write_origin() == P.ORIGIN_MEMBER
     finally:
         requester_role_context.reset(rt); request_id_context.reset(tok)
     tok = request_id_context.set("slack-1a2b3c4d")          # a prefix alone is nobody
     try:
-        assert skills_mod._derive_lesson_origin() == skills_mod.LESSON_ORIGIN_USER
+        assert P.write_origin() == P.ORIGIN_USER
     finally:
         request_id_context.reset(tok)
 
@@ -291,7 +230,10 @@ def test_no_client_name_keys_a_rule_in_the_agent():
     import ghost_agent.utils.logging as lg
     for name in ("is_slack_request_id", "SLACK_REQUEST_PREFIX", "ORIGIN_SLACK"):
         assert not hasattr(lg, name), name
-    assert not hasattr(skills_mod, "LESSON_ORIGIN_SLACK")
+    from ghost_agent.memory import population as P
+    assert not hasattr(P, "ORIGIN_SLACK")
+
+
 def test_the_seed_line_states_a_record_and_suggests_nothing(tmp_path):
     """Fails in the world where the result ends with 'Reuse seed=N … for
     ANOTHER TAKE' — the ready next action an unintelligible follow-up

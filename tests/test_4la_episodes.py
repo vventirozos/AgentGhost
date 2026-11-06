@@ -135,7 +135,6 @@ def _agent(em):
     ctx.memory_system = None
     ctx.llm_client = MagicMock()
     ctx.args = MagicMock()
-    ctx.skill_memory = MagicMock(is_read_only=False)
     return GhostAgent(ctx)
 
 
@@ -185,7 +184,7 @@ def test_the_agents_own_failure_is_a_failure(tmp_path, reply):
 def test_sim_and_bench_never_teach(label):
     from ghost_agent.core.agent import turn_may_teach
     from types import SimpleNamespace
-    assert turn_may_teach(SimpleNamespace(turn_origin_label=label, skill_memory=SimpleNamespace(is_read_only=False))) is False
+    assert turn_may_teach(SimpleNamespace(turn_origin_label=label)) is False
 
 
 def test_the_teach_gate_fails_closed(monkeypatch):

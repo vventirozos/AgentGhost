@@ -6,13 +6,17 @@ Memory=Active, Graph=Active (N edges)…"). The operator: "nothing about the
 agent's internals, memories, graphs, lessons, nothing about labs". This module
 adds six lines, one per group of parts, and what is wrong with them:
 
-    Models · Memory stores · Learning · Projects and schedule ·
+    Models · Memory stores · Rules · Projects and schedule ·
     Labs and sandbox · Storage and safety
+
+(§4TD, 2026-11-06: the third line was "Learning" — the lesson count and the
+owner's rules. The lesson store is removed; the line is the owner's rules, and
+an old playbook file is neither read nor judged.)
 
 What it is built on:
 
 * IT REPAIRS NOTHING AND PROBES NOTHING. Several things named "check" or
-  "reconcile" elsewhere REPAIR as they look (``check_rule_integrity``,
+  "reconcile" elsewhere REPAIR as they look (
   ``sync_owner_mirrors``, ``reconcile_indexes``, ``runs.reconcile``,
   ``temp_documents.sweep``) — none is called. No model, no network, no
   sandbox exec (an exec STARTS a stopped container, so service liveness is not
@@ -23,8 +27,9 @@ What it is built on:
 * A DAMAGED FILE IS LEFT AS IT IS (review r1, r2). The stores' own readers set
   a corrupt file aside and carry on with an empty store — a check that read
   through them renamed the file and then reported "0 lessons", fine. So every
-  JSON file this module reads through a store is looked at FIRST: the profile,
-  the playbook, the document index and the rule ledger (``_damaged``), and the
+  JSON file this module reads through a store is looked at FIRST: the profile
+  and the document index (``_damaged``), the owner's rules (the
+  store's own ``owner_rules.damaged`` — it never sets a file aside), and the
   two sandbox registries (``_registry_rows`` — the same guarded read as their
   supervisors: no symlink followed, bounded — and the rows are COUNTED from
   that one read: the supervisors' ``_load``, which renames a torn file, is
@@ -56,7 +61,7 @@ What it is built on:
   the parts read before a slow one are kept.
 * WHAT IT CANNOT KNOW: that a store lost data BEFORE this call and has saved
   since. A reader that meets a corrupt file sets it aside — and the turn that
-  asks for the health check has already read the profile and the playbook to
+  asks for the health check has already read the profile to
   build its prompt, so a torn file is usually gone before this module looks.
   What is left to see is that the store's file is MISSING (each store creates
   its file when it starts, so "absent" means set aside or removed): that is
@@ -340,32 +345,17 @@ def _memory(context, out: _Parts) -> None:
               lambda xm: f"experience {_plural(_int(xm.count()), 'row')}")
 
 
-# ── Learning ────────────────────────────────────────────────────────────────
+# ── Rules ───────────────────────────────────────────────────────────────────
 
-def _learning(context, out: _Parts) -> None:
-    sm = getattr(context, "skill_memory", None)
-    if sm is None or not out.damaged("lesson playbook", _damaged(getattr(sm, "file_path", None), list,
-                                                                 empty_ok=True, must_exist=True)):
-        def _lessons(sm):
-            total = _int(sm.count_lessons())
-            rules = sm.all_owner_rule_rows()
-            if not isinstance(rules, list):
-                raise _Unreadable("owner rules")
-            return f"{_plural(total, 'lesson')} in the playbook, of them {_plural(len(rules), 'owner rule')}"
-        out.store(context, "skill_memory", "lesson playbook", _lessons)
-
+def _rules(context, out: _Parts) -> None:
     system_dir = _real_dir(getattr(context, "memory_dir", None))
     system_dir = system_dir.parent if system_dir is not None else None
     if system_dir is not None:
-        from ..core import failure_replay as fr
-        if not out.damaged("rule ledger", _damaged(system_dir / "selfplay" / fr.LEDGER, list, empty_ok=True)):
-            def _proposed():
-                cases = [c for c in fr.load(system_dir) if isinstance(c, dict)]
-                proposed = sum(1 for c in cases if fr.is_proposed(c))
-                adopted = sum(1 for c in cases if fr.rule_state(c) == "adopted")
-                return (f"{_plural(proposed, 'proposed rule')} waiting for the owner's decision, "
-                        f"{adopted} adopted from replays")
-            out.read("proposed rules", _proposed)
+        # §4SZ: the owner's rules — one file the owner dictates into (core/owner_rules.py)
+        from ..core import owner_rules as _or
+        if not out.damaged("owner rules", _or.damaged(system_dir) or None):
+            out.read("owner rules", lambda: f"{_plural(len(_or.rules(system_dir)), 'owner rule')} "
+                                            f"(of at most {_or.RULES_MAX}, shown on every turn)")
 
 
 # ── Projects and schedule ───────────────────────────────────────────────────
@@ -543,7 +533,7 @@ def _storage(context, out: _Parts) -> None:
 SECTIONS: Tuple[Tuple[str, Callable[[object, _Parts], None], bool], ...] = (
     ("Models", _models, False),
     ("Memory stores", _memory, True),
-    ("Learning", _learning, True),
+    ("Rules", _rules, True),
     ("Projects and schedule", _projects, True),
     ("Labs and sandbox", _labs, True),
     ("Storage and safety", _storage, True),

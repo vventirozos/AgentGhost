@@ -60,10 +60,7 @@ def _bench_chat_context(tmp_path, item_id):
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string.return_value = ""
     context.memory_system = None
-    context.skill_memory = types.SimpleNamespace(
-        is_read_only=True,
-        last_playbook_triggers=[],
-        get_recent_failures=lambda *a, **k: "No failures")
+    context.simulated = True
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     context.memory_dir = tmp_path / "system" / "memory"

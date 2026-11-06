@@ -205,22 +205,6 @@ class TestTheStoresAndGatesOutsideTheLoop:
         assert _bookkeeping_call_failed("ERROR: project not found") is True
 
 class TestTheCallSitesPassTheObject:
-    def test_a_composed_step_is_classified_from_the_OBJECT(self):
-        """Both call sites did `result_str = str(result)` one line before
-        asking the status-aware question, so `_step_result_ok`'s status arm
-        was unreachable from either — browser FAILED, memory PARTIAL, swarm
-        UNRESOLVED and file_system PARTIAL all counted as successful steps
-        and inflated the macro success_rate the model is shown."""
-        import ghost_agent.tools.composed_skills as C
-
-        tree = ast.parse(inspect.getsource(C))
-        calls = [ast.unparse(n) for n in ast.walk(tree)
-                 if isinstance(n, ast.Call)
-                 and ast.unparse(n.func).endswith("_step_result_ok")]
-        assert len(calls) >= 2, f"expected both step paths, got {calls}"
-        for c in calls:
-            assert "result_str" not in c, (
-                f"a step is classified from the stringified result: {c}")
 
     def test_the_shell_failure_flag_is_not_gated_on_the_verdict(self):
         """`_pf_exec_failed` was set only `if not _res_is_error` — so a

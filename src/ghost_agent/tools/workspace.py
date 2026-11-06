@@ -1,7 +1,7 @@
 """workspace tool — read-only ACTIVITY LEDGER of the user's workspace (what already happened: tracked-file changes, task/command outcomes, research pulled). It does no work — see §4FJ for why the advertised text says so.
 
-Companion to ``introspect`` (read selfhood) and ``self_state`` (write
-selfhood). This tool answers questions like:
+Companion to ``introspect`` (the agent's own selfhood). This tool answers
+questions like:
   * "what changed since yesterday?"
   * "what did my scheduled tasks do?"
   * "what papers / pages have I already pulled?"

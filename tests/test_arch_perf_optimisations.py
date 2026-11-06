@@ -54,8 +54,6 @@ def _make_agent(*, llm_response="ok", with_tools=False, native_tools=False):
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.graph_memory = MagicMock()
     ctx.graph_memory.get_neighborhood = MagicMock(return_value=[])
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value="")
     ctx.sandbox_dir = "/tmp/sandbox"
     return GhostAgent(ctx)
 
@@ -141,31 +139,6 @@ async def test_request_state_caches_profile_string():
     assert s1 == s2 == "profile-data"
     # Profile fetched only once across two reads.
     assert agent.context.profile_memory.get_context_string.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_request_state_caches_skill_playbook_per_query():
-    agent = _make_agent()
-    agent.context.skill_memory.get_playbook_context = MagicMock(return_value="playbook v1")
-    state = GhostAgent._RequestState(agent)
-
-    a = await state.get_skill_playbook("query-A")
-    b = await state.get_skill_playbook("query-A")
-    c = await state.get_skill_playbook("query-B")
-    assert a == b == "playbook v1"
-    # query-A fetched once, query-B fetched once: 2 total calls.
-    assert agent.context.skill_memory.get_playbook_context.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_request_state_skill_playbook_invalidation():
-    agent = _make_agent()
-    agent.context.skill_memory.get_playbook_context = MagicMock(return_value="playbook")
-    state = GhostAgent._RequestState(agent)
-    await state.get_skill_playbook("q")
-    state.invalidate_skill_playbook()
-    await state.get_skill_playbook("q")
-    assert agent.context.skill_memory.get_playbook_context.call_count == 2
 
 
 def test_request_state_caches_active_tool_defs():
@@ -541,18 +514,17 @@ async def test_route_falls_back_on_router_exception():
     await client.close()
 
 
-
-
-
-
 @pytest.mark.asyncio
 async def test_a_short_follow_up_is_retrieved_on_the_users_own_words():
     """§4NQ: no worker rewrite before the reply. With a worker pool present,
     a short anaphoric follow-up used to be rewritten by Nova (EXPAND_QUERY)
     and a compound request decomposed (DECOMPOSE_QUERY) — both were removed
     after a replay of real owner turns showed them changing retrieval mostly
-    for the worse. The lesson fetch must get the message as typed."""
+    for the worse. The hydration must get the message as typed."""
     agent = _make_agent()
+    bus = MagicMock()
+    bus.hydrate_context = AsyncMock(return_value="")
+    agent._get_memory_bus = lambda: bus
     agent.context.llm_client.worker_clients = [{"client": MagicMock()}]
     agent.context.llm_client.route = AsyncMock(return_value="rewritten via router")
     body = {
@@ -567,6 +539,4 @@ async def test_a_short_follow_up_is_retrieved_on_the_users_own_words():
     tasks = [str(c.kwargs.get("task") or (c.args[0] if c.args else ""))
              for c in agent.context.llm_client.route.await_args_list]
     assert not [t for t in tasks if t in ("EXPAND_QUERY", "DECOMPOSE_QUERY")], tasks
-    search_args = agent.context.skill_memory.get_playbook_items.call_args
-    assert search_args is not None
-    assert search_args[0][0] == "run it then"
+    assert bus.hydrate_context.await_args.args[0] == "run it then"

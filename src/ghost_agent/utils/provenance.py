@@ -8,7 +8,7 @@ owner had said it.
 
 :func:`note_tool_result` is called by the dispatcher for every tool result.
 A result from an untrusted SOURCE marks the request. Sinks that must not act
-on content alone — standing instructions (tasks, skills, macros), owner
+on content alone — standing instructions (tasks, skills), owner
 facts, confirms, data leaving the machine — ask :func:`untrusted_seen` and
 refuse, or require the user's own words.
 
@@ -52,8 +52,9 @@ _JOB_OUTPUT = frozenset({"collect", "log", "logs", "tail", "output", "result", "
                          "get", "fetch"})   # §4NS: every alias the jobs tool maps to collect
 
 
-#: acquired skills and composed macros (registered by their runner
-#: factories): their output is opaque — whatever their steps fetched
+#: acquired skills (registered by their runner factory): their output is
+#: opaque — whatever their code fetched. (Composed macros registered here
+#: too until the macro engine was removed, §4TA 2026-11-05.)
 _OPAQUE: set = set()
 
 
@@ -119,7 +120,7 @@ def is_untrusted_source(tool_name: str, args=None, extra_tools=()) -> bool:
         if act == "exec":
             return bool(_NET_CODE.search(" ".join(str(a.get(k) or "") for k in ("cmd", "stdin"))))
         return act in ("http", "get")
-    if name in extra_tools or name in _OPAQUE:     # skills and macros: opaque output
+    if name in extra_tools or name in _OPAQUE:     # acquired skills: opaque output
         return True
     return False
 
@@ -279,8 +280,8 @@ def user_message(req_id: Optional[str] = None) -> str:
 
 def refuse_if_untrusted(what: str, req_id: Optional[str] = None):
     """A declared refusal when content from outside entered this request,
-    else None. For sinks that create STANDING behaviour (tasks, skills,
-    macros): the user confirms in a new message, where nothing was read."""
+    else None. For sinks that create STANDING behaviour (tasks, skills):
+    the user confirms in a new message, where nothing was read."""
     src = untrusted_seen(req_id)
     if not src:
         return None

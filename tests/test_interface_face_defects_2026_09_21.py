@@ -118,28 +118,4 @@ def test_vortex_idle_motion_does_not_grow_with_uptime(lab):
 
 # ── F1: the line budget replaces index-ordered dropping ───────────────
 
-def test_vortex_read_turn_stays_under_the_line_cap(lab):
-    r = _run(lab["new"], "budget")
-    assert r["maxLines"] == 12000
-    assert r["cappedFrac"] < 0.06, r                        # transient frames only, while the budget converges
-    assert r["minBudget"] < 0.9, r                          # the budget engaged
-    assert r["budgetAfterRest"] > 0.99, r                   # and relaxed fully once the surge ended
-
-
-
-
 # ── F3: camera-static forms opt out of the dive couplings ─────────────
-
-@pytest.mark.parametrize("form", ["vortex", "tesseract"])
-def test_a_static_camera_form_gets_no_dive_dim_and_a_brighter_busy_state(lab, form):
-    r = _run(lab["new"], "camdive", FACE_FORM=form)
-    assert r["immersion"] > 0.8, r                          # the turn engaged (the dive VALUE still rises)
-    assert r["uDive"] == 0.0 and r["motesVisible"] is False, r
-    assert r["bloomTurn"] > r["bloomRest"], r               # busy glows more than idle
-
-
-def test_a_diving_form_keeps_its_interior_couplings(lab):
-    r = _run(lab["new"], "camdive", FACE_FORM="cube")
-    assert r["uDive"] > 0.5 and r["motesVisible"] is True, r
-
-

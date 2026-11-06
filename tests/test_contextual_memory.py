@@ -22,7 +22,6 @@ def mock_context():
     ctx.scratchpad.list_all.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.sandbox_dir = "/tmp/sandbox"
-    ctx.skill_memory = None
     ctx.graph_memory = None
     return ctx
 
@@ -58,13 +57,23 @@ async def test_time_decayed_salience(tmp_path):
     assert "New Document" in lines[0], "Time-decay failed: Old memory ranked higher!"
     assert "Old Document" in lines[1], "Time-decay failed: Missing old memory!"
 
+
+def _spy_bus(agent):
+    """The bus the agent hydrates from, as a spy (§4TD: the lesson fetch this
+    used to look at is gone; the words typed are what reach `hydrate_context`)."""
+    bus = MagicMock()
+    bus.hydrate_context = AsyncMock(return_value="")
+    agent._get_memory_bus = lambda: bus
+    return bus
+
+
 @pytest.mark.asyncio
 async def test_a_short_follow_up_searches_on_its_own_words(mock_context):
     """§4NQ: a short follow-up is no longer prefixed with the previous reply
     ("Context: … | User intent: …") nor rewritten by the worker — retrieval
     runs on the message as typed."""
-    mock_context.skill_memory = MagicMock()
     agent = GhostAgent(mock_context)
+    bus = _spy_bus(agent)
     
     # Stop the loop early by returning a standard response without tool calls
     mock_context.llm_client.chat_completion.return_value = {
@@ -77,17 +86,9 @@ async def test_a_short_follow_up_searches_on_its_own_words(mock_context):
         {"role": "user", "content": "run it then"} # Very short, ambiguous query
     ]
     
-    with patch("ghost_agent.core.agent.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
-        mock_to_thread.return_value = "Mocked Memory"
-        await agent.handle_chat({"messages": messages, "model": "test"}, MagicMock())
-        
-        # Find the memory search call
-        print("Mocked calls:", mock_to_thread.call_args_list)
-        # the user's own words reach the lesson fetch (§4NM vector tier retired; §4NQ no expansion)
-        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.skill_memory.get_playbook_items)
-        actual_query = search_call.args[1]
-        
-        assert actual_query == "run it then"
+    await agent.handle_chat({"messages": messages, "model": "test"}, MagicMock())
+    # the user's own words reach the hydration (§4NQ no expansion)
+    assert bus.hydrate_context.await_args.args[0] == "run it then"
 
 @pytest.mark.asyncio
 async def test_self_contained_command_is_not_contaminated(mock_context):
@@ -95,8 +96,8 @@ async def test_self_contained_command_is_not_contaminated(mock_context):
     backticks) must search on the RAW message — NOT get the previous reply
     prepended. Prepending the prior 'difference between projects' answer is
     what made a partial-failure delete re-answer the previous question."""
-    mock_context.skill_memory = MagicMock()
     agent = GhostAgent(mock_context)
+    bus = _spy_bus(agent)
 
     mock_context.llm_client.chat_completion.return_value = {
         "choices": [{"message": {"content": "ok", "tool_calls": []}}]
@@ -108,19 +109,14 @@ async def test_self_contained_command_is_not_contaminated(mock_context):
         {"role": "user", "content": "delete `ecef207c0d4b` and `516217d294cc`"},
     ]
 
-    with patch("ghost_agent.core.agent.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
-        mock_to_thread.return_value = "Mocked Memory"
-        await agent.handle_chat({"messages": messages, "model": "test"}, MagicMock())
+    await agent.handle_chat({"messages": messages, "model": "test"}, MagicMock())
+    actual_query = bus.hydrate_context.await_args.args[0]
 
-        # the user's own words reach the lesson fetch (§4NM vector tier retired; §4NQ no expansion)
-        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.skill_memory.get_playbook_items)
-        actual_query = search_call.args[1]
-
-        # The prior comparison must NOT leak into the delete's search query.
-        assert "Context:" not in actual_query
-        assert actual_query == messages[-1]["content"]
-        assert "comparison" not in actual_query
-        assert actual_query == "delete `ecef207c0d4b` and `516217d294cc`"
+    # The prior comparison must NOT leak into the delete's search query.
+    assert "Context:" not in actual_query
+    assert actual_query == messages[-1]["content"]
+    assert "comparison" not in actual_query
+    assert actual_query == "delete `ecef207c0d4b` and `516217d294cc`"
 
 @pytest.mark.asyncio
 async def test_episodic_archival(mock_context):

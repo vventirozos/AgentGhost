@@ -63,11 +63,11 @@ async def test_an_ambiguous_name_never_picks_silently(action):
 # ── 3. a dead-end refusal ends the tool phase on the first refusal ──
 
 async def test_a_probe_write_refusal_carries_its_reason(tmp_path):
-    from ghost_agent.tools.composed_skills import tool_manage_composed_skills
-    ctx = type("C", (), {"memory_dir": tmp_path, "sandbox_dir": tmp_path})()
+    # (pinned on the macro manager until it was removed, §4TA; `manage_skills` refuses the same way)
+    from ghost_agent.tools.acquired_skills import tool_manage_skills
     tok = request_id_context.set("probe-1")
     try:
-        out = await tool_manage_composed_skills(context=ctx, action="delete", name="x")
+        out = await tool_manage_skills(memory_dir=tmp_path, sandbox_dir=tmp_path, action="delete", skill_name="x")
     finally:
         request_id_context.reset(tok)
     assert getattr(out, "reason_code", None) == "not_owner_write"

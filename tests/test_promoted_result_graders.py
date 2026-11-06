@@ -155,15 +155,6 @@ def test_the_advancers_other_failure_check_also_refuses_it():
         "--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nok") is False
 
 
-
-
-def test_a_promoted_macro_step_is_not_a_successful_step():
-    from ghost_agent.tools.composed_skills import _step_result_ok
-    assert _step_result_ok(_result()) is False
-    assert _step_result_ok(
-        "--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nok") is True
-
-
 @pytest.mark.asyncio
 async def test_the_smoke_gate_does_not_fail_open_on_an_unfinished_run():
     """A mangled run fails OPEN (None = pass) by design; an unfinished one

@@ -171,9 +171,9 @@ def test_leaf_context_keeps_the_project_and_wraps_memory_read_only():
     """World where it fails: the isolation nulls the project (paths would
     resolve to the sandbox root, the §4EI class) or leaves memory writable
     (a leaf would teach)."""
-    from ghost_agent.memory.readonly import ReadOnlySkillMemory
+    from ghost_agent.core.isolation import is_simulated_context
     base = SimpleNamespace(sandbox_dir="/tmp/sb", current_project_id=None,
-                           memory_system=object(), skill_memory=object(), graph_memory=None,
+                           memory_system=object(), graph_memory=None,
                            args=SimpleNamespace(perfect_it=True, smart_memory=0.5, native_tools=False),
                            workspace_model=object(), journal=object(), llm_client=object())
     # the base is UNBOUND (as the advancer's context is); the leaf pins the
@@ -181,7 +181,7 @@ def test_leaf_context_keeps_the_project_and_wraps_memory_read_only():
     iso = cl.build_leaf_context(base, leaf_id="L1", project_id="p1")
     assert iso.current_project_id == "p1" and iso.sandbox_dir == "/tmp/sb"
     assert base.current_project_id is None           # the live context is untouched
-    assert isinstance(iso.skill_memory, ReadOnlySkillMemory)
+    assert is_simulated_context(iso) and not is_simulated_context(base)   # §4TD: the mark, not a wrapper
     assert iso.trajectory_task_kind == "leaf" and iso.turn_origin_label == "leaf"
     assert iso.trajectory_extra_static == {"leaf_id": "L1"}
     assert iso.workspace_model is None and iso.journal is None

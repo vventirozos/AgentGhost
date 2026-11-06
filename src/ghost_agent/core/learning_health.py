@@ -1,13 +1,18 @@
 """Learning-health telemetry — read-only aggregation of the on-disk stores
-the agent's learning/cognitive loops write to.
+the agent's background loops write to.
 
-The 2026-07 loop-closing work shipped a large stack (outcome-gated lesson
-utility, competence context, episode recovery, calibration; §4PJ removed the
-competence profile and the confidence calibration) each carrying an
+The 2026-07 loop-closing work shipped a large stack, each part carrying an
 explicit "watch/keep-or-kill in ~2 weeks" criterion — but nothing surfaced
 the data to make that call. This turns those pending watches into one
 screen. Pure reads; never mutates; never raises (every store access is
 defensive so a missing/corrupt file degrades to "n/a", not a crash).
+
+What it reports today: the episode store, which registered background jobs
+fired (mechanism and subsystem liveness), what the loops produced that anyone
+used (loop yield), prompt-optimisation artifacts, verifier escalations and the
+tool-call framing-leak watch. The lesson playbook's block went with the lesson
+store (§4TD, 2026-11-06; §4PJ had removed the competence profile and the
+confidence calibration): an old ``skills_playbook.json`` is not read.
 
 Exposed as ``introspect action='learning'`` and ``scripts/learning_health.py``.
 """
@@ -23,36 +28,6 @@ from typing import Any, Dict, List, Optional
 
 # The "a report must not die" handlers log here.
 logger = logging.getLogger("GhostAgent")
-
-# FALLBACK mirrors of gates OWNED by other modules. The live values are
-# imported lazily at report time (see the ``_live_*`` helpers) so the
-# instrument cannot drift from the mechanism it reports on — hand-copied
-# mirrors here already skewed two verdicts (found 2026-07-27). These literals
-# are used only when the owning module cannot be imported, and match its
-# values as of 2026-07-27.
-_STALE_MIN_RETRIEVALS = 5    # skills._STALE_MIN_RETRIEVALS
-_STALE_HIT_RATE = 0.35       # skills._STALE_HIT_RATE
-_OUTCOME_MIN_OBS = 4         # skills._OUTCOME_MIN_OBS ("decisive" floor)
-
-
-def _live_stale_gates():
-    """skills.py's stale-lesson demotion signal (min retrievals, hit-rate
-    floor), read from the owning module with a last-known fallback."""
-    try:
-        from ..memory.skills import _STALE_MIN_RETRIEVALS as r, _STALE_HIT_RATE as h
-        return int(r), float(h)
-    except Exception:  # noqa: BLE001
-        return _STALE_MIN_RETRIEVALS, _STALE_HIT_RATE
-
-
-def _live_outcome_min_obs() -> int:
-    """skills.py's decisive-outcome floor (the tick count at which the
-    outcome arm may influence utility)."""
-    try:
-        from ..memory.skills import _OUTCOME_MIN_OBS as n
-        return int(n)
-    except Exception:  # noqa: BLE001
-        return _OUTCOME_MIN_OBS
 
 
 def _load_json(path: Path, default=None):
@@ -83,43 +58,6 @@ def _load_jsonl(path: Path, limit: Optional[int] = None) -> List[dict]:
     return list(buf)
 
 
-# Lessons CREATED before this date accumulated their retrieval counters
-# during the double-booking era, so their hit-rate denominator is inflated and
-# cannot be un-mixed retroactively — the counters are cumulative with no
-# per-period breakdown. Lessons created AFTER it accumulated entirely in the
-# clean era, which gives an honest denominator without discarding anything.
-#
-# ⚠ AUDIT 2026-08-10. The report printed the contaminated mean with a
-# "do not trend across that date" caveat — a number the reader was told not to
-# use, next to no number they could. Measured: contaminated 0.620 vs CLEAN
-# 0.557 over 13 lessons / 600 retrievals. The caveat was hiding a 0.06
-# OVERSTATEMENT that was computable all along.
-_LESSON_CLEAN_EPOCH = "2026-08-01"
-
-
-def _lesson_created_ts(lesson: dict):
-    """Creation time as epoch seconds, or None when unparseable."""
-    v = lesson.get("timestamp")
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v) or None
-    import datetime as _dt
-    try:
-        return _dt.datetime.fromisoformat(
-            str(v).replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def _lesson_hit_rate(lesson: dict) -> float:
-    # Laplace-smoothed hit rate, matching skills.compute_lesson_utility's
-    # (helpful+1)/(retrievals+2) convention.
-    h = int(lesson.get("helpful_retrievals") or 0)
-    r = int(lesson.get("retrievals") or 0)
-    return (h + 1) / (r + 2)
-
-
 def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
     """Aggregate the learning stores under ``memory_dir`` (the
     system/memory directory). Returns a nested dict of sections; each is
@@ -127,76 +65,8 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
     md = Path(memory_dir)
     report: Dict[str, Any] = {}
 
-    # -- Lessons (playbook) ------------------------------------------------
-    pb = _load_json(md / "skills_playbook.json", []) or []
-    if isinstance(pb, list):
-        outcome_min = _live_outcome_min_obs()
-        stale_min_r, stale_hr = _live_stale_gates()
-        decisive = [l for l in pb
-                    if (int(l.get("succeeded_retrievals") or 0)
-                        + int(l.get("failed_retrievals") or 0)) >= outcome_min]
-        # Single O(n) pass; the old list-membership version compared dicts
-        # by equality (O(n²), and duplicate lessons misclassified).
-        n_pass_only = n_fail_only = n_mixed = 0
-        for l in decisive:
-            s_ticks = int(l.get("succeeded_retrievals") or 0)
-            f_ticks = int(l.get("failed_retrievals") or 0)
-            if s_ticks > 0 and f_ticks == 0:
-                n_pass_only += 1
-            elif f_ticks > 0 and s_ticks == 0:
-                n_fail_only += 1
-            else:
-                n_mixed += 1
-        stale = [l for l in pb
-                 if int(l.get("retrievals") or 0) >= stale_min_r
-                 and _lesson_hit_rate(l) < stale_hr]
-        hrs = [_lesson_hit_rate(l) for l in pb if int(l.get("retrievals") or 0) > 0]
-        # CLEAN denominator: lessons created after the double-booking era, so
-        # every retrieval they counted was counted once. See _LESSON_CLEAN_EPOCH.
-        import datetime as _dt
-        _cut = _dt.datetime.fromisoformat(_LESSON_CLEAN_EPOCH).timestamp()
-        _clean = [l for l in pb
-                  if int(l.get("retrievals") or 0) > 0
-                  and (_lesson_created_ts(l) or 0) >= _cut]
-        _clean_hrs = [_lesson_hit_rate(l) for l in _clean]
-        report["lessons"] = {
-            "total": len(pb),
-            "graduated": sum(1 for l in pb if l.get("graduated")),
-            "quarantined": sum(1 for l in pb if l.get("quarantined")),
-            "verified": sum(1 for l in pb if l.get("verified")),
-            # §4FD provenance: who wrote the lessons the prompt retrieves.
-            # "" = legacy (pre-stamp). A "probe" count above zero is a leak.
-            "by_origin": {
-                k: sum(1 for l in pb if str(l.get("origin") or "") == k)
-                for k in ("user", "auto", "probe", "bench", "")},
-            "with_outcome_ticks": sum(
-                1 for l in pb
-                if (int(l.get("succeeded_retrievals") or 0)
-                    + int(l.get("failed_retrievals") or 0)) > 0),
-            "decisive": len(decisive),
-            "present_on_pass_only": n_pass_only,
-            "present_on_failure_only": n_fail_only,
-            "present_on_both": n_mixed,
-            "stale_prune_candidates": len(stale),
-            "mean_hit_rate": round(sum(hrs) / len(hrs), 3) if hrs else None,
-            # The honest headline. `mean_hit_rate` above spans the
-            # double-booking era and OVERSTATES (measured 0.620 vs 0.557).
-            "mean_hit_rate_clean": (round(sum(_clean_hrs) / len(_clean_hrs), 3)
-                                    if _clean_hrs else None),
-            "clean_lessons": len(_clean_hrs),
-            "clean_epoch": _LESSON_CLEAN_EPOCH,
-            "clean_retrievals": sum(int(l.get("retrievals") or 0)
-                                    for l in _clean),
-            # Raw outcome-tick totals (2026-07-27): the honest FAILURE-arm
-            # liveness test. At the live ~96% turn pass rate a retrieved
-            # lesson almost surely accrues ≥1 success, so the fail-ONLY
-            # bucket is near-impossible by construction and its emptiness
-            # says nothing about the arm — total failed ticks does.
-            "succeeded_ticks_total": sum(
-                int(l.get("succeeded_retrievals") or 0) for l in pb),
-            "failed_ticks_total": sum(
-                int(l.get("failed_retrievals") or 0) for l in pb),
-        }
+    # (§4TD: no lessons block — the lesson store was removed, and an old
+    # `skills_playbook.json` under the memory dir is not read)
 
     # -- Adaptive threshold ------------------------------------------------
     at = _load_json(md / "adaptive_threshold.json", {}) or {}
@@ -661,91 +531,6 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
          else collect_learning_health(memory_dir, args))
     lines: List[str] = ["### LEARNING HEALTH"]
 
-    les = r.get("lessons")
-    if les:
-        # §4M (Lens D F6d): at the cap, "N total" is a saturated window
-        # (the store trims on every write), not a population count — say so.
-        _cap_note = ""
-        try:
-            from ..memory.skills import PLAYBOOK_MAX as _PBMAX
-            if int(les["total"]) >= int(_PBMAX):
-                _cap_note = f" (AT CAP {_PBMAX} — trims on every write)"
-        except Exception:
-            pass
-        lines.append(
-            f"\nLESSONS: {les['total']} total{_cap_note} "
-            f"({les['graduated']} graduated, {les['verified']} verified, "
-            f"{les['quarantined']} quarantined)")
-        _bo = les.get("by_origin") or {}
-        if _bo:
-            _probe = int(_bo.get("probe") or 0)
-            lines.append(
-                f"  origin: user {int(_bo.get('user') or 0)}, "
-                f"auto {int(_bo.get('auto') or 0)}, bench {int(_bo.get('bench') or 0)}, "
-                f"legacy {int(_bo.get('') or 0)}"
-                + (f", ⚠ probe {_probe} (diagnostics must never teach)" if _probe else ""))
-        lines.append(
-            f"  outcome ticks on {les['with_outcome_ticks']} lessons; "
-            f"decisive (≥4 obs): {les['decisive']} "
-            f"[pass-only {les['present_on_pass_only']}, "
-            f"fail-only {les['present_on_failure_only']}, "
-            f"both {les['present_on_both']}]")
-        # ⚠ The CLEAN figure leads. The all-lessons mean spans the
-        # double-booking era and overstates; printing it with a "do not trend"
-        # caveat gave the reader a number they were told not to use and no
-        # number they could — while the clean one was computable all along.
-        _chr, _cn = les.get("mean_hit_rate_clean"), les.get("clean_lessons")
-        if _chr is not None and _cn:
-            lines.append(
-                f"  mean hit-rate: {_chr} (CLEAN — {_cn} lessons created after "
-                f"{les.get('clean_epoch')}, {les.get('clean_retrievals')} "
-                f"retrievals, denominator counted once)")
-            # Direction COMPUTED, not asserted. This line used to print a
-            # hardcoded "OVERSTATES": true when written (0.620 vs 0.557),
-            # false on live data within a month (0.673 vs 0.681 — the
-            # "overstating" number was LOWER). A report that renders both
-            # numbers and then asserts their ordering from memory is an
-            # instrument stating a stale fact as a measurement. The claim
-            # that matters — not comparable, double-counted denominator —
-            # does not depend on the direction.
-            try:
-                _all_v, _clean_v = float(les["mean_hit_rate"]), float(_chr)
-                _dir = ("currently overstates" if _all_v > _clean_v
-                        else "currently understates" if _all_v < _clean_v
-                        else "coincidentally matches")
-            except (TypeError, ValueError):
-                _dir = "cannot be ordered against"
-            lines.append(
-                f"    all-lessons {les['mean_hit_rate']} spans the "
-                f"double-booking era and {_dir} the clean figure — not "
-                "comparable either way (denominator double-counted)")
-        else:
-            lines.append(
-                f"  mean hit-rate: {les['mean_hit_rate']} ⚠ CONTAMINATED — no "
-                f"post-{les.get('clean_epoch')} lesson has retrievals yet, so "
-                f"no clean denominator exists")
-        lines.append(
-            f"  stale/prune candidates: {les['stale_prune_candidates']}")
-        _fail_ticks = int(les.get("failed_ticks_total") or 0)
-        _succ_ticks = int(les.get("succeeded_ticks_total") or 0)
-        lines.append(
-            f"  outcome ticks total: {_succ_ticks} succeeded / "
-            f"{_fail_ticks} failed")
-        # Inertness test rewritten 2026-07-27: fail-ONLY lessons are
-        # near-impossible at a ~96% pass rate (any retrieved lesson
-        # accrues a success), so their absence was a metric artifact,
-        # not evidence. The arm is inert only if the success side is
-        # clearly flowing while not a single failure tick ever landed.
-        if _fail_ticks == 0 and _succ_ticks >= 20:
-            lines.append(
-                "  ⚠ FAILURE arm has recorded ZERO failed-retrieval ticks "
-                "while the success arm flows — the demotion loop looks "
-                "inert on this model.")
-        elif _fail_ticks > 0 and les["present_on_failure_only"] == 0:
-            lines.append(
-                "  (failure ticks flow; no fail-only lesson yet — expected "
-                "at a high turn pass rate)")
-
     epi = r.get("episodes")
     if epi:
         lines.append(
@@ -853,7 +638,9 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
     # to expose. Liveness above asks "did this mechanism RUN?"; this asks
     # "did it produce anything anyone CONSUMED?". Dream fired on schedule
     # for six weeks and minted 25 macros that were invoked ZERO times, and
-    # every liveness probe would have read FIRED throughout.
+    # every liveness probe would have read FIRED throughout. (The macro
+    # engine and its row are removed, §4TA 2026-11-05; the axis stays for
+    # the loops that are left.)
     #
     # Extended here rather than given its own introspect action on purpose:
     # a parallel surface is one more thing an operator has to remember to

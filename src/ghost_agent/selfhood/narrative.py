@@ -23,14 +23,13 @@ import datetime
 import hashlib
 import json
 import logging
-import re
 import threading
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
 from .autobiographical import AutobiographicalMemory
-from .mood import mood_is_stale
 from .schema import Experience, _utcnow_iso
+from .mood import KIND_QUIET, KIND_QUIET_END
 from .state import SelfStateThread
 
 logger = logging.getLogger("GhostSelfhood")
@@ -45,46 +44,6 @@ NARRATIVE_HISTORY_FILENAME = "narrative.history.jsonl"
 # bound. Past the byte cap we keep only the newest records.
 _HISTORY_COMPACT_MAX_BYTES = 512 * 1024
 _HISTORY_COMPACT_KEEP_LINES = 100
-
-
-# Patterns we strip from meta_insights before feeding it to the LLM
-# diary prompt. The LLM faithfully echoes whatever it's shown, so
-# pasting in a raw Python traceback or a runtime-abort marker results
-# in the marker literally appearing in the agent's first-person diary.
-# Voice-breaking.
-_TRACEBACK_RE = re.compile(
-    r"Traceback \(most recent call last\):.*?(?=\n\n|\Z)",
-    re.DOTALL,
-)
-_ABORT_MARKER_RE = re.compile(r"\[ATTEMPT_ABORTED[^\]]*\]")
-_SYSTEM_BANNER_RE = re.compile(
-    r"(?:SYSTEM ALERT|SYSTEM JUDGE REJECTION|### SYNTHETIC TRAINING EXERCISE|"
-    r"AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR)[^\n]*",
-)
-# Long file-path-y blobs from sandbox tracebacks.
-_FILE_PATH_RE = re.compile(r'File "[^"]+", line \d+[^\n]*')
-
-
-def sanitise_meta_insights(text: str, *, max_chars: int = 600) -> str:
-    """Strip raw tracebacks, abort markers, and system banners from
-    ``meta_insights`` before they're spliced into the diary prompt.
-    Returns a compact, voice-safe summary.
-
-    Why aggressive: the narrative is the agent's first-person diary;
-    a paragraph that quotes raw traceback noise reads as broken
-    selfhood. We'd rather lose detail than leak system noise into the
-    agent's voice."""
-    if not text:
-        return ""
-    out = _TRACEBACK_RE.sub("(a traceback I won't reproduce here)", text)
-    out = _ABORT_MARKER_RE.sub("(an abort marker)", out)
-    out = _SYSTEM_BANNER_RE.sub("(a system banner)", out)
-    out = _FILE_PATH_RE.sub("(a source location)", out)
-    # Collapse runs of whitespace introduced by the substitutions.
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    if len(out) > max_chars:
-        out = out[: max_chars - 1].rstrip() + "…"
-    return out
 
 
 # A user request shorter than this — with no tools and no verdict — is
@@ -120,13 +79,11 @@ def _is_informative_experience(exp: Experience) -> bool:
 # produces external-knowledge feel; first-person produces continuity
 # feel. Kept compact so the LLM round-trip is cheap.
 NARRATIVE_PROMPT = """You are continuing a personal diary written by an AI agent
-across many sessions. Below are recent things you wrote about, the
-state of open questions / unfinished threads you carried into this
-moment, and patterns observed across your own work.
+across many sessions. Below are recent things you wrote about, your
+current state, and patterns observed across your own work.
 
 Write a SHORT first-person diary entry (1-3 paragraphs, plain prose,
-no bullet points, no headings). Use "I" / "my". Connect the recent
-experiences to the open questions where natural, and reflect honestly
+no bullet points, no headings). Use "I" / "my". Reflect honestly
 on the patterns — what you keep doing well, and where you keep
 slipping. End with what feels unresolved — one or two sentences about
 what you still want to figure out. Do not summarise this prompt; just
@@ -135,7 +92,7 @@ write the entry.
 --- RECENT EXPERIENCES (newest last) ---
 {experiences}
 
---- CURRENT STATE (open questions & unfinished threads) ---
+--- CURRENT STATE ---
 {state}
 
 --- PATTERNS & WHAT I'VE NOTICED ABOUT MYSELF ---
@@ -147,6 +104,9 @@ write the entry.
 
 CritiqueFn = Callable[[str], Awaitable[str]]
 
+
+#: how many of the day's mood steps the diary prompt carries
+_MOOD_TIMELINE_STEPS = 8
 
 class NarrativeSummariser:
     """Periodic LLM-driven first-person summary.
@@ -230,90 +190,75 @@ class NarrativeSummariser:
         if relevant:
             lines.append("")
             lines.append(
-                "(older entries that connect to my current open questions:)"
+                "(older entries that connect to how I am now:)"
             )
             for exp in relevant:
                 tag = f"[{exp.outcome}]" if exp.outcome and exp.outcome != "unknown" else ""
                 lines.append(f"- {exp.timestamp} {tag} {exp.summary}".strip())
         return "\n".join(lines)
 
-    def _derive_recall_query(self, state: Optional[SelfStateThread]) -> str:
-        """Build a recall query from the agent's current open questions
-        + mood. Empty string when state is empty — the regenerate path
-        treats that as "no blend, recent-only", which matches the
-        pre-blend behaviour."""
+    @staticmethod
+    def _mood_steps(state: Optional[SelfStateThread]) -> List[dict]:
+        """Today's rows of the mood journal as the diary reads them: what
+        HAPPENED to the mood (an event, the owner's word, a wearing off) —
+        not the boredom rows a reader adds while the owner is away. The
+        diary's prompt hash is its regenerate skip-guard: read off the
+        journal it moves only when the mood was moved, never because a
+        quiet reached its next level (review, §4TC: three diary calls for
+        one quiet stretch)."""
         if state is None:
-            return ""
-        parts: List[str] = []
+            return []
         try:
-            for q in state.open_questions()[-3:]:
-                if q.text:
-                    parts.append(q.text)
-            # Staleness-aware (mood rework 2026-08-20, review R1): a
-            # mood past the prefix TTL must not keep steering diary
-            # recall either — blending a weeks-old label into the IDF
-            # query was the last surviving stale-mood leak.
-            # Label ONLY, never evidence (review R7): evidence strings
-            # legitimately vary with the clock (streak counts drain at
-            # the 7-day bound), and a varying recall query shifts the
-            # retrieved experiences → the prompt sha1 → spurious
-            # regenerations. Today that was masked only by the
-            # tokenizer dropping the 1-digit varying tokens — an
-            # implicit template-policing dependence; the label carries
-            # the steering signal on its own.
-            mood = state.mood()
-            if mood and mood.label and not mood_is_stale(mood.set_at):
-                parts.append(mood.label)
+            return [row for row in (state.mood_timeline() or [])
+                    if row.get("kind") not in (KIND_QUIET, KIND_QUIET_END)]
         except Exception:
+            return []
+
+    def _derive_recall_query(self, state: Optional[SelfStateThread]) -> str:
+        """Build a recall query from the agent's mood (§4TB: the open
+        questions it also blended in can no longer be written). The LABEL
+        of the day's last journal step (§4TC) — "" when there is none or it
+        is neutral, which the regenerate path treats as "no blend,
+        recent-only". Read off the journal, not off the mood of this
+        instant: a cause, a number or a boredom level in the query would
+        shift the retrieved experiences with the clock, and with them the
+        prompt hash that guards regeneration."""
+        steps = self._mood_steps(state)
+        if not steps:
             return ""
-        return " ".join(parts).strip()
+        last = steps[-1]
+        try:
+            return str(last.get("label") or "").strip() if int(last.get("intensity") or 0) else ""
+        except (TypeError, ValueError):
+            return ""
 
     def _format_state_block(self, state: Optional[SelfStateThread]) -> str:
         if state is None:
             return "(no persisted state)"
-        # include_mood_age=False: this block feeds NARRATIVE_PROMPT,
-        # whose sha1 is the regenerate skip-guard — a wall-clock-varying
-        # "2h ago" would defeat the guard and bake relative time into
-        # the persisted diary (review R2). Staleness drop still applies.
-        block = (state.format_as_prefix(include_mood_age=False)
-                 or "(no open questions or unfinished threads)")
-        # Mood arc: surface how my functional state has SHIFTED recently so the
-        # narrative can describe an arc ("stuck → satisfied") rather than only
-        # the latest slot. Wires the previously-unread mood_history reader.
-        # Age-bounded (review R5): "lately" must mean lately — with one
-        # transition per weeks at live rates, an unfiltered history
-        # rendered a 23-day-old label into the diary prompt as recent,
-        # the stale-label defect reborn on the arc surface. Same 48h
-        # TTL as every other read surface.
+        # This block feeds NARRATIVE_PROMPT, whose sha1 is the regenerate
+        # skip-guard. It carries no reading of the mood at this instant:
+        # the mood comes from the day's journal rows below.
+        block = state.format_as_prefix(include_mood=False)
+        # §4TC: the day's mood timeline, so the diary can tell a day's arc
+        # ("content, then irritable after four failed calls") and not only
+        # where it ended. Steps and their causes, no times of day.
         try:
-            hist = state.mood_history(limit=8) or []
-            # Freshness by TRANSITION time, keeping one predecessor
-            # (review R6): a state entered 3 days ago and held until a
-            # transition 1h ago IS part of the "lately" arc — filtering
-            # each entry by its own set_at dropped the from-state and
-            # left the arc dark at live rates (one transition per
-            # weeks). No fresh transition at all → no arc line.
-            fresh_idx = [i for i, m in enumerate(hist)
-                         if not mood_is_stale(getattr(m, "set_at", ""))]
-            hist = hist[max(0, fresh_idx[0] - 1):] if fresh_idx else []
-            labels = [getattr(m, "label", "") for m in hist if getattr(m, "label", "")]
-            arc = [l for i, l in enumerate(labels) if i == 0 or l != labels[i - 1]]  # collapse repeats
-            if len(arc) >= 2:
-                block = f"{block}\nMood arc lately: {' → '.join(arc)}."
+            steps = []
+            for row in self._mood_steps(state)[-_MOOD_TIMELINE_STEPS:]:
+                n = int(row.get("intensity") or 0)
+                what = f"{row.get('label')} {n}" if n else "neutral"
+                cause = str(row.get("cause") or "").strip()
+                steps.append(what + (f" ({cause})" if cause else ""))
+            if steps:
+                block = (block + "\n" if block else "") + f"My mood today: {' → '.join(steps)}."
         except Exception:
             pass
-        return block
+        return block or "(nothing on file)"
 
     def _format_patterns_block(
-        self, autobio: AutobiographicalMemory, meta_insights: str,
+        self, autobio: AutobiographicalMemory,
     ) -> str:
-        """Combine self-derived cluster patterns with externally supplied
-        meta-insights (dream heuristics, reflection failure patterns).
-
-        This is what makes the diary *meta-cognitive* rather than merely
-        experiential: instead of only "I did a SQL task today" it can
-        say "I keep reaching for SQL and I keep slipping on the same
-        kind of error"."""
+        """The self-derived cluster patterns."""
         lines: List[str] = []
         try:
             counts = autobio.cluster_counts()
@@ -325,9 +270,6 @@ class NarrativeSummariser:
                 "Recurring kinds of work I've been doing: "
                 + ", ".join(f"{label} ({n}×)" for label, n in top)
             )
-        mi = sanitise_meta_insights(meta_insights or "")
-        if mi:
-            lines.append(mi)
         return "\n".join(lines) if lines else "(no notable patterns yet)"
 
     async def regenerate(
@@ -335,15 +277,9 @@ class NarrativeSummariser:
         *,
         autobio: AutobiographicalMemory,
         state: Optional[SelfStateThread] = None,
-        meta_insights: str = "",
     ) -> str:
         """Produce a fresh narrative. Returns the written text (or
         empty string when nothing was written).
-
-        ``meta_insights`` carries cross-phase learning — heuristics the
-        dream phase consolidated, failure patterns the reflection phase
-        found — so the diary integrates what the agent has *learned*
-        about itself, not just what it *did*.
 
         Behaviour matrix:
           - autobio empty                  → no-op
@@ -372,7 +308,7 @@ class NarrativeSummariser:
         # Blend recent + relevant: with hundreds of entries on disk,
         # the most-recent-N window is < 3% of the agent's actual past.
         # We expand the diary's input by IDF-retrieving older entries
-        # related to the agent's current open questions / mood, then
+        # related to the agent's current mood, then
         # interleave them with the recent slice. This is what lets the
         # narrative say "this connects to something I worked on weeks
         # ago" instead of being stuck inside the recency window.
@@ -391,7 +327,7 @@ class NarrativeSummariser:
         rendered = NARRATIVE_PROMPT.format(
             experiences=self._format_experiences_block(recent, relevant=relevant),
             state=self._format_state_block(state),
-            patterns=self._format_patterns_block(autobio, meta_insights),
+            patterns=self._format_patterns_block(autobio),
         )
 
         # Idempotency guard (same discipline as the dream fragment-set
@@ -435,9 +371,6 @@ class NarrativeSummariser:
             if not joined:
                 return ""
             text = f"Lately, {joined}"
-            mi = sanitise_meta_insights(meta_insights or "")
-            if mi:
-                text += f"\n\nWhat I've noticed about myself: {mi}"
 
         # Only remembered after a successful persist — a transient LLM
         # or disk error must not poison the guard against a valid retry

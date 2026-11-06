@@ -24,7 +24,6 @@ def mock_context():
     context.tool_system = MagicMock()
     context.memory_system = MagicMock()
     context.profile_memory = None
-    context.skill_memory = None
     return context
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ CANON="$HERE/../../static/matrix_graph.js"
 # Every module the client imports. tests/test_clockwork_ux.py walks the
 # imports and fails if one is missing from this line — a module that is not
 # deployed is an ImportError on the device and a client that will not start.
-MODULES="client.py webface.py chatlog.py turnstatus.py facestate.py markup.py speech.py devstatus.py agentapi.py commands.py device_probe.py"
+MODULES="client.py icons.py webface.py chatlog.py turnstatus.py facestate.py markup.py speech.py devstatus.py agentapi.py commands.py device_probe.py"
 STAGE=/home/vasilis/bin/.stage
 
 echo "→ syncing canonical face modules"

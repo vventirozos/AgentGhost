@@ -158,7 +158,6 @@ def agent():
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string.return_value = ""
     context.memory_system = None
-    context.skill_memory = None
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     return GhostAgent(context)
@@ -381,7 +380,6 @@ def _make_ts(**over):
         last_user_content="do the thing",
         char_budget=4000,
         strikes=StrikeLedger(),
-        task_tree=MagicMock(),
         _user_batch_intent=None,
         _request_constraints=[],
         repeated_action_steered=set(),

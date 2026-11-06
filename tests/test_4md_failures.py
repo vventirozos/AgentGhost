@@ -294,18 +294,6 @@ async def test_empty_replies_are_the_server_not_the_users_wording(monkeypatch):
     assert calls <= 3
 
 
-async def test_an_aborted_turn_credits_no_lesson():
-    from ghost_agent.core.agent import GhostAgent
-    from tests.helpers import make_context
-    ctx = make_context()
-    sm = MagicMock()
-    ctx.skill_memory = sm
-    agent = GhostAgent(ctx)
-    await agent._credit_turn_lessons(0, "what is the capital of peru",
-                                     final_text="CRITICAL: Upstream error 503 [ATTEMPT_ABORTED_UPSTREAM]")
-    sm.credit_recent_retrievals.assert_not_called()
-
-
 def test_a_cut_answer_is_announced_and_marked():
     from ghost_agent.core.agent import TRUNCATED_ANSWER_NOTE, UPSTREAM_ABORT_MARKER, _ABORT_MARKER_RE
     assert _ABORT_MARKER_RE.search(UPSTREAM_ABORT_MARKER)

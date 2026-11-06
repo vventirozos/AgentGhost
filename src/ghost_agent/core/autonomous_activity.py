@@ -1,7 +1,7 @@
 """Autonomous-activity ledger — the agent's outbound "mouth" (2026-07-11).
 
-The idle battery (maintenance, formerly "dream"; workspace tidy, narratives, the self-play slot — failure replay, regression suite and the
-reaction judge since §4NM) and scheduled turns all do real work while the
+The idle battery (maintenance, formerly "dream"; workspace tidy, narratives —
+the self-play slot was removed in §4SZ) and scheduled turns all do real work while the
 operator is away — but until this module, only project
 autoadvance ever told the user (via ``core.project_digest``); everything
 else surfaced solely as ``pretty_log`` lines on the console. This ledger
@@ -60,7 +60,7 @@ _PHASE_LABELS = {
     "self_play": "self-play",
     "scheduled_task": "scheduled task",
     "agent_message": "message from the agent",
-    "open_questions": "open questions",
+    "open_questions": "open questions",   # §4TB: rows written before the stale-questions job was removed
     "project": "project",
     "service": "service",
     "job": "background job",
@@ -108,10 +108,9 @@ EXPECT_GATED = "gated"
 
 PHASE_EXPECTATION = {
     # measured firing continuously (7d/24h): 159/21, 155/22, 89/15, 99/14, 43/5
-    "self_play": EXPECT_PERIODIC,
+    # (§4SZ: "self_play" — the failure-replay slot — is removed, so nothing expects its heartbeat)
     "maintenance": EXPECT_PERIODIC,   # §4NM: was "dream" (see PHASE_ALIASES)
     # records only when there was an outcome to record
-    "open_questions": EXPECT_ON_OUTPUT,      # `if stale:`
     "workspace_tidy": EXPECT_ON_OUTPUT,      # `if _tidy_deleted:`
     "native_tool_repair": EXPECT_ON_OUTPUT,  # ~0 by design; each one is news
     # externally triggered
@@ -141,7 +140,9 @@ PHASE_ALIASES = {"dream": "maintenance"}
 #: §4PJ: phases whose producer was REMOVED. Their old ledger rows are history,
 #: not a live loop — the liveness table skips them instead of printing
 #: "UNREGISTERED phase" for the 7 days the rows stay in its window.
-RETIRED_PHASES = frozenset({"calibration"})
+#: (§4SZ: `self_play` — the failure-replay slot. §4TB: `open_questions` — the
+#: stale-questions listing, gone with the `self_state` tool.)
+RETIRED_PHASES = frozenset({"calibration", "self_play", "open_questions"})
 
 
 def canonical_phase(phase) -> str:
@@ -583,6 +584,67 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
         logger.debug("consumer watermark save failed: %s", e)
 
 
+# §4TB: WHO IS POLLING NOW. The offsets file above records a consumer's
+# position, and (since 2026-08-01) is not rewritten by an unchanged ack — so
+# nothing on disk says whether a consumer is still there: one that last acked
+# five days ago and one that polled ten seconds ago look the same, and
+# `notify_operator` listed both as "(poller, ≤30s)". The pending endpoint
+# notes each poll here, in memory, on the context: a restart forgets it, and
+# every live client is back within one poll interval.
+#: a consumer that polled within this many seconds is polling NOW
+CONSUMER_POLLING_WINDOW_S = 300.0
+_CONSUMER_POLLS_MAX = 32
+#: what a consumer name may be to be SHOWN. The name comes from a request and
+#: ends up in text the MODEL reads (`notify_operator`'s result): a name with a
+#: line break wrote a "SYSTEM NOTE:" line of its own there (review). A client
+#: under any other name is served as before and still counts as a client —
+#: registered, polling — but it is never named ("another client").
+CONSUMER_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+
+
+def valid_consumer_name(name) -> bool:
+    return isinstance(name, str) and CONSUMER_NAME_RE.fullmatch(name) is not None
+
+
+def note_consumer_poll(context, consumer, now: Optional[float] = None,
+                       acknowledged: bool = False) -> None:
+    """Record that ``consumer`` polled the pending endpoint just now.
+    ``acknowledged``: it has a stored position (it can receive). Never raises.
+
+    Recorded: a client with a stored position, WHATEVER its name (the table
+    is keyed by the raw name; `notify_operator` never renders one that is no
+    plain token), and a first-contact client with a plain-token name. An odd
+    name without a position is not recorded: anyone can send one.
+
+    Bounded, and the bound cannot be used against a real client: when the
+    table is full the oldest entry WITHOUT a position goes first — a run of
+    one-shot names evicts itself, never a client that acknowledged (review:
+    33 names pushed the live one out)."""
+    try:
+        if not isinstance(consumer, str) or not (acknowledged or valid_consumer_name(consumer)):
+            return
+        polls = getattr(context, "_notify_consumer_polls", None)
+        if not isinstance(polls, dict):
+            polls = {}
+            context._notify_consumer_polls = polls
+        polls.pop(consumer, None)                   # newest last
+        polls[consumer] = (float(time.time() if now is None else now), bool(acknowledged))
+        while len(polls) > _CONSUMER_POLLS_MAX:
+            victim = next((n for n, (_t, ack) in polls.items() if not ack), None)
+            polls.pop(victim if victim is not None else next(iter(polls)))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("consumer poll not noted: %s", e)
+
+
+def consumer_polls(context) -> Dict[str, float]:
+    """{consumer: epoch of its last poll} since this process started. Keys
+    are RAW names: show one only if `valid_consumer_name` says so."""
+    polls = getattr(context, "_notify_consumer_polls", None)
+    if not isinstance(polls, dict):
+        return {}
+    return {n: v[0] for n, v in polls.items() if isinstance(n, str)}
+
+
 # --------------------------------------------------------------------------
 # Digest rendering
 # --------------------------------------------------------------------------
@@ -608,6 +670,20 @@ def _seen_in_conversation(r) -> bool:
         return False
 
 
+def digest_shows(r, *, exclude_phases=DIGEST_EXCLUDED_PHASES,
+                 current_req_id: str = "", severities=None) -> bool:
+    """Does the digest render this record? THE filter of
+    :func:`render_activity_digest`, as one predicate — `notify_operator`
+    asks it before it names the "next-turn digest" as a channel (§4TB: it
+    named it always, although a record written in an owner turn is never
+    shown there)."""
+    return bool(r.summary and r.phase not in (exclude_phases or ())
+                and (severities is None or r.severity in severities)
+                and not (current_req_id
+                         and r.meta.get("req_id") == current_req_id)
+                and not _seen_in_conversation(r))
+
+
 def render_activity_digest(records: List[ActivityRecord], *,
                            max_items: int = 6,
                            exclude_phases=DIGEST_EXCLUDED_PHASES,
@@ -624,11 +700,8 @@ def render_activity_digest(records: List[ActivityRecord], *,
     noise; they remain reachable via ``introspect action='activity'``).
     Identical (phase, summary) repeats collapse into one "×N" line."""
     items = [r for r in (records or [])
-             if r.summary and r.phase not in (exclude_phases or ())
-             and (severities is None or r.severity in severities)
-             and not (current_req_id
-                      and r.meta.get("req_id") == current_req_id)
-             and not _seen_in_conversation(r)]
+             if digest_shows(r, exclude_phases=exclude_phases,
+                             current_req_id=current_req_id, severities=severities)]
     if not items:
         return ""
     items.sort(key=lambda r: 0 if r.severity == SEVERITY_NOTIFY else 1)
@@ -923,6 +996,8 @@ __all__ = [
     "is_internal_request",
     "load_offset", "save_offset",
     "load_consumer_offset", "save_consumer_offset",
+    "note_consumer_poll", "consumer_polls", "CONSUMER_POLLING_WINDOW_S", "digest_shows",
+    "valid_consumer_name",
     "render_activity_digest", "render_activity_report",
     "render_activity_brief",
     "summarize_turn_content", "record_scheduled_result",

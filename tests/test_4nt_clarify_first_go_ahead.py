@@ -242,7 +242,6 @@ async def test_the_direct_question_reaches_the_client(stream):
     a = make_stream_agent()
     a.context.trajectory_collector = MagicMock()
     a.context.trajectory_collector.append = MagicMock(return_value=None)
-    a.context.skill_memory = SimpleNamespace(is_read_only=False)
     a.context.turn_origin_label = None
     calls = {"n": 0}
 

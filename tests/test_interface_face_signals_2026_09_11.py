@@ -78,11 +78,29 @@ class TestFacePureHelpers:
         assert out == ["search", None, "write", None]
 
     def test_mood_shifts_only_the_cold_pole_and_is_bounded(self, graph_js):
+        """§4TC: the nine moods — low energy cooler (negative), high energy
+        warmer (positive); "neutral", the labels the removed derived updater
+        wrote and anything unknown are 0."""
         fn = _fn(graph_js, "moodHueFor")
-        out = eval_js(fn, "['satisfied','idle','curious','stuck','overloaded','nonsense',null].map(moodHueFor)")
-        assert out[:5] == [-0.035, -0.06, 0.03, 0.05, 0.07]
-        assert out[5:] == [0.0, 0.0]
-        assert all(abs(v) <= 0.07 for v in out), "a mood offset that large would cross into the hot pole"
+        out = eval_js(fn, "['content','calm','down','bored','tired','cheerful','curious','restless','irritable']"
+                          ".map(moodHueFor)")
+        assert out == [-0.015, -0.03, -0.035, -0.04, -0.045, 0.025, 0.03, 0.04, 0.045]
+        rest = eval_js(fn, "['neutral','satisfied','idle','stuck','overloaded','nonsense','',null,undefined,7]"
+                           ".map(moodHueFor)")
+        assert rest == [0.0] * 10
+        assert eval_js(fn, "moodHueFor('IRRITABLE')") == 0.045
+
+    def test_the_intensity_scales_the_mood_shift_and_stays_in_the_cold_pole(self, graph_js):
+        fns = ("let targetMoodHue = 0, _moodLive = null; const moodLook = () => null;\n" + _fn(graph_js, "moodHueFor") + "\n"
+               + _fn(graph_js, "moodHueScale") + "\n" + _fn(graph_js, "setMoodHue"))
+        assert eval_js(fns, "[1, 2, 3, 0, null, undefined, 'x', 9].map(moodHueScale)") == [0.5, 1, 1.5, 1, 1, 1, 1, 1]
+        got = eval_js(fns, "[setMoodHue('irritable', 1), setMoodHue('irritable', 2), setMoodHue('irritable', 3),"
+                           " setMoodHue('irritable'), setMoodHue('tired', 3), setMoodHue('neutral', 0),"
+                           " setMoodHue(null, null)]")
+        assert got == pytest.approx([0.0225, 0.045, 0.0675, 0.045, -0.0675, 0.0, 0.0])
+        labels = "['content','calm','down','bored','tired','cheerful','curious','restless','irritable']"
+        every = eval_js(fns, f"{labels}.flatMap(l => [1, 2, 3].map(n => setMoodHue(l, n)))")
+        assert all(abs(v) <= 0.07 for v in every), "a mood offset that large would cross into the hot pole"
 
     def test_error_kind_classification(self, graph_js):
         fn = _fn(graph_js, "errorKindFor")
@@ -113,7 +131,7 @@ class TestFacePureHelpers:
                      "fireIdleTwitch", "ghost_face_auto", "ghost_face_tune"):
             assert gone not in graph_nc, f"{gone} is back"
         m = re.search(r"const FORMS = \[(.*?)\];", graph_nc, re.DOTALL)
-        assert re.findall(r"'(\w+)'", m.group(1)) == ["cube", "tesseract", "vortex", "descent", "empty"]
+        assert re.findall(r"'(\w+)'", m.group(1)) == ["moodtesseract", "empty"]
 
 
 class TestFaceRenderWiring:
@@ -127,9 +145,9 @@ class TestFaceRenderWiring:
 
     def test_stillness_slows_time_and_the_pulse_clock(self, graph_nc):
         # dt-scaled since 2026-09-20 (tStep = the clock advance this frame).
-        assert "const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF * _tsSpeed();" in graph_nc   # camDive since 2026-09-21; temperament speed since 2026-10-30
+        assert "const tStep = 0.005 * motionMul * dtF * _tsSpeed();" in graph_nc   # camDive since 2026-09-21; temperament speed since 2026-10-30
         assert "time += tStep;" in graph_nc
-        assert "* (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul * _tsSpeed();" in graph_nc
+        assert "* (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul * _tsSpeed() * _moodNow.pulse;" in graph_nc
         i = graph_nc.index("const still = Math.min(1.0, Math.max(")
         body = graph_nc[i:i + 300]
         assert "verdict === 'pass'" in body and "errorKind === 'refusal'" in body and "gait.verify" in body
@@ -148,14 +166,14 @@ class TestFaceRenderWiring:
         assert "i === recallNode ? 1.0 + TUNE.recallFlare * 4.0 * recallSpark * (1.0 - recallSpark) : 1.0" in graph_nc
 
     def test_mood_and_error_kinds_reach_the_uniforms(self, graph_nc):
-        assert "+ moodHue * (FORM === 'vortex' ? 0.4 : 1.0);" in graph_nc
+        assert "hueDrift * _moodNow.drift + moodHue + _moodNow.hue;" in graph_nc
         i = graph_nc.index("let formDim = 0.55;")
         body = graph_nc[i:i + 500]
         assert "errorKind === 'network'" in body and "errorKind === 'timeout'" in body
         assert "verdict === 'pass'" in body
 
     def test_gaze_moves_the_look_target_not_the_camera(self, graph_nc):
-        assert "_lookTarget(gazeX, gazeY * (1.0 - dive) - _lookDrop * dive," in graph_nc   # §4PR: target, then blended lookAt
+        assert "_lookTarget(gazeX, gazeY * (1.0 - dive), -3.5 * dive);" in graph_nc   # §4PR: target, then blended lookAt
         assert "targetGazeY = active ? -TUNE.gazeY : 0.0;" in graph_nc
 
     def test_verdict_stop_exhales_and_background_breathes_the_scale(self, graph_nc):
@@ -170,14 +188,12 @@ class TestFaceRenderWiring:
             assert k in body, k
 
     def test_the_animate_chain_covers_exactly_the_roster(self, graph_nc):
-        # The LAST `if (FORM === 'vortex')` before the gait pass is the anatomy
-        # chain (earlier ones pick scene rotation and the camera).
+        # The LAST corridor test before the gait pass is the anatomy chain; empty
+        # is its trailing else.
         j = graph_nc.index("const radial = 1.0")
-        i = graph_nc.rindex("    if (FORM === 'vortex') {", 0, j)
-        chain = graph_nc[i:j]
-        branches = re.findall(r"\} else if \(FORM === '(\w+)'\)", chain)
-        assert branches == ["tesseract", "cube", "descent"], branches   # 2026-09-20 roster (+ the cube2 experiment)
-        assert "} else if (FORM === 'empty')" not in chain, "empty is the trailing else now"
+        i = graph_nc.rindex("    if (FORM === 'moodtesseract') {", 0, j)
+        assert re.findall(r"\} else if \(", graph_nc[i:j].split("        const axis")[0]) is not None
+        assert "} else if (FORM ===" not in graph_nc[i:j]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -274,9 +290,7 @@ let _turnVerdict = null, _lastRecallAt = 0;
                      "dataset.form = 'auto'"):
             assert gone not in app_nc, f"{gone} is back in app.js"
         assert 'id="face-tooltip"' not in html
-        i = app_nc.index("const FACE_FORM_HINTS = {")
-        hints = app_nc[i:app_nc.index("};", i)]
-        assert re.findall(r"(\w+): ", hints) == ["cube", "tesseract", "vortex", "descent", "empty"]
+        assert "FACE_FORM_HINTS" not in app_nc and "face-form" not in html
         ws = strip_js_comments((_STATIC / "workspace.js").read_text(encoding="utf-8"))
         pal = strip_js_comments((_STATIC / "palette.js").read_text(encoding="utf-8"))
         assert "facelab" not in ws and "faceLab" not in ws and "faceLab" not in pal and "Face lab" not in pal
@@ -306,7 +320,8 @@ class TestStatusFeedsTheFace:
         assert "feedFace();" in status_js[i:i + 900]
         i = status_js.index("async function feedFace()")
         body = status_js[i:i + 900]
-        assert "face.setMoodHue(health && health.mood ? health.mood.label : null)" in body
+        assert "face.setMoodHue(health && health.mood ? health.mood.label : null," in body
+        assert "health && health.mood ? health.mood.intensity : null);" in body        # §4TC
         assert "fetch('/api/turns'" in body and "face.setBackgroundBusy(backgroundBusyFrom(data, mine))" in body
 
 
@@ -328,21 +343,54 @@ class TestHealthCarriesMood:
         import json
         return json.loads(resp.body)
 
-    def test_mood_label_and_provenance(self):
-        body = self._health(SimpleNamespace(label="curious", source="derived", set_at="2026-09-11T10:00:00Z"))
-        assert body["mood"] == {"label": "curious", "source": "derived", "set_at": "2026-09-11T10:00:00Z"}
+    def test_mood_label_intensity_manner_and_who_set_it(self):
+        """§4TC: one shape, always an object."""
+        body = self._health(lambda: SimpleNamespace(label="irritable", intensity=2, manner="sarcastic",
+                                                    source="owner", set_at="2026-09-11T10:00:00Z"))
+        assert body["mood"] == {"label": "irritable", "intensity": 2, "manner": "sarcastic",
+                                "set_at": "2026-09-11T10:00:00Z", "source": "owner"}
+        body = self._health(lambda: SimpleNamespace(label="bored", intensity=1, manner="", source="auto", set_at=""))
+        assert body["mood"] == {"label": "bored", "intensity": 1, "manner": "", "set_at": "", "source": "auto"}
 
-    def test_callable_mood_and_missing_mood(self):
-        body = self._health(lambda: SimpleNamespace(label="stuck", source="self", set_at=""))
-        assert body["mood"]["label"] == "stuck"
-        assert self._health(None)["mood"] is None
-        assert self._health(lambda: None)["mood"] is None
+    NEUTRAL = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}
+
+    def test_a_neutral_mood_keeps_the_manner_and_names_no_owner(self):
+        body = self._health(lambda: SimpleNamespace(label="neutral", intensity=0, manner="formal",
+                                                    source="owner", set_at="2026-09-11T10:00:00Z"))
+        assert body["mood"] == {**self.NEUTRAL, "manner": "formal"}
+
+    def test_a_missing_or_unreadable_mood_is_the_neutral_object(self):
+        def boom():
+            raise RuntimeError("store down")
+        for bad in (None, lambda: None, boom, "irritable", SimpleNamespace(label="irritable"),
+                    lambda: SimpleNamespace(label="irritable", intensity="2"),
+                    lambda: SimpleNamespace(label=7, intensity=2),
+                    lambda: SimpleNamespace(label="irritable", intensity=True)):
+            assert self._health(bad)["mood"] == self.NEUTRAL
+
+    def test_an_out_of_range_intensity_is_brought_into_range(self):
+        body = self._health(lambda: SimpleNamespace(label="tired", intensity=9, manner=None, source="x", set_at=None))
+        assert body["mood"] == {"label": "tired", "intensity": 3, "manner": "", "set_at": "", "source": "auto"}
+
+    def test_the_real_state_thread_feeds_the_endpoint(self, tmp_path):
+        from ghost_agent.selfhood import SelfModel
+        from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+        sm = SelfModel(root=tmp_path)
+        assert self._health(sm.state.mood)["mood"] == self.NEUTRAL
+        before = sm.state.path.exists()
+        sm.state.set_owner_mood("cheerful", ANCHOR_DIRECTION["cheerful"], 3)
+        sm.state.set_manner("playful", 1)
+        raw = sm.state.path.read_bytes()
+        body = self._health(sm.state.mood)["mood"]
+        assert (body["label"], body["intensity"], body["manner"], body["source"]) == ("cheerful", 3, "playful", "owner")
+        assert body["set_at"].endswith("Z")
+        assert sm.state.path.read_bytes() == raw and before is False       # the endpoint only reads
 
 
 def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=18.0" in index and "style.css?v=7.9" in index
-    assert "matrix_graph.js?v=18.0" in app and "workspace.js?v=9.2" in app
-    assert "status.js?v=7.6" in ws and "palette.js?v=7.5" in ws
+    assert "app.js?v=18.8" in index and "style.css?v=8.0" in index
+    assert "matrix_graph.js?v=18.8" in app and "workspace.js?v=9.3" in app
+    assert "status.js?v=7.7" in ws and "palette.js?v=7.5" in ws

@@ -348,7 +348,6 @@ def _chat_agent(tmp_path):
     context.args.perfect_it = False
     context.sandbox_dir = "/tmp"
     context.memory_dir = str(tmp_path / "memory")
-    context.skill_memory = None
     context.memory_system = MagicMock()
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string.return_value = ""

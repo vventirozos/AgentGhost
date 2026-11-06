@@ -31,7 +31,7 @@ from ghost_agent.core.agent import GhostAgent, _PURE_TRIGGER_TOOLS, _STATIC_TOOL
 
 PURE = "zz_pure_trigger"     # §4SI: dream_mode (the last properties:{} tool) left; simulated below
 STATIC = "web_search"        # static, takes arguments
-RUNTIME = "zz_runtime_macro"  # registered at runtime, not in TOOL_DEFINITIONS
+RUNTIME = "zz_runtime_skill"  # registered at runtime, not in TOOL_DEFINITIONS
 UNKNOWN = "no_such_tool_xyz"  # not exposed at all
 XML_TOOL = "file_system"
 

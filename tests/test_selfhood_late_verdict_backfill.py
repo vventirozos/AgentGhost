@@ -114,12 +114,11 @@ def _fake_agent(collector_result, cached, self_model, *, read_only=False,
         _recent_trajectories_for_correction=({"fp": cached} if cached
                                              else {}),
         self_model=self_model,
-        skill_memory=SimpleNamespace(is_read_only=read_only),
         turn_origin_label=origin_label,
+        simulated=read_only,
     )
     fake = SimpleNamespace(
         context=ctx,
-        _flush_stashed_lesson_outcome=lambda tid, ok: None,
         _drop_pending_corrections_for=lambda tid: None,
     )
     return fake, writes
@@ -471,7 +470,7 @@ class TestRealOnlyOriginGate:
 
         async def go_user():
             GhostAgent._backfill_trajectory_outcome(fake, tid, "passed")
-            fake.context.skill_memory.is_read_only = True   # next request
+            fake.context.simulated = True   # next request
             await asyncio.sleep(0.35)
 
         asyncio.run(go_user())
@@ -486,7 +485,7 @@ class TestRealOnlyOriginGate:
 
         async def go_sim():
             GhostAgent._backfill_trajectory_outcome(fake2, tid2, "passed")
-            fake2.context.skill_memory.is_read_only = False
+            fake2.context.simulated = False
             await asyncio.sleep(0.35)
 
         asyncio.run(go_sim())
@@ -563,10 +562,9 @@ def _feedback_agent(collector, self_model, *, read_only=False):
             trajectory_collector=collector,
             _recent_trajectories_for_correction={},
             self_model=self_model,
-            skill_memory=SimpleNamespace(is_read_only=read_only),
             args=None,
+            simulated=read_only,
         ),
-        _flush_stashed_lesson_outcome=lambda tid, ok: None,
     )
 
 
@@ -693,11 +691,9 @@ class TestConvergenceAgainstTheRealCollector:
                 trajectory_collector=col,
                 _recent_trajectories_for_correction={"fp": cached},
                 self_model=sm,
-                skill_memory=SimpleNamespace(is_read_only=False),
                 turn_origin_label=None,
                 args=None,
             ),
-            _flush_stashed_lesson_outcome=lambda t, ok: None,
             _drop_pending_corrections_for=lambda t: None,
         )
         return col, sm, agent

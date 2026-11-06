@@ -40,7 +40,6 @@ ITEMS = [
  ("execute", "Run Python code that prints the product of 7 and 6, and reply with only the number it printed.", r"^\W*42\W*$", ["execute"]),
  ("system_utility", "Use your system utility tool to get today's date. Reply with only the date as YYYY-MM-DD.", rf"{TODAY}", ["system_utility","execute"]),
  ("scratchpad", f"Write the value tok{N} into your scratchpad under the key probe, then read that key back and reply with only the value.", rf"tok{N}", ["scratchpad"]),
- ("list_lessons", "Use list_lessons to count how many lessons are in your playbook. Reply with only the integer count.", r"\d+", ["list_lessons","introspect"]),
  ("introspect", "Use introspect (action summary) and reply with only the single word OK if it returned without error, otherwise ERR.", r"^\W*OK\W*$", ["introspect"]),
  ("manage_projects", "List my projects with manage_projects and reply with only the number of projects, as an integer.", r"^\W*\d+\W*$", ["manage_projects"]),
  ("manage_tasks", f"Create a task named probe_{N} with manage_tasks, confirm it appears in the task list, then delete it. Reply with only the word DONE.", r"DONE", ["manage_tasks"]),
@@ -50,7 +49,6 @@ ITEMS = [
  ("browser", "Use the browser tool to open https://check.torproject.org/ and reply with only the word TOR if the page says the browser is configured to use Tor, otherwise NOT.", r"^\W*TOR\W*$", ["browser"]),
  ("report_pdf", f"Use report_pdf to generate a PDF titled probe_{N} containing one paragraph of any text. Reply with only the path of the generated file.", r"\.pdf", ["report_pdf"]),
  ("knowledge_base", "Use knowledge_base to list the documents it holds. Reply with only the integer number of documents (0 if none).", r"\d+", ["knowledge_base"]),
- ("self_state", "Use self_state to read your current state and reply with only the word OK if it returned, otherwise ERR.", r"^\W*OK\W*$", ["self_state","introspect"]),
  ("fact_check", "Use fact_check on the claim 'water boils at 100 C at sea level' and reply with only SUPPORTED or REFUTED.", r"SUPPORTED|REFUTED", ["fact_check","web_search"]),
 ]
 res = []

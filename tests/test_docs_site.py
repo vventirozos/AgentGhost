@@ -43,6 +43,8 @@ _KNOWN_TOMBSTONES = {
     "tools/qwen_bridge.html",   # module removed
     "tools/memory_tools.html",  # covers tools/memory.py
     "tools/database.html",      # §4SX-s: postgres_admin removed 2026-11-05, page is a tombstone
+    "tools/composed_skills.html",  # §4TA: the macro engine removed 2026-11-05, page is a tombstone
+    "memory/skills.html",       # §4TD: the lesson store removed 2026-11-06, page is a tombstone
 }
 
 # Doc directories that mirror a source package one-to-one.

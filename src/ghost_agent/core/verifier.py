@@ -1574,7 +1574,7 @@ def record_escalation(*, kind: str, route: str, outcome: str,
 
 # Confidence a high-stakes CONFIRMED is capped to when the main model
 # declines to confirm it. Deliberately NOT a flip to REFUTED: a refute is
-# punitive (user-visible auditor note, lesson retraction, FAILED corpus
+# punitive (user-visible auditor note, FAILED corpus
 # label, auto-repair) and the strong model saying "not confirmed" is not
 # the same as it saying "wrong". Capping below the 0.7 gate means the turn
 # is recorded as UNVERIFIED — no fabricated PASSED, no manufactured
@@ -3469,7 +3469,7 @@ class Verifier:
         "latest PostgreSQL version" turn it refuted a correct answer at
         90%, and called 49152 bytes "not exactly 48 KB"; the main 35B got
         the same three cases right 3/3. A false REFUTE is expensive
-        (scrubs the turn's lessons, files follow-up tasks, shows the user
+        (files follow-up tasks, shows the user
         a correction, marks the trajectory failed → poisons the corpus
         every downstream learner trains on), while the escalation costs
         one main-model call on the RARE refute path only. Screen cheap,
@@ -3954,8 +3954,8 @@ class Verifier:
     def _guard_memory_refute(self, result: Optional[VerifyResult], claim: str,
                              haystack: str) -> Optional[VerifyResult]:
         """A REFUTED whose every issue asserts a counter-fact found nowhere in
-        what the agent saw is downgraded to UNCERTAIN — no failed label, no
-        lesson scrub, no correction to the user (see
+        what the agent saw is downgraded to UNCERTAIN — no failed label,
+        no correction to the user (see
         `_refute_rests_on_memory`). Kill switch GHOST_VERIFY_MEMORY_REFUTE_GUARD=0."""
         if (result is None or result.verdict != VerifyVerdict.REFUTED
                 or not _memory_refute_guard_enabled()
@@ -4755,7 +4755,7 @@ class Verifier:
         consumption gate (`_CONFIRM_WITHHELD_CONF_CAP`), so the turn is
         recorded as unverified rather than as a pass or as a failure. That
         asymmetry is deliberate: a REFUTED is punitive (auditor note to the
-        user, lesson retraction, FAILED corpus label, auto-repair round),
+        user, FAILED corpus label, auto-repair round),
         and "the strong judge would not confirm this" is weaker evidence
         than "the strong judge says this is wrong". Capping removes the
         fabricated PASSED without manufacturing a failure.

@@ -24,14 +24,14 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>tools / tool_failure.py</h1>
-  <p class="subtitle">Failure classification taxonomy. Decides whether a failed tool should retry, replan, or self-correct.</p>
+  <p class="subtitle">Failure classification taxonomy. Decides what a failed tool call tells the model: try once more, stop repeating the call, or read the error and fix it.</p>
 
   <h2>Classes</h2>
   <div class="scroll"><table>
     <thead><tr><th>Class</th><th>Patterns (regex)</th><th>Agent action</th></tr></thead>
     <tbody>
       <tr><td><strong>RETRYABLE</strong></td><td>timeout · rate-limit · connection reset · 502/503/504</td><td>Retry with exponential backoff up to <code>MAX_RETRIES = 3</code>.</td></tr>
-      <tr><td><strong>FATAL</strong></td><td>permission denied · access denied · tool not found · MANDATORY · invalid param · auth error · HTTP 401/403 (reason phrase or an <code>http</code>/<code>status</code> context — <strong>not</strong> a bare <code>403</code> substring, which used to misclassify byte counts / line numbers as fatal)</td><td>Mark FAILED; trigger replan; do not retry.</td></tr>
+      <tr><td><strong>FATAL</strong></td><td>permission denied · access denied · tool not found · MANDATORY · invalid param · auth error · HTTP 401/403 (reason phrase or an <code>http</code>/<code>status</code> context — <strong>not</strong> a bare <code>403</code> substring, which used to misclassify byte counts / line numbers as fatal)</td><td>The model is told "PERMANENT ERROR — do NOT retry this tool call"; an argument error instead names the argument to correct. Nothing re-plans (this cell said "trigger replan" until 2026-11-05; the <code>replan</code> tool did nothing and was removed, &sect;4TB).</td></tr>
       <tr><td><strong>DIAGNOSTIC</strong></td><td>AssertionError · RuntimeError · SyntaxError · Traceback · FileNotFoundError · ImportError · EXIT CODE: [1-9]</td><td>Inject the full error into context for LLM self-correction.</td></tr>
       <tr><td><strong>UNKNOWN</strong></td><td>none of the above</td><td>Inject a short error notice.</td></tr>
     </tbody>
@@ -53,7 +53,7 @@
 <p>Five readers &mdash; <code>distill/outcome_heuristics._looks_like_tool_error</code>,
 <code>core/project_advancer._looks_like_failure</code> and
 <code>classify_verify_result</code>, <code>tools/registry._acquired_skill_result_class</code>,
-<code>tools/composed_skills._step_result_ok</code> &mdash; plus the turn loop's fallback-hint
+<code>tools/composed_skills._step_result_ok</code> (removed with the macro engine, &sect;4TA) &mdash; plus the turn loop's fallback-hint
 scan and <code>acquired_skills</code>' TDD gate each ran an <em>unanchored</em>
 <code>EXIT CODE:\s*(\d+)</code> over the whole body, while the turn loop's
 &ldquo;Process finished successfully.&rdquo; rule already demanded a line-anchored

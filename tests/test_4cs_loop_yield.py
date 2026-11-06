@@ -12,6 +12,11 @@ UNMEASURED. A view that printed "invoked: 0" for both would say the same
 thing about the macro loop (genuinely barren, and fixable) and the
 graduated-skill loop (injected into the prompt on every matching turn, but
 with no counter anywhere) — opposite problems with opposite remedies.
+
+(§4TA, 2026-11-05: the macro engine and its `macros.auto_mined` row are
+removed. The axis and its states stay for the loops that are left; the
+macro-row tests went with their subject, and a macro registry left on disk
+is pinned as NOT read.)
 """
 
 import json
@@ -29,7 +34,6 @@ from ghost_agent.core.liveness import (
 
 @pytest.fixture
 def home(tmp_path):
-    (tmp_path / "system" / "memory" / "composed_skills").mkdir(parents=True)
     (tmp_path / "system" / "memory" / "acquired_skills").mkdir(parents=True)
     return tmp_path
 
@@ -83,137 +87,6 @@ class TestStateDerivation:
             YieldResult(minted=1, invoked=0, status=GATED)) == GATED
 
 
-# ── the macro loop: the case this was built for ──────────────────────────
-class TestMacroYield:
-    def _store(self, home, entries):
-        _w(home, "system/memory/composed_skills/composed_skills.json", entries)
-
-    def test_hand_written_macros_do_not_mask_a_barren_loop(self, home):
-        """The live shape on 2026-08-23: 26 macros / 3 invocations, and
-        every invocation belonged to the ONE hand-written macro. Counting
-        them together reports a working loop."""
-        mined = "Auto-discovered recurring sequence (a → b) seen in 3 turns."
-        self._store(home, {
-            "auto_a_b": {"status": "proposed", "usage_count": 0,
-                         "success_count": 0, "last_used": 0.0,
-                         "trigger_description": mined},
-            "auto_c_d": {"status": "proposed", "usage_count": 0,
-                         "success_count": 0, "last_used": 0.0,
-                         "trigger_description": mined},
-            "youtube_transcribe": {"status": "active", "usage_count": 3,
-                                   "success_count": 0, "last_used": 1.0,
-                                   "trigger_description": "hand-written"},
-        })
-        res = L._yield_macros(home)
-        assert res.minted == 2, "hand-written macros are not this loop's output"
-        assert res.activated == 0
-        assert res.invoked == 0
-        assert _yield_status(res) == BARREN
-        assert "1 hand-written" in res.note
-
-    def test_a_real_invocation_flips_it_to_yielding(self, home):
-        self._store(home, {
-            "auto_a_b": {"status": "active", "usage_count": 4,
-                         "success_count": 3, "last_used": time.time(),
-                         "trigger_description":
-                             "Auto-discovered recurring sequence (a → b) "
-                             "seen in 3 past turns."},
-        })
-        res = L._yield_macros(home)
-        assert res.invoked == 4 and res.activated == 1
-        assert _yield_status(res) == YIELDING
-        assert "3/4 invocations succeeded" in res.note
-        assert res.last_invoked is not None
-
-    def test_a_missing_store_is_NO_SOURCE(self, home):
-        assert _yield_status(L._yield_macros(home)) == NO_SOURCE
-
-    def test_an_EMPTY_store_is_not_the_same_as_a_missing_one(self, home):
-        self._store(home, {})
-        res = L._yield_macros(home)
-        assert res.minted == 0
-        assert _yield_status(res) == EMPTY, \
-            "an empty store parses — a measured zero, not a gap, and not a "\
-            "loop whose artifacts nobody invokes"
-
-    def test_an_operator_DEFINED_macro_named_auto_is_not_loop_output(self, home):
-        """`manage_composed_skills(action='define')` accepts any valid
-        identifier, `auto_*` included. Booking one as loop output would let
-        ITS invocations make a barren loop read YIELDING — a lexical proxy
-        for a provenance fact, which is a class this project has paid for
-        repeatedly. Provenance is asked of the producer's own
-        `trigger_description`."""
-        self._store(home, {
-            "auto_a_b": {"status": "proposed", "usage_count": 0,
-                         "success_count": 0, "last_used": 0.0,
-                         "trigger_description":
-                             "Auto-discovered recurring sequence (a → b) "
-                             "seen in 3 past turns."},
-            "auto_my_helper": {"status": "active", "usage_count": 12,
-                               "success_count": 12, "last_used": 1.0,
-                               "trigger_description": "my hand-written macro"},
-        })
-        res = L._yield_macros(home)
-        assert res.minted == 1, "only the producer-stamped row is loop output"
-        assert res.invoked == 0, "the hand-defined macro's 12 uses must not count"
-        assert _yield_status(res) == BARREN
-        assert "1 hand-written" in res.note
-
-    def test_both_producers_stamps_are_recognised(self, home):
-        """If either producer's wording changes, this loop's output stops
-        being counted and the row silently reads EMPTY. Checked against the
-        producers' real strings."""
-        self._store(home, {
-            "auto_x_y": {"status": "proposed", "usage_count": 0,
-                         "trigger_description":
-                             "Auto-discovered recurring sequence (x → y) "
-                             "seen in 4 past turns."},
-            "auto_generic_p_q_abc123": {
-                "status": "proposed", "usage_count": 0,
-                "trigger_description":
-                    "Proven 2-step sequence graduated from 5 successful runs"},
-        })
-        assert L._yield_macros(home).minted == 2
-
-    def test_a_MALFORMED_row_is_reported_not_silently_booked(self, home):
-        """`hand = len(data) - len(auto)` booked every corrupt row as
-        hand-written, so the note asserted a count it had not measured."""
-        self._store(home, {
-            "auto_a_b": {"status": "proposed", "usage_count": 0,
-                         "trigger_description":
-                             "Auto-discovered recurring sequence (a → b) "
-                             "seen in 3 past turns."},
-            "broken": None, "also_broken": "corrupt",
-            "youtube_transcribe": {"status": "active", "usage_count": 3},
-        })
-        res = L._yield_macros(home)
-        assert res.minted == 1
-        # Recomputed from the fixture, not restated: exactly one dict row
-        # is neither loop-minted nor malformed. `hand = 1` frozen as a
-        # constant survived a coincidental "1 hand-written" assertion.
-        assert "1 hand-written" in res.note, res.note
-        assert "2 unreadable row(s) skipped" in res.note
-
-    def test_the_hand_written_count_is_MEASURED_not_assumed(self, home):
-        mined = "Auto-discovered recurring sequence (a → b) seen in 3 turns."
-        self._store(home, {
-            "auto_a_b": {"status": "proposed", "usage_count": 0,
-                         "trigger_description": mined},
-            "h1": {"status": "active", "usage_count": 1},
-            "h2": {"status": "active", "usage_count": 1},
-            "h3": {"status": "active", "usage_count": 1},
-        })
-        res = L._yield_macros(home)
-        assert res.minted == 1
-        assert "3 hand-written" in res.note, res.note
-
-    def test_a_home_with_ONLY_hand_written_macros_reports_EMPTY(self, home):
-        self._store(home, {"h1": {"status": "active", "usage_count": 9}})
-        res = L._yield_macros(home)
-        assert res.minted == 0 and res.invoked == 0
-        assert _yield_status(res) == EMPTY
-
-
 # ── the loops whose zero would be a LIE ──────────────────────────────────
 class TestUnmeasuredLoops:
     def test_gepa_applies_are_per_process_so_not_claimed(self, home):
@@ -225,23 +98,6 @@ class TestUnmeasuredLoops:
         assert res.minted == 2 and res.activated == 1
         assert res.invoked is None
         assert _yield_status(res) == UNMEASURED
-
-
-class TestLessonYield:
-    def test_iso_last_retrieved_is_parsed_not_dropped(self, home):
-        """`_parse_ts` exists because these stores write ISO strings and an
-        earlier probe threw ValueError on every row, reporting a healthy
-        store as silent."""
-        _w(home, "system/memory/skills_playbook.json", [
-            {"retrievals": 10, "helpful_retrievals": 7,
-             "last_retrieved_at": "2026-08-23T20:03:33.754724"},
-            {"retrievals": 0, "helpful_retrievals": 0},
-        ])
-        res = L._yield_lessons(home)
-        assert res.minted == 2 and res.activated == 1 and res.invoked == 10
-        assert res.last_invoked is not None, "ISO timestamps must parse"
-        assert "1 lesson(s) never retrieved" in res.note
-        assert _yield_status(res) == YIELDING
 
 
 # ── the view itself ──────────────────────────────────────────────────────
@@ -337,7 +193,7 @@ class TestYieldView:
         feature could be deleted with the suite green. It now asserts the
         registry is populated and that every declared probe appears.
         """
-        assert len(YIELD_PROBES) >= 5, "the probe registry was emptied"   # §4NM: mining.failure_envs left
+        assert len(YIELD_PROBES) >= 3, "the probe registry was emptied"   # §4NM: mining.failure_envs left; §4TA: macros; §4TD: lessons
         rows = yield_all(home)["rows"]
         assert len(rows) == len(YIELD_PROBES), "rows were dropped or capped"
         assert {r["name"] for r in rows} == {p.name for p in YIELD_PROBES}
@@ -347,14 +203,15 @@ class TestYieldView:
             assert row["activated_means"] != row["invoked_means"]
 
     def test_the_loops_this_surface_EXISTS_for_are_probed(self, home):
-        """A probe registry missing the macro loop is the §4CS defect
+        """A probe registry missing a producing loop is the §4CS defect
         with a telemetry view bolted beside it."""
         names = {p.name for p in YIELD_PROBES}
-        # ("evolve.candidates" went with ghost_agent/evolve, §4NM)
-        for required in ("macros.auto_mined", "skills.acquired",
-                         "lessons.playbook",
+        # ("evolve.candidates" went with ghost_agent/evolve, §4NM;
+        #  "macros.auto_mined" with the macro engine, §4TA)
+        for required in ("skills.acquired",
                          "prompts.gepa"):
             assert required in names, f"{required} is not probed"
+        assert "macros.auto_mined" not in names
 
     def test_no_row_is_silently_dropped_or_capped(self, monkeypatch, home):
         """The sibling section carried a top-N cut that structurally
@@ -379,9 +236,12 @@ class TestYieldView:
         (it made all 8 sibling probes report NO_SOURCE). Assert on rows
         that only a real run can produce."""
         from ghost_agent.core.learning_health import render_learning_health
+        _w(home, "system/memory/acquired_skills/skills_registry.json", {
+            "news_headlines": {"status": "active", "usage_count": 5}})
+        # a macro registry left from before §4TA: not read, no row
         _w(home, "system/memory/composed_skills/composed_skills.json", {
-            "auto_a_b": {"status": "active", "usage_count": 5,
-                         "success_count": 5, "last_used": time.time(),
+            "auto_a_b": {"status": "active", "usage_count": 7,
+                         "success_count": 7, "last_used": time.time(),
                          "trigger_description":
                              "Auto-discovered recurring sequence (a → b) "
                              "seen in 3 past turns."}})
@@ -390,9 +250,10 @@ class TestYieldView:
         section = out.split("LOOP YIELD", 1)[1]
         # The probe actually ran, against the store we just wrote, and the
         # path arithmetic resolved to THIS home.
-        assert "macros.auto_mined" in section
+        assert "skills.acquired" in section
         assert YIELDING in section
         assert "invoked    5" in section, section[:800]
+        assert "macro" not in section.lower() and "invoked    7" not in section
 
     def test_a_probe_cannot_report_yield_it_did_not_read(self, home):
         """Every probe must derive its numbers from its own store: with no
@@ -479,46 +340,6 @@ class TestGepaYield:
         assert _yield_status(res) == UNMEASURED
 
 
-class TestLessonQuarantine:
-    def test_quarantined_rows_are_excluded_from_every_column(self, home):
-        """Quarantine is RETENTION WITHOUT SERVICE: the row stays visible
-        to an operator and `_filter_quarantined` keeps it out of both
-        retrieval surfaces, so it can never be retrieved again. Counting
-        them made 30% of the live `invoked` figure dead history."""
-        _w(home, "system/memory/skills_playbook.json", [
-            {"retrievals": 10, "helpful_retrievals": 7,
-             "last_retrieved_at": "2026-08-23T20:03:33"},
-            {"retrievals": 100, "helpful_retrievals": 90, "quarantined": True,
-             "quarantine_reason": "noise", "last_retrieved_at":
-                 "2026-08-23T21:00:00"},
-        ])
-        res = L._yield_lessons(home)
-        # ⚠ REVIEW ROUND 2: `minted` was the SERVED count, which made a
-        # store whose rows were ALL quarantined render "minted NOTHING
-        # yet" — the most alarming state this store can be in shown as its
-        # most benign — and made `minted` mean "produced AND still served"
-        # here and "produced" in every other probe. Minted is produced.
-        assert res.minted == 2, "a quarantined lesson was still minted"
-        assert res.activated == 1, "but it can never be retrieved again"
-        assert res.invoked == 10, "its 100 retrievals are dead history"
-        assert "1 quarantined row(s) excluded" in res.note
-
-    def test_an_ALL_QUARANTINED_store_is_BARREN_not_empty(self, home):
-        """The most alarming state this store can be in must not render as
-        the most benign. Reachable: this project has a history of mass
-        lesson destruction."""
-        _w(home, "system/memory/skills_playbook.json", [
-            {"retrievals": 40, "helpful_retrievals": 30, "quarantined": True}
-            for _ in range(44)])
-        res = L._yield_lessons(home)
-        assert res.minted == 44 and res.invoked == 0
-        assert _yield_status(res) == BARREN
-        assert res.derived_zero, "the zero follows from the quarantine"
-        row = {r["name"]: r for r in yield_all(home)["rows"]}["lessons.playbook"]
-        assert row["name"] in yield_all(home)["blocked"]
-        assert row["name"] not in yield_all(home)["empty"]
-
-
 class TestAgeUnits:
     def test_age_is_reported_in_HOURS(self, monkeypatch, home):
         """A minutes-for-hours slip renders a 5-day-old artifact as
@@ -550,7 +371,8 @@ class TestDerivedZeroIsNotAMeasuredOne:
         zero", and both live members violated it — the gate's zero is
         arithmetic and the macro loop's is structural (a `proposed` macro
         cannot be run). "Nobody invokes them" sends an operator looking for
-        a consumer; the remedy is upstream."""
+        a consumer; the remedy is upstream. (The macro row is gone, §4TA; the
+        distinction is driven here with stand-in probes.)"""
         monkeypatch.setattr(L, "YIELD_PROBES", [
             YieldProbe("ignored", "s",
                        lambda _h: YieldResult(minted=5, activated=5, invoked=0),
@@ -655,49 +477,6 @@ class TestGepaCountsLoadsNotApplies:
 # went with ghost_agent/evolve, §4NM.)
 
 
-class TestMacroProvenanceHasOneDefinition:
-    def test_the_reader_matches_the_shared_constants(self):
-        """⚠ ROUND 2: `_MACRO_LOOP_MARKS` held COPIES of the producers'
-        strings with nothing linking them. Rewording either producer — a
-        pure refactor — made the loop's own output invisible AND made the
-        row assert a fabricated provenance fact, with the suite green.
-        The dream miner is gone (§4NM) and the macros it minted are still
-        on disk, so the READER must keep matching the shared constants.
-        """
-        from ghost_agent.tools import composed_skills as cs
-        assert L._is_loop_minted_macro(
-            "auto_x", {"trigger_description":
-                       f"{cs.MACRO_MARK_MINED} (a → b) seen in 3 past turns."})
-        assert L._is_loop_minted_macro(
-            "auto_y", {"trigger_description":
-                       f"Proven 2-step {cs.MACRO_MARK_GRADUATED} 5 runs"})
-        # Provenance must NOT be claimed when it cannot be read.
-        assert not L._is_loop_minted_macro("auto_z", {"trigger_description": ""})
-
-    def test_the_GRADUATION_producer_stamp_is_recognised(self):
-        """Macros minted by the former skills_auto graduation producer are
-        still on disk; the reader must keep recognising their stamp, built
-        from the shared constant."""
-        from ghost_agent.tools import composed_skills as cs
-        n, support = 3, 5
-        desc = (f"Proven {n}-step {cs.MACRO_MARK_GRADUATED} "
-                f"{support} successful runs")
-        assert L._is_loop_minted_macro("auto_generic_x_y_abc123",
-                                       {"trigger_description": desc})
-
-    def test_provenance_is_NOT_claimed_when_the_marks_are_unreadable(
-            self, monkeypatch):
-        """A reader that cannot tell provenance must answer "not ours",
-        never "ours" — claiming it would book someone else's macro as loop
-        output and let ITS invocations make a barren loop read YIELDING."""
-        monkeypatch.setattr(
-            L, "_macro_marks",
-            lambda: (_ for _ in ()).throw(ImportError("gone")))
-        assert L._is_loop_minted_macro(
-            "auto_x", {"trigger_description":
-                       "Auto-discovered recurring sequence (a → b)"}) is False
-
-
 class TestSummaryLinesAreAllPresent:
     def _probes(self, monkeypatch, **kinds):
         mk = {"empty": YieldResult(minted=0, invoked=0),
@@ -736,6 +515,9 @@ class TestMachineReadableYield:
         could alarm on it programmatically and `--json` had no yield key —
         the §4CS failure mode fixed only for a human who reads the report."""
         from ghost_agent.core.learning_health import collect_learning_health
+        _w(home, "system/memory/acquired_skills/skills_registry.json", {
+            "unused_tool": {"status": "active", "usage_count": 0}})
+        # a macro registry left from before §4TA: not read, in no set
         _w(home, "system/memory/composed_skills/composed_skills.json", {
             "auto_a_b": {"status": "proposed", "usage_count": 0,
                          "trigger_description":
@@ -746,32 +528,7 @@ class TestMachineReadableYield:
         assert set(y) >= {"rows", "barren", "blocked", "unmeasured", "gaps",
                           "empty", "n_probes"}
         assert y["n_probes"] == len(YIELD_PROBES)
-        assert "macros.auto_mined" in y["blocked"] + y["barren"]
+        assert "skills.acquired" in y["barren"]
+        assert not [r["name"] for r in y["rows"] if "macro" in r["name"]]
 
-    def test_an_all_PROPOSED_macro_store_is_BLOCKED_not_ignored(self, home):
-        """The live shape: 25 minted, 0 approved, 0 invoked. The zero is
-        structural — a proposed macro cannot be run — so the remedy is the
-        approval queue, not a missing consumer."""
-        _w(home, "system/memory/composed_skills/composed_skills.json", {
-            f"auto_{i}": {"status": "proposed", "usage_count": 0,
-                          "trigger_description":
-                              "Auto-discovered recurring sequence (a → b) "
-                              "seen in 3 past turns."} for i in range(25)})
-        res = L._yield_macros(home)
-        assert res.minted == 25 and res.activated == 0 and res.invoked == 0
-        assert res.derived_zero, "an unapproved backlog is a derived zero"
-        out = yield_all(home)
-        assert "macros.auto_mined" in out["blocked"]
-        assert "macros.auto_mined" not in out["barren"]
 
-    def test_an_APPROVED_but_unused_macro_IS_measured_barren(self, home):
-        """Once one is approved the zero becomes a real measurement: it
-        could have been invoked and was not."""
-        _w(home, "system/memory/composed_skills/composed_skills.json", {
-            "auto_a_b": {"status": "active", "usage_count": 0,
-                         "trigger_description":
-                             "Auto-discovered recurring sequence (a → b) "
-                             "seen in 3 past turns."}})
-        res = L._yield_macros(home)
-        assert res.activated == 1 and not res.derived_zero
-        assert "macros.auto_mined" in yield_all(home)["barren"]

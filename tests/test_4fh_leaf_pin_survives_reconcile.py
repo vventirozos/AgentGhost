@@ -17,7 +17,7 @@ from ghost_agent.tools import projects as tp
 
 def _base(pid=None):
     return SimpleNamespace(sandbox_dir="/tmp/sb", current_project_id=pid,
-                           memory_system=object(), skill_memory=object(), graph_memory=None,
+                           memory_system=object(), graph_memory=None,
                            args=SimpleNamespace(perfect_it=True, smart_memory=0.5, native_tools=False),
                            workspace_model=object(), journal=object(), llm_client=object(),
                            scratchpad=None)

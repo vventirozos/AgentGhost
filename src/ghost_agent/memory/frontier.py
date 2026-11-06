@@ -173,7 +173,7 @@ class FrontierTracker:
             # NOT silently return empty — the next _save would overwrite
             # the file and WIPE all accumulated cluster mastery / tier /
             # outcome history. Preserve the bad file as a timestamped
-            # sidecar (mirrors SkillMemory._load_playbook) so the loss is
+            # sidecar (the policy every JSON store here follows) so the loss is
             # recoverable and auditable, then start fresh.
             try:
                 import time as _time

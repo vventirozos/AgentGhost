@@ -47,17 +47,16 @@ class TestWeightedRRF:
         top_source = fused[0][0]["source"]
         assert top_source == "graph"
 
-    def test_procedural_boosts_skill(self):
-        vector = self._make_items("vector", ["Some memory"])
+    def test_procedural_ranks_the_graded_experience_first(self):
         graph = self._make_items("graph", ["Some edge"])
-        skill = self._make_items("skill", ["## LESSON: Always check encoding"])
+        experience = self._make_items("experience", ["- asked X — graded RIGHT."])
 
         fused = MemoryBus._reciprocal_rank_fusion(
-            [vector, graph, skill], intent="procedural"
+            [graph, experience], intent="procedural"
         )
-
-        top_source = fused[0][0]["source"]
-        assert top_source == "skill"
+        weights = MemoryBus._INTENT_WEIGHTS["procedural"]
+        winner = "experience" if weights["experience"] > weights["graph"] else "graph"
+        assert fused[0][0]["source"] == winner
 
     def test_contextual_is_balanced(self):
         vector = self._make_items("vector", ["Memory 1"])

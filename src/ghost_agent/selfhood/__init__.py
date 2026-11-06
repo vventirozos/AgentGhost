@@ -3,7 +3,7 @@ continuous self via five components:
 
   1. AutobiographicalMemory — first-person experience log
   2. continuity tag        — every record carries subject="self"
-  3. SelfStateThread       — cross-session open questions / mood / unfinished
+  3. SelfStateThread       — cross-session mood and last-active stamp
   4. recognition layer     — build_wakeup_prefix renders past as "mine"
   5. NarrativeSummariser   — periodic first-person diary regeneration
 
@@ -18,11 +18,10 @@ from .autobiographical import (
 )
 from .model import SelfModel
 from .mood import (
-    DERIVED_MOOD_VOCAB,
-    MOOD_STALE_AFTER_HOURS,
-    SELF_MOOD_GRACE_HOURS,
-    MoodSignals,
-    derive_mood,
+    LABELS as MOOD_LABELS,
+    MANNERS,
+    TurnSignals,
+    tone_line,
 )
 from .narrative import NarrativeSummariser
 from .recognition import (
@@ -34,32 +33,28 @@ from .recognition import (
 from .schema import (
     Experience,
     Mood,
-    OpenQuestion,
     SCHEMA_VERSION,
     SelfState,
-    UnfinishedThread,
 )
-from .state import SelfStateThread
+from .state import MoodView, SelfStateThread
 
 __all__ = [
     "AutobiographicalMemory",
-    "DERIVED_MOOD_VOCAB",
     "Experience",
-    "MOOD_STALE_AFTER_HOURS",
+    "MANNERS",
+    "MOOD_LABELS",
     "Mood",
-    "MoodSignals",
+    "MoodView",
     "NarrativeSummariser",
-    "SELF_MOOD_GRACE_HOURS",
-    "OpenQuestion",
     "PREFIX_CLOSE",
     "PREFIX_OPEN",
     "SCHEMA_VERSION",
     "SelfModel",
     "SelfState",
     "SelfStateThread",
-    "UnfinishedThread",
     "build_wakeup_prefix",
-    "derive_mood",
     "strip_wakeup_prefix",
     "summarise_turn_first_person",
+    "tone_line",
+    "TurnSignals",
 ]

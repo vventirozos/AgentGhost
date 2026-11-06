@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -164,8 +164,8 @@
       <p>The mechanical checks after each answer, the idle-time jobs, and what was tried and removed.</p>
     </a>
     <a class="card" href="learning-loop.html">
-      <h3>The learning loop</h3>
-      <p>From your 👎 to a rule you approve and a test that keeps it fixed — with a worked example.</p>
+      <h3>Owner rules</h3>
+      <p>Standing instructions you dictate ("learn this rule: …"): the commands, the limits, and what was removed from the learning system on 2026-11-05.</p>
     </a>
     <a class="card" href="long-horizon.html">
       <h3>Long tasks</h3>
@@ -238,7 +238,7 @@
       <tr>
         <td><strong>Learning from its own runs</strong></td>
         <td>Uncommon. Memory frameworks store what happened; they don't generally change behaviour because of it.</td>
-        <td>Your 👎 or correction starts an idle-time replay of the question that ends in one proposed rule and a proposed regression test — adopted only when you say so. The self-teaching passes (automatic skills, self-written lessons, reflection, post-mortems) were measured on real turns, did not help (§4NC/§4ND), and were removed on 2026-10-11 (§4NM).</td>
+        <td>It does not. You dictate a rule ("learn this rule: …") and it is in every prompt of yours, at most 10 rules. The self-teaching passes (automatic skills, self-written lessons, reflection, post-mortems) were measured on real turns, did not help (§4NC/§4ND), and were removed on 2026-10-11 (§4NM). The idle replay of your failed turns, which proposed rules for you to approve, was removed on 2026-11-05 (§4SZ): 13 replays in 27 days, nothing proposed in the last 17.</td>
       </tr>
       <tr>
         <td><strong>Tuning its own prompts</strong></td>
@@ -253,12 +253,12 @@
       <tr>
         <td><strong>Acting without being asked</strong></td>
         <td>Agents generally act when invoked. Scheduling is usually external.</td>
-        <td>A background loop (the <em>idle scheduler</em>) runs memory upkeep, replays your failures and re-runs your regression tests during idle time, and never interrupts a turn. Scheduled and condition-triggered tasks are first-class.</td>
+        <td>A background loop (the <em>idle scheduler</em>) runs memory upkeep and housekeeping during idle time, and never interrupts a turn. Scheduled and condition-triggered tasks are first-class.</td>
       </tr>
       <tr>
         <td><strong>Measuring whether a change helped</strong></td>
         <td>Rare outside published benchmarks.</td>
-        <td>The regression suite: every rule you adopt comes with a test that is re-asked after each deploy and daily, so a fix that stops working is reported. Live randomised A/B arms were tried and dropped: at this traffic none could reach a verdict (§4ND), and the whole experiments registry was removed on 2026-10-11 (§4NN).</td>
+        <td>The failure census: a report over the owner's turns, checked against a sample graded blind by hand every 14 days. Live randomised A/B arms were tried and dropped: at this traffic none could reach a verdict (§4ND), and the whole experiments registry was removed on 2026-10-11 (§4NN). The owner's regression suite was removed on 2026-11-05 (§4SZ): it held no kept test.</td>
       </tr>
       <tr>
         <td><strong>Third-party accounts</strong></td>
@@ -270,20 +270,20 @@
   </div>
 
   <h3>What that costs</h3>
-  <p>The same table read the other way. A local model caps reasoning quality below what a frontier API gives you. Search over Tor against scrapers is slower and less accurate than a keyed search API. The answer checks are mechanical, so they catch a broken page or a missing file but not an invented fact — on hand-graded owner turns (2026-10-14 to 10-20) about 43% were right and 14% wrong, and invented knowledge is the main open failure. Failure replay and the regression tests only run if the machine stays on and idle. And more moving parts means more that can quietly stop working — several subsystems here have been silently inert for weeks at a time before instrumentation caught them, which is why so much of the tooling is about detecting that specific failure.</p>
+  <p>The same table read the other way. A local model caps reasoning quality below what a frontier API gives you. Search over Tor against scrapers is slower and less accurate than a keyed search API. The answer checks are mechanical, so they catch a broken page or a missing file but not an invented fact — on hand-graded owner turns (2026-10-14 to 10-20) about 43% were right and 14% wrong, and invented knowledge is the main open failure. The idle upkeep only runs if the machine stays on and idle. And more moving parts means more that can quietly stop working — several subsystems here have been silently inert for weeks at a time before instrumentation caught them, which is why so much of the tooling is about detecting that specific failure.</p>
 
   <h2>The unusual parts, in detail</h2>
 
   <p>The mechanism behind each of the rows above.</p>
 
   <h3>It remembers across sessions, in several shapes</h3>
-  <p>Closing the chat wipes nothing. Facts and documents, relationships between things, a profile of you, the rules you approved, a running journal, and past episodes and conversations are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. Only your profile, your facts and your rules go into every prompt; the rest is searched when you ask. <a href="memory.html">How memory works →</a></p>
+  <p>Closing the chat wipes nothing. Facts and documents, relationships between things, a profile of you, the rules you gave it, a running journal, and past episodes and conversations are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. Only your profile, your facts and your rules go into every prompt; the rest is searched when you ask. <a href="memory.html">How memory works →</a></p>
 
   <h3>It checks what it delivered</h3>
-  <p>After each reply, mechanical checks look at what the turn actually produced. Does the page it built load without errors? Are the files it says it wrote on disk? Is the reply an answer, not just narration of its work? Does an image show what the reply describes? A failure is recorded and can start a replay in the learning loop. Since 2026-10-14 (§4OW) the second-model <em>judge</em> that also read the answer against the evidence is off by default. Measured on a week of real use, it was wrong on 9 of 17 refusals, and none of them was shown to you. <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on. <a href="self-improvement.html">How the self-check works →</a></p>
+  <p>After each reply, mechanical checks look at what the turn actually produced. Does the page it built load without errors? Are the files it says it wrote on disk? Is the reply an answer, not just narration of its work? Does an image show what the reply describes? A failure is recorded with the turn. Since 2026-10-14 (§4OW) the second-model <em>judge</em> that also read the answer against the evidence is off by default. Measured on a week of real use, it was wrong on 9 of 17 refusals, and none of them was shown to you. <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on. <a href="self-improvement.html">How the self-check works →</a></p>
 
-  <h3>It learns from you, and asks before it changes</h3>
-  <p>A 👎, or a next message that says the answer missed, starts a loop: while you're away Ghost asks itself the same question again, works out what went wrong and one rule that would fix it, tests the rule on the same question and on your regression tests, and then asks you. Nothing changes until you say "learn rule N". The same complaint becomes a test that is re-asked after every update, so a fix that breaks later is reported. It does not grade or teach itself — measured, that didn't work. <a href="learning-loop.html">The learning loop, with a worked example →</a></p>
+  <h3>It follows the rules you give it</h3>
+  <p>Say "learn this rule: answer in English" and the sentence is in every prompt of yours from then on. "show my rules" lists your rules; "forget rule N" removes one after you confirm. There are at most 10. Ghost does not grade or teach itself — measured, that didn't work — and since 2026-11-05 it no longer proposes rules either: the idle loop that replayed your failed turns and the regression tests were removed after 27 days in which they produced almost nothing. A 👎 is still recorded as your label on the turn. <a href="learning-loop.html">Owner rules, with the commands →</a></p>
 
   <h3>It can search Tor hidden services</h3>
   <p>Normal search engines don't index <code>.onion</code> sites, so there's a separate path through the dedicated onion engines. Each retry is forced onto a fresh Tor circuit, because whether an engine answers depends on which exit you drew — and engines that share a search index are counted once, so corroboration means independent sources. <a href="tools.html">How onion search works →</a></p>
@@ -292,7 +292,7 @@
   <p>Outbound traffic goes through Tor, and this is enforced rather than intended: a boot-time probe plus a process-wide block on direct connections to public addresses. If Tor is unreachable, Ghost won't start. A silently-cleartext agent is worse than a stopped one. <a href="safety.html">How that's enforced →</a></p>
 
   <h3>It works while you're away</h3>
-  <p>Given a quiet stretch, Ghost files away facts from your recent turns, tidies its memory stores, replays your recent failures to find a rule worth proposing to you, and re-runs the regression tests you kept. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
+  <p>Given a quiet stretch, Ghost files away facts from your recent turns, tidies its memory stores and project workspaces, and backs the stores up once a day. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
 
   <h2>Every advanced feature, in one table</h2>
 
@@ -309,7 +309,7 @@
       <tr class="group"><td colspan="3">Memory and context</td></tr>
       <tr>
         <td><a href="core/bus.html"><strong>Rank-fusion memory</strong></a></td>
-        <td>The prompt's memory sources merged by <em>rank</em> with a fixed weight table, because similarity scores from different stores aren't comparable to each other. Since October 2026 only your lessons and rules and facts about you are added to every prompt; the vector, graph, episode and past-session stores answer when you ask (<code>recall</code>). The prompt tiers for those stores were removed on 2026-10-11 (§4NM).</td>
+        <td>The prompt's memory sources merged by <em>rank</em> with a fixed weight table, because similarity scores from different stores aren't comparable to each other. Since October 2026 only your rules and facts about you are added to every prompt; the vector, graph, episode and past-session stores answer when you ask (<code>recall</code>). The prompt tiers for those stores were removed on 2026-10-11 (§4NM).</td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
@@ -338,9 +338,9 @@
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
-        <td><a href="memory/skills.html"><strong>Lessons playbook</strong></a></td>
-        <td>Holds the rules <em>you</em> approved — they go into every one of your prompts. Ghost no longer writes lessons for itself. <a href="learning-loop.html">The learning loop →</a></td>
-        <td><span class="badge good">on</span></td>
+        <td><a href="memory/skills.html"><strong>Lessons playbook (removed)</strong></a></td>
+        <td>The lessons Ghost once wrote for itself. Out of every prompt since 2026-10-13 (§4ON); the store and its two tools were removed on 2026-11-06 (§4TD). Your rules are in their own file. <a href="learning-loop.html">Owner rules →</a></td>
+        <td><span class="badge warn">out of use (removal planned)</span></td>
       </tr>
       <tr>
         <td><a href="core/context_manager.html"><strong>Context-pressure governor</strong></a></td>
@@ -393,8 +393,8 @@
       </tr>
       <tr>
         <td><a href="tools/composed_skills.html"><strong>Composed skills</strong></a></td>
-        <td>Multi-step tool sequences with branching, compiled into a single macro instead of re-derived each time.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Multi-step tool sequences ("macros") kept under one name. Removed on 2026-11-05 (§4TA): nothing proposed or used them. <code>youtube_transcribe</code>, the one macro in real use, is a built-in tool now; a recurring bundle such as a daily report is an <a href="learning-loop.html">owner rule</a>.</td>
+        <td><span class="badge bad">removed</span></td>
       </tr>
       <tr>
         <td><a href="algorithms/dream_cycle.html"><strong>Maintenance cycle</strong></a></td>
@@ -402,13 +402,18 @@
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
-        <td><a href="learning-loop.html"><strong>Failure replay</strong></a></td>
-        <td>Replays <em>your</em> real failures, diagnoses one rule, tests it and proposes it to you — and runs your regression tests. Invented practice problems (synthetic self-play) were removed on 2026-10-11 (§4NM). <a href="learning-loop.html">The learning loop →</a></td>
+        <td><a href="learning-loop.html"><strong>Owner rules</strong></a></td>
+        <td>Up to 10 standing instructions you dictate ("learn this rule: …"), shown on every one of your turns. One file, changed only by your own commands.</td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
+        <td><a href="learning-loop.html#removed"><strong>Failure replay</strong></a></td>
+        <td>Replayed <em>your</em> real failures while idle, diagnosed one rule, tested it and proposed it to you, and ran your regression tests. Removed on 2026-11-05 (§4SZ): 13 replays and 5 adopted rules in 27 days, nothing new in the last 17, and no kept test. Invented practice problems (synthetic self-play) had been removed on 2026-10-11 (§4NM).</td>
+        <td><span class="badge bad">removed</span></td>
+      </tr>
+      <tr>
         <td><a href="core/feedback.html"><strong>Human feedback</strong></a></td>
-        <td>A 👍/👎 writes a ground-truth label that outranks every machine verdict — and a 👎 starts the <a href="learning-loop.html">learning loop</a>.</td>
+        <td>A 👍/👎 writes a ground-truth label that outranks every machine verdict. The failure census and the index of graded turns read it. It no longer starts a replay (removed 2026-11-05).</td>
         <td><span class="badge good">on</span></td>
       </tr>
 
@@ -537,7 +542,7 @@
       </tr>
       <tr>
         <td><a href="algorithms/selfhood.html"><strong>Self-model</strong></a></td>
-        <td>An autobiographical log, open questions and a running diary, readable through <code>introspect</code>. The wake-up prefix that put this in every prompt, and the idle job that derived a mood from it, were removed on 2026-10-11 (§4NM).</td>
+        <td>An autobiographical log, a mood and a running diary, readable through <code>introspect</code>. The mood moves by itself, can be set in chat, and is audible in how replies are phrased (2026-11-06, §4TC). The wake-up prefix that put self-state in every prompt, and the idle job that derived a mood, were removed on 2026-10-11 (§4NM).</td>
         <td><span class="badge good">on</span></td>
       </tr>
 

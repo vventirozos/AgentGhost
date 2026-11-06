@@ -80,16 +80,15 @@ def test_self_model_stats_reports_counts(tmp_path: Path):
         outcome="passed",
         final_response="ok",
     )
-    sm.state.note_open_question("Why?")
-    sm.state.add_unfinished("rewrite the parser")
-    sm.state.set_mood("focused", "deep in code")
+    from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+    sm.state.set_owner_mood("content", ANCHOR_DIRECTION["content"], 2, note="deep in code")
 
     stats = sm.stats()
     assert stats["enabled"] is True
     assert stats["experience_count"] == 1
-    assert stats["open_questions"] == 1
-    assert stats["unfinished_threads"] == 1
-    assert stats["last_mood"] == "focused"
+    assert "open_questions" not in stats and "unfinished_threads" not in stats   # §4TB
+    assert "principle_count" not in stats
+    assert (stats["last_mood"], stats["last_mood_intensity"], stats["last_mood_source"]) == ("content", 2, "owner")
     assert stats["narrative_present"] is False  # not regenerated yet
 
 
@@ -120,66 +119,6 @@ async def test_self_model_consolidate_narrative_disabled(tmp_path: Path):
     sm = SelfModel(root=tmp_path, enabled=False)
     out = await sm.consolidate_narrative()
     assert out == ""
-
-
-def test_wakeup_prefix_stamps_surfaced_experience_ids(tmp_path: Path):
-    sm = SelfModel(root=tmp_path)
-    assert sm._last_prefix_experience_ids == ()
-    e1 = sm.capture_turn(
-        trajectory_id="t-1",
-        user_request="explain memoisation",
-        tool_names=[],
-        outcome="passed",
-        final_response="ok",
-    )
-    e2 = sm.capture_turn(
-        trajectory_id="t-2",
-        user_request="rate my poem",
-        tool_names=[],
-        outcome="passed",
-        final_response="ok",
-    )
-    sm.build_wakeup_prefix(recent_experiences_n=3)
-    assert set(sm._last_prefix_experience_ids) == {e1.id, e2.id}
-
-
-def test_note_referenced_credits_prefix_surfaced_older_experience(tmp_path: Path):
-    # The wake-up prefix IDF-retrieves experiences from the ENTIRE log —
-    # exactly the ones likely OLDER than note_referenced_experiences'
-    # recent(50) window. They must still be creditable.
-    sm = SelfModel(root=tmp_path)
-    old = sm.capture_turn(
-        trajectory_id="t-old",
-        user_request="investigate the trapdoor cipher lattice weakness",
-        tool_names=["execute"],
-        outcome="passed",
-        final_response="done",
-    )
-    assert old is not None
-    # Push it far outside the recent(50) window.
-    for i in range(60):
-        sm.capture_turn(
-            trajectory_id=f"t-{i}",
-            user_request=f"unrelated filler chore number {i} with words",
-            tool_names=["execute"],
-            outcome="passed",
-            final_response="ok",
-        )
-    assert all(e.id != old.id for e in sm.autobio.recent(limit=50))
-
-    prefix = sm.build_wakeup_prefix(query="trapdoor cipher lattice")
-    assert old.id in sm._last_prefix_experience_ids
-    assert "trapdoor cipher lattice" in prefix
-
-    n = sm.note_referenced_experiences(
-        prefix_text=prefix,
-        response_text=(
-            "Earlier I investigated the trapdoor cipher lattice weakness "
-            "— same approach applies here."
-        ),
-    )
-    assert n >= 1
-    assert sm.autobio.reference_count(old.id) >= 1
 
 
 def test_self_model_capture_never_raises(tmp_path: Path, monkeypatch):

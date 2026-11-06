@@ -70,54 +70,103 @@ class Experience:
 
 
 @dataclass
-class OpenQuestion:
-    """Something the agent (or the user, via the agent) is still
-    trying to figure out across sessions."""
-
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    text: str = ""
-    source_trajectory_id: str = ""
-    opened_at: str = field(default_factory=_utcnow_iso)
-    resolved_at: str = ""  # empty when still open
-
-
-@dataclass
-class UnfinishedThread:
-    """A task / topic the agent left mid-flight in a prior session."""
-
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    descriptor: str = ""           # short label
-    source_trajectory_id: str = ""
-    opened_at: str = field(default_factory=_utcnow_iso)
-    closed_at: str = ""
-
-
-@dataclass
 class Mood:
-    """Latest qualitative state. Bounded by recency, not by sentiment
-    analysis — the agent reports its own functional state."""
+    """The stored mood (§4TC): two numbers and what was last read off them.
 
-    label: str = ""                # short tag (e.g. "curious", "stuck", "satisfied")
-    evidence: str = ""             # one sentence why
-    set_at: str = field(default_factory=_utcnow_iso)
-    # Provenance (mood rework 2026-08-20): "self" = authored via the
-    # self_state tool; "derived" = computed by the functional-state
-    # updater from verdict streaks / pressure / open questions. Records
-    # predating the field load as "self" (from_dict filters unknown
-    # keys, dataclass default fills missing ones) — historically
-    # accurate, since the tool was the only writer.
-    source: str = "self"
+    ``p`` (pleasantness) and ``e`` (energy) are in [-1, 1] and were written
+    at ``updated_at``; they decay from there (``selfhood/mood.py``). ``label``
+    and ``intensity`` are what was last read off the pair — kept so a label
+    or an intensity is only given up clearly past a boundary — with when
+    (``set_at``), by whom (``source``: "auto" | "owner") and why (``cause``).
+    ``novelty`` is the tag that makes the P+ E+ region "curious". ``recent``
+    holds the last few events that moved the pair (``{"at","cause","kind"}``).
+
+    The MANNER is separate: a way of talking the owner set, with its own
+    intensity. It does not decay.
+
+    Before §4TC a mood was ``{"label", "evidence", "set_at", "source":
+    "self"|"derived"}``. Such a record has no pair: ``SelfState.from_dict``
+    ignores it and the mood starts neutral."""
+
+    p: float = 0.0
+    e: float = 0.0
+    updated_at: str = ""
+    label: str = "neutral"
+    intensity: int = 0
+    novelty: bool = False
+    source: str = "auto"
+    set_at: str = ""
+    cause: str = ""
+    recent: List[Dict[str, Any]] = field(default_factory=list)
+    manner: str = ""
+    manner_intensity: int = 0
+    manner_set_at: str = ""
+
+    @classmethod
+    def from_dict(cls, d: Any) -> Optional["Mood"]:
+        """A stored mood, or None when ``d`` is not one (an old label-only
+        record, garbage). Every field is coerced: a hand-edited file costs
+        the mood, never the state."""
+        if not isinstance(d, dict) or "p" not in d or "e" not in d:
+            return None
+        from .mood import LABELS, NEUTRAL, SOURCE_AUTO, SOURCE_OWNER, clamp, resolve_manner
+
+        def _text(key: str, cap: int = 400) -> str:
+            v = d.get(key)
+            return v[:cap] if isinstance(v, str) else ""
+
+        def _level(key: str) -> int:
+            v = d.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return 0
+            try:
+                return max(0, min(3, int(v)))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        label = _text("label", 32)
+        intensity = _level("intensity")
+        if label not in LABELS or intensity == 0:
+            label, intensity = NEUTRAL, 0
+        recent = [{"at": str(r.get("at") or "")[:40], "cause": str(r.get("cause") or "")[:400],
+                   "kind": str(r.get("kind") or "")[:24]}
+                  for r in (d.get("recent") if isinstance(d.get("recent"), list) else [])
+                  if isinstance(r, dict)][-MOOD_RECENT_CAUSES:]
+        manner = resolve_manner(d.get("manner")) if isinstance(d.get("manner"), str) else ""
+        return cls(
+            p=clamp(d.get("p")), e=clamp(d.get("e")),
+            updated_at=_text("updated_at", 40),
+            label=label, intensity=intensity,
+            novelty=d.get("novelty") is True,
+            source=SOURCE_OWNER if d.get("source") == SOURCE_OWNER else SOURCE_AUTO,
+            set_at=_text("set_at", 40), cause=_text("cause"),
+            recent=recent,
+            manner=manner,
+            manner_intensity=(_level("manner_intensity") or 2) if manner else 0,
+            manner_set_at=_text("manner_set_at", 40) if manner else "",
+        )
+
+
+#: how many of the latest events ``Mood.recent`` keeps
+MOOD_RECENT_CAUSES = 5
 
 
 @dataclass
 class SelfState:
-    """The cross-session state thread. Persisted as one JSON file."""
+    """The cross-session state thread. Persisted as one JSON file.
+
+    §4TB (2026-11-05): `open_questions` and `unfinished_threads` are no
+    longer fields. A file written before that carries both keys; they are
+    ignored on read and absent from the next write."""
 
     schema_version: str = SCHEMA_VERSION
-    open_questions: List[OpenQuestion] = field(default_factory=list)
-    unfinished_threads: List[UnfinishedThread] = field(default_factory=list)
     mood: Optional[Mood] = None
     last_session_at: str = ""
+    #: §4TC (review): when the OWNER was last here — stamped when an owner's
+    #: request arrives and when it ends, through the owner-only gate. The
+    #: length of a quiet is measured from it, so a restart does not change
+    #: it. Distinct from `last_session_at`, which every captured turn stamps.
+    last_owner_turn_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -127,22 +176,16 @@ class SelfState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SelfState":
-        # Filter unknown keys (like Experience/Principle.from_dict) so a
-        # schema-divergent, newer, or hand-edited state.json is NOT rejected
-        # by a bare `**q` TypeError — which _read_or_empty swallows into an
-        # empty state that the next mutation then OVERWRITES onto the good
-        # file (silent cross-session data loss).
-        oq = [OpenQuestion(**{k: v for k, v in q.items() if k in OpenQuestion.__annotations__})
-              for q in (d.get("open_questions") or []) if isinstance(q, dict)]
-        ut = [UnfinishedThread(**{k: v for k, v in t.items() if k in UnfinishedThread.__annotations__})
-              for t in (d.get("unfinished_threads") or []) if isinstance(t, dict)]
-        mood_raw = d.get("mood")
-        mood = (Mood(**{k: v for k, v in mood_raw.items() if k in Mood.__annotations__})
-                if isinstance(mood_raw, dict) else None)
+        # Tolerant by construction: unknown keys are ignored (a pre-§4TB
+        # file with its two removed lists loads), and a mood that is not the
+        # §4TC shape — the old label record, a hand-edited value — is no
+        # mood (`Mood.from_dict`), never a TypeError that `_read_or_empty`
+        # would swallow into an empty state the next write then puts over
+        # the good file.
         return cls(
             schema_version=str(d.get("schema_version") or SCHEMA_VERSION),
-            open_questions=oq,
-            unfinished_threads=ut,
-            mood=mood,
+            mood=Mood.from_dict(d.get("mood")),
             last_session_at=str(d.get("last_session_at") or ""),
+            last_owner_turn_at=(d.get("last_owner_turn_at")
+                                if isinstance(d.get("last_owner_turn_at"), str) else ""),
         )

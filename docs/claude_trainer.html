@@ -62,10 +62,12 @@
     that promotion also scheduled a fire-and-forget reflection that distilled a lesson into
     <code>SkillMemory</code>, and the trainer's retention retest measured whether that lesson
     stuck. <strong>Reflection was removed on 2026-10-11 (§4NM)</strong>: a correction now
-    marks the turn FAILED and makes it a seed for the <a href="learning-loop.html">learning
-    loop</a> (idle replay → candidate rule → operator approval), and no lesson is written by
-    the correction itself. The trainer still drives the correction classifier and grades
-    answers; its retention step measures only what the operator has since adopted as a rule.
+    marks the turn FAILED and writes nothing else (the lesson store itself was removed on 2026-11-06, §4TD). From 2026-10-10
+    to 2026-11-05 a FAILED turn was also a seed for the failure-replay loop (idle replay →
+    candidate rule → operator approval); that loop was removed (§4SZ, see
+    <a href="learning-loop.html#removed">Owner rules</a>). The trainer still drives the
+    correction classifier and grades answers; its retention step measures only what the
+    operator has since stated as a rule ("learn this rule: …").
   </div>
 
   <h2>The critical detail: making a correction actually trigger learning</h2>
@@ -80,7 +82,7 @@
     </tbody>
   </table></div>
   <p>A naive "you're wrong, the answer is X" satisfies A but misses B, so it
-  <strong>silently fails to record any lesson</strong>. <code>build_correction_message()</code>
+  <strong>silently fails to label the turn</strong>. <code>build_correction_message()</code>
   therefore restates the question and is <em>trigger-first</em>: it appends the correct answer
   only when the extra tokens don't dilute the overlap below 0.40; for short questions it
   degrades to opener+question (learning still fires — the answer simply isn't embedded in the
@@ -91,7 +93,7 @@
   <pre><code>1. ASK        send the question to the live agent (/api/chat)
 2. JUDGE      Claude grades the answer vs. an authoritative reference (0.0–1.0)
 3. CORRECT    if wrong, send a both-signals correction → agent promotes the
-              prior turn to FAILED (a seed for the learning loop; no lesson is written)
+              prior turn to FAILED (a label only; no lesson is written)
 4. RE-JUDGE   grade the in-context follow-up answer
 5. WAIT       pause (historical: let the since-removed reflection land)
 6. RETEST     re-ask in a FRESH conversation; Claude scores retention</code></pre>
@@ -144,10 +146,10 @@ ANTHROPIC_API_KEY=sk-... \
   <p>The console summary (and the optional <code>--report</code> JSON) tracks:
   <code>first_try_correct</code>, <code>needed_teaching</code>,
   <code>corrections_that_triggered_learning</code> (the count whose corrections actually fired
-  the predicate — watch this; if it is below <code>needed_teaching</code>, some lessons were
-  never recorded), <code>retention_tested</code>, and <code>retention_improved</code> (fresh
-  re-asks that scored materially higher than the first attempt — the real evidence a lesson
-  stuck).</p>
+  the predicate — watch this; if it is below <code>needed_teaching</code>, some turns were
+  never labelled), <code>retention_tested</code>, and <code>retention_improved</code> (fresh
+  re-asks that scored materially higher than the first attempt; nothing is taught any more, so this
+  is not evidence of learning unless a rule was stated).</p>
 
   <div class="note">
     <strong>Caveats.</strong> Requires the live agent (see Install &amp; Run) and an
@@ -159,7 +161,7 @@ ANTHROPIC_API_KEY=sk-... \
   <p class="footer-note">Source: <code>scripts/claude_trainer.py</code> ·
   Tests: <code>tests/test_claude_trainer_correction.py</code> ·
   Learning loop: <code>core/agent.py</code>, <code>distill/user_correction.py</code>,
-  <code>memory/skills.py</code> (<code>reflection/loop.py</code> was removed 2026-10-11, §4NM).</p>
+  <code>memory/skills.py</code> (removed 2026-11-06, §4TD; <code>reflection/loop.py</code> was removed 2026-10-11, §4NM).</p>
 </main>
 </body>
 </html>

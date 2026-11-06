@@ -131,7 +131,7 @@ def test_every_idle_job_has_a_purpose():
     """Enumerated over the source: fails where a new idle job is added
     without saying what it is for."""
     names = _appended_job_names()
-    assert {"maintenance", "store-hygiene", "tidy", "failure-replay"} <= names
+    assert {"maintenance", "store-hygiene", "tidy"} <= names and "failure-replay" not in names   # §4SZ
     assert names <= set(IDLE_JOB_PURPOSE), names - set(IDLE_JOB_PURPOSE)
 
 
@@ -153,14 +153,12 @@ def test_a_failed_job_says_failed_with_its_purpose():
 
 
 def test_store_hygiene_note_names_counts_and_failures():
-    assert _store_hygiene_note(0, 0, {"removed": [], "marked": []}) == "nothing to fix"
-    n = _store_hygiene_note(2, 1, {"removed": ["a"], "marked": []}, ["re-index"])
-    assert n == ("2 orphaned lesson-index entries dropped, 1 lesson(s) re-indexed, "
-                 "1 expired video transcript(s) removed; re-index FAILED")
+    assert _store_hygiene_note({"removed": [], "marked": []}) == "nothing to fix"
+    assert _store_hygiene_note({"removed": ["a"], "marked": []}, ["temporary-document sweep"]) == (
+        "1 expired video transcript(s) removed; temporary-document sweep FAILED")
     # a failure alone is not "nothing to fix"
-    assert _store_hygiene_note(0, 0, {}, ["orphan check"]) == "orphan check FAILED"
-    # a non-int count (a mocked store) is not reported as work
-    assert _store_hygiene_note(MagicMock(), None, None) == "nothing to fix"
+    assert _store_hygiene_note({}, ["temporary-document sweep"]) == "temporary-document sweep FAILED"
+    assert _store_hygiene_note(None) == "nothing to fix"
 
 
 # ── through the real tick ───────────────────────────────────────────────────
@@ -199,59 +197,16 @@ async def test_the_tick_prints_store_hygiene_counts():
     from tests.test_biological_watchdog import _make_agent
     agent = _make_agent(idle_seconds=1200, memory_ids=0)
     agent.context.project_store = None
-    sk = MagicMock()
-    sk.reconcile_vector_orphans.return_value = 2
-    sk.heal_missing_twins.return_value = 0
-    agent.context.skill_memory = sk
     calls, cap = _tick_lines(agent)
     with patch("ghost_agent.core.dream.Dreamer"), \
          patch("ghost_agent.memory.temp_documents.sweep",
-               return_value={"removed": [], "marked": [], "dropped": []}), \
+               return_value={"removed": ["a", "b"], "marked": [], "dropped": []}), \
          patch("ghost_agent.core.agent.pretty_log", side_effect=cap), \
          patch("ghost_agent.core.agent.random.random", return_value=0.99):
         await agent._biological_tick()
     idle = [c for t, c in calls if t == "Idle Cycle"]
     assert idle and "store-hygiene (" in idle[0], calls
-    assert "2 orphaned lesson-index entries dropped" in idle[0]
-
-
-@pytest.mark.asyncio
-async def test_the_window_restart_says_when_the_replay_ran_and_what_can_run():
-    from tests.test_biological_watchdog import _make_agent
-    agent = _make_agent(idle_seconds=4000, memory_ids=0)
-    agent.context.project_store = None
-    agent._last_selfplay_at = datetime.datetime.now() - datetime.timedelta(minutes=30)
-    calls, cap = _tick_lines(agent)
-    with patch("ghost_agent.core.dream.Dreamer"), \
-         patch("ghost_agent.core.agent.pretty_log", side_effect=cap), \
-         patch("ghost_agent.core.agent.random.random", return_value=0.99):
-        await agent._biological_tick()
-    line = [c for t, c in calls if t == "Idle Cycle" and "idle window restarted" in c]
-    assert line, calls
-    assert "the failure-replay slot last ran 30m ago and waits ~" in line[0]
-    assert "maintenance, store hygiene, tidy" in line[0]
-
-
-@pytest.mark.asyncio
-async def test_the_tick_prints_the_failure_replay_outcome(tmp_path):
-    """Fails where the slot's result fell off the line (it ran; what came
-    of it is the useful half)."""
-    from tests.test_idle_scheduler_logging import _make_deeply_idle_agent
-    from ghost_agent.core import agent as agent_mod
-    agent = _make_deeply_idle_agent(tmp_path)
-    calls, cap = _tick_lines(agent)
-
-    async def _declines(ctx):
-        raise agent_mod._NoOwnerSeed()
-    agent._self_play_slot_body = _declines
-    with patch("ghost_agent.core.agent.random.random", return_value=0.0), \
-         patch("ghost_agent.core.dream.Dreamer"), \
-         patch("ghost_agent.core.agent.pretty_log", side_effect=cap):
-        await agent._biological_tick()
-    idle = [c for t, c in calls if t == "Idle Cycle" and "failure-replay" in c]
-    assert idle, calls
-    assert (f"failure-replay ({IDLE_JOB_PURPOSE['failure-replay']}): "
-            "nothing to do (no owner failure to replay, no test due)") in idle[0]
+    assert "2 expired video transcript(s) removed" in idle[0]
 
 
 def test_purposes_are_keyed_by_the_scheduler_labels():
@@ -336,7 +291,6 @@ async def test_a_raising_narrative_is_listed_as_failed():
     agent.context.project_store = None
     sm = MagicMock(enabled=True)
     sm.consolidate_narrative = AsyncMock(side_effect=RuntimeError("worker down"))
-    sm.stale_open_questions.return_value = []
     agent.context.self_model = sm
     calls, cap = _tick_lines(agent)
     with patch("ghost_agent.core.dream.Dreamer"), \

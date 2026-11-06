@@ -288,7 +288,6 @@ async def test_a_members_web_research_is_verified_after_the_reply(agent, monkeyp
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
     verifier, vmock = _make_verifier([_verdict(VerifyVerdict.REFUTED, issues=["the year is 2017"])])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     agent._active_constraint_note = MagicMock(return_value="OWNER PROJECT: secret plan || USER REQUEST: ")
     agent.available_tools["web_search"] = AsyncMock(return_value="It launched in 2017. https://x.org/a")
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=[
@@ -318,7 +317,6 @@ async def test_a_members_verdict_never_looks_at_the_owners_images(agent, monkeyp
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
     verifier, vmock = _make_verifier([_verdict(VerifyVerdict.CONFIRMED)])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     spy = MagicMock(return_value=(None, None))
     monkeypatch.setattr(A, "_select_visual_evidence", spy)
     agent.available_tools["web_search"] = AsyncMock(return_value="logo: https://cdn.x/owner_private_logo.png")
@@ -539,7 +537,6 @@ async def test_a_member_never_waits_on_a_verdict_in_sync_mode(agent, monkeypatch
     verifier, vmock = _make_verifier([])
     vmock.side_effect = slow
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     agent.available_tools["web_search"] = AsyncMock(return_value="It launched in 2017.")
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=[
         {"choices": [{"message": {"content": "", "tool_calls": [
@@ -560,7 +557,6 @@ async def test_a_members_late_correction_is_bound_to_its_answer(agent, monkeypat
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
     verifier, vmock = _make_verifier([_verdict(VerifyVerdict.REFUTED, conf=0.97, issues=["the year is 2017"])])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     agent.available_tools["web_search"] = AsyncMock(return_value="It launched in 2017.")
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=[
         {"choices": [{"message": {"content": "", "tool_calls": [
@@ -599,7 +595,6 @@ async def test_a_member_never_waits_at_the_gate_after_a_failed_search(agent, mon
     verifier, vmock = _make_verifier([])
     vmock.side_effect = slow
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     agent.available_tools["web_search"] = AsyncMock(
         return_value="Error: search failed — ZERO results from every engine over Tor.")
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=[

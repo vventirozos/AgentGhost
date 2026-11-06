@@ -69,7 +69,7 @@ class _rid:
 
 def _user_ctx():
     return types.SimpleNamespace(
-        skill_memory=types.SimpleNamespace(is_read_only=False))
+        )
 
 
 # ── 1. the predicate ────────────────────────────────────────────────────────
@@ -84,7 +84,7 @@ class TestTurnOrigin:
         with _rid("abcd1234"):
             assert turn_origin(_user_ctx()) == "user"
             assert turn_origin(types.SimpleNamespace(
-                skill_memory=types.SimpleNamespace(is_read_only=True))) == "sim"
+                simulated=True)) == "sim"
             assert turn_origin(types.SimpleNamespace(
                 turn_origin_label="bench")) == "bench"
 
@@ -195,13 +195,6 @@ def _real_user_context(tmp_path, record_calls):
     context.profile_memory.get_context_string.return_value = ""
     context.memory_system = None
     context.memory_bus = None
-    context.skill_memory = types.SimpleNamespace(
-        is_read_only=False,
-        last_playbook_triggers=["real lesson trigger"],
-        _playbook_turn_key="",
-        get_recent_failures=lambda *a, **k: "No failures",
-        record_surfaced_outcomes=lambda *a, **k: record_calls.append((a, k)) or 0,
-    )
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     context.memory_dir = tmp_path / "system" / "memory"
@@ -250,30 +243,6 @@ async def test_real_handle_chat_stamps_the_population(
     # carries no metacog bundle, so the recorder has no reading to pair and
     # records nothing for EITHER run — a row-count assertion here would be
     # vacuous in the direction that matters.)
-
-
-class TestCreditGates:
-
-    @pytest.mark.asyncio
-    async def test_lesson_outcome_credit_skips_a_probe_turn(self):
-        seen = []
-        sm = types.SimpleNamespace(
-            record_surfaced_outcomes=lambda *a, **k: seen.append((a, k)) or 0)
-        agent = GhostAgent.__new__(GhostAgent)
-        agent.context = types.SimpleNamespace(
-            skill_memory=sm,
-            skill_memory_is_read_only=False)
-        agent.context.skill_memory.is_read_only = False
-        kwargs = dict(surfaced_triggers=["t"], execution_failure_count=0,
-                      verifier_backfill=("passed", 0.9),
-                      trajectory_id="tj")
-        with _rid("abcd0001"):
-            await agent._record_lesson_outcomes(**kwargs)
-        assert seen, "control: a user turn credits its surfaced lessons"
-        seen.clear()
-        with _rid("probe-0001"):
-            await agent._record_lesson_outcomes(**kwargs)
-        assert seen == []
 
 
 # ── 6. the stream shows the population ──────────────────────────────────────

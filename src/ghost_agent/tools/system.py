@@ -656,7 +656,7 @@ async def tool_check_health(context=None):
         # (a graph that cannot be counted is named by the memory line below)
 
         # §4SY: one line per group of the stores and services behind the
-        # agent (models, memory stores, learning, projects and schedule, labs
+        # agent (models, memory stores, the owner's rules, projects and schedule, labs
         # and sandbox, storage and safety) — see tools/health_internals.py
         from .health_internals import internals_report
         _lines, _found, _unchecked = await internals_report(context)

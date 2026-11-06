@@ -17,49 +17,9 @@ import json
 import pytest
 from unittest.mock import MagicMock
 
-from ghost_agent.memory.skills import SkillMemory, build_lesson
 
 
 # ----------------------------------------------------------------- lessons
-
-
-class TestLessonSourceRefs:
-    def test_build_lesson_stores_refs_capped(self):
-        lesson = build_lesson(task="T", source_refs=[f"ep:{i}" for i in range(30)])
-        assert lesson["source_refs"][0] == "ep:0"
-        assert len(lesson["source_refs"]) == 20
-
-    def test_learn_lesson_persists_refs(self, tmp_path):
-        sm = SkillMemory(tmp_path)
-        sm.learn_lesson("Always verify paths before writing.", "none",
-                        "Always verify paths before writing.",
-                        source="learn_skill", source_refs=["ep:1", "ep:2"])
-        entry = sm._load_playbook()[0]
-        assert entry["source_refs"] == ["ep:1", "ep:2"]
-
-    def test_duplicate_merge_unions_refs(self, tmp_path):
-        sm = SkillMemory(tmp_path)
-        sm.learn_lesson("Always verify paths before writing.", "none",
-                        "Always verify paths before writing.",
-                        source="learn_skill", source_refs=["ep:1"])
-        sm.learn_lesson("Always verify paths before writing.", "none",
-                        "Always verify paths before writing.",
-                        source="learn_skill", source_refs=["ep:2", "ep:1"])
-        entry = sm._load_playbook()[0]
-        assert entry["source_refs"] == ["ep:1", "ep:2"]
-        assert entry["frequency"] == 2
-
-    def test_vector_twin_carries_refs(self, tmp_path):
-        sm = SkillMemory(tmp_path)
-        vm = MagicMock()
-        vm.search_advanced.return_value = []  # no vector duplicate
-        sm.learn_lesson("Always verify paths before writing.", "none",
-                        "Always verify paths before writing.",
-                        memory_system=vm, source="learn_skill",
-                        source_refs=["ep:1", "ep:2"])
-        meta = vm.add.call_args.args[1]
-        assert meta["type"] == "skill"
-        assert meta["source_refs"] == "ep:1,ep:2"
 
 
 # ------------------------------------------------------------ recall surface

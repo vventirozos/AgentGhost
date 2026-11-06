@@ -236,85 +236,11 @@ async def test_correction_promotion_drops_cache_entry(tmp_path):
 # ----------------------------------------------------- lesson retraction
 
 
-async def test_correction_retracts_lessons_from_promoted_trajectory(tmp_path):
-    """When a turn is promoted to FAILED via user-correction, any
-    lessons the just-finished turn produced (tagged with its trajectory
-    id) must be scrubbed from the SkillMemory before retrieval can
-    surface them on the next user query.
-
-    Wires a real SkillMemory + collector + classifier path and
-    asserts the playbook entry tagged with the prior turn's
-    trajectory id is gone after the helper fires."""
-    from ghost_agent.memory.skills import SkillMemory
-
-    collector = TrajectoryCollector(root=tmp_path, session_id="s1")
-    skill_mem = SkillMemory(tmp_path)
-    ctx = _ctx(collector=collector)
-    ctx.skill_memory = skill_mem
-    ctx.memory_system = None
-    a = _bare_agent(ctx)
-
-    # Simulate the prior turn: trajectory recorded + opt-prot lesson
-    # written tagged with that trajectory's id.
-    prev_assistant = (
-        "I incorrectly described django middleware in this response"
-    )
-    traj = _t(
-        "T-poison",
-        user_request="explain django middleware briefly",
-        response=prev_assistant,
-    )
-    collector.append(traj)
-    a._stash_trajectory_for_correction_lookup(traj)
-
-    skill_mem.learn_lesson(
-        task="Optimization Analysis: explain django middleware briefly",
-        mistake="Sub-optimal pattern via Perfection Protocol",
-        solution="some optimization advice based on the wrong answer",
-        source_trajectory_id="T-poison",
-        source="learn_skill",
-    )
-    skill_mem.learn_lesson(  # unrelated lesson — must survive
-        task="how to fix asyncio race",
-        mistake="x",
-        solution="y",
-        source_trajectory_id="T-other",
-        source="learn_skill",
-    )
-
-    # User corrects.
-    msgs = _build_correction_messages(
-        prev_user="explain django middleware briefly",
-        prev_assistant=prev_assistant,
-        current_user=(
-            "no, explain django middleware request response cycle briefly"
-        ),
-    )
-    a._maybe_promote_prior_turn_via_user_correction(msgs, msgs[-1]["content"])
-
-    # Retraction is now scheduled off the event loop (asyncio.to_thread)
-    # so the user turn never blocks on the playbook lock + Chroma delete;
-    # drain the scheduled task before asserting.
-    import asyncio as _asyncio
-    pending = [t for t in _asyncio.all_tasks() if t is not _asyncio.current_task()]
-    if pending:
-        await _asyncio.gather(*pending)
-
-    # The opt-prot's poisoned lesson is gone; the unrelated one
-    # survives.
-    import json as _json
-    pb = _json.loads((tmp_path / "skills_playbook.json").read_text())
-    triggers = {p.get("trigger") for p in pb}
-    assert "Optimization Analysis: explain django middleware briefly" not in triggers
-    assert "how to fix asyncio race" in triggers
-
-
-async def test_correction_skips_retraction_when_no_skill_memory(tmp_path):
-    """Helper is robust to missing skill_memory — promotion still
-    fires, retraction is silently skipped."""
+async def test_correction_still_promotes(tmp_path):
+    """A correction promotes the turn it corrects (§4TD: the lesson retraction
+    beside it is removed with the lesson store)."""
     collector = TrajectoryCollector(root=tmp_path, session_id="s1")
     ctx = _ctx(collector=collector)
-    ctx.skill_memory = None  # explicit
     ctx.memory_system = None
     a = _bare_agent(ctx)
 

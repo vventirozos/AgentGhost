@@ -13,7 +13,8 @@ Fixed bugs pinned here:
     failure masked a successful schedule
  5. registry: browser lambda evaluated _proj_ws() twice; three tools lacked
     **kwargs so a hallucinated arg raised TypeError
- 6. self_state: resolve/close now require a match target
+ 6. self_state: resolve/close now require a match target (the tool was removed in §4TB,
+    2026-11-05, and this pin with it)
 """
 
 import asyncio
@@ -141,30 +142,3 @@ class TestRegistryKwargsTolerance:
         src = inspect.getsource(reg.get_available_tools)
         assert "host_dir, workdir = _proj_ws()" in src
         assert '_proj_ws()[0], container_workdir=_proj_ws()[1]' not in src
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 6. self_state resolve/close require a target
-# ──────────────────────────────────────────────────────────────────────
-
-class TestSelfStateRequiresTarget:
-    async def test_resolve_without_text_errors_clearly(self):
-        from ghost_agent.tools.self_state import tool_self_state
-
-        class _State:
-            def open_questions(self):
-                return []
-
-            def unfinished_threads(self):
-                return []
-
-            def mood(self):
-                return None
-
-        class _Model:
-            enabled = True
-            state = _State()
-
-        out = await tool_self_state(action="resolve_question", self_model=_Model())
-        assert "required" in out.lower()
-        assert "None" not in out

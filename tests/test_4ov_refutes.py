@@ -108,7 +108,7 @@ def late_agent(monkeypatch):
     monkeypatch.delenv("GHOST_JUDGE_REFUTE_CONSEQUENCES", raising=False)
     from ghost_agent.core.agent import GhostAgent
     ag = GhostAgent.__new__(GhostAgent)
-    ag.context = SimpleNamespace(verifier=None, skill_memory=None, trajectory_collector=None)
+    ag.context = SimpleNamespace(verifier=None, trajectory_collector=None)
     ag._human_label_locked = lambda tid: False
     ag._strong_verdict_for = lambda tid: None
     ag._queue_source_caveat = lambda *a, **k: None

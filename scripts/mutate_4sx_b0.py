@@ -24,7 +24,6 @@ MUT = [
     ('G4 conv-getter-ignores-scope', A, '            return s.conversation_key\n        return self.__dict__.get("_conversation_fallback", "")', '            pass\n        return self.__dict__.get("_conversation_fallback", "")'),
     # scope builder
     ('S1 member-persists', A, '            return RequestScope(origin=ORIGIN_MEMBER, context=self.context)', '            return RequestScope(conversation_key=conversation_key_for_session(sid), origin=ORIGIN_MEMBER, persist=True, context=self.context)'),
-    ('S2 replay-persists', A, '                return RequestScope(origin=ORIGIN_REPLAY, context=self.context)', '                return RequestScope(conversation_key=conversation_key_for_session(sid), origin=ORIGIN_REPLAY, persist=True, context=self.context)'),
     ('S3 probe-persists', A, '            return RequestScope(conversation_key=key, origin=ORIGIN_PROBE, context=self.context)', '            return RequestScope(conversation_key=key, origin=ORIGIN_PROBE, persist=persist, context=self.context)'),
     ('S4 unattended-off', A, '        if str(req_id).startswith(_UNOWNED_RID_PREFIXES) or turn_origin_value != "user":', '        if False:'),
     ('S5 passed-scope-ignored', A, '        if scope is not None:\n            scope.context = self.context\n            return scope', '        if False:\n            scope.context = self.context\n            return scope'),

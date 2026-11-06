@@ -121,10 +121,10 @@ async def test_an_idempotent_repeat_is_noted_and_the_next_call_still_runs():
 
     async def good(**kw):
         calls["n"] += 1; return "ok"
-    agent.available_tools = {"learn_skill": _aok, "good": good}
+    agent.available_tools = {"update_profile": _aok, "good": good}
     args = {"name": "s", "steps": "x"}
-    ts = _ts(tool_calls=[_call("learn_skill", args), _call("good", {})],
-             executed_idempotent={_hash("learn_skill", args)})
+    ts = _ts(tool_calls=[_call("update_profile", args), _call("good", {})],
+             executed_idempotent={_hash("update_profile", args)})
     await agent._dispatch_and_process_tool_batch(ts)
     notes = [m for m in ts.tools_run_this_turn if "SYSTEM IDEMPOTENCY" in str(m.get("content"))]
     assert len(notes) == 1
@@ -149,26 +149,22 @@ async def test_a_knowledge_base_insert_fact_repeat_is_an_idempotent_note_too():
 # ── D4: cache invalidations after skill / sandbox mutations ──────────────────
 class TestInvalidations:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("name,args,playbook,tooldefs", [
-        ("learn_skill", {"name": "s"}, True, False),
-        ("create_skill", {"name": "s", "code": "x"}, False, True),
-        ("manage_skills", {"action": "delete", "name": "s"}, False, True),
-        ("manage_skills", {"action": "list"}, False, False),
-        ("manage_composed_skills", {"action": "define", "name": "m"}, False, True),
-        ("manage_composed_skills", {"action": "approve", "name": "m"}, False, True),
-        ("manage_composed_skills", {"action": "delete", "name": "m"}, False, True),
-        ("manage_composed_skills", {"action": "list"}, False, False),
-        ("web_search", {"query": "q"}, False, False),
+    @pytest.mark.parametrize("name,args,tooldefs", [
+        ("create_skill", {"name": "s", "code": "x"}, True),
+        ("manage_skills", {"action": "delete", "name": "s"}, True),
+        ("manage_skills", {"action": "list"}, False),
+        # §4TA: the macro manager is removed — its name is nothing special any more
+        ("manage_composed_skills", {"action": "define", "name": "m"}, False),
+        ("manage_composed_skills", {"action": "delete", "name": "m"}, False),
+        ("web_search", {"query": "q"}, False),
         # the action is normalised (`.strip().lower()`) before it is compared —
         # the observed defect the code comment names (`action=" define "`)
-        ("manage_skills", {"action": "DELETE ", "name": "s"}, False, True),
-        ("manage_composed_skills", {"action": " Define ", "name": "m"}, False, True),
+        ("manage_skills", {"action": "DELETE ", "name": "s"}, True),
     ])
-    async def test_which_calls_invalidate_what(self, name, args, playbook, tooldefs):
+    async def test_which_calls_invalidate_what(self, name, args, tooldefs):
         agent = _dispatch_agent(); agent.available_tools = {name: _aok}
         ts = _ts(tool_calls=[_call(name, args)])
         await agent._dispatch_and_process_tool_batch(ts)
-        assert ts.request_state.invalidate_skill_playbook.called is playbook
         assert ts.request_state.invalidate_tool_defs.called is tooldefs
 
 
@@ -299,12 +295,12 @@ class TestWorldChangeClearsThePreflightGuard:
         ("file_system", {"operation": "read", "path": "a.py"}, False),
         ("execute", {"command": "ls -la"}, False),
         ("execute", {"command": "touch new.txt"}, True),
-        # `_call_mutated_world` (agent.py L396): only file_system, manage_services,
-        # execute (command heuristic) and manage_composed_skills can reset the
-        # guard — a knowledge-base ingest is not the sandbox world it reasons about.
+        # `_call_mutated_world`: only file_system, manage_services, lab, run and
+        # execute (command heuristic) can reset the guard — a knowledge-base
+        # ingest is not the sandbox world it reasons about.
         ("knowledge_base", {"action": "ingest_document", "path": "d.pdf"}, False),
-        ("manage_composed_skills", {"action": "define", "name": "m"}, True),
-        ("manage_composed_skills", {"action": "list"}, False),
+        # §4TA: the macro manager is removed — a tool of that name resets nothing
+        ("manage_composed_skills", {"action": "define", "name": "m"}, False),
         ("web_search", {"query": "q"}, False),
     ])
     async def test_table(self, name, args, clears):
@@ -435,7 +431,6 @@ async def _succ(**kw):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name,args,tool", [
     ("execute", {"command": "touch x"}, _aok),                      # L16817 (execute success arm)
-    ("learn_skill", {"name": "s", "steps": "x"}, _succ),             # L16948 (setter SUCCESS arm)
     ("file_system", {"operation": "write", "path": "a.py", "content": "x"}, _aok),  # L16953 (else arm)
 ])
 async def test_a_mutating_success_resets_the_seen_tools_set(name, args, tool):

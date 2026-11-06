@@ -147,7 +147,7 @@
   TLS, and an iOS <code>getUserMedia</code> permission timeout. The service worker
   does not register over a <em>self-signed</em> cert (browser policy) — which is why the
   mobile entry point is the <strong>tailscale-served front door</strong> below, not
-  <code>:8080</code> directly. The face-form menu clamps to the viewport on BOTH axes and
+  <code>:8080</code> directly. The face-form menu (removed 2026-11-06) clamped to the viewport on BOTH axes and
   scrolls internally (<code>max-height</code>) — a right-anchored menu near the left edge
   of the centered phone header used to hang half off-screen
   (2026-08-01; <code>tests/test_interface_log_and_mobile.py</code> +
@@ -360,6 +360,7 @@
   computed from the shipped constants, node-executed builder budgets).</p>
 
   <h2>Form picker + delete-all sessions (2026-07-29)</h2>
+  <p><em>The picker was removed on 2026-11-06 (§4TG): see "mood tesseract".</em></p>
   <p><strong>Form picker:</strong> the header face button no longer blind-cycles (at 9 forms, reaching the one
   you wanted took up to 8 clicks × 1.4s reorganization blends). It now opens <code>#face-form-menu</code> — a
   glass panel in the <code>#msg-menu</code> visual language, anchored under the button — listing every form
@@ -395,7 +396,7 @@
   middle") — element, container, dwell/priority arbitration tables, flash/fade logic, and the zen-mode scale
   rule all excised; the status line is now the only per-turn icon surface, ambient activity still animates the
   face itself, and <code>updateStateFromIcon</code> survives purely as the face's working-state driver.
-  <strong>Corridor filtering:</strong> background work (self-play, dreams) streams on the same socket with its
+  <strong>Corridor filtering:</strong> background work (scheduled tasks and jobs; self-play and dreams when this was written, both since removed) streams on the same socket with its
   own request ids — on send the line adopts the id of the FIRST "request started" corridor that opens (ours:
   the POST fires it within ~a second; an already-open corridor can never be adopted) and only lines carrying
   that id update the caption. <code>TICKER_VERBS</code> maps common step titles to friendly phrasings
@@ -587,12 +588,20 @@
     operator feedback). A tap POSTs <code>/api/feedback</code> (proxied); same-signal repeats are
     a client no-op AND server-idempotent. A failed label is reported ONCE per bubble
     (<code>_noteFeedbackFailure</code>, 2026-09-05 — it used to add a system line per tap; a
-    different failure still speaks, a success clears the latch). The id is captured from the SSE
+    different failure still speaks, a success clears the latch). <strong>Thumbs-down hint
+    (2026-11-05, &sect;4SZ):</strong> when the response to a recorded 👎 carries <code>hint</code>,
+    <code>sendFeedback</code> shows it as a system line ("Noted. If there is something I should
+    always do differently, state it as a rule &mdash; say: learn this rule: &lt;the rule&gt;"), once
+    per page load (<code>_ruleHintShown</code>), and only after the label is latched and saved, so a
+    hint that fails to parse cannot report a recorded label as lost. A 👍, a repeat of the same thumb
+    (a client no-op) and a failed label show no hint. See
+    <a href="../learning-loop.html#thumbs-down">Owner rules</a>; pinned by
+    <code>tests/test_4sz_thumbs_down_hint.py</code>. The id is captured from the SSE
     frames' <code>chatcmpl-&lt;req_id&gt;</code> envelope — which the chat route now GUARANTEES is
     the agent's id (2026-09-05: the streamed-final path forwarded llama-server frames verbatim,
     so the bubble held llama's 32-char completion id and every thumb came back "no trajectory
     found for request_id"). A second cause has no fix by design: a reply the system writes
-    without a model turn (an owner rule/test command; a greeting until §4RP-c removed its
+    without a model turn (an owner rule command; a greeting until §4RP-c removed its
     fast path) has NO trajectory, so the agent remembers those ids
     (<code>Agent.is_trivial_reply</code>), the route stamps the reply's frames
     <code>{"ghost": {"labelable": false}}</code>, and the bubble renders <em>no thumbs</em>
@@ -866,7 +875,7 @@
   <p><strong>Mechanism.</strong> One server-side file, <code>~/Data/AI/.ghost_ui_prefs.json</code>
   (override with <code>GHOST_UI_PREFS_FILE</code>; the test suite isolates it at collection time
   like the push files). <code>POST /api/ui/prefs</code> (<code>X-Ghost-Key</code>, body
-  <code>{"face_form": "…"}</code>) stores a pick; the face-form menu calls it on every pick
+  <code>{"face_form": "…"}</code>) stores a pick; the animations button calls it on every press
   (<code>app.js rememberFaceForm</code>, fire-and-forget — the face has already switched locally;
   a failed save is one console warning and localStorage stays as the fallback). <code>GET /</code>
   injects the stored value as <code>&lt;meta name="ghost-face-form"&gt;</code> next to the key
@@ -1149,9 +1158,17 @@
     <li><strong>Background breath.</strong> status.js polls <code>/api/turns</code> with the health probe;
     <code>backgroundBusyFrom(turns, mySessionId)</code> → <code>setBackgroundBusy</code>: outer nodes (r &gt; 1.5)
     breathe on a slower rhythm and bloom rides it faintly.</li>
-    <li><strong>Mood baseline.</strong> <code>health.mood.label</code> → <code>setMoodHue</code> →
-    <code>moodHueFor</code> (satisfied −0.035, idle −0.06, curious +0.03, stuck +0.05, overloaded +0.07 — all
-    within the cold pole), lerped over ~1 minute onto <code>uHueDrift</code>.</li>
+    <li><strong>Mood baseline.</strong> <code>health.mood.label</code> and <code>health.mood.intensity</code> →
+    <code>setMoodHue(label, intensity)</code> → <code>moodHueFor</code> × <code>moodHueScale</code>, lerped over
+    ~1 minute onto <code>uHueDrift</code>. Since 2026-11-06 (§4TC) the labels are the agent's nine moods: low
+    energy sits cooler (content −0.015, calm −0.03, down −0.035, bored −0.04, tired −0.045), high energy warmer
+    (cheerful +0.025, curious +0.03, restless +0.04, irritable +0.045); <code>neutral</code> and any unknown
+    label are 0. The intensity scales the shift (×0.5 at 1, ×1 at 2, ×1.5 at 3) — always within ±0.07, inside
+    the cold pole. <code>/api/health</code> now always carries a <code>mood</code> object: <code>label</code>
+    ("neutral" when there is none), <code>intensity</code> 0–3, <code>manner</code>, <code>set_at</code>,
+    <code>source</code> ("auto" | "owner"). (Until then: satisfied −0.035, idle −0.06, curious +0.03, stuck
+    +0.05, overloaded +0.07, the labels of the removed derived mood.) Versions: matrix_graph.js 18.1,
+    status.js 7.7, workspace.js 9.3, app.js 18.1.</li>
     <li><strong>Composer gaze.</strong> typing → <code>setComposerGaze(true)</code>: the camera's look target
     drops toward the composer (fades with the dive); blur / send clears it.</li>
     <li><strong>Voice.</strong> the hold-to-talk stream gets an AnalyserNode (never routed to the speakers)
@@ -1434,12 +1451,34 @@
   <li><strong>Turn arc</strong>: waiting for the first words builds <em>anticipation</em> (lean in, held breath); inside <code>&lt;think&gt;</code> it slows and goes still; streaming text drives a <em>speech</em> envelope from the token rate (faster, a faint nod); the first answer text releases the anticipation.</li>
   <li><strong>Session memory</strong>: fatigue integrates working time (~2&nbsp;h to full, ~30&nbsp;min rest to clear); 23:00&ndash;07:00 lowers the baseline and favours dozing; a turn after &gt;1&nbsp;h away <em>wakes</em> it.</li>
   <li><strong>Idle repertoire</strong> at rest (no turn, calm, ≥&nbsp;8&nbsp;s after the last): glance, stretch, sigh, twitch, look-around, doze &mdash; never the same twice running, every ~7&ndash;21&nbsp;s (longer when tired or at night). A requested twitch waits ≥&nbsp;4&nbsp;s and for the last to fade (moving it mid-twitch popped a node, 0.054/frame).</li>
-  <li><strong>Signals</strong> (all client-side, no server change): every live log line → <code>noteLogLine</code> (icons → work kind: web/code/file/memory/image/think; outcome: ok/fail/warn/retry/stop, cache restore/fail, dream, queued); every streamed chunk → <code>noteStreamChunk</code>.</li>
-  <li><strong>Frame-rate independent</strong>: wander is smooth value noise of time, the clock is frame-integrated (re-synced forward after a paused tab), so 30/60/120&nbsp;Hz give the same face. Reduced motion keeps the old fixed speed/amplitude.</li>
+  <li><strong>Signals</strong> (all client-side, no server change): every live log line → <code>noteLogLine</code> (the row's own icon → work kind: web/code/file/memory/image/think; outcome: ok/fail/warn/retry/stop, cache restore/fail, dream, queued; free text and continuation lines report nothing, see v1.4 below); every streamed chunk → <code>noteStreamChunk</code>.</li>
+  <li><strong>Frame-rate independent</strong>: wander is smooth value noise of time, the clock integrates the true frame time (re-synced forward only after a paused tab or a frame gap over 1&nbsp;s), so 30/60/120&nbsp;Hz give the same face. Reduced motion keeps the old fixed speed/amplitude.</li>
 </ul>
 <p>Tests: <code>tests/test_interface_face_temperament.py</code> (19, executed under node + the real face under the harness; 8 hand mutants killed). Measured live (headless, swiftshader): idle speed 1.00 → waiting lean 0.49 → thinking speed 0.60/still 0.39 → error jitter 0.64 → speaking speed 1.29 → pass; brightness unchanged (mean luminance 3.2&ndash;4.0). Introspection: <code>getTemperament()</code>.</p>
 <h3>v1.2/1.3 — the body (operator: "can't say i saw a huge difference")</h3>
-<p>v1.1 kept every effect within a few percent, and its gaze steered a look target that the camera-static forms (<code>tesseract</code>, <code>vortex</code>) never read &mdash; on the operator's form the glances did nothing. The temperament now drives the whole creature on every form, on top of whatever the form does: head turns and tilts (scene rotation &mdash; glance/look-around up to ~30&deg;, a slow pondering sway while thinking, a head tilt on curiosity), a ~7&nbsp;Hz startle shake, a <em>coil</em> while waiting (scale down to ~&minus;8%) that <em>lets go</em> on the first words (+8% swell), stretch/sigh swells, sinking and dimming into a doze, a lift on waking, brightness flares (startle, wake, speech) and a bloom glow that pulses with each streamed chunk. Offsets are taken off before the per-form code reads the scene and re-applied after the blend; a form switch snapshots the scene <em>without</em> them (else the first blend frame applied the body twice &mdash; a 0.11 scale jump). Brightness never overrides an error kind's own dim, and reduced motion gets no body at all.</p>
+<p>v1.1 kept every effect within a few percent, and its gaze steered a look target that the camera-static forms (<code>tesseract</code>, <code>vortex</code>) never read &mdash; on the operator's form the glances did nothing. The temperament now drives the whole creature on every form, on top of whatever the form does: head turns and tilts (scene rotation &mdash; glance/look-around up to ~30&deg;, about 10&deg; since v1.4, a slow pondering sway while thinking, a head tilt on curiosity), a ~7&nbsp;Hz startle shake, a <em>coil</em> while waiting (scale down to ~&minus;8%) that <em>lets go</em> on the first words (+8% swell), stretch/sigh swells, sinking and dimming into a doze, a lift on waking, brightness flares (startle, wake, speech) and a bloom glow that pulses with each streamed chunk. Offsets are taken off before the per-form code reads the scene and re-applied after the blend; a form switch snapshots the scene <em>without</em> them (else the first blend frame applied the body twice &mdash; a 0.11 scale jump). Brightness never overrides an error kind's own dim, and reduced motion gets no body at all.</p>
+<h3>v1.4/1.5 — calm at rest (2026-11-06, §4TF; operator: the tesseract is "gittery and erratic, mostly while idle")</h3>
+<p>Measured on the real loop: with the body and the twitch off, ten idle minutes were smooth (median visible node 0.20&nbsp;px per frame at worst). With them on it reached 1.59&nbsp;px, with whole-scene turns of about 25&deg; every ~14&nbsp;s. Reactions to real events keep their strength; what the face does on its own at rest does not:</p>
+<ul>
+  <li><strong>Idle body at a third</strong> (<code>IDLE_BODY</code>): the wander and the idle actions (glance, look-around, stretch, sigh, doze) move the scene at a third of before. The gaze output, which only the cube's look target reads, is unchanged.</li>
+  <li><strong>Eased body</strong> (<code>BODY_TAU</code>, 0.25&nbsp;s, frame-rate independent): yaw, pitch, the slow part of roll, vertical offset, scale and the slow part of brightness can no longer step in one frame, whatever the input: a cancelled idle action (was 9&ndash;37&nbsp;px, now under 1&nbsp;px), a clock re-sync, a drive nudge. Only the startle's ~7&nbsp;Hz shake and flare stay instant, on purpose.</li>
+  <li><strong>One tilt at a time</strong>: a web, image or recall cue during a head tilt joins it; each one used to restart it on a random side.</li>
+  <li><strong>No twitch on the tesseract</strong>: its wireframe is computed apart from the nodes, so a twitch pulled corners off their edges and could hold the whole kernel. The other forms keep it.</li>
+  <li><strong>Only a row's own icon reports</strong> (<code>logRowIcon</code>, <code>classifyLogLine</code>): <code>│ tag [HH:MM:SS] ICON …</code>. Everything after that column and every continuation line is free text. The server's <code>is_error</code> (the words ERROR or Exception anywhere in a line) now only colours the log console. Of 415 such lines in the live log, 157 were continuation text and 33 thoughts, for example one about psql's <code>ON_ERROR_STOP</code>, and each shook the face; 211 were 🔶 warning rows (<code>tool warning</code>, <code>transient fail</code>), which now react as the warnings they are, without the startle. A row's icon also sets the face's working state and tint; free text no longer does.</li>
+  <li><strong>Clock</strong>: it used to integrate the clamped frame step and re-sync when 5&nbsp;s behind, so below 20&nbsp;fps it jumped 5&nbsp;s about every 20&nbsp;s. It now re-syncs only after a gap over 1&nbsp;s between frames, on the frame stamps or the wall clock, which covers a paused tab and a system sleep (rAF stamps can stop through one).</li>
+</ul>
+<p>Tests: <code>tests/test_interface_face_idle_calm_2026_11_06.py</code>, executed on the real loop, with the key scenarios also run on the pre-fix copy, where they must fail. Rollback: <code>interface/face_backups/20261106-preidlecalm/</code>.</p>
+<h3>mood tesseract (2026-11-06, §4TG)</h3>
+<p><strong>The only face.</strong> The operator removed cube, tesseract, vortex and descent, and with them the form menu. <code>#animations-btn</code> in the header switches between <code>moodtesseract</code> (animations enabled) and <code>empty</code> (disabled, nothing drawn); the choice is saved through the same <code>face_form</code> pref as before. A stored pick of a removed form opens on <code>moodtesseract</code> (<code>FORM_ALIASES</code>). Rollback: <code>interface/face_backups/20261106-premoodonly/</code>.</p>
+<p>Each look also has its own five colours in place of the blue-to-red ring: cheerful a sunrise (teal, cerulean, orchid, coral, rose), irritable a fire (soot, wine, crimson, ember, oxblood), tired a dusk (slate teal, dusk blue, lavender, mauve). Neutral lands back on the exact thermal colours. The stops are the same <code>COLORS.palette</code> objects the shaders read, and only this form writes them.</p>
+<p>A sixth form: the tesseract's corridor carrying the agent's mood, id <code>moodtesseract</code> (ids stay <code>[a-z]</code> for the server's prefs and the handheld; the picker shows "mood tesseract"). The plain tesseract ignores the mood's look. The label and intensity already reach the face from <code>/api/health</code> every 25&nbsp;s; <code>moodLook(label, intensity)</code> turns them into slow baselines, eased over seconds: shell flow, kernel spin and size, breath rate and depth, wobble, brightness, the corridor's heat gradient, scene height, and through <code>setMoodBias</code> how often idle actions come, how likely a doze, how hard events land. Nothing moves per frame, so it cannot bring back the idle jitter.</p>
+<ul>
+  <li><strong>cheerful</strong>: quicker flow, fuller breath, brighter, slightly warmer, more frequent gestures.</li>
+  <li><strong>irritable</strong>: the kernel's red reaches the whole corridor; a tight, fast kernel, rigid shells, a quick sharp breath; errors land harder.</li>
+  <li><strong>tired</strong>: slow, dim and cold, sitting lower, dozing often; events land softer.</li>
+  <li>Any other label looks neutral for now. Intensity takes 35&nbsp;%, 70&nbsp;% or all of the look. A real failure still startles over any of them. Under reduced motion the tempo stays steady, and the mood shows in light and colour only.</li>
+</ul>
+<p><strong>Try it</strong> in the browser console with the form selected: <code>__ghostFace.previewMood('irritable', 3)</code>, then <code>__ghostFace.previewMood()</code> to go back to the real mood. The preview is not saved. Tests: <code>tests/test_interface_face_mood_tesseract_2026_11_06.py</code>. Rollback: <code>interface/face_backups/20261106-premoodform/</code>.</p>
 <p><strong>Intensity knob</strong>: default 1.5. In the browser console: <code>localStorage.ghost_face_intensity = 2.5</code> then reload (0 = the quiet v1.1 face, 3 = theatrical; per device).</p>
 <p><strong>Rollback</strong>: <code>interface/face_backups/20261030-pretemperament/</code> holds the previous <code>matrix_graph.js</code>, <code>app.js</code>, <code>index.html</code> (and siblings). Copy them back over <code>interface/static/</code> and bump <code>?v=</code> (index → app.js → matrix_graph) above the current 17.6; no restart needed (statics are read per request).</p>
 

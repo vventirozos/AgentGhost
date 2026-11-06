@@ -399,8 +399,8 @@ async def test_overview_composes_every_surface_and_stays_bounded(tmp_path, monke
     import ghost_agent.core.learning_health as lh
     monkeypatch.setattr(lh, "render_learning_health", lambda md, a=None: _FAKE_LEARNING)
     sm = SelfModel(root=tmp_path / "self")
-    sm.state.set_mood("satisfied", "my last 5 verdict-bearing turns all passed")
-    sm.state.note_open_question("Why does the verifier land late?")
+    from ghost_agent.selfhood.mood import KIND_THUMB_UP
+    sm.note_owner_reaction(KIND_THUMB_UP)
     sm.capture_turn(trajectory_id="t-1", user_request="fix the parser",
                     tool_names=["execute"], outcome="passed", final_response="fixed it")
     sm.autobio.mark_session_boot(prior_session_at="")
@@ -410,11 +410,11 @@ async def test_overview_composes_every_surface_and_stays_bounded(tmp_path, monke
     ctx = _ctx(tmp_path, activity_log=log)
     out = await tool_introspect(action="overview", self_model=sm, context=ctx)
     assert "How I am:" in out
-    assert "mood: satisfied — my last 5 verdict-bearing turns all passed" in out
-    assert "Why does the verifier land late?" in out
+    assert "  mood: content, 1 of 3 — the owner gave a thumbs-up" in out      # §4TC: label, intensity, latest cause
+    assert "open questions" not in out.lower() and "carried over" not in out   # §4TB: nothing can write them
     assert "fix the parser" in out and "Session resumed" not in out
     assert "What changed" in out and "netmon" in out
-    assert "LESSONS: 3 total" in out and "⚠ a warning worth keeping" in out
+    assert "LESSONS: 3 total" not in out and "⚠ a warning worth keeping" in out
     assert "Experiments:" not in out          # §4NN: the experiments surface is gone
     assert len(out) <= I._OVERVIEW_MAX_CHARS
 
@@ -455,7 +455,7 @@ async def test_overview_names_every_absent_surface(tmp_path):
     out = await tool_introspect(action="overview", self_model=None, context=ctx)
     assert "selfhood is disabled" in out
     assert "ledger is not attached" in out
-    assert "Learning: memory_dir unavailable." in out
+    assert "Background loops: memory_dir unavailable." in out
     assert "Experiments" not in out           # §4NN
     disabled = SelfModel(root=tmp_path, enabled=False)
     out2 = await tool_introspect(action="overview", self_model=disabled, context=ctx)
@@ -482,33 +482,20 @@ async def test_overview_surface_failure_is_named_not_swallowed(tmp_path, monkeyp
     monkeypatch.setattr(lh, "render_learning_health", _boom)
     ctx = _ctx(tmp_path)
     out = await tool_introspect(action="overview", context=ctx)
-    assert "Learning: unavailable (RuntimeError: walk exploded)" in out
+    assert "Background loops: unavailable (RuntimeError: walk exploded)" in out
 
 
 # ────────────────────────────────────────────────────────────── summary
 
-async def test_summary_renders_open_question_and_thread_text(tmp_path):
+async def test_stats_renders_the_mood_with_its_intensity_and_cause(tmp_path):
+    """§4TC: the stats line is label + intensity + the latest cause (it showed
+    a derived label with its evidence, provenance and a STALE flag)."""
+    from ghost_agent.selfhood.mood import KIND_THUMB_DOWN
     sm = SelfModel(root=tmp_path)
-    sm.state.note_open_question("Why does the verifier land late?")
-    sm.state.add_unfinished("the chess release")
-    out = await tool_introspect(action="summary", self_model=sm)
-    assert "Open questions I'm still carrying:" in out
-    assert "Why does the verifier land late?" in out
-    assert "Threads I left unfinished:" in out and "the chess release" in out
-
-
-async def test_stats_renders_mood_evidence(tmp_path):
-    sm = SelfModel(root=tmp_path)
-    sm.state.set_mood("stuck", "3 of my last 5 verdict-bearing turns failed")
+    assert "Mood: neutral" in (await tool_introspect(action="stats", self_model=sm)).splitlines()
+    sm.note_owner_reaction(KIND_THUMB_DOWN)
     out = await tool_introspect(action="stats", self_model=sm)
-    assert "Last noted mood: stuck — 3 of my last 5 verdict-bearing turns failed (" in out
-
-
-async def test_summary_principles_carry_their_age(tmp_path):
-    sm = SelfModel(root=tmp_path)
-    sm.note_principle("I verify before asserting")
-    out = await tool_introspect(action="summary", self_model=sm)
-    assert "- I verify before asserting (noted just now)" in out
+    assert "Mood: down, 1 of 3 — the owner gave a thumbs-down" in out.splitlines()
 
 
 # ──────────────────────────────────────────── cross-surface (R5) table

@@ -57,7 +57,7 @@ class TestStreamWiring:
     @pytest.mark.asyncio
     async def test_watchdog_break_lands_in_the_durable_text_not_the_client(self):
         """L25115 `full_content += break_text`: the synthetic break must be in the
-        DURABLE content (the next turn replans on it) while the client gets only
+        DURABLE content (the record says the reply was cut) while the client gets only
         the clean interrupt notice."""
         a = make_stream_agent(); a._write_project_work_log_safe = AsyncMock()
         chunks = await _drive(a, ["<think>\nlooping now:\n"] + [self._ROW] * 60)

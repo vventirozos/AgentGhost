@@ -85,22 +85,7 @@ async def test_a_report_with_missing_sources_is_partial(tmp_path):
     assert getattr(out, "status", None) is OutcomeStatus.PARTIAL and str(out).startswith("PARTIAL")
 
 
-# ── B5: a refused macro step is not a succeeded step ──
-
-async def test_a_blocked_macro_step_is_a_failed_step():
-    from ghost_agent.tools.composed_skills import _step_result_ok, build_step_executor
-    ex = build_step_executor({}, {"other_macro"})
-    out = await ex("other_macro", {})
-    assert not _step_result_ok(out)
-    missing = await ex("no_such_tool", {})
-    assert not _step_result_ok(missing)
-    assert getattr(missing, "status", None) is OutcomeStatus.REJECTED
-
-
-async def test_a_blocked_step_declares_itself_rejected():
-    from ghost_agent.tools.composed_skills import build_step_executor
-    out = await build_step_executor({}, {"m"})("m", {})
-    assert getattr(out, "status", None) is OutcomeStatus.REJECTED
+# (B5 — a refused macro step is not a succeeded step — went with the macro engine, §4TA)
 
 
 # ── B7: the unattended advancer reads failure heads the shared way ──
@@ -114,7 +99,20 @@ def test_the_advancer_sees_every_failure_head(text):
 
 # ── B8: exception arms and unavailable refusals are declared ──
 
-async def test_an_unavailable_self_state_is_rejected():
-    from ghost_agent.tools.self_state import tool_self_state
-    out = await tool_self_state(action="list", self_model=None)
+async def test_an_unavailable_mood_write_is_rejected():
+    """§4TB: was `self_state` (removed); its one surviving write is
+    `introspect(action="set_mood")`, and with no self-model it is REJECTED,
+    not booked OK."""
+    from ghost_agent.tools.introspect import tool_introspect
+    from ghost_agent.utils.logging import request_id_context
+    tok = request_id_context.set("web-4lz-owner")           # §4TC (review): the write is the owner's own request's
+    try:
+        out = await tool_introspect(action="set_mood", mood="calm", self_model=None)
+    finally:
+        request_id_context.reset(tok)
     assert getattr(out, "status", None) is OutcomeStatus.REJECTED
+    assert getattr(out, "reason_code", None) == "tool_unavailable"
+    # … and outside the owner's own request it is REJECTED too, one step earlier
+    out = await tool_introspect(action="set_mood", mood="calm", self_model=None)
+    assert getattr(out, "status", None) is OutcomeStatus.REJECTED
+    assert getattr(out, "reason_code", None) == "owner_only"

@@ -3,9 +3,9 @@
 the ledger and the liveness table; the module and the ``Dreamer`` class keep
 their names because ~30 files import them).
 
-Nothing here learns or writes lessons any more — the REM consolidation,
-heuristics, episode consolidation, distillation and graduation were removed
-in §4NM. One pass (``Dreamer.dream``) does housekeeping only: project digests,
+Nothing here learns anything — the REM consolidation, heuristics, episode
+consolidation, distillation and graduation were removed in §4NM, and the
+lesson store itself in §4TD. One pass (``Dreamer.dream``) does housekeeping only: project digests,
 the file-manifest backfill, the trajectory archive, the daily store care
 (verified snapshot + forget-archive retention) and, at most every 6 h, the
 store maintenance (graph stale-edge prune, node compression, cross-store
@@ -120,23 +120,8 @@ class Dreamer:
         note = ""
         self._maint_counts = {"graph_pruned": 0, "graph_merged": 0}
         _remember(self.context, "_last_store_maintenance", time.time())
-        # §4OR: every adopted owner rule still carries the owner's exact text
-        # (2026-10-12: a dedup merge rewrote rule 1 and nothing noticed)
-        try:
-            _mdir = _real_dir(getattr(self.context, "memory_dir", None))
-            _sm = getattr(self.context, "skill_memory", None)
-            if _mdir is not None and _sm is not None:
-                from .failure_replay import check_rule_integrity
-                _fixes = await asyncio.to_thread(check_rule_integrity, Path(_mdir).parent, _sm,
-                                                 getattr(self.context, "memory_system", None))
-                if _fixes:
-                    _msg = "Your adopted rules were changed by something else and are restored: " + ", ".join(_fixes)
-                    pretty_log("Owner Rule Restored", _msg, icon=Icons.VERDICT_NOTE, level="INFO")   # §4OK: already fixed — information
-                    _log = getattr(self.context, "activity_log", None)
-                    if _log is not None:
-                        _log.record("maintenance", _msg, severity="notify")
-        except Exception as _rix:  # noqa: BLE001
-            logger.warning("owner-rule integrity check skipped: %s", _rix)
+        # (§4SZ: the owner's rules are ONE file now — core/owner_rules.py — so there is no
+        # second copy for an integrity check to compare against; the §4OR check is gone)
 
         # KB review 10-30: the owner's profile mirrors (graph + vector) made
         # equal to the profile — retires the pre-fix unqualified duplicates
@@ -212,8 +197,7 @@ class Dreamer:
         """The idle housekeeping pass (§4NM: the REM / lesson side — the
         consolidation call, heuristics → lessons, episode consolidation,
         failure-cluster distillation, macro proposals, graduation, utility
-        pruning — was removed; lessons come only from `learn_skill` and
-        the operator's repairs). What runs: project digests, the file-
+        pruning — was removed; §4TD removed the lesson store). What runs: project digests, the file-
         manifest backfill, trajectory archive, the daily store care
         (snapshot + forget-archive retention) and, when due, the store
         maintenance (graph prune / compress / cross-store reconcile).
@@ -302,7 +286,7 @@ class Dreamer:
         self.last_dream_outcome = {"phase": "skipped",
                                    "side_output": bool(project_digests or _mbf or _maint),
                                    "summary": _summary}
-        msg = "Housekeeping cycle done (lessons come only from learn_skill / operator repairs)."
+        msg = "Housekeeping cycle done."
         if project_digests:
             msg += f" Wrote {project_digests} project digest(s)."
         if _mbf:

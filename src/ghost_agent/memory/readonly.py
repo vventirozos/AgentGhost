@@ -15,8 +15,7 @@ the real store, so reads keep working unchanged.
 The previous version listed no-op methods by GUESSED names (``add_memory``,
 ``delete_memory``, ``add_triplet``, ``insert_fact`` …) that DO NOT EXIST on
 the real stores, while the real mutators (``add``, ``ingest_document``,
-``delete_fragment``, ``add_triplets``, ``delete_by_target``,
-``remove_by_trigger`` …) fell straight through ``__getattr__`` to the
+``delete_fragment``, ``add_triplets``, ``delete_by_target`` …) fell straight through ``__getattr__`` to the
 writable store and executed. The mutator lists below are pinned to the real
 methods and covered by ``tests/test_readonly_memory.py`` so a store growing a
 new writer surfaces there.
@@ -36,8 +35,8 @@ logger = logging.getLogger("GhostAgent")
 
 
 #: §4LH final review: the named lists are a deny-list, and every writer added
-#: after them leaked through (unquarantine_lesson, reconcile_vector_orphans,
-#: heal_missing_twins, _update_lesson_fields). A method named for a mutation —
+#: after them leaked through (four lesson-store writers, since removed with
+#: that store). A method named for a mutation —
 #: public or private — is a no-op through any façade, listed or not.
 _MUTATING_NAME = re.compile(
     r"^_*(?:add|set|save|write|update|upsert|delete|remove|retract|prune|mark|credit|record|bump|"
@@ -53,11 +52,12 @@ class _ReadOnlyProxy:
     """Base façade: reads proxy through, named mutators no-op, raw writable
     handles are blocked. Subclasses set ``_MUTATORS`` and ``_BLOCKED_ATTRS``.
 
-    ``is_read_only`` is exposed so callers that branch on it (e.g. dream's
-    Perfect-It skip) see the wrap.
+    A wrap is NOT the marker of a simulated context: that is the context's
+    own ``simulated`` flag (``core/isolation.is_simulated_context``, §4TD —
+    the ``is_read_only`` attribute these classes carried for that purpose is
+    gone, so there is one marker and not two).
     """
 
-    is_read_only = True
     _MUTATORS: frozenset = frozenset()
     # Raw writable handles that must never be reachable THROUGH the proxy.
     # ``real`` is always blocked (the underlying store is kept as ``_real``).
@@ -74,7 +74,7 @@ class _ReadOnlyProxy:
 
     def __getattr__(self, name):
         # Only fires for names not found by normal lookup (so the class-level
-        # methods / _MUTATORS / _BLOCKED_ATTRS / is_read_only resolve first).
+        # methods / _MUTATORS / _BLOCKED_ATTRS resolve first).
         if name in self._MUTATORS or _MUTATING_NAME.match(name):
             return self._noop
         if name in self._BLOCKED_ATTRS:
@@ -92,7 +92,7 @@ class ReadOnlyVectorMemory(_ReadOnlyProxy):
         "add", "smart_update", "ingest_document", "process_batch",
         "bump_retrievals", "bump_helpful", "forget_episode",
         "delete_document_by_name", "correct_fragment", "delete_fragment",
-        "delete_by_query", "delete_skill_twins",
+        "delete_by_query",
         # 2026-07-22: `_update_library_index` writes the operator's real
         # library_index.json. `ingest_document` was already blocked (returns
         # None), but tools/memory.py's `tool_gain_knowledge` only checks for a
@@ -134,40 +134,6 @@ class ReadOnlyVectorMemory(_ReadOnlyProxy):
         return real.search_advanced(*a, **kw)
 
 
-class ReadOnlySkillMemory(_ReadOnlyProxy):
-    """Skill playbook: reads pass through, lesson/stat writes are no-ops."""
-
-    _MUTATORS = frozenset({
-        "learn_lesson", "save_playbook", "retract_lessons_from_trajectory",
-        "record_retrieval", "record_helpful_retrieval",
-        "credit_recent_retrievals", "record_retrievals_bulk",
-        "record_surfaced_outcomes",
-        "mark_verified", "remove_by_trigger", "remove_rows",
-        # quarantine_lesson landed 2026-07-17, AFTER the 2026-07-14 façade
-        # hardening — without this entry a delegated sub-agent (e.g. via
-        # counterfactual regression checks) could quarantine a REAL operator
-        # lesson through the façade.
-        "quarantine_lesson",
-        "quarantine_citing",      # §4LC
-        "remove_request_scoped",  # §4LC
-        "write_owner_rule", "remove_owner_rule",   # §4OR: the owner's rule writes
-    })
-
-    def get_playbook_context(self, *a, **kw):
-        """Results pass through, but the two write side-effects are forced
-        OFF: the retrieval-stat bump (`record_retrievals`) — same leak class
-        `ReadOnlyVectorMemory.search` closes — and the
-        `last_playbook_triggers` attribution stamp (`stamp_triggers`), which
-        would otherwise overwrite the OPERATOR turn's hydration record with
-        the sub-agent's lesson set mid-turn."""
-        real = self.__dict__.get("_real")
-        if real is None:
-            return ""
-        kw["record_retrievals"] = False
-        kw["stamp_triggers"] = False
-        return real.get_playbook_context(*a, **kw)
-
-
 class ReadOnlyGraphMemory(_ReadOnlyProxy):
     """Knowledge graph: queries pass through, triple writes are no-ops."""
 
@@ -183,5 +149,5 @@ class ReadOnlyGraphMemory(_ReadOnlyProxy):
 
 
 __all__ = [
-    "ReadOnlyVectorMemory", "ReadOnlySkillMemory", "ReadOnlyGraphMemory",
+    "ReadOnlyVectorMemory", "ReadOnlyGraphMemory",
 ]

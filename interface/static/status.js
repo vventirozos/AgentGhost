@@ -147,8 +147,9 @@ export function initStatus(_ctx) {
         feedFace();
     }
 
-    // The face's slow signals (2026-09-11): the agent's functional mood
-    // (health.mood.label → a baseline hue shift) and whether a turn that
+    // The face's slow signals (2026-09-11): the agent's mood
+    // (health.mood.label → a baseline hue shift, scaled by
+    // health.mood.intensity — §4TC) and whether a turn that
     // is NOT ours holds the lock (a dream / self-play turn → a second,
     // slower breath at the edge). Pure decision in `backgroundBusyFrom`;
     // executed under node.
@@ -164,7 +165,8 @@ export function initStatus(_ctx) {
         if (!face) return;
         try {
             if (typeof face.setMoodHue === 'function') {
-                face.setMoodHue(health && health.mood ? health.mood.label : null);
+                face.setMoodHue(health && health.mood ? health.mood.label : null,
+                                health && health.mood ? health.mood.intensity : null);
             }
             if (typeof face.setBackgroundBusy === 'function') {
                 const res = await fetch('/api/turns', { signal: AbortSignal.timeout(6000) });

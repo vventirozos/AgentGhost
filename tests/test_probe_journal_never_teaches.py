@@ -42,8 +42,7 @@ def _agent():
     journal = MagicMock()
     a.context = types.SimpleNamespace(
         journal=journal, llm_client=None,
-        args=types.SimpleNamespace(model="m", smart_memory=1.0),
-        skill_memory=types.SimpleNamespace(is_read_only=False))
+        args=types.SimpleNamespace(model="m", smart_memory=1.0))
     return a, journal
 
 

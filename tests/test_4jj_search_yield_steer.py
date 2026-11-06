@@ -83,7 +83,7 @@ def _ts(calls, strikes, steered):
         msg={"role": "assistant", "content": ""}, ui_content="",
         parse_failure_reason="", model="test-model",
         last_user_content="find the three facts", char_budget=4000,
-        strikes=strikes, task_tree=MagicMock(),
+        strikes=strikes,
         _user_batch_intent=None, _request_constraints=[],
         repeated_action_steered=steered, messages=[], seen_tools=set(),
         executed_idempotent=set(), raw_tools_called=set(), tool_usage={},

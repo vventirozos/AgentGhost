@@ -47,8 +47,6 @@ def _make_agent(llm_responses=None):
         ctx.llm_client.chat_completion = AsyncMock(side_effect=llm_responses)
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string = MagicMock(return_value="")
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value="")
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.episodic_memory = None

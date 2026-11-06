@@ -86,7 +86,6 @@ async def test_agent_streaming(forced_final, mock_agent):
     mock_agent.context.scratchpad.list_all.return_value = ""
     mock_agent.context.profile_memory = MagicMock()
     mock_agent.context.memory_system = None
-    mock_agent.context.skill_memory = None
 
     def sync_return(): return ""
     mock_agent.context.profile_memory.get_context_string.return_value = sync_return()
@@ -178,7 +177,6 @@ async def test_agent_manage_skills_bypasses_meta_nudge(mock_agent):
     mock_agent.context.scratchpad.list_all.return_value = ""
     mock_agent.context.profile_memory = MagicMock()
     mock_agent.context.memory_system = MagicMock()
-    mock_agent.context.skill_memory = MagicMock()
     
     def sync_return(): return ""
     mock_agent.context.profile_memory.get_context_string.return_value = sync_return()

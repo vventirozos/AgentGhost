@@ -73,7 +73,6 @@ MUT = [
     ('R38 strike-any-run-output', ST, '        return bool(_RUN_COLLECT_HEAD_RE.match(_o.strip()))', '        return True'),
     ('R39 egress-run-free', EG, '    "run": "url_literals",', ''),
     ('R40 replay-may-run', IS, '    "lab", "run",', '    "lab",'),
-    ('R41 macro-may-run', CS, '    "run",           # §4SX D5: a process that keeps running is a turn\'s own work too', ''),
     # review r2
     ('R42 inflight-not-awaited', R, '    if pending:\n        # review r2 M1', '    if False:\n        # review r2 M1'),
     ('R43 inflight-not-registered', R, '        _LEAF_INFLIGHT.setdefault(leaf, set()).add(t)', '        pass'),

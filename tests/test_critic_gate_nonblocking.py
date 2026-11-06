@@ -22,7 +22,6 @@ def agent():
     ctx.args = MagicMock()
     ctx.args.smart_memory = 0.0
     ctx.llm_client = MagicMock()
-    ctx.skill_memory = MagicMock()
     ctx.memory_system = MagicMock()
     ctx.verifier = None
     return GhostAgent(ctx)
@@ -139,66 +138,3 @@ async def test_pure_async_releases_without_waiting(agent, monkeypatch):
     await asyncio.sleep(0)  # let the background task drain
 
 
-@pytest.mark.asyncio
-async def test_late_refuted_scrubs_lessons(agent, monkeypatch):
-    """A REFUTED verdict that lands after the response retracts the turn's
-    lessons via the done-callback."""
-    monkeypatch.delenv("GHOST_CRITIC_GATE_TIMEOUT", raising=False)
-    agent.context.verifier = MagicMock()
-    agent.context.verifier.llm_client = _critic_llm()
-    agent.context.skill_memory = MagicMock()
-
-    last_tool = {"name": "execute", "content": "out"}
-    agent._compute_verifier_verdict = AsyncMock(
-        return_value=(_verdict(VerifyVerdict.REFUTED, conf=0.9, issues=["wrong"]), last_tool)
-    )
-
-    with patch(
-        "ghost_agent.core.agent._find_substantive_tool_for_verifier",
-        return_value=last_tool,
-    ):
-        v_result, lt = await agent._compute_verifier_verdict_gated(
-            tools_run_this_turn=[last_tool],
-            messages=[],
-            final_ai_content="answer",
-            last_user_content="q",
-            lc="q",
-            trajectory_id="traj-1",
-        )
-
-    assert v_result is None  # released unverified
-    # Give the background task + done-callback + to_thread time to run.
-    await asyncio.sleep(0.2)
-    agent.context.skill_memory.retract_lessons_from_trajectory.assert_called_once()
-    args, kwargs = agent.context.skill_memory.retract_lessons_from_trajectory.call_args
-    assert args[0] == "traj-1"
-
-
-@pytest.mark.asyncio
-async def test_late_confirmed_does_not_scrub(agent, monkeypatch):
-    """A late CONFIRMED verdict must NOT retract anything."""
-    monkeypatch.delenv("GHOST_CRITIC_GATE_TIMEOUT", raising=False)
-    agent.context.verifier = MagicMock()
-    agent.context.verifier.llm_client = _critic_llm()
-    agent.context.skill_memory = MagicMock()
-
-    last_tool = {"name": "execute", "content": "out"}
-    agent._compute_verifier_verdict = AsyncMock(
-        return_value=(_verdict(VerifyVerdict.CONFIRMED), last_tool)
-    )
-
-    with patch(
-        "ghost_agent.core.agent._find_substantive_tool_for_verifier",
-        return_value=last_tool,
-    ):
-        await agent._compute_verifier_verdict_gated(
-            tools_run_this_turn=[last_tool],
-            messages=[],
-            final_ai_content="answer",
-            last_user_content="q",
-            lc="q",
-            trajectory_id="traj-1",
-        )
-
-    await asyncio.sleep(0.2)
-    agent.context.skill_memory.retract_lessons_from_trajectory.assert_not_called()

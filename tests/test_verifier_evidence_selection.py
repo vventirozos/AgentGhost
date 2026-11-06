@@ -72,8 +72,8 @@ def test_normalizes_aliases_and_case():
 
 
 def test_known_bookkeeping_set_includes_expected_names():
-    for name in {"manage_projects", "scratchpad", "learn_skill",
-                 "update_profile", "replan"}:
+    for name in {"manage_projects", "scratchpad",
+                 "update_profile", "abort_attempt"}:
         assert name in _BOOKKEEPING_TOOL_NAMES
 
 

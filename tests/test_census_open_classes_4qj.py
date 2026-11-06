@@ -10,7 +10,8 @@ a description. Plain renders (no look) keep the "NOT seen" sentence.
 overview that said health was NOT checked, and "all my recent turns smooth"
 under a mood older than a failed turn. The overview now carries the
 breaker's last-known state of each node (no I/O), and a mood older than a
-listed failed turn says so.
+listed failed turn says so. (§4TC: the derived mood and its "all passed"
+evidence are gone, and that clause with them — see (3b) below.)
 """
 import asyncio
 import datetime as dt
@@ -213,7 +214,14 @@ def test_the_overview_opens_with_the_known_state_under_the_unchecked_line(monkey
     assert first.startswith(I.OVERVIEW_HEALTH_LINE + "\n") and "vision answering" in first
 
 
-# ── (3b) a mood older than a failed turn says so ────────────────────────────
+# ── (3b) the mood line makes no claim about how the turns went ──────────────
+#
+# §4QJ added a clause to a "satisfied — my last 5 verdict-bearing turns all
+# passed" mood that sat above a [failed] turn. §4TC removed the derived mood
+# with its verdict evidence, so there is no such claim to qualify: the line is
+# the label, its intensity and the event that caused it. The clause, its
+# counter (`_failed_listed`) and their four tests went with it; what stays
+# pinned is that the line says nothing about verdicts under a listed failure.
 
 def _iso(minutes_ago):
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes_ago)).isoformat()
@@ -224,42 +232,26 @@ def _exp(outcome, minutes_ago, words="x"):
                            answer_gist="", user_first_words=words)
 
 
-def _model(mood_minutes_ago, exps):
-    stats = {"last_mood": "satisfied", "last_mood_set_at": _iso(mood_minutes_ago),
-             "last_mood_source": "self", "last_mood_evidence": "my last 5 verdict-bearing turns all passed"}
+def _model(stats, exps):
     autobio = SimpleNamespace(recent=lambda **k: list(exps))
-    return SimpleNamespace(enabled=True, stats=lambda: stats, autobio=autobio,
-                           open_questions=lambda *a, **k: [])
+    return SimpleNamespace(enabled=True, stats=lambda: stats, autobio=autobio)
 
 
-def test_a_failed_turn_under_a_satisfied_mood_is_named(monkeypatch):
-    monkeypatch.setattr(I, "_render_carried_state", lambda *a, **k: "")
-    out = I._overview_selfhood(_model(23 * 60, [_exp("passed", 60 * 14, "a"), _exp("failed", 47, "b")]))
-    mood = next(line for line in out.splitlines() if "mood:" in line)
-    assert "satisfied" in mood and "BUT 1 of the turns listed below FAILED" in mood
-    assert "do not say all recent turns went well" in mood
+def test_the_mood_line_claims_nothing_about_the_listed_turns():
+    stats = {"last_mood": "content", "last_mood_intensity": 1, "last_mood_source": "auto",
+             "last_mood_cause": "the owner gave a thumbs-up", "manner": "", "manner_intensity": 0}
+    out = I._overview_selfhood(_model(stats, [_exp("passed", 60 * 14, "a"), _exp("failed", 47, "b")]))
+    lines = out.splitlines()
+    assert lines[1] == "  mood: content, 1 of 3 — the owner gave a thumbs-up"
+    assert "[failed]" in out                                  # the failed turn is still listed
+    assert "passed" not in lines[1] and "FAILED" not in out and "all recent turns" not in out
+    assert not hasattr(I, "_failed_listed")
 
 
-def test_the_mood_restamped_after_the_failure_still_names_it(monkeypatch):
-    """r2 MAJOR 2: the mood is re-derived (and re-stamped) after every turn,
-    and a late verdict back-fills "failed" without moving the turn's time —
-    comparing with set_at never fired."""
-    monkeypatch.setattr(I, "_render_carried_state", lambda *a, **k: "")
-    out = I._overview_selfhood(_model(1, [_exp("failed", 47, "b"), _exp("passed", 5, "c")]))
-    assert "BUT 1 of the turns listed below FAILED" in out
-
-
-def test_no_failed_turn_or_a_non_satisfied_mood_adds_nothing(monkeypatch):
-    monkeypatch.setattr(I, "_render_carried_state", lambda *a, **k: "")
-    assert "FAILED" not in I._overview_selfhood(_model(60, [_exp("passed", 10, "b")]))
-    m = _model(60, [_exp("failed", 10, "b")])
-    m.stats()["last_mood"] = "stuck"
-    assert "listed below FAILED" not in I._overview_selfhood(m)
-
-
-def test_failed_listed_counts_a_collapsed_repeat_once():
-    assert I._failed_listed([(_exp("failed", 5), 3), (_exp("passed", 4), 1)]) == 1
-    assert I._failed_listed([]) == 0
+def test_a_neutral_mood_and_a_manner_each_have_their_line():
+    out = I._overview_selfhood(_model({"last_mood": "", "last_mood_intensity": 0, "manner": "terse",
+                                       "manner_intensity": 2}, []))
+    assert out.splitlines()[1:3] == ["  mood: neutral", "  manner (set by the owner): terse, 2 of 3"]
 
 
 def test_a_pool_listing_one_url_twice_is_one_server():

@@ -46,7 +46,6 @@ def _make_agent(idle_seconds: int = 0,
 
     ctx.profile_memory = MagicMock()
     ctx.scratchpad = MagicMock()
-    ctx.skill_memory = None
     ctx.graph_memory = None
     ctx.sandbox_dir = "/tmp/sandbox"
     ctx.last_activity_time = datetime.datetime.now() - datetime.timedelta(seconds=idle_seconds)

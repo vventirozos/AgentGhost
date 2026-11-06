@@ -131,7 +131,6 @@ MUTANTS = [
     # ── C: API routes, logger ──
     ("R store call inline again", ROUTES, "        ok, detail = await _store_call(memory.correct_fragment, match, replacement)\n", "        ok, detail = memory.correct_fragment(match, replacement)\n"),
     ("R store call unbounded", ROUTES, "        return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=budget)\n", "        return await asyncio.to_thread(fn, *args, **kwargs)\n"),
-    ("R quarantine inline", ROUTES, "        n = int(await _store_call(sm.quarantine_lesson, trigger, reason) or 0)\n", "        n = int(sm.quarantine_lesson(trigger, reason) or 0)\n"),
     ("R timeout answers 500 not 504", ROUTES, '    return JSONResponse({"error": str(exc)}, 504)\n', '    return JSONResponse({"error": str(exc)}, 500)\n'),
     ("R catch_all forwards the key", ROUTES, "    headers = _forwardable_headers(request.headers)\n", '    headers = dict(request.headers)\n    headers.pop("host", None)\n    headers.pop("content-length", None)\n'),
     ("R catch_all not booked", ROUTES, "    await _booking.enter_async_context(_main_node_request(_llm, hold_lock=False))\n", ""),

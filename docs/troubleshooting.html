@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -52,7 +52,7 @@
     <dt>memory_system_loaded</dt>
     <dd><code>false</code> means Ghost booted <strong>degraded</strong>: HTTP answers normally, but there's no memory and every background pass is silently disabled. It will chat with you and remember nothing.</dd>
     <dt>biological_watchdog_alive</dt>
-    <dd><code>false</code> means the background loop — the idle scheduler — died (the key keeps its old name). Ghost still answers, but it has stopped its idle work: maintenance, store hygiene, failure replay and the regression tests. The web status chip shows <em>idle scheduler DEAD</em>; at boot a healthy one logs <code>Idle Scheduler — started; jobs: …</code>. Nothing will tell you this — it just goes quiet.</dd>
+    <dd><code>false</code> means the background loop — the idle scheduler — died (the key keeps its old name). Ghost still answers, but it has stopped its idle work: the memory journal, maintenance, store hygiene and the workspace tidy. The web status chip shows <em>idle scheduler DEAD</em>; at boot a healthy one logs <code>Idle Scheduler — started; jobs: …</code>. Nothing will tell you this — it just goes quiet.</dd>
   </dl>
 
   <h3>Beyond the two fields: the live verification harnesses</h3>
@@ -60,10 +60,10 @@
   <ul>
     <li><code>functional_live_test.py</code> — API, auth, malformed input, sessions, workspace save, then three live turns (<code>--core</code> skips the turns).</li>
     <li><code>tool_probes_live.py</code> — one bounded "reply with only X" prompt per tool family, checked mechanically, with the tool that actually ran read back from the log.</li>
-    <li><code>selfhood_functional_test.py</code> — capture, tool-using turn, the state thread through the <code>self_state</code> tool, narrative, stress, unity. Section G corrupts the live <code>state.json</code> and needs <code>--corrupt-live-state</code>.</li>
+    <li><code>selfhood_functional_test.py</code> — capture, tool-using turn, narrative, stress, unity (the section that drove the removed <code>self_state</code> tool is gone). Section G corrupts the live <code>state.json</code> and needs <code>--corrupt-live-state</code>.</li>
   </ul>
   <p>For the idle loops, <code>scripts/learning_health.py</code> (or <code>introspect action='learning'</code>) is the liveness screen: every registered phase, what its zero means, and a <code>✗ DEAD</code> only for a periodic loop whose heartbeat has not declined recently.</p>
-  <p>The <em>judgment</em> systems — the verifier, the claim binder, escalation — used to be scored against known truth by the night oracle benches (<code>night_bench_round.py</code>, <code>verify_bench*.py</code>, <code>if_bench.py</code>); those scripts and the bench banks were deleted on 2026-10-11 (§4NM). What remains as the standing check is the owner's regression suite (<a href="learning-loop.html">the learning loop</a>): kept tests re-run after every deploy and daily, and a failure is reported.</p>
+  <p>The <em>judgment</em> systems — the verifier, the claim binder, escalation — used to be scored against known truth by the night oracle benches (<code>night_bench_round.py</code>, <code>verify_bench*.py</code>, <code>if_bench.py</code>); those scripts and the bench banks were deleted on 2026-10-11 (§4NM). The owner's regression suite, which replaced them as the standing check from 2026-10-10, was removed on 2026-11-05 (§4SZ): it held no kept test. No standing automatic check of the judgment systems runs now; the failure census (<code>scripts/failure_census.py</code>) and its hand-graded sample are the measurement.</p>
 
   <h2>It won't start</h2>
 
@@ -179,14 +179,35 @@ docker info --format '{{.ServerVersion}}'</pre>
   <h2>The answers are wrong</h2>
 
   <h3>It claims it did something it didn't</h3>
-  <p>The self-check catches only part of this, mechanically: a file the reply says it wrote that is not on disk, a page it built that throws on load, a reply that narrates instead of answering, a picture that does not show what the reply says. When the file, page or reply check fails within about 15 seconds, the reply gets one repair round before it is sent; otherwise the failure is recorded (and can seed a failure replay), and you are generally not shown a correction. Other false claims are not checked: the LLM judge that read answers against the evidence is off since §4OW (2026-10-14). Correct it, or give it a 👎.</p>
+  <p>The self-check catches only part of this, mechanically: a file the reply says it wrote that is not on disk, a page it built that throws on load, a reply that narrates instead of answering, a picture that does not show what the reply says. When the file, page or reply check fails within about 15 seconds, the reply gets one repair round before it is sent; otherwise the failure is recorded with the turn, and you are generally not shown a correction. Other false claims are not checked: the LLM judge that read answers against the evidence is off since §4OW (2026-10-14). Correct it, or give it a 👎.</p>
   <p>If the mechanical checks seem not to run at all, confirm they are on: <code>--no-verifier</code> disables them.</p>
 
   <h3>It answers a different question than the one asked</h3>
-  <p>Tell it. Corrections are a strong signal — they mark the turn as failed, and a failed turn of yours can be replayed by the <a href="learning-loop.html">learning loop</a>, which may propose a rule and a regression test. A correction needs a recognisable correction phrase and real overlap with your previous message, so "no, I asked for the file paths, not the counts" registers where a fresh unrelated question doesn't.</p>
+  <p>Tell it. A correction marks the previous turn as failed, and that label is kept with the turn. A correction needs a recognisable correction phrase and real overlap with your previous message, so "no, I asked for the file paths, not the counts" registers where a fresh unrelated question doesn't. The label does not change later answers by itself (the loop that replayed failed turns and proposed a rule was removed on 2026-11-05). If the same mistake keeps coming back, state a rule: <em>"learn this rule: …"</em> puts your sentence into every prompt of yours (<a href="learning-loop.html">Owner rules</a>).</p>
 
   <h3>It got worse after learning something</h3>
-  <p>Only rules you adopted change its behaviour now. Say <em>"show all rules"</em>, then <em>"forget rule N"</em> and <em>"confirm forget rule N"</em> for the one that hurts. If you keep regression tests, a rule that breaks one is flagged in its proposal, before you adopt it. <a href="learning-loop.html">The learning loop →</a></p>
+  <p>Only rules you stated change its behaviour now. Say <em>"show my rules"</em>, then <em>"forget rule N"</em> and <em>"confirm forget rule N"</em> for the one that hurts. <a href="learning-loop.html">Owner rules →</a></p>
+
+  <h3>"Your rules file … so I left it exactly as it is"</h3>
+  <p>The rules file, <code>$GHOST_HOME/system/owner_rules.json</code>, is damaged or cannot be read. Ghost does not rename, replace or rewrite it. Until it reads again, no rule is in your prompts and every rule command answers with this line, which names what is wrong (for example "is not readable JSON", "holds two rules numbered 3", or "holds more than 10 rules" after an edit by hand). A directory in the file's place counts as damage too ("cannot be read (IsADirectoryError)"). So does a key written twice in the file ("is not readable JSON"), and a row with a blank rule text or a rule number above 999,999 ("holds a row that is not a rule"). The health check's <em>Learning</em> line says <code>owner rules file DAMAGED (…)</code>. Repair the file, or remove it to start with no rules. <a href="learning-loop.html#damaged">A damaged rules file →</a></p>
+
+  <h3>"I could not write your rules file … so nothing was changed"</h3>
+  <p>The rules file reads fine, but Ghost could not save a change to it. The line names the error, for example <code>PermissionError</code> (the <code>system</code> folder is read-only) or <code>OSError</code> (the disk is full). The rules you had are intact and nothing was added or removed. Fix the folder or free space, then send the command again. <a href="learning-loop.html#write-failure">When the file cannot be written →</a></p>
+
+  <h3>"delete rule 3" or "add rule: …" did nothing</h3>
+  <p>Those are not commands. Only the exact messages change a rule: <em>"learn this rule: …"</em>, <em>"forget rule N"</em> then <em>"confirm forget rule N"</em>, and <em>"forget all my rules"</em> then <em>"confirm forget all my rules"</em>. A short message about your rules that is none of these ("delete rule 3", "add rule: …", "new rule: …", "erase rule 2", "reset my rules") goes to the model, which is told that nothing was changed and which message to send. A message in Greek, or one longer than 20 words, reaches the model without that note. The old commands of the replay loop ("learn rule N", "dismiss rule N", "show me all proposed rules") are in the same group: they do nothing. <a href="learning-loop.html#commands">The commands →</a></p>
+
+  <h3>"show all rules" did not list my rules</h3>
+  <p>The list command needs "my": <em>"show my rules"</em> (also "list my rules", "show all my rules"). "show all rules" and "list all rules" stopped being commands on 2026-11-05 (review r3), because that is also what one says about a firewall or a linter. They go to the model, which is told to answer with the message to send.</p>
+
+  <h3>"learn this rule …" was not stored</h3>
+  <p>A dictated rule needs a colon after "this rule" (not a comma, a full stop or a dash), has to be one line, the message may not open with a quote mark, and the rule may not hold a question mark anywhere (or end with ";"). A rule that quotes a question, such as "when I ask 'what's new?' give five headlines", is not taken: write it without the question mark. Otherwise the message goes to the model, which is told that nothing was stored. Send the rule alone: <em>"learn this rule: answer in English"</em>. <a href="learning-loop.html#dictating">The four conditions →</a></p>
+
+  <h3>A rule holds more than I meant</h3>
+  <p>One line that states a rule and also asks for something else ("learn this rule: answer in English, and now tell me the weather") is stored whole, and the second request is not answered. The reply quotes what was stored. Say <em>"forget rule N"</em>, then <em>"confirm forget rule N"</em>, and dictate the rule alone.</p>
+
+  <h3>I said "yes" and the rule is still there</h3>
+  <p>A forget is confirmed only by the exact message Ghost asks for: <em>"confirm forget rule N"</em> (or <em>"confirm forget all my rules"</em>), within 15 minutes. A bare "yes" or "ok" removes nothing, because it may be answering something else; while the preview is still waiting, the model is told that nothing was removed and to answer with the message to send. <a href="learning-loop.html#bare-yes">A bare "yes" confirms nothing →</a></p>
 
   <h2>Reading the log</h2>
 
@@ -300,7 +321,7 @@ grep "\[SYSTEM\]" "$GHOST_HOME/system/ghost-agent.log" | tail -40</pre>
 2026-08-04 19:35:24 - GhostStream - INFO  - [1165839c +7.79s] system weather — Location: Reykjavik
 2026-08-04 20:10:41 - GhostStream - INFO  - [SYSTEM] memory journal — read 1 memory</pre>
 
-  <p><code>[SYSTEM]</code> in place of a request id means the agent did that on its own — background work, not something you asked for. Filtering on it is the quickest way to see what the idle scheduler has been doing; each idle pass that did work leaves one <code>idle cycle — ran …</code> line, ending with the failure-replay slot's result when that slot ran.</p>
+  <p><code>[SYSTEM]</code> in place of a request id means the agent did that on its own — background work, not something you asked for. Filtering on it is the quickest way to see what the idle scheduler has been doing; each idle pass that did work leaves one <code>idle cycle — ran …</code> line.</p>
 
   <div class="note warn">
     <strong>The log is redacted by default.</strong> Secrets, API keys, <code>.onion</code> addresses, home directory paths and personal details are masked in both sinks, because the log is the thing you leave on screen. If you're chasing a bug and need to see the raw content, <code>--no-redact-logs</code> turns it off — and should be turned back on afterwards.
@@ -324,7 +345,7 @@ grep "\[SYSTEM\]" "$GHOST_HOME/system/ghost-agent.log" | tail -40</pre>
       </li>
       <li>
         <h4>Is the idle work alive?</h4>
-        <p>Ask it: <em>"is your learning working?"</em> (or run <code>scripts/learning_health.py</code>). That reports whether the idle passes — maintenance, failure replay, regression tests — are actually running and succeeding, which absence of errors will not tell you.</p>
+        <p>Ask it: <em>"is your learning working?"</em> (or run <code>scripts/learning_health.py</code>). That reports whether the idle passes are actually running and succeeding, which absence of errors will not tell you. Only maintenance is expected to leave a regular heartbeat; the other jobs record a row when they had something to do.</p>
       </li>
       <li>
         <h4>What does it think is broken about itself?</h4>

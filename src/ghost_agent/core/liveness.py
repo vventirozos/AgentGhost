@@ -566,7 +566,8 @@ def render(ghost_home: Optional[Path] = None) -> str:
 #   * The macro loop ran for six weeks. Dream fired on schedule, mined
 #     sequences, minted 25 composed skills. Every probe above would have
 #     read FIRED. Invocations across every auto-mined macro, all time: 0.
-#     Nothing anywhere said so (§4CS).
+#     Nothing anywhere said so (§4CS). (The miner was removed 2026-10-11
+#     and the macro engine itself on 2026-11-05, §4TA — the axis stays.)
 #   * §4CH found dream ledgering a CONSTANT for its busiest subsystem —
 #     919 identical rows — which is the same failure wearing a number.
 #
@@ -587,7 +588,7 @@ def render(ghost_home: Optional[Path] = None) -> str:
 # BARREN vs UNMEASURED is the whole point, and it is the same distinction
 # `probe_all` draws between ZERO and NO_SOURCE one level up. A view that
 # printed "invoked: 0" for both would have said the same thing about the
-# macro loop (genuinely barren, and fixable) and the graduated-skill loop
+# (since removed) macro loop (genuinely barren, and fixable) and the graduated-skill loop
 # (injected into the prompt on every matching turn, but with no counter
 # anywhere) — opposite problems, opposite remedies.
 
@@ -644,8 +645,8 @@ RETIRED = "retired"
 # see the pathology.
 #
 # NOTHING NEW IS RECORDED. Every store already carries the per-item
-# counter that `invoked` sums (`retrievals` on lessons and graduated
-# skills, `usage_count` on macros and acquired skills). This is a second
+# counter that `invoked` sums (`usage_count` on acquired skills; the lesson
+# store's `retrievals` went with it, §4TD). This is a second
 # statistic over the SAME vector, which is why `total` must equal the
 # row's `invoked` — pinned, because a spread computed over a different
 # population than the row describes would be a plausible lie.
@@ -687,9 +688,9 @@ class Spread:
     four places before a reviewer executed it. The claim was "scoring
     over all 29 would report 100% top-1 for a store with one runnable
     item". Top-1 SHARE is `top1 / total` and is INVARIANT to adding
-    zero-count items — measured on the live macro shape, eligible-only
-    and all-29 both give `top1_share = 1.0`. (There are also three
-    runnable macros, not one.)
+    zero-count items — measured on the (since removed, §4TA) macro store's
+    shape, eligible-only and all-29 both give `top1_share = 1.0`. (There
+    were also three runnable macros, not one.)
 
     What the eligible population actually changes is everything ELSE:
     `coverage` (0.333 vs 0.034), the UNDERPOWERED floor (`5*n` = 15 vs
@@ -717,7 +718,7 @@ def _eligible_counts(rows, count_of, eligible_now) -> List[int]:
 
     The union half is not generosity, it is an INVARIANT. `invoked` is
     summed over every row the probe owns; if an item was retrieved while
-    active and later demoted (a macro un-approved, a skill degraded), a
+    active and later demoted (a skill degraded), a
     "currently eligible" population would drop its retrievals from `total`
     while the row still counts them in `invoked` — and a spread computed
     over a different population than its own row is exactly the kind of
@@ -816,7 +817,7 @@ def _spread(counts: List[int]) -> Spread:
     # broken retriever with a false claim (5 is not more than 5).
     # Exhaustively checked: under `>=`, DISTRIBUTED was UNREACHABLE at
     # n == 2 for every total from 1 to 2000 — a dead verdict on an
-    # ordinary store shape (two active skills, two approved macros). The
+    # ordinary store shape (two active skills). The
     # operator now matches the sentence.
     if sp.top1_share > _SPREAD_TOP1_BAR:
         sp.verdict = CONCENTRATED
@@ -854,9 +855,9 @@ class YieldResult:
     #: stand in for one.
     status: Optional[str] = None
     #: ⚠ REVIEW ROUND 2. BARREN's contract is "measurable, and MEASURED at
-    #: zero", and a live member violated it: the macro loop's zero is
-    #: structural (a `proposed` macro is not advertised and cannot be
-    #: run). An operator triaging "produce
+    #: zero", and a live member violated it: the macro loop's zero was
+    #: structural (a `proposed` macro was not advertised and could not be
+    #: run; that row is gone, §4TA). An operator triaging "produce
     #: artifacts NOBODY INVOKES" concludes the artifacts are being ignored;
     #: the truth is they are BLOCKED UPSTREAM, which is a different remedy.
     #: Same BARREN/UNMEASURED distinction, one level finer.
@@ -894,7 +895,8 @@ def _yield_status(res: "YieldResult") -> str:
         return NO_SOURCE
     # ⚠ REVIEW ROUND 2: this test used to sit BELOW the `invoked is None`
     # one, so EMPTY was unreachable for every probe whose invocation
-    # channel is unmeasured. An empty `auto_skills.json` rendered
+    # channel is unmeasured. An empty store (the since-removed
+    # `auto_skills.json`) rendered
     # "1 loop(s) have artifacts but NO durable use counter" — asserting
     # artifacts for a store that has none. "No artifacts" outranks "no
     # counter for the artifacts": with nothing minted, the missing counter
@@ -919,120 +921,9 @@ def _read_json(home: Path, rel: str):
         return None
 
 
-#: The two auto-mint producers stamp their own `trigger_description`
-#: (core/dream.py's miner and the former skills_auto graduation mint). Provenance
-#: is asked of THAT, not of the name alone: `manage_composed_skills(
-#: action="define")` accepts any identifier, `auto_foo` included, so an
-#: operator- or model-defined macro would otherwise be booked as loop
-#: output — and ITS invocations would make a barren loop read YIELDING.
-#: Measured 2026-08-23: prefix and description agree on 26 of 26 live rows.
-#: ⚠ REVIEW ROUND 2: these were COPIES of the producers' strings, with
-#: nothing linking them. Rewording either producer — a pure refactor —
-#: made the loop's own output invisible AND made the row assert a
-#: fabricated provenance fact ("2 hand-written macro(s) excluded" about
-#: two macros the loop had just minted), with the suite green. That is
-#: this project's "token pins vs executed pins" and "lexical proxy for a
-#: semantic property" lessons committed inside the fix for them.
-#:
-#: Both producers now BUILD their `trigger_description` from these, so
-#: there is one definition and it cannot drift. `tools/composed_skills.py`
-#: imports them; `core/dream.py` and `core/agent.py` interpolate them.
-def _macro_marks():
-    """The two producer stamps, from the module the PRODUCERS import.
-
-    They live in `tools/composed_skills` because both producers already
-    import it to build their description; a copy here is what drifted.
-    """
-    from ..tools.composed_skills import (
-        MACRO_MARK_GRADUATED, MACRO_MARK_MINED,
-    )
-    return MACRO_MARK_MINED, MACRO_MARK_GRADUATED
-
-
-def _is_loop_minted_macro(key, row) -> bool:
-    """Is this stored macro THIS LOOP's output?
-
-    Asked of the producer's own stamp, not of the name: `action="define"`
-    accepts any valid identifier including `auto_*`, so a hand-defined
-    macro would otherwise be booked as loop output and ITS invocations
-    would make a barren loop read YIELDING.
-    """
-    if not isinstance(row, dict) or not str(key).startswith("auto_"):
-        return False
-    desc = str(row.get("trigger_description") or "").lower()
-    try:
-        mined, graduated = _macro_marks()
-    except Exception:                                       # noqa: BLE001
-        return False        # cannot tell provenance ⇒ do not claim it
-    return mined.lower() in desc or graduated.lower() in desc
-
-
-def _yield_macros(home: Path) -> YieldResult:
-    """Composed-skill macros, AUTO-MINED ONLY.
-
-    The auto-mined subset is the loop's own output. Counting the hand-made
-    macros with it is how a barren loop hides: on 2026-08-23 the store read
-    26 macros / 3 invocations, and every one of those invocations belonged
-    to the single hand-written `youtube_transcribe`. The loop's true figure
-    was 25 minted / 0 activated / 0 invoked.
-    """
-    data = _read_json(home, "system/memory/composed_skills/composed_skills.json")
-    if not isinstance(data, dict):
-        return YieldResult(note="composed_skills.json absent or unreadable")
-    auto = {k: v for k, v in data.items() if _is_loop_minted_macro(k, v)}
-    malformed = sum(1 for v in data.values() if not isinstance(v, dict))
-    hand = sum(1 for k, v in data.items()
-               if isinstance(v, dict) and not _is_loop_minted_macro(k, v))
-    invoked = sum(int(v.get("usage_count") or 0) for v in auto.values())
-    succeeded = sum(int(v.get("success_count") or 0) for v in auto.values())
-    # `_parse_ts`, like every peer probe. A raw `float()` raised
-    # ValueError on an ISO stamp — the shape `auto_skills.json` writes for
-    # the same concept — and the whole row rendered `no_source`
-    # ("probe raised: ValueError"): a populated store reported as missing.
-    last = max((_parse_ts(v.get("last_used")) or 0.0 for v in auto.values()),
-               default=0.0)
-    parked = sum(1 for v in auto.values() if v.get("status") != "active")
-    note = (f"{hand} hand-written macro(s) excluded — they are not this "
-            f"loop's output")
-    if parked:
-        # ⚠ REVIEW ROUND 1: with every macro at "proposed" this zero is
-        # DERIVED, not observed. A proposed macro is not advertised, not
-        # dispatchable, and `action='run'` refuses it — `usage_count`
-        # CANNOT be non-zero. Saying so keeps the row honest: the finding
-        # is the unapproved backlog, not an ignored tool.
-        note += (f"; {parked} still 'proposed' — a proposed macro is not "
-                 f"advertised and cannot be run, so their zero is DERIVED, "
-                 f"not observed. Approve with "
-                 f"manage_composed_skills(action='approve')")
-    if invoked:
-        note += f"; {succeeded}/{invoked} invocations succeeded"
-    if malformed:
-        note += f"; ⚠ {malformed} unreadable row(s) skipped"
-    active = sum(1 for v in auto.values() if v.get("status") == "active")
-    return YieldResult(
-        minted=len(auto),
-        activated=active,
-        invoked=invoked,
-        last_invoked=last or None,
-        note=note,
-        # ELIGIBLE = active (∪ anything already invoked). A `proposed`
-        # macro is not advertised and `action='run'` refuses it, so it
-        # cannot appear in the denominator of "where did the retrievals
-        # go" — scoring over all 29 would report 100% top-1 about a store
-        # with one runnable macro, which is the derived-zero error
-        # transplanted into the new axis.
-        spread=_spread(_eligible_counts(
-            auto.values(),
-            lambda v: v.get("usage_count"),
-            lambda v: v.get("status") == "active")),
-        # ⚠ REVIEW ROUND 2: with NOTHING approved this zero is structural,
-        # not measured — a proposed macro is not advertised, not
-        # dispatchable, and `action='run'` refuses it, so `usage_count`
-        # CANNOT be non-zero. "Nobody invokes them" sends an operator
-        # looking for a consumer; the remedy is the approval queue.
-        derived_zero=("no macro is approved, so none can be invoked"
-                      if auto and not active else ""),
-    )
+# (The `macros.auto_mined` row — `_yield_macros`, `_is_loop_minted_macro`,
+# `_macro_marks` — went with the macro engine, §4TA 2026-11-05. The old
+# `composed_skills/composed_skills.json` is no longer read by anything.)
 
 
 def _yield_acquired_skills(home: Path) -> YieldResult:
@@ -1071,56 +962,8 @@ def _yield_acquired_skills(home: Path) -> YieldResult:
     )
 
 
-def _yield_lessons(home: Path) -> YieldResult:
-    """The lesson playbook — the one loop with a full outcome channel."""
-    data = _read_json(home, "system/memory/skills_playbook.json")
-    if not isinstance(data, list):
-        return YieldResult(note="skills_playbook.json absent or unreadable")
-    all_rows = [v for v in data if isinstance(v, dict)]
-    # ⚠ REVIEW ROUND 1: quarantine is RETENTION WITHOUT SERVICE. The row
-    # stays in the playbook so an operator can see it, and
-    # `_filter_quarantined` is applied at BOTH retrieval surfaces, so a
-    # quarantined lesson can never be retrieved again. Counting them made
-    # 278 of 926 retrievals (30%) dead history reported as live yield.
-    served = [v for v in all_rows if not v.get("quarantined")]
-    quarantined = len(all_rows) - len(served)
-    rows = served
-    malformed = len(data) - len(all_rows)
-    retr = sum(int(v.get("retrievals") or 0) for v in rows)
-    helpful = sum(int(v.get("helpful_retrievals") or 0) for v in rows)
-    last = max((_parse_ts(v.get("last_retrieved_at")) or 0.0 for v in rows),
-               default=0.0)
-    never = sum(1 for v in rows if not int(v.get("retrievals") or 0))
-    note = (f"{helpful}/{retr} retrievals marked helpful; {never} lesson(s) "
-            f"never retrieved")
-    if quarantined:
-        note += (f"; {quarantined} quarantined row(s) excluded — retained "
-                 f"for an operator to see, filtered out of every retrieval")
-    if malformed:
-        note += f"; ⚠ {malformed} unreadable row(s) skipped"
-    return YieldResult(
-        # ⚠ REVIEW ROUND 2: `minted` was the SERVED count, so a store whose
-        # rows were ALL quarantined rendered "minted NOTHING yet" — the
-        # most alarming state this store can be in shown as its most
-        # benign, in a project with a history of mass lesson destruction.
-        # It also made `minted` mean "produced AND still served" for this
-        # one probe and "produced" everywhere else. Minted is produced.
-        minted=len(all_rows),
-        activated=len(rows) - never,
-        invoked=retr,
-        last_invoked=last or None,
-        note=note,
-        derived_zero=("every lesson is quarantined, so none can be "
-                      "retrieved" if all_rows and not rows else ""),
-        # ELIGIBLE = SERVED, i.e. not quarantined — `_filter_quarantined`
-        # runs at both retrieval surfaces, so a quarantined lesson can
-        # never be drawn again. Scoring over `all_rows` would credit the
-        # store with a tail that is structurally unreachable, and read as
-        # poor coverage when the truth is deliberate withdrawal. This
-        # mirrors `invoked`, which is already summed over `rows`.
-        spread=_spread(_eligible_counts(
-            rows, lambda v: v.get("retrievals"), lambda v: True)),
-    )
+# (The `lessons.playbook` row — `_yield_lessons` — went with the lesson store,
+# §4TD 2026-11-06. An old `skills_playbook.json` is no longer read by anything.)
 
 
 #: ⚠ REVIEW ROUND 2 rewrote this signal three times over.
@@ -1379,21 +1222,11 @@ def _human_labels(home: Path) -> Dict[str, str]:
 
 
 YIELD_PROBES: List[YieldProbe] = [
-    YieldProbe("macros.auto_mined",
-               "system/memory/composed_skills/composed_skills.json",
-               _yield_macros,
-               activated_means="status == active (operator-approved)",
-               invoked_means="usage_count summed over auto-mined macros"),
     YieldProbe("skills.acquired",
                "system/memory/acquired_skills/skills_registry.json",
                _yield_acquired_skills,
                activated_means="status == active (a degradation flag — see note)",
                invoked_means="usage_count summed (excludes 'infra' results)"),
-    YieldProbe("lessons.playbook",
-               "system/memory/skills_playbook.json",
-               _yield_lessons,
-               activated_means="retrieved at least once",
-               invoked_means="retrievals summed"),
     YieldProbe("prompts.gepa",
                "system/optim/*.json",
                _yield_gepa,

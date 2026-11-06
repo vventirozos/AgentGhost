@@ -158,30 +158,6 @@ def test_vector_memory_concurrent_add_and_search_serialised():
 # ============================================================ SkillMemory
 
 
-def test_skill_memory_lazy_lock():
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory.__new__(SkillMemory)
-    lock = sm._get_lock()
-    assert lock is not None
-    lock.acquire(); lock.release()
-
-
-def test_skill_memory_get_playbook_uses_snapshot(tmp_path):
-    """get_playbook_context releases the file lock before consuming the
-    playbook contents — verify that a concurrent write to the file mid-
-    iteration doesn't corrupt the result."""
-    import json
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook([{"task": "t1", "mistake": "m1", "solution": "s1"}])
-
-    out = sm.get_playbook_context()
-    assert "t1" in out
-    assert "m1" in out
-    assert "s1" in out
-
-
 # ============================================================ stream timeout
 
 

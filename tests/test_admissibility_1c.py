@@ -31,55 +31,6 @@ def _traj(kind, stamp=None, outcome="passed"):
 # R1 review fixes — behavioral pins
 # ──────────────────────────────────────────────────────────────────────
 
-class TestHydratedLessonsStamp:
-    def _record(self, ctx_extra):
-        from ghost_agent.core.agent import GhostAgent
-
-        class _Col:
-            def __init__(self):
-                self.appended = []
-
-            def append(self, traj):
-                self.appended.append(traj)
-                return Path("/dev/null")
-
-        col = _Col()
-        ctx = types.SimpleNamespace(
-            trajectory_collector=col, self_model=None, profile_memory=None,
-            _recent_trajectories_for_correction=None, **ctx_extra)
-        agent = GhostAgent.__new__(GhostAgent)
-        agent.context = ctx
-        agent._record_turn_trajectory(
-            messages=[{"role": "user", "content": "solve it"},
-                      {"role": "assistant", "content": "done"}],
-            final_content="done", req_id="rH", model="m",
-            user_request="solve it")
-        return col.appended[0]
-
-    def test_bench_records_never_carry_the_real_turns_lessons(self):
-        # R5 review MAJOR: the read-only wrapper passed
-        # last_playbook_triggers through, so bench trajectories were
-        # stamped with the LAST REAL TURN's lesson set as their own
-        # hydration — counterfactual-attribution poison.
-        sm = types.SimpleNamespace(
-            is_read_only=True,
-            last_playbook_triggers=["real lesson trigger"])
-        traj = self._record({
-            "trajectory_task_kind": "bench",
-            "turn_origin_label": "bench",
-            "skill_memory": sm,
-        })
-        assert traj.task_kind == "bench"
-        assert "hydrated_lessons" not in (traj.extra or {})
-
-    def test_real_turns_still_stamp_their_hydration(self):
-        sm = types.SimpleNamespace(
-            is_read_only=False,
-            last_playbook_triggers=["real lesson trigger"])
-        traj = self._record({"skill_memory": sm})
-        assert (traj.extra or {}).get("hydrated_lessons") == \
-            ["real lesson trigger"]
-
 
 class TestSourceWindowPins:
     # Honest window pins for one-line guards whose behavioral harnesses
@@ -104,22 +55,3 @@ class TestSourceWindowPins:
         window = src[i:i + 1200]
         assert 'turn_origin(self.context) == "user"' in window
 
-    def test_playbook_triggers_stay_off_the_readonly_passthrough(self):
-        # R6: this R5 fix was revertible with 297 tests green (the belt
-        # caught the observable effect, but the fix itself was unpinned).
-        # The passthrough serving the LAST REAL TURN's lesson set to sim
-        # reads is the root cause; it must stay denied.
-        #
-        # §4CL S1: the façade moved to `core/isolation.py`, and the pin
-        # moved from a source-window grep to the executed contract — a
-        # sim read of that attribute must RAISE, not serve.
-        import pytest as _pytest
-        from unittest.mock import MagicMock
-        from ghost_agent.core.isolation import ReadOnlySkillMemory
-
-        assert "last_playbook_triggers" not in (
-            ReadOnlySkillMemory._SAFE_PASSTHROUGH)
-        real = MagicMock()
-        real.last_playbook_triggers = ["a-real-users-lesson"]
-        with _pytest.raises(AttributeError, match="passthrough whitelist"):
-            ReadOnlySkillMemory(real).last_playbook_triggers

@@ -24,19 +24,6 @@ def production(monkeypatch):
 
 # ── lesson writers ────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("source,written", [
-    ("dream", False), ("dream_pattern", False), ("distilled", False), ("self_play", False),
-    ("bench", False), ("reflection", False), ("journal_postmortem", False), ("episode", False),
-    ("perfection_protocol", False), ("", False),
-    ("learn_skill", True), ("operator_repair", True),
-])
-def test_only_the_owners_and_the_operators_lessons_are_written(tmp_path, production, source, written):
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    t = f"when checking a disk quota on a {source or 'blank'} host"
-    w = sm.learn_lesson(t, "guessed the number", "Run df -h and quote the line.", trigger=t, source=source)
-    assert (w is not None) is written
-
 
 def _fn(module, name):
     tree = ast.parse(inspect.getsource(module))
@@ -101,13 +88,6 @@ def test_store_maintenance_still_runs_without_rem():
 def test_store_maintenance_runs_at_most_every_six_hours_on_the_skip_path():
     from ghost_agent.core.dream import Dreamer
     assert Dreamer.STORE_MAINTENANCE_EVERY_S == 6 * 3600
-
-
-def test_a_refused_perfect_it_lesson_logs_no_save(monkeypatch, production):
-    from ghost_agent.core import agent
-    src = ast.unparse(_fn(agent, "_perfect_it_generate_and_learn"))
-    # §4NV: the source is refused since §4NC, so there is no "saved" line at all
-    assert "Saved optimization strategy" not in src and "Internal Learning" not in src
 
 
 def test_owner_facts_still_reach_a_question_about_the_owner(production):

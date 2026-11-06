@@ -181,10 +181,9 @@ async def test_no_scope_is_autopilot(tmp_path, fake):
     assert fake.calls[0].origin == "autopilot"
 
 
-@pytest.mark.parametrize("origin", ["member", "replay"])
-async def test_members_and_replays_never_reach_a_lab(tmp_path, fake, scope, origin):
+async def test_a_member_never_reaches_a_lab(tmp_path, fake, scope):
     c = _ctx(tmp_path)
-    scope(c, origin)
+    scope(c, "member")
     r = await L.tool_lab(c, action="templates")
     assert r.status is OutcomeStatus.REJECTED and "not_allowed" in r
     assert fake.calls == []
@@ -628,8 +627,7 @@ def test_replays_cannot_call_it():
 def test_members_and_leaves_are_not_given_it():
     from ghost_agent.core import agent as A
     assert "lab" not in A._MEMBER_ALLOWED_TOOLS
-    from ghost_agent.tools.composed_skills import MACRO_FORBIDDEN_STEP_TOOLS
-    assert "lab" in MACRO_FORBIDDEN_STEP_TOOLS
+    # (the macro-step deny list this also checked went with the macro engine, §4TA)
 
 
 def test_loop_sets_know_it_is_program_output_and_work():
@@ -645,7 +643,6 @@ def test_schema_actions_match_the_dispatch():
     assert props["action"]["enum"] == list(L.ACTIONS)
     assert props["op"]["enum"] == list(L.MEMBER_OPS)
     assert "detach" not in json.dumps(L.LAB_TOOL_DEFINITION)      # no detached exec in Phase B
-
 
 
 # ------------------------------------------------------------------ review r1 fixes
@@ -1163,7 +1160,6 @@ async def test_a_probe_destroys_only_its_own_labs(tmp_path, fake, scope):
     assert r.status is OutcomeStatus.OK
 
 
-
 async def test_r3_minors(tmp_path, fake, scope):
     from ghost_agent.memory.lab_inventory import inventory_for
     from ghost_agent.core.evidence_gate import _empty_reason
@@ -1194,7 +1190,6 @@ async def test_r3_minors(tmp_path, fake, scope):
     assert _looks_like_tool_error(f"[{LAB}/web:80/] no answer yet: ConnectionRefusedError", "lab")
 
 
-
 async def test_r4_pins(tmp_path, fake, scope, monkeypatch):
     from ghost_agent.memory.lab_inventory import inventory_for
     from ghost_agent.distill.outcome_heuristics import _looks_like_tool_error
@@ -1221,7 +1216,6 @@ async def test_r4_pins(tmp_path, fake, scope, monkeypatch):
     row = f"[{LAB}/db no exit code 1s]\nSTDOUT:\nEXIT CODE: 1\n"
     assert not _looks_like_tool_error(row, "lab")
     assert _empty_reason("lab", {}, row, False) == "lab: no answer"
-
 
 
 def test_r5_a_lab_drop_note_names_the_file_that_did_land():

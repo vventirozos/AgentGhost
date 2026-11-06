@@ -22,7 +22,6 @@ def mock_context():
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     context.memory_system = None
-    context.skill_memory = None
     context.llm_client = MagicMock()
     context.llm_client.swarm_clients = None
     return context

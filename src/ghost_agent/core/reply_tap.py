@@ -23,6 +23,11 @@ it is generated, under these rules:
   extends what was sent exactly (the rest goes out) or it does not: a
   ``ghost.retract`` frame tells the client to drop what it showed, and the
   whole reply follows. A new generation after shown text retracts first.
+  When the one change is reply smoothing's own trim (the finalize reports it,
+  §4TE), the frame also says ``trimmed`` and ``tail_chars``: a client that cannot
+  erase keeps what it printed and prints only that many characters from the
+  end of the reply. Never inferred from a diff: a review found that a removed
+  "3 failed." reads exactly like removed narration.
 
 The tap is created by the chat route for an owner's streamed request and
 reached through ``reply_tap_context``; the agent only feeds it. No tap — the
@@ -53,7 +58,6 @@ _BASIC_UNSAFE_RE = re.compile(
 #: (r2: re-scanning the whole buffer on every delta was quadratic)
 _SCAN_OVERLAP = 96
 FRAME_CHARS = 15
-
 
 def _default_unsafe(text: str) -> bool:
     """The agent's shared detector when it is loaded (always, in the
@@ -104,6 +108,7 @@ class ReplyTap:
         self._qf = None             # the generation's MarkerFilter
         self._qf_len = 0
         self._qf_seen = ""
+        self._trims: List[str] = []   # §4TE: the reply through finalize's reported trims
 
     def set_lead(self, text: str) -> None:
         """§4MU: the finalize prepends a staged block (a deferred correction
@@ -114,6 +119,16 @@ class ReplyTap:
         self.lead = str(text or "")
 
     # ── the agent's side ──────────────────────────────────────────────
+    def note_trim(self, before: str, after: str) -> None:
+        """§4TE: finalize's reply smoothing changed ``before`` into ``after``.
+        Consecutive trims chain; an unreported edit between two starts over, so
+        the earlier text can no longer explain the screen."""
+        before, after = str(before or ""), str(after or "")
+        if self._trims and self._trims[-1] == before:
+            self._trims.append(after)
+        else:
+            self._trims = [before, after]
+
     def bind(self, req_id: str) -> None:
         """The id the turn was filed under (a colliding client id is renamed
         `id#2` by the turn registry — r2: frames carried the route's)."""
@@ -196,7 +211,12 @@ class ReplyTap:
         else:
             had_sent = bool(self.sent)
             if had_sent:
-                out.append(self._retract_frame("the reply was rewritten"))
+                _tail = self._trim_tail(_shown, final_text)
+                if _tail is None:
+                    out.append(self._retract_frame("the reply was rewritten"))
+                else:       # §4TE: a client that cannot erase need not reprint
+                    out.append(self._retract_frame("narration trimmed", {
+                        "trimmed": True, "tail_chars": len(_tail)}))
             rest = final_text
             outcome = "retracted" if (had_sent or self.retracts) else "not streamed"
         if not self._role_sent:
@@ -215,6 +235,32 @@ class ReplyTap:
         return [self._retract_frame("a streamed final follows")] if self.sent else []
 
     # ── internals ─────────────────────────────────────────────────────
+    def _client_view(self, text: str) -> str:
+        """``text`` as the client is shown it (quote markers hidden)."""
+        if not self.quote_view:
+            return text
+        from .quote_bound import MarkerFilter
+        f = MarkerFilter()
+        f.feed(text)
+        f.finish()
+        return f.text()
+
+    def _trim_tail(self, shown: str, final_text: str) -> Optional[str]:
+        """§4TE: the new text at the end of ``final_text`` when the screen
+        differs from it by smoothing's reported trims and nothing else; None
+        otherwise. Both ends are exact: what was shown is a reply smoothing
+        received, and the final starts with the reply it finally returned."""
+        if not self._trims:
+            return None
+        views = [self._client_view(t).replace("\r", "").strip() for t in self._trims]
+        after = views[-1]
+        final = final_text.lstrip()
+        if not after or shown.strip() not in views[:-1] or not final.startswith(after):
+            return None
+        if after.count("```") % 2:      # a tail opening inside a fence renders wrongly on its own
+            return None
+        return final[len(after):]
+
     def _latch(self, why: str) -> None:
         self._latched = True
         if self.sent:
@@ -229,10 +275,11 @@ class ReplyTap:
                                          {"content": text[i:i + FRAME_CHARS]}))
         self.sent += text
 
-    def _retract_frame(self, why: str) -> bytes:
+    def _retract_frame(self, why: str, detail: Optional[Dict[str, Any]] = None) -> bytes:
         self.retracts.append(why)
         self.sent = ""
-        return _frame(self.chunk_id, self.created, self.model, {}, ghost={"retract": True})
+        return _frame(self.chunk_id, self.created, self.model, {},
+                      ghost={"retract": True, **(detail or {})})
 
     def _retract(self, why: str) -> None:
         self.queue.put_nowait(self._retract_frame(why))

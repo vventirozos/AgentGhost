@@ -17,9 +17,7 @@ that isn't blocked will surface here.
 import pytest
 from unittest.mock import MagicMock
 
-from ghost_agent.memory.readonly import (
-    ReadOnlyVectorMemory, ReadOnlySkillMemory, ReadOnlyGraphMemory,
-)
+from ghost_agent.memory.readonly import ReadOnlyVectorMemory, ReadOnlyGraphMemory
 
 
 class TestVectorReadOnly:
@@ -59,7 +57,6 @@ class TestVectorReadOnly:
         assert ro.real is None          # the writable store itself
         assert ro.collection is None    # chromadb handle
         assert ro.client is None
-        assert ro.is_read_only is True
 
     def test_absent_store_degrades(self):
         ro = ReadOnlyVectorMemory(None)
@@ -85,30 +82,6 @@ class TestVectorReadOnly:
         ro = ReadOnlyVectorMemory(real)
         assert ro._update_library_index("synthetic.txt", "add") is None
         real._update_library_index.assert_not_called()
-
-
-class TestSkillReadOnly:
-    def test_real_mutators_are_noops(self):
-        real = MagicMock()
-        ro = ReadOnlySkillMemory(real)
-        for m in ("learn_lesson", "save_playbook",
-                  "retract_lessons_from_trajectory", "record_retrieval",
-                  "record_helpful_retrieval", "credit_recent_retrievals",
-                  "record_retrievals_bulk",
-                  "mark_verified", "remove_by_trigger"):
-            assert getattr(ro, m)("x") is None, f"{m} not blocked"
-        real.learn_lesson.assert_not_called()
-        real.remove_by_trigger.assert_not_called()
-
-    def test_reads_pass_through(self):
-        real = MagicMock()
-        real.get_playbook_items.return_value = [{"trigger": "t"}]
-        ro = ReadOnlySkillMemory(real)
-        assert ro.get_playbook_items("q") == [{"trigger": "t"}]
-
-    def test_real_handle_blocked(self):
-        ro = ReadOnlySkillMemory(MagicMock())
-        assert ro.real is None
 
 
 class TestGraphReadOnly:
@@ -174,8 +147,3 @@ class TestMutatorListsMatchRealStores:
         missing = writers - ReadOnlyGraphMemory._MUTATORS
         assert not missing, f"unblocked GraphMemory writers: {missing}"
 
-    def test_skill_writers_all_blocked(self):
-        from ghost_agent.memory.skills import SkillMemory
-        writers = self._mutating_methods(SkillMemory)
-        missing = writers - ReadOnlySkillMemory._MUTATORS
-        assert not missing, f"unblocked SkillMemory writers: {missing}"

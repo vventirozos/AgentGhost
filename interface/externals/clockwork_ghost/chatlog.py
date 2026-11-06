@@ -180,29 +180,19 @@ class ChatLog(QScrollArea):
 
     def _style(self, role: str) -> str:
         T = self.T
-        # Padding lives here: 13/17 reads as a bubble rather than a slab.
-        # The operator's own words stay MONOSPACE (they are commands, and it
-        # matches the input field they were typed into); the agent's prose is
-        # SANS, because a briefing in monospace is what made long answers look
-        # wrong in the first place.
-        pad = "padding: 13px 17px;"
+        # Soft tinted cards, no hairlines or notches: the two speakers differ by
+        # side and tint. (SANS for both since 2026-11-06, operator: "modern".)
+        pad = "padding: 12px 17px;"
         if role == "user":
-            base = f"{pad} font-family: {T.FONT}; font-size: 19px;"
+            base = f"{pad} font-family: {SANS}; font-size: 20px;"
             return (f"QLabel {{ {base} color: {T.TEXT};"
-                    f" background-color: rgba(46, 30, 20, 0.42);"
-                    f" border: 1px solid rgba(255, 192, 138, 0.22);"
-                    f" border-right: 2px solid {T.USER};"
-                    # Notched on the speaker's corner, exactly like the web UI.
-                    f" border-top-left-radius: 16px; border-top-right-radius: 4px;"
-                    f" border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }}")
+                    f" background-color: rgba(255, 192, 138, 0.15); border: none;"
+                    f" border-radius: 18px; }}")
         if role == "agent":
             base = f"{pad} font-family: {SANS}; font-size: 20px;"
             return (f"QLabel {{ {base} color: {T.TEXT};"
-                    f" background-color: rgba(26, 16, 44, 0.42);"
-                    f" border: 1px solid rgba(201, 166, 255, 0.20);"
-                    f" border-left: 2px solid {T.ACCENT};"
-                    f" border-top-left-radius: 4px; border-top-right-radius: 16px;"
-                    f" border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }}")
+                    f" background-color: rgba(18, 16, 32, 0.62); border: none;"
+                    f" border-radius: 18px; }}")
         return (f"QLabel {{ padding: 4px 10px; font-family: {SANS}; font-size: 16px;"
                 f" color: {T.TEXT_DIM}; background: transparent; border: none; }}")
 

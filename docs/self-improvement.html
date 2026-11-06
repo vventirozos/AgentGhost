@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a class="current" href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -40,14 +40,14 @@
 <main>
   <span class="eyebrow">How it works</span>
   <h1>Checking and learning</h1>
-  <p class="subtitle">Three things: mechanical checks after every answer, the learning loop that turns your 👎 into a rule you can approve, and maintenance passes that only run when you've left it alone. Since October 2026 the only thing that changes how it answers is a rule <em>you</em> approved.</p>
+  <p class="subtitle">Three things: mechanical checks after every answer, the rules you dictate, and maintenance passes that only run when you've left it alone. Ghost does not teach itself: the only thing that changes how it answers is a rule <em>you</em> stated.</p>
 
   <div class="note">
-    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em> and the <em>rules you have approved</em>. Everything happens on your own machines.
+    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em> and the <em>rules you have given it</em>. Everything happens on your own machines.
   </div>
 
   <div class="note good">
-    <strong>Looking for how it learns from you?</strong> The whole loop — your 👎, the replays while you're away, the rule it proposes, your decision, and the regression tests that keep a fix fixed — has its own page with a worked example: <a href="learning-loop.html">The learning loop</a>.
+    <strong>Looking for how it learns from you?</strong> You dictate a rule ("learn this rule: …") and it is in every prompt of yours from then on. The commands, the limits and an example are on <a href="learning-loop.html">Owner rules</a>. The loop that replayed your failures and proposed rules, and the regression tests, were removed on 2026-11-05 (§4SZ); that page says why.
   </div>
 
   <h2>Part one: checking its own answers</h2>
@@ -72,7 +72,7 @@
       </li>
       <li>
         <h4>Whatever happens is recorded</h4>
-        <p>The verdict is stored with the turn. You are generally not shown it. A failed check on one of your turns can put it on the list for the <a href="learning-loop.html">learning loop</a> to replay — but nothing is ever adopted on a check's word. Ghost no longer writes lessons for itself: the producers that did (reflection, post-mortems, distillation, dream consolidation) were removed on 2026-10-11 (§4NM).</p>
+        <p>The verdict is stored with the turn. You are generally not shown it, and nothing acts on it afterwards: the idle replay of failed turns that used to read it was removed on 2026-11-05 (§4SZ, <a href="learning-loop.html#removed">why</a>). Ghost no longer writes lessons for itself: the producers that did (reflection, post-mortems, distillation, dream consolidation) were removed on 2026-10-11 (§4NM).</p>
       </li>
     </ol>
   </div>
@@ -82,7 +82,7 @@
   </div>
 
   <h3>When you correct it yourself</h3>
-  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction. While you're away, the main model also reads your next message after each answer, in a short background check, and decides whether it showed the answer missed. Your 👎 and these corrections are what the <a href="learning-loop.html">learning loop</a> starts from: they are the only signals that can lead to a regression test. A failed check or a run of failed tool calls can also start a replay, but never a test.</p>
+  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction. Your 👎 and these corrections are recorded as your label on the turn. The failure census (an operator report of how answers went) and the index of graded past turns read that label. Nothing is replayed or proposed from it any more: until 2026-11-05 a 👎 or a correction started an idle replay that could end in a proposed rule and a regression test, and a background check on the main model (the reaction judge) read your next message after each answer; all three were removed that day (§4SZ). If you want a correction to stick, state it as a rule: <a href="learning-loop.html">"learn this rule: …"</a>.</p>
 
   <h2>Part two: what it does while you're away</h2>
 
@@ -94,21 +94,21 @@
 
   <p>So on a busy day, almost none of this runs. That's intended.</p>
 
-  <p>One mechanism is easy to misread. Most phases only run while you've been idle between fifteen and sixty minutes. Past an hour that window rolls over and opens again, so during a long absence each phase gets another chance after its cooldown. Until October 2026 only self-play finishing re-opened the window, which meant <code>--no-self-play</code> quietly stopped almost everything else too; the window now rolls on its own (§4LF), and the roll never touches the clock that records when you were last active.</p>
+  <p>One mechanism is easy to misread. Most phases only run while you've been idle between fifteen and sixty minutes. Past an hour that window restarts, so during a long absence each phase gets another chance after its cooldown. The restart happens every hour of quiet, unconditionally, and it never touches the clock that records when you were last active; the log line reads <code>no request for Nm — the idle window restarted: …</code>. History: until October 2026 only self-play finishing re-opened the window, which meant <code>--no-self-play</code> quietly stopped almost everything else too (fixed in §4LF). Until 2026-11-05 the failure-replay slot, when it ran, reset the last-active clock itself; that slot was removed (§4SZ), and no idle job writes that clock now.</p>
 
   <div class="note warn">
     <strong>If you use <code>--bio-time-scale</code> to exercise these loops quickly:</strong> it now divides the phase cooldowns and the loop's own tick interval as well as the idle windows. Until 2026-08-08 it only compressed the windows — the cooldowns kept their real durations, so a phase with a three-hour cooldown could fire at most once no matter how many accelerated epochs a run claimed to cover. The helper meant to scale them existed and had a passing unit test, but nothing ever called it. Any measurement taken with this flag before that date covers roughly one epoch per phase, whatever it says.
   </div>
 
   <h3>There is a floor on how far you can compress time</h3>
-  <p>Accelerating the clock only works while the compressed window stays <em>wider than the work</em>. The gates shrink when you raise the scale; the work doesn't. In August 2026, when this was observed, a dream was a real model call and took something like a minute whether the scale was 1 or 60 (dreaming and synthetic self-play were later removed, §4NM; the floor still applies to any job that takes real time).</p>
+  <p>Accelerating the clock only works while the compressed window stays <em>wider than the work</em>. The gates shrink when you raise the scale; the work doesn't. In August 2026, when this was observed, a dream was a real model call and took something like a minute whether the scale was 1 or 60 (dreaming and synthetic self-play were later removed, §4NM, and the slot that replaced self-play on 2026-11-05, §4SZ; the floor still applies to any job that takes real time).</p>
   <p>At <code>--bio-time-scale 60</code> the window for the middle phases is 45 seconds — narrower than a single dream. What was actually observed, tick by tick:</p>
   <pre><code>idle 1..10s   nothing eligible yet
 idle ~11s     dream starts — and runs for ~60 real seconds
 idle ~71s     the 15–60s window has already closed
               self-play (no upper bound) fires and resets the idle clock
 idle 1..10s   …and round again, forever</code></pre>
-  <p>The middle of the window is never sampled, so the tidy pass, both narrative consolidations, stale-question surfacing and project auto-advance <strong>can never run</strong> — and they report zero firings, which reads exactly like "we measured them and they did nothing."</p>
+  <p>The middle of the window is never sampled, so the tidy pass, both narrative consolidations, stale-question surfacing (a job removed on 2026-11-05) and project auto-advance <strong>can never run</strong> — and they report zero firings, which reads exactly like "we measured them and they did nothing."</p>
   <div class="note">
     <strong>Practical rule:</strong> keep the scale at <strong>20 or below</strong> (a window of at least ~2 minutes). The agent now warns loudly at boot if the scale you chose makes the window narrower than the work, and names the phases that would silently never fire. Every ablation number recorded before 2026-08-09 measured dreaming and self-play only.
   </div>
@@ -129,10 +129,9 @@ idle 1..10s   …and round again, forever</code></pre>
         <p>Ghost updates its running first-person account of what it's been doing, and its record of what changed in your files. Reviewing failed turns (reflection) used to write lessons here too; measured on real turns, those lessons reached the turn they were meant for 18% of the time and changed the reply in 3 of 20, and it was removed on 2026-10-11 (§4NM).</p>
       </li>
       <li>
-        <h4>After ~1 hour — replay your failures, and run your tests</h4>
-        <p>Ghost picks a recent turn of yours that went wrong — you gave it a 👎, or your next message showed the reply missed — and asks the same question again as a labelled test, with and without a candidate rule. Ghost then tells you the rule and what happened with and without it: <em>Candidate rule 3 — say “show rule 3” to read it, “learn rule 3” to adopt it</em>. Nothing is learnt until you say so; “show all rules” lists them, “forget rule N” removes an adopted one and “dismiss rule N” or “dismiss all proposed rules” sets aside ones you don't want (each after you confirm).</p>
-        <p>The same evidence also becomes <strong>regression tests</strong> (§4NE). Ghost drafts one — the question, what a right answer must contain, and checks a program can run — and asks you: “keep test 4”, “edit test 4: it must name the vendor's page”, or “forget test 4” (“show regression tests” lists them). Kept tests are re-asked after every update to Ghost and once a day, and a failing one is reported to you. A candidate rule is also run against your kept tests, so its proposal says whether it breaks any of them. See <a href="core/regression.html">core.regression</a>.</p>
-        <p>With no recent failure and no test due, nothing runs — the <code>Idle Cycle</code> console line then reads <code>failure-replay (replays one of your past failures or runs your regression tests): nothing to do (no owner failure to replay, no test due)</code>; when the slot did run it ends with what it did. Invented practice problems were removed on 2026-10-11 (§4NM).</p>
+        <h4>After ~1 hour — the idle window restarts</h4>
+        <p>No job of its own runs at this point. The window restarts, so maintenance, store hygiene, the tidy pass and the other 10–60 minute jobs can run again as their own cooldowns allow. The <code>Idle Cycle</code> console line then reads <code>no request for Nm — the idle window restarted: …</code>.</p>
+        <p>Until 2026-11-05 this was the slot that replayed one of your failed turns, proposed a rule ("learn rule N") and ran your regression tests. In the 27 days it was live it made 13 replays and proposed 9 rules, of which 5 were adopted; it proposed nothing in its last 17 days, and the regression suite held no kept test. It was removed (§4SZ): <a href="learning-loop.html#removed">what was removed, and why</a>. Invented practice problems had been removed earlier, on 2026-10-11 (§4NM).</p>
       </li>
     </ol>
     <p class="caption">Times are how long you've been quiet. Each phase also has its own cooldown between runs.</p>
@@ -141,9 +140,7 @@ idle 1..10s   …and round again, forever</code></pre>
   <h3>Smaller jobs in the same loop</h3>
   <dl class="kv terms">
     <dt>Store hygiene and tidy</dt>
-    <dd>Repairs the lesson index, removes expired temporary video transcripts, and deletes leftover screenshots and scratch files in project workspaces.</dd>
-    <dt>Stale questions</dt>
-    <dd>Lists its own open questions older than three days.</dd>
+    <dd>Removes expired temporary video transcripts, and deletes leftover screenshots and scratch files in project workspaces. (It also repaired the lesson index until the lesson store was removed on 2026-11-06.)</dd>
     <dt>Advancing projects on its own</dt>
     <dd>When idle, push one project you put on autopilot forward by one step. Runs on hard per-project budgets and stops at anything that needs you. Off in the code by default; the production launcher turns it on with <code>--autoadvance-idle</code>. It only touches projects you put on autopilot.</dd>
   </dl>
@@ -158,9 +155,10 @@ idle 1..10s   …and round again, forever</code></pre>
   <table>
     <thead><tr><th>Reads trajectories to ask</th><th>Produces</th><th>Today</th></tr></thead>
     <tbody>
-      <tr><td>Which of your answers did you say were wrong?</td><td>A replay case, a candidate rule for you to approve, a regression test proposal.</td><td><span class="badge good">on</span> — <a href="learning-loop.html">the learning loop</a></td></tr>
-      <tr><td>Is a kept regression test still passing?</td><td>A pass/fail per test, reported to you on failure.</td><td><span class="badge good">on</span> — <a href="core/regression.html">core.regression</a></td></tr>
       <tr><td>What did you do while I was away?</td><td>Ledger reads for <code>introspect</code>.</td><td><span class="badge good">on</span></td></tr>
+      <tr><td>How did the owner's answers go? (failure census)</td><td>An operator report (<code>scripts/failure_census.py</code>).</td><td><span class="badge good">on</span></td></tr>
+      <tr><td>Which of your answers did you say were wrong? (failure replay)</td><td>A replay case, a candidate rule for you to approve, a regression test proposal.</td><td><span class="badge bad">removed</span> 2026-11-05 (§4SZ) — 13 replays in 27 days, nothing proposed in the last 17</td></tr>
+      <tr><td>Is a kept regression test still passing? (regression suite)</td><td>A pass/fail per test, reported to you on failure.</td><td><span class="badge bad">removed</span> 2026-11-05 (§4SZ) — it held 0 kept tests</td></tr>
       <tr><td>What went wrong in this turn? (reflection)</td><td>A self-written lesson.</td><td><span class="badge bad">removed</span> — reached its turn 18% of the time</td></tr>
       <tr><td>What about the agent itself made this fail? (post-mortem)</td><td>A classified defect report.</td><td><span class="badge bad">removed</span> — 129 of 130 runs found nothing</td></tr>
       <tr><td>Which procedures keep recurring? (auto skills)</td><td>A new reusable skill.</td><td><span class="badge bad">removed</span> — trivial sequences that quoted old requests</td></tr>
@@ -179,16 +177,10 @@ idle 1..10s   …and round again, forever</code></pre>
   <dl class="kv terms">
     <dt>"What did you do while I was away?"</dt>
     <dd>Reads the background activity ledger — which passes ran, what came out of them, over whatever window you name.</dd>
-    <dt>"show all rules"</dt>
-    <dd>The rules you adopted, the ones waiting for you, and the forgotten and dismissed ones — read from the store by Ghost itself, not recalled by the model.</dd>
-    <dt>"show me all proposed rules"</dt>
-    <dd>Only the rules waiting for your decision, each in full, with how to adopt or dismiss them. "show all pending rules", "show my proposed rules" and "show candidate rules" are the same command.</dd>
-    <dt>"dismiss all proposed rules"</dt>
-    <dd>Lists the rules waiting for you; "confirm dismiss all proposed rules" sets them aside. They were never in use, so nothing changes in how Ghost answers, and "learn rule N" still adopts one later. "dismiss rule N" does the same for one rule.</dd>
-    <dt>"show regression tests"</dt>
-    <dd>Your kept and proposed tests, each with its last result.</dd>
+    <dt>"show my rules"</dt>
+    <dd>Your rules, by number — read from the store by Ghost itself, not recalled by the model. The other rule commands are on <a href="learning-loop.html#commands">Owner rules</a>. The commands for proposed rules ("show me all proposed rules", "dismiss all proposed rules", "learn rule N") were retired on 2026-11-05. They are ordinary messages now: they change nothing and reach the model, which is told that there are no proposed rules any more and which messages work. The regression-test commands ("show regression tests", "run regression tests", "keep test N") were retired the same day and are not recognised either: they reach the model as ordinary chat.</dd>
     <dt>"Is your learning actually working?"</dt>
-    <dd>Health telemetry for the learning loop itself: are your rules reaching prompts, is the regression suite running, are the background passes firing. This is the page to check when you suspect a subsystem has quietly stopped running.</dd>
+    <dd>The learning report (<code>introspect</code>, action <code>learning</code>): whether the background passes are firing and what they produced. (Its sections about the lesson store went with that store on 2026-11-06.) This is still the place to check when you suspect a background pass has quietly stopped running.</dd>
   </dl>
 
   <h2 id="no-power">The second failure mode: a verdict with no power behind it</h2>
@@ -200,10 +192,10 @@ idle 1..10s   …and round again, forever</code></pre>
   </ul>
   <p>A third instrument was dead in the other direction. The arm-stamp coverage alarm exists so that a broken stamp can't hide, but its denominator was every user turn ever recorded — most of them from before the framework shipped — so a <em>total</em> stamp outage would have moved the headline from 16.8% to about 16.3%, under an "under half" warning that had been permanently on. It now reports a trailing window beside the lifetime figure, and the window is the one that raises the alarm.</p>
   <p><strong>The general rule this leaves behind:</strong> absence of evidence is evidence of absence only when the design could have found something. Any instrument that reports a null result should be able to tell you what it <em>would</em> have taken to see one.</p>
-  <p><strong>What was done about it (October 2026, §4ND).</strong> At this agent's traffic no randomised arm could reach a verdict within a useful time, so every arm was disabled; the arms' estimator (PPI) and the risk governor were removed on 2026-10-11 (§4NM), and the arm machinery itself (<code>core/experiments.py</code> and <code>introspect action='experiments'</code>) was removed on 2026-10-11 (§4NN). The confidence score went too: re-computed from raw data it was no better than guessing the base rate, and later it ranked answers no better than a coin flip either, so it was removed. The improvement signal that remains is the one that has power: your own verdict, through <a href="learning-loop.html">the learning loop</a> and its regression tests.</p>
+  <p><strong>What was done about it (October 2026, §4ND).</strong> At this agent's traffic no randomised arm could reach a verdict within a useful time, so every arm was disabled; the arms' estimator (PPI) and the risk governor were removed on 2026-10-11 (§4NM), and the arm machinery itself (<code>core/experiments.py</code> and <code>introspect action='experiments'</code>) was removed on 2026-10-11 (§4NN). The confidence score went too: re-computed from raw data it was no better than guessing the base rate, and later it ranked answers no better than a coin flip either, so it was removed. The improvement signal that remained was your own verdict. From 2026-10-10 to 2026-11-05 it ran through an idle failure-replay loop and a regression suite; measured over those 27 days the loop proposed nothing in its last 17 and the suite held no test, so both were removed (§4SZ). What is left is the direct form: <a href="learning-loop.html">a rule you dictate</a>.</p>
 
   <div class="note warn">
-    <strong>The characteristic failure mode here is silence.</strong> A learning pass that has stopped running looks exactly like a learning pass with nothing to do — both produce no output. If you want to know whether this machinery is alive, check <code>biological_watchdog_alive</code> on the health endpoint (the key keeps its old name; it reports the idle scheduler) and ask for the activity ledger. Don't infer it from the absence of errors.
+    <strong>The characteristic failure mode here is silence.</strong> A background pass that has stopped running looks exactly like a background pass with nothing to do — both produce no output. If you want to know whether this machinery is alive, check <code>biological_watchdog_alive</code> on the health endpoint (the key keeps its old name; it reports the idle scheduler) and ask for the activity ledger. Don't infer it from the absence of errors.
   </div>
 
   <h2>Turning parts of it off</h2>
@@ -214,18 +206,18 @@ idle 1..10s   …and round again, forever</code></pre>
     <thead><tr><th>Flag</th><th>Turns off</th></tr></thead>
     <tbody>
       <tr><td><code>--no-dream</code></td><td>Store maintenance and the daily snapshot. Leaves the rest running.</td></tr>
-      <tr><td><code>--no-trajectories</code></td><td>Recording turns at all. This also stops the learning loop, since it has nothing to read.</td></tr>
+      <tr><td><code>--no-trajectories</code></td><td>Recording turns at all. The failure census and <code>introspect</code> then have no turns to read.</td></tr>
       <tr><td><code>--no-verifier</code></td><td>The checks after each answer. Not recommended outside an experiment — see below.</td></tr>
       <tr><td><code>--no-memory</code></td><td>Everything. Ghost becomes a plain chat wrapper.</td></tr>
     </tbody>
   </table>
   </div>
 
-  <p>There is no flag that turns off only the failure replay and regression runs (the old <code>--no-self-play</code> is gone). The other direction — switches that are <strong>off</strong> unless you set them to <code>1</code>: <code>GHOST_VERIFIER_JUDGE</code> (the second-model judge, above) and <code>GHOST_AUTO_LESSONS</code> (the old self-written lessons in prompts, see <a href="learning-loop.html#retired">the learning loop</a>).</p>
-  <p>The switches that used to sit beside these — <code>GHOST_HYDRATION_JUDGE</code>, <code>GHOST_CODING_PRACTICE</code>, <code>GHOST_PRODUCER_LESSONS</code>, <code>GHOST_AUTO_SKILLS</code>, <code>GHOST_SKILL_PRUNE</code>, <code>GHOST_ROUTER</code>, <code>GHOST_FORESIGHT</code>, <code>GHOST_RISK_GOVERNOR</code>, <code>GHOST_GEPA_AUTONOMY</code>, <code>GHOST_BUS_VECTOR_TIER</code>, <code>GHOST_BUS_GRAPH_TIER</code>, <code>GHOST_BUS_EPISODIC_TIER</code>, <code>GHOST_BUS_SESSION_TIER</code>, <code>GHOST_DREAM_REPLAY</code>, <code>GHOST_EVOLVE</code>, <code>GHOST_COMPETENCE_PROMPT</code>, <code>GHOST_CONF_COMPETENCE</code>, <code>GHOST_VERIFIER_SHOW_OWNER</code> — are gone with the code they switched (2026-10-11, §4NM). Why each went is on <a href="learning-loop.html#off">the learning loop page</a>.</p>
+  <p>The failure replay and the regression runs no longer exist, so there is nothing to switch off (the old <code>--no-self-play</code> flag went earlier; <code>GHOST_SELFPLAY_COOLDOWN_S</code> and <code>GHOST_REACTION_JUDGE</code> went with the slot on 2026-11-05). The other direction — switches that are <strong>off</strong> unless you set them to <code>1</code>: <code>GHOST_VERIFIER_JUDGE</code> (the second-model judge, above). (<code>GHOST_AUTO_LESSONS</code> went with the lesson store on 2026-11-06, see <a href="learning-loop.html#retired">Owner rules</a>.)</p>
+  <p>The switches that used to sit beside these — <code>GHOST_HYDRATION_JUDGE</code>, <code>GHOST_CODING_PRACTICE</code>, <code>GHOST_PRODUCER_LESSONS</code>, <code>GHOST_AUTO_SKILLS</code>, <code>GHOST_SKILL_PRUNE</code>, <code>GHOST_ROUTER</code>, <code>GHOST_FORESIGHT</code>, <code>GHOST_RISK_GOVERNOR</code>, <code>GHOST_GEPA_AUTONOMY</code>, <code>GHOST_BUS_VECTOR_TIER</code>, <code>GHOST_BUS_GRAPH_TIER</code>, <code>GHOST_BUS_EPISODIC_TIER</code>, <code>GHOST_BUS_SESSION_TIER</code>, <code>GHOST_DREAM_REPLAY</code>, <code>GHOST_EVOLVE</code>, <code>GHOST_COMPETENCE_PROMPT</code>, <code>GHOST_CONF_COMPETENCE</code>, <code>GHOST_VERIFIER_SHOW_OWNER</code> — are gone with the code they switched (2026-10-11, §4NM). Why each went is on <a href="learning-loop.html#off">the Owner rules page</a>.</p>
 
   <div class="note">
-    <strong>Why <code>--no-verifier</code> exists.</strong> A check that finishes after the answer was sent can't change what you already read — its payoff is the short repair window and marking the turn so the learning loop can replay it. With the judge off the checks are mostly cheap program checks; the image look is the one that costs a model call. The flag exists so you can measure the difference rather than assume it.
+    <strong>Why <code>--no-verifier</code> exists.</strong> A check that finishes after the answer was sent can't change what you already read — its payoff is the short repair window and the verdict recorded with the turn. With the judge off the checks are mostly cheap program checks; the image look is the one that costs a model call. The flag exists so you can measure the difference rather than assume it.
   </div>
 
   <div class="pager">
@@ -235,12 +227,12 @@ idle 1..10s   …and round again, forever</code></pre>
     </a>
     <a class="next" href="learning-loop.html">
       <span class="dir">Next</span>
-      <span class="to">The learning loop</span>
+      <span class="to">Owner rules</span>
     </a>
   </div>
 
   <footer>
-    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code>, <code>core/dream.py</code>, <code>core/failure_replay.py</code> and <code>core/regression.py</code> on 2026-10-10, and against the §4NM removal list on 2026-10-11. Part one re-checked against the production launcher on 2026-10-26 (§4OW, §4OX, §4PJ). Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
+    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code> and <code>core/dream.py</code> on 2026-10-10, and against the §4NM removal list on 2026-10-11. Part one re-checked against the production launcher on 2026-10-26 (§4OW, §4OX, §4PJ). The idle schedule and the rule commands were re-checked against <code>core/agent.py</code> and <code>core/owner_rules.py</code> on 2026-11-05 (§4SZ), when <code>core/failure_replay.py</code> and <code>core/regression.py</code> were removed. Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
   </footer>
 </main>
 </body>

@@ -115,7 +115,7 @@
     <li><strong>Wired by meaning</strong> (<code>core/agent.py</code> and the sets elsewhere):
       <ul>
         <li>mutating world, edit-churn verify, last clean tool, external evidence, work tools, batch wall, drop note, the idempotency guard's mutating set;</li>
-        <li>replay-forbidden, macro-forbidden, egress <code>url_literals</code> + code tools, claim-source excluded, evidence tools (task state and gate), the read-write loop set;</li>
+        <li>replay-forbidden (and macro-forbidden, until the macro engine was removed in &sect;4TA), egress <code>url_literals</code> + code tools, claim-source excluded, evidence tools (task state and gate), the read-write loop set;</li>
         <li>provenance (<code>logs</code>/<code>collect</code> count as outside content);</li>
         <li>program output: only a <code>collect</code> result (head <code>[run NAME STATE exit=N]</code> + an <code>EXIT CODE:</code> line). A log's "ERROR" is content (<code>outcome_heuristics._run_result_failed</code>).</li>
       </ul></li>

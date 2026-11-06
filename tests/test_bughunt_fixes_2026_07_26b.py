@@ -156,8 +156,6 @@ def _agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.cached_sandbox_state = None
     ctx.sandbox_dir = "/tmp/sandbox"

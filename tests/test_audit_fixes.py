@@ -119,22 +119,19 @@ def test_bus_format_markdown_per_source_cap_prevents_monopoly():
     # global char budget; the fused RRF ranking is no longer discarded by fixed
     # per-section budgets. Anti-monopoly is now a per-source COUNT cap, so a tier
     # with many high-scoring items can't crowd out other tiers. Here graph has 10
-    # items all scored above vector/skill; the cap keeps only 6, leaving budget
-    # for the lower-ranked vector + skill items.
+    # items all scored above vector; the cap keeps only 6, leaving budget
+    # for the lower-ranked vector items.
     fused = (
         [({"source": "graph", "text": f"graph_node_{i}"}, 0.9 - i * 0.01) for i in range(10)]
         + [({"source": "vector", "text": "vec_0"}, 0.4)]
-        + [({"source": "skill", "text": "useful skill text"}, 0.3)]
     )
     out = MemoryBus._format_markdown(fused, max_chars=6000)
     # Graph is capped at the per-source cap (6), not all 10.
     assert out.count("graph_node_") == MemoryBus._PER_SOURCE_CAP
-    # Vector + skill must still appear despite graph dominating the top ranks.
+    # Vector must still appear despite graph dominating the top ranks.
     assert "vec_0" in out
-    assert "useful skill text" in out
     assert "TOPOLOGICAL KNOWLEDGE GRAPH" in out
     assert "MEMORY CONTEXT" in out
-    assert "SKILL PLAYBOOK" in out
 
 
 # ============================================================ #28 lazy log
@@ -184,7 +181,6 @@ async def test_biological_watchdog_dream_cooldown_blocks_back_to_back():
     ctx.llm_client.foreground_requests = 0  # HARD LOCK also gates on this now
     ctx.profile_memory = MagicMock()
     ctx.scratchpad = MagicMock()
-    ctx.skill_memory = None
     ctx.graph_memory = None
     ctx.sandbox_dir = "/tmp/sandbox"
     ctx.last_activity_time = datetime.datetime.now() - datetime.timedelta(minutes=20)

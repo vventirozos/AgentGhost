@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { createTemperament } from './temperament.js?v=1.3';
+import { createTemperament, logRowIcon } from './temperament.js?v=1.6';
+export { logRowIcon };
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -99,7 +100,6 @@ const LINK_BUDGET_MIN = 0.45;
 let scene, camera, renderer, composer, bloomPass;
 let instancedMesh, linesMesh;
 let lineGeometry, nodeMaterial, lineMaterial;
-let motesMesh, motesMaterial;
 let time = 0;
 let currentShapeSpeed = SPEEDS.idle;
 let animationFrameId;
@@ -165,43 +165,6 @@ let _bob = 0.0;          // swim bob: rises on contraction, sinks on glide
 let _bobTarget = 0.0;
 let huePhase = 0.0;      // bounded thermal oscillation (see hueDrift)
 
-// ── Vortex (form 'vortex') — self-similar swallow ──────────────────
-// A logarithmic cone converging at the singularity (origin), opening
-// toward the camera. Because the taper is EXPONENTIAL the funnel is
-// self-similar — the conveyor's depth wrap (fract) is an infinite
-// fractal zoom: matter streams in from beyond the screen edges, is
-// consumed at the apex, respawns at the rim, forever. THE CAMERA NEVER
-// MOVES — busy and idle are the same scene at different intensities,
-// so completion needs no reset at all: the view just morphs back as
-// the flow calms (operator: "don't pull the camera out; morph the
-// default view like an infinite fractal — the main animation is not
-// the spinning, it's the swallow").
-//   vortexTravel = eased user-turn ENGAGEMENT (0..1): drives flow
-//     surge, harmonic shape amplitude, and the singularity's appetite.
-//   tunnelFlow   = accumulated conveyor depth (the swallow itself).
-//   vortexSpin   = slow ambient swirl — deliberately NOT the star.
-// In-falling matter morphs through procedural, never-repeating shapes:
-// a drifting field of low-order harmonics deforms the cross-section.
-let vortexTravel = 0.0;
-let tunnelFlow = 0.0;
-let vortexSpin = 0.0;
-// This frame's advance of vortexSpin. The stream's DIFFERENTIAL swirl
-// (matter near the hole turns slower than the rim) was written as
-// `vortexSpin × (0.9 − 0.4·dOut)` — the ever-growing spin angle times a
-// factor that changes as the node flows outward, so every frame the
-// node's angle jumped by `0.4 × vortexSpin × ΔdOut`: nothing on a fresh
-// page, 13× the idle motion after 20 minutes, and node teleports on a
-// user turn after an hour (measured 2026-09-21 — the §4JA class again,
-// spin×depth instead of time×rate). Each stream node now INTEGRATES its
-// own swirl at its current depth factor (`bp.swirl += step × factor`).
-let _vortexSpinStep = 0.0;
-// cube: the charge runners' integrated travel. Their progress used to
-// be `time * speed * (1 + 1.5 * drive + …)` — a phase that JUMPS by
-// `time × Δdrive` whenever the drive envelope moves, and `time` only
-// grows, so an hour into a session every log line sent the runners
-// zipping across the grid (2026-09-20). Integrated per frame instead.
-let cubeRunnerFlow = 0.0;
-
 // ── cube2 (2026-09-20, EXPERIMENT) — the infinite cube ─────────────
 // Wireframe cube shells nested at exponentially spaced scales: each is
 // BORN tiny and hot at the kernel, grows outward (self-similar
@@ -233,27 +196,11 @@ let _c2Wob = 0.0;                                 // the wobble amplitude in for
 // (dark-red shadow + accretion ring) sits deep on the view axis; stream
 // matter EMERGES from its glow (L small) and blooms outward/past the
 // camera (L grows exponentially — still a self-similar infinite fall).
-const VORTEX_APEX_Z = -2.0;   // the hole, deep on the view axis
 // Spawn AT the ring's edge, not inside it: matter emerges THROUGH the
 // accretion ring, so the shadow interior keeps only its dim embers and
 // reads as a genuinely dark hole.
-const VORTEX_LMIN = 0.55;
-const VORTEX_KOUT = 2.6;      // exponential expansion — self-similarity knob
-const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;   // cone half-angle
 
 // ── AI-form state (2026-07-29) ─────────────────────────────────────
-// descent: the optimizer bead. True gradient descent on the (moving)
-// loss surface — velocity, damping, soft walls, stuck-kick.
-let beadX = 0.4, beadZ = 0.3, beadVX = 0.0, beadVZ = 0.0;
-let beadStill = 0.0;         // seconds spent near-stationary
-const beadTrail = [];        // recent (x,z) surface points, newest first
-// One trail sample per 60fps-frame, 120 deep (2s). It was one every
-// THIRD frame, 40 deep: each new sample shifted every tail node one
-// entry back at 20Hz — the tail stuttered along behind the bead
-// (0.07–0.08 unit jumps every third frame, measured 2026-09-20). Now
-// sampled once per 60fps-frame of wall time.
-const BEAD_TRAIL_LEN = 120;
-let _descTick = 0;           // accumulated dtF; one sample per whole unit
 let errorState = 0.0;
 let targetErrorState = 0.0;
 let workingState = 0.0;
@@ -290,45 +237,19 @@ let hueDrift = 0.0;
 // The shader-side counterpart is the uOrganic uniform.
 const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 
-// ── Forms (roster trimmed 2026-09-12, again 2026-09-20) ───────────
-// Interchangeable body plans over ONE motion engine (the asymmetric
-// _pulseShape propulsion, hot core, flinch, thermal anatomy):
-//   cube      — the weight tensor (the form called `lattice` until
-//               2026-09-20): a tumbling crystal grid; diagonal
-//               activation waves heat the sites they cross; a hot
-//               attention kernel drifts the volume, bending the grid
-//               toward itself; charge runners ride the axes. DEFAULT.
-//   cube2     — EXPERIMENT (2026-09-20): the infinite cube. Nested
-//               wireframe shells born hot at the kernel bloom outward
-//               past the viewer forever; slightly twisted with depth,
-//               breathing on the pulse clock, edges gently bent.
-//   vortex    — a black hole ahead of the viewer; self-similar
-//               expansion flow, accretion ring, dark shadow.
-//   descent   — the loss landscape: an undulating terrain sheet, cold
-//               ridges / warm valleys; the optimizer bead rolls
-//               downhill trailing heat, kicked to explore again
-//               whenever it settles (and on error flinches).
-//   empty     — no face.
-// Removed 2026-09-12 at the operator's request: abyssal, horizon,
-// cortex, stack, conversation, toolgraph (and the auto mode + face lab).
-// Removed 2026-09-20 (operator): embedding, and the old `cube` (the
-// infinite monolith with resident complexities); `lattice` took the
-// name `cube` and became the default.
-// The header's form button opens a picker built from this roster; the
-// choice persists (server-side + localStorage).
-// `tesseract` (2026-09-22) is the form built as `cube2` on 2026-09-20/21 —
-// the infinite corridor of nested frames, kernel lattice, stream and roll;
-// the operator kept it and asked for a name of its own. The engine's
-// internals keep their cube2/C2 names; the stored pick "cube2" resolves to
-// it (FORM_ALIASES).
-const FORMS = ['cube', 'tesseract', 'vortex', 'descent', 'empty'];
-const FORM_ALIASES = { cube2: 'tesseract' };
-// Default form: CUBE (operator pick, 2026-09-20; vortex was the default
-// from 2026-07-28). The form the operator last picked overrides it —
-// resolved by `resolveInitialForm` below; a stored name that left the
-// roster (`lattice`, `embedding`, the old `cube` — the last resolves to
-// THIS cube) falls through to the default.
-let formIndex = FORMS.indexOf('cube');
+// The forms: `moodtesseract`, the infinite corridor of nested frames, kernel
+// lattice, stream and roll, showing the agent's mood through MOOD_LOOKS, and
+// `empty`, no face. The header's button (the handheld's too) switches between them:
+// animations enabled / disabled (operator, 2026-11-06, who removed cube,
+// tesseract, vortex and descent; rollback in interface/face_backups/20261106-premoodonly).
+// The internals keep their cube2/C2 names. Ids stay [a-z]: the server's prefs and
+// the handheld's form state refuse anything else.
+const FORMS = ['moodtesseract', 'empty'];
+// A pick stored before the other faces went opens as the one that stayed.
+const FORM_ALIASES = { cube2: 'moodtesseract', tesseract: 'moodtesseract', cube: 'moodtesseract', vortex: 'moodtesseract', descent: 'moodtesseract' };
+// Default form: the first. A stored pick overrides it, resolved by
+// `resolveInitialForm` below; a name that left the roster falls through to it.
+let formIndex = FORMS.indexOf('moodtesseract');
 
 // Which form to boot into (2026-09-05). Precedence, highest first:
 //   1. the SERVER's record of the last form picked ANYWHERE — server.py
@@ -401,13 +322,6 @@ const IMMERSION_CAP = PREFERS_REDUCED_MOTION ? 0.15 : 1.0;
 const CAMERA_REST_Z = 5.0;
 const CAMERA_DIVE_Z = 1.3;   // inside the cloud (node shell radius ~2)
 
-// Interior atmosphere: tiny drifting motes that only exist while
-// immersed. The dive dilutes local node density (the scene scales up
-// around the viewer), so the inside looked empty — the motes are the
-// "data nebula" filling that void. Drift is computed in the vertex
-// shader from a per-mote seed, so the layer costs one draw call and
-// zero per-frame CPU; it is skipped entirely (visible=false) at rest.
-const MOTE_COUNT = IS_MOBILE ? 150 : 400;
 
 // TTS-driven audio level (0..1). Wired by setAudioLevel() from app.js
 // when the TTS engine is active; multiplies node jitter subtly so the
@@ -450,10 +364,17 @@ let twitchAmp = 0.0;         // rendered twitch: eased attack, not a pop
 // The inner state (temperament.js, 2026-10-30): events nudge its drives
 // and every kick below is scaled by the gain it returns; `animate` reads
 // its outputs (`TS`) once per frame. Rollback: interface/face_backups/.
-// Its clock is FRAME-INTEGRATED (deterministic under the node harness,
-// which seeds Math.random) and re-syncs FORWARD to the wall clock only
-// when the tab was paused — so a real absence still reads as one.
+// Its clock is FRAME-INTEGRATED on the true frame time (deterministic under
+// the node harness, which seeds Math.random) and re-syncs FORWARD to the wall
+// clock only after a real absence: a gap too long to be rendering between two
+// frames, on the frame stamps or on the wall clock. The wall clock covers a paused
+// tab and a system sleep (rAF stamps can stop through one, and document.hidden
+// stays false). It used to integrate
+// the CLAMPED dtF and re-sync whenever it fell 5 s behind, so below 20 fps it
+// jumped 5 s about every 20 s (measured at 15 fps) and the whole body lurched.
 let _temperNow = Date.now();
+let _temperWall = _temperNow;
+const TEMPER_ABSENCE_MS = 1000;
 function _readIntensity() {
     try { const v = parseFloat(localStorage.getItem('ghost_face_intensity')); return isFinite(v) ? v : null; }
     catch (e) { return null; }
@@ -522,13 +443,10 @@ export const DIALECT_VALUES = Object.freeze({
     verify: ['still', 'align'],
 });
 export const DIALECTS = Object.freeze({
-    cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
-    tesseract:    { radialAxis: 'none', search: 'ring',  read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
-    vortex:       { radialAxis: 'none', search: 'ring',  read: 'thicken',  tool: 'kick',   write: 'flow', verify: 'still' },
-    descent:      { radialAxis: 'y',    search: 'plane', read: 'settle',   tool: 'kick',   write: 'flow', verify: 'still' },
+    moodtesseract: { radialAxis: 'none', search: 'ring', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
     empty:        { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'wave', verify: 'still' },
 });
-const _DIALECT_DEFAULT = DIALECTS.vortex;
+const _DIALECT_DEFAULT = DIALECTS.moodtesseract;
 export function dialectFor(form) { return DIALECTS[form] || _DIALECT_DEFAULT; }
 // Per-frame derived gait scalars the form branches read (set in animate).
 let gaitFlow = 0, gaitThicken = 0, gaitFlash = 0, gaitAlign = 0;
@@ -882,49 +800,6 @@ void main() {
 }
 `;
 
-const moteVertexShader = `
-attribute float aSeed;
-uniform float uTime;
-uniform float uDive;
-uniform float uHueDrift;
-uniform float uDpr;
-${paletteGLSL}
-${hueWaveGLSL}
-varying vec3 vMoteCol;
-varying float vMoteFade;
-
-void main() {
-    // Slow, per-mote orbital drift — pure shader math, no CPU updates.
-    vec3 p = position + 0.18 * vec3(
-        sin(uTime * 0.40 + aSeed * 37.0),
-        cos(uTime * 0.33 + aSeed * 53.0),
-        sin(uTime * 0.27 + aSeed * 71.0)
-    );
-    vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
-    // Near fade (don't smear across the lens) + gentle far fade, all
-    // gated by the dive: motes are invisible at rest by construction.
-    float near = smoothstep(0.12, 0.8, -mvPosition.z);
-    float far = 1.0 - clamp((-mvPosition.z - 3.0) / 6.0, 0.0, 0.85);
-    vMoteFade = near * far * uDive;
-    vMoteCol = palette(aSeed + uHueDrift + hueWave(position));
-    // Perspective size attenuation, clamped so close motes stay motes.
-    gl_PointSize = min(mix(1.5, 4.5, fract(aSeed * 7.31))
-        * (2.2 / max(-mvPosition.z, 0.2)) * uDpr, 9.0 * uDpr);
-    gl_Position = projectionMatrix * mvPosition;
-}
-`;
-
-const moteFragmentShader = `
-varying vec3 vMoteCol;
-varying float vMoteFade;
-void main() {
-    vec2 c = gl_PointCoord - vec2(0.5);
-    float d = length(c) * 2.0;
-    if (d > 1.0) discard;
-    float a = pow(1.0 - d, 2.5) * 0.55 * vMoteFade;
-    gl_FragColor = vec4(vMoteCol * a, a);
-}
-`;
 
 // ── Anatomy builders ───────────────────────────────────────────────
 // Each fills basePositions + nodeSeeds for exactly NODE_COUNT nodes.
@@ -940,11 +815,8 @@ function _buildAnatomy() {
     basePositions.length = 0;
     _noProx.fill(0);
     const f = FORMS[formIndex];
-    if (f === 'cube') _buildCube();
-    else if (f === 'tesseract') _buildCube2();
-    else if (f === 'descent') _buildDescent();
-    else if (f === 'empty') _buildEmpty();
-    else _buildVortex();
+    if (f === 'empty') _buildEmpty();
+    else _buildCube2();
 }
 
 // Form E — EMPTY: no face at all. Nodes park on a sparse far sphere
@@ -968,163 +840,12 @@ function _buildEmpty() {
     }
 }
 
-// Form D — VORTEX: a black hole facing the viewer. Spiral arms wind
-// down a funnel whose throat holds the crimson singularity; the whole
-// structure swirls (faster with ambient work), matter heats from cold
-// blue at the mouth to arterial red at the throat, and user turns send
-// the camera traveling down the tunnel (see vortexTravel above).
-function _buildVortex() {
-    const ARMS = 5;
-    const CORE_COUNT = Math.max(8, Math.round(NODE_COUNT * 0.055));
-    const RING_COUNT = Math.round(NODE_COUNT * 0.14);
-    const HAZE_COUNT = Math.round(NODE_COUNT * 0.32);
-    const ARM_COUNT = NODE_COUNT - CORE_COUNT - RING_COUNT - HAZE_COUNT;
-    let n = 0;
-
-    const pushStream = (armLocked, count) => {
-        for (let b = 0; b < count; b++, n++) {
-            const d = Math.random();
-            // theta0 is the STATIC arm anchor — spiral wind + swirl are
-            // applied per frame from the node's FLOWING progress.
-            const theta0 = armLocked
-                ? (b % ARMS) * (Math.PI * 2 / ARMS) + (Math.random() - 0.5) * 0.20
-                : Math.random() * Math.PI * 2;
-            basePositions.push({
-                kind: armLocked ? 0 : 1, d0: d, theta0,
-                swirl: 0.0,          // integrated differential swirl (2026-09-21)
-                // Wide speed spread: streams genuinely SHEAR past each
-                // other instead of riding one conveyor (monotony fix).
-                flowScale: 0.6 + Math.random() * 1.0,
-                // Per-node trajectory: each grain flies its own cone
-                // angle, so the outward bloom has parallax variety.
-                sinA: VORTEX_SIN * (0.78 + Math.random() * 0.45),
-                cosA: VORTEX_COS * (0.90 + Math.random() * 0.20),
-                rJit: 0.94 + Math.random() * 0.12,
-                seedJit: Math.random() * 0.03,
-                jit: Math.random() * Math.PI * 2,
-                sz: armLocked ? 1.0 : 0.85,
-            });
-            nodeSeeds[n] = 0.60 - d * 0.56;              // overwritten per frame
-        }
-    };
-    pushStream(true, ARM_COUNT);
-    pushStream(false, HAZE_COUNT);
-
-    // The accretion ring — the black hole's icon. A dark-red band
-    // orbiting the shadow, slightly elliptic for perspective.
-    for (let k = 0; k < RING_COUNT; k++, n++) {
-        basePositions.push({
-            kind: 3,
-            th0: (k / RING_COUNT) * Math.PI * 2 + Math.random() * 0.15,
-            rRing: 0.62 * (0.92 + Math.random() * 0.16),
-            zJit: (Math.random() - 0.5) * 0.10,
-            jit: Math.random() * Math.PI * 2,
-            sz: 0.9,
-        });
-        nodeSeeds[n] = 0.595 + Math.random() * 0.02;     // anchored dark red
-    }
-
-    // The shadow — dim crimson embers inside the ring.
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.18 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: rr * Math.sin(ph) * Math.cos(th),
-            hy: rr * Math.sin(ph) * Math.sin(th),
-            hz: rr * Math.cos(ph) * 0.5,
-            jit: Math.random() * Math.PI * 2,
-            sz: 0.55,
-        });
-        nodeSeeds[n] = 0.60 + Math.random() * 0.02;
-    }
-}
-
 // Form F — CUBE (named `lattice` until 2026-09-20): the weight tensor.
 // A slowly tumbling crystal grid, cell edge tuned just under the
 // (form-tightened) link radius so ONLY axis-neighbors weave — a literal
 // wireframe tensor, the first angular silhouette. Cold at the corners,
 // warming toward the middle; diagonal activation waves and a drifting
 // hot attention kernel do the living.
-const CUBE_N = IS_MOBILE ? [4, 5, 5] : [6, 6, 6];
-const CUBE_A = IS_MOBILE ? 0.80 : 0.72;   // cell edge
-// Dive (2026-09-20): the immersion dive used to plunge to the GLOBAL
-// 1.3 — straight into the grid's interior, cell edge ≈ the camera's
-// near-fade, "random dots" — while the attention kernel, the form's
-// only hot focus, wandered ±0.85 off the origin and projected OFF
-// SCREEN at full dive (measured: screen (1.24, 1.72)). It now gets the
-// old monolith's treatment: focus-translated onto the kernel's
-// post-tumble position and a PARTIAL dive — close enough to watch the
-// kernel bend the grid, never inside the dot cloud. 2.7 → 2.2 (operator,
-// 2026-09-20: "feels too far"); the kernel fills ~a quarter of the
-// half-height, and its depth still clears the near-fade band (0.3–1.4).
-const CUBE_DIVE_Z = 2.2;
-function _buildCube() {
-    const [NX, NY, NZ] = CUBE_N;
-    const SITES = NX * NY * NZ;
-    const RUNNERS = Math.min(IS_MOBILE ? 12 : 20, NODE_COUNT - SITES - 8);
-    const spanOf = (m) => ((m - 1) / 2) * CUBE_A;
-    let n = 0;
-    for (let ix = 0; ix < NX; ix++)
-        for (let iy = 0; iy < NY; iy++)
-            for (let iz = 0; iz < NZ; iz++, n++) {
-                // Chebyshev shell 0 (center) → 1 (corner): the cold
-                // base gradient — corners coldest, heart warmer.
-                const shell = Math.max(
-                    Math.abs(ix - (NX - 1) / 2) / Math.max((NX - 1) / 2, 1),
-                    Math.abs(iy - (NY - 1) / 2) / Math.max((NY - 1) / 2, 1),
-                    Math.abs(iz - (NZ - 1) / 2) / Math.max((NZ - 1) / 2, 1));
-                basePositions.push({
-                    kind: 0,
-                    gx: (ix - (NX - 1) / 2) * CUBE_A,
-                    gy: (iy - (NY - 1) / 2) * CUBE_A,
-                    gz: (iz - (NZ - 1) / 2) * CUBE_A,
-                    // Diagonal wave phase 0..1 across the volume.
-                    wp: (ix + iy + iz) / (NX + NY + NZ - 3),
-                    seed0: 0.20 - shell * 0.16 + Math.random() * 0.02,
-                    jit: Math.random() * Math.PI * 2,
-                });
-                nodeSeeds[n] = basePositions[n].seed0;   // reheated per frame
-            }
-    // Charge runners: violet packets riding the grid lines, wrapping
-    // face to face (size-tapered at the faces so the wrap hides).
-    for (let k = 0; k < RUNNERS; k++, n++) {
-        const axis = Math.floor(Math.random() * 3);
-        const cell = (m) => (Math.floor(Math.random() * m) - (m - 1) / 2) * CUBE_A;
-        basePositions.push({
-            kind: 1,
-            dx: axis === 0 ? 1 : 0, dy: axis === 1 ? 1 : 0, dz: axis === 2 ? 1 : 0,
-            ox: axis === 0 ? 0 : cell(NX),
-            oy: axis === 1 ? 0 : cell(NY),
-            oz: axis === 2 ? 0 : cell(NZ),
-            span: spanOf(axis === 0 ? NX : axis === 1 ? NY : NZ) + 0.30,
-            d0: Math.random(),
-            speed: 0.05 + Math.random() * 0.08,
-            jit: Math.random() * Math.PI * 2,
-            sz: 0.85,
-        });
-        nodeSeeds[n] = 0.44 + Math.random() * 0.05;
-    }
-    // The attention kernel: a hot locus scanning the tensor (its
-    // drifting center is computed per frame; these are its offsets).
-    while (n < NODE_COUNT) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.26 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: rr * Math.sin(ph) * Math.cos(th),
-            hy: rr * Math.cos(ph),
-            hz: rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-            sz: 0.85,
-        });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.04;
-        n++;
-    }
-}
-
 // Form G — CUBE2 (2026-09-20, experiment): the infinite cube.
 // C2_SHELLS wireframe cube shells share one exponential depth axis:
 // a shell at phase d ∈ [0,1) has half-size L = C2_L0·e^(C2_K·d) —
@@ -1242,50 +963,6 @@ function _buildCube2() {
     }
 }
 
-// Form I — DESCENT: the loss landscape. A tilted terrain sheet whose
-// height field slowly EVOLVES (the objective is non-stationary —
-// training), cold on the ridges, warming in the valleys; the hot
-// optimizer bead rolls true gradient descent across it, pressing the
-// surface down where it passes, trailing heat, and taking a
-// learning-rate kick whenever it settles too long (or on a flinch).
-const DESC_NX = IS_MOBILE ? 11 : 15, DESC_NZ = IS_MOBILE ? 9 : 15;
-const DESC_SX = 4.4, DESC_SZ = 3.4;   // sheet spans (x, z)
-const DESC_H = 0.85;                  // height-field scale
-function _lossH(x, z, t) {
-    return DESC_H * (0.30 * Math.sin(1.7 * x + 0.9 * z + t * 0.13)
-        + 0.22 * Math.sin(2.3 * z - 1.1 * x + t * 0.117)
-        + 0.14 * Math.sin(2.2 * x + 3.1 * z + t * 0.071)
-        + 0.10 * Math.sin(2.5 * (x + z) - t * 0.093));
-}
-function _buildDescent() {
-    let n = 0;
-    for (let ix = 0; ix < DESC_NX; ix++)
-        for (let iz = 0; iz < DESC_NZ; iz++, n++) {
-            basePositions.push({
-                kind: 0,
-                gx: -DESC_SX / 2 + DESC_SX * ix / (DESC_NX - 1),
-                gz: -DESC_SZ / 2 + DESC_SZ * iz / (DESC_NZ - 1),
-                jit: Math.random() * Math.PI * 2,
-            });
-            nodeSeeds[n] = 0.1;                      // recomputed per frame
-        }
-    while (n < NODE_COUNT) {   // the optimizer bead + cooling trail
-        const bi = n - DESC_NX * DESC_NZ;
-        const total = NODE_COUNT - DESC_NX * DESC_NZ;
-        basePositions.push({
-            kind: 1,
-            s: bi / Math.max(total - 1, 1),          // 0 head → 1 tail end
-            rr: 0.03 + Math.random() * 0.05,
-            jit: Math.random() * Math.PI * 2,
-            sz: 1.0,
-        });
-        nodeSeeds[n] = 0.60;
-        n++;
-    }
-    beadX = 0.4; beadZ = 0.3; beadVX = 0; beadVZ = 0;
-    beadStill = 0; beadTrail.length = 0;
-}
-
 // ── Form switching ─────────────────────────────────────────────────
 export function getForm() { return FORMS[formIndex]; }
 
@@ -1366,20 +1043,94 @@ export function setBackgroundBusy(busy) {
     targetBackgroundBusy = busy ? 1.0 : 0.0;
 }
 
+// Mood → how the corridor carries itself, on `moodtesseract` only (2026-11-06,
+// prototype: three contrasting moods; any other label looks neutral). The mood is
+// a slow baseline under the events: only rates and sizes, eased over seconds,
+// nothing that moves per frame, so it cannot bring the jitter back (§4TF).
+//   flow    shells' birth rate      spin    kernel's turn     pulse   breath's rate
+//   breath  breath's depth          kernel  kernel's size     wob     shells' wobble
+//   bright  overall light           hue     colour shift      drift   the idle colour swing
+//   heat    the corridor's gradient: above 0 the kernel's red reaches further out,
+//           below 0 the whole corridor runs colder. Sliding the hue alone did not
+//           read: irritable at full strength never looked red.
+//   droop   scene height            gap     time between idle actions
+//   doze    extra doze weight       react   how hard events land
+//   ring    the mood's own five colours, in the order of COLORS.palette: the
+//           outer shells sit near the first, the kernel near the fourth. Each
+//           stays in one family and dark, as the thermal ring does, because
+//           additive blending and bloom lift them a long way.
+const MOOD_NEUTRAL = Object.freeze({ flow: 1, spin: 1, pulse: 1, breath: 1, kernel: 1, wob: 1,
+    bright: 1, hue: 0, drift: 1, heat: 0, droop: 0, gap: 1, doze: 0, react: 1,
+    ring: COLORS.palette.map((c) => new THREE.Color(c)) });
+const MOOD_FIELDS = Object.keys(MOOD_NEUTRAL).filter((f) => f !== 'ring');
+const MOOD_RINGS = {
+    cheerful:  ['#0a4a50', '#125a7a', '#5a2a86', '#8a3a24', '#56204a'],   // sunrise: teal, cerulean, orchid, coral, rose
+    irritable: ['#1c0a2c', '#3c0e34', '#6e0c28', '#8e2c0a', '#4e0f12'],   // fire: soot, wine, crimson, ember, oxblood
+    tired:     ['#123f4c', '#27436e', '#4c4080', '#5e3a66', '#2e2a50'],   // dusk: slate teal, dusk blue, lavender, mauve
+};
+const MOOD_LOOKS = {
+    cheerful: { flow: 1.5, spin: 1.6, pulse: 1.25, breath: 1.7, kernel: 1.2, wob: 1.2,
+        bright: 1.3, hue: 0.03, drift: 0.5, heat: 0.2, droop: 0.06, gap: 0.6, doze: 0, react: 1.1 },
+    irritable: { flow: 1.35, spin: 2.6, pulse: 1.7, breath: 1.8, kernel: 0.7, wob: 0.35,
+        bright: 1.1, hue: 0.02, drift: 0.3, heat: 0.8, droop: 0, gap: 1, doze: 0, react: 1.5 },
+    tired: { flow: 0.4, spin: 0.3, pulse: 0.5, breath: 1.3, kernel: 0.9, wob: 1.0,
+        bright: 0.75, hue: 0, drift: 0.2, heat: -0.22, droop: -0.2, gap: 1.5, doze: 3, react: 0.6 },
+};
+// Share of the look at each intensity: 1 barely there, 2 clear, 3 unmistakable.
+const MOOD_STRENGTH = { 1: 0.35, 2: 0.7, 3: 1 };
+// Pure. An unknown label or intensity 0 is neutral; an absent intensity reads as 2.
+export function moodLook(label, intensity) {
+    const key = String(label || '').toLowerCase();
+    const look = Object.prototype.hasOwnProperty.call(MOOD_LOOKS, key) ? MOOD_LOOKS[key] : null;
+    const n = intensity == null ? 2 : Number(intensity);
+    const k = MOOD_STRENGTH[n];
+    if (!look || !k) return MOOD_NEUTRAL;
+    const out = {};
+    for (const f of MOOD_FIELDS) out[f] = MOOD_NEUTRAL[f] + (look[f] - MOOD_NEUTRAL[f]) * k;
+    out.ring = MOOD_NEUTRAL.ring.map((c, i) => new THREE.Color(c).lerp(new THREE.Color(MOOD_RINGS[key][i]), k));
+    // Reduced motion keeps a steady tempo, as the temperament does; the mood
+    // still shows in light and colour.
+    if (PREFERS_REDUCED_MOTION) for (const f of ['flow', 'spin', 'pulse', 'breath', 'wob']) out[f] = MOOD_NEUTRAL[f];
+    return out;
+}
+const _moodNow = { ...MOOD_NEUTRAL };     // the eased look, read per frame
+let _moodLive = MOOD_NEUTRAL, _moodPreview = null;
+// Try a look by hand, from the console: __ghostFace.previewMood('irritable', 3);
+// previewMood() goes back to the agent's real mood. Not saved anywhere.
+export function previewMood(label, intensity) {
+    _moodPreview = label == null ? null : moodLook(label, intensity == null ? 3 : intensity);
+    return { ...(_moodPreview || _moodLive) };
+}
+
 // Mood → a slow baseline shift of the COLD pole only (never competes
-// with the hot pole). Pure mapping; executed under node.
+// with the hot pole). Pure mapping; executed under node. §4TC: the labels
+// are the agent's nine moods — low energy sits cooler (deeper blue, toward
+// the plum bridge), high energy warmer (indigo → violet); "neutral" and any
+// unknown label are 0. `moodHueScale` lets the intensity (1–3) scale the
+// shift: half at 1, as given at 2, half again at 3 — always within ±0.07.
 export function moodHueFor(label) {
     switch (String(label || '').toLowerCase()) {
-        case 'satisfied': return -0.035;   // deeper, settled blue
-        case 'idle': return -0.06;         // toward the plum bridge — resting
+        case 'content': return -0.015;     // settled blue
+        case 'calm': return -0.03;         // deeper, settled blue
+        case 'down': return -0.035;        // deeper still
+        case 'bored': return -0.04;        // toward the plum bridge — resting
+        case 'tired': return -0.045;       // the plum bridge
+        case 'cheerful': return 0.025;     // indigo
         case 'curious': return 0.03;       // indigo, leaning violet
-        case 'stuck': return 0.05;         // violet
-        case 'overloaded': return 0.07;    // violet, nearly warm
+        case 'restless': return 0.04;      // violet
+        case 'irritable': return 0.045;    // violet, nearly warm
         default: return 0.0;
     }
 }
-export function setMoodHue(label) {
-    targetMoodHue = moodHueFor(label);
+export function moodHueScale(intensity) {
+    const n = Number(intensity);
+    return n === 1 ? 0.5 : n === 3 ? 1.5 : 1.0;      // 2, absent or unreadable → as given
+}
+export function setMoodHue(label, intensity) {
+    targetMoodHue = moodHueFor(label) * moodHueScale(intensity);
+    // A failed health poll passes null: keep the last look through the blip (it
+    // would drop to neutral within seconds and come back on the next good poll).
+    if (label != null) _moodLive = moodLook(label, intensity);
     return targetMoodHue;
 }
 
@@ -1543,41 +1294,6 @@ export function init() {
     linesMesh = new THREE.LineSegments(lineGeometry, lineMaterial);
     scene.add(linesMesh);
 
-    // Interior motes (see MOTE_COUNT comment). Distributed with an
-    // inward bias so the region the camera dives through is the
-    // densest. Added to the scene so they inherit its spin/scale.
-    const moteGeom = new THREE.BufferGeometry();
-    const motePos = new Float32Array(MOTE_COUNT * 3);
-    const moteSeeds = new Float32Array(MOTE_COUNT);
-    for (let i = 0; i < MOTE_COUNT; i++) {
-        const u = Math.random(), v = Math.random();
-        const th = 2 * Math.PI * u, ph = Math.acos(2 * v - 1);
-        const r = 2.4 * Math.pow(Math.random(), 0.55); // inward bias
-        motePos[i * 3] = r * Math.sin(ph) * Math.cos(th);
-        motePos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
-        motePos[i * 3 + 2] = r * Math.cos(ph);
-        moteSeeds[i] = Math.random();
-    }
-    moteGeom.setAttribute('position', new THREE.BufferAttribute(motePos, 3));
-    moteGeom.setAttribute('aSeed', new THREE.BufferAttribute(moteSeeds, 1));
-    motesMaterial = new THREE.ShaderMaterial({
-        vertexShader: moteVertexShader,
-        fragmentShader: moteFragmentShader,
-        uniforms: {
-            uTime: { value: 0 },
-            uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
-            uWaveAmp: { value: 1.0 },
-            uDive: { value: 0 },
-            uDpr: { value: _appliedDpr },
-            ...paletteUniforms(),
-        },
-        transparent: true,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-    });
-    motesMesh = new THREE.Points(moteGeom, motesMaterial);
-    motesMesh.visible = false;   // skipped entirely at rest
-    scene.add(motesMesh);
 
     // Scale scene down by 10%
     scene.scale.set(0.9, 0.9, 0.9);
@@ -1603,7 +1319,6 @@ function handleResize() {
         _appliedDpr = pr;
         renderer.setPixelRatio(pr);
         if (typeof composer.setPixelRatio === 'function') composer.setPixelRatio(pr);
-        if (motesMaterial) motesMaterial.uniforms.uDpr.value = pr;
     }
     renderer.setSize(container.clientWidth, container.clientHeight);
     composer.setSize(container.clientWidth, container.clientHeight);
@@ -1744,7 +1459,7 @@ export function setAudioLevel(level) {
 // Richer signals (2026-10-30): every live log line (its icons say the
 // work kind and the outcome) and every streamed reply chunk (the token
 // rate, and whether the model is inside <think>) feed the temperament.
-export function noteLogLine(content, isError) { return temper.ingestLog(content, isError); }
+export function noteLogLine(content) { return temper.ingestLog(content); }
 export function noteStreamChunk(text) {
     temper.ingestChunk(text);
     activityTarget = Math.min(1.0, activityTarget + 0.012);
@@ -1764,14 +1479,12 @@ export function getDebugState() {
         pulse: _fract(pulsePhase),
         bob: _bob,
         anatomy: FORMS[formIndex],
-        vortexTravel,
-        tunnelFlow,
         phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
-        backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv, body: { ..._bodyPrev },
+        backgroundBusy, moodHue, moodLook: { ..._moodNow }, pulsePhase, gazeY, errorKind, errorKindEnv, body: { ..._bodyPrev },
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
-        dtF, clock: time, cubeRunnerFlow, cube2Flow, cube2Travel, twitchAmp,
-        vortexSpin, linkBudget: _linkBudget, maxLines: MAX_LINES,
-        tesseract: { lines: { ..._c2LineStats }, kernelSpin: c2KernelSpin, wob: _c2Wob,
+        dtF, clock: time, cube2Flow, cube2Travel, twitchAmp,
+        linkBudget: _linkBudget, maxLines: MAX_LINES,
+        tesseract: { lines: { ..._c2LineStats }, breaths: _c2Shells.map((s) => s.L / (C2_L0 * Math.exp(C2_K * s.d))), kernelSpin: c2KernelSpin, wob: _c2Wob,
                  tw: _c2Shells.map((sh) => sh.tw), d: _c2Shells.map((sh) => sh.d),
                  seeds: _c2Shells.map((sh) => sh.seed), kernelBase: _c2KernelBase,
                  shells: C2_SHELLS, kernelN: C2_KERNEL_N, stream: _c2StreamCount, roll: c2Roll },
@@ -2060,14 +1773,7 @@ const NET_FLICKER_DUTY = 0.40;
 // terrain reads as a mesh surface, not a solid (the mobile sheet is
 // sparser, hence the wider radius).
 const LINK_MULT = {
-    vortex: 1.5,
-    cube: 0.45,
-    tesseract: 0.35,  // nothing links by proximity here (explicit edges); kept for the table's completeness
-    // Descent radius must cover a grid step across the WORST-CASE
-    // analytic slope of _lossH (all terms aligned), or the sheet
-    // tears momentarily on steep ridges — computed invariant pinned
-    // in tests/test_interface_face_forms_ai.py.
-    descent: IS_MOBILE ? 0.38 : 0.20,
+    moodtesseract: 0.35,  // nothing links by proximity here (explicit edges)
 };
 
 // The thermal oscillation's clock (body below in animate's comment).
@@ -2109,8 +1815,10 @@ function animate(ts) {
     // Frame-time scale — see the dtF declaration. `ts` is the rAF
     // timestamp; the very first frame (and the first after a pause)
     // has no previous stamp and steps exactly one 60fps frame.
+    let frameMs = 1000 / 60;
     if (typeof ts === 'number' && _lastFrameTs !== null) {
-        dtF = Math.min(DT_MAX, Math.max(DT_MIN, (ts - _lastFrameTs) / (1000 / 60)));
+        frameMs = ts - _lastFrameTs;
+        dtF = Math.min(DT_MAX, Math.max(DT_MIN, frameMs / (1000 / 60)));
     } else {
         dtF = 1.0;
     }
@@ -2149,9 +1857,14 @@ function animate(ts) {
     audioLevel *= decay(0.92);
 
     // ── Temperament (2026-10-30): one step per frame ───────────────
-    _temperNow += dtF * (1000 / 60);
-    if (Date.now() - _temperNow > 5000) _temperNow = Date.now();
-    TS = temper.step(dtF / 60, _temperNow);
+    const _wall = Date.now(), _wallGap = _wall - _temperWall;
+    _temperWall = _wall;
+    if (frameMs > TEMPER_ABSENCE_MS || _wallGap > TEMPER_ABSENCE_MS) {
+        frameMs = 1000 / 60;
+        _temperNow = Math.max(_temperNow, _wall);
+    }
+    _temperNow += frameMs;
+    TS = temper.step(frameMs / 1000, _temperNow);
     if (TS.startleKick > 0) flinch = Math.min(1.0, flinch + 0.45 * TS.startleKick);
 
     // ── Signal-layer envelopes (2026-09-11) ─────────────────────────
@@ -2163,7 +1876,12 @@ function animate(ts) {
     verdictEnv *= decay(verdict === 'pass' ? TUNE.passHold : 0.975);   // pass holds ~2s, others ~1s
     if (verdictEnv < 0.01) { verdictEnv = 0; verdict = null; }
     backgroundBusy += (targetBackgroundBusy - backgroundBusy) * ease(0.01);
-    moodHue += (targetMoodHue + TS.hueShift - moodHue) * ease(0.0008);     // ~1 min to settle
+    // The mood's own form takes its colour from the look alone: adding this shift
+    // pushed the kernel past the red stop, and a preview never matched the live mood.
+    // The mood form carries no label shift, and sheds one brought over from the
+    // plain tesseract as fast as its look arrives, not over the usual minute. With
+    // no look showing it keeps the usual rate, so at neutral it stays the tesseract.
+    moodHue += ((FORMS[formIndex] === 'moodtesseract' ? 0.0 : targetMoodHue) + TS.hueShift - moodHue) * ease(FORMS[formIndex] === 'moodtesseract' && (_moodPreview || _moodLive) !== MOOD_NEUTRAL ? 0.012 : 0.0008);     // ~1 min to settle
     gazeX += (targetGazeX + TS.gazeX - gazeX) * ease(0.03);
     gazeY += (targetGazeY + TS.gazeY - gazeY) * ease(0.03);
     errorKindEnv *= decay(0.985);
@@ -2200,61 +1918,28 @@ function animate(ts) {
     // keys on the NAME (index comparisons broke silently whenever the
     // FORMS array grew; 2026-07-29, when the four AI forms joined).
     const FORM = FORMS[formIndex];
-    // The camera-STATIC forms (vortex, cube2 — their user-turn story is
-    // their own engagement law; empty has nothing to dive into) opt out
-    // of everything the dive does for a camera that moves INTO the cloud:
-    // the interior line dim, the bloom damp (×0.5 — it made the vortex's
-    // busy state DIMMER than idle, 0.50 vs 0.57, cancelling the surge the
-    // comments promise), the motes, the interior clock speed-up and the
-    // proximity thickening. The scene swell was already neutralised for
-    // them; these five couplings were not (measured 2026-09-21: vortex
-    // mean brightness FELL on a user turn, 6.6 → 6.3).
-    const camDive = (FORM === 'vortex' || FORM === 'tesseract' || FORM === 'empty') ? 0.0 : dive;
-
-    // Vortex engagement + flow (see the vortexTravel declaration).
-    // Engagement eases up while a user turn runs and eases back down on
-    // completion — since the camera never moves and the cone is
-    // self-similar, that ease IS the whole transition: busy morphs into
-    // idle with no reset of any kind.
-    if (FORM === 'vortex') {
-        if (userTurnState > 0.5) {
-            vortexTravel += (IMMERSION_CAP - vortexTravel) * ease(0.010);
-        } else if (vortexTravel > 0.001) {
-            vortexTravel *= decay(0.985);            // calm back down (~5s)
-        } else {
-            vortexTravel = 0.0;
-        }
-        const travelNorm = Math.min(vortexTravel / Math.max(IMMERSION_CAP, 0.001), 1.0);
-        // THE SWALLOW — the main animation. Slow accretion at idle, a
-        // touch quicker under ambient work, a strong endless in-fall
-        // while a user request executes (full emergence cycle ≈ 5s).
-        // The rate is TURBULENT, not constant: it surges and slackens on
-        // slow beats, and while feeding it GULPS in rhythm with the
-        // pulse — a constant conveyor read as monotonic.
-        const flowTurb = 1.0 + CALM * (0.35 * Math.sin(time * 0.23)
-            * Math.sin(time * 0.081 + 1.7)
-            + 0.45 * travelNorm * _pulseShape(_fract(pulsePhase)));
-        tunnelFlow += (dtF / 60) * (0.008
-            + 0.014 * Math.max(workingState, activity)
-            + 0.19 * travelNorm) * flowTurb * CALM
-            * (1.0 + TUNE.flowWrite * gaitFlow) * (1.0 - 0.5 * gaitThicken);
-        // Swirl (final direction 2026-07-28): idle keeps its slight
-        // rotation (0.125); busy ACCELERATES it moderately (+60%)
-        // alongside the flow surge — falling faster AND spinning
-        // faster, but nowhere near the early "way too fast" rates
-        // (that culprit was wind-coupling, long since fixed).
-        _vortexSpinStep = (dtF / 60) * (0.125
-            + 0.025 * Math.max(workingState, activity, travelNorm)) * CALM;
-        vortexSpin += _vortexSpinStep;
-    } else {
-        vortexTravel = 0.0;
-        _vortexSpinStep = 0.0;
+    // The mood's look: only its own form has a target; leaving eases back to
+    // neutral, and neutral is exactly 1/0 so every other form is untouched.
+    const _moodT = FORM === 'moodtesseract' ? (_moodPreview || _moodLive) : MOOD_NEUTRAL;
+    for (const f of MOOD_FIELDS) {
+        const gap = _moodT[f] - _moodNow[f];
+        _moodNow[f] = Math.abs(gap) < 1e-4 ? _moodT[f] : _moodNow[f] + gap * ease(0.012);
     }
+    // The ring's stops are the objects all three materials read, so only a mood
+    // ever writes them, and at neutral they land back on the exact thermal colours.
+    COLORS.palette.forEach((c, i) => {
+        const t = _moodT.ring[i];
+        if (c.r === t.r && c.g === t.g && c.b === t.b) return;
+        c.lerp(t, ease(0.012));
+        if (Math.abs(c.r - t.r) + Math.abs(c.g - t.g) + Math.abs(c.b - t.b) < 3e-4) c.set(t);
+    });
+    temper.setMoodBias(_moodT);
+
     // cube2: the same engagement law as the vortex — the birth rate is
     // the swallow. Idle ≈ a new shell every ~4.5s; a user turn ≈ every
     // 0.7s, gulping in rhythm with the pulse; completion is a pure
     // intensity morph (no reset, no camera travel).
-    if (FORM === 'tesseract') {
+    if (FORM === 'moodtesseract') {
         if (userTurnState > 0.5) {
             cube2Travel += (IMMERSION_CAP - cube2Travel) * ease(0.010);
         } else if (cube2Travel > 0.001) {
@@ -2266,7 +1951,7 @@ function animate(ts) {
         const c2Turb = 1.0 + CALM * (0.30 * Math.sin(time * 0.21) * Math.sin(time * 0.077 + 1.1)
             + 0.45 * c2n * _pulseShape(_fract(pulsePhase)));
         cube2Flow += (dtF / 60) * (0.020 + 0.020 * Math.max(workingState, activity)
-            + 0.10 * c2n) * c2Turb * CALM * (1.0 + TUNE.flowWrite * gaitFlow);
+            + 0.10 * c2n) * c2Turb * CALM * (1.0 + TUNE.flowWrite * gaitFlow) * _moodNow.flow;
         // v2: a tool call sends a burst of packets down every edge (the
         // line shader's `burst` term rides uPulseT), and a user turn keeps
         // the charge visibly moving.
@@ -2281,7 +1966,7 @@ function animate(ts) {
     // tStep is THIS frame's advance of the shared clock; the per-form
     // integrated phases below (runner flow, cube churn/spin) step by it
     // so they stay locked to `time` at constant rate.
-    const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF * _tsSpeed();
+    const tStep = 0.005 * motionMul * dtF * _tsSpeed();
     time += tStep;
 
     // Idle breathing: ±1% scene-scale sine at ~0.1Hz. Below the
@@ -2309,9 +1994,7 @@ function animate(ts) {
     // background breath is a second, slower rhythm under everything.
     const exhale = verdict === 'stop' ? TUNE.exhale * Math.sin(Math.PI * (1.0 - verdictEnv)) * verdictEnv : 0;
     const bgBreath = TUNE.bgBreath * backgroundBusy * Math.sin(time * 0.31 + 0.9);
-    const sceneScale = ((FORM === 'vortex' || FORM === 'tesseract') ? 0.9 * breathe
-        : FORM === 'cube' ? 0.9 * breathe * (1.0 + dive * 0.18)
-        : baseScale) * (1.0 + exhale + bgBreath);
+    const sceneScale = (FORM === 'moodtesseract' ? 0.9 * breathe : baseScale) * (1.0 + exhale + bgBreath);
     // Steady targets go into _sceneT; _applySceneBlend writes them (or
     // the blend toward them after a form switch) below — §4PR.
     const T = _sceneT;
@@ -2325,28 +2008,13 @@ function animate(ts) {
     T.rx = scene.rotation.x; T.ry = scene.rotation.y; T.rz = scene.rotation.z;
     T.px = scene.position.x; T.py = scene.position.y;
     if (!PREFERS_REDUCED_MOTION) {
-        if (FORM === 'vortex') {
-            // Vortex: the funnel must keep facing the viewer, so no big
-            // heading wander — instead the whole scene ROLLS around the
-            // view axis (global swirl) with only a whisper of tilt.
-            T.rx = 0.06 * Math.sin(time * 0.050);
-            T.ry = 0.05 * Math.sin(time * 0.031 + 1.0);
-            T.rz = vortexSpin * 0.22;
-            T.px = 0.05 * Math.sin(time * 0.031);
-            T.py = _bob * 0.5;
-        } else if (FORM === 'cube' || FORM === 'tesseract') {
-            // Cube: near-still heading — its OWN slow tumble is the
-            // motion. The full heading wander compounded with the
-            // focus-translation release into an "erratic zoom-out" (the
-            // old monolith, v2), and it kept the silhouette from ever
-            // settling into a readable cube; the wander peaked at ~40%
-            // of the tumble rate — nothing the eye will miss.
+        if (FORM === 'moodtesseract') {
+            // Near-still heading: the corridor's own roll is the motion.
             T.ry = 0.09 * Math.sin(time * 0.029);
             T.rx = 0.05 * Math.sin(time * 0.021 + 0.7);
-            T.rz = 0.02 * Math.sin(time * 0.017 + 2.0)
-                + (FORM === 'tesseract' ? c2Roll : 0.0);        // v3: the corridor's slow roll
+            T.rz = 0.02 * Math.sin(time * 0.017 + 2.0) + c2Roll;   // v3: the corridor's slow roll
             T.px = 0.04 * Math.sin(time * 0.023);
-            T.py = _bob * 0.4;
+            T.py = _bob * 0.4 + _moodNow.droop;
         } else {
             // Heading wander: the creature holds a loose heading and lets
             // it drift — sums of incommensurate slow sines, so it turns
@@ -2367,35 +2035,18 @@ function animate(ts) {
     // rides on top at any depth.
     camera.position.x += (parallaxTargetX - camera.position.x) * ease(0.04);
     camera.position.y += (parallaxTargetY - camera.position.y) * ease(0.04);
-    if (FORM === 'vortex') {
-        // Vortex: THE CAMERA NEVER MOVES — the self-similar swallow does
-        // all the traveling. It studies the hole itself.
-        T.camZ = CAMERA_REST_Z;
-        _lookTarget(camera.position.x * 0.35, camera.position.y * 0.35,
-            VORTEX_APEX_Z);
-    } else if (FORM === 'tesseract') {
+    if (FORM === 'moodtesseract') {
         // cube2: the camera never moves either — the shells' outward
         // bloom is the fall; it studies the kernel at the origin.
         T.camZ = CAMERA_REST_Z;
         _lookTarget(camera.position.x * 0.35, camera.position.y * 0.35, 0.0);
     } else {
-        // Cube: PARTIAL dive only — close enough to watch the attention
-        // kernel work the grid, never inside the cloud ("zoom is too
-        // much... just shows random dots").
-        const _partial = FORM === 'cube';
-        const _diveZ = _partial ? CUBE_DIVE_Z : CAMERA_DIVE_Z;
-        T.camZ = CAMERA_REST_Z - (CAMERA_REST_Z - _diveZ) * dive;
+        T.camZ = CAMERA_REST_Z - (CAMERA_REST_Z - CAMERA_DIVE_Z) * dive;
         // Look-target blend: at rest the camera studies the origin; deep in
         // the cloud it must look FORWARD through it instead — near the
         // origin, lookAt(0,0,0) turns tiny parallax offsets into wild
         // rotations (the lookAt singularity).
-        // Descent (2026-09-20): the bead sits 0.30 BELOW the view axis
-        // (the hover lift) and a level camera put it at screen y −0.6 —
-        // the bottom fifth, under the composer on a phone. Pitch the
-        // look target down with the dive so the optimizer rides mid-low
-        // in frame while the camera still hovers above the sheet.
-        const _lookDrop = FORM === 'descent' ? 0.75 : 0.0;
-        _lookTarget(gazeX, gazeY * (1.0 - dive) - _lookDrop * dive, (_partial ? -1.0 : -3.5) * dive);
+        _lookTarget(gazeX, gazeY * (1.0 - dive), -3.5 * dive);
     }
     // The form-switch blend (see _sceneFrom): the same smoothstep the node
     // blend below applies this frame, or exactly the steady targets.
@@ -2433,7 +2084,7 @@ function animate(ts) {
     // agitates both rate and amplitude — a recoil, not a flash.
     pulsePhase += (dtF / 60) * (0.20 + 0.105 * currentShapeSpeed)
         * (1.0 + flinch * 1.2)
-        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul * _tsSpeed();
+        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul * _tsSpeed() * _moodNow.pulse;
     flinch *= decay(0.97);
 
     const pulseAmp = (0.16 + 0.10 * drive + 0.22 * flinch)
@@ -2448,91 +2099,7 @@ function animate(ts) {
     _bobTarget = 0.10 * Math.sin(time * 0.043 + 0.5);
     _bob += (_bobTarget - _bob) * ease(0.02);
 
-    if (FORM === 'vortex') {
-        // ── VORTEX: the self-similar swallow. Each wall node's depth
-        //    FLOWS (dEff advances with tunnelFlow); its distance from
-        //    the apex is L0·e^(−k·d) so the wrap is an invisible fractal
-        //    renormalization; its hue re-heats blue→red along the fall
-        //    (seeds recomputed per frame, uploaded below). A drifting
-        //    harmonic field morphs the cross-section through organic,
-        //    never-repeating shapes — the "procedurally generated
-        //    content" being consumed — swelling while a turn runs.
-        const engage = Math.min(vortexTravel / Math.max(IMMERSION_CAP, 0.001), 1.0);
-        // Pulsing OFF at idle (final direction 2026-07-28): the resting
-        // vortex only drifts and turns. A SLIGHT pulse (35%) is allowed
-        // while busy — it rides the feeding gulps and keeps the surge
-        // from feeling like a conveyor.
-        const vPulseScale = 0.35 * Math.max(engage, drive);
-        const a2 = (0.10 + 0.20 * engage) * Math.sin(time * 0.110);
-        const a3 = (0.08 + 0.16 * engage) * Math.sin(time * 0.073 + 2.1);
-        const a5 = (0.05 + 0.11 * engage) * Math.sin(time * 0.047 + 0.7);
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 2) {
-                // The shadow's embers: dim, trembling, hungrier while a
-                // request runs — the center is never static.
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + (0.14 * vPulseScale + 0.28 * engage) * c;
-                const tremor = 0.02 + 0.04 * engage;
-                currentPositions[i].set(
-                    bp.hx * g + tremor * CALM * Math.sin(time * 1.1 + bp.jit),
-                    bp.hy * g + tremor * CALM * Math.cos(time * 0.9 + bp.jit * 2.0),
-                    VORTEX_APEX_Z + bp.hz * g
-                        + 0.04 * CALM * Math.sin(time * 0.7 + bp.jit));
-            } else if (bp.kind === 3) {
-                // The accretion ring: the iconic slow orbit, breathing
-                // with the pulse, swelling slightly while feeding.
-                const th = bp.th0 + vortexSpin * 1.6;
-                const rr = bp.rRing
-                    * (1.0 + 0.05 * CALM * Math.sin(time * 0.5 + bp.jit)
-                        + 0.10 * engage * _pulseShape(_fract(pulsePhase)));
-                currentPositions[i].set(
-                    rr * Math.cos(th),
-                    rr * Math.sin(th) * 0.92,
-                    VORTEX_APEX_Z + bp.zJit
-                        + 0.03 * CALM * Math.sin(time * 0.8 + bp.jit));
-            } else {
-                // Stream matter: EMERGES from the hole's glow (L small,
-                // screen center) and blooms outward past the viewer —
-                // expansion optical flow = falling IN. The wrap at LMAX
-                // happens far off-screen; the respawn at LMIN hides
-                // inside the ring's glow. Hue cools as matter recedes
-                // from the hole (hottest at the center).
-                const dOut = _fract(bp.d0 + tunnelFlow * bp.flowScale);
-                const L = VORTEX_LMIN * Math.exp(VORTEX_KOUT * dOut);
-                // Spiral wind cut 4.2 → 1.2 → 0.35 across three "too
-                // fast" reports: the wind is traversed by the FLOW, so
-                // any busy surge multiplies into apparent rotation —
-                // keep it near-nothing. The differential is flattened
-                // too (0.9→0.5 center→rim, was 1.5): the center is
-                // where the eye rests, so it must not spin fastest by
-                // much. Busy total ≈ 13°/s near the hole vs ~6°/s idle.
-                bp.swirl += _vortexSpinStep * (0.9 - 0.4 * dOut);   // integrated, see _vortexSpinStep
-                const theta = bp.theta0 + (1.0 - dOut) * 0.35 + bp.swirl;
-                // Organic cross-section morph — the procedural content.
-                const shape = 1.0
-                    + a2 * Math.sin(2.0 * theta + dOut * 5.0)
-                    + a3 * Math.sin(3.0 * theta - dOut * 7.0)
-                    + a5 * Math.sin(5.0 * theta + dOut * 11.0);
-                // Turbulence: grains wobble off their trajectories, more
-                // while feeding, scale-relative so spawn stays calm.
-                const turb = (0.05 + 0.30 * engage)
-                    * Math.sin(time * (1.1 + bp.flowScale) + bp.jit * 3.0 + dOut * 7.0);
-                const pinch = _pulseShape(_fract(pulsePhase - dOut * 0.25));
-                const rad = L * bp.sinA * bp.rJit * shape
-                    * (1.0 - pulseAmp * 0.35 * vPulseScale * pinch)
-                    + turb * L * 0.10 * CALM;
-                currentPositions[i].set(
-                    rad * Math.cos(theta),
-                    rad * Math.sin(theta),
-                    VORTEX_APEX_Z + L * bp.cosA
-                        + turb * 0.12 * CALM
-                        + 0.05 * CALM * Math.sin(time * 0.6 + bp.jit));
-                nodeSeeds[i] = Math.max(0.02, 0.60 - dOut * 0.56) + bp.seedJit;
-            }
-        }
-        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'tesseract') {
+    if (FORM === 'moodtesseract') {
         // ── CUBE2 (v2): the kernel lattice tumbles on its integrated spin;
         //    each shell's frame (phase → size, twist = stack twist + the
         //    inherited kernel angle unwinding, breath, wobble, birth-pull,
@@ -2548,17 +2115,19 @@ function animate(ts) {
         // through the scene-scale exhale every form shares.
         const passEnv = verdict === 'pass' ? verdictEnv : 0.0;
         const shudder = verdict === 'refute' ? 0.09 * verdictEnv * CALM * Math.sin(time * 45.0) : 0.0;
-        const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign);
+        const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign) * _moodNow.wob;
+        const c2Amp = pulseAmp * _moodNow.breath;
         const wob = wobBase * (1.0 - 0.85 * passEnv) + shudder;
         _c2Wob = wob;
         // Kernel spin: integrated at the current rate (idle a slow turn,
         // a user turn faster, a tool call a kick) — see c2KernelSpin.
-        c2KernelSpin += (dtF / 60) * (0.10 + 0.50 * c2n + 0.8 * gaitFlash) * CALM * motionMul;
+        c2KernelSpin += (dtF / 60) * (0.10 + 0.50 * c2n + 0.8 * gaitFlash) * CALM * motionMul * _moodNow.spin;
         _c2KernelFrame(c2KernelSpin);
         // The stack's slow roll (v3): the whole corridor screws inward —
         // a full turn in ~5 minutes at idle, three times that on a turn.
         c2Roll += (dtF / 60) * (0.02 + 0.04 * c2n) * CALM * motionMul;
         const twDecay = decay(passEnv > 0.05 ? C2_TW_DECAY_PASS : C2_TW_DECAY);
+        const c2Slope = 1.0 - Math.max(0.0, _moodNow.heat), c2Cold = Math.min(0.0, _moodNow.heat);
         for (let k = 0; k < _c2Shells.length; k++) {
             const sh = _c2Shells[k];
             const d = _fract(sh.d0 + cube2Flow);
@@ -2568,12 +2137,12 @@ function animate(ts) {
             }
             sh.prevD = d;
             sh.tw *= twDecay;
-            _c2Frame(sh, d, kx, ky, kz, wob, pulseAmp);
+            _c2Frame(sh, d, kx, ky, kz, wob, c2Amp);
             // Heat wave (v2): hottest at birth, cooling as it grows, with a
             // pulse of warmth racing outward on the breath clock — stronger
             // while a user turn runs, so busy reads as red pulses leaving
             // the kernel.
-            sh.seed = Math.min(0.62, Math.max(0.02, 0.60 - d * 0.52)
+            sh.seed = Math.min(0.62, Math.max(0.02, 0.60 - d * 0.52 * c2Slope + c2Cold)
                 + 0.10 * (0.35 + c2n) * _pulseShape(_fract(pulsePhase - d * 0.35))
                 + 0.08 * c2n * (1.0 - d));
         }
@@ -2581,7 +2150,7 @@ function animate(ts) {
             + 0.12 * _pulseShape(_fract(pulsePhase + 0.05));
         const tremor = 0.010 + 0.020 * c2n;
         const _dust = _c2Dust;   // scratch frame; _c2Frame rewrites every field it reads
-        const km = _c2KernelM, kr = C2_KERNEL_R * g;
+        const km = _c2KernelM, kr = C2_KERNEL_R * g * _moodNow.kernel;
         for (let i = 0; i < NODE_COUNT; i++) {
             const bp = basePositions[i];
             const P = currentPositions[i];
@@ -2599,183 +2168,20 @@ function animate(ts) {
                     ky + km[3] * lx + km[4] * ly + km[5] * lz + tremor * CALM * Math.cos(time * 0.9 + bp.jit * 2.0),
                     kz + km[6] * lx + km[7] * ly + km[8] * lz + tremor * CALM * Math.sin(time * 0.7 + bp.jit * 3.0));
                 bp.sz = 1.15 * (1.0 + 0.5 * c2n + 0.4 * gaitFlash);
-                nodeSeeds[i] = Math.min(0.62, 0.58 + 0.03 * c2n + 0.02 * Math.sin(time * 0.8 + bp.jit));
+                nodeSeeds[i] = Math.min(0.62, 0.58 + 0.03 * c2n + 0.02 * Math.sin(time * 0.8 + bp.jit) + c2Cold);
             } else {
                 // Stream grain (v3): its own phase and speed on the shared
                 // expansion; spirals about the axis as it recedes; hot at
                 // birth, cooling outward; tapered like a shell.
                 const d = _fract(bp.d0 + cube2Flow * bp.flowScale);
-                _c2Frame(_dust, d, kx, ky, kz, 0.0, pulseAmp);
+                _c2Frame(_dust, d, kx, ky, kz, 0.0, c2Amp);
                 const phi = bp.uphi + C2_STREAM_SPIRAL * d;
                 _c2Pt(P, _dust, bp.ur * Math.cos(phi), bp.ur * Math.sin(phi), bp.uz);
                 P.x += 0.02 * CALM * Math.sin(time * 0.6 + bp.jit);
                 P.y += 0.02 * CALM * Math.cos(time * 0.5 + bp.jit * 2.0);
                 bp.sz = 0.9 * _dust.fade * (1.0 + 0.3 * c2n);
-                nodeSeeds[i] = Math.min(0.62, Math.max(0.02, 0.60 - d * 0.55) + 0.06 * c2n * (1.0 - d));
+                nodeSeeds[i] = Math.min(0.62, Math.max(0.02, 0.60 - d * 0.55 * c2Slope + c2Cold) + 0.06 * c2n * (1.0 - d));
             }
-        }
-        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'cube') {
-        // ── CUBE: the weight tensor tumbles slowly while diagonal
-        //    activation waves sweep it (riding the shared pulse clock),
-        //    heating the sites they cross; the hot attention kernel
-        //    drifts a Lissajous through the volume, bending nearby grid
-        //    toward itself; charge runners ride the axis lines.
-        const la1 = time * 0.055 * CALM, la2 = time * 0.034 * CALM;
-        const lc1 = Math.cos(la1), ls1 = Math.sin(la1);
-        const lc2 = Math.cos(la2), ls2 = Math.sin(la2);
-        const kx = 0.85 * Math.sin(time * 0.111);
-        const ky = 0.80 * Math.sin(time * 0.087 + 1.7);
-        const kz = 0.85 * Math.cos(time * 0.067 + 0.6);
-        const waveGain = 0.16 + 0.22 * drive + 0.15 * flinch;
-        const alignMul = 1.0 - TUNE.alignGain * gaitAlign;   // verify: the grid snaps true
-        // Runner travel is INTEGRATED (see cubeRunnerFlow): same rate
-        // law as before, stepped per frame instead of multiplied into
-        // the ever-growing clock.
-        cubeRunnerFlow += tStep * (1.0 + 1.5 * drive + 2.0 * gaitFlow);
-        // Dive focus (2026-09-20, the descent lesson):
-        // the kernel's POST-TUMBLE position is subtracted from every
-        // node, dive-weighted, so the camera's partial dive lands ON the
-        // attention kernel — the form's hot focus — instead of the grid
-        // centre with the kernel off screen. The kernel's Lissajous and
-        // the tumble are both continuous, so the follow never jumps.
-        const _kx1 = kx * lc1 + kz * ls1;
-        const _kz1 = -kx * ls1 + kz * lc1;
-        const _cubeFx = dive * _kx1;
-        const _cubeFy = dive * (ky * lc2 - _kz1 * ls2);
-        const _cubeFz = dive * (ky * ls2 + _kz1 * lc2);
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            let x, y, z;
-            if (bp.kind === 0) {
-                const w = _pulseShape(_fract(pulsePhase - bp.wp * 0.42));
-                const dxk = bp.gx - kx, dyk = bp.gy - ky, dzk = bp.gz - kz;
-                const kAtt = Math.exp(-(dxk * dxk + dyk * dyk + dzk * dzk) / 0.55);
-                const lean = 0.10 * kAtt * alignMul;            // pulled toward attention
-                const wd = 0.055 * pulseAmp * w * CALM * alignMul;   // along (1,1,1)/√3
-                x = bp.gx - dxk * lean + wd * 0.577
-                    + 0.018 * CALM * alignMul * Math.sin(time * 1.1 + bp.jit);
-                y = bp.gy - dyk * lean + wd * 0.577
-                    + 0.018 * CALM * alignMul * Math.sin(time * 0.8 + bp.jit * 2.0);
-                z = bp.gz - dzk * lean + wd * 0.577;
-                nodeSeeds[i] = Math.min(0.60,
-                    bp.seed0 + w * waveGain + 0.28 * kAtt * (1.0 + gaitFlash * TUNE.flashGain));
-            } else if (bp.kind === 1) {
-                const t = _fract(bp.d0 + cubeRunnerFlow * bp.speed);
-                const p = -bp.span + t * 2 * bp.span;
-                // Taper at the faces so the wrap hides off-grid.
-                bp.sz = 0.85 * Math.min(1, 8 * Math.min(t, 1 - t) + 0.10);
-                x = bp.ox + bp.dx * p;
-                y = bp.oy + bp.dy * p;
-                z = bp.oz + bp.dz * p;
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.15 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                x = kx + bp.hx * g;
-                y = ky + bp.hy * g;
-                z = kz + bp.hz * g;
-            }
-            // Stately two-axis tumble — crystalline, no medusan sway.
-            const x1 = x * lc1 + z * ls1;
-            const z1 = -x * ls1 + z * lc1;
-            currentPositions[i].set(
-                x1 - _cubeFx,
-                y * lc2 - z1 * ls2 - _cubeFy,
-                y * ls2 + z1 * lc2 - _cubeFz);
-        }
-        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'descent') {
-        // ── DESCENT: true gradient descent on the evolving loss
-        //    surface. Numeric ∇h each frame; damping keeps the roll
-        //    readable; soft walls; a learning-rate kick fires when the
-        //    bead settles (basin found) or the agent flinches (bad
-        //    gradient step). The sheet dips under the bead and heats
-        //    where it passes; ridges stay cold, valleys warm.
-        const ddt = dtF / 60;
-        const lr = 1.6 * (0.55 + 0.45 * drive + 0.6 * gaitFlow);
-        const eps = 0.06;
-        const gX = (_lossH(beadX + eps, beadZ, time)
-            - _lossH(beadX - eps, beadZ, time)) / (2 * eps);
-        const gZ = (_lossH(beadX, beadZ + eps, time)
-            - _lossH(beadX, beadZ - eps, time)) / (2 * eps);
-        beadVX = (beadVX - gX * lr * ddt) * decay(0.965);
-        beadVZ = (beadVZ - gZ * lr * ddt) * decay(0.965);
-        beadX += beadVX * ddt * 2.0 * CALM;
-        beadZ += beadVZ * ddt * 2.0 * CALM;
-        const XL = DESC_SX / 2 - 0.25, ZL = DESC_SZ / 2 - 0.25;
-        if (beadX > XL) { beadX = XL; beadVX = -Math.abs(beadVX) * 0.5; }
-        if (beadX < -XL) { beadX = -XL; beadVX = Math.abs(beadVX) * 0.5; }
-        if (beadZ > ZL) { beadZ = ZL; beadVZ = -Math.abs(beadVZ) * 0.5; }
-        if (beadZ < -ZL) { beadZ = -ZL; beadVZ = Math.abs(beadVZ) * 0.5; }
-        const spd = Math.hypot(beadVX, beadVZ);
-        beadStill = spd < 0.10 ? beadStill + ddt : 0;
-        if (beadStill > 2.2 || (flinch > 0.55 && beadStill > 0.4)) {
-            const ka = Math.random() * Math.PI * 2;
-            const kk = 0.9 + 0.7 * drive;
-            beadVX += Math.cos(ka) * kk;
-            beadVZ += Math.sin(ka) * kk;
-            beadStill = 0;
-        }
-        // One trail sample per 60fps-frame of wall time (see
-        // BEAD_TRAIL_LEN): the tail's temporal length is the same on a
-        // 120Hz display as on a throttled 30fps tab.
-        _descTick += dtF;
-        while (_descTick >= 1.0) {
-            _descTick -= 1.0;
-            beadTrail.unshift([beadX, beadZ]);
-            if (beadTrail.length > BEAD_TRAIL_LEN) beadTrail.pop();
-        }
-        // Tilt the whole landscape toward the camera.
-        const TC = Math.cos(-0.52), TS = Math.sin(-0.52);
-        // Dive focus (2026-07-29 operator report: "descent usually
-        // zooms into an uninteresting location when busy"): the
-        // immersion dive zooms toward the scene ORIGIN — a generic
-        // patch of terrain — while the story (the hot bead) is off
-        // wherever it rolled. While diving, translate the whole sheet
-        // so the BEAD sits at the origin, slightly below the view axis
-        // (+0.30 lift so the camera hovers over the surface instead of
-        // clipping into it): a user turn rides the optimizer hunting
-        // the minimum. Weighted by `dive` — at rest nothing moves; the
-        // bead's position is continuous (velocity physics; kicks jolt
-        // velocity, never position), so the follow never jumps.
-        const _bwYpre = _lossH(beadX, beadZ, time) + 0.10;
-        const _descFx = dive * beadX;
-        const _descFy = dive * (_bwYpre * TC - beadZ * TS - 0.15 + 0.30);
-        const _descFz = dive * (_bwYpre * TS + beadZ * TC);
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            let x, y, z;
-            if (bp.kind === 0) {
-                const h = _lossH(bp.gx, bp.gz, time);
-                const dxb = bp.gx - beadX, dzb = bp.gz - beadZ;
-                const heat = Math.exp(-(dxb * dxb + dzb * dzb) / 0.30);
-                x = bp.gx;
-                y = h - 0.10 * heat
-                    + 0.02 * CALM * Math.sin(time * 0.9 + bp.jit);
-                z = bp.gz;
-                // Height → thermal: ridges cold, valleys warm, the
-                // bead's neighborhood glowing.
-                const hn = Math.max(0, Math.min(1, 0.5 + h / (2 * DESC_H * 0.76)));
-                nodeSeeds[i] = 0.04 + (1 - hn) * 0.30 + 0.24 * heat;
-            } else {
-                // Each tail node reads one trail entry; with a sample per
-                // frame the entries shift by exactly one bead-step per
-                // frame, so every tail node glides (interpolating between
-                // neighbouring entries was measured equivalent and dropped).
-                const _tl = Math.max(beadTrail.length - 1, 0);
-                const _ti = Math.min(Math.floor(bp.s * _tl), _tl);
-                const P = beadTrail.length ? beadTrail[_ti] : [beadX, beadZ];
-                x = P[0] + bp.rr * Math.sin(time * 2.3 + bp.jit * 3.0);
-                y = _lossH(P[0], P[1], time) + 0.10
-                    + bp.rr * Math.cos(time * 1.9 + bp.jit * 2.0);
-                z = P[1] + bp.rr * Math.sin(time * 2.1 + bp.jit * 5.0);
-                bp.sz = 1.0 - bp.s * 0.55;
-                nodeSeeds[i] = 0.60 - bp.s * 0.22;
-            }
-            currentPositions[i].set(
-                x - _descFx,
-                y * TC - z * TS - 0.15 - _descFy,
-                y * TS + z * TC - _descFz);
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     } else {
@@ -2804,7 +2210,11 @@ function animate(ts) {
         // got the full-amplitude shake).
         const shudder = verdict === 'refute' ? TUNE.shudder * verdictEnv * CALM : 0;
         const writeW = DIAL.write === 'wave' ? gait.write : 0;
-        const twitchP = idleTwitchNode >= 0 ? currentPositions[idleTwitchNode] : null;
+        // Not on the tesseract: its wireframe is computed apart from the nodes,
+        // so a twitch pulled corners off their edges, and the neighbourhood of a
+        // node near the centre held the whole kernel (5–18× the rest motion,
+        // every ~13 s; operator: "gittery", 2026-11-06).
+        const twitchP = idleTwitchNode >= 0 && !FORM === 'moodtesseract' ? currentPositions[idleTwitchNode] : null;
         for (let i = 0; i < NODE_COUNT; i++) {
             const p = currentPositions[i];
             if (basePositions[i].kind === 8) continue;
@@ -2890,7 +2300,7 @@ function animate(ts) {
     // cube2 draws its shells as explicit polylines (a wireframe cube's
     // edges span far more than any proximity radius at the outer
     // scales); those nodes are skipped by the O(n²) pass below.
-    if (FORM === 'tesseract') {
+    if (FORM === 'moodtesseract') {
         lineIdx = _emitCube2Edges(linePosAttr, lineUvAttr, lineHueAttr, lineFadeAttr, connected, lineIdx);
     }
 
@@ -2899,7 +2309,7 @@ function animate(ts) {
     // the middle of them (the O(n²) distances are computed either way;
     // this only accepts more pairs, bounded by MAX_LINES).
     // (Per-form multipliers: LINK_MULT, module scope.)
-    const proximitySq = PROXIMITY_SQ * (1.0 + camDive * 0.15)
+    const proximitySq = PROXIMITY_SQ
         * (LINK_MULT[FORM] === undefined ? 1.0 : LINK_MULT[FORM])
         * (1.0 + TUNE.thickenLinks * gaitThicken)    // read, 'thicken' dialect
         * _linkBudget;                                // see LINK_BUDGET_MIN
@@ -3011,13 +2421,12 @@ function animate(ts) {
     // the hue wave/drift so its center stays anchored DARK RED instead
     // of swinging through the plum stop ("bright purple" report).
     // cube2 v3: the kernel IS the hot focal point — no centre dim there.
-    const centerDim = FORM === 'vortex' ? 0.85 : (FORM === 'tesseract' ? 0.0 : 0.30);
-    const centerXY = FORM === 'vortex' ? 1.0 : 0.0;
-    const waveAmp = FORM === 'vortex' ? 0.3 : 1.0;
+    const centerDim = FORM === 'moodtesseract' ? 0.0 : 0.30;
+    const centerXY = 0.0;
+    const waveAmp = 1.0;
     // Mood rides the drift as a slow baseline (cold-pole shift only;
     // the vortex keeps its anchored centre).
-    const hueDriftOut = hueDrift * (FORM === 'vortex' ? 0.3 : 1.0)
-        + moodHue * (FORM === 'vortex' ? 0.4 : 1.0);
+    const hueDriftOut = hueDrift * _moodNow.drift + moodHue + _moodNow.hue;
     // Master luminance: EVERY form emits ~half the light so the face
     // BLENDS into the background (operator: "too bright and
     // distracting", then extended to all faces) — structure and motion
@@ -3038,6 +2447,7 @@ function animate(ts) {
     // kind's own dim (network flicker, timeout fade, refusal) and never
     // under reduced motion (a steady face)
     if (!PREFERS_REDUCED_MOTION && !errorKind) formDim *= TS.bright;
+    formDim *= _moodNow.bright;
 
     const nUniforms = instancedMesh.material.uniforms;
     const clk = shaderClock(time);   // wrapped / CPU-side phases (§4PR)
@@ -3055,7 +2465,7 @@ function animate(ts) {
     nUniforms.uSweepMode.value = DIAL.search === 'plane' ? 1.0 : (DIAL.search === 'ring' ? 2.0 : 0.0);
     nUniforms.uSweepHeat.value = TUNE.sweepHeat;
     // The ring scan reaches the whole stack in cube2 (shells grow to ~8).
-    const sweepReach = FORM === 'tesseract' ? 7.0 : 2.4;
+    const sweepReach = FORM === 'moodtesseract' ? 7.0 : 2.4;
     nUniforms.uSweepReach.value = sweepReach;
     nUniforms.uAccentStrength.value = accentStrength;
     nUniforms.uHueDrift.value = hueDriftOut;
@@ -3073,23 +2483,12 @@ function animate(ts) {
     lUniforms.uPulseT.value = pulseT;
     lUniforms.uAccentStrength.value = accentStrength;
     lUniforms.uHueDrift.value = hueDriftOut;
-    lUniforms.uDive.value = camDive;
     lUniforms.uSweep.value = gait.search;
     lUniforms.uSweepAngle.value = sweepAngle;
     lUniforms.uSweepHeat.value = TUNE.sweepHeat;
     lUniforms.uSweepReach.value = sweepReach;
-    lUniforms.uLineSweep.value = FORM === 'tesseract' ? 1.0 : 0.0;
+    lUniforms.uLineSweep.value = FORM === 'moodtesseract' ? 1.0 : 0.0;
 
-    // Interior motes: only rendered while actually diving — and never
-    // for the empty form (a dive there would summon motes out of a
-    // deliberately blank screen).
-    motesMesh.visible = camDive > 0.01;
-    if (motesMesh.visible) {
-        motesMaterial.uniforms.uTime.value = clk.uTime;
-        motesMaterial.uniforms.uDive.value = camDive;
-        motesMaterial.uniforms.uHueDrift.value = hueDriftOut;
-        motesMaterial.uniforms.uWaveAmp.value = waveAmp;
-    }
 
     // Bloom breathes with the envelope. The old formula added
     // errorState * 2.2 (a 3x glow flashbang on any error line) and
@@ -3108,7 +2507,7 @@ function animate(ts) {
         + (verdict === 'pass' ? 0.2 * verdictEnv : 0)
         + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9))
         + 0.35 * TS.glow)
-        * BLOOM_SCALE * (1.0 - 0.5 * camDive) * 0.65;
+        * BLOOM_SCALE * 0.65 * _moodNow.bright;
 
     composer.render();
 

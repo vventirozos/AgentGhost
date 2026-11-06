@@ -99,7 +99,7 @@ def test_current_source_reads_the_live_request_but_keeps_only_the_owners_clause(
     is a Triumph" went into the ledger and back into prompts); a question
     clause is taken for the statement."""
     from ghost_agent.utils import logging as L
-    from ghost_agent.memory.lesson_scope import current_request
+    from ghost_agent.memory.request_text import current_request
     msg = "here is my token sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 keep it; my dog is called Bruno"
     t1 = L.request_id_context.set("req-123"); t2 = current_request.set(msg)
     try:
@@ -129,7 +129,7 @@ def test_profile_update_records_stated_restated_replaced(profile, led):
     """Broken worlds: a singleton replacement recorded as a plain statement
     (the old value vanishes from history); a restatement recorded as new."""
     from ghost_agent.utils import logging as L
-    from ghost_agent.memory.lesson_scope import current_request
+    from ghost_agent.memory.request_text import current_request
     t1 = L.request_id_context.set("req-a"); t2 = current_request.set("my name is Vasilis")
     try:
         profile.update("root", "name", "Vasilis")

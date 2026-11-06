@@ -12,24 +12,10 @@ from tests.test_4fm_prefix_rewarm import agent_with_llm  # noqa: F401 — the fi
 
 
 # ── the prompt cache ─────────────────────────────────────────────────────────
-def test_a_composed_skill_description_carries_no_live_counters(tmp_path):
-    """Fails where "used 3x with 33% success" changed on every use and
-    re-prefilled the conversation behind the tool block."""
-    from ghost_agent.tools.composed_skills import ComposedSkill, ComposedSkillRegistry, SkillStep
-    reg = ComposedSkillRegistry(tmp_path)
-    sk = ComposedSkill(name="briefing", trigger_description="morning briefing",
-                       steps=[SkillStep(tool_name="web_search", description="news",
-                                        param_template={"query": "$topic"})],
-                       usage_count=3, success_count=1)
-    reg.register(sk)
-    d1 = json.dumps(reg.to_tool_definitions())
-    sk.usage_count, sk.success_count = 9, 9
-    d2 = json.dumps(reg.to_tool_definitions())
-    assert d1 == d2 and "33%" not in d1 and "used 3x" not in d1
 
 
 # ── what holds the reply ─────────────────────────────────────────────────────
-@pytest.mark.parametrize("tool,blocks", [("introspect", False), ("self_state", False),
+@pytest.mark.parametrize("tool,blocks", [("introspect", False),
                                          ("web_search", True), ("execute", True)])
 def test_a_self_report_does_not_hold_the_reply_for_its_verdict(tool, blocks):
     """Fails where "good morning ghost" waited 35 s of 60 for a verdict on
@@ -37,10 +23,6 @@ def test_a_self_report_does_not_hold_the_reply_for_its_verdict(tool, blocks):
     from ghost_agent.core.agent import _should_await_repair_verdict
     lt = {"name": tool, "content": "x" * 400}
     assert _should_await_repair_verdict(65.0, lt, False) is blocks
-
-
-
-
 
 
 # ── simple turns ─────────────────────────────────────────────────────────────
@@ -55,8 +37,6 @@ def test_a_greek_greeting_takes_the_fast_path(text, trivial):
     assert GhostAgent._is_strict_trivial_chat(text.lower()) is trivial
 
 
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role,consumed", [("member", False), ("owner", True)])
 async def test_a_members_turn_leaves_the_warmup_check_for_the_owner(monkeypatch, tmp_path, role, consumed):
@@ -65,7 +45,6 @@ async def test_a_members_turn_leaves_the_warmup_check_for_the_owner(monkeypatch,
     from tests.test_requester_role import _agent, _resp
     from tests.helpers import FakeBgTasks
     agent, ctx, _ = _agent(monkeypatch, tmp_path)
-    ctx.skill_memory = MagicMock(is_read_only=False)
     ctx._warmed_sys_hash = "boot0000"
     ctx.llm_client.chat_completion = AsyncMock(return_value=_resp("ok"))
     await agent.handle_chat({"messages": [{"role": "user", "content": "what is the capital of France?"}]},

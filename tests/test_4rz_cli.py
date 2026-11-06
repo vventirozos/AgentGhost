@@ -2685,3 +2685,175 @@ class Test4SBR2Leftovers:
         h.g.chat_turn("q")
         assert list(h.g._outbox) == ["H", "yes"]
         assert h.g._take_draft() == ""
+
+
+# --- §4TE (req 0cbbc995): the CLI does not print a trimmed reply twice ------
+
+_T_BODY = "First paragraph of the reply.\n\nSecond paragraph of the reply."
+_T_SHOWN = "Let me write this up.\n\n" + _T_BODY
+
+
+def _t_retract(**extra):
+    return b"data: " + _json.dumps({"choices": [{"delta": {}}],
+                                     "ghost": {"retract": True, **extra}}).encode()
+
+
+def _t_trim(tail=0):
+    return _t_retract(trimmed=True, tail_chars=tail)
+
+
+class _NoLive:
+    """A Live tail is transient (a real terminal erases it), yet a captured
+    console keeps its frames: without it, text counts see only what stays."""
+    def __init__(self, *a, **k):
+        pass
+
+    start = stop = update = lambda self, *a, **k: None
+
+
+class TestTrimmedReply:
+    def _stream(self, monkeypatch, frames):
+        api = cli.GhostAPI("http://localhost:9", "k")
+        g = cli.GhostCLI(api, session_id="sid")
+        monkeypatch.setattr(api, "chat_stream",
+                            lambda *a, **k: _FakeSSE(frames))
+        return g, g.stream_reply("rid")
+
+    def test_a_trim_is_not_printed_twice_and_history_keeps_the_final(self, monkeypatch, out):
+        g, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), _chunk(_T_BODY),
+                                             b"data: [DONE]"])
+        shown = _plain(out)
+        assert text == _T_BODY
+        assert shown.count("First paragraph") == 1 and "revised" not in shown
+        assert g._turn_clean is True and g._turn_stopped is False
+
+    def test_only_the_new_tail_is_printed(self, monkeypatch, out):
+        final = _T_BODY + "\n\nA new closing line."
+        monkeypatch.setattr(cli, "Live", _NoLive)
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(len("A new closing line.")),
+                                             _chunk(final), b"data: [DONE]"])
+        shown = _plain(out)
+        assert text == final
+        assert shown.count("First paragraph") == 1 and shown.count("A new closing line.") == 1
+        assert "revised" not in shown
+
+    def test_a_plain_retract_still_reprints(self, monkeypatch, out):
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_retract(), _chunk(_T_BODY),
+                                             b"data: [DONE]"])
+        shown = _plain(out)
+        assert text == _T_BODY and "revised" in shown and shown.count("First paragraph") == 2
+
+    @pytest.mark.parametrize("extra", [
+        {"trimmed": "yes", "tail_chars": 0}, {"trimmed": True}, {"trimmed": True, "tail_chars": -1},
+        {"trimmed": True, "tail_chars": True}, {"trimmed": True, "tail_chars": "0"},
+    ])
+    def test_a_malformed_flag_is_a_plain_retract(self, monkeypatch, out, extra):
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_retract(**extra), _chunk(_T_BODY),
+                                             b"data: [DONE]"])
+        assert text == _T_BODY and "revised" in _plain(out)
+
+    def test_a_tail_longer_than_the_reply_reprints(self, monkeypatch, out):
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(10 ** 6), _chunk(_T_BODY),
+                                             b"data: [DONE]"])
+        assert text == _T_BODY and "revised" in _plain(out)
+
+    def test_a_cut_stream_shows_what_arrived_as_a_revision(self, monkeypatch, out):
+        g, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), _chunk("First para")])
+        assert text == "First para" and "revised" in _plain(out)
+        assert g._turn_clean is False
+
+    def test_an_empty_reply_after_a_trim_flag_stays_a_stop(self, monkeypatch, out):
+        g, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), b"data: [DONE]"])
+        assert text == "" and g._turn_stopped is True and g._turn_clean is False
+        assert "revised" in _plain(out)
+
+    def test_a_second_retract_settles_the_held_reply_first(self, monkeypatch, out):
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), _chunk("held text"),
+                                             _t_retract(), _chunk(_T_BODY), b"data: [DONE]"])
+        assert text == _T_BODY and _plain(out).count("revised") == 2
+
+    def test_a_trim_flag_with_nothing_on_screen_prints_the_reply(self, monkeypatch, out):
+        _, text = self._stream(monkeypatch, [_t_trim(), _chunk(_T_BODY), b"data: [DONE]"])
+        assert text == _T_BODY and _plain(out).count("First paragraph") == 1
+
+    def test_control_characters_in_a_kept_reply_are_stripped(self, monkeypatch, out):
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), _chunk(_T_BODY + "\x1b[31m"),
+                                             b"data: [DONE]"])
+        assert "\x1b" not in text
+
+    def test_the_busy_prompt_path_keeps_one_copy(self, monkeypatch, out):
+        h = _Harness(monkeypatch, sse=[_chunk(_T_SHOWN), _t_trim(), _chunk(_T_BODY), b"data: [DONE]"])
+        h.g.chat_turn("q")
+        shown = _plain(out)
+        assert shown.count("First paragraph") == 1 and "revised" not in shown
+        assert h.g.history[-1]["content"] == _T_BODY
+
+    def _one_shot(self, monkeypatch, frames):
+        api = cli.GhostAPI("http://localhost:9", "k")
+        monkeypatch.setattr(api.http, "post", lambda *a, **k: _FakeSSE(frames))
+        monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+        return cli.one_shot(api, "q", None)
+
+    def test_a_terminal_one_shot_keeps_one_copy(self, monkeypatch, out):
+        monkeypatch.setattr(cli, "Live", _NoLive)
+        assert self._one_shot(monkeypatch, [_chunk(_T_SHOWN), _t_trim(len("New end.")),
+                                            _chunk(_T_BODY + "\n\nNew end."), b"data: [DONE]"]) == 0
+        shown = _plain(out)
+        assert shown.count("First paragraph") == 1 and shown.count("New end.") == 1
+        assert "revised" not in shown
+
+    def test_a_one_shot_tail_with_control_characters_prints_only_the_tail(self, monkeypatch, out):
+        """r1 finding 5: tail_chars counts the agent's text, before sanitising."""
+        monkeypatch.setattr(cli, "Live", _NoLive)
+        tail = "\x1b" * 10 + "New end."
+        self._one_shot(monkeypatch, [_chunk(_T_SHOWN), _t_trim(len(tail)),
+                                     _chunk(_T_BODY + "\n\n" + tail), b"data: [DONE]"])
+        shown = _plain(out)
+        assert shown.count("reply.") == 2 and shown.count("New end.") == 1   # no kept text again
+
+    @pytest.mark.parametrize("exc", [KeyboardInterrupt, cli.requests.RequestException])
+    def test_a_one_shot_interrupted_while_holding_loses_nothing(self, monkeypatch, out, exc):
+        """r1 finding 6: the held reply is shown, not dropped."""
+        class _Boom(_FakeSSE):
+            def iter_lines(self):
+                yield from self._lines
+                raise exc()
+        api = cli.GhostAPI("http://localhost:9", "k")
+        monkeypatch.setattr(api.http, "post", lambda *a, **k: _Boom(
+            [_chunk(_T_SHOWN), _t_trim(), _chunk("Replacement text.")]))
+        monkeypatch.setattr(api, "cancel_turn", lambda **k: (404, {}))
+        monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+        cli.one_shot(api, "q", None)
+        assert "Replacement text." in _plain(out) and "revised" in _plain(out)
+
+    def test_an_error_while_holding_shows_the_revision_before_the_error(self, monkeypatch, out):
+        """r1 finding 8: the notice lands after the text it refers to."""
+        _, text = self._stream(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), _chunk("Held text."),
+                                             b'data: {"error": {"message": "boom"}}'])
+        shown = _plain(out)
+        assert text == "Held text." and shown.index("Held text.") < shown.index("boom")
+
+    def test_a_terminal_one_shot_cut_stream_shows_a_revision(self, monkeypatch, out):
+        self._one_shot(monkeypatch, [_chunk(_T_SHOWN), _t_trim(), _chunk("First para")])
+        assert "revised" in _plain(out)
+
+
+def test_the_real_tap_frames_drive_the_cli_to_one_copy(monkeypatch, out):
+    """Server and client together: the tap's own frames, not hand-made ones."""
+    from ghost_agent.core.reply_tap import ReplyTap
+    shown = "Let me write this up now, as asked.\n\n" + _T_BODY + " " + "More detail here. " * 20
+    final = shown.split("\n\n", 1)[1]
+    tap = ReplyTap("r1", "m", 1)
+    tap.begin_generation()
+    tap.feed(shown)
+    frames = []
+    while not tap.queue.empty():
+        frames.append(tap.queue.get_nowait())
+    tap.note_trim(shown, final)
+    frames += tap.finish(final)
+    lines = [l.encode() for f in frames for l in f.decode().split("\n\n") if l]
+    api = cli.GhostAPI("http://localhost:9", "k")
+    g = cli.GhostCLI(api, session_id="sid")
+    monkeypatch.setattr(api, "chat_stream", lambda *a, **k: _FakeSSE(lines))
+    assert g.stream_reply("rid") == final
+    assert _plain(out).count("First paragraph") == 1 and "revised" not in _plain(out)

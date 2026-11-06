@@ -35,19 +35,11 @@ def mocks():
         "- (User) -[OWNS]-> (Dog)",
     ])
 
-    skill = MagicMock()
-    # Per-lesson API preferred by the bus; the blob renderer is the fallback.
-    skill.get_playbook_items = MagicMock(return_value=[
-        {"text": "Don't recurse forever.", "trigger": "recursion"},
-    ])
-    skill.record_retrievals_bulk = MagicMock()
-    skill.get_playbook_context = MagicMock(return_value="## RECENT LESSONS\n1. Don't recurse forever.")
-    skill.learn_lesson = MagicMock()
 
     profile = MagicMock()
     profile.update = MagicMock()
 
-    return {"vector": vec, "graph": graph, "skill": skill, "profile": profile}
+    return {"vector": vec, "graph": graph, "profile": profile}
 
 
 @pytest.fixture
@@ -55,7 +47,6 @@ def bus(mocks):
     return MemoryBus(
         vector_memory=mocks["vector"],
         graph_memory=mocks["graph"],
-        skill_memory=mocks["skill"],
         profile_memory=mocks["profile"],
     )
 
@@ -109,54 +100,40 @@ def test_rrf_dedupes_across_rankers():
 
 @pytest.mark.asyncio
 async def test_hydrate_context_fans_out_in_parallel(bus, mocks):
-    """The hydrating tiers — the owner's facts and the lessons — are both
-    queried; the retired vector tier and the topical graph are not (§4NM)."""
+    """The owner's facts are queried; the retired vector tier and the topical
+    graph are not (§4NM), and no lesson tier exists (§4TD)."""
     out = await bus.hydrate_context("where does my dog sleep?")
     mocks["vector"].search_items.assert_not_called()
     mocks["vector"].search.assert_not_called()
     mocks["graph"].get_neighborhood.assert_not_called()
     mocks["graph"].owner_facts_matching.assert_called_once()
-    mocks["skill"].get_playbook_items.assert_called_once()
     # Combined Markdown contains markers from each hydrating section.
     assert "TOPOLOGICAL KNOWLEDGE GRAPH" in out
     assert "MEMORY CONTEXT" not in out
-    assert "SKILL PLAYBOOK" in out
+    assert "SKILL PLAYBOOK" not in out
     assert "(User) -[OWNS]-> (Dog)" in out
 
 
 @pytest.mark.asyncio
 async def test_hydrate_context_actually_concurrent(bus, mocks):
-    """hydrate_context must use asyncio.gather, not sequential awaits."""
+    """The tiers are fetched with asyncio.gather, not sequential awaits."""
     # ⚠ COUNTS OVERLAP, does not time it (a wall-clock band flaked under the
     # full suite, R5). Peak overlap IS the property — a sequential
     # implementation can never exceed 1.
-    timings = {"started": 0, "finished": 0, "live": 0, "peak": 0}
+    live = {"now": 0, "peak": 0, "calls": 0}
 
-    async def slow_to_thread(func, *args, **kwargs):
-        timings["started"] += 1
-        timings["live"] += 1
-        timings["peak"] = max(timings["peak"], timings["live"])
-        await asyncio.sleep(0.05)
-        result = func(*args, **kwargs)
-        timings["live"] -= 1
-        timings["finished"] += 1
-        return result
+    async def tier(*_a, **_k):
+        live["calls"] += 1
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        await asyncio.sleep(0.02)
+        live["now"] -= 1
+        return []
 
-    with patch("ghost_agent.core.bus.asyncio.to_thread", side_effect=slow_to_thread):
-        import time
-        t0 = time.monotonic()
+    with patch.object(bus, "_fetch_graph", tier), patch.object(bus, "_fetch_experience", tier), \
+            patch.object(bus, "_fetch_history", tier):
         await bus.hydrate_context("where does my dog sleep?")
-        elapsed = time.monotonic() - t0
-
-    # The two fetches (the owner's facts, the lessons) are in flight AT THE
-    # SAME TIME; the third call is the post-fusion credit pass, sequential
-    # after formatting by design.
-    assert timings["peak"] >= 2, (
-        f"hydrate_context awaited its fetches sequentially — peak overlap "
-        f"was {timings['peak']}, expected 2 concurrent")
-    assert timings["started"] == 3
-    assert timings["finished"] == 3
-    assert elapsed < 1.0, f"hydrate_context took {elapsed:.3f}s"
+    assert live["calls"] == 3 and live["peak"] == 3, live
 
 
 @pytest.mark.asyncio
@@ -166,8 +143,6 @@ async def test_hydrate_context_empty_query_short_circuits(bus, mocks):
     mocks["vector"].search_items.assert_not_called()
     mocks["vector"].search.assert_not_called()
     mocks["graph"].get_neighborhood.assert_not_called()
-    mocks["skill"].get_playbook_items.assert_not_called()
-    mocks["skill"].get_playbook_context.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -176,32 +151,20 @@ async def test_hydrate_context_swallows_subsystem_errors(mocks):
     bus = MemoryBus(
         vector_memory=mocks["vector"],
         graph_memory=mocks["graph"],
-        skill_memory=mocks["skill"],
     )
     out = await bus.hydrate_context("where does my dog sleep?")
-    # A graph failure must not abort the whole hydrate; the lessons still appear.
+    # A graph failure must not abort the whole hydrate.
     assert "TOPOLOGICAL KNOWLEDGE GRAPH" not in out
-    assert "SKILL PLAYBOOK" in out
 
 
 @pytest.mark.asyncio
 async def test_hydrate_context_truncates_to_char_budget(bus, mocks):
-    big = "x" * 200_000
-    mocks["skill"].get_playbook_items = MagicMock(
-        return_value=[{"text": big, "trigger": "big"}])
-    out = await bus.hydrate_context("query", max_chars=500)
-    # Either the per-section budget or the global truncation marker fires;
-    # both are valid evidence the formatter refused to dump 200 KB.
-    assert ("[... TRUNCATED]" in out) or ("truncated for budget" in out) or ("[...]" in out)
+    mocks["graph"].owner_facts_matching = MagicMock(
+        return_value=[f"fact {i} " + "x" * 200 for i in range(40)])
+    out = await bus.hydrate_context("where does my dog sleep?", max_chars=500)
+    # The formatter refuses to dump 40 facts into a 500-char budget.
+    assert "fact 0" in out
     assert len(out) < 1500
-
-
-@pytest.mark.asyncio
-async def test_hydrate_context_skips_skill_no_lessons(bus, mocks):
-    mocks["skill"].get_playbook_items = MagicMock(return_value=[])
-    mocks["skill"].get_playbook_context = MagicMock(return_value="No lessons learned yet.")
-    out = await bus.hydrate_context("anything")
-    assert "SKILL PLAYBOOK" not in out
 
 
 @pytest.mark.asyncio
@@ -243,46 +206,25 @@ async def test_publish_fact_routes_profile_update(bus, mocks):
 
 
 @pytest.mark.asyncio
-async def test_publish_fact_routes_skill_lesson(bus, mocks):
-    rep = await bus.publish_fact("learn_skill", {
-        "skill": {"task": "T", "mistake": "M", "solution": "S"},
-    })
-    mocks["skill"].learn_lesson.assert_called_once_with(
-        "T", "M", "S", memory_system=mocks["vector"],
-        # tagged, and checked against the request in hand (producers review)
-        source="learn_skill", generality_context=""
-    )
-    assert rep["skill"] == "ok"
-
-
-@pytest.mark.asyncio
 async def test_publish_fact_concurrent_fanout(bus, mocks):
-    """All four subsystems must run inside one asyncio.gather."""
-    started = []
-
-    real_to_thread = asyncio.to_thread
+    """All three subsystems must run inside one asyncio.gather."""
+    live = {"now": 0, "peak": 0, "calls": 0}
 
     async def tracking(func, *args, **kwargs):
-        started.append(func)
-        await asyncio.sleep(0.05)
+        live["calls"] += 1
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        await asyncio.sleep(0.02)
+        live["now"] -= 1
         return func(*args, **kwargs)
 
     with patch("ghost_agent.core.bus.asyncio.to_thread", side_effect=tracking):
-        import time
-        t0 = time.monotonic()
         await bus.publish_fact("compound", {
             "text": "fact",
             "triplets": [{"subject": "a", "predicate": "B", "object": "c"}],
             "profile_update": {"category": "x", "key": "y", "value": "z"},
-            "skill": {"task": "t", "mistake": "m", "solution": "s"},
         })
-        elapsed = time.monotonic() - t0
-    assert len(started) == 4
-    # Concurrent ≈ 50ms (one shared sleep); sequential would be ≈200ms
-    # (4 × 50ms). The 150ms bound leaves a generous overhead budget so the
-    # test doesn't flake under full-suite CPU / thread-pool contention while
-    # still clearly distinguishing concurrent from sequential fan-out.
-    assert elapsed < 0.15
+    assert live["calls"] == 3 and live["peak"] >= 2, live
 
 
 @pytest.mark.asyncio

@@ -91,8 +91,6 @@ def test_deep_reason_is_read_by_nothing(monkeypatch, capsys):
     assert reads == [], reads
 
 
-
-
 # ── the idle scheduler's job list comes from the code ───────────────────
 
 def test_every_idle_label_is_a_listed_job():
@@ -120,14 +118,14 @@ def test_every_idle_label_is_a_listed_job():
 
 def test_the_job_list_follows_this_boots_flags():
     import ghost_agent.core.agent as A
-    ctx = SimpleNamespace(journal=object(), skill_memory=object(),
+    ctx = SimpleNamespace(journal=object(), 
                           project_store=object(),
                           self_model=SimpleNamespace(enabled=True),
                           workspace_model=SimpleNamespace(enabled=False))
     on = A.idle_scheduler_jobs(SimpleNamespace(no_dream=False, autoadvance_idle=True), ctx)
     assert "maintenance" in on and any("autoadvance" in j for j in on)
     assert "workspace narrative" not in on                       # disabled model
-    assert any("failure replay" in j for j in on)
+    assert not any("replay" in j or "regression" in j for j in on)      # §4SZ: the slot is removed
     off = A.idle_scheduler_jobs(SimpleNamespace(no_dream=True, autoadvance_idle=False), ctx)
     assert "maintenance" not in off and not any("autoadvance" in j for j in off)
 
@@ -160,18 +158,8 @@ def test_flag_uncertainty_is_not_offered_to_the_model():
 
 def test_the_fusion_table_names_only_the_live_sources():
     from ghost_agent.core.bus import MemoryBus
-    assert {k for w in MemoryBus._INTENT_WEIGHTS.values() for k in w} == {"graph", "skill", "experience", "history"}   # §4QL/§4QM added two
+    assert {k for w in MemoryBus._INTENT_WEIGHTS.values() for k in w} == {"graph", "experience", "history"}   # §4QL/§4QM added two
     assert "intent_weights" not in inspect.signature(MemoryBus.__init__).parameters
-
-
-def test_contextual_fusion_puts_a_lesson_before_a_fact_at_equal_rank():
-    """§4NN review MAJOR: equal weights tied, and the tie reversed production's
-    order (skill first) on the default intent."""
-    from ghost_agent.core.bus import MemoryBus
-    w = MemoryBus._INTENT_WEIGHTS
-    assert w["contextual"]["skill"] > w["contextual"]["graph"]
-    assert w["factual"]["graph"] / w["factual"]["skill"] == pytest.approx(4.06, rel=1e-3)
-    assert w["procedural"]["skill"] > w["procedural"]["graph"]
 
 
 # ── §4NN tidy-up: the fs_batch macro (always-off experiment arm) is gone ──

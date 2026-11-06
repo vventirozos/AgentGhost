@@ -74,7 +74,7 @@
   <ul>
     <li>Owner only: members are on an allowlist (<code>_MEMBER_ALLOWED_TOOLS</code>) that does not name it.</li>
     <li>A work tool: refused on a status question while work is live (<code>_WORK_TOOLS</code>), under the deadline preflight (<code>_BATCH_WALL_TOOLS</code>). Its result is outside content (<code>UNTRUSTED_SOURCE_TOOLS</code>).</li>
-    <li>Never inside a replay (<code>REPLAY_FORBIDDEN_TOOLS</code>) or as a composed-skill macro step (<code>MACRO_FORBIDDEN_STEP_TOOLS</code>). Sub-agents and coding leaves have allowlists without it.</li>
+    <li>Never inside a replay (<code>REPLAY_FORBIDDEN_TOOLS</code>). (It was also refused as a macro step; the macro engine was removed on 2026-11-05, &sect;4TA.) Sub-agents and coding leaves have allowlists without it.</li>
   </ul>
 
   <h2 id="gate">The transcript is the proof of the run (&sect;4ST)</h2>

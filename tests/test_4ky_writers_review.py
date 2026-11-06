@@ -228,7 +228,6 @@ def test_a_public_owner_turn_loads_no_private_profile_or_memory():
     ctx.scratchpad.list_all.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.graph_memory = MagicMock()
-    ctx.skill_memory = MagicMock()
     ctx.sandbox_dir = "/tmp/sandbox"
     agent = GhostAgent(ctx)
     t = reply_surface_context.set("public")

@@ -44,8 +44,6 @@ def _make_agent(*, playbook="", native_tools=True):
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.graph_memory = MagicMock()
     ctx.graph_memory.get_neighborhood = MagicMock(return_value=[])
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_playbook_context = MagicMock(return_value=playbook)
     ctx.sandbox_dir = "/tmp/sandbox"
     return GhostAgent(ctx)
 
@@ -63,25 +61,6 @@ def _first_user(payload):
 
 
 @pytest.mark.asyncio
-async def test_pinned_playbook_rides_volatile_not_the_pinned_block(monkeypatch):
-    monkeypatch.setenv("GHOST_PIN_TOOL_SCHEMAS", "1")
-    agent = _make_agent(playbook="ALWAYS wrap paths in quotes.")
-    body = {"messages": [{"role": "user", "content": "Explain the tradeoffs between two database migration strategies for me?"}], "model": "test", "stream": False}
-    await agent.handle_chat(body, MagicMock())
-
-    payload = _last_nonstream_payload(agent)
-    pinned = _first_user(payload)["content"]
-    whole = "\n".join(m.get("content", "") for m in _msgs(payload))
-
-    # The pinned session_context is present...
-    assert "<session_context>" in pinned
-    # ...but the per-turn playbook is NOT inside it (it would bust the cache).
-    assert "SKILL PLAYBOOK" not in pinned
-    # The playbook still reaches the model — in the volatile block.
-    assert "SKILL PLAYBOOK" in whole
-
-
-@pytest.mark.asyncio
 async def test_unpinned_composition_unchanged(monkeypatch):
     monkeypatch.delenv("GHOST_PIN_TOOL_SCHEMAS", raising=False)
     agent = _make_agent(playbook="ALWAYS wrap paths in quotes.")
@@ -90,20 +69,16 @@ async def test_unpinned_composition_unchanged(monkeypatch):
 
     payload = _last_nonstream_payload(agent)
     whole = "\n".join(m.get("content", "") for m in _msgs(payload))
-    # Unpinned still surfaces the playbook (single-message injection); no
-    # session_context pinning.
-    assert "SKILL PLAYBOOK" in whole
+    # No session_context pinning. (§4TD: no lesson playbook in any prompt.)
+    assert "SKILL PLAYBOOK" not in whole
     assert "<session_context>" not in whole
 
 
 class TestSourceInvariants:
-    def test_pinned_stable_injection_excludes_playbook(self):
+    def test_pinned_stable_injection_is_the_stable_parts(self):
         src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
-        # Under pin, _stable_injection is built WITHOUT fetched_playbook.
         assert 'if _pin_stable:' in src
         assert '_stable_injection = f"{tool_header_block}\\n\\n{active_persona}{fetched_context}{_continuity_tail}"' in src
-        # The unpinned else-branch keeps playbook inline (unchanged layout).
-        assert '{active_persona}{fetched_playbook}{fetched_context}' in src
 
     def test_pinned_final_gen_directive_routed_to_volatile(self):
         src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)

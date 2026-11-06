@@ -535,6 +535,27 @@ class _StreamPrinter:
             if rest.strip():
                 console.print(_reply_block(rest))
 
+    def adopt(self, reply: str, tail_chars: int) -> None:
+        """§4TE: the finished reply only lost narration from what is on
+        screen. Keep the printed lines, make ``reply`` the text kept as
+        history and /save, and print only its last ``tail_chars``."""
+        self.settle()
+        cut = len(reply) - tail_chars
+        with self._lock:
+            self.text = _safe(reply[:cut])
+            self.upto = len(self.text)
+        if tail_chars:
+            self.feed(reply[cut:])
+
+
+def _trim_tail_chars(ghost: Any) -> int | None:
+    """§4TE: how much of the reply after this retract is new text, when the
+    agent says it only trimmed what was shown; None for any other retract."""
+    if not isinstance(ghost, dict) or ghost.get("trimmed") is not True:
+        return None
+    n = ghost.get("tail_chars")
+    return n if type(n) is int and n >= 0 else None
+
 
 def _reply_block(markup: str) -> Padding:
     """One block of the agent's reply, on the gutter. Every path that prints
@@ -1458,6 +1479,25 @@ class GhostCLI:
         held = None                    # §4KP: a list while the reply is held
         saw_done = False               # the stream's own terminal frame arrived
         saw_retract = False            # a hard stop's shape: retract, then no reply
+        trim_hold = None               # §4TE: (tail_chars, the reply's chunks)
+
+        def _release_trim(clean: bool) -> None:
+            """§4TE: settle a held reply. The whole of it arrived: keep what
+            is printed. It did not: as any retract, so nothing is lost."""
+            nonlocal printer, trim_hold
+            if trim_hold is None:
+                return
+            tail_chars, parts = trim_hold
+            trim_hold = None
+            reply = "".join(parts)
+            if clean and tail_chars <= len(reply) and reply.strip():
+                printer.adopt(reply, tail_chars)
+                return
+            printer.settle()
+            note("↺ revised — the reply continues below", "mute")
+            printer = new_printer()
+            if reply:
+                printer.feed(reply)
 
         def _release() -> None:
             nonlocal held, waiting
@@ -1481,6 +1521,7 @@ class GhostCLI:
             if waiting:
                 status_spin.stop()
                 waiting = False
+            _release_trim(False)       # before the notice the caller prints
             printer.settle()
 
         try:
@@ -1536,8 +1577,12 @@ class GhostCLI:
                         # call followed, or the reply was rewritten). Printed
                         # lines cannot be taken back: mark it, start again.
                         saw_retract = True
+                        _release_trim(False)
+                        _tail_chars = _trim_tail_chars(obj.get("ghost"))
                         if held is not None:
                             held.clear()
+                        elif printer.text and _tail_chars is not None:
+                            trim_hold = (_tail_chars, [])
                         elif printer.text:
                             printer.settle()
                             note("↺ revised — the reply continues below", "mute")
@@ -1551,6 +1596,9 @@ class GhostCLI:
                         continue
                     if held is not None:
                         held.append(chunk)
+                        continue
+                    if trim_hold is not None:
+                        trim_hold[1].append(chunk)
                         continue
                     if waiting:            # first token: spinner down
                         status_spin.stop()
@@ -1572,6 +1620,7 @@ class GhostCLI:
             if self._turn_interrupted or not saw_done:
                 held = None            # §4KP: never the unfiltered reasoning of a cut reply
             _release()
+            _release_trim(saw_done and not self._turn_interrupted)
             _settle()
         # §4RZ r3: stopped on the agent (by another client, or /cancel) — the
         # stream ends normally; only the reply says so. Read by the busy
@@ -3185,7 +3234,27 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None,
         from ``finally`` (idempotent), so an abort/error mid-stream still
         leaves the partial reply visible — completed blocks already flowed
         into the scroll as they streamed."""
+        _release_trim(False)           # no-op after a normal end; never lost
         printer.settle()
+
+    trim_hold = None                   # §4TE: (tail_chars, the reply's chunks)
+
+    def _release_trim(clean: bool) -> None:
+        """§4TE: as in GhostCLI.stream_reply."""
+        nonlocal printer, trim_hold
+        if trim_hold is None:
+            return
+        tail_chars, parts = trim_hold
+        trim_hold = None
+        reply = "".join(parts)
+        if clean and tail_chars <= len(reply) and reply.strip():
+            printer.adopt(reply, tail_chars)
+            return
+        printer.settle()
+        console.print(Text(" " * GUTTER + "↺ revised — the reply continues below", style="mute"))
+        printer = _StreamPrinter()
+        if reply:
+            printer.feed(reply)
 
     try:
         # §4MP: piped output cannot take back streamed text — ask for the
@@ -3231,8 +3300,12 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None,
                 # is still a terminal on the other end.
                 if (obj.get("ghost") or {}).get("retract") is True:
                     # §4MP (a terminal: piped output asked for no retracts)
+                    _release_trim(False)
+                    _tail_chars = _trim_tail_chars(obj.get("ghost"))
                     if held is not None:
                         held.clear()
+                    elif render and printer.text and _tail_chars is not None:
+                        trim_hold = (_tail_chars, [])
                     elif render and printer.text:
                         printer.settle()
                         console.print(Text(" " * GUTTER + "↺ revised — the reply continues below", style="mute"))
@@ -3240,18 +3313,23 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None,
                     continue
                 if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                     held = []
-                chunk = _safe((obj.get("choices") or [{}])[0]
+                _raw_chunk = ((obj.get("choices") or [{}])[0]
                               .get("delta", {}).get("content", ""))
+                chunk = _safe(_raw_chunk)
                 if not chunk:
                     continue
                 if held is not None:           # §4KP: complete, then strip
                     held.append(chunk)
+                    continue
+                if trim_hold is not None:      # raw: tail_chars counts the agent's text
+                    trim_hold[1].append(_raw_chunk)
                     continue
                 if render:
                     printer.feed(chunk)
                 else:
                     sys.stdout.write(chunk)
                     sys.stdout.flush()
+            _release_trim(saw_done and not got_error)
             if held is not None and saw_done and not got_error:
                 chunk, held = strip_orphan_think_close("".join(held)), None
                 if render:

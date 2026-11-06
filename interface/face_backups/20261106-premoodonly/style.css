@@ -1,0 +1,2934 @@
+:root {
+    --keyboard-height: 0px;
+    --bg-color: #000000;
+    --text-color: #f1f3f5;
+    --accent-color: #7b62c4;
+    --secondary-color: #3a5fae;
+    --error-color: #c22745;
+    --success-color: #2e7d54;
+    --surface-bg: rgba(14, 9, 24, 0.5);
+    --surface-border: rgba(123, 98, 196, 0.16);
+    --surface-highlight: rgba(123, 98, 196, 0.32);
+    --blur-amt: 30px;
+    --font-main: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+* {
+    -webkit-tap-highlight-color: rgba(255, 255, 255, 0.08);
+}
+
+html, body {
+    overscroll-behavior: none;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-family: var(--font-main);
+    overflow: hidden;
+    height: 100dvh;
+    width: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+
+button, [role="button"], .icon-btn, #send-btn, #mic-btn, .render-btn {
+    touch-action: manipulation;
+}
+
+#background-layer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    background: radial-gradient(circle at center, rgba(12, 12, 20, 0.8) 0%, rgba(0, 0, 0, 1) 100%);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* When the user has scrolled up to review history, the sphere recedes
+   so the chat takes focus. Reverts as soon as they return to the bottom. */
+body.is-reading #background-layer {
+    opacity: 0.45;
+}
+
+#sphere-container {
+    width: 100%;
+    height: 100%;
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+#ui-layer {
+    position: relative;
+    z-index: 10;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    pointer-events: none;
+    transform: translateY(calc(-1 * var(--keyboard-height)));
+    transition: transform 0.2s ease;
+}
+
+/* Header */
+header {
+    display: flex;
+    /* Own stacking layer above main#chat-container (which is positioned,
+       so it would otherwise paint over the static header where they meet
+       and steal taps from the buttons). */
+    position: relative;
+    z-index: 20;
+    justify-content: space-between;
+    align-items: flex-start;
+    padding: 16px 32px;
+    padding-top: max(16px, env(safe-area-inset-top));
+    padding-left: max(32px, env(safe-area-inset-left));
+    padding-right: max(32px, env(safe-area-inset-right));
+    pointer-events: auto;
+    flex-shrink: 0;
+    background: linear-gradient(to bottom, rgba(0, 0, 0, 0.6) 0%, transparent 100%);
+}
+
+/* The ONLINE chip (2026-09-05, operator: "fit the button theme"): an
+   .icon-btn — same glass, border, height and hover as its neighbours —
+   stretched into a pill for the dot + state word. It is the LIVE LOG
+   toggle (app.js); `.active` marks the drawer open. Background, border
+   and blur come from .icon-btn on purpose: nothing here may restate them
+   or the chip drifts from the buttons again. ≤480px it drops the word
+   and becomes a round light (see the phone header block). */
+#status-indicator {
+    width: auto;
+    height: 44px;
+    padding: 0 18px 0 14px;
+    gap: 10px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.8);
+}
+
+#connection-dot {
+    width: 8px;
+    height: 8px;
+    background-color: var(--success-color);
+    border-radius: 50%;
+    box-shadow: 0 0 12px var(--success-color);
+    transition: background-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Semantic connection states — set via `#connection-dot.state-<name>`
+   from app.js so the status dot signals more than just online/offline. */
+#connection-dot.state-online {
+    background-color: var(--success-color);
+    box-shadow: 0 0 12px var(--success-color);
+}
+#connection-dot.state-pending {
+    background-color: #6d54b8;
+    box-shadow: 0 0 12px #6d54b8;
+    animation: dotPulse 1.2s ease-in-out infinite;
+}
+#connection-dot.state-busy {
+    background-color: var(--accent-color);
+    box-shadow: 0 0 12px var(--accent-color);
+    animation: dotPulse 1s ease-in-out infinite;
+}
+#connection-dot.state-error {
+    background-color: var(--error-color);
+    box-shadow: 0 0 12px var(--error-color);
+}
+@keyframes dotPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.55; transform: scale(0.75); }
+}
+
+#header-controls {
+    display: flex;
+    /* Horizontal row, not a vertical stack. As a column the 5 icon
+       buttons made the (flex-shrink:0) header ~300px tall, reserving the
+       top third of the screen above the chat — which read as "chats are
+       hidden at the top". A row keeps the header one button tall. */
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 12px;
+    align-items: center;
+}
+
+.icon-btn {
+    background: var(--surface-bg);
+    border: 1px solid var(--surface-border);
+    color: rgba(255, 255, 255, 0.8);
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+}
+
+.icon-btn:hover {
+    background: var(--surface-highlight);
+    color: #fff;
+    transform: scale(1.05);
+}
+
+/* Chat Area */
+main#chat-container {
+    /* flex:1 1 0 + min-height:0 is the robust fill pattern: the chat grows
+       to fill the space between the (compact) header and the input and
+       never overflows its siblings. Earlier this used margin-top:auto to
+       bottom-anchor a max-height-capped block, but on iOS Safari that
+       auto-margin + flex-grow combo let the container overlap the header,
+       so its buttons couldn't be tapped on mobile. No cap, no auto margin,
+       no top mask fade (which had hidden the top 15% until hover). */
+    flex: 1 1 0;
+    min-height: 0;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 10px;
+}
+
+#chat-log {
+    flex-grow: 1;
+    overflow-y: auto;
+    padding: 0 32px 32px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    pointer-events: auto;
+    scroll-behavior: smooth;
+    min-height: 0;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+}
+
+/* Prettier, Professional Message Windows */
+.message:first-child {
+    margin-top: auto;
+}
+
+.message {
+    max-width: 85%;
+    padding: 18px 24px;
+    border-radius: 12px;
+    font-size: 0.95rem;
+    line-height: 1.7;
+    font-weight: 300;
+    animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+    word-wrap: break-word;
+    position: relative;
+    letter-spacing: 0.02em;
+}
+
+@media (min-width: 768px) {
+
+    /* Strictly constrain width to clear the center sphere */
+    .message {
+        max-width: 35%;
+        margin: 0 40px;
+    }
+}
+
+.message.user {
+    align-self: flex-end;
+    color: #dfe3ec;
+    /* Dark-blue glass — YOUR side of the conversation */
+    background: rgba(9, 13, 28, 0.28);
+    border: 1px solid rgba(58, 95, 174, 0.35);
+    border-right: 2px solid #3a5fae;
+    /* Tech accent */
+    border-radius: 16px 4px 16px 16px;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    /* Technical feel */
+}
+
+.message.agent {
+    align-self: flex-start;
+    color: #eceaf4;
+    /* Deep-purple glass — the agent's side */
+    background: rgba(22, 13, 38, 0.20);
+    border: 1px solid rgba(75, 26, 122, 0.4);
+    border-left: 2px solid #4b1a7a;
+    /* Agent accent */
+    border-radius: 4px 16px 16px 16px;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+.message.system {
+    align-self: center;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: rgba(255, 255, 255, 0.4);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--surface-border);
+    border-radius: 30px;
+    padding: 8px 16px;
+    margin: 10px 0;
+    backdrop-filter: blur(10px);
+    box-shadow: none;
+}
+
+/* Input Area */
+footer#input-area-wrapper {
+    padding: 0 32px 40px 32px;
+    padding-bottom: max(40px, env(safe-area-inset-bottom));
+    padding-left: max(32px, env(safe-area-inset-left));
+    padding-right: max(32px, env(safe-area-inset-right));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+    pointer-events: auto;
+    background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.5) 70%, transparent 100%);
+}
+
+/* Turn status line (v3): re-parented directly under the waiting reply
+   bubble while a user turn runs — timer chip + description + text-sized
+   icon. Integration pass (operator: "the timer doesn't belong there"):
+   the clock becomes a quiet tabular-nums CHIP (a badge, not part of the
+   sentence — and no width jitter at 0:09→0:10), the description reads
+   in the UI's main font, and visual grouping replaces the literal
+   `:`/`-` separators. Hidden and parked outside the chat log between
+   turns. */
+#turn-status {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin: 4px 0 12px 12px;
+    max-width: 85%;
+    animation: slideInLeft 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+#turn-status.hidden { display: none; }
+
+/* §4RB: reasoning-effort selector beside the mic/send buttons. A grey bars
+   icon (operator 10-24): hollow bars = Default, 1/2/3 filled = Low/Med/X-high.
+   The native select sits invisibly over the icon (a tap opens the system
+   picker); the icon reads its value with :has(option:checked), and the wrap
+   hides whenever effort.js hides the select. */
+#effort-wrap {
+    position: relative;
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: rgba(255, 255, 255, 0.38);
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+#effort-wrap:has(#effort-select.hidden) { display: none; }
+#effort-wrap:hover,
+#effort-wrap:has(#effort-select:focus-visible) { color: rgba(255, 255, 255, 0.72); background-color: rgba(255, 255, 255, 0.05); }
+#effort-wrap:has(#effort-select:focus-visible) { outline: 1px solid var(--accent-color); outline-offset: 1px; }
+#effort-icon rect { fill: currentColor; fill-opacity: 0; stroke: currentColor; stroke-width: 1; }
+#effort-wrap:has(option[value="low"]:checked) .b1,
+#effort-wrap:has(option[value="medium"]:checked) :is(.b1, .b2),
+#effort-wrap:has(option[value="xhigh"]:checked) rect { fill-opacity: 1; }
+#effort-select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    opacity: 0;
+    border: none;
+    -webkit-appearance: none;
+    appearance: none;
+    font-size: 16px;   /* iOS zooms on focus below 16px */
+    cursor: pointer;
+}
+#effort-select option { background: var(--bg-color); color: var(--text-color); }
+#effort-select.hidden { display: none; }
+/* Token counter under the composer's buttons (2026-10-27, operator: "discreet").
+   Same grey as the idle effort icon, small tabular digits, one line; hidden
+   until the agent reports a turn's tokens (tokens.js). Not a control (no
+   hover state); selection off so a tap near Send selects nothing on iOS.
+   It keeps pointer events: its title (the cached part) is a desktop hover. */
+#token-count {
+    flex-shrink: 0;
+    align-self: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    color: rgba(255, 255, 255, 0.38);
+    white-space: nowrap;
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+}
+/* Hidden keeps its line (operator 10-27: the whole input window resized
+   from empty to showing a count — "that resize looks weird"): the pill is
+   always sized for it, the text just isn't drawn. */
+#token-count.hidden { visibility: hidden; }
+/* Operator 10-27: "on the right side, under the buttons … similar in
+   mobile". The last flex item, a whole row, right-aligned — it ends under
+   Send on desktop and on the phone composer's controls row alike, and the
+   text field and buttons keep their places. */
+#token-count {
+    order: 1;
+    flex-basis: 100%;
+    text-align: right;
+    padding-right: 6px;
+    line-height: 1.2;
+    min-height: 1.2em;        /* an empty counter still holds its line */
+}
+@media (min-width: 481px) {
+    /* :has() for specificity: the base #input-area rule (gap: 16px) comes
+       later in this file */
+    #input-area:has(> #token-count) { flex-wrap: wrap; row-gap: 2px; }
+}
+#turn-status-clock {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.6px;
+    line-height: 1;
+    padding: 3px 7px;
+    border-radius: 7px;
+    background: rgba(123, 98, 196, 0.12);
+    border: 1px solid rgba(123, 98, 196, 0.18);
+    color: rgba(178, 188, 208, 0.75);
+}
+#turn-status-desc {
+    font-family: var(--font-main);
+    font-size: 0.74rem;
+    font-weight: 300;
+    letter-spacing: 0.02em;
+    color: rgba(168, 178, 198, 0.8);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+#turn-status-icon {
+    flex-shrink: 0;
+    font-size: 0.8rem;
+    line-height: 1;
+    opacity: 0.85;
+}
+
+#input-area {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    width: 100%;
+    max-width: 750px;
+    /* 2026-10-25 (operator: the phone composer buttons "seem to overlap"):
+       content-box made the pill 100% + 28px padding + 2px border — 30px
+       wider than the footer's content box, centred by the footer's
+       align-items so it spilled 15px past each side (5px from a phone's
+       screen edge; 786px against the 750px max on desktop). */
+    box-sizing: border-box;
+    background: rgba(14, 9, 24, 0.62);
+    border: 1px solid rgba(75, 26, 122, 0.4);
+    border-radius: 30px;
+    padding: 10px 10px 10px 24px;
+    backdrop-filter: blur(var(--blur-amt));
+    -webkit-backdrop-filter: blur(var(--blur-amt));
+    transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+#input-area:focus-within {
+    border-color: #4b1a7a;
+    background: rgba(20, 20, 30, 0.7);
+    box-shadow: 0 15px 50px rgba(0, 0, 0, 0.7), 0 0 20px rgba(75, 26, 122, 0.4);
+    transform: translateY(-2px);
+}
+
+#chat-input {
+    flex-grow: 1;
+    background: transparent;
+    border: none;
+    color: #fff;
+    font-family: var(--font-main);
+    font-size: max(1.05rem, 16px);
+    padding: 14px 0;
+    resize: none;
+    /* ⚠ The ONE deliberate `outline: none`. The composer's focus
+       indicator is `#input-area:focus-within` (border colour, fill,
+       glow and a 2px lift on the whole pill) — a stronger and more
+       legible signal than a ring drawn around a borderless textarea
+       inside it. This exemption is asserted in
+       tests/test_interface_a11y.py, which fails if the focus-within
+       rule is ever removed while this line stays: an exemption nobody
+       checks is just a hole with a comment on it. */
+    outline: none;
+    max-height: 150px;
+    line-height: 1.5;
+    font-weight: 300;
+    /* textarea scrollHeight includes vertical padding, so the JS
+       auto-grow assigns padding-inclusive values. Without border-box
+       the element would render (scrollHeight + padding) tall and jump
+       ~28px on the first keystroke. */
+    box-sizing: border-box;
+}
+
+#chat-input::placeholder {
+    color: rgba(255, 255, 255, 0.3);
+}
+
+#send-btn {
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.8);
+    border: 1px solid var(--surface-border);
+    border-radius: 50%;
+    width: 52px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#send-btn svg {
+    margin-right: -2px;
+    margin-top: 2px;
+    transition: transform 0.3s;
+    stroke-width: 2px;
+}
+
+#send-btn:hover {
+    background: var(--accent-color);
+    color: #fff;
+    transform: scale(1.05);
+    box-shadow: 0 0 18px rgba(123, 98, 196, 0.35);
+}
+
+#send-btn:active {
+    transform: scale(0.95);
+}
+
+#send-btn.send-btn-cancel {
+    color: var(--error-color);
+    border-color: var(--error-color);
+}
+
+/* §4RZ step 6a: a message sent while a turn runs. Dim until the turn ends
+   (then it is an ordinary bubble); the label says what happens to it.
+   §4SB: the bubble was 0.55 opaque with a 0.5-alpha label (~2.5:1 on the
+   black page); dashed border + a lighter text colour do the dimming now and
+   the label reads at 4.5:1 or better. */
+.message.user.queued {
+    opacity: 0.85;
+    color: #c8cdd8;
+    border-style: dashed;
+    font-size: 0.78rem;
+}
+.message.user .queued-label {
+    display: block;
+    margin-top: 4px;
+    font-size: 0.7rem;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.9);
+}
+/* the system's progress answer reads as a sentence, not a status chip */
+.message.system.queued-status {
+    text-transform: none;
+    letter-spacing: normal;
+}
+#interrupt-btn {
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.8);
+    border: 1px solid var(--surface-border);
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+#interrupt-btn.hidden {
+    display: none;
+}
+#interrupt-btn:hover {
+    border-color: var(--error-color);
+    color: var(--error-color);
+}
+
+#send-btn.send-btn-cancel:hover {
+    background: var(--error-color);
+    color: #fff;
+    box-shadow: 0 0 20px rgba(194, 39, 69, 0.4);
+}
+
+/* Custom Scrollbar & Animations */
+/* Firefox: the ::-webkit-scrollbar rules below don't apply, so set the
+   standard properties too (thin track in the same dark-red theme). */
+html {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(75, 26, 122, 0.6) rgba(255, 255, 255, 0.05);
+}
+
+::-webkit-scrollbar {
+    width: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(75, 26, 122, 0.6);
+    border-radius: 5px;
+    border: 1px solid rgba(75, 26, 122, 0.3);
+    transition: background 0.3s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #4b1a7a;
+    box-shadow: 0 0 10px #4b1a7a;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(20px) scale(0.98);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+body.zen-mode #ui-layer #chat-container,
+body.zen-mode #ui-layer #input-area {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.5s ease;
+}
+
+body.zen-mode header {
+    background: transparent;
+    pointer-events: none;
+}
+
+body.zen-mode .icon-btn {
+    pointer-events: auto;
+    opacity: 0.3;
+    /* Dim button when in Zen Mode */
+}
+
+body.zen-mode .icon-btn:hover {
+    opacity: 1;
+}
+
+@media (max-width: 768px) {
+    #header-controls {
+        flex-direction: row;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+    }
+}
+
+@media (max-width: 480px) {
+    header {
+        padding: 10px 12px;
+        /* The shorthand above RESETS padding-top, silently discarding the
+           base rule's safe-area inset — in a standalone (home-screen) PWA
+           with black-translucent the page runs under the iOS status bar,
+           so the header sat beneath the clock/Dynamic Island (2026-08-01).
+           Re-assert the inset after every padding shorthand on header. */
+        padding-top: max(10px, env(safe-area-inset-top));
+        padding-left: max(12px, env(safe-area-inset-left));
+        padding-right: max(12px, env(safe-area-inset-right));
+        /* ONE row (2026-09-05, operator). This used to be a two-row
+           column: rail toggle + status centred on top, seven buttons
+           below. The phone header block near the end of this file sizes
+           the controls so the row fits a 375px screen. */
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+
+    #status-wrapper {
+        align-items: flex-start;
+    }
+
+    #header-controls {
+        justify-content: flex-end;
+        width: auto;
+    }
+
+    #chat-log {
+        padding: 0 20px 20px 20px;
+    }
+
+    .message {
+        max-width: 85%;
+        font-size: 0.95rem;
+        padding: 14px 18px;
+    }
+
+    footer#input-area-wrapper {
+        padding: 0 12px 12px 12px;
+        padding-bottom: max(12px, env(safe-area-inset-bottom));
+        padding-left: max(12px, env(safe-area-inset-left));
+        padding-right: max(12px, env(safe-area-inset-right));
+        gap: 12px;
+    }
+
+    /* Phone composer (2026-10-25, operator: the three buttons "seem weird on
+       mobile (iphone) like they are overlapping"). Measured at 375px: the
+       text field had 175px, beside a 52px mic, a 28px effort icon centred
+       on its own axis and a 44px send at flex-end — three sizes on three
+       baselines. Now two rows inside the pill: the text field takes the
+       whole first row; the controls sit under it on one row, same 40px
+       targets as the phone header — mic and effort on the left, send on
+       the right (margin-left: auto, so the row keeps its shape when the
+       effort switch is off and #effort-wrap is display:none).
+       Pinned (rendered, WebKit) in tests/test_interface_composer_mobile.py. */
+    #input-area {
+        flex-wrap: wrap;
+        align-items: center;
+        border-radius: 24px;
+        padding: 4px 8px 8px 8px;
+        gap: 2px 8px;
+    }
+
+    #chat-input {
+        flex: 1 1 100%;
+        font-size: max(1rem, 16px);
+        padding: 10px 10px 8px 10px;
+    }
+
+    /* #input-area prefix: the base #mic-btn rule sits LATER in this file at
+       the same specificity and kept the mic at 52px (caught by the rendered pin). */
+    #input-area #mic-btn,
+    #input-area #send-btn,
+    #input-area #effort-wrap {
+        width: 40px;
+        height: 40px;
+        align-self: center;
+    }
+
+    #input-area #effort-wrap {
+        border-radius: 50%;
+    }
+
+    #input-area #send-btn {
+        margin-left: auto;
+    }
+}
+
+/* Planner Monologue */
+#status-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+#planner-monologue {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    /* Was #c22745 — which IS --error-color. Ordinary planner narration
+       ("considering X…") was painted in the app's error colour, so the
+       one signal reserved for something being wrong fired on every
+       healthy turn, and it measured 3.64:1 (AA failure) besides. This
+       violet is the accent already used by .notif-phase and measures
+       8.72:1. Errors keep --error-color to themselves. */
+    color: #b894ff;
+    text-shadow: 0 0 8px rgba(75, 26, 122, 0.8);
+    max-width: 600px;
+    line-height: 1.4;
+    opacity: 0;
+    height: 0;
+    overflow: hidden;
+    transition: all 0.5s ease;
+    padding-left: 4px;
+}
+
+#planner-monologue.visible {
+    opacity: 1;
+    height: auto;
+    margin-top: 4px;
+}
+
+/* Markdown Styles in Chat */
+.message p {
+    margin: 0 0 10px 0;
+}
+
+.message p:last-child {
+    margin-bottom: 0;
+}
+
+.message pre {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    margin: 10px 0;
+}
+
+.message code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    background: rgba(255, 255, 255, 0.1);
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+.message pre code {
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+    color: #9aa8d8;
+}
+
+.message ul,
+.message ol {
+    margin: 10px 0;
+    padding-left: 20px;
+}
+
+.message li {
+    margin-bottom: 4px;
+}
+
+.message strong {
+    font-weight: 600;
+    color: #fff;
+}
+
+.message a {
+    color: var(--accent-color);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--accent-color);
+}
+
+.message a:hover {
+    text-shadow: 0 0 8px var(--accent-color);
+}
+
+/* PDF download cards emitted by the `report_pdf` tool. The agent renders
+   the link as [📄 Title (PDF)](/api/download/...) — the JS decorator
+   adds .pdf-link so we can promote it from a dashed-underline anchor
+   into something that visually reads as a downloadable artefact, on
+   the same tier as image thumbnails. */
+.message a.pdf-link {
+    display: inline-block;
+    padding: 8px 14px;
+    margin: 6px 0;
+    border: 1px solid var(--accent-color);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    text-decoration: none;
+    font-weight: 600;
+    transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.message a.pdf-link:hover {
+    background: rgba(255, 255, 255, 0.06);
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.15);
+    text-shadow: 0 0 8px var(--accent-color);
+}
+
+.message blockquote {
+    border-left: 3px solid var(--secondary-color);
+    margin: 10px 0;
+    padding-left: 12px;
+    color: rgba(255, 255, 255, 0.7);
+    font-style: italic;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Markdown block elements the agent actually emits (2026-09-04)
+
+   These had NO rules at all, so `table`/`th`/`td`, `h1`-`h6` and `hr`
+   fell through to the UA defaults inside a bubble styled for nothing
+   else. Measured on a live reply before this block: `th` padding was
+   the UA's `1px` with `border-collapse: separate` and no rules, so a
+   four-column comparison rendered as ragged text whose columns could
+   not be told apart; `hr` came out as the UA's `rgb(128,128,128)`
+   groove — the BRIGHTEST element in the bubble, reading as a heading
+   underline rather than a section break; and `h2` landed at 2em UA
+   bold beside 0.95rem/300 body text, which is the wrong voice as well
+   as the wrong size.
+
+   The agent writes plans, comparisons and headed sections constantly,
+   so this is load-bearing formatting, not polish.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Tables. `collapse` is required, not cosmetic: with `separate` the
+   cell borders below never join into rules and the grid reads as
+   floating dashes. The horizontal scroller is applied by app.js
+   (`decorateTables`) — a table wider than the bubble must SCROLL, not
+   crush its columns, which is the defect this replaces. */
+.message table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 0.88em;
+}
+
+.message th,
+.message td {
+    padding: 7px 10px;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* The header takes the mono eyebrow treatment used by every other
+   label in this UI (#rail-title, .panel-title, .notif-phase) so a
+   table header reads as one of ours rather than as browser chrome. */
+.message th {
+    font-family: var(--font-mono);
+    font-size: 0.74em;
+    font-weight: 500;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.58);
+    white-space: nowrap;
+}
+
+.message tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* Scroller wrapper (built by app.js). `max-width: 100%` on the wrapper
+   plus `width: max-content` on the table is what lets a wide table
+   keep its column widths and scroll, instead of being squeezed to the
+   bubble width. */
+.message .table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    margin: 12px 0;
+}
+
+.message .table-scroll > table {
+    width: max-content;
+    min-width: 100%;
+    margin: 0;
+}
+
+/* Headings. Kept close to body size — a reply is a paragraph with
+   structure, not a document — and differentiated by WEIGHT and the
+   mono/sans axis rather than by scale, which is how the rest of the
+   interface separates levels. */
+.message h1,
+.message h2,
+.message h3,
+.message h4,
+.message h5,
+.message h6 {
+    font-weight: 500;
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+    margin: 18px 0 8px;
+    color: #fff;
+}
+
+.message h1:first-child,
+.message h2:first-child,
+.message h3:first-child,
+.message h4:first-child,
+.message h5:first-child,
+.message h6:first-child {
+    margin-top: 0;
+}
+
+.message h1 { font-size: 1.25em; }
+.message h2 { font-size: 1.12em; }
+
+/* h3 and below become mono eyebrows: at these sizes another half-step
+   of scale is invisible, but the family switch is not. */
+.message h3,
+.message h4,
+.message h5,
+.message h6 {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.62);
+}
+
+/* Section break, not a heading underline: a hairline that fades at
+   both ends, matching .empty-hero-rule. `border: none` is the load-
+   bearing half — without it the UA groove stays visible under the
+   gradient. */
+.message hr {
+    border: none;
+    height: 1px;
+    margin: 18px 0;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        rgba(123, 98, 196, 0.35) 50%,
+        transparent 100%);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Render Window – Floating Visualizer
+   ═══════════════════════════════════════════════════════════════ */
+
+#render-window {
+    position: absolute;
+    z-index: 100;
+    width: min(600px, 90vw);
+    height: min(500px, 80dvh);
+    top: max(10%, 10px);
+    left: max(10%, 10px);
+    background: rgba(13, 8, 22, 0.88);
+    border: 1px solid rgba(75, 26, 122, 0.55);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.8),
+        0 0 22px rgba(75, 26, 122, 0.25),
+        inset 0 1px 0 rgba(123, 98, 196, 0.28);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    pointer-events: auto;
+}
+
+#render-window.hidden {
+    display: none !important;
+}
+
+/* --- Header / Drag Handle --- */
+#render-header {
+    background: rgba(75, 26, 122, 0.2);
+    padding: 10px 15px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: grab;
+    border-bottom: 1px solid rgba(75, 26, 122, 0.4);
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: none;
+    flex-shrink: 0;
+}
+
+#render-header:active {
+    cursor: grabbing;
+}
+
+#render-title {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #c9405a;
+    text-shadow: 0 0 8px rgba(75, 26, 122, 0.6);
+}
+
+#render-controls {
+    display: flex;
+    gap: 6px;
+}
+
+.render-btn {
+    background: transparent;
+    color: #fff;
+    border: 1px solid rgba(75, 26, 122, 0.5);
+    border-radius: 4px;
+    width: 28px;
+    height: 28px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+}
+
+.render-btn:hover {
+    background: #4b1a7a;
+    border-color: #4b1a7a;
+    box-shadow: 0 0 8px rgba(75, 26, 122, 0.5);
+}
+
+/* --- Content Area --- */
+#render-content-wrapper {
+    flex-grow: 1;
+    position: relative;
+    overflow: hidden;
+    background: #000;
+}
+
+#render-iframe,
+#render-iframe-sandboxed,
+#mermaid-container,
+#chart-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+    transition: transform 0.2s ease;
+}
+
+#render-iframe,
+#render-iframe-sandboxed {
+    background: #fff;
+}
+
+/* The sandboxed (code-render) iframe is hidden until renderHTMLContent
+   shows it; the same-origin iframe is the default visible one. */
+#render-iframe-sandboxed {
+    display: none;
+}
+
+#mermaid-container {
+    overflow: auto;
+    padding: 20px;
+    box-sizing: border-box;
+    /* display:none by DEFAULT (JS shows flex when rendering a diagram):
+       these two containers are opaque, absolutely positioned LAST in the
+       wrapper, so any path that forgets to hide them paints over the
+       iframes — the "window opens, shows nothing" symptom class. */
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: #0d0716;
+}
+
+#chart-container {
+    padding: 20px;
+    box-sizing: border-box;
+    display: none;
+    background: #0d0716;
+}
+
+
+/* --- Visualize Button on Code Blocks --- */
+.render-code-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: rgba(75, 26, 122, 0.7);
+    color: #fff;
+    border: 1px solid rgba(75, 26, 122, 0.6);
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    cursor: pointer;
+    opacity: 0;
+    transition: all 0.2s ease;
+    z-index: 5;
+}
+
+pre:hover .render-code-btn {
+    opacity: 1;
+}
+
+.render-code-btn:hover {
+    background: #4b1a7a;
+    box-shadow: 0 0 10px rgba(75, 26, 122, 0.6);
+}
+
+.message img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    margin-top: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+    cursor: zoom-in;
+    transition: transform 0.2s ease;
+}
+
+.message img:hover {
+    transform: scale(1.02);
+}
+
+.message img.renderable-hidden-img {
+    display: none !important;
+}
+
+.message pre.renderable-hidden {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 10px 0 !important;
+    display: flex;
+    justify-content: center;
+}
+
+.message pre.renderable-hidden code {
+    display: none !important;
+}
+
+.message pre.renderable-hidden .render-code-btn {
+    position: static !important;
+    opacity: 1 !important;
+    width: 100%;
+    height: 40px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    background: rgba(75, 26, 122, 0.4);
+    border: 1px dashed rgba(255, 255, 255, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.message pre.renderable-hidden .render-code-btn:hover {
+    background: #4b1a7a;
+}
+
+#mic-btn {
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.8);
+    border: 1px solid var(--surface-border);
+    border-radius: 50%;
+    width: 52px;
+    height: 52px;
+    /* Hold-to-talk on touch: the long-press must belong to the recording
+       gesture, not to text-selection / the iOS callout / scroll. */
+    touch-action: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#mic-btn:hover { background: var(--accent-color); color: #fff; transform: scale(1.05); }
+#mic-btn:active { transform: scale(0.95); }
+
+#mic-btn.recording {
+    background: var(--error-color);
+    color: white;
+    border-color: var(--error-color);
+    animation: pulseRecording 1s infinite alternate;
+}
+
+@keyframes pulseRecording {
+    from { box-shadow: 0 0 10px var(--error-color); transform: scale(1); }
+    to { box-shadow: 0 0 30px var(--error-color); transform: scale(1.1); }
+}
+
+#tts-toggle-btn.active {
+    background: rgba(46, 125, 84, 0.2);
+    color: var(--success-color);
+    border-color: var(--success-color);
+    box-shadow: 0 0 15px rgba(46, 125, 84, 0.4);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Typing indicator (three staggered dots)
+   Replaces the old setInterval text "Thinking." animation.
+   ═══════════════════════════════════════════════════════════════ */
+.typing-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 14px;
+}
+.typing-indicator span {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent-color);
+    box-shadow: 0 0 8px rgba(123, 98, 196, 0.6);
+    animation: typingBounce 1.1s infinite ease-in-out;
+}
+.typing-indicator span:nth-child(2) { animation-delay: 0.15s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes typingBounce {
+    0%, 80%, 100% { transform: translateY(0); opacity: 0.35; }
+    40%           { transform: translateY(-4px); opacity: 1; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Streaming cursor glyph (appended to an active agent message)
+   Applied via `.message.agent.streaming`.
+   ═══════════════════════════════════════════════════════════════ */
+.message.agent.streaming::after {
+    content: '▌';
+    display: inline-block;
+    margin-left: 2px;
+    color: var(--accent-color);
+    font-weight: 400;
+    animation: cursorBlink 1s step-end infinite;
+    text-shadow: 0 0 8px rgba(123, 98, 196, 0.55);
+}
+@keyframes cursorBlink {
+    0%, 50%   { opacity: 1; }
+    50.01%, 100% { opacity: 0; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Decorated code blocks — language badge + copy button
+   ═══════════════════════════════════════════════════════════════ */
+.message pre.decorated-code {
+    padding: 0;
+    overflow: hidden;
+}
+.message pre.decorated-code .code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: rgba(0, 0, 0, 0.45);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.55);
+}
+.message pre.decorated-code .code-lang {
+    color: var(--accent-color);
+    text-shadow: 0 0 6px rgba(123, 98, 196, 0.35);
+}
+.message pre.decorated-code .code-copy {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.7);
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 1px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-transform: uppercase;
+}
+.message pre.decorated-code .code-copy:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.3);
+}
+.message pre.decorated-code .code-copy.copied {
+    color: var(--success-color);
+    border-color: var(--success-color);
+    box-shadow: 0 0 10px rgba(46, 125, 84, 0.3);
+}
+.message pre.decorated-code code {
+    display: block;
+    padding: 12px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Broken-image fallback badge
+   ═══════════════════════════════════════════════════════════════ */
+.broken-image-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.55);
+    background: rgba(194, 39, 69, 0.08);
+    border: 1px dashed rgba(194, 39, 69, 0.4);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin: 8px 0;
+    letter-spacing: 0.5px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Empty-state hero (first-run / post-/clear)
+   ═══════════════════════════════════════════════════════════════ */
+.empty-hero {
+    align-self: center;
+    text-align: center;
+    margin: auto 0;
+    padding: 40px 32px;
+    max-width: 600px;
+    pointer-events: auto;
+    /* Slower and gentler than the old slideIn: this is the first thing
+       drawn over a live animated background, and a fast entrance made the
+       two motions fight. */
+    animation: heroFade 1.1s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.empty-hero-title {
+    font-family: var(--font-mono);
+    /* 200 weight + wide tracking reads as engraved rather than shouted.
+       The old 2.2rem/700/10px with two stacked glows was the single
+       heaviest element on the screen. */
+    font-size: clamp(1.6rem, 7vw, 2.4rem);
+    font-weight: 200;
+    color: rgba(255, 255, 255, 0.92);
+    margin: 0 0 18px;
+    display: flex;
+    justify-content: center;
+}
+.empty-hero-title span {
+    letter-spacing: 0.42em;
+    opacity: 0;
+    animation: heroLetter 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+/* Trailing letter keeps its tracking in the box but not on the screen —
+   without this the word sits visibly left of centre. */
+.empty-hero-title span:last-child { margin-right: -0.42em; }
+.empty-hero-title span:nth-child(1) { animation-delay: 0.10s; }
+.empty-hero-title span:nth-child(2) { animation-delay: 0.17s; }
+.empty-hero-title span:nth-child(3) { animation-delay: 0.24s; }
+.empty-hero-title span:nth-child(4) { animation-delay: 0.31s; }
+.empty-hero-title span:nth-child(5) { animation-delay: 0.38s; }
+
+/* A hairline that draws itself outward — the only ornament. */
+.empty-hero-rule {
+    width: min(220px, 46vw);
+    height: 1px;
+    margin: 0 auto 16px;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        rgba(123, 98, 196, 0.55) 50%,
+        transparent 100%);
+    transform: scaleX(0);
+    animation: heroRule 1.2s cubic-bezier(0.16, 1, 0.3, 1) 0.42s both;
+}
+
+.empty-hero-sub {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 300;
+    color: rgba(255, 255, 255, 0.34);
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    margin: 0;
+    animation: heroFade 1s cubic-bezier(0.16, 1, 0.3, 1) 0.62s both;
+}
+
+@keyframes heroFade {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes heroLetter {
+    from { opacity: 0; transform: translateY(14px); filter: blur(6px); }
+    to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
+}
+@keyframes heroRule {
+    from { transform: scaleX(0); }
+    to   { transform: scaleX(1); }
+}
+
+/* Motion is decoration here; honour the OS preference. */
+@media (prefers-reduced-motion: reduce) {
+    .empty-hero,
+    .empty-hero-title span,
+    .empty-hero-rule,
+    .empty-hero-sub {
+        animation: none;
+        opacity: 1;
+        transform: none;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Planner monologue — add fade-in motion to the existing slide
+   ═══════════════════════════════════════════════════════════════ */
+#planner-monologue.visible {
+    animation: fadeInSoft 0.4s ease;
+}
+@keyframes fadeInSoft {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* uConsole 5-inch 720p Optimizations */
+@media (max-width: 1280px) and (max-height: 720px) {
+    header {
+        padding: 8px 15px;
+        /* Landscape PHONES also match this uConsole query, and the
+           shorthand resets the safe-area insets: the status bar/Dynamic
+           Island occupy the top and LEFT edge in landscape standalone
+           mode. max() keeps the uConsole (no notch, env()=0) at its
+           compact 8/15px. */
+        padding-top: max(8px, env(safe-area-inset-top));
+        padding-left: max(15px, env(safe-area-inset-left));
+        padding-right: max(15px, env(safe-area-inset-right));
+        /* min-height, NOT a fixed height. On a portrait phone this query
+           also matches (height <= 720) while the <=480 rule makes the
+           header a 2-row column (status + buttons); a fixed 50px clipped
+           that, so the buttons overflowed below the header into the chat.
+           min-height keeps the uConsole's single-row bar compact while
+           letting the phone header grow to contain its buttons. */
+        min-height: 50px;
+    }
+    #chat-log {
+        font-size: 0.9rem; /* Slightly smaller text for readability */
+        padding: 15px;
+    }
+    .message {
+        padding: 10px 14px;
+        max-width: 90%;
+    }
+    #input-area-wrapper {
+        padding: 10px;
+    }
+    #chat-input {
+        /* font-size intentionally NOT set < 16px here: on phones (which
+           also match this query) iOS Safari auto-zooms the page when an
+           input under 16px is focused. The 0.95rem shrink is uConsole-only
+           (see the min-width:1000px block below). */
+        padding: 10px;
+    }
+    /* Scale down the Render Window for the small screen. NO !important:
+       drag/resize write inline styles, and !important here silently made
+       both dead on the uConsole and landscape phones (inline loses to a
+       stylesheet !important). Specificity + source order still beat the
+       base rule; a user drag simply wins afterwards. */
+    #render-window {
+        width: 85vw;
+        height: 80vh;
+        left: 7.5vw;
+        top: 10vh;
+    }
+}
+
+/* 36px buttons are a uConsole-only optimisation. The query above also
+   matches phones (any viewport <=720px tall — portrait SE, landscape),
+   where 36px is below the 44px touch-target guideline. Gate the shrink on
+   a wide viewport (min-width:1000px) so only the uConsole's 1280px-wide
+   screen gets it; phones keep the base 44px .icon-btn/#send-btn/#mic-btn.
+   Largest phones top out ~932px wide in landscape, well under 1000px. */
+@media (min-width: 1000px) and (max-height: 720px) {
+    .icon-btn, #mic-btn, #send-btn {
+        width: 36px;
+        height: 36px;
+    }
+    /* uConsole-only: safe here because it's not a touch phone, so iOS
+       focus-zoom doesn't apply. */
+    #chat-input {
+        font-size: 0.95rem;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Visual enhancements — motion & depth polish
+   Layered on top of the existing cyber theme; nothing above changes
+   structurally. All heavy motion is disabled under
+   prefers-reduced-motion at the bottom of this block.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Directional message entrances: user bubbles drift in from the right,
+   agent bubbles from the left, so the two sides read as a dialogue.
+   These override only the animation-NAME from the base `.message` rule
+   (higher specificity), and are never toggled at runtime — so streaming
+   state changes can't replay the entrance. */
+@keyframes slideInLeft {
+    from { opacity: 0; transform: translateX(-22px) scale(0.98); }
+    to   { opacity: 1; transform: none; }
+}
+@keyframes slideInRight {
+    from { opacity: 0; transform: translateX(22px) scale(0.98); }
+    to   { opacity: 1; transform: none; }
+}
+.message.agent { animation-name: slideInLeft; }
+.message.user  { animation-name: slideInRight; }
+
+/* Live agent reply: a pulsing accent edge runs down the left border while
+   tokens stream. Implemented as a ::before overlay (not an `animation` on
+   the bubble itself) so toggling `.streaming` never disturbs the one-shot
+   entrance animation. Pairs with the existing ::after cursor glyph. */
+.message.agent.streaming::before {
+    content: '';
+    position: absolute;
+    left: -1px;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    border-radius: 4px;
+    background: var(--accent-color);
+    box-shadow: 0 0 12px var(--accent-color), 0 0 4px var(--accent-color);
+    animation: edgePulse 1.6s ease-in-out infinite;
+}
+@keyframes edgePulse {
+    0%, 100% { opacity: 0.35; box-shadow: 0 0 6px var(--accent-color); }
+    50%      { opacity: 1;    box-shadow: 0 0 16px var(--accent-color), 0 0 6px var(--accent-color); }
+}
+
+/* Hover lift on finished bubbles — subtle depth cue. */
+.message.agent, .message.user {
+    transition: box-shadow 0.3s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.3s ease;
+}
+.message.agent:hover {
+    transform: translateY(-1px);
+    border-color: rgba(123, 98, 196, 0.35);
+    box-shadow: 0 10px 36px rgba(0, 0, 0, 0.25), 0 0 18px rgba(123, 98, 196, 0.08);
+}
+.message.user:hover {
+    transform: translateY(-1px);
+    border-color: rgba(75, 26, 122, 0.7);
+    box-shadow: 0 10px 36px rgba(0, 0, 0, 0.25), 0 0 18px rgba(75, 26, 122, 0.18);
+}
+
+/* Breathing glow on the input while focused — a slow, low-amplitude pulse
+   layered over the static focus shadow. Only box-shadow is keyframed, so
+   the focus-within translateY lift is preserved. */
+#input-area:focus-within {
+    animation: inputGlow 3.2s ease-in-out infinite;
+}
+@keyframes inputGlow {
+    0%, 100% { box-shadow: 0 15px 50px rgba(0, 0, 0, 0.7), 0 0 16px rgba(75, 26, 122, 0.30); }
+    50%      { box-shadow: 0 15px 50px rgba(0, 0, 0, 0.7), 0 0 26px rgba(75, 26, 122, 0.55); }
+}
+
+/* Send button gets a faint accent ring at rest so it reads as the
+   primary affordance without shouting. */
+#send-btn:not(.send-btn-cancel) {
+    box-shadow: 0 0 0 1px rgba(123, 98, 196, 0.08), inset 0 0 12px rgba(123, 98, 196, 0.04);
+}
+
+/* Empty-state hero: the animated gradient sweep and the staggered chip
+   reveal were removed 2026-08-16 with the chips themselves. The wordmark
+   is deliberately a flat hairline now — a moving gradient on top of a
+   moving background was two animations competing for the same glance. */
+
+/* Decorated code blocks: a thin accent rule along the header bottom and a
+   left accent stripe give code a clearer, more designed frame. */
+.message pre.decorated-code {
+    border-left: 2px solid rgba(123, 98, 196, 0.35);
+}
+.message pre.decorated-code .code-header {
+    background: linear-gradient(90deg, rgba(123, 98, 196, 0.06), rgba(0, 0, 0, 0.45) 60%);
+    border-bottom: 1px solid rgba(123, 98, 196, 0.18);
+}
+
+/* Respect reduced-motion: kill the continuous/entrance animations and
+   long transitions for users who ask for it. (matrix_graph.js applies a
+   matching damping to the 3D sphere.) */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+    }
+    .message { animation: none !important; }
+    .empty-hero-title,
+    .empty-hero-title span,
+    .empty-hero-rule,
+    .empty-hero-sub {
+        animation: none !important;
+        opacity: 1 !important;
+        transform: none !important;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Live log console (2026-07-13) — bottom drawer rendering the same
+   pretty-log stream that drives the face. Visual language mirrors
+   #render-window (dark glass, violet borders); lines are dim
+   monospace with a jewel-accent left border per icon class.
+   ═══════════════════════════════════════════════════════════════ */
+
+#log-console {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: min(44dvh, 440px);
+    z-index: 90; /* above chat, below #render-window (100) */
+    background: rgba(9, 6, 16, 0.58);
+    border-top: 1px solid rgba(75, 26, 122, 0.55);
+    box-shadow: 0 -16px 44px rgba(0, 0, 0, 0.75),
+        0 0 20px rgba(75, 26, 122, 0.22);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    display: flex;
+    flex-direction: column;
+    pointer-events: auto;
+}
+
+#log-console.hidden {
+    display: none !important;
+}
+
+#log-console-header {
+    background: rgba(75, 26, 122, 0.18);
+    border-bottom: 1px solid rgba(75, 26, 122, 0.4);
+    padding: 8px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 2px;
+    color: rgba(255, 255, 255, 0.65);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#log-console-controls {
+    display: flex;
+    gap: 8px;
+}
+
+#log-console-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    line-height: 1.55;
+}
+
+.log-line {
+    color: rgba(158, 170, 192, 0.92);
+    border-left: 2px solid transparent;
+    padding-left: 8px;
+    margin-bottom: 2px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.log-line-error {
+    color: #e0637f;
+}
+
+#log-resume {
+    position: absolute;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(75, 26, 122, 0.55);
+    border: 1px solid rgba(123, 98, 196, 0.6);
+    color: #e6e9ef;
+    border-radius: 999px;
+    padding: 5px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+#log-resume.hidden {
+    display: none !important;
+}
+
+/* Chat "new messages" pill (2026-09-11) — same shape as #log-resume,
+   anchored just above the composer inside the positioned chat main. */
+#chat-resume {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    background: rgba(75, 26, 122, 0.55);
+    border: 1px solid rgba(123, 98, 196, 0.6);
+    color: #e6e9ef;
+    border-radius: 999px;
+    padding: 5px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+#chat-resume.hidden {
+    display: none !important;
+}
+
+/* Retry on the error / Stop bubbles (2026-09-11). The bubble is a
+   system pill (uppercase mono); the button is its own small pill so a
+   thumb finds it. */
+.msg-retry-btn {
+    margin-left: 10px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(123, 98, 196, 0.7);
+    background: rgba(75, 26, 122, 0.35);
+    color: #e6e9ef;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    cursor: pointer;
+    min-height: 28px;
+}
+.msg-retry-btn:hover { background: rgba(123, 98, 196, 0.3); color: #fff; }
+
+#status-indicator.active {
+    background: rgba(75, 26, 122, 0.28);
+    color: #b894ff;
+    border-color: rgba(123, 98, 196, 0.7);
+    box-shadow: 0 0 15px rgba(75, 26, 122, 0.45);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   WORKSPACE (2026-07-28) — operator console chrome
+   Sessions rail, notifications, status panel, command palette,
+   message actions, toasts, memory modal, density modes.
+   Same visual language as the established theme: dark glass, violet
+   hairlines, mono uppercase eyebrows; glow stays reserved for STATE
+   (streaming, errors, notifications), never for chrome.
+   ═══════════════════════════════════════════════════════════════ */
+
+:root {
+    --rail-w: 276px;
+    --panel-bg: rgba(11, 7, 19, 0.86);
+    --panel-border: rgba(123, 98, 196, 0.28);
+    --hairline: rgba(123, 98, 196, 0.14);
+    --eyebrow-color: rgba(255, 255, 255, 0.55);
+}
+
+/* Body becomes a horizontal workspace: rail | ui-layer. The face layer
+   is position:fixed so it keeps painting behind BOTH columns. */
+body {
+    display: flex;
+}
+#ui-layer {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+/* Header left cluster: rail toggle + status. */
+#header-left {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    pointer-events: auto;
+    min-width: 0;
+}
+
+/* ── Sessions rail ─────────────────────────────────────────────── */
+#session-rail {
+    width: var(--rail-w);
+    flex-shrink: 0;
+    margin-left: calc(-1 * var(--rail-w));
+    transition: margin-left 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    z-index: 30;
+    background: rgba(8, 5, 14, 0.62);
+    border-right: 1px solid var(--hairline);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    pointer-events: auto;
+    padding-top: max(12px, env(safe-area-inset-top));
+    padding-left: env(safe-area-inset-left);
+}
+body.rail-open #session-rail {
+    margin-left: 0;
+}
+body.zen-mode #session-rail,
+body.zen-mode #rail-scrim {
+    display: none;
+}
+
+#rail-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px 8px 18px;
+    flex-shrink: 0;
+}
+#rail-title {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 3px;
+    color: var(--eyebrow-color);
+    user-select: none;
+    -webkit-user-select: none;
+}
+/* Rail actions (2026-09-05): load / save workspace beside "+". Save is
+   disabled with nothing to save — a dimmed, inert glyph, no hover lift. */
+#rail-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+#rail-actions .icon-btn {
+    width: 36px;
+    height: 36px;
+}
+#rail-actions .icon-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+#rail-actions .icon-btn:disabled:hover {
+    background: var(--surface-bg);
+    color: rgba(255, 255, 255, 0.8);
+    transform: none;
+}
+
+#session-search {
+    margin: 2px 14px 10px 14px;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    color: var(--text-color);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    /* No `outline: none` here. It used to suppress the ring at ID
+       specificity, which outranks the :focus-visible rule below, and the
+       only remaining indicator was #session-search:focus nudging the
+       border from rgba(123,98,196,.14) to .32 — a 1px hairline moving
+       between two nearly identical alphas. Keyboard users had nothing to
+       see. The border nudge stays as the pointer-focus treatment; the
+       ring rides on top for keyboard focus. */
+    -webkit-appearance: none;
+}
+#session-search:focus {
+    border-color: var(--surface-highlight);
+}
+
+#session-list {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    padding: 0 10px 14px 10px;
+}
+
+/* A session row: jewel-hue stripe (stable per id — the rail reads as
+   strata of the agent's episodic memory), title, meta, delete. */
+.session-row {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+    border-radius: 10px;
+    margin-bottom: 2px;
+    transition: background 0.2s ease;
+}
+.session-row:hover { background: rgba(123, 98, 196, 0.08); }
+.session-row.active { background: rgba(123, 98, 196, 0.14); }
+.session-stripe {
+    width: 3px;
+    border-radius: 3px;
+    margin: 8px 0 8px 6px;
+    flex-shrink: 0;
+    opacity: 0.8;
+}
+.session-row.active .session-stripe { opacity: 1; box-shadow: 0 0 8px currentColor; }
+.session-main {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    background: none;
+    border: none;
+    color: inherit;
+    text-align: left;
+    padding: 9px 8px 9px 10px;
+    cursor: pointer;
+    font-family: var(--font-main);
+    border-radius: 10px;
+}
+.session-title {
+    font-size: 0.83rem;
+    font-weight: 400;
+    color: rgba(255, 255, 255, 0.86);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.session-row.active .session-title { color: #fff; }
+.session-meta {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.5px;
+    /* 0.55 alpha measured 3.09:1 against the near-black rail — a WCAG AA
+       failure on the line you navigate the rail BY ("1h ago · 48 msgs"),
+       at 9.9px. 0.75 measures 5.17:1 and is still visibly secondary to the
+       title above it. Pinned in tests/test_interface_contrast.py, which
+       recomputes the ratio from this value rather than matching the text. */
+    color: rgba(158, 170, 192, 0.75);
+}
+.session-delete {
+    align-self: center;
+    width: 30px;
+    height: 30px;
+    margin-right: 4px;
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 0.7rem;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s ease, color 0.2s ease;
+}
+.session-row:hover .session-delete,
+.session-row:focus-within .session-delete { opacity: 1; }   /* §4PR: keyboard focus */
+.session-delete:hover { color: #e0637f; background: rgba(194, 39, 69, 0.12); }
+@media (pointer: coarse) {
+    .session-delete { opacity: 0.5; width: 38px; height: 38px; }
+}
+
+.session-empty, #rail-note {
+    padding: 14px 18px;
+    font-size: 0.75rem;
+    line-height: 1.6;
+    color: rgba(158, 170, 192, 0.6);
+}
+
+/* Destructive rail footer: quiet until hovered, unmistakable when armed.
+   Two-step confirm lives in sessions.js — the .armed state is the
+   "click again" window. */
+#rail-footer {
+    flex-shrink: 0;
+    padding: 8px 10px 12px 10px;
+    border-top: 1px solid rgba(123, 98, 196, 0.12);
+}
+#rail-footer.hidden { display: none; }
+#delete-all-sessions-btn {
+    width: 100%;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.5px;
+    color: rgba(158, 170, 192, 0.45);
+    cursor: pointer;
+    transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+#delete-all-sessions-btn:hover {
+    color: #e0637f;
+    background: rgba(194, 39, 69, 0.10);
+}
+#delete-all-sessions-btn.armed {
+    color: #fff;
+    background: rgba(194, 39, 69, 0.28);
+    border-color: rgba(224, 99, 127, 0.55);
+}
+#delete-all-sessions-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* Face-form picker: same glass-panel language as #msg-menu, anchored
+   under the header button by app.js. */
+#face-form-menu {
+    position: fixed;
+    z-index: 160;
+    min-width: 230px;
+    /* Phone guards: never wider than the viewport, and 10 items don't fit
+       a landscape phone — scroll inside the menu instead of off-screen.
+       app.js clamps the anchor position on BOTH axes to match. */
+    max-width: calc(100vw - 16px);
+    max-height: min(60dvh, calc(100dvh - 90px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    padding: 6px;
+}
+#face-form-menu.hidden { display: none; }
+.face-form-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 14px;
+    width: 100%;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 12px;
+    cursor: pointer;
+    text-align: left;
+}
+.face-form-item:hover { background: rgba(123, 98, 196, 0.16); }
+.face-form-item.active { background: rgba(123, 98, 196, 0.22); }
+.face-form-name {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.85);
+}
+.face-form-item.active .face-form-name { color: #fff; }
+.face-form-item.active .face-form-name::before {
+    content: '● ';
+    color: #9b7fe8;
+    font-size: 0.6rem;
+}
+.face-form-hint {
+    font-family: var(--font-main);
+    font-size: 0.68rem;
+    color: rgba(158, 170, 192, 0.55);
+    white-space: nowrap;
+}
+#rail-note.hidden { display: none; }
+
+
+#rail-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 115;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+}
+#rail-scrim.hidden { display: none; }
+
+/* Drawer mode: phones, portrait tablets, and short landscapes. */
+@media (max-width: 899.98px), (max-height: 499.98px) {
+    #session-rail {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: min(84vw, 320px);
+        margin-left: 0;
+        transform: translateX(-105%);
+        transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        z-index: 120;
+        border-right: 1px solid var(--panel-border);
+        box-shadow: 24px 0 60px rgba(0, 0, 0, 0.6);
+        padding-bottom: env(safe-area-inset-bottom);
+    }
+    body.rail-open #session-rail {
+        transform: translateX(0);
+    }
+}
+
+/* ── Status chip: DEGRADED tag (the model pill and the clickable
+      status panel were removed 2026-09-05; the chip is a light) ── */
+#status-indicator.degraded::after {
+    content: 'DEGRADED';
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    letter-spacing: 1.5px;
+    color: #e0637f;
+    border: 1px solid rgba(194, 39, 69, 0.5);
+    border-radius: 999px;
+    padding: 2px 8px;
+    animation: dotPulse 1.6s infinite;
+}
+
+/* ── Panel chrome (notifications; the status panel was removed 2026-09-05) ── */
+#notif-panel {
+    position: fixed;
+    top: calc(max(16px, env(safe-area-inset-top)) + 58px);
+    right: 16px;
+    width: min(384px, calc(100vw - 32px));
+    max-height: min(64dvh, 560px);
+    z-index: 110;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.7), 0 0 24px rgba(75, 26, 122, 0.18);
+    backdrop-filter: blur(22px);
+    -webkit-backdrop-filter: blur(22px);
+    pointer-events: auto;
+    overflow: hidden;
+}
+#notif-panel.hidden { display: none; }
+
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--hairline);
+    flex-shrink: 0;
+}
+.panel-title {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 3px;
+    color: var(--eyebrow-color);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#notif-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+
+/* Bottom sheets on phones. */
+@media (max-width: 640px) {
+    #notif-panel {
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: auto;
+        max-height: 72dvh;
+        border-radius: 16px 16px 0 0;
+        border-bottom: none;
+    }
+}
+
+.notif-item {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--hairline);
+    border-left: 2px solid rgba(123, 98, 196, 0.5);
+}
+.notif-item-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 4px;
+}
+.notif-phase {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 2px;
+    color: rgba(184, 148, 255, 0.85);
+}
+.notif-time {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    color: rgba(158, 170, 192, 0.5);
+}
+.notif-summary {
+    font-size: 0.83rem;
+    line-height: 1.55;
+    color: rgba(255, 255, 255, 0.85);
+    word-break: break-word;
+}
+.notif-empty {
+    padding: 22px 18px;
+    font-size: 0.78rem;
+    color: rgba(158, 170, 192, 0.6);
+}
+
+/* Lock-screen alerts row at the top of the bell panel (2026-09-11). */
+.notif-push-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--hairline);
+    border-left: 2px solid rgba(123, 98, 196, 0.5);
+    background: rgba(75, 26, 122, 0.12);
+}
+.notif-push-text {
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: rgba(230, 233, 239, 0.85);
+}
+.notif-push-btn {
+    flex: none;
+    padding: 6px 12px;
+    min-height: 32px;
+    border-radius: 999px;
+    border: 1px solid rgba(123, 98, 196, 0.7);
+    background: rgba(75, 26, 122, 0.35);
+    color: #e6e9ef;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    cursor: pointer;
+}
+.notif-push-btn:hover { background: rgba(123, 98, 196, 0.3); color: #fff; }
+.notif-push-btn:disabled { opacity: 0.5; cursor: default; }
+
+#notif-btn { position: relative; }
+#notif-badge {
+    position: absolute;
+    top: -3px;
+    right: -3px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: var(--accent-color);
+    color: #fff;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    line-height: 18px;
+    text-align: center;
+    box-shadow: 0 0 10px rgba(123, 98, 196, 0.8);
+}
+#notif-badge.hidden { display: none; }
+
+/* ── Toasts ────────────────────────────────────────────────────── */
+#toast-stack {
+    position: fixed;
+    top: calc(max(12px, env(safe-area-inset-top)) + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    /* §4PR: above the modals (150) — an error toast raised BY a modal was
+       blurred behind it, and tapping it hit the overlay and closed the
+       modal; below #msg-menu (160) */
+    z-index: 155;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    pointer-events: none;
+    width: min(440px, calc(100vw - 24px));
+}
+.toast {
+    pointer-events: auto;
+    max-width: 100%;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-left: 3px solid var(--accent-color);
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    line-height: 1.5;
+    color: rgba(255, 255, 255, 0.88);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    animation: toastIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    cursor: default;
+    word-break: break-word;
+}
+.toast-clickable { cursor: pointer; }
+.toast-ok { border-left-color: #2e7d54; }
+.toast-error { border-left-color: #c22745; }
+.toast-notify { border-left-color: #b894ff; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), 0 0 18px rgba(123, 98, 196, 0.35); }
+.toast-out { opacity: 0; transform: translateY(-6px); transition: all 0.25s ease; }
+@keyframes toastIn {
+    from { opacity: 0; transform: translateY(-10px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Command palette ───────────────────────────────────────────── */
+#cmd-palette {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding-top: max(12vh, calc(env(safe-area-inset-top) + 24px));
+}
+#cmd-palette.hidden { display: none; }
+#palette-box {
+    width: min(560px, 92vw);
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.8), 0 0 30px rgba(75, 26, 122, 0.2);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    overflow: hidden;
+}
+#palette-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--hairline);
+    padding: 16px 18px;
+    color: var(--text-color);
+    font-family: var(--font-main);
+    font-size: max(1rem, 16px);
+    /* This one had `outline: none` AND no :focus rule of any kind, so
+       it was the only control in the app with no focus indicator at
+       all — invisible after arrowing down into #palette-results and
+       back up. The ring is now its indicator; `outline-offset: -2px`
+       keeps it inside the rounded palette box instead of straddling
+       the edge. */
+}
+#palette-input:focus-visible {
+    outline-offset: -2px;
+}
+#palette-results {
+    max-height: min(46dvh, 420px);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 6px;
+}
+.palette-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    padding: 11px 14px;
+    border-radius: 9px;
+    cursor: pointer;
+}
+.palette-item.selected {
+    background: rgba(123, 98, 196, 0.16);
+    box-shadow: inset 2px 0 0 var(--accent-color);
+}
+.palette-label { font-size: 0.88rem; color: rgba(255, 255, 255, 0.9); }
+.palette-hint {
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    color: rgba(158, 170, 192, 0.55);
+    flex-shrink: 0;
+}
+.palette-empty { padding: 18px; font-size: 0.8rem; color: rgba(158, 170, 192, 0.6); }
+
+/* ── Per-message actions ───────────────────────────────────────── */
+.msg-actions {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.message:hover .msg-actions { opacity: 1; }
+@media (pointer: coarse) {
+    .msg-actions { opacity: 0.55; }
+}
+/* First-line reservation for the overlay (2026-09-05). The absolutely
+   positioned time + ⋯ sat ON the first line of text: a one-word "hello"
+   bubble drew its timestamp behind the word, and a reply's first line
+   ran under the ⋯ button (operator screenshot). A float in normal flow
+   makes the first line wrap around the overlay's footprint — and a
+   one-word bubble simply grows so the word and the overlay share the
+   line — without adding a row to every message. Sized for the widest
+   time the locale can print ("12:59 PM") plus the ⋯ button, minus the
+   bubble's own right padding; touch buttons are bigger, so is the
+   reservation. Only bubbles that HAVE the overlay pay for it:
+   streaming / thinking bubbles keep their full first line. */
+.message:has(> .msg-actions)::before {
+    content: '';
+    float: right;
+    width: 72px;
+    height: 1.6em;
+}
+@media (pointer: coarse) {
+    .message:has(> .msg-actions)::before { width: 86px; }
+}
+/* Phone bubbles (2026-10-25, operator: "the way it wraps text around the
+   timer, the word placement and line wrapping etc"). In a ~240px text
+   column the 86px first-line reservation left two or three words on the
+   first line and the rest below it, with the time + ⋯ hanging over the
+   corner. Under 480px the overlay leaves the corner: no reservation, and
+   .msg-actions becomes a footer row in normal flow, right-aligned under
+   the text. On an agent bubble the thumbs row floats left into that same
+   footer row (flow-root contains the float), so the bubble grows by one
+   row, not two. Desktop keeps the hover overlay. Rendered pins:
+   tests/test_interface_composer_mobile.py. */
+@media (max-width: 480px) {
+    .message:has(> .msg-actions)::before { content: none; }
+    .msg-actions {
+        position: static;
+        justify-content: flex-end;
+        margin-top: 6px;
+        opacity: 0.55;
+    }
+    .message.agent:has(> .msg-actions) { display: flow-root; }
+    .message.agent:has(> .msg-actions) > .msg-feedback {
+        float: left;
+        margin-top: 2px;    /* measured: centres the thumbs on the 34px menu button's row */
+    }
+}
+.msg-time {
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    letter-spacing: 1px;
+    /* Same measurement as .session-meta: 3.09:1 -> 5.17:1. See the note
+       there; both are pinned by the same recomputation test. */
+    color: rgba(158, 170, 192, 0.75);
+    user-select: none;
+    -webkit-user-select: none;
+}
+.msg-menu-btn {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 0.8rem;
+    line-height: 1;
+    cursor: pointer;
+}
+.msg-menu-btn:hover { background: var(--surface-highlight); color: #fff; }
+@media (pointer: coarse) {
+    .msg-menu-btn { width: 34px; height: 34px; }
+}
+
+/* ── Outcome-label thumbs (agent bubbles with a known request id) ──
+   A quiet right-aligned footer row INSIDE the bubble, in normal flow —
+   not in the floating .msg-actions overlay, which crowded the timestamp/
+   menu and could sit on top of the reply text. Ghost buttons in the
+   muted meta tone; hover lifts them to the shared dark-chip chrome; the
+   chosen thumb latches in the violet accent and keeps the row visible. */
+.msg-feedback {
+    display: flex;
+    justify-content: flex-end;
+    gap: 4px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.message.agent:hover .msg-feedback,
+.msg-feedback:focus-within,
+.msg-feedback.fb-decided { opacity: 1; }
+@media (pointer: coarse) {
+    .msg-feedback { opacity: 0.55; }
+    .msg-feedback.fb-decided { opacity: 1; }
+}
+.msg-fb-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    color: rgba(158, 170, 192, 0.55);   /* the .msg-time meta tone */
+    cursor: pointer;
+}
+.msg-fb-btn svg { width: 13px; height: 13px; display: block; }
+.msg-fb-btn:hover {
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(0, 0, 0, 0.3);
+    border-color: var(--hairline);
+}
+.msg-fb-btn:disabled { cursor: default; pointer-events: none; }
+.msg-fb-btn.fb-active {
+    color: #9f8ae0;
+    border-color: rgba(123, 98, 196, 0.55);
+    background: rgba(123, 98, 196, 0.14);
+}
+@media (pointer: coarse) {
+    .msg-fb-btn { width: 38px; height: 30px; }
+    .msg-fb-btn svg { width: 15px; height: 15px; }
+}
+
+#msg-menu {
+    position: fixed;
+    z-index: 160;
+    min-width: 210px;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    padding: 6px;
+}
+#msg-menu.hidden { display: none; }
+.msg-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: rgba(255, 255, 255, 0.85);
+    font-family: var(--font-main);
+    font-size: 0.84rem;
+    cursor: pointer;
+}
+.msg-menu-item:hover { background: rgba(123, 98, 196, 0.16); color: #fff; }
+
+/* ── Day separators ────────────────────────────────────────────── */
+.day-separator {
+    align-self: center;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: rgba(158, 170, 192, 0.5);
+    user-select: none;
+    -webkit-user-select: none;
+}
+.day-separator::before, .day-separator::after {
+    content: '';
+    width: 48px;
+    height: 1px;
+    background: var(--hairline);
+}
+
+/* ── Long code: fixed-height window with an internal scrollbar ──── */
+.message pre.decorated-code { position: relative; }
+.message pre.code-collapsed code {
+    max-height: 300px;
+    overflow-y: auto;             /* right-hand scrollbar, not clipping */
+    display: block;
+    overscroll-behavior: contain; /* don't chain-scroll the chat log */
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Action bar at the BOTTOM of every decorated block — stays reachable
+   while the window above it is scrolled. */
+.message pre.decorated-code .code-footer {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-top: 1px solid rgba(123, 98, 196, 0.18);
+    background: linear-gradient(90deg, rgba(123, 98, 196, 0.06), rgba(0, 0, 0, 0.45) 60%);
+}
+.message pre.decorated-code .code-expand {
+    background: none;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    color: rgba(184, 148, 255, 0.85);
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    padding: 3px 9px;
+    cursor: pointer;
+}
+.message pre.decorated-code .code-expand:hover {
+    background: rgba(123, 98, 196, 0.18);
+    color: #fff;
+}
+
+/* ── Memory modal ──────────────────────────────────────────────── */
+#memory-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 16px;
+}
+#memory-modal.hidden { display: none; }
+#memory-modal-box {
+    width: min(520px, 100%);
+    max-height: min(80dvh, 640px);
+    overflow-y: auto;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    padding-bottom: 16px;
+}
+#memory-modal-hint {
+    margin: 12px 18px;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: rgba(158, 170, 192, 0.75);
+}
+.modal-label {
+    display: block;
+    margin: 10px 18px 4px 18px;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--eyebrow-color);
+}
+.modal-label.hidden { display: none; }
+/* ── Shared modal chrome (2026-09-05): the ask-about-this-file sheet
+      wears the memory modal's look via classes. New modals use these. ── */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 16px;
+}
+.modal-overlay.hidden { display: none; }
+.modal-box {
+    width: min(520px, 100%);
+    max-height: min(84dvh, 720px);
+    overflow-y: auto;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    padding-bottom: 16px;
+}
+.modal-hint {
+    margin: 12px 18px;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: rgba(158, 170, 192, 0.75);
+}
+/* File line under the question: a 64px thumbnail beside the stored name.
+   (The first cut showed the picture full-width ABOVE the box, which put
+   the typing under the phone keyboard — operator.) */
+#upload-ask-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 12px 18px 0 18px;
+    min-width: 0;
+}
+#upload-ask-meta .modal-hint { margin: 0; min-width: 0; }
+#upload-ask-file { font-family: var(--font-mono); word-break: break-all; }
+#upload-ask-preview-wrap {
+    flex: 0 0 64px;
+    width: 64px;
+    height: 64px;
+    border-radius: 10px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--hairline);
+}
+#upload-ask-preview-wrap[hidden] { display: none; }
+#upload-ask-preview {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+/* Phones: anchor the sheet to the TOP so the keyboard (bottom third)
+   never covers the question box; desktop keeps it centred. */
+@media (max-width: 640px) {
+    .modal-overlay,
+    #memory-modal {
+        align-items: flex-start;
+        padding-top: max(20px, env(safe-area-inset-top));
+    }
+}
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin: 16px 18px 0 18px;
+}
+.modal-btn {
+    min-height: 44px;
+    border-radius: 9px;
+    padding: 10px 18px;
+    font-family: var(--font-main);
+    font-size: 0.84rem;
+    cursor: pointer;
+    background: none;
+    border: 1px solid var(--hairline);
+    color: rgba(255, 255, 255, 0.7);
+}
+.modal-btn.primary {
+    background: rgba(123, 98, 196, 0.3);
+    border: 1px solid var(--surface-highlight);
+    color: #fff;
+}
+.modal-btn.primary:hover { background: rgba(123, 98, 196, 0.45); }
+
+#memory-match, #memory-replacement, .modal-textarea {
+    display: block;
+    width: calc(100% - 36px);
+    margin: 0 18px;
+    box-sizing: border-box;
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    color: var(--text-color);
+    font-family: var(--font-mono);
+    font-size: max(0.85rem, 16px);
+    line-height: 1.5;
+    padding: 10px 12px;
+    resize: vertical;
+    /* `outline: none` removed for the same reason as #session-search:
+       the :focus border-color nudge below is the pointer treatment, not
+       a keyboard focus indicator. */
+}
+#memory-match:focus, #memory-replacement:focus, .modal-textarea:focus { border-color: var(--surface-highlight); }
+/* A pristine default reads as a suggestion: dimmer, italic — it is gone
+   the moment the operator types (app.js resolvePristineInput). */
+.modal-textarea.pristine { color: rgba(158, 170, 192, 0.7); font-style: italic; }
+#memory-replacement.hidden { display: none; }
+#memory-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin: 16px 18px 0 18px;
+}
+#memory-modal-cancel, #memory-modal-apply {
+    border-radius: 9px;
+    padding: 10px 18px;
+    font-family: var(--font-main);
+    font-size: 0.84rem;
+    cursor: pointer;
+}
+#memory-modal-cancel {
+    background: none;
+    border: 1px solid var(--hairline);
+    color: rgba(255, 255, 255, 0.7);
+}
+#memory-modal-apply {
+    background: rgba(123, 98, 196, 0.3);
+    border: 1px solid var(--surface-highlight);
+    color: #fff;
+}
+#memory-modal-apply:hover { background: rgba(123, 98, 196, 0.45); }
+#memory-modal-apply:disabled { opacity: 0.5; cursor: wait; }
+
+/* ── Density modes ─────────────────────────────────────────────── */
+body.compact .message {
+    padding: 10px 16px;
+    font-size: 0.88rem;
+    line-height: 1.55;
+}
+body.compact #chat-log { gap: 12px; }
+body.compact .session-main { padding: 6px 8px 6px 10px; }
+body.compact .session-title { font-size: 0.78rem; }
+
+/* ── Restore/re-render without replaying entrances ─────────────── */
+body.restoring .message { animation: none !important; }
+
+/* ── Keyboard focus (visible, theme-consistent) ────────────────────
+   This was an ENUMERATION of ten selectors, and the two controls a
+   keyboard user reaches first — #send-btn and #mic-btn, the primary
+   actions — were not on it, along with #palette-input, .face-form-item
+   and #delete-all-sessions-btn. That is the failure mode of a hand-kept
+   list: every control added after it was written starts with no focus
+   ring, and nothing says so.
+
+   Replaced with a rule over the interactive elements themselves, so a
+   new control is covered on the day it is added. `:where()` keeps the
+   specificity at 0-1-0 (the :focus-visible pseudo-class alone), so any
+   component that wants a different ring can still override with a plain
+   class selector. Enumerated and pinned in tests/test_interface_a11y.py
+   — the test walks index.html and fails on a focusable element this
+   rule cannot match. */
+:where(button, [role="button"], [role="menuitem"], a[href],
+       input, textarea, select, [tabindex]:not([tabindex="-1"])):focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+}
+
+/* ── Phone header (2026-09-05, operator: "everything fits in a single
+      line in mobile"). Two controls left, five right, 40px targets, 6px
+      gaps. Budget at 375px: 24 padding + 40 + 6 + 40 + 5×40 + 4×6 = 334,
+      so the row has 41px to spare on the smallest iPhone. The status
+      chip drops its word and becomes a round light — the dot's colour
+      is the state, the tap opens the live log; DEGRADED shows as a red
+      ring instead of the tag. The left cluster is the one that shrinks
+      (the planner monologue wraps under the light); the controls never
+      wrap. ────────────────────────────────────────────────────────── */
+@media (max-width: 480px) {
+    #header-left {
+        flex: 1 1 0;
+        min-width: 0;
+        gap: 6px;
+        align-items: center;
+    }
+    #status-wrapper {
+        min-width: 0;
+        max-width: 100%;
+        /* The base 8px gap sits between the chip and the (height:0)
+           planner line and made the wrapper 8px taller than the buttons,
+           so the centred row put the chip 4px ABOVE its neighbours —
+           caught by the rendered pin, not by eye. The monologue keeps
+           its own margin-top when it becomes visible. */
+        gap: 0;
+    }
+    #planner-monologue {
+        max-width: 100%;
+    }
+    #header-controls {
+        flex: 0 0 auto;
+        flex-wrap: nowrap;
+        gap: 6px;
+    }
+    #header-controls .icon-btn,
+    #header-left .icon-btn {
+        width: 40px;
+        height: 40px;
+    }
+    #status-indicator {
+        width: 40px;
+        padding: 0;
+        gap: 0;
+        border-radius: 50%;
+    }
+    #status-text {
+        display: none;
+    }
+    #status-indicator.degraded::after {
+        display: none;
+    }
+    #status-indicator.degraded {
+        border-color: rgba(194, 39, 69, 0.7);
+        box-shadow: 0 0 14px rgba(194, 39, 69, 0.45);
+    }
+}
+
+/* §4RZ r6a7: messages handed back, above the composer */
+#restore-tray { display: flex; flex-direction: column; gap: 4px; margin: 0 0 6px; max-height: 30vh; overflow-y: auto; }
+#restore-tray.hidden { display: none; }
+#restore-tray .restore-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+    border: 1px dashed currentColor; border-radius: 8px; opacity: 0.85; font-size: 0.9em; }
+#restore-tray .restore-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+#restore-tray button { background: none; border: 1px solid currentColor; border-radius: 6px;
+    color: inherit; padding: 2px 8px; cursor: pointer; font: inherit; }
+#restore-tray .restore-warn { font-size: 0.85em; opacity: 0.8; }
+/* §4SB: the tray's live status line — read by screen readers, not seen */
+#restore-status { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }

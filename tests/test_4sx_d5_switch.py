@@ -69,7 +69,7 @@ async def test_the_registry_dispatches_run_and_the_aliases_with_the_context(monk
     monkeypatch.setattr(REG, "jobs_alias", await fake("jobs"))
     ctx = SimpleNamespace(args=SimpleNamespace(), sandbox_manager=None, memory_dir=None, llm_client=None,
                           scratchpad=None, profile_memory=None, memory_system=None, tor_proxy=None,
-                          current_project_id=None, scheduler=None, skill_memory=None)
+                          current_project_id=None, scheduler=None)
     tools = REG.get_available_tools(ctx)
     await tools["run"](action="status")
     await tools["manage_services"](action="status")
@@ -113,8 +113,7 @@ def test_the_sets_hold_run_by_meaning():
     from ghost_agent.core.strikes import READWRITE_LOOP_TOOLS
     from ghost_agent.core.task_state import EVIDENCE_TOOLS as TS_EVIDENCE
     from ghost_agent.memory.egress import CODE_TOOLS, OUTBOUND_TOOLS
-    from ghost_agent.tools.composed_skills import MACRO_FORBIDDEN_STEP_TOOLS
-    assert "run" in REPLAY_FORBIDDEN_TOOLS and "run" in MACRO_FORBIDDEN_STEP_TOOLS
+    assert "run" in REPLAY_FORBIDDEN_TOOLS       # (the macro-step deny list went with the macro engine, §4TA)
     assert OUTBOUND_TOOLS["run"] == "url_literals" and "run" in CODE_TOOLS
     assert "run" in SOURCE_EXCLUDED_TOOLS and "run" in EVIDENCE_TOOLS and "run" in TS_EVIDENCE
     assert "run" in READWRITE_LOOP_TOOLS
@@ -306,7 +305,7 @@ async def test_execute_gets_the_context_to_record_the_run(tmp_path, monkeypatch)
     ctx = SimpleNamespace(args=SimpleNamespace(labs_host="", labs_key_file=""), sandbox_manager=None,
                           memory_dir=tmp_path, llm_client=None, scratchpad=None, profile_memory=None,
                           memory_system=None, tor_proxy=None, current_project_id=None, scheduler=None,
-                          skill_memory=None, sandbox_dir=tmp_path)
+                          sandbox_dir=tmp_path)
     tools = REG.get_available_tools(ctx)
     await tools["execute"](command="echo hi")
     assert seen.get("run_context") is ctx

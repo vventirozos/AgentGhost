@@ -48,12 +48,15 @@ def test_wakeup_prefix_with_recent_experiences(tmp_path: Path):
 
 def test_wakeup_prefix_with_state(tmp_path: Path):
     state = SelfStateThread(tmp_path)
-    state.note_open_question("How do I really know I exist?")
-    state.add_unfinished("write the essay on consciousness")
+    from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+    state.set_owner_mood("calm", ANCHOR_DIRECTION["calm"], 2, note="thinking about the consciousness essay")
+    state.touch_session()
 
     text = build_wakeup_prefix(autobio=None, state=state, narrative=None)
-    assert "How do I really know I exist?" in text
-    assert "consciousness" in text
+    assert "My mood: calm, 2 of 3." in text and "I was last active" in text
+    # §4TC: the line is the label and its intensity — the cause and the owner's
+    # note are read through `introspect(action="mood")`, not carried here
+    assert "consciousness" not in text
 
 
 def test_wakeup_prefix_truncates_to_cap(tmp_path: Path):
@@ -100,8 +103,8 @@ def test_wakeup_prefix_combines_all_three(tmp_path: Path):
     autobio = AutobiographicalMemory(tmp_path / "auto")
     autobio.append(Experience(summary="I solved a puzzle.", outcome="passed"))
     state = SelfStateThread(tmp_path / "state")
-    state.note_open_question("Why does this keep working?")
-    state.set_mood("curious")
+    from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+    state.set_owner_mood("curious", ANCHOR_DIRECTION["curious"], 2)
     narrative = "I have been doing puzzles. They feel like training."
 
     text = build_wakeup_prefix(
@@ -109,7 +112,6 @@ def test_wakeup_prefix_combines_all_three(tmp_path: Path):
         recent_experiences_n=3,
     )
     assert "puzzle" in text
-    assert "Why does this keep working?" in text
     assert "curious" in text
     assert "training" in text
     # All three sections present, separated cleanly

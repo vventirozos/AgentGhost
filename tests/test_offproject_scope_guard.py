@@ -127,7 +127,7 @@ async def test_dispatch_steers_once_on_root_write():
             msg={"role": "assistant", "content": ""}, ui_content="",
             parse_failure_reason="", model="test-model",
             last_user_content="do the thing", char_budget=4000,
-            strikes=StrikeLedger(), task_tree=MagicMock(),
+            strikes=StrikeLedger(),
             _user_batch_intent=None, _request_constraints=[],
             repeated_action_steered=set(), messages=[], seen_tools=set(),
             executed_idempotent=set(), raw_tools_called=set(), tool_usage={},

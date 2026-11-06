@@ -41,11 +41,9 @@ class TestConditionalBuiltinsAreStatic:
     def test_constant_matches_live_derivation(self, monkeypatch):
         # Ground truth: the names get_active_tool_definitions itself appends
         # beyond TOOL_DEFINITIONS, with every conditional gate enabled and the
-        # runtime (macro/skill) sources disabled. If a future built-in is
+        # runtime (acquired-skill) source disabled. If a future built-in is
         # advertised conditionally but not added to the constant, this fails.
         import ghost_agent.tools.registry as reg
-        monkeypatch.setattr(reg, "register_composed_skills",
-                            lambda *a, **k: None)
         ctx = MagicMock()
         ctx.sandbox_dir = None       # disables acquired-skill advertising
         ctx.memory_system = None

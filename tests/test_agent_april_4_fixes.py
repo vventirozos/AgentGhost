@@ -13,7 +13,6 @@ async def test_agent_think_tag_stripping():
     mock_context.args.max_context = 4000
     mock_context.args.temperature = 0.5
     mock_context.profile_memory = None
-    mock_context.skill_memory = None
     mock_context.graph_memory = None
     mock_context.memory_system = None
     mock_context.args.smart_memory = 0.0
@@ -52,7 +51,6 @@ async def test_agent_payload_penalties():
     mock_context.args.max_context = 4000
     mock_context.args.temperature = 0.5
     mock_context.profile_memory = None
-    mock_context.skill_memory = None
     mock_context.graph_memory = None
     mock_context.memory_system = None
     mock_context.args.smart_memory = 0.0

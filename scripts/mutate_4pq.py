@@ -16,11 +16,8 @@ MUT = [
     ("Q2 outcome dropped", AG, "        parts.append(text + (f\": {outcome}\" if outcome else \"\"))", "        parts.append(text)"),
     ("Q3 failure reads as its last outcome", AG, "                   if failed else note)", "                   if False else note)"),
     ("Q4 tidy outcome never set", AG, "                        _idle_notes[\"tidy\"] = (", "                        _unused = ("),
-    ("Q5 orphan count not captured", AG, "                            _hy_orph = await asyncio.to_thread(\n                                _sk.reconcile_vector_orphans, _ms)", "                            await asyncio.to_thread(\n                                _sk.reconcile_vector_orphans, _ms)"),
     ("Q6 hygiene note never set", AG, "                    _idle_notes[\"store-hygiene\"] = _store_hygiene_note(", "                    _unused = _store_hygiene_note("),
     ("Q7 failures alone read as nothing to fix", AG, "        return \"; \".join(bad) if bad else \"nothing to fix\"", "        return \"nothing to fix\""),
-    ("Q8 mocked counts reported as work", AG, "    o = orphans if isinstance(orphans, int) else 0", "    o = int(orphans or 0)"),
-    ("Q9 window line lost its reason", AG, "                f\"the failure-replay slot last ran {_fr_ago / 60.0:.0f}m ago and waits ~{_fr_next / 60.0:.0f}m more, \"", "                \"failure replay cooling down; \""),
     ("Q10 failed backup reads quiet", DR, "    idle = not (d or f or snap or rec or graph_ran == \"failed\"", "    idle = not (d or f or rec or graph_ran == \"failed\""),
     ("Q11 graph not-due reads as cleaned", DR, "    elif graph_ran:\n        graph = (", "    elif True:\n        graph = ("),
     ("Q12 backup name dropped", DR, "        backup = \"store backup taken (\" + snap.replace(\"snapshot \", \"\", 1) + \")\"", "        backup = \"store backup taken\""),
@@ -37,7 +34,6 @@ MUT = [
     ("Q24 error outcome reads did work", AG, "                                if isinstance(_outcome, dict) and _outcome.get(\"phase\") == \"error\"   # r2 m2", "                                if False"),
     ("Q25 skipped tidy counted as checked", AG, "                            if _tst.startswith(\"skipped\") and _tst != \"skipped: no project dir\":", "                            if False:"),
     ("Q26 no project dir counted as a fault", AG, "                            if _tst.startswith(\"skipped\") and _tst != \"skipped: no project dir\":", "                            if _tst.startswith(\"skipped\"):"),
-    ("Q15 failure-replay outcome lost", AG, "            if _slot_note:\n                _idle_notes[\"failure-replay\"] = _slot_note", "            if False:\n                _idle_notes[\"failure-replay\"] = _slot_note"),
 ]
 _H["MUT"][:] = MUT
 _H["PINS"][:] = ["tests/test_4pq_idle_lines.py", "tests/test_4nm_batch5.py", "tests/test_bio_r1_fixes.py",

@@ -115,7 +115,8 @@ class EvalContext:
                     # generic sniffer for `execute` too and missed 61 REJECTED
                     # refusals (46 file_system "None of the SEARCH/REPLACE
                     # blocks matched", 7 manage_services, 4 postgres_admin,
-                    # 4 manage_composed_skills SYSTEM BLOCK).
+                    # 4 manage_composed_skills SYSTEM BLOCK — a tool
+                    # removed since, §4TA).
                     from ..core.agent import _action_failed
                     errs = sum(1 for t in tcs
                                if t.get("error")

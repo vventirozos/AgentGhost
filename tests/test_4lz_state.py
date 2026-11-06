@@ -12,15 +12,6 @@ import pytest
 
 # ── C1: a damaged store is set aside, never overwritten by the next save ──
 
-def test_a_damaged_macro_store_survives_the_next_save(tmp_path):
-    from ghost_agent.tools.composed_skills import ComposedSkillRegistry
-    f = tmp_path / "composed_skills.json"
-    f.write_text('{"m1": {"name": "m1", "steps": []')          # truncated
-    reg = ComposedSkillRegistry(tmp_path)
-    reg.save()
-    kept = list(tmp_path.glob("composed_skills.json.corrupt-*"))
-    assert kept and kept[0].read_text().startswith('{"m1"')
-
 
 def test_a_damaged_skill_registry_survives_the_next_save(tmp_path):
     from ghost_agent.tools.acquired_skills import AcquiredSkillManager

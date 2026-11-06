@@ -91,11 +91,6 @@ class TestEveryMigratedReader:
         assert _acquired_skill_result_class(
             "--- EXECUTION RESULT ---\nEXIT CODE: 124\nSTDOUT/STDERR:\n") == "infra"
 
-    def test_composed_skills_step_result_ok(self):
-        from ghost_agent.tools.composed_skills import _step_result_ok
-        assert _step_result_ok(QUOTED) is True
-        assert _step_result_ok(GENUINE_FAIL) is False
-        assert _step_result_ok(GENUINE_OK) is True
 
     def test_corpus_reader_with_a_real_toolcall(self):
         """The production input type of the learners' reader."""

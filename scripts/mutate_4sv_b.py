@@ -49,8 +49,8 @@ MUT = [
     ("I9 cap-back", IN, "_OVERVIEW_MAX_CHARS = 3720", "_OVERVIEW_MAX_CHARS = 3200"),
     ("I5 reader-raises", IN, '        logger.debug("introspect self-image read skipped: %s", e)\n        return ""', "        raise"),
     ("I6 indent-lost", IN, '        return indent + line if line else ""', '        return line if line else ""'),
-    ("I7 line-after-carried", IN, '        image = _self_image(context, indent="  ")\n        if image:\n            lines.append(image)\n        carried = _render_carried_state(self_model, indent="  ")\n        lines.append(carried if carried else\n                     "  nothing carried over: no open questions or "\n                     "unfinished threads")\n',
-     '        carried = _render_carried_state(self_model, indent="  ")\n        lines.append(carried if carried else\n                     "  nothing carried over: no open questions or "\n                     "unfinished threads")\n        image = _self_image(context, indent="  ")\n        if image:\n            lines.append(image)\n'),
+    # (I7 "line-after-carried" — the self-image line placed after the carried-state lines — is removed:
+    # §4TB took the carried-state lines out of the overview with open questions and unfinished threads.)
 ]
 PINS = ["tests/test_4sv_mirror.py"]
 

@@ -252,8 +252,8 @@ def test_UNKNOWN_denominator_withholds_SIM_GATED_alarms_only(tmp_path,
 
 def test_turn_origin_agrees_with_the_SIMULATION_GATE_it_borrows_from():
     """⚠ THE SEAM. The stamp is only worth counting if it splits the same
-    population the ledgers' own gates split. Both read `skill_memory
-    .is_read_only`; a second, private notion of "real traffic" is what let the
+    population the ledgers' own gates split. Both read the `simulated` mark
+    (`is_simulated_context`, §4TD); a second, private notion of "real traffic" is what let the
     denominator and the ledgers disagree for a day.
 
     ⚠ `is True` is load-bearing and this pins it: a MagicMock context (which
@@ -264,19 +264,14 @@ def test_turn_origin_agrees_with_the_SIMULATION_GATE_it_borrows_from():
     from unittest.mock import MagicMock
     from ghost_agent.core.agent import turn_origin
 
-    class _RO:
-        is_read_only = True
-
     class _Ctx:
-        skill_memory = None
+        simulated = False
 
-    sim = _Ctx(); sim.skill_memory = _RO()
+    sim = _Ctx(); sim.simulated = True
     assert turn_origin(sim) == "sim"
 
-    real = _Ctx(); real.skill_memory = object()      # no attribute at all
-    assert turn_origin(real) == "user"
-
-    assert turn_origin(_Ctx()) == "user", "a context without a skill store"
+    assert turn_origin(_Ctx()) == "user"
+    assert turn_origin(object()) == "user", "a context with no marker at all"
     assert turn_origin(MagicMock()) == "user", (
         "a MagicMock's truthy attribute must NOT read as a simulation")
 

@@ -23,7 +23,6 @@ from ghost_agent.core.bus import MemoryBus
 from ghost_agent.core.sessions import SessionStore
 from ghost_agent.memory.episodes import EpisodicMemory
 from ghost_agent.memory.graph import GraphMemory
-from ghost_agent.memory.skills import SkillMemory
 from ghost_agent.memory.vector import VectorMemory
 
 
@@ -54,7 +53,7 @@ DISTRACTORS = [
 @pytest.fixture(scope="module")
 def env(tmp_path_factory):
     root = tmp_path_factory.mktemp("recall_eval")
-    for sub in ("vec", "graph", "skill", "epi"):
+    for sub in ("vec", "graph", "epi"):
         (root / sub).mkdir()
     vm = VectorMemory(root / "vec", "http://mock-url")
     for fact, _ in GOLDEN_VECTOR:
@@ -67,13 +66,6 @@ def env(tmp_path_factory):
         {"subject": "vasilis", "predicate": "WORKS_AT", "object": "orbitdata"},
         {"subject": "ghost", "predicate": "RUNS_ON", "object": "port 8000"},
     ])
-
-    sm = SkillMemory(root / "skill")
-    sm.learn_lesson(
-        "deploy fails with EACCES", "retrying the copy blindly",
-        "When a deploy fails with EACCES, verify the publish path ownership first.",
-        memory_system=vm, source="operator_repair",   # §4NC: a module fixture runs before the conftest switch
-    )
 
     epi = EpisodicMemory(root / "epi")
     epi.record_episode(
@@ -92,7 +84,7 @@ def env(tmp_path_factory):
         "We agreed the kubernetes deployment happens friday after the backup.",
     )
 
-    bus = MemoryBus(vector_memory=vm, graph_memory=gm, skill_memory=sm,
+    bus = MemoryBus(vector_memory=vm, graph_memory=gm,
                     episodic_memory=epi, session_store=ss)
     return SimpleNamespace(vm=vm, bus=bus)
 
@@ -147,10 +139,6 @@ class TestVectorTier:
 
 
 class TestHydrationEndToEnd:
-    async def test_skill_tier_surfaces_lesson(self, env):
-        out = await env.bus.hydrate_context("how do I fix a deploy that fails with EACCES")
-        assert "publish path" in out
-
     async def test_off_topic_query_does_not_surface_golden_facts(self, env):
         """The relevance gates must keep unrelated memories out of the
         prompt — injection of everything would also 'pass' hit-rate tests.

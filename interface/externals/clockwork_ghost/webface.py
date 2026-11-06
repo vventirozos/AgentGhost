@@ -283,6 +283,15 @@ class WebFaceWidget(QWidget):
     def set_form(self, name: str):
         self._js(f"window.ghostFace && ghostFace.form({name!r})")
 
+    def set_agent_mood(self, label: str, intensity: int):
+        """The agent's own mood (§4TC), for the mood tesseract's look. Not
+        ``set_mood``, which is this client's working state (think, speak...)."""
+        self._js(f"window.ghostFace && ghostFace.agentMood({label!r}, {int(intensity)})")
+
+    def animations_on_at_start(self) -> bool:
+        """Will the face open with animations on? For the chip's first label."""
+        return facestate.startup_form(FACE_DIR) != "empty"
+
     def cycle_form(self, on_name=None):
         """Advance to the next form and REMEMBER it for the next start.
 

@@ -21,7 +21,6 @@ def mock_agent():
     context.scratchpad = None
     context.profile_memory = None
     context.graph_memory = None
-    context.skill_memory = None
     context.memory_bus = None
     context.sandbox_manager = None
     context.biological_task = None
@@ -144,8 +143,9 @@ async def test_agent_query_expansion_and_bypass(mock_agent):
         # point (2026-07-07). It's still the vector-search call the expanded
         # query flows into, so it remains the marker for this test.
         mock_agent.context.memory_system.search_items = MagicMock(return_value=[])
-        mock_agent.context.skill_memory = MagicMock()
-        mock_agent.context.skill_memory.get_playbook_items = MagicMock(return_value=[])
+        bus = MagicMock()
+        bus.hydrate_context = AsyncMock(return_value="")
+        mock_agent._get_memory_bus = lambda: bus
 
         # Scenario 1: short user text is searched as typed (§4NQ)
         messages = [
@@ -164,15 +164,16 @@ async def test_agent_query_expansion_and_bypass(mock_agent):
                  pass
 
         # Verify that should_fetch_memory fired and expanded the query
-        # §4NM/§4NQ: the user's words reach the lesson fetch
-        mock_agent.context.skill_memory.get_playbook_items.assert_called()
-        called_query = mock_agent.context.skill_memory.get_playbook_items.call_args[0][0]
+        # §4NM/§4NQ: the user's words reach the hydration
+        bus.hydrate_context.assert_awaited()
+        called_query = bus.hydrate_context.await_args.args[0]
 
         # §4NQ: no "Context: … | User intent: …" prefix any more
         assert called_query == "run it then"
 
-        # Scenario 2: Fact-check should skip memory fetch entirely
-        mock_agent.context.skill_memory.get_playbook_items.reset_mock()
+        # Scenario 2: a fact-check message is hydrated like any other
+        # (§4TB r2: the lexical switch that skipped memory for it is removed)
+        bus.hydrate_context.reset_mock()
         messages_fact = [
             {"role": "user", "content": "Please verify and fact-check this claim."}
         ]
@@ -183,4 +184,4 @@ async def test_agent_query_expansion_and_bypass(mock_agent):
             print(f"DEBUG EXCEPTION IN HANDLE_CHAT 2: {repr(e)}")
             pass
             
-        mock_agent.context.skill_memory.get_playbook_items.assert_not_called()
+        bus.hydrate_context.assert_awaited()

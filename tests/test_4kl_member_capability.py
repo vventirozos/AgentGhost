@@ -34,7 +34,7 @@ from tests.test_4jj_search_yield_steer import _agent as _sy_agent, _run_searches
 from tests.test_requester_role import _dispatch_table, _marked_agent, _resp
 
 # Control tools the model uses on itself; they grant the user nothing.
-_CONTROL_TOOLS = {"abort_attempt", "replan"}
+_CONTROL_TOOLS = {"abort_attempt"}
 
 # Each capability the notice DENIES → the tools that would provide it. None of
 # them may be on the allowlist, and each must be a real tool.
@@ -222,7 +222,6 @@ def _loop_agent():
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string.return_value = ""
     context.memory_system = None
-    context.skill_memory = None
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     return GhostAgent(context)
@@ -299,8 +298,6 @@ def test_the_fallback_puts_the_evidence_first_and_the_marker_last():
     assert A._ABORT_MARKER_RE.search(out)            # the corpus still reads the abort
 
 
-
-
 @pytest.mark.parametrize("max_turns,calls,report", [(3, 3, False), (4, 3, False), (5, 4, True)])
 async def test_the_breaker_at_the_real_turn_limit(max_turns, calls, report):
     """No stub for `second_cap_reports`: the breaker must pass it the real
@@ -318,7 +315,6 @@ async def test_the_breaker_at_the_real_turn_limit(max_turns, calls, report):
         assert A.CROSS_TURN_LOOP_MARKER not in final and "Here is what the searches found." in final
     else:
         assert final.index(A.CROSS_TURN_LOOP_MARKER) > 0 and "not a finished answer" in final
-
 
 
 def _search_call():
@@ -413,7 +409,6 @@ async def test_an_allowlisted_tool_refused_for_its_arguments_says_why_and_stays_
     assert "The vision_analysis tool itself is available on this channel" in text
     assert A._MEMBER_TOOL_BLOCK in text                       # the unlisted tool keeps the plain block
     assert called.await_count == 0
-
 
 
 # ── round 3: the predicate against the parser, the reset, member strikes ──
@@ -538,7 +533,6 @@ def test_the_loop_fallback_is_refuted_as_a_loop_not_a_budget():
     assert "text-only fallback" in refute_no_answer_fallback(FALLBACK_HEADS["text_only"] + " x")[0]
 
 
-
 def test_a_failing_plan_check_is_not_an_answer(monkeypatch):
     import ghost_agent.core.reply_smoothing as RS
 
@@ -570,7 +564,6 @@ async def test_narration_that_echoes_the_request_is_not_waved_through():
             {"messages": [{"role": "user", "content": "what happened to lot 4217 at the auction"}]}, FakeBgTasks())
     assert len(payloads) == 4 and payloads[3].get("tool_choice") == "none"   # the breaker acted
     assert "REPORT" in final
-
 
 
 def _member_script(agent, ctx, turns):
@@ -686,19 +679,6 @@ async def test_an_empty_batch_leaves_the_refusal_count_alone(monkeypatch, member
     ts = _sy_ts([], strikes, set())
     await agent._dispatch_and_process_tool_batch(ts)
     assert strikes.member_refused_batches == 2
-
-
-async def test_an_owners_refused_learn_skill_is_not_a_member_refusal(monkeypatch):
-    """A probe (or any non-teaching owner turn) refuses learn_skill too; only a
-    member's refusal counts toward the member limit."""
-    agent = _sy_agent()
-    agent.available_tools = {"learn_skill": AsyncMock()}
-    monkeypatch.setattr(A, "turn_may_teach", lambda ctx: False)
-    ts = _sy_ts([("learn_skill", {"task": "t", "mistake": "m", "solution": "s"})], StrikeLedger(), set())
-    await agent._dispatch_and_process_tool_batch(ts)
-    rows = [r for r in ts.tools_run_this_turn if r.get("_synthetic")]
-    assert rows and not any(r.get("_member_refused") for r in rows)
-    assert ts.strikes.member_refused_batches == 0
 
 
 async def test_a_members_parse_error_takes_the_parse_error_branch(monkeypatch, member_role):

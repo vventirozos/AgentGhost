@@ -300,18 +300,11 @@ async def test_the_role_does_not_leak_into_the_next_request(monkeypatch, tmp_pat
     assert requester_is_member() is False
 
 
-def test_the_playbook_writer_backstop_blocks_a_member():
-    from ghost_agent.memory.skills import playbook_writes_blocked
+def test_a_member_turn_may_not_teach():
     from ghost_agent.core.agent import turn_may_teach
     t1 = requester_role_context.set("member"); t2 = request_id_context.set("web-1")
     try:
-        assert playbook_writes_blocked() is True
         assert turn_may_teach(MagicMock()) is False
-    finally:
-        request_id_context.reset(t2); requester_role_context.reset(t1)
-    t1 = requester_role_context.set("owner"); t2 = request_id_context.set("web-1")
-    try:
-        assert playbook_writes_blocked() is False
     finally:
         request_id_context.reset(t2); requester_role_context.reset(t1)
 
@@ -600,16 +593,10 @@ async def test_a_member_turn_hydrates_no_owner_memory_and_no_playbook(monkeypatc
     agent, ctx, appended = _agent(monkeypatch, tmp_path)
     bus = MagicMock(); bus.hydrate_context = AsyncMock(return_value="RECALLED: the owner is Vasilis")
     monkeypatch.setattr(agent, "_get_memory_bus", lambda: bus)
-    playbook_calls = []
-    from ghost_agent.core.agent import GhostAgent as _G
-    async def _pb(self, q):
-        playbook_calls.append(q); return "LESSON: something about the owner"
-    monkeypatch.setattr(_G._RequestState, "get_skill_playbook", _pb)
     ctx.llm_client.chat_completion = AsyncMock(side_effect=[_resp("I don't know your name."), _resp("(unreachable)")])
     await agent.handle_chat({"messages": [{"role": "user", "content": "check my name and tell me"}]},
                             FakeBgTasks(), request_id="web-2", requester_role="member")
     bus.hydrate_context.assert_not_awaited()
-    assert playbook_calls == []
     sys_prompt = await _system_prompt(ctx)
     assert "Vasilis" not in sys_prompt
     # control: the owner hydrates
@@ -625,7 +612,7 @@ async def test_the_role_rides_the_trajectory(monkeypatch, tmp_path):
     """The idle phases refuse a member's turn as a lesson source by the role
     recorded on the trajectory (`extra["requester_role"]`), never by how the
     request id is spelled."""
-    from ghost_agent.memory.skills import trajectory_may_teach
+    from ghost_agent.memory.population import trajectory_may_teach
     agent, ctx, _ = _agent(monkeypatch, tmp_path)
     await agent.handle_chat({"messages": [{"role": "user", "content": "check who you are and tell me"}]},
                             FakeBgTasks(), request_id="slack-42424242", requester_role="member")
@@ -650,15 +637,10 @@ def _marked_agent(monkeypatch, tmp_path):
     ctx.scratchpad = sp
     bus = MagicMock(); bus.hydrate_context = AsyncMock(return_value="MARK-RECALL the owner is Vasilis")
     monkeypatch.setattr(agent, "_get_memory_bus", lambda: bus)
-    from ghost_agent.core.agent import GhostAgent as _G
-
-    async def _pb(self, q):
-        return "MARK-PLAYBOOK owner lesson"
-    monkeypatch.setattr(_G._RequestState, "get_skill_playbook", _pb)
     return agent, ctx, bus
 
 
-MARKERS = ("MARK-PROFILE", "MARK-SCRATCH", "MARK-RECALL", "MARK-PLAYBOOK")
+MARKERS = ("MARK-PROFILE", "MARK-SCRATCH", "MARK-RECALL")
 # (§4NM took the competence block out of prompts; §4PJ removed the profile.)
 
 
@@ -700,7 +682,7 @@ async def test_no_header_behaves_identically_on_any_request_id(monkeypatch, tmp_
     with NO role under a `slack-` id and under a plain id has the same
     observables — profile in the prompt, recall hydrated, a walled tool
     reached, a smart-memory row, a teachable trajectory."""
-    from ghost_agent.memory.skills import trajectory_may_teach
+    from ghost_agent.memory.population import trajectory_may_teach
     seen = []
     for rid in ("slack-abcdef01", "abcdef02"):
         agent, ctx, bus = _marked_agent(monkeypatch, tmp_path / rid)
@@ -1296,7 +1278,7 @@ def _traj_pair():
     return [Trajectory(session_id="m", extra={"requester_role": "member"}), Trajectory(session_id="o")]
 
 
-@pytest.mark.parametrize("wrapper", ["memory.skills.iter_teachable"])    # §4NM: the PRM/self-play retrain wrappers are gone
+@pytest.mark.parametrize("wrapper", ["memory.population.iter_teachable"])    # §4NM: the PRM/self-play retrain wrappers are gone
 def test_the_training_read_wrappers_drop_member_turns(wrapper):
     import importlib
     mod, fn = wrapper.rsplit(".", 1)

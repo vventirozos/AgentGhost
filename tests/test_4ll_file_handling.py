@@ -232,25 +232,6 @@ def test_an_empty_marker_file_can_be_written(tmp_path, name):
     assert "MANDATORY" in str(_fs(operation="write", sandbox_dir=tmp_path, path="app.py", content=""))
 
 
-# ── what file failures teach ─────────────────────────────────────────────────
-@pytest.mark.parametrize("fix,refused", [
-    ("Call `git(operation=write, path=\"config\")` to set the remote.", True),
-    ("Use file_system(operation=\"batch\") to change several files.", True),
-    ("Use file_system(operation='edit', old_string=…, new_string=…) for a part of a file.", False),
-])
-def test_a_lesson_that_prescribes_a_tool_that_does_not_exist_is_refused(tmp_path, fix, refused):
-    """Fails where the reflection on the §4KB checks saved "call git(…)" after
-    the git tool was removed — nothing compared lessons with the registry.
-    (§4NM: written as the live writer, learn_skill.)"""
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("When configuring the repository remote", "it used the wrong tool for the job", fix, None,
-                    trigger="When configuring the repository remote", source="learn_skill", origin="user")
-    rows = json.loads(sm.file_path.read_text()) if sm.file_path.exists() else []
-    assert (len(rows) == 0) is refused
-
-
-
 def test_a_non_empty_replacement_wins_over_an_empty_alias(tmp_path):
     (tmp_path / "f.py").write_text("X = 1\nY = 2\n")
     _fs(operation="replace", sandbox_dir=tmp_path, path="f.py", content="Y = 2", replace_with="", new_string="Y = 42")
@@ -272,12 +253,3 @@ def test_the_sandboxs_own_path_in_another_case_is_not_the_users_machine(tmp_path
     assert _host_path_block(tmp_path, p.upper()) is None
 
 
-@pytest.mark.parametrize("text", [
-    "Check the page with vision_analysis(action='verify_ui', image='shot.png').",
-    "Do NOT call git(operation='commit') — run git through execute.",
-    "In the page script, page.evaluate(action='scroll') runs in the browser.",
-    "Use file_system(operation='list') to see the folder.",
-])
-def test_lessons_that_call_real_tools_or_warn_are_kept(text):
-    from ghost_agent.memory.lesson_quality import unknown_tool_calls
-    assert unknown_tool_calls(text) == []

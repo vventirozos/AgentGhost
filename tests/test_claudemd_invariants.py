@@ -55,7 +55,7 @@ class TestCooldownConstants:
 
     def test_cooldown_constants_are_all_positive(self):
         from ghost_agent.core.agent import GhostAgent
-        for attr in ("_DREAM_COOLDOWN", "_SELFPLAY_COOLDOWN"):
+        for attr in ("_DREAM_COOLDOWN",):          # §4SZ: the self-play slot and its cooldown are gone
             v = getattr(GhostAgent, attr)
             assert isinstance(v, int)
             assert v > 0, f"{attr} must be positive seconds"
@@ -296,24 +296,6 @@ class TestVerifierAPI:
 # SkillMemory provenance + retraction
 # ──────────────────────────────────────────────────────────────────────
 
-class TestSkillMemoryProvenanceAPI:
-    """CLAUDE.md: 'SkillMemory lessons carry source_trajectory_id
-    provenance ... retract_lessons_from_trajectory("") returns 0 to
-    prevent legacy bulk-scrub.'"""
-
-    def test_retract_with_empty_string_id_returns_zero(self, tmp_path):
-        from ghost_agent.memory.skills import SkillMemory
-        sm = SkillMemory(tmp_path)
-        # Empty string is the protected sentinel — must not scrub everything
-        assert sm.retract_lessons_from_trajectory("") == 0
-
-    def test_retract_signature_has_memory_system_kwarg(self):
-        from ghost_agent.memory.skills import SkillMemory
-        sig = inspect.signature(SkillMemory.retract_lessons_from_trajectory)
-        assert "memory_system" in sig.parameters, (
-            "memory_system kwarg required for vector-store delete pass"
-        )
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Self-play intent guard
@@ -322,9 +304,6 @@ class TestSkillMemoryProvenanceAPI:
 class TestSelfPlayIntentGuard:
     """CLAUDE.md: 'Self-play tool has an intent guard
     (`tools/memory.py::_user_asked_for_self_play`).'"""
-
-
-
 
 
 # ──────────────────────────────────────────────────────────────────────

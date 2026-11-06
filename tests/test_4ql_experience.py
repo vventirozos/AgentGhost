@@ -151,7 +151,7 @@ def test_review_r1_public_turns_precedence_followups_and_system_commands(store):
     census_vs_thumb = _traj("t-ct", "i have written the following plan for a migration, review it", req_id="r-ct")
     follow = _traj("t-fu", "is there a way to run it on a mac?", reply="Yes — the Bloodborne port runs on macOS via Crossover.",
                    tools=[_browser("https://example.org/port")]); follow["extra"]["conv_user_turns"] = 3
-    cmd = _traj("t-cmd", "show me all proposed rules", reply="Candidate rule 4 (proposed): …")
+    cmd = _traj("t-cmd", "show my rules", reply="Your rules (2 of at most 10; …")
     labels = {"t-pub": ("RIGHT", "gold", ""), "t-ct": ("RIGHT", "thumb", ""), "req:r-ct": ("WRONG", "census", "its critical fix inverts correct practice"),
               "t-fu": ("RIGHT", "gold", ""), "t-cmd": ("RIGHT", "gold", "")}
     store.sync([pub, census_vs_thumb, follow, cmd], labels)
@@ -417,7 +417,6 @@ def test_fan_out_includes_the_tier_and_the_block_renders_under_its_header(monkey
     monkeypatch.setenv(X.ENV_FLAG, "1")
     line = "- 2026-10-10, asked \"what is the latest version of postgresql ?\" — graded RIGHT. It worked by: browser(postgresql.org)."
     bus = _bus([line])
-    bus.skill = None
     tiers = asyncio.run(bus._fetch_all_tiers("what is the latest version of postgresql ?",
                                              scope_request="what is the latest version of postgresql ?"))
     assert [{"source": "experience", "text": line}] in tiers
@@ -513,7 +512,7 @@ def test_store_maintenance_syncs_the_index(monkeypatch):
     from ghost_agent.core import dream
     called = {}
     monkeypatch.setattr(dream, "sync_experience_index", lambda ctx: called.setdefault("ctx", ctx) and {"added": 2, "updated": 0, "removed": 0})
-    ctx = SimpleNamespace(memory_dir="/nonexistent", skill_memory=None, graph_memory=None, memory_system=None,
+    ctx = SimpleNamespace(memory_dir="/nonexistent", graph_memory=None, memory_system=None,
                           experience_memory=object())
     d = dream.Dreamer(ctx)
     monkeypatch.setattr(d, "_compress_graph_nodes", MagicMock(return_value=0))

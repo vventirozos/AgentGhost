@@ -54,7 +54,6 @@ def _make_ts(**over):
         last_user_content="do the thing",
         char_budget=4000,
         strikes=MagicMock(),
-        task_tree=MagicMock(),
         _user_batch_intent=None,
         _request_constraints=[],
         repeated_action_steered=False,

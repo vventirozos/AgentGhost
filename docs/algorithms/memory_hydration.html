@@ -17,7 +17,7 @@
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a class="current" href="memory_hydration.html">Memory hydration (RRF)</a>
-    <a href="dream_cycle.html">Maintenance &amp; failure replay</a>
+    <a href="dream_cycle.html">Maintenance cycle</a>
     <a href="skill_acquisition.html">Skill acquisition</a>
     <a href="circuit_breaker.html">Circuit breaker</a>
     <a href="selfhood.html">Selfhood (unified self)</a>
@@ -28,7 +28,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>Memory hydration with Reciprocal Rank Fusion</h1>
-  <p class="subtitle">How a query becomes a sectioned markdown injection. In production two sources still feed the prompt: the owner's facts (graph, by kind) and the skill tier (owner rules; auto lessons are off, <code>GHOST_AUTO_LESSONS=0</code>). The vector, episodic and session tiers were retired from hydration on 2026-10-11 (&sect;4NM); those stores answer only through <code>recall</code>.</p>
+  <p class="subtitle">How a query becomes a sectioned markdown injection. In production three sources feed the prompt: the owner's facts (graph, by kind), experience and history. The owner's rules are their own file and their own <code>### OWNER RULES</code> block, outside hydration. The skill tier was removed with the lesson store on 2026-11-06 (&sect;4TD); the vector, episodic and session tiers were retired from hydration on 2026-10-11 (&sect;4NM) and those stores answer only through <code>recall</code>.</p>
 
   <h2>RRF formula</h2>
   <pre><code>combined_score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)
@@ -38,14 +38,14 @@ k = 10  (MemoryBus._RRF_K on the hydration path; 60 is only the classmethod defa
   <h2>Intent weights</h2>
   <p>The bus first classifies the query as <em>factual</em>, <em>procedural</em>, or <em>contextual</em> with a keyword classifier (<code>MemoryBus._classify_query_intent</code>, no LLM call), on the user's own words (<code>raw_user_text</code>), not an expanded follow-up. Since §4MJ it tokenises on letters, reads "how" as procedural only in "how to/do/can/should/would", as factual in "how old/many/much/long/far", and not at all in a greeting ("how are you"), and ignores "should".</p>
   <div class="scroll"><table>
-    <thead><tr><th>Intent</th><th>graph (owner facts)</th><th>skill (lessons)</th></tr></thead>
+    <thead><tr><th>Intent</th><th>graph (owner facts)</th><th>experience</th><th>history</th></tr></thead>
     <tbody>
-      <tr><td>factual</td><td>2.0</td><td>0.5</td></tr>
-      <tr><td>procedural</td><td>0.5</td><td>2.0</td></tr>
-      <tr><td>contextual</td><td>1.0</td><td>1.0</td></tr>
+      <tr><td>factual</td><td>2.03</td><td>1.0</td><td>1.0</td></tr>
+      <tr><td>procedural</td><td>0.464</td><td>1.0</td><td>1.0</td></tr>
+      <tr><td>contextual</td><td>0.927</td><td>1.0</td><td>1.0</td></tr>
     </tbody>
   </table></div>
-  <p><code>MemoryBus._INTENT_WEIGHTS</code> is hand-tuned and is the only table; it lists only the two sources that still feed a prompt (a source not listed fuses at weight 1.0). The vector, episodic and session columns left with those tiers (§4NM); the learned weights that used to override the table were removed on 2026-10-11 (§4NN — see below).</p>
+  <p><code>MemoryBus._INTENT_WEIGHTS</code> is hand-tuned and is the only table; it lists the three sources that feed a prompt (a source not listed fuses at weight 1.0). The vector, episodic and session columns left with those tiers (§4NM), the skill column with the lesson store (§4TD); the learned weights that used to override the table were removed on 2026-10-11 (§4NN — see below).</p>
 
   <h2>Global budget &amp; fused-score ordering</h2>
   <p>Final markdown is capped at <code>max_chars</code>: production passes <code>context_budget=4000</code>, scaled to 8000 / 12000 for 16+ / 31+ words of the USER's message (§4MJ: not the expanded query). <strong>The fused RRF ranking now drives inclusion and order.</strong> Items are emitted in <em>descending fused score</em> (interleaved across sources) under a single global budget — source headers are emitted lazily on first sight so a tier's items still cluster under its header. The earlier fixed per-section budget map (<code>_SECTION_BUDGETS</code>, graph 25 % / vector 40 % / skill 20 % / episodic 15 %) was removed: it re-grouped items by source and silently discarded the fused score / intent weights, making them cosmetic.</p>
@@ -59,10 +59,10 @@ k = 10  (MemoryBus._RRF_K on the hydration path; 60 is only the classmethod defa
   <h2>Step-by-step</h2>
   <ol>
     <li><strong>Split</strong> the user's message only where it lists topics with "and also" / "as well as" (no model call). <span class="tag">2026-10-11 &sect;4NQ</span> The Nova rewrite of short follow-ups and the Nova decomposition into 2-3 sub-queries were removed: replayed on 284 real owner turns, the rewrite changed what was retrieved on 16 of 166 and mostly for the worse (it turned "what is my dogs name ?" into a third-person query that no longer found the owner's fact), and the decomposition changed 20 of 118, mostly by adding off-topic lessons — each for 1-2 s before the first token. Retrieval now runs on the message as typed; the conversation history still reaches the main model.</li>
-    <li><strong>Fan-out</strong>: <code>asyncio.gather</code> hits each available memory tier with each sub-query. The vector, topical graph, episodic and session tiers were removed from hydration on 2026-10-11 (§4NM — they had been switched off since §4MJ/§4NC/§4NG and measured 0 items / 20% / 15% relevant). Skill (lessons and owner rules) and the owner-facts lookup stay on; the other stores answer through <code>recall</code> on request.</li>
+    <li><strong>Fan-out</strong>: <code>asyncio.gather</code> hits each available memory tier with each sub-query. The vector, topical graph, episodic and session tiers were removed from hydration on 2026-10-11 (§4NM — they had been switched off since §4MJ/§4NC/§4NG and measured 0 items / 20% / 15% relevant). The lesson tier went on 2026-11-06 (§4TD). The owner-facts lookup stays on, experience and history behind their switches; the other stores answer through <code>recall</code> on request.</li>
     <li><strong>Per-source ranking</strong>: each tier returns its own ordered list (owner-fact lookup by kind for graph; BM25-augmented vector for skills). The vector and episode rankers left with their tiers (&sect;4NM).</li>
     <li><strong>Fuse</strong>: RRF scores each candidate across rankers; intent weights bias the sum.</li>
-    <li><strong>Format</strong>: sections grouped by source, in first-acceptance order: <code>### TOPOLOGICAL KNOWLEDGE GRAPH:</code>, <code>### MEMORY CONTEXT:</code>, <code>### SKILL PLAYBOOK (…)</code>. (<code>### PAST EPISODES</code> / <code>### PAST CONVERSATIONS</code> belonged to the tiers removed in &sect;4NM and no longer appear.)</li>
+    <li><strong>Format</strong>: sections grouped by source, in first-acceptance order: <code>### TOPOLOGICAL KNOWLEDGE GRAPH:</code>, <code>### MEMORY CONTEXT:</code>. (<code>### SKILL PLAYBOOK</code> went with the lesson store, §4TD; <code>### PAST EPISODES</code> / <code>### PAST CONVERSATIONS</code> belonged to the tiers removed in &sect;4NM and no longer appear.)</li>
     <li><strong>Inject</strong>: NOT into the system prompt — the block rides the per-turn injection wrapped in <code>&lt;session_context&gt;</code>; with <code>GHOST_PIN_TOOL_SCHEMAS=1</code> (live) it is pinned to the conversation's first user message so the cached prefix stays byte-stable.</li>
   </ol>
 

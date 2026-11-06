@@ -21,8 +21,6 @@ def agent():
     
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None
@@ -32,17 +30,6 @@ def agent():
     
     agent_inst = GhostAgent(ctx)
     return agent_inst
-
-@pytest.mark.asyncio
-async def test_replan_tool_is_async():
-    """Verifies that the replan tool in the registry is correctly wrapped in an async function."""
-    tools = get_available_tools(MagicMock())
-    replan_func = tools.get("replan")
-    
-    assert replan_func is not None
-    result = await replan_func(reason="test strategy reset")
-    assert "Strategy Reset Triggered" in result
-    assert "test strategy reset" in result
 
 @pytest.mark.asyncio
 async def test_tool_anonymity_translation(agent):

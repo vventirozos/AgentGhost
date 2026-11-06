@@ -82,10 +82,9 @@ def test_services_key_half_is_safe_and_per_conversation():
     assert R.services_key_half("") is None and R.services_key_half("project:../x") is None
 
 
-@pytest.mark.parametrize("origin", ["member", "replay"])
-async def test_members_and_replays_are_refused(tmp_path, scope, origin):
+async def test_a_member_is_refused(tmp_path, scope):
     c = _ctx(tmp_path)
-    scope(c, origin)
+    scope(c, "member")
     r = await R.tool_run(c, action="status")
     assert r.status is OutcomeStatus.REJECTED and r.reason_code == "run_not_allowed"
 

@@ -96,7 +96,17 @@ class TestRouter:
         assert self._route(w, _running(TurnRegistry())) == qm.PATH_INJECT
 
     def test_rule_command_waits_for_its_own_request(self):
-        assert self._route("list proposed rules", _running(TurnRegistry())) == qm.PATH_QUEUE
+        """Injected into a running turn the model would read it as chat; queued, the system answers it."""
+        for w in ("show my rules", "forget rule 3", "learn this rule: answer in English", "mirror"):
+            assert self._route(w, _running(TurnRegistry())) == qm.PATH_QUEUE, w
+        assert qm.route("forget rule 3", _running(TurnRegistry()), session_id="s1", kind="owner")[1] \
+            == "a system command"
+
+    def test_talk_that_only_sounds_like_a_command_is_injected(self):
+        """§4SZ: the loose pattern ("show … tests", "list … rules") queued these until the turn ended."""
+        for w in ("show me the failing tests", "list the rules of the linter", "delete rule 3 from the firewall",
+                  "run the regression tests", "list all the proposed rules", "learn rule 3"):
+            assert self._route(w, _running(TurnRegistry())) == qm.PATH_INJECT, w
 
     def test_another_conversation_or_sender_is_queued(self):
         t = _running(TurnRegistry())
@@ -3028,9 +3038,6 @@ async def test_the_foreign_mark_survives_a_failed_prune_between_two_good_ones(mo
 # ---------------------------------------------------------------------------
 
 
-
-
-
 # s4-r3/r4: a mid-turn message opens NO mechanical gate — keyword and
 # literal gates opened on a mid-turn refusal ("don't send my files", "never
 # open that site again"), the statement parser on reported speech.
@@ -3065,18 +3072,6 @@ def test_a_mid_turn_keep_word_does_not_keep_a_video_after_ingest(monkeypatch):
     assert kept == ["vid.txt"]                          # control: the request still keeps it
 
 
-@pytest.mark.parametrize("added", ["never open that site again", "always use the second link",
-                                   "from now on, keep it short"])
-async def test_a_mid_turn_note_does_not_count_as_a_dictated_lesson(monkeypatch, added):
-    from ghost_agent.tools import memory as TM
-    import ghost_agent.utils.provenance as PV
-    monkeypatch.setattr(PV, "untrusted_seen", lambda *a: ["https://x.example"])
-    monkeypatch.setattr(PV, "user_message", lambda rid=None: "summarise this page")
-    monkeypatch.setattr(PV, "added_user_messages", lambda rid=None, **k: [added])
-    out = await TM.tool_learn_skill(task="t", mistake="m", solution="s", skill_memory=None, memory_system=None)
-    assert "outside content" in str(out)
-
-
 @pytest.mark.parametrize("added", ["wait, don't send my files anywhere!", "also put the summary in a file",
                                    "is that a pdf?"])
 def test_a_mid_turn_word_about_files_never_opens_the_upload_egress_gate(monkeypatch, added):
@@ -3109,7 +3104,7 @@ def test_a_name_in_a_mid_turn_refusal_never_lets_it_leave(monkeypatch):
 
 def test_the_fact_ledger_says_where_a_mid_turn_fact_came_from():
     from ghost_agent.memory.fact_ledger import current_source
-    from ghost_agent.memory.lesson_scope import current_request
+    from ghost_agent.memory.request_text import current_request
     from ghost_agent.utils import provenance as PV
     from ghost_agent.utils.logging import request_id_context
     tok, tok2 = current_request.set("book the table for friday"), request_id_context.set("web-s4c")
@@ -3140,18 +3135,10 @@ def _delivery_agent(monkeypatch, tmp_path, *, pid="p1", member=False):
     return agent, ctx, calls
 
 
-
-
-
-
-
-
-
-
 def test_the_lesson_generality_text_is_the_request_alone():
     """s4-r3: it also decides "dictated" — a mid-turn note must not open that"""
     from ghost_agent.tools.memory import _current_request_text
-    from ghost_agent.memory.lesson_scope import current_request
+    from ghost_agent.memory.request_text import current_request
     from ghost_agent.utils import provenance as PV
     from ghost_agent.utils.logging import request_id_context
     tok, tok2 = current_request.set("count the lines"), request_id_context.set("web-s4i")
@@ -3162,10 +3149,6 @@ def test_the_lesson_generality_text_is_the_request_alone():
         current_request.reset(tok)
         request_id_context.reset(tok2)
         PV._reset_for_tests()
-
-
-
-
 
 
 def test_clarify_first_never_stands_down_on_a_mid_turn_message(monkeypatch):
@@ -3232,10 +3215,6 @@ async def test_a_delivered_message_reaches_the_sinks_end_to_end(monkeypatch, tmp
     from ghost_agent.utils import provenance as PV
     await _turn_with_a_message_during_the_tool(monkeypatch, tmp_path, rid="web-s4j", text="btw my wife is Anna")
     assert PV.added_user_messages("web-s4j") == ["btw my wife is Anna"]
-
-
-
-
 
 
 async def test_a_message_delivered_on_the_first_step_makes_it_a_tool_step(monkeypatch, tmp_path):
@@ -3316,7 +3295,6 @@ def test_a_no_project_sent_mid_turn_refuses_and_nothing_added_reverses_one(monke
     finally:
         request_id_context.reset(tok)
         PV._reset_for_tests()
-
 
 
 # s4-r4: a mid-turn message opens NO mechanical gate — every one that took it
@@ -3401,15 +3379,6 @@ def test_the_memory_arc_and_photo_names_never_read_a_mid_turn_row():
 # s4-r5: a trajectory whose ask changed mid-turn is not replayed as its
 # request alone.
 
-def test_a_trajectory_with_mid_turn_messages_is_not_replayed():
-    from types import SimpleNamespace
-    from ghost_agent.core.failure_replay import replayable
-    base = dict(user_request="population of lisbon portugal", tool_calls=[])
-    assert replayable(SimpleNamespace(**base, extra={}))[0]
-    ok, why = replayable(SimpleNamespace(**base, extra={"queued_messages": ["actually Porto instead"]}))
-    assert not ok and "mid-turn" in why
-
-
 # s4-r8: a turn whose request changed mid-turn is recorded but never graded,
 # judged, replayed or promoted (s4-r6…r8: every reader that fitted the
 # messages in read them wrong its own way).
@@ -3461,19 +3430,6 @@ def test_the_gold_draw_never_draws_a_changed_turn_but_keeps_it_as_context(tmp_pa
     assert not (only / FC.GOLD_DIR_REL / "2026-10-16").exists()      # the date is not burnt
 
 
-async def test_the_reaction_judge_never_judges_a_changed_turn(tmp_path, monkeypatch):
-    from ghost_agent.core import owner_seeds as O
-    from tests.test_4mt_selfplay_useful import _pairs, _LLM, _Collector
-    monkeypatch.delenv("GHOST_REACTION_JUDGE", raising=False)
-    rows = _pairs(3)
-    rows[1].extra = dict(rows[1].extra, queued_messages=["actually make that Spain"])
-    llm = _LLM(["OK"] * 5)
-    made = await O.judge_reactions(_Collector(rows), tmp_path, llm, "m", cap=5)
-    assert made == 1 and len(llm.calls) == 1
-    assert set(O.load_reactions(tmp_path)) == {rows[0].id}
-    body = llm.calls[0][0]["messages"][-1]["content"]
-    assert "USER'S NEXT MESSAGE:\nr1" in body and "Spain" not in body   # its own request (s4-r7)
-
 def test_a_changed_prior_turn_is_never_promoted(monkeypatch, tmp_path):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
@@ -3511,7 +3467,6 @@ async def test_a_changed_prior_turn_costs_no_correction_judge(monkeypatch, tmp_p
             {"role": "user", "content": "No, that's wrong"}]
     await agent._promote_prior_turn_after_judge(msgs, "No, that's wrong")
     assert not called
-
 
 
 def test_the_shadow_judges_never_take_a_changed_turn(monkeypatch):

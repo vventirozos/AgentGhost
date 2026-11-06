@@ -226,7 +226,6 @@ def _scripted_agent(reply_fn):
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
     ctx.memory_system = None
-    ctx.skill_memory = None
     ctx.scratchpad = MagicMock()
     ctx.scratchpad.list_all.return_value = ""
     agent = GhostAgent(ctx)

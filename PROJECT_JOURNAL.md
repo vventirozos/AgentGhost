@@ -58750,3 +58750,1146 @@ D1 (delete chess-coach + jiu-jitsu-calendar through the teardown) move to the en
   mine; "grep a new name first" again). `asyncio.run` joins a stuck reader's thread, so the timeout test measures
   inside the coroutine. The first unreadable-registry test failed because `inventory_for` answers None for a file
   that does not open and I had read None as "no labs".
+
+## §4SZ — the learning system is reduced to the owner's rules (2026-11-05, operator: "look at the learning system and thoroughly evaluate it. look at usecases, ease of use, practicality. design everything.. should we keep it, improve it or remove it ?" → my verdict: keep the owner's rules, remove the rest, make dictation the main path → "proceed . Remove all user defined rules" → asked which meaning → "Delete the 5 rules, keep the feature")
+
+**R0 — scope, property, threat model.** Scope: the failure-replay idle slot, the regression suite, the reaction
+judge, the automatic-lesson store and its retrieval, the `learn_skill` / `list_lessons` tools, composed skills, the
+lesson parts of the learning report; kept and rebuilt: the owner's rules. Property: an owner's rule is shown on every
+owner turn and on no other surface, changes only by the owner's own command, and no removed part leaves a caller, a
+job, a heartbeat or a prompt line behind. Threats: a cut that leaves a dangling reference on a rarely-run path; the
+idle window's clock (the slot's `finally` was its only writer); a member or public surface reaching the rules; a
+command matcher that hijacks ordinary chat (a system command gets no model).
+
+- **Evaluation (live data, 27 days).** 13 replay cases → 9 proposed rules → 5 adopted (two the same "latest
+  version" rule, three a restatement of "say only what the tool output shows"); 0 new cases since 10-19. The picker's
+  funnel over the last 17 days: 295 owner turns, 30 flagged, 0 replayable (23 follow-ups — the conversation cannot be
+  rebuilt — and 7 action requests); 10 of 88 flagged turns in 30 days became a case. 11 owner thumbs-down in a month,
+  none since 10-19 led anywhere. Regression suite: 2 proposals, both expired, 0 kept. `learn this rule:` never used.
+  `learn_skill` 0 calls / 30 d. Composed skills: 17 rows, 0 uses. 26 automatic lessons out of prompts since 10-13 but
+  still listed by `list_lessons` and described as live by the learning report. Reaction judge: 1–6 background calls
+  a day on the main model, each saving the conversation to disk. ~14k source lines in 12 modules, 78 test files.
+  The health-claim and news rules were flagged again after adoption; code changes (§4QJ, §4SJ) fixed those.
+- **Phase 1 — the five rules deleted (17:06).** Through the agent's own code, offline (agent stopped 20 s):
+  `remove_owner_rule` per rule and `forgotten_at` on each ledger case — `check_rule_integrity` would have written
+  back any rule whose case still read "adopted". Dry-run on a copy first. Backup:
+  `~/Data/AI/Data/backups/learning-removal-20261105/`.
+- **Phase 2 — `core/owner_rules.py`.** ONE store (`system/owner_rules.json`) the owner dictates into: "learn this
+  rule: …" (or "remember this rule: …"), "show all rules", "show rule N", "forget rule N" → "confirm
+  forget rule N", "forget all my rules" → confirm. Cap 10, a full list REFUSES (the old cap hid the oldest), 8–400
+  characters, one clean line, a number is never reused. The block, the command dispatch, the queued-message
+  classifier, the privacy forget's note and the health check read this store; the §4OR integrity check is gone with
+  the second copy it compared. The replay loop's RULE commands are answered with how it works now.
+- **A thumbs-down says how to state a rule.** `/api/feedback` answers a recorded 👎 (not a repeat) with a `hint`;
+  the web client shows it as a system line once per page load, after the label is latched.
+- **Phase 3 — removed:** `core/failure_replay.py`, `core/regression.py`, `core/owner_seeds.py`,
+  `distill/reaction_judge.py`, `core/practice_brief.py`; the slot, its exceptions, cooldown, supervised run and
+  `/api/operator/self-play-slot`; the replay read-only dispatch guard and the `replay` scope branch; `self_play` from
+  the liveness expectations. The idle window now restarts unconditionally after an hour of quiet and NO idle phase
+  writes `last_activity_time` (the slot's `finally` was the one exception to §4LF's rule).
+- **Found while cutting.** (1) `_replay_block` was still read 12 lines below the definition I removed → NameError on
+  every MEMBER tool refusal; the member-wall tests caught it (53 failures) — a cut leaves a use behind as easily as a
+  fix does. (2) The ported §4PY test caught my own `_clean`: a plain `strip` of quote marks ate the closing quote of
+  "never 'the pet'". (3) With one periodic phase left, the liveness alarm for a silent `maintenance` is withheld by
+  the agent-down guard unless another job wrote a row — the tests had used `self_play` as that evidence.
+- **Tests.** New: `test_4sz_owner_rules.py`, `test_4sz_system_commands.py` (the §4PY mechanism tests ported to the
+  new commands), `test_4sz_idle_window.py`, `test_4sz_kept_guards.py`, `test_4sz_thumbs_down_hint.py` (the client
+  half runs `sendFeedback` under node). Deleted with their subject: the 4mw / 4mt / 4mx / 4ne / 4or / 4px / 4py /
+  4pz files and 24 single tests; the liveness tests re-pointed from `self_play` to `maintenance`.
+- **Not removed, found on the way:** the knowledge shadow (its own switch) still writes
+  `verifier/knowledge_shadow.jsonl`, which only the replay picker read; the failure census still reads the old
+  reaction-verdict files when present; `scripts/mutate_4pm.py` still names `owner_seeds` mutants.
+- **Review r1 (a reader who did not write it): 1 MAJOR, in the new module.** *The command matchers took ordinary
+  chat.* A command gets NO model, and my first set had aliases: "add rule: allow tcp 443 from the office" was stored
+  as a standing rule, "delete rule 3" in a firewall chat was a forget preview, "remove all the rules" a forget-all,
+  and the retired-command reply answered "run the regression tests", "show test 3" and "edit test 4: …" in a coding
+  chat. Fix by deleting, not adding: the commands are the exact phrases above and nothing else ("this rule" + a
+  separator; "all"/"my" before "rules"; the one verb "forget" — §4PZ had already taken delete/remove out of the old
+  commands for this reason, and I put them back); the retired reply covers the old RULE commands only. A short
+  message about the rules that is no command still reaches the model with the note that nothing changed.
+  The same review, MINOR: (a) *the store replaced what it could not read* — a damaged file was set aside and the
+  next rule was "Rule 1" again with the health check reading "0 owner rules"; on a file it could not READ it wrote a
+  new one over the old. Now a damaged or unreadable file is left exactly as it is, no rule is shown, every command
+  says so and the health check asks the store itself (`owner_rules.damaged`). (b) "confirm forget all my rules"
+  removed a rule added after the preview → the confirmation is bound to the numbers the preview showed. (c) one
+  pass of control-token removal rebuilt a token from a nested one → removed until none is left. (d) the loose
+  `is_system_command` pattern ("show … tests", "list … rules") queued "show me the failing tests" mid-turn and kept
+  it out of the experience store → it is now the commands' own matchers. (e) `self_play` heartbeat rows would read
+  "UNREGISTERED phase" for a week → `RETIRED_PHASES`. (f) the lesson legend and three operator texts still named
+  the replay. (g) dead after the cut: `_run_idle_job`, `_owner_active`, `IDLE_JOB_CAP_S`, `ORIGIN_REPLAY` and its
+  two branches — removed.
+- **Review r2 (a second reader): 2 MAJOR, the same class, inside the r1 fix.** (1) *The dictation took everything
+  to the end of the message.* "Learn this rule: if x > 5 then y = 2x. Now, what is y for x = 7?" was stored whole
+  and never answered; so were a rule followed by a second request on the next line, "Remember this rule, it will be
+  on the exam: …" (the comma separator I had added for speech-to-text) and a quoted copy of the command inside a
+  question. Now: a colon only, ONE line, no opening quote, and a message that ends in "?" is a question. What is
+  left is inherent to a command with no model — one line that states a rule and asks for something else is stored
+  as written; the reply quotes it and says how to remove it. (2) *The retired-command reply answered chat*: "list
+  all the suggested rules" after the assistant had suggested lint rules, "delete all pending rules", "replace rule 3
+  with rule 7". Fix by deleting: `_RETIRED_RE` and its banner are gone; the old commands are ordinary messages and
+  the model's note says there are no proposed rules any more. **Twice the same class in my own matcher — the rule
+  that held both times: a command with no model must be an exact phrase, and every alias, separator and "helpful"
+  reply added beside it was a way for chat to land there.**
+  The same review, MINOR: "list all the rules" matched ("the" removed — "all" or "my"); a failed save was swallowed
+  and the MODEL answered "learn this rule: …" unaided → the system says "I could not write your rules file"; a
+  directory in place of the file read as "no rules"; a preview dated in the future or NaN confirmed for ever
+  (`_fresh`); more than ten hand-edited rules showed ten and hid the rest → damage; a hand-edited rule was shown
+  raw in the list; an empty memory dir wrote the file into the working directory; a bare "yes" to a forget preview
+  reached the model with no note (it would say the rule is gone) → `PENDING_HINT` names the exact confirmation.
+  Found by the end-to-end test while fixing: the agent matched the command on its whitespace-COLLAPSED text, so "one
+  line only" did not hold through `handle_chat` → `_message_lines`. Tests that could not fail: the clock AST check
+  walked only the tick's own body (now every write of a user clock in the package, by function); the browser guard
+  test passed with the guard inverted (now its sense is checked); the who-may-run tests replaced the classifier
+  (one now sets the real request context). Known limit, left and written at the call site: the command runs at
+  arrival, before the turn lock.
+- **Review r3 (a third reader): 2 MAJOR at the low end, both in the note I ADDED in the r2 fix.** No rule lost,
+  no number reused, no cap overflow in any sequence it ran. (1) *The "a preview is waiting" note outlived the
+  preview*: I had removed the clearing of `pending` after a confirmation as an "equivalent mutant" — and then, in
+  the same round, added a reader of `pending` that made it not equivalent: for 15 minutes "ok thanks" told the
+  model that rule 2, already forgotten, was waiting to be confirmed. The note is now given only while what the
+  preview showed is still there. (2) *A message opening with "ok"/"yes" lost the general note* ("ok, delete rule
+  2"): the affirmation branch returned early. MINOR, fixed: a question was recognised only by a FINAL "?" ("…for
+  x = 7?!", a Greek question) → a dictated rule holds no question mark; "list all rules" / "show all rules" matched
+  in a firewall chat → the listing command needs "my" ("show my rules"); natural phrasings with no note ("new
+  rule: …", "forget the rule about news"); a rule number no command can name, a blank rule and a key written
+  twice are damage; a preview time too large for a clock raised; emoji-only rules were all "the same rule"; the
+  census's standing-rules reader still looked in the playbook (and a missing profile skipped it). Tests that
+  could not fail: the enumeration's allow-list covered files that needed none; the timing bound (1 s) let a
+  quadratic pattern through (0.8 s) → 0.25 s; one ported pin only looked for a `.set` and a `.get` → removed.
+  **A harness side effect, cleaned:** the r2 and r3 reviewers drove `handle_chat` outside pytest with the shell's
+  `GHOST_HOME`, and 54 rows went into the live census (two one-second bursts) — removed from a backup-first
+  rewrite while the agent was idle. A review brief must set `GHOST_HOME` to a temp directory.
+  Left, by decision: `show rule N` / `forget rule N` are context-blind (documented commands; forget only previews);
+  a one-line rule that also asks for something without a question mark is stored as written; `_clean` removes
+  `<|…|>` tokens only (the rule is the owner's own text, as any message of theirs); the command runs at arrival.
+- **The half-deployed tree (19:23).** The agent had been running since 17:06 on the old code while I deleted
+  modules it imports lazily: its idle tick failed every cycle, every owner turn logged "owner rule command failed"
+  and one turn ended in an internal error. The operator noticed first. Restarted on the current tree after a
+  compile + import + startup-test check. For the remaining phases the work is done in a COPY of the tree and
+  swapped in with the restart.
+- **Tests deleted with a file are behaviour lost with it.** Deleting the loop's test FILES also deleted the only
+  tests of five probe guards that are still live (a probe never uses up the owner's corrections, never queues a
+  caveat, writes no project research, books no browser visit; the overview is not a health check). Recovered by
+  running the old files against the new tree and keeping what still passed → `test_4sz_kept_guards.py`, plus two
+  written new for guards that never had a test (a probe's message is not judged as the owner's correction; a probe
+  records no source as pulled). Next time: before deleting a test file, run it against the cut tree first.
+- **Layers removed while fixing** (the battery's equivalent mutants): `pending` cleared after a forget and after an
+  add (the confirmation already checks the number exists, matches and is fresh; numbers are never reused); a
+  3-character minimum and an import fallback in `rules_mentioning` (`profile.mentions` is a whole-word match).
+- **Phases 4–6 (pending):** the lesson store (`skill_memory` is named in 12 source and 153 test files), the two
+  tools, composed skills, the learning report.
+
+
+## §4TA — the macro engine is removed (2026-11-05, operator: "scope the removal of the proposed macros . i want to be able to create custom tools (like the one that i use for news) and be able to create new ones. but i don't think that the automatic macro proposal system works." → I scoped two options (A: remove only the proposals; B: remove the whole engine) → "proceed with B. … remove the macro engine.")
+
+**R0 — scope, property, threat model.** Scope: composed skills ("macros": named sequences of tool calls) — the
+engine `tools/composed_skills.py`, the `manage_composed_skills` tool, the registry file under the memory dir, the
+macros advertised as top-level tools and their runners, and every special case for them in the turn loop, the
+replay containment, the strike tables, the skill listing and the yield report. Kept, untouched in behaviour:
+acquired skills (`create_skill`, `manage_skills`, the owner's `news_headlines`). Kept under the same name, as a
+built-in: `youtube_transcribe`. Property: after the cut no module imports the engine; an old registry file on disk
+is never loaded, advertised or rewritten; `youtube_transcribe(url)` does what the macro's one step did and every
+table that named it still names it; a model that calls a removed name gets what any unknown name gets. Threats: a
+cut that leaves a use behind on a rarely-run path (§4SZ found one); a table keyed on tool names that treated the
+macro as "runtime-registered" and now treats the built-in differently; a helper that other code borrowed from the
+engine; a test file deleted with behaviour that is still live in it; containment — a macro was dropped from a
+contained replay as a class, a built-in is not.
+
+- **Evidence (live data, measured today).** Nothing has proposed a macro since the miner was removed on 2026-10-11
+  (§4NM): the last proposal is dated 2026-09-16 and `compile_from_pattern` had no caller. 12 proposed macros, never
+  approved, never used. 4 auto-mined macros ACTIVE and advertised to the model on every turn: three never used, one
+  used 3 times on the day it was created (1 success). No macro was ever defined by hand. The only real one was the
+  code-owned `youtube_transcribe` (8 uses, 5 successes, last 2026-10-16) — a ONE-step alias for
+  `knowledge_base(action='transcribe', filename=<url>)`. Head cost, counted with the live tokenizer: the
+  `manage_composed_skills` definition 980 tokens + the 4 auto macro definitions 668 = ~1,650 of the ~26,700-token
+  cached head. A "daily report" (weather + news + health check) is done with an owner rule and the model calling
+  the three tools — tested live — not with a macro.
+- **Removed.** `tools/composed_skills.py` (1,714 lines), `tools/yt_download.py` (the code-owned macro definition),
+  `scripts/sync_youtube_transcribe_macro.py`. In `tools/registry.py`: the tool definition, the dispatch entry,
+  `register_composed_skills` and `register_composed_skill_runners`. In `core/agent.py`:
+  `_COMPOSED_SKILL_MUTATING_ACTIONS` and its branch in `_call_mutated_world`, the tool's entries in `is_mutating`
+  and in the tool-definition refresh. In `core/isolation.py`: the entry in `REPLAY_FORBIDDEN_TOOLS`, the block that
+  forbade every macro in a contained surface, the `composed_skills` folder in a fork's memory seed, the
+  `_composed_skill_registry` ring. In `core/strikes.py`: the entry in `READWRITE_LOOP_TOOLS`. In
+  `tools/acquired_skills.py`: `_list_composed_skills` and the "Composed skills (named macros)" part of the
+  `manage_skills` list with its "[PROPOSED …]" tag, and `create_skill`'s refusal of a name a macro had. In
+  `core/liveness.py`: the `macros.auto_mined` yield row (`_yield_macros`, `_is_loop_minted_macro`,
+  `_macro_marks`). The `manage_skills` description no longer says "AND composed macros". Comments that described
+  macros as present were corrected across the 14 changed modules; history stays where it is dated.
+- **Kept, and how `youtube_transcribe` was re-homed.** A static definition in `TOOL_DEFINITIONS`
+  (`YOUTUBE_TRANSCRIBE_TOOL_DEFINITION`): the description it had, without the "[COMPOSED SKILL] … (1 steps)"
+  wrapping; one parameter `url`, required. The handler (`_youtube_transcribe` in `get_available_tools`) looks the
+  knowledge-base callable up in the dispatch dict AT CALL TIME — the egress-guarded one, which is what the macro's
+  step called — and calls it with `action="transcribe", filename=url`; the result comes back as it is (no
+  "1/1 steps succeeded" envelope, no 4,000-character step cap; a declared failure keeps its status). No `url` →
+  a declared refusal that names `url`, nothing fetched; other arguments are ignored, as the macro ignored them.
+  The tables, each checked: `REPLAY_FORBIDDEN_TOOLS` — named, kept; `UNTRUSTED_SOURCE_TOOLS` — named, kept (the
+  runner's `register_opaque` is gone with the runner, the name entry is what marks a transcript as outside
+  content); the census's `_LOOKUP_TOOLS` — named, kept; `_MEMBER_ALLOWED_TOOLS` and `LEAF_ALLOWED_TOOLS` — allow
+  lists, never named it, still do not; `_COLLAPSE_READSAFE` — never named it (it ingests), still does not;
+  `is_mutating` / `_call_mutated_world` / the strike tables — never named it, unchanged; the egress tables key on
+  `knowledge_base`, which the inner call still passes through. `_usage_is_bookable` (who books a skill run, §4MI)
+  moved to `tools/acquired_skills.py`, its other caller.
+- **Found while cutting.** (1) *Containment.* §4LS M3 dropped every macro from a contained replay because a
+  macro's steps ran through the FULL dispatch dict. The built-in's handler holds the same dict, so with the block
+  simply deleted a caller's own deny list that named `knowledge_base` and not `youtube_transcribe` would have kept
+  a way to it. `restrict_tool_surface` now forbids `youtube_transcribe` wherever the tool it calls
+  (`YOUTUBE_TRANSCRIBE_INNER_TOOL`) is forbidden. (2) *Static, not runtime-registered.* As a macro the name was
+  outside `_STATIC_TOOL_NAMES`, so an empty-argument native call to it won over a competing XML call; as a built-in
+  with a required parameter it yields, like every other built-in — the one behaviour change, and the intended one.
+  (3) *`manage_composed_skills` is not an unknown tool to the name healer.* No code names it, but the general rule
+  for a mistyped tool name (`_canonicalise_tool_name`, closest match ≥ 0.7) resolves it to `manage_skills` (0.75).
+  Driven through the real dispatch: `list` lists the custom tools, `define` / `run` / `approve` are "Unknown
+  action", a macro-style `delete(name=…)` deletes nothing (`skill_name is required`). Left as the ordinary handling
+  it is, and pinned as a fact; an old `auto_*` name matches nothing and gets the unknown-tool reply with the tool
+  list. (4) The lint baseline held 2 tolerated findings for the deleted file → written down (`ALLOWED_SLACK` is 0).
+- **Tests.** New: `test_4ta_macro_engine_removed.py` (the built-in's definition and handler, the egress-guarded
+  inner call, the tables, an old registry on disk byte-identical after the tool list, the dispatch table, a
+  listing, a creation, a fork seed and the reports; nothing recreates the folder; a removed name through the real
+  dispatch; `create_skill` accepts a name an old macro had and refuses `youtube_transcribe` as a built-in; the
+  reports carry no macro row; AST enumerations: no import of the engine in src / scripts / interface, no string
+  constant naming the removed tool) and `test_4ta_kept_guards.py`. Each test of the five macro test files was
+  judged against the cut tree before the files were deleted (the §4SZ lesson): deleted with their subject —
+  `test_composed_skills.py`, `test_composed_skills_fixes.py`, `test_composed_skill_step_truncation.py`,
+  `test_4cs_macro_param_schema.py` and the macro classes of `test_composed_skill_run_action.py`; kept from that
+  last file — the direct tests of the three other branches of `_call_mutated_world` (elsewhere they are pinned
+  only through the batch dispatch).
+  Ported, not deleted, in the other files: who books a skill run (the macro store's tests → `log_telemetry` on an
+  acquired skill, all request kinds), a self-play turn cannot change the skill store, a probe's refusal carries
+  its reason, a `job-` wake may delete a skill, the padded-action tool-list refresh (`define` → `manage_skills
+  delete`), the read-then-write loop remedy (→ `manage_tasks` / `manage_projects`), the runtime-registered
+  duplicate-call and empty-argument pins (macro → skill), M3 containment (→ the rule above), the YouTube macro's
+  one-step pin (→ the built-in through the real dispatch table, a hostile link passed as data). Removed inside
+  mixed files: the macro classes and single tests in 20 files (step classification, the resolver, mint safety,
+  the yield row). `scripts/mutate_4ta.py`: 40 mutants + 2 controls. Suite in the working copy: 29,704 passed, 81 skipped,
+  3 failed — the three tests that look for the launcher and the CLI link beside the repository, which a copy of
+  the tree does not have (the same three fail on the copy before the change); lint gate OK.
+- **Not removed, found on the way.** `docs/labs/*.md` (dated design notes) still cite `composed_skills.py` by
+  line. `scripts/mutate_4sx_d5.py` and `scripts/mutate_4qa.py` name the deleted file (one mutant each; both
+  batteries already had stale anchors before this change), `scripts/mutate_4sx_b.py` anchors on the removed
+  branch (already stale since §4SX D5). `tests/test_4sx_d5_switch.py::test_jobs_maps_onto_the_run_row_of_that_job`
+  fails when its file is run alone (it imports a sibling test module by bare name) — before this change too.
+  `trajectory_may_teach` is still tested with the consumer label "macro_mining". The lesson store, `learn_skill` /
+  `list_lessons` and the lesson rows of the learning report are the next phase.
+- **Docs.** `docs/tools/composed_skills.html` is a tombstone (what it was, the evidence, what replaced it, what
+  still holds); `learning-loop.html#macros` says how to get a recurring bundle with an owner rule ("learn this
+  rule: when I ask for my daily report, give me the weather, the news headlines and a health check"); the registry,
+  acquired-skills, isolation, strikes, introspect, youtube-ingest, agent (`#4ta`) and guide pages corrected;
+  `docs/logging.html` regenerated (6 macro titles gone).
+- **Independent review (a reader who did not write it): no runtime defect; 1 MAJOR test gap, 3 MINOR.**
+  (1) MAJOR, *a deleted test whose subject is live* — again: `test_a_macro_is_opaque_everywhere` was the only pin
+  of "a runtime-registered tool's output is outside content", and that guard still serves acquired skills. With
+  the provenance check replaced by `if False:` 4,780 tests passed. Three tests now pin it for a custom tool (the
+  registered name alone; the dispatch through the real loop; the runner's own mark with the name registry
+  emptied). (2) *A stale call to the removed manager reached the custom tools*: the mistyped-name healer mapped
+  `manage_composed_skills` onto `manage_skills` (a 0.75 match), where `action="delete", skill_name=…` DELETED a
+  custom tool with no confirmation and ANY action ran that tool's owner sweep (it retired a degraded skill). I
+  had left that as "ordinary handling" and pinned it; the pin never tried `skill_name=` or a degraded skill. A
+  removed tool's name is now never healed onto a neighbour (`_REMOVED_TOOL_NAMES`) — it is an unknown tool.
+  (3) Two older batteries listed the deleted file and raised before running anything → their one macro mutant
+  each removed. (4) "Who books a skill run" varied request ids only → the member population is pinned. NIT fixed:
+  `knowledge_base` is exempt from the context shield and `youtube_transcribe`, the same result, was not.
+- **Battery `scripts/mutate_4ta.py`:** first run 41/41 killed (one mutant read HARNESS in the automated run —
+  its selected test ids no longer existed once the dispatch entry was gone — and was killed by hand in a scratch
+  copy, 19 tests failing); re-run with the nine review mutants: see the deploy line.
+- **Head.** ~1,650 tokens of tool definitions leave the cached head (the manager 980, the four auto-mined macro
+  tools 668; `youtube_transcribe` stays at ~180).
+- **Deploy:** the tree was changed in a COPY (`~/Data/AI/.agent_work/Agent`) and swapped in with the restart —
+  the running agent imports lazily from the repo (§4SZ's lesson). The live macro store
+  (`memory/composed_skills/`, `memory/auto_skills.json`: 12 proposed, 4 auto-mined, `youtube_transcribe`) was
+  moved to `backups/learning-removal-20261105/`.
+
+
+## §4TB — four tools reviewed: replan removed, self_state folded into introspect, fact_check returns its sources, notify_operator reports delivery truthfully (2026-11-05, operator: "thoroughly review, look for usecase gaps, deficiencies, improvements etc the following tools: fact_check, self_state, notify_operator, replan. provide suggestions." → review → "maybe set mood should go into introspect and self_state can go ?" → "i want all of them")
+
+**R0 — scope, property, threat model.** Scope: four tools and what only served them — `replan` (the tool, not
+`manage_projects(action="replan")`), `self_state` with the open questions, unfinished threads and principles it
+authored, `fact_check`'s result and its bounds, `notify_operator`'s confirmation. Property: a removed tool leaves no
+definition, handler, table entry or prompt line behind, and a stale call to it is an unknown tool that reaches no
+neighbour; the one write that survives (`set_mood`) is stored, held and worded as before, by the same requests as
+before and by no other; every other `introspect` action behaves and is routed as it was; a fact check's result names
+the pages it rested on and a page cannot write any part of that result's grammar; the notification text claims only
+what is true at the moment of the call. Threats: a cut that leaves a use behind on a rarely-run path (§4SZ, §4TA);
+a table keyed on tool NAMES that now holds a tool with one writing action; an old file on disk read by code that no
+longer knows its fields, and rewritten without the mood; a test deleted while the behaviour it pinned is still live
+(three times today); outside content in a section the model reads as the tool's own words.
+
+- **Evidence (four months of recorded turns: 6,061 turns, 17,062 tool calls; 30 day-folders in the last 30 days).**
+  `replan` 0 calls ever. `self_state` 53 calls — 81 % `list`, 6 real writes ever, `add_unfinished` never in a real
+  turn; 2 owner calls in the last 30 days, both `set_mood`. `fact_check` 7 calls, 2 real, 0 by the owner in the last
+  30 days; no result ever carried a link. `notify_operator` 26 calls, 0 errors, 3 owner calls in the last 30 days.
+- **Change 1 — `replan` removed.** Its implementation returned one sentence addressed to a planner deleted in
+  October (§4NM); nothing in the loop reacted to the call. Gone: the definition, the handler and its dispatch entry,
+  its entries in `_MEMBER_ALLOWED_TOOLS` and `_BOOKKEEPING_TOOL_NAMES`, its name in the member steer caveat (which
+  subtracts only `abort_attempt` now) and in a comment of the `execute` import blocklist.
+  *The `TaskTree` carrier.* `handle_chat` built `TaskTree()` per request and passed it through
+  `TurnState.task_tree`; an AST search of `src/` (names, attributes, keyword arguments) found the build, the pack and
+  the unpack and no read. The local, the field and the import are removed; 16 test files that built a `TurnState`
+  lose the keyword. The project `TaskTree` is untouched.
+  *The name healer.* `_canonicalise_tool_name("replan", …)` resolves to nothing: its closest built-in is `recall` at
+  0.5 against the 0.7 cut-off, so it is NOT in `_REMOVED_TOOL_NAMES`; a stale call gets the ordinary unknown-tool
+  reply (pinned through the real dispatch, four spellings).
+  *The watchdog's marker.* When the cognitive watchdog severs a final stream that loops inside a think block it
+  appended a synthetic `<function=replan>` call to the DURABLE text, in the active path's dialect, and
+  `reply_smoothing` exempted that shape from the unparsed-call scrub. Can it reach a later turn as a call? As a
+  parsed call, no: the stream is only used for the final generation, where the client (and so the stored session
+  and the next request's history) gets the "[⚠ stream interrupted …]" notice; nothing parses a recorded reply. As
+  TEXT, yes: the record feeds the project work log, the episode, the trajectory and the "my answer" line of a
+  recalled experience (`answer_gist` — with the old marker it read `<tool_call> <function=replan> …`), which later
+  turns read as tool results — an exemplar of a call to a tool that no longer exists. So the marker is now a plain
+  note (`WATCHDOG_BREAK_NOTE`: the closing think tag and "[SYSTEM OVERRIDE: my internal reasoning got stuck in a
+  loop and the reply was cut off here.]"), with no dialect branch, and the scrub's exemption (`_PRESERVED_CALL_RE`)
+  is removed: a `replan` call written in a reply is an unparsed call like any other.
+- **Change 2 — `self_state` folded into `introspect` as `set_mood`.** The tool's description said that what it
+  recorded "is shown to you at the start of your next session": false since the wake-up prefix was deleted (§4NM).
+  Questions, threads and principles had no other writer and were read into no prompt.
+  *The write.* `introspect(action="set_mood", mood=…, evidence=…)` → `SelfStateThread.set_mood(source="self")`: the
+  same slot, clamps (64 / 300), history line, 6-hour hold against the derived updater and reply text ("Mood set to
+  '…' (…)."). New, minimal: the word `clear` (or `none`) as the mood takes a SELF-set mood off (`clear_mood`), so
+  the derived one resumes with the next reading; a derived mood is not removed that way. (First cut: an EMPTY mood
+  cleared too — review item 4.)
+  *Who may write — the same population as `self_state`.* It was callable in owner, scheduled and job turns; a member
+  had no access (allow-list, and `introspect` refuses a member outright); a coding leaf has neither tool; a contained
+  (isolated replay) surface had it on `REPLAY_FORBIDDEN_TOOLS`. `introspect` is allowed on a contained surface, so
+  the action refuses itself there (`isolation.is_contained_context`, the context's forbidden-tools record; that
+  copy's self-model is nulled as well). New refusals, as briefed: a request that read outside content
+  (the shared `provenance.refuse_if_untrusted` → REJECTED `untrusted_content`, read actions stay open) and a probe
+  (dry run, "PROBE — not set", nothing recorded). Order: member → the argument → contained → outside content →
+  model unavailable → probe → write.
+  *The lists that name `introspect`, each checked.* `_COLLAPSE_READSAFE` (batch collapse of identical calls): kept,
+  and `is_mutating` is now true for `set_mood` (`_introspect_is_write_call` → `tools/introspect.is_write_call`, which
+  normalises the action exactly as the tool does; "write" when it cannot be asked) — so two identical `set_mood`
+  calls both run and a read after the write in one batch runs again; pinned through the real dispatch with the
+  counterweight (two identical reads still collapse). `_SELF_REPORT_TOOLS` (no blocking verdict await): `self_state`
+  removed, `introspect` kept for every action — `self_state set_mood` had the same treatment. `_RETRIEVAL_SURFACE_NAMES`:
+  unchanged. `_call_mutated_world`: false for it (nothing the pre-flight guard reasons about), as it was for
+  `self_state`. Idempotent setters: not one, as `self_state` was not. `REPLAY_FORBIDDEN_TOOLS`: `self_state` out,
+  the action-level refusal in. `UNTRUSTED_SOURCE_TOOLS` / `is_untrusted_source`: `introspect` is not an outside
+  source, unchanged. `core/strikes.py`, the evidence gate, the census lookup lists, `_WORK_TOOLS`: none names either
+  tool. `_canonicalise_tool_name("self_state")`: resolves to nothing (best 0.42) → unknown tool, not in
+  `_REMOVED_TOOL_NAMES`; pinned that a stale `self_state(action="set_mood")` writes nothing.
+  *Removed because nothing can write it any more.* `tools/self_state.py`; `selfhood/values.py` and the `SelfModel`
+  principle API with `evaluate_response_alignment`; the principle gate in finalize (`--principle-gate` stays
+  ACCEPTED and ignored, in `_DEPRECATED_NOOP_ARGS` — a launcher that passes it must still boot); `OpenQuestion`,
+  `UnfinishedThread`, their lists in `SelfState` and every writer, cap and reader of them; the question, thread and
+  principle lines of `overview` / `summary` / `stats` and the three counts in `stats()`; the idle "stale questions"
+  job (phase 2.8b) — its `open_questions` phase is in `RETIRED_PHASES`, so a week of old rows does not print
+  "UNREGISTERED phase" (§4SZ's `self_play` lesson); the question input of the diary's recall query and the
+  open-question wording of the diary prompt; the `values` block of the (unwired) wake-up prefix builder.
+  *The `curious` signal.* `derive_mood` rule 4 needed an open question under 24 h old. None can be written, so it
+  could never fire again: the rule, its two signals and the label in `DERIVED_MOOD_VOCAB` are removed, not re-based.
+  `curious` remains a label the agent may set itself (the face's colour for it is untouched).
+  *Old files.* `SelfState.from_dict` filters unknown keys, so a `state.json` with the two lists loads with its mood
+  and last-active stamp; the next write (every captured turn stamps the session) holds no lists. `values.json` is
+  never read or rewritten (archived at deploy).
+- **Change 3 — `fact_check`.** *Sources.* On success the result is the verdict FOLLOWED BY "SOURCES the verdict
+  rested on (N sources; …)": for each block of the research report that contributed (it loaded and holds facts) the
+  URL, the title when the search gave one, and the head of the extracted evidence — at most 8 sources, 120 / 300
+  characters, 3,200 for the section, the rest counted. Read from the report in hand (`factcheck_sources`), no fetch,
+  no model call. The report carries URLs only; `_deep_research_core` takes an optional `source_titles` dict and fills
+  it from the search results (an out-parameter: the report and its grammar are unchanged), and only a research
+  callable that marks itself (`accepts_source_titles`, the registry's) is asked — a plain callable is still called
+  with the claim alone. *Outside content.* Each title and evidence is flattened to ONE line, passed through
+  `neutralise_report_grammar`, and any result head inside it is marked as quoted (`‹fact check complete›`); every
+  line under the section head starts with text the tool wrote; every line of the VERDICT after its first is
+  quoted (review item 6; the first cut quoted only a line that started like a head). One head, one section,
+  whatever a page says. `neutralise_report_grammar` also quotes `FACT CHECK PARTIAL`
+  and the section head in page text now. Heads, statuses and reason codes are unchanged; PARTIAL and FAILED carry no
+  section; the tool stays in every outside-content list and in `SOURCE_EXCLUDED_TOOLS`.
+  *One wall clock.* The research await had no bound (its page phase stops at 190 s; the search waves before it did
+  not): it is cut at phase + 90 s (the waves, reformulations and the query rewrite at their own ceilings are 77 s). The verify call gets what the whole-call clock leaves, at most its own 150 s; with
+  under a second left it is not started (a side call on the main model saves the conversation first). Default total
+  = the two halves' own ceilings (~580 s), `GHOST_FACTCHECK_TOTAL_S` for less. A verify that runs out → the PARTIAL
+  shape with the research in hand (`factcheck_verify_timeout`). A research that runs out has NOTHING in hand, so it
+  is `FACT CHECK FAILED … NOT verified — treat it as unchecked` (`factcheck_research_timeout`), worded as transient
+  like the no-source failure (§4GI r3).
+  *The memory switch.* `is_fact_check = "fact-check" in lc or "verify" in lc` switched hydration off for any message
+  with "verify" in it. Now `is_fact_check_request` (first cut: "fact-check", "fact check", "factcheck" and
+  `fact_check` as a word anywhere; narrowed to the first line by review item 5; DELETED in review r2 — no message
+  switches memory off). Its only reader was `should_fetch_memory`.
+  *Description.* + "State the claim as ONE sentence, as you want it judged. The reply is a verdict followed by the
+  sources it rested on."
+- **Change 4 — `notify_operator`.** *Who is polling now.* The consumers file holds positions and is not rewritten by
+  an unchanged ack (2026-08-01), so nothing on disk tells a live client from one gone for five days. The pending
+  endpoint now notes each poll in memory on the context (`note_consumer_poll`, 32 names at most); a restart forgets
+  it and every live client is back within one poll interval. A client is a channel only if it polled within 5
+  minutes AND has a stored position (one that never acked is re-baselined past every record on each poll, so it
+  receives nothing — it is named as such). Every other known client is named on a "Not reachable now" line: "not
+  polling now — last polled 5.0d ago" / "no poll since the agent started". *Wording.* "Notification queued …", never
+  "delivered"; with a registered client and none polling: "queued; no client is polling right now — it is
+  delivered when one reconnects" (the texts for no registered client, an unreadable client list and the names
+  are review items 7–9).
+  *The digest.* The digest's filter is one predicate now (`digest_shows`, used by `render_activity_digest`); the
+  tool asks it about a record shaped like the one it wrote, so "next-turn digest" is named for a scheduled or job
+  turn and not for an owner turn. *Description.* "their own notification channels (Slack DM, the web console; phone
+  push only when configured)", "reaches ONLY the operator" kept. Unchanged: the 500-character clamp, the rate limit,
+  the probe dry run, the outside-content prefix, the finish-line steer and the backstop (`_notify_delivered` reads
+  the status and the head).
+- **Found while cutting.** (1) *A test I wrote caught my own extractor*: `factcheck_sources` removed the FIRST
+  "[EDGE EXTRACTED FACTS]" anywhere in a block, so a page that wrote the marker in its text lost it there and kept
+  the block's own; it now removes only the leading one. (2) *An equivalent layer, removed*: `source_block_failed(b)
+  or not distilled_block_has_facts(b)` — the second already answers False for a failed block. (3) The harness
+  `scripts/selfhood_functional_test.py` drove `self_state` in its section C and read the question lists in section
+  G: section C is removed (its subject is gone), G uses the mood. (4) Three older batteries anchored on lines this
+  change edits (`mutate_4ta` T4, `mutate_4sz` W5, `mutate_4sv_b` I7): the first two anchors follow the new lines,
+  I7's subject (the self-image line's place among the carried-state lines) is gone and the mutant with it.
+- **Head.** Tool definitions, `len(json.dumps(defn))`, after the review: `replan` 337 → 0; `self_state` 1,922 → 0;
+  `introspect` 3,527 → 3,508 (one more action, two more parameters); `fact_check` 307 → 424; `notify_operator`
+  928 → 957; `abort_attempt` −30 (the pointer at `replan`). The five together 7,021 → 4,889 characters; all
+  definitions 63,970 → 61,808 (31 → 29 tools). The system prompt's SELF
+  SURFACE rule lost "open questions" twice and gained the write: 1,262 → 1,337 characters.
+- **Tests.** New: `test_4tb_replan_removed.py`, `test_4tb_set_mood.py`, `test_4tb_fact_check.py`,
+  `test_4tb_notify_delivery.py` (behavioural; the guards through the real dispatch; AST enumerations for the removed
+  names). Each test of every touched file was judged against the cut tree before anything was deleted. Deleted with
+  their subject: `test_values_substrate.py` (15, principles) and `test_selfhood_self_state_tool.py` (its `set_mood`,
+  disabled-model and bad-argument cases are ported to the new file); the question / thread writers, dedup and caps
+  in `test_selfhood_state_thread.py` (6) and `test_bug_hunt_fixes.py` (2, `_cap`); the `curious` rule's five tests
+  and the two `self_state list` views in `test_selfhood_derived_mood.py` (the same staleness property is pinned on
+  `introspect stats` beside them); the stale-question gardener (4); the principle and carried-state renders (4);
+  `self_state`'s missing-target pin; `replan`'s own unit test; the source-text pin of the marker's two dialects.
+  Ported, not deleted: the mixed-window rule, the diary's blend (driven by a fresh mood now), "an unavailable write
+  is REJECTED", "a non-string action does not raise" (→ `introspect`), the idle window's mid-phase witness (stale
+  questions → the diary), the scrub pins (the note is no leak; a `replan` call is one, both dialects), the notify
+  client pin. `scripts/mutate_4tb.py`: 57 mutants + 2 controls; `check`: anchors OK. Before the battery, each
+  mutant was applied by hand to a scratch copy of the tree and the pins run (a fixed test list, not the
+  coverage-selected battery): 57 of 57 killed, the known-bad control killed, the no-op control survived.
+  Suite in the working copy: 29,844 passed, 81 skipped, 1 failed — the test that looks for the CLI link beside the
+  repository, which a copy of the tree does not have; lint gate OK. The source-text pin baseline went down by 3
+  (884 → 881: the marker's dialect pin) and the lint baseline lost the entry of the deleted `self_state.py`.
+  After the review (the four files hold 369 tests): 30,034 passed, 81 skipped, the same 1 failed; lint gate OK.
+  After review r2 (400 tests in the four files): 30,064 passed, 81 skipped, 2 failed — the same location test and
+  `test_interface_face_temperament.py::test_matrix_graph_feeds_and_reads_the_temperament` (a web-face animation
+  test with a random draw: `restSpeed` 0.847 against a 0.85 bound; untouched by this change, 3 of 3 green when
+  run alone); lint gate OK.
+- **What was NOT changed.** `manage_projects(action="replan")`. The watchdog itself. The derived mood, the diary,
+  the Mirror, `/api/health`'s mood, the face. No intensity, duration or effect of a mood on replies. The read
+  actions of `introspect`. The research report's grammar. The notification transports and the clients.
+  Not removed, found on the way: the selfhood wake-up prefix builder (`recognition.build_wakeup_prefix`,
+  `SelfModel.build_wakeup_prefix`) has no caller in `src/` — the functional harness renders it; a client that
+  never acknowledges its baseline never receives a notification (the result now says so; the endpoint is
+  unchanged); `_seen_in_conversation` asks `request_kind` in the context of the turn that RENDERS the digest;
+  nine older `mutate_*` batteries had stale anchors before this change.
+- **Independent review (a reader who did not write it): no critical or major defect; 11 MINOR and two groups of
+  NITs — all fixed, each with a test that fails without the fix.**
+  (1) *A description still pointed at the removed tool*: `abort_attempt` sent the model to `replan` "to escape a
+  hard problem". The pointer is gone, and one test walks every tool description, parameter description and the
+  system prompt for the name of a removed tool.
+  (2) *The sources section and the link check disagreed, in both directions.* (a) A report citing a URL the fact
+  check LISTED drew "LINK CHECK: … NOT fetched": `fetched_urls` did not read `fact_check` results. It now takes
+  the URL of each row (`factcheck_listed_urls`: a COMPLETE result only, the lines under the sources head only, a
+  line that is `N. <URL>` and nothing else). (b) A URL written in a page's TITLE or EVIDENCE entered the same
+  check as a page read. Every token of a title or an evidence that looks like a link — a scheme, `www.`, an onion
+  host, `name.tld/…`, an IPv4 address with a path — is replaced by "[link]", after entities and percent-escapes
+  are decoded until nothing changes (text that does not settle in 8 rounds is replaced whole) — this layer was
+  deleted in review r2. (c) A URL over 300
+  characters was CUT, and a cut URL is another URL: a row holds the whole URL or "(URL too long to list)"; an
+  address that is not http(s) is "(not a web address)". Rows are now `N. <URL>`, then `title:` and `evidence:` on
+  indented lines.
+  (3) *The same mood set again and again was never stopped.* Booking `set_mood` as a write (so two calls do not
+  collapse) also took it out of the no-progress breaker, which `self_state set_mood` was under. The breaker
+  counts `introspect` whatever the action: a note on the second identical call with the same result, a stop on
+  the third (five rounds through `_dispatch_and_process_tool_batch`).
+  (4) *A call without a mood cleared the standing one*: no argument, the label under another key
+  (`{"label": "happy"}`), `null`, a number. `mood` is required and must be text ("SYSTEM ERROR: 'mood' is required
+  for set_mood …", nothing changed); only the words `clear` / `none` clear.
+  (5) *The memory switch was still too wide*: "the fact checker script fails", "fact checkers disagree", a pasted
+  log naming `fact_check.py`. Now the FIRST LINE only (200 characters): the verb as one word (`fact-check`,
+  `factcheck`, nothing glued on) anywhere on it, or the two words "fact check" where the message STARTS with them
+  (after "please", "can you", "could you", "ok,"). "κάνε fact-check …" runs without memory; "κάνε fact check …"
+  and "use fact_check on …" keep it — the tool is called either way, and its verdict rests on outside sources.
+  (The rule was deleted in review r2.)
+  (6) *"A verdict line that starts like a head is quoted" did not hold for every line start*: `\r`, U+2028,
+  U+2029, VT, FF, NEL, NBSP indentation, zero-width characters, markdown emphasis. True by construction now:
+  separators are unified, the first line is the verdict line, EVERY later line is written with "> ", and a head
+  anywhere in the prose is marked (`‹fact check complete›`). The report neutraliser unifies the same separators
+  and accepts the same leads.
+  (7) *"Delivered when one reconnects" was false when no client had ever acknowledged* — a first-contact client is
+  baselined past the record: "queued in the activity ledger; no client is registered for notifications yet — a
+  client that connects later starts after this message and will not receive it". The old sentence stays where a
+  registered client exists and none polls. A polling client without a position was described twice, and the two
+  lines contradicted each other: one line now, "connected, but not registered yet … it may not receive this"
+  ("may": it does receive it if it then acknowledges a starting point it was given BEFORE the message — pinned
+  through the endpoint).
+  (8) *A cadence was claimed* ("poller, ≤30s"; nothing in the tree knows a client's interval): "(last polled 12s
+  ago)"; a client that is away: "not polling now — last polled 5.0d ago; it receives this at its next poll".
+  (9) *A client's name went from a request into text the model reads*: a name with a line break wrote a "SYSTEM
+  NOTE:" line of its own. A name is `[A-Za-z0-9_.-]{1,32}` where it is recorded AND where it is shown (any other
+  is served as before, never recorded, never shown — r2: counted, still never shown); a full poll table evicts the oldest entry WITHOUT a position
+  first (33 one-shot names pushed the live client out); "Not reachable now" names six and counts the rest; no
+  name twice; a consumers file that cannot be read → "Clients: the client list could not be read." and no claim
+  about who receives the message.
+  (10) *A facade with no caller*: `SelfModel.note_referenced_experiences` and the id stamp it read had none in
+  `src/`, `interface/` or `scripts/` → removed with their three tests. `SelfModel.build_wakeup_prefix` is KEPT:
+  the functional harness calls it twice; its test is restored.
+  (11) *Two texts still said a FATAL failure triggers a replan* — the docstring of `tools/tool_failure.py` and
+  `docs/tools/registry.html`. Both say what happens: the model is told "PERMANENT ERROR — do NOT retry this tool
+  call"; nothing re-plans.
+  NITs, `set_mood`: a guard that cannot be asked REFUSES (`guard_unavailable`) — the first cut let the write
+  through; the label and its evidence lose terminal escapes, control characters and chat-template tokens; a probe
+  of a disabled model is told "unavailable", not that a mood would have been set; the outside-content refusal is
+  the shared one (same words, status and reason as a scheduled task's, so the loop treats it as the same designed
+  stop). NITs, `fact_check`: the two settings are parsed defensively (`GHOST_FACTCHECK_TOTAL_S=abc` raised at
+  import and took the tools package with it); the research's own waits use the cancel-safe helper (on Python 3.10
+  the stdlib `wait_for` drops a cancellation that lands with the result — the research ran on after it was cut);
+  tests for five mutants that survived a reading (the URL bound, case-insensitive marking, FAILED / PARTIAL in the
+  marking, the side call's allowance, a research cut by a smaller total).
+  *A layer deleted on the way*: `_fc_outside_line` flattened whitespace before decoding and again after; the first
+  could not change the result (an encoded line break only exists after decoding).
+  Left as it is, reported: a URL the VERIFIER writes in its prose still enters the link check's haystack (the
+  model's text, as before this change — closed in review r2, below); `detect_referenced_experiences`,
+  `record_reference` and `get_by_ids` in `selfhood/autobiographical.py` have no caller in `src/` any more.
+- **Review r2 (a second, narrow read of the fixes): nothing major; 4 MINOR inside the fixes, NITs, test gaps.
+  Two layers DELETED, not refined.**
+  *Deleted — the fact-check memory switch.* A lexical test on the user's message that turned memory hydration off
+  for the turn. It misfired as the bare word "verify" (before §4TB), then as "fact check" anywhere, then — on the
+  first line only — on file names, paths and questions ("open factcheck.py", "the /factcheck endpoint returns
+  500", "what did I tell you about the fact-check I ran yesterday?") while missing "hey, fact check this: X". Two
+  rounds of misfires: by this project's rule a flip-flopping lexical rule is removed. `is_fact_check_request`,
+  the flag and its place in `should_fetch_memory` are gone; a fact-check turn is hydrated like any other. The
+  verdict never used memory — checked in the code: the verify call is sent a fixed system line and one user
+  message holding the claim and the research report, nothing else (pinned).
+  *Deleted — the broad "[link]" layer.* Replacing every token that LOOKED like a link in a title or an evidence
+  line (after eight rounds of entity / percent decoding) mangled ordinary text ("What is Node.js?" → "What is
+  [link]", "rose 12%ad revenue" → mojibake) and still let punycode names, single-label hosts and zero-width hosts
+  vouch for a link. The rule is structural now: for a COMPLETED check, link grounding reads only the `N. <URL>`
+  rows (`link_grounding._fact_check_seen` / `tool_row_text`, the reading `fetched_urls` already used) — never a
+  title, an evidence line or the verdict's prose. In a title or an evidence only an address written out
+  (`http://`, `https://`, `www.`) is shown as "[link]", for the reader; no decoding, no `word.tld` matching.
+  (M1) *The sources section was built from the report AFTER it was cut for the verifier*: a URL shortened by the
+  cut was listed and counted as fetched, the truncation notice stood as a source's evidence, sources past the cut
+  were missing. Built from the whole report; the cut applies to what the verifier is sent.
+  (M2) *A fact-check-only request got no end-of-request "Source check"*: `unopened_citation_note` did not count
+  `fact_check` as a fetching tool. It does (a listed source: no note; a made-up URL: the note).
+  (M3) the memory switch, above. (M4) *A registered client under a name that is no plain token was hidden* — and
+  the result then said nobody was registered and that the client would not receive what it did receive.
+  "Registered" and "polling" are decided from ANY stored position and any recorded poll (a client with a position
+  is recorded whatever its name; the table is keyed by the raw name); only the DISPLAY is restricted: "another
+  client (name not shown; last polled 12s ago)", "2 other clients (names not shown; …)".
+  NITs: mood label and evidence lose Unicode format characters (Cf), and a label with nothing visible left is the
+  "'mood' is required" error; a verdict with nothing visible in it is the PARTIAL shape, not `FACT CHECK COMPLETE`
+  over an empty line; a head spelled with zero-width or full-width characters is marked (found in the NFKC form
+  without format characters, which replaces the text only when it holds such a head — "10 m²" stays); a source
+  URL with an upper-case scheme is a web address; a research left behind at the time bound has its exception
+  read (no "Task exception was never retrieved"). Pinned, no change needed: six quiet clients end with a full
+  stop, not "; +0 more" (the tail was already conditional); `{"slack": null}` is no registration; a verify budget
+  of 0 falls back to 150 s.
+  *Measured, not changed:* the contained-run refusal costs ONE strike through the dispatch, the same as the
+  outside-content refusal (and as the scheduled task's, its sibling); the member refusal costs none because the
+  dispatch refuses a member before the tool runs. The three are the same outcome shape (REJECTED, nothing
+  changed); the equality is pinned.
+  *Left on purpose:* "NONE." and "clear it" are stored as labels (only the exact words clear); set → clear → set →
+  clear → set is stopped by the no-progress breaker; a check that did not complete (PARTIAL / FAILED) is read
+  whole for grounding — it is the research report, as a `deep_research` result is. Deleted with their subject:
+  the fact-check-request table and its two `handle_chat` tests (one test of the opposite replaces them), the
+  disguise matrix of the old link layer, and `test_agent_skips_bus_on_fact_check_query` (it asserted on a method
+  hydration does not call, so it had never pinned anything); the second scenario of
+  `test_agent_query_expansion_and_bypass` now asserts the lessons ARE fetched for a fact-check message. An older
+  battery (`mutate_4qm` Q1) anchored on the removed line and follows the new one.
+- **Battery `scripts/mutate_4tb.py`:** first run 57/57 killed (with `tests/test_selfhood_derived_mood.py` added to
+  the pins). After the review: 113 mutants + 2 controls (56 new, 16 of the first 57 re-anchored on the changed
+  lines), `check`: anchors OK. Each was applied by hand to a scratch copy and the pins run: 113 of 113 killed, the
+  known-bad control killed, the no-op control survived — eight of the new ones survived the first pass and got a
+  test each (a probe of a disabled model, the argument read before the guards, case-insensitive quoting in the
+  report neutraliser, text that never stops decoding, a row only as a whole line, a row on the verdict line, the
+  default clock's save allowance, an odd name taking a place in the poll table). After review r2: 129 mutants +
+  2 controls — 8 removed with the deleted code (the memory switch F14 F15 F20–F23, the decoding passes F31 F32),
+  24 added (F46–F61, M32 M33, N29–N34), 16 re-anchored (F5 F6 F7 F11 F18 F19 F27 F29 F30 F44 N16 N17 N18 N25 N27,
+  and F54 once more after its first form survived: the two blank-edge loops overlapped and became one
+  expression); `check`: anchors OK; by hand in scratch copies 129 of 129 killed, known-bad killed, no-op
+  survived. Battery re-run: see the deploy line.
+
+- **Battery / deploy.** `scripts/mutate_4tb.py`: full run 113/113 before the second fix round, then the 39 added or changed mutants re-run — all killed; the no-op control survives when run without five other trees beside it (in the full run it read KILLED on `test_4rd_live_stop`, a timing-sensitive test that passes alone 3/3 and appears in no mutant's result). Full suite in the copy 30,064 passed (the location test and one random face-animation test aside), lint OK. Swapped in from the tree copy with one gated restart on 2026-11-06 01:55; head 24,991 → 24,469 tokens; `selfhood/state.json`, `values.json` and the mood history copied to `backups/learning-removal-20261105/selfhood-before-4tb/`, `values.json` then removed from the live store. Live probes: a greeting (introspect overview), "change your mood to cheerful" (introspect set_mood, a probe's dry run, mood unchanged) and a notification (dry run) — no error, no prefix-warmup miss. Post-deploy suite on the live tree: 30,065 passed, the random face-animation test the only failure.
+
+## §4TC — the mood becomes a real one: automatic, adjustable in chat, audible in the reply, with a journal (2026-11-06, operator: "some ideas about set_mood. it should: 1. Be mainly Automatic and autonomous. we need to re-evaluate how mood is being calculated / estimated automatically now. 2. You adjust its mood in chat. don't be so grumpy, "cheer up", "be more sarcastic", be neutral. etc.. 3. The mood should be able to set the tone of the reply. that would make things interesting.. 4. Intensity should be variable (1-3). 5. A mood with a story. introspect should be able to keep a journal... things i'm not sure. when does the mood change ? and what changes it." → decisions: "automatic mood set can reach 3"; thumbs and corrections move it ("2 yes"); "everyone hears it"; "make sure that the variable mood prompts don't affect the save-restore head and that these sit after head"; after the live comparison: "mood applies" to incidents and bad news too, and "level 3 can say it's in a mood")
+
+**R0 — scope, property, threat model.** Scope: the mood — how it is computed, what moves it, how the owner
+adjusts it (`introspect(action="set_mood")`), how a reply hears it, and how it is read back (`introspect`, the
+diary, `/api/health`, the face). Property: the mood is a pair of numbers that decays by itself and is moved by a
+closed list of events, each with a named size, and by nothing else; only a real owner request moves it; every
+main-loop reply hears it through ONE line whose text depends on (label, intensity, manner, manner intensity)
+alone; that line sits in the per-turn state block and the cached / saved head is the same bytes under every mood;
+a neutral mood with no manner adds zero bytes; `set_mood` is called by the same requests as before, refuses the
+same ones the same way, and stores no free text; every change of label or intensity is one row of a bounded
+journal; an old file on disk loads. Threats: a mood line that reaches the system slot or a tool description
+(a 28k-token head re-read on every mood change); a stated cause read as a fact about the world (seen live); a
+probe, a member, a scheduled task or a leaf moving the owner's mood; a read that writes; a label that flickers
+as the pair decays across a boundary; the boredom of a long quiet vanishing at the moment the owner's request
+resets the clock it is read from; a streamed turn's hook reading the NEXT request's flags; a test of the old
+mood deleted while the behaviour it pinned is still live; older batteries anchored on the lines this changes.
+
+- **Evidence that the old automatic mood had to go (three months of the mood history).** The derived mood changed
+  148 times and only three labels ever fired: `idle` 101 (owner quiet > 30 min), `satisfied` 30 (the last 5
+  verdict-bearing turns all passed), `stuck` 12 (3 of the last 5 failed); `overloaded` and `curious` never. It
+  keyed on verifier verdicts, most of which have been off since mid-October, and test traffic made it "stuck".
+  No reply depended on it.
+- **Evidence from the live comparison (36 labelled probes; a candidate line in the per-turn state block).** Weak
+  wording ("colour the wording only") was inaudible for moods. The STRONG wording was clearly audible at level
+  2, with facts, numbers and tool use identical in every cell. Three problems shaped the spec: (1) a stated
+  CAUSE was treated as fact — an invented "nothing has happened for hours" made the model move a 15-minute-old
+  event to "the morning" → the cause is not in the line; (2) the mood steered WHAT was mentioned (an irritable
+  arm led with a negative item) — accepted by the operator; (3) level 1 was too strong and level 3 announced
+  the mood → the level sentences below.
+- **The design — two numbers.** `selfhood/mood.py` (pure: no I/O, no clock read) and `selfhood/state.py` (the
+  stored pair, the journal, the read-modify-write under the state lock). Pleasantness `P` and energy `E`, each
+  in [−1, 1], in `state.json` with `updated_at`. Both halve every 2 hours, applied when the mood is read or
+  moved; no background job. Intensity = `max(|P|, |E|)`: < 0.20 none ("neutral"), ≥ 0.20 → 1, ≥ 0.45 → 2,
+  ≥ 0.75 → 3; no cap on the automatic one. Label = the region: the smaller of |P|, |E| over the larger is
+  under 0.40 → an axis label (`content` P+, `down` P−, `restless` E+, `bored` E−), else a diagonal one
+  (`cheerful` P+E+, `calm` P+E−, `irritable` P−E+, `tired` P−E−). `curious` is the P+E+ region reached through
+  a novelty event — a tag on the stored mood, kept while the pair stays in that region. Hysteresis: a held
+  label stands until the ratio is past the boundary by 0.10 (a sign flip always is); a held intensity is given
+  up only below its threshold − 0.04, at every level on the way down. Decay scales both numbers alike, so it
+  never changes the region; and a mood that only decays reads the same whenever it is looked at (pinned: one
+  store settled on the way, one not, the same label, level and "since" at every hour).
+
+  | constant | value |
+  |---|---|
+  | `HALF_LIFE_S` | 7,200 s |
+  | `INTENSITY_THRESHOLDS` / `INTENSITY_MARGIN` | (0.20, 0.45, 0.75) / 0.04 |
+  | `AXIS_RATIO` / `AXIS_MARGIN` | 0.40 / 0.10 |
+  | `EV_TROUBLE` (per failed call or guard event) / `TROUBLE_CAP` | (−0.12, +0.08) / 4 per turn |
+  | `EV_CLEAN_TURN` / `CLEAN_TURN_MIN_CALLS` | (+0.08, 0) / 3 |
+  | `EV_RESEARCH` (novelty) / `RESEARCH_MIN_SOURCES` | (+0.15, +0.20) / 3 distinct pages |
+  | `EV_LONG_TURN` / `LONG_TURN_S` / `LONG_TURN_CALLS` | (−0.15, −0.30) / 900 s / 25 calls |
+  | `EV_THUMB_UP` / `EV_THUMB_DOWN` | (+0.25, +0.05) / (−0.30, 0) — the up's energy became 0 in review r2 |
+  | `EV_CORRECTION` / `EV_PRAISE` | (−0.20, 0) / (+0.10, 0) |
+  | boredom, first cut: `BOREDOM_AFTER_S` / `BOREDOM_E_PER_HOUR` / `BOREDOM_E_MAX` | 10,800 s / 0.10 / 0.60 — REPLACED in the review |
+  | boredom, after the review: `BOREDOM_AFTER_S` / `BOREDOM_DEEP_AFTER_S` | 21,600 s → bored 1 / 43,200 s → bored 2, read-time only |
+  | `PRAISE_MAX_WORDS` / `THUMB_MAX_TURN_AGE_S` (review) | 6 words / 86,400 s |
+  | `ANCHOR_MAGNITUDE` (owner-set, intensity 1 / 2 / 3) | 0.32 / 0.60 / 0.90 |
+  | anchor directions (P, E) | cheerful, curious (1, 0.75); content (1, 0); calm (1, −0.75); restless (0, 1); bored (0, −1); irritable (−1, 0.75); down (−1, 0); tired (−0.75, −1); "excited" (0.75, 1) |
+  | `DEFAULT_INTENSITY` | 2 |
+  | `MOOD_HISTORY_MAX_ROWS` / `MOOD_HISTORY_KEEP_ROWS` / `MOOD_RECENT_CAUSES` | 1,200 / 1,000 / 5 |
+
+- **What changes it — the only writers.** Everything goes through `SelfStateThread.nudge(dp, de, cause, kind)`:
+  bring the stored pair to now, add, clamp, store, journal on a change, return before and after.
+  (a) *The end of an owner's turn* — `GhostAgent._record_turn_trajectory` (the shared trajectory-append path of
+  streamed and non-streamed turns, where the old hook sat) → `_mood_turn_signals` → `SelfModel.note_owner_turn`.
+  The signals are the loop's own: this turn's tool calls and which of them failed (the corpus's reconstruction,
+  so "failed" means here what it means there; a designed stop is not a failure; only the messages after this
+  turn's request count — the boundary rule of `_this_turn_step_count`, extracted as `_this_turn_boundary`); the
+  distinct pages the research tools read (`link_grounding.fetched_urls`); guard events (below); the turn's
+  duration. One turn's events are applied as ONE move with the causes joined. A plain chat turn changes nothing.
+  A turn cut from outside (`_record_aborted_turn`) is recorded and changes nothing.
+  (b) *Guard events* — a req-keyed ledger beside the breaker reports (`note_guard_event` / `guard_events_for`,
+  64 requests, popped when a request id is reused): an edit-churn steer and stop, a futility steer and report,
+  a killed thinking loop, every breaker that closes a request (inside `stamp_loop_breaker`), and a turn that
+  ended under the context-pressure lockdown (the semaphore-time snapshot the old hook carried).
+  (c) *The owner's reactions* — a thumb: `core/feedback.apply_human_label`, inside the existing selfhood gate
+  (the labelled row is a real owner turn; a member's turn was refused earlier), for a label sent by a client
+  the owner uses (`OWNER_LABEL_SOURCES`: web, clockwork, cli, slack:owner — an allow-list; "api", a script or
+  `slack:requester` do not count) and not for an identical repeat. A correction: the positive verdict of the
+  user-correction judge in `_promote_prior_turn_after_judge`. Thanks: a whole word of `PRAISE_WORDS` in the
+  owner's message, not right after "no" / "not", where the request starts in `handle_chat` (once per request).
+  (First cut. The review narrowed it to a short message of thanks and filler only, and gave the thumb a 24-hour
+  bound — below.)
+  (d) *Quiet* — decay needs no event. (FIRST CUT of boredom, as built — REPLACED in the review, below, by a
+  read-time rule that stores nothing.) Boredom: past 3 quiet hours the energy is pulled DOWN TO −0.10 per quiet
+  hour, at most −0.60 (under the third threshold: boredom alone reaches intensity 2). It is read off the clock
+  the agent already keeps (`context.last_owner_activity_time`, never written by the mood;
+  `selfhood.model.owner_quiet_seconds`, attached in `main.py`) by every reader, with nothing written. The
+  clock is reset by the heartbeat of the owner's next request — so `_heartbeat` first writes down what time
+  and the quiet did (`_mood_settle_before_owner_clock` → `SelfModel.settle_mood`), and the reply to "I'm back"
+  is the bored one.
+  (e) *The owner says so* — `set_mood`, below.
+  *Who may move it* (`mood_moves_on_this_request`, fails closed): request kind "owner", turn origin "user", and
+  the context neither a contained copy nor an owner-memory-isolated delegate nor a non-live population. Not a
+  probe, a member's turn, a scheduled task, a job wake, a sub-agent, self-play, a bench or replay run, a leaf.
+- **`introspect(action="set_mood")` and the manner.** Parameters `mood`, `intensity` (1–3, default 2; a number
+  out of range goes to its nearest end), `manner`, `evidence`. §4TB's guards are untouched (first cut; the review
+  added the owner-only gate, below): the member block
+  first, then the arguments, then contained → outside content → model unavailable → probe (dry run) → write;
+  fail closed; the cleaning of what is stored or echoed; the no-progress breaker. New: `mood` is one of the nine
+  labels or a synonym from a small table (happy / cheery → cheerful, grumpy / annoyed / cranky → irritable,
+  relaxed → calm, sad / low → down, sleepy / exhausted → tired, excited → cheerful with the energy as the
+  larger number, …); any other word is REFUSED with the list, before the guards, and a refused word refuses
+  the whole call. The pair is put on the label's anchor at the intensity; from there it decays and reacts like
+  any mood. `neutral` / `clear` / `none` put the pair at 0, 0 and clear the manner (a manner named in the same
+  call is set afterwards). The MANNER is separate: sarcastic, playful, formal, terse, gentle, dramatic (others
+  refused with the list); it takes the call's `intensity` — ONE parameter serves both, the simpler schema — does
+  not decay, and `manner="none"` clears only it. Relative asks ("cheer up", "don't be so grumpy") are the
+  model's to translate: one sentence with two examples in the description.
+- **Tone: one line per turn, after the head.** `_ds_parts` gets a section `mood_tone` right after
+  `owner_rules` (`_mood_tone_block`): `YOUR MOOD RIGHT NOW: <label>, <n> of 3.[ MANNER (set by the owner):
+  <manner>, <m> of 3.] Speak in that mood: it must be audible in HOW you phrase this reply - word choice,
+  rhythm - the way a person in that mood would say the same thing. <LEVEL> WHAT you say stays exactly as it
+  would be: the same facts, the same numbers, the same tool use, the same completeness, no refusing. This
+  applies to every reply, serious ones included.` LEVEL: 1 "At 1 it is a faint tint: word choice only, no
+  remarks about it."; 2 "At 2 it is clearly noticeable, with a remark or two in character."; 3 "At 3 it is
+  strong, and you may say outright that you are in this mood." Manner alone: `MANNER (set by the owner): …
+  Speak in that manner: …` with the same limits (its level 3: "At 3 it is strong throughout."). No cause, no
+  time, no decimal: the text is `tone_line(label, intensity, manner, manner_intensity)`.
+  *Who gets it* (`mood_is_heard_on_this_request`): owner (private and public surface), Slack members, probes,
+  scheduled-task turns, the wake-up of an owner's job. *Who does not:* `sub-` / `sim-` requests, bench and
+  replay ids, code outside a request, coding leaves, contained copies, self-play contexts; and no internal side
+  call — the verifier, summaries, the diary, the Mirror and the judges build their own prompts, and an AST walk
+  finds `tone` / `tone_line` / `_mood_tone_block` called in exactly two files.
+  *The head.* One request sent through the real `handle_chat` under five states (neutral, irritable 2,
+  cheerful 3, tired 1 + sarcastic, a manner alone), native tools on and off, the stable pin and the state
+  anchor on and off: the system slot + tool definitions hash to one value in each configuration
+  (`bbe05d6d00d5d16a`, 92,570 bytes, native; `bfb5e8c9280e8b7e`, 22,739 bytes, text tools; `head_shape`
+  identical); the line (410–477 characters) is found once, in the trailing `<system_state_update>` block,
+  never in the system slot or the tools. The saved head (`_head_payload`, owner and members) has one shape
+  under all five. A neutral mood sends byte for byte what an agent with selfhood off sends.
+- **A mood with a story.** One row per change of label or intensity: `label`, `intensity`, `p`, `e`, `at`,
+  `cause`, `kind` (turn / thumb_up / thumb_down / correction / praise / owner / quiet / decay), and the owner's
+  evidence as `note` on an owner row. A mood that wore off unseen gets its row from the next writer (an
+  owner's request settles it), DATED when it wore off — the decay is a formula (`decay_step_s`). The stored
+  mood also remembers the last 5 events that moved the pair, changed label or not: the "why". New read action
+  `introspect(action="mood")`: the mood now (label, n of 3, automatic / set by the owner, since when), the
+  manner, why, and today's timeline ("09:10 content 1 — … → 11:40 irritable 2 — 4 tool calls failed in this
+  turn → 12:05 cheerful 2 — the owner said so (set_mood)"), the newest 12 steps, "→ now …" when the mood has
+  moved since its last row. `overview` / `summary` / `stats`: label + intensity + the latest cause, and the
+  manner. The diary's state block: `My mood: irritable, 2 of 3.` and `My mood today: content 1 (…) → irritable
+  2 (…).` — steps and causes, no times of day (its prompt hash is the regenerate skip-guard); the prompt text
+  itself is unchanged; its recall query is the label, or nothing for a neutral mood. The Mirror does not read
+  the mood: unchanged.
+- **Outside the agent.** `/api/health` always carries `mood`: `label` ("neutral" when none), `intensity` 0–3,
+  `manner`, `set_at`, `source` ("auto" | "owner"). `status.js` passes label and intensity to the face;
+  `matrix_graph.js::moodHueFor` has the nine labels (low energy cooler: content −0.015 … tired −0.045; high
+  energy warmer: cheerful +0.025 … irritable +0.045; neutral and unknown 0) and `moodHueScale` scales by the
+  intensity (×0.5 / ×1 / ×1.5, at most ±0.0675, inside the ±0.07 the cold pole allows). The handheld's web face
+  is the same file (kept identical). The CLI and the handheld client do not read `health.mood`. Cache-bust:
+  matrix_graph.js 18.1, status.js 7.7, workspace.js 9.3, app.js 18.1.
+- **Removed.** `derive_mood`, `MoodSignals`, `DERIVED_MOOD_VOCAB`, the streak / idle constants,
+  `SELF_MOOD_GRACE_HOURS`, `MOOD_STALE_AFTER_HOURS`, `mood_is_stale`, `provenance_phrase`,
+  `describe_mood_provenance`, `age_phrase`; `SelfModel.update_derived_mood` and `_maybe_retire_acute_mood`;
+  `SelfStateThread.set_mood` / `clear_mood` and the `include_mood_age` switch of `format_as_prefix`;
+  `AutobiographicalMemory.recent_verdicts` with `is_aborted_record` / `ABORTED_ROW_MARKS` (its only reader);
+  the `evidence` / `set_at` / `source: self|derived` mood record; the overview's "BUT N of the turns listed
+  below FAILED" clause and `_failed_listed` (there is no "all passed" claim left to qualify); `last_mood_evidence`
+  in `stats()`. Kept from the old hook: the `pressure_lockdown` snapshot plumbing — it now feeds one guard event.
+- **Old files.** A stored mood without a pair (`{"label", "evidence", "set_at", "source"}`) is no mood: the
+  state loads, the rest of the file is kept, the mood starts neutral and the next write stores `mood: null` or
+  the new shape. Rows of that shape in `mood.history.jsonl` stay in the file and are skipped by the reader —
+  also a row whose label happens to be one of today's ("curious"). A hand-edited mood costs the mood, never the
+  state (every field coerced).
+- **Found while cutting.** (1) *Two equivalent layers, deleted before the battery could not kill them*: the
+  store clamped a pair every writer had already clamped; and the heartbeat skipped the settle under the boredom
+  threshold — a settle that finds nothing changed writes nothing anyway. Without the second, an owner's request
+  also writes down a mood that wore off, which is what dates the journal. (After the review the settle is no
+  longer in the heartbeat at all: `_mood_owner_arrived`, once where `handle_chat` takes the request.) (2) *The row of a worn-off mood was
+  dated when it was noticed*, and a mood two levels down read differently depending on who had looked in
+  between (the margin held only the stored level): the level is now the highest one ≤ held whose lowered bound
+  is still met, and the row carries the crossing time. (3) *"Neutral" with a pair left under the first
+  threshold was a no-op*: one thanks later the mood was back. It zeroes the pair. (4) *A long clean turn read
+  "bored"*: the clean-turn bonus cancelled the pleasantness of the long-turn event, leaving energy alone; a
+  long turn is not also a clean turn. (5) `owner_quiet_seconds` raised on an aware datetime (caught by its own
+  test). (6) Only one older battery anchored on the changed lines — `mutate_4tb`: 11 anchors. Seven follow the
+  new lines (the known-bad control, M3, M6, M11, M20, M21, M30); M4, M5, M16, M17 went with their subjects
+  (the derived mood, the self / derived provenance, an old stored mood being kept); its pin list lost the
+  deleted test file. Checked by reading every battery's table without running it (AST: assignments only).
+  (7) `docs/logging.html` regenerated: the `selfhood` title is now logged from `selfhood/state.py` (one line per
+  journal row), no longer from `selfhood/model.py`.
+- **Head.** `introspect` definition, `len(json.dumps(defn))`: 3,508 → 3,926 (+418; allowance 450). All
+  definitions 61,808 → 62,226 (29 tools). The system prompt's SELF SURFACE rule: "mood with evidence" → "mood
+  with its cause", + "`mood` for why-are-you-in-this-mood", and the write sentence now names `mood` and/or
+  `manner` with three of the operator's phrases. All static text.
+- **Tests.** New, behavioural: `test_4tc_mood_engine.py` (251: decay, thresholds, regions and their margins,
+  every event's sign / size / cap, boredom, anchors and synonyms, the journal and its bound, what a read may
+  write, old files), `test_4tc_mood_hooks.py` (97: each hook through the method that carries it —
+  `_record_turn_trajectory`, the real SSE drain, `apply_human_label` over a real collector,
+  `_promote_prior_turn_after_judge`, `handle_chat`, `_heartbeat` — and who may trigger it; AST enumerations of
+  the guard sites, of every caller of a mood writer, of the one writer of the owner clock),
+  `test_4tc_set_mood.py` (83: labels, synonyms, refusals, intensity, manner, neutral, the `mood` action, the
+  view lines), `test_4tc_tone_line.py` (74: the text per level, who hears it, the real loop's payload, the head
+  hash, the saved head, zero bytes for neutral). `test_4tb_set_mood.py` keeps every guard test, driven with
+  labels the action accepts (70 test functions → 121 collected cases).
+  *Deleted with their subject:* `test_selfhood_derived_mood.py` (86: the rule table, the grace window, acute
+  retirement and hold, the staleness TTL and provenance wording, the verdict back-scan) and
+  `test_mood_ignores_aborted_rows.py` (4: the back-scan's aborted-row filter); in `test_4tb_set_mood.py` the
+  six-hour hold, "after a clear the derived mood resumes", "a clear never removes a derived mood"; in
+  `test_census_open_classes_4qj.py` the four tests of the "satisfied above a failed turn" clause.
+  *Ported, not deleted:* the timestamp helpers; a hand-edited timestamp costs the mood line only; the diary
+  block is the same text until the mood changes, and its recall query is the label alone (nothing for a mood
+  that wore off); the end-of-turn hook's origin gate, its preference of the lockdown snapshot over the live
+  flag, and the executed streamed-drain pin; "an abort from outside is not something that happened to me"
+  (through `_record_aborted_turn`); the 64 / 300-character clamps (the evidence; an echoed unknown word); the
+  cleaning of control characters, escapes, chat-template tokens and format characters; "clear-headed is not a
+  clear" (now: it is no label either); old state and history files; the idle tick writes no mood (now for every
+  writer); the face's hue bound; `/api/health`'s tolerance of a missing or mock mood.
+  `scripts/mutate_4tc.py`: 90 mutants + 2 controls, `check`: anchors OK. Before the battery, each mutant was
+  applied by hand to a scratch copy of the tree and a fixed list of pins run: 90 of 90 killed, the known-bad
+  control (the mood line appended to the system slot) killed by the head-hash test, the no-op survived — one
+  survived the first pass (the journal's cap, which the test scaled with the constant) and got its pin. The 23
+  `set_mood` mutants of `mutate_4tb.py` that still apply were re-run the same way: 23 of 23 killed.
+  Suite in the working copy: 30,478 passed, 82 skipped, 1 failed — the test that looks for the CLI link beside
+  the repository, which a copy of the tree does not have; lint gate OK (99 error-class findings, the baseline). The
+  first full run also failed `test_4nv_log_lines.py::test_the_title_table_in_the_docs_is_current` (item 7 above).
+- **What was NOT done.** No LLM call classifies a mood or praise. No configuration flag. No change to owner
+  rules, other tools, the lesson store, the learning report, scheduled tasks. The Mirror is untouched. The
+  manner has no journal rows (the timeline is the mood's). The live files were not migrated (archived at
+  deploy; an old state loads and an old mood is ignored). Not fixed, found on the way: with `--no-trajectories`
+  the end-of-turn hook does not run (it lives on the trajectory-append path, as the old one did); the owner
+  clock is in memory, so the first owner request after a restart sees no boredom; `turn_origin` is "user" for a
+  `bench-` / `replay-` / no-request id on the live context, so `capture_turn` stamps the last-active time for
+  them (the mood's own gate asks the request kind as well); `tests/test_interface_face_temperament.py::
+  test_matrix_graph_feeds_and_reads_the_temperament` fails on a random draw about one run in three, alone and
+  unchanged by this work (it never calls the mood functions).
+
+- **Independent review (a reader who did not write it): R1 (the head), R3, R4, R5 and R6 held in every experiment;
+  2 MAJOR and 10 MINOR — all addressed, each with a test that fails without the fix and mutants in the battery.**
+  **MAJOR 1 — `set_mood` was not owner-only.** `_mood_guard` refused a contained run, outside content, a member
+  and a probe, and nothing else: a real `handle_chat` turn under a `sched-` / `job-` / `sub-` / `sim-` / `bench-`
+  / `replay-` id SET the mood and the manner "on the owner's word", and a direct call was not refused for a
+  context marked leaf / sim / bench / owner-memory-isolated / with a read-only skill store. A manner never wears
+  off and everyone hears it. Now the write runs only where the automatic mood may be moved — the same predicate,
+  `mood_moves_on_this_request` (request kind "owner", turn origin "user", not contained, not isolated; anything
+  but a plain `True` is a no; a check that cannot be asked refuses with `guard_unavailable`). Everyone else gets
+  "SYSTEM BLOCK: only the owner can set the mood or the manner — nothing was changed. …" (`owner_only`, REJECTED,
+  nothing changed, the strike cost of the contained-run refusal — pinned side by side through the dispatch).
+  Order: member → the arguments → contained → probe or owner's own request → outside content → model
+  unavailable → probe dry run → write; so a scheduled turn that read a page is told "owner only", not to ask
+  for a confirmation in a new message. This NARROWS §4TB, where the owner's scheduled and job turns could write
+  (no §4TB test pinned that; its docs said so and are corrected). Pinned through the tool for eight request ids
+  and five context marks × five kinds of write, through the dispatch, and through real `handle_chat` turns for
+  six id kinds (the model calls `set_mood` with a mood and a manner; nothing is stored) beside an owner turn
+  that sets both and already hears them in the reply that confirms it.
+  **MAJOR 2 — boredom redesigned (the operator's decision, delegated to the reviewer; built as specified).**
+  Replaying a month of the owner's real turns against the first rule: boredom written into the pair at his
+  return left only 13 % of his turns starting neutral and about 40 % starting "bored"; every overnight scheduled
+  report would have been written bored; and it depended on whether a restart fell in the night (the owner clock
+  was in memory). THIS REPLACES THE FIRST BOREDOM RULE. Now: boredom is READ-TIME ONLY and never stored into the
+  pair — `SelfStateThread.mood()` reports `bored` 1 once the owner has been quiet ≥ 6 h and `bored` 2 once
+  ≥ 12 h, never more, only when the stored, decayed mood is neutral (a real mood that has not worn off, the
+  owner's included, is not replaced). A request being answered by the owner never reads it (`request_kind() ==
+  "owner"` → no quiet; his message ended it); probes, scheduled turns, job wakes and members answered during
+  the quiet do. The quiet is measured from a PERSISTED stamp, `last_owner_turn_at` in `state.json`, written
+  through the owner-only gate when an owner's request arrives (`GhostAgent._mood_owner_arrived`, called once
+  where `handle_chat` takes the request — the settle left the heartbeat) and when it ends
+  (`_record_turn_trajectory`, a turn that was cut included); the in-memory clock is asked only while there is
+  no stamp; the agent's own activity clocks are never written. When the owner returns the stored pair is
+  whatever it had decayed to — the quiet simply ends. Journal: one row when a read first sees bored 1, one for
+  bored 2, each dated when its threshold was crossed, and one "the quiet ended" row at the owner's return if a
+  bored row was written — each at most once per quiet: what the quiet already has is read off the journal
+  (`_open_boredom`: quiet rows since the last "quiet ended", not before the quiet began) and remembered in
+  memory, so a poller adds no row per poll, a restart adds no second row, and a thumb that came without a turn
+  neither reopens nor hides the quiet. A mood that wore off unseen is written down before the first bored row,
+  so the journal stays in order. The diary no longer reads the mood of the instant: its state block is the
+  last-active line, the manner and the day's journal steps WITHOUT the quiet rows, and its recall query is the
+  label of the day's last step — the review saw three diary model calls for one quiet stretch; the block is now
+  byte-identical through bored 1, bored 2 and the owner's return. Removed with the first rule:
+  `boredom_floor`, `BOREDOM_E_PER_HOUR`, `BOREDOM_E_MAX`, `settle`'s quiet argument, `SelfModel.settle_mood`,
+  `_mood_settle_before_owner_clock`.
+  **MINOR.** (3) *No code change, said plainly:* the correction event keys on the existing user-correction
+  judge, which had ZERO positive verdicts in the last 30 days of live logs. No lexical correction detector was
+  added. In practice the owner's thumbs are the reaction signal; a correction moves the mood only when that
+  judge fires. (4) *Praise false positives* — 6 of 18 live matches of the word list were not praise ("make it
+  look awesome", "…this wasn't awesome"). `has_praise` is narrow now: at most 6 words and, punctuation, digits
+  and emoji aside, nothing but thanks / praise words or pairs and filler, at least one of them praise. The
+  review's fixtures are pinned both ways ("a great number of files", "thanks to the cache it works", "Great
+  Britain's capital?", "perfect square numbers", "oh great, it broke again", "no, thanks", curly-apostrophe
+  "isn't great", Greek negation, a pasted document ending "thank you"). (5) *Six tests of LIVE code were deleted
+  by my own slice* in `test_selfhood_enhancements.py` (the IDF cache ×2, the reference counter ×2,
+  `detect_referenced_experiences` ×2 — the cut that replaced the mood-history tests ran on to the next section
+  header): restored from the live tree's copy, they pass unchanged; every edited test file's test names were
+  then diffed against the live copy and only the intended differences remain. (6) *A byte that is not UTF-8 in
+  `mood.history.jsonl`* made `introspect(action="mood")` fail with UnicodeDecodeError, lost the diary's
+  timeline and switched the growth cap off: the reader decodes with `errors="replace"` and skips what does not
+  parse; the cap counts and rewrites BYTES. (7) *Under the state anchor a mood changed mid-request left two
+  contradictory lines* for the later calls of that request: the trailing block's changed `mood_tone` section
+  now starts "UPDATED — this replaces the earlier mood line." (`_state_changes`, that section only — the
+  mechanism has no general hook); pinned with a five-call turn that sets the mood at call 3, native and text
+  tools: calls 4 and 5 carry the old line where it was first shown and the marked new one in the trailing
+  block, and the head hash is one value over all five calls. (8) *What the mood does not look at:* every
+  `introspect` row and every designed refusal (`MOOD_BLIND_REASONS`: `untrusted_content`,
+  `owner_data_blocked`, `owner_only`) is left out before anything is counted — neither trouble nor a "clean"
+  call; and a turn in which the owner SET the mood or the manner (a `set_mood` call that succeeded) gets no
+  automatic move (`TurnSignals.owner_set`): a wrong word then the right one lands exactly on the anchor, and
+  "cheer up" with four failing calls, a guard event and context pressure in the same turn stays cheerful 2.
+  (9) *A thumb moves the mood only when the turn it labels is at most 24 hours old*
+  (`feedback.turn_is_recent_enough`; a turn whose time cannot be read does not; the label is recorded either
+  way). (10) *A context-pressure lockdown is journalled as* "the context ran out of room (context pressure)",
+  not as "a loop guard stepped in" (`TurnSignals.pressure`; still one unit of trouble). (11) *Four mutants the
+  review found alive, now pinned:* "today" is the LOCAL day (a `now` near midnight, east and west of UTC); a
+  stamp from another day carries its date; "Why" shows the last three causes; a SETTLED step-down of an
+  owner-set mood keeps `source: owner` on disk. (12) *The research tag was lost when the same turn had one
+  failure* (it read "restless"): the tag is no longer tied to the diagonal region — a mood moved by a novelty
+  event reads "curious" for as long as P > 0 and E > 0. Trouble wins the sign of P: research + one failure is
+  curious 1 (P = +0.03), research + two is restless (P = −0.09) and the tag is dropped.
+  *Not done as specified, and why:* (a) the review asked for praise to count "with no negation word anywhere";
+  there is no separate negation list — a negation is neither praise nor filler, so the only-praise-and-filler
+  rule already rejects it, and a second list was a layer no mutant could kill (pinned instead: no negation is
+  ever in the praise or filler sets, and every negated fixture is not praise). (b) "store [the owner stamp] when
+  an owner turn ends": it is ALSO stamped when the owner's request arrives — without that, a poller during the
+  owner's own long turn would read the previous turn's end as the quiet and write a bored row inside his turn.
+  (c) "applies only when the stored mood is neutral and no owner-set mood is active": one condition — an
+  owner-set mood that is active is not neutral. *Left on purpose:* a read never MOVES the mood, but while it sees a boredom it can
+  settle a mood that wore off unseen (the stored pair is rewritten to its decayed value — the same value any
+  reader computes from it — with its "it wore off" row) and add the row of a boredom level it is the first to
+  see; these are the only writes a read makes;
+  a thumb does not stamp the owner's presence; with `--no-trajectories` the END of a turn is not stamped (the
+  arrival is); the manner still has no journal rows.
+  *Tests after the review:* `test_4tc_mood_engine.py` 314 (was 251), `test_4tc_mood_hooks.py` 133 (97),
+  `test_4tc_set_mood.py` 170 (83), `test_4tc_tone_line.py` 81 (74); `test_4lz_truth.py`'s unavailable-write test
+  now runs as an owner request (outside one it is the owner-only refusal, pinned beside it). `scripts/mutate_4tc.py`: 135 mutants + 2
+  controls (`check`: anchors OK) — 8 removed with the first boredom rule and the word-list praise (B2–B7, E17,
+  E18), 53 added, 11 re-anchored on changed lines; `scripts/mutate_4tb.py`: anchors unchanged. By hand in
+  scratch copies, a fixed list of pins: 135 of 135 killed on the first pass, the known-bad control killed by the
+  head-hash test, the no-op survived; the 23 `set_mood` mutants of `mutate_4tb.py` re-run after the guard's
+  reorder: 23 of 23 killed. Suite in the working copy after the review: 30,677 passed, 82 skipped, 1 failed —
+  the location test; lint gate OK (99 error-class findings, the baseline). (The run before it also failed
+  `test_4lz_truth.py::test_an_unavailable_mood_write_is_rejected`, which called `set_mood` outside any request:
+  the test above.)
+
+- **Review r2 (a second, narrow read of the fixes): nothing critical or major; 8 items, all addressed, each with a
+  test that fails without it and a mutant.**
+  (1) *The journal's order during a quiet.* (a) A thumb at +5 h whose mood wore off AFTER the six-hour line gave
+  `content 1 → neutral (wore off) → bored 1` with the bored row dated BEFORE the wearing off: a boredom — the
+  row and what a read reports as "since" — is dated at the later of the threshold crossing and the moment the
+  mood became neutral (`_bored_since`). (b) With bored 1 already seen, a thumb at +7 h in the same process: the
+  in-memory memo skipped the settle, so the thumb's mood got no "it wore off" row until the owner's return and
+  the timeline came out of order. `_note_bored` settles whenever the stored mood is not neutral, memo or not.
+  The thumb test no longer restarts the thread mid-test and asserts ORDER (stamps non-decreasing) as well as
+  counts; the restart case has a test of its own. (2) *A successful `set_mood` was a plain string*, and the
+  turn's error sniffer read the owner's evidence in it ("Error: the deploy failed, cheer up") as a FAILED call:
+  `owner_set` was false and the automatic nudge landed on his word. The reply is a declared OK outcome; with
+  that evidence and two failing calls the pair is exactly the anchor. (3) *Praise:* a message that ends with
+  "?" or the Greek question mark (closing quotes, "!" and emoji aside) is not praise; "is", "it's" and "that"
+  are not filler ("is that so great"; "that's" stays); added: "σε ευχαριστώ", "σ'ευχαριστώ", "μπράβο σου",
+  "ευχαριστώ ρε", "great work", "good work", "many thanks", "thanks mate", "thank u", "cheers". Both lists
+  pinned both ways. (4) *Thumbs:* a turn dated in the FUTURE is not recent (0 ≤ age ≤ 24 h); `EV_THUMB_UP` is
+  (+0.25, 0) — with +0.05 of energy, toggling up / down on one turn pumped the energy. (5) *The research tag
+  belongs to the move that set it:* decay keeps it; any later nudge that is not itself a research event clears
+  it (research then three thumbs reads cheerful 3, not "curious, 3 of 3: the owner gave a thumbs-up"); an
+  owner-set mood followed by a research turn may read curious; `set_owner_mood` clears an old tag (pinned — the
+  review's mutant survived). (6) *On a public surface* the owner's `introspect(action="mood")` and the mood
+  lines of overview / summary / stats keep the label, the intensity, the manner and the day's steps and
+  withhold every cause — "the reasons are shown in a private conversation" — as well as the note; a surface
+  that cannot be read counts as public. Tested with the real surface context variable. (7) *Pin gaps:* a PROBE
+  that read outside content gets the owner's `untrusted_content` refusal, not the dry run; the journal reader
+  skips a line that is valid JSON but no object (a number, null, true, a list, a string) and a line nested so
+  deep that parsing raises RecursionError (that one was a real gap: only ValueError was caught); the "UPDATED —"
+  prefix also stands when the changed line carries a manner. (8) *Wording:* `mood()`'s docstring and this
+  section said "a read never writes the pair". Exactly: a read never MOVES the mood; while it sees a boredom
+  it can settle a worn-off mood to its decayed value (the same value under decay) and write journal rows.
+  *A layer deleted on the way:* `_bored_since` clamped its result to "now"; both of its inputs already lie
+  behind now, so no mutant could tell the clamp from its absence.
+  *Left as it is, on the reviewer's word:* a request id in odd case (`Probe-x`) is classified as the owner's —
+  `request_kind` matches lower-case prefixes and internal ids are minted lower-case (noticed, not fixed); a
+  scheduled report written during a long quiet is written under "bored 1"; what counts as trouble.
+  *Numbers:* `test_4tc_mood_engine.py` 371 cases, `test_4tc_mood_hooks.py` 140, `test_4tc_set_mood.py`
+  175, `test_4tc_tone_line.py` 81 (767 in all; 698 after the first review). `scripts/mutate_4tc.py`: 156 mutants + 2 controls (`check`:
+  anchors OK) — 21 added (B29 B30, E27–E32, W23, V14–V18, S17 S18, J18–J21, H13), 5 re-anchored (B18 B19 E13
+  W17 V13); `mutate_4tb.py` untouched. By hand in scratch copies: 156 / 156 killed, the known-bad control killed, the no-op survived; the 23 set-mood mutants of `mutate_4tb.py` 23 / 23. Suite: 30,746 passed, 82 skipped, 1 failed (the working copy's location test, as before); lint gate OK (99, the baseline).
+
+- **Battery / live comparison / deploy.** `scripts/mutate_4tc.py`: full runs 90/90 (first build) and 135/135 (after review r1), then the 26 mutants added or changed in r2 — all killed; the known-bad control (the mood line appended to the system slot) dies on the head-hash test, the no-op survives. Swapped in from the tree copy on 2026-11-06 06:02–06:13; head 24,469 → 24,600 tokens (the `set_mood` parameters). **A deploy slip of mine:** the comparison script stopped the service and started it again at once; `launchctl bootstrap` right after `bootout` fails ("Input/output error") while the service is still unloading, the script waited seven minutes for an agent that was never started, and the agent was DOWN for about ten minutes (06:02–06:12) before the script's own cleanup brought it back. The restart now waits until the service is gone and retries. **Live comparison on the real line** (16 labelled probes; for each mood the agent was stopped, the mood put into the live state through `SelfStateThread`, the agent started — no owner traffic was faked — and the state and the mood journal restored afterwards): neutral sends no line; irritable 2, cheerful 3 and tired 1 + sarcastic 2 were audible ("Not a drop expected… keep the jacket zipped"; cheerful 3 says it is in a cheerful mood); the weather figures were identical in all four moods and each reply made the same single tool call; the production-outage reply kept its three checks and commands in every mood with the mood in the framing; the technical answer barely changed. The saved head was restored from disk in 0.5 s at each of the four restarts under different moods (24,374 of 24,378 tokens cached), no prefix-warmup miss. Weak spot: a level-1 mood with a level-2 sarcastic manner barely showed on a factual reply.
+
+## §4TD — the lesson store is removed (2026-11-06, operator: "look at the learning system and thoroughly evaluate it. look at usecases, ease of use, practicality. design everything.. should we keep it, improve it or remove it ?" → verdict: keep only the owner's rules, remove the rest → "proceed . Remove all user defined rules" → "Delete the 5 rules, keep the feature"; then "proceed unattended, usual verification protocol.")
+
+**R0 — scope, property, threat model.** Scope: the lesson store — `memory/skills.py`, `memory/lesson_scope.py`,
+`memory/lesson_quality.py`, the `ReadOnlySkillMemory` wrapper, the tools `learn_skill` and `list_lessons`, their
+list entries and special cases, the prompt's LESSONS SURFACE, the turn-loop lesson code, and the lesson parts of
+the learning report, the liveness probes and the `introspect` overview. Kept, untouched in behaviour: acquired
+skills, the owner's rules, the experience store and its labels, the failure census, vector memory, profile, KB,
+graph, projects, scheduled tasks, the trajectory collector, the feedback labels, the §4TC mood hooks. Property:
+no module imports the store; a stale call gets what any unknown name gets; an old playbook file is not read,
+rewritten or recreated (and is moved out by the deploy purge); lesson twins in the vector store are never served; and every guard that used to ask "is
+this a simulation?" through `context.skill_memory.is_read_only` answers the same as before. Threats: **the main
+one is the last** — that attribute was the marker of a simulated context, so deleting the store could silently
+turn each guard open (a contained replay paging the operator, writing the real corrections file, booking as the
+owner); the next is a test deleted with behaviour that is still live; then a healer that turns a stale name into
+a live tool, a twin surfacing through a path nobody looked at, and a table keyed on the removed names.
+
+- **Evidence.** The 26 automatic lessons were OUT of every prompt since 2026-10-13 (§4ON), yet `list_lessons`
+  still listed them and the learning report described them as live. `learn_skill`: 0 calls in 30 days. The replay
+  loop that wrote lessons went in §4SZ, so nothing but the model's own `learn_skill` could write one. Cost:
+  `skill_memory` named in ~14 source files and ~200 test files; 1,757 characters of tool definitions and 782 of
+  system prompt on every turn.
+
+- **Removed.** The three modules (5,013 lines; `src/` is 6,334 lines smaller in all). `core/isolation.py`'s
+  `ReadOnlySkillMemory`, `context.skill_memory`, the bus's skill tier and its retrieval credit, `POST
+  /api/lessons/quarantine` and the other lesson routes, the idle phase's lesson-index passes (store hygiene is the
+  temporary-document sweep alone), the narrative's lesson input, the lesson lines of learning report / overview.
+  Nineteen one-shot script files that were already applied and import the store (listed in the report of this work); they
+  have no use on the data as it stands, and each one's result is recorded in its own journal section. Env vars no
+  longer read: `GHOST_AUTO_LESSONS`, `GHOST_PLAYBOOK_MAX`, `GHOST_LESSON_OUTCOME_UTILITY`,
+  `GHOST_LESSON_TRIGGER_DISTANCE`, `GHOST_ACE_PLAYBOOK`. No CLI flag configured lessons, so `_DEPRECATED_NOOP_ARGS`
+  is unchanged. `memory/skills.html` is a dated tombstone.
+
+- **Moved, not removed.** What other code borrowed from the store: the population predicates (`write_origin`,
+  `usage_credit_blocked`, `iter_teachable`, `trajectory_may_teach`) to `memory/population.py`, the request-text
+  helpers to `memory/request_text.py`.
+
+- **Isolation re-based, site by site.** One flag: `context.simulated`. `core/isolation.py` holds `SIMULATED_ATTR`,
+  `mark_simulated(context)` (fail closed: a context that will not take the flag or does not read it back raises)
+  and `is_simulated_context(context)` (`is True` only; a context that raises on reading reads as simulated; `None`
+  is not simulated, as before). `GhostContext.__init__` sets it False. Set at the two places that build a simulated
+  context: `isolated_replay_context`, right after the copy, and `coding_loop.build_leaf_context`, first and outside
+  the `try`. Guards, each pinned both ways by a `test_site_*` test in `tests/test_4td_lesson_store_removed.py`:
+  `turn_origin` → "sim" (no owner booking; mood reads it through here); `_compute_verifier_verdict` → no ledger
+  identity trace; `_pending_corrections_path` → no real corrections file; the `solution.py` short-circuit →
+  stands down; `_finalize_and_return` `is_simulation` → Perfect-It skip, notify backstop, stored promise fire;
+  `handle_chat` → no notify-promise capture; the head check `_iso` → no warm-up; the streamed tail `_sim` → backstop
+  and stored fire. Eight calls in `core/agent.py`, counted by an AST test. The route-level `is_read_only` sites went
+  with their routes; acquired-skills booking never read the flag (`_usage_is_bookable` goes by kind).
+
+- **What I found while cutting.** (1) `build_leaf_context` installed the read-only wrapper inside a `try`: a failed
+  wrap left the leaf looking like the live context to every guard. Now the stamp is outside and a refused stamp
+  refuses the leaf. A real weakening of the old code, closed. (2) Lesson twins are `type: skill` rows in the vector
+  store, and two read paths would serve them once nothing filtered them: `RETIRED_ROW_TYPES`, narrowed in `where`
+  and dropped again after the query. Measured on chromadb 1.5.5: `$nin` keeps rows with no `type`, so old typeless
+  rows stay visible. (3) `_canonicalise_tool_name` measured against today's tools: `learnskill` → `create_skill` at
+  0.667, `listlessons` 0.4, both under the 0.7 cut, so neither heals today; the two names are in
+  `_REMOVED_TOOL_NAMES` anyway, because a later tool name must not start catching them. (4) `reset_all`'s note ("their
+  records in the skill store… boot reconcile re-indexes them") stays true for `acquired_skill`
+  (`backfill_missing_skill_embeddings`) and stays; retired `skill` rows are left out of the orphan count. (5) Two
+  test sweeps relied on timing the lesson awaits had supplied: `test_verifier_auto_repair` on a `to_thread` hop, and
+  `test_late_verdict_ordering` on an order those awaits made certain — that one assertion was dropped, the rest
+  kept. (6) The docs' weight tables were already wrong (2.0 / 0.5 against the code's 2.03 / 0.464 / 0.927, no
+  experience or history columns); corrected. (7) Outside this scope, reported and not fixed: pyflakes' `undefined
+  name 'ToolOutcome'` at `tools/projects.py:277` and `undefined name 'Trajectory'` in `core/agent.py`.
+
+- **Unavoidable behaviour changes.** The diary's `meta_insights` input is empty: it held what was left in the lesson
+  store. Procedural hydration has no skill ranker (it passed nothing since §4SZ). The learning report and overview
+  no longer speak of lessons: overview's section is "Background loops", warnings only. Hydration credits nothing
+  after fusion.
+
+- **Tests.** New: `tests/test_4td_lesson_store_removed.py` (61 tests). Judged one by one: whole
+  files deleted only when their subject was the store (34 files); individually removed tests recorded by name;
+  ported where behaviour lives on (population, bus fusion over three tiers, labels, health, probe lists). A fixture
+  sweep (AST) turned `is_read_only=True` markers into `simulated=True`; non-literal markers were found by grepping
+  the snapshot and restored by hand. `tests/test_4tb_replan_removed.py`'s no-removed-name check gained both names.
+  Pin baseline 881 → 862 (no file grew); lint baseline 86 → 83 (the three entries of removed code, nothing new).
+  Older batteries: 12 mutants whose subject is gone dropped (4gi R quarantine inline; 4pq Q5 Q8; 4rc R17; 4sy H44f
+  H44g; tier1_2026_09_13's six), 6 re-anchored (4pp T21, 4ql R10, 4rc R14, 4ta H2, 4tb R2, kb_1030 P1); checked by
+  parsing only, never run.
+
+- **What was NOT removed.** The `X-Ghost-Arm: no_lessons` arm name (it is the owner-rules control arm).
+  `failure_census`'s `lesson_channel_blocked` and `list_lessons` (they read stored rows). `failure_dimension`'s
+  wordings that name lessons (old failure text still says so). Dated history in docs and comments. Old disk data is not
+  simply ignored: the first draft of this section said it was, and the review showed why that is not enough (below).
+  It is purged at deploy by `scripts/lesson_purge_4td.py`; the `RETIRED_ROW_TYPES` filter stays as a defence.
+
+- **Head / token effect.** `len(json.dumps(defn))`: all definitions 62,226 (29 tools) → 60,469 (27). `learn_skill`
+  380 and `list_lessons` 1,100 gone; `introspect` 3,926 → 3,828; `manage_skills` 1,213 → 1,034; `create_skill`
+  1,288, `knowledge_base` 6,622 and `recall` 962 unchanged. `SYSTEM_PROMPT` 22,452 → 21,670 (LESSONS SURFACE 504
+  plus the SKILLS and SELF edits). 2,539 characters off the cached head in all.
+
+- **Numbers.** Individually removed tests: 258 (whole deleted files aside), each judged; test files 1,290 → 1,257. Last full
+  suite + lint: 29,925 passed, 82 skipped, 1 failed — `test_ghost_cli.py::TestLocation::test_bin_symlink_points_into_repo`,
+  the working copy's location, not a finding; lint gate OK. The run before it showed that a sweep had left
+  `tests/test_verifier_auto_repair.py` uncollectable (an import above `from __future__`); fixed, and it now passes.
+  `scripts/mutate_4td.py`: 78 mutants + 2 controls, `check` only: anchors OK. Not run.
+
+- **Independent reviews and the first battery (fix round).** Two reviews and `mutate_4td.py -j6 all` (69 killed, 9
+  survived incl. the no-op, 2 HARNESS).
+  *A — MAJOR, forget:* `forget_preview` answered "Nothing stored matches" while `type=skill` rows and
+  `skills_playbook.json` still quoted the name. This **replaces "old data is simply ignored"**: operator's decision, the
+  data is purged at deploy, so the reply becomes true. `scripts/lesson_purge_4td.py <GHOST_HOME> <BACKUP_DIR> [--dry-run]`
+  refuses (dry run too) when anything answers on 127.0.0.1:8000 — only a refused connection counts as nobody there —
+  or the backup dir is not writable or lies inside the memory dir, and a real run also refuses when another writer holds
+  the store; it exports the rows, reads the export back (same rows, same text) BEFORE the first delete, deletes those
+  ids only and requires the store to end exactly that many rows smaller, then moves the three files. Rerunnable: an
+  export is merged into, an unreadable one refuses, a moved file never replaces one already there. The dry run counts
+  through a read-only sqlite connection, because opening a chroma client can write; it changes no byte (pinned by
+  hash). `"skill"` STAYS in `_FORGET_PROTECTED_TYPES`: after the purge the entry matches nothing, and if a backup is
+  ever restored its rows belong to the script (export first), not to a sweep that would delete a few and leave the rest.
+  Not run on live data: the operator runs it at deploy. *Found while testing it:* chroma's delete does not scrub the
+  file. Measured on a temp store, 300 rows deleted: the text still occurred 1,239 times in the bytes of `chroma.sqlite3`
+  (`embeddings_queue` kept its 601 log records, plus free pages). No tool reads those, so forget's reply is true of what
+  the agent can read, but the bytes need compaction and the older `chroma.sqlite3.pre-*` copies still hold the rows: the
+  operator's call, not done here.
+  *B — pins lost with lesson tests, now back, all driving the real code:* `usage_credit_blocked` through both real
+  counters (probe, sched-, job-, sub-, owner); the Perfect-It `<tool_call>` strip; accent folding through forget's
+  `_target_word_coverage`; `current_request` read from inside a real turn by its real reader (nothing pinned the wiring;
+  `test_clockwork_ux`, which the reviewer's mutant tripped, passes alone and failed the same way under another unrelated
+  mutant here, so it is a load flake);
+  `_PRE_TOOL_BOOKKEEPING_TOOLS` (L2 was already pinned by `test_4og_reply_state.py`, which the selection missed because a
+  module-level constant is "covered" by import only: added to PINS; L3 had no pin), `knowledge_base` bookkeeping,
+  `update_profile` clearing the loop breaker's memory, the ambient path's second filter, the graph tier through
+  `hydrate_context`. A1 and A2 died by hand (exit 5: the selected test ids vanish when a registered name goes), so they now swap the
+  two functions and keep the name, with a test that each name reaches its own function. Two vacuous assertions made real.
+  *C — dead leftovers removed:* `bus.last_hydration` (write-only, with a false comment) and the `turn_id` that only
+  stamped it; `meta_insights` and its sanitiser (nothing passed it, so the rendered prompt is unchanged byte for byte: the
+  empty value added no line); the `list_lessons` row of `tool_probes_live.py`; what `claude_trainer.py` said about
+  recording lessons; stale prose.
+  *D — docs stating removed behaviour as current:* corrected or dated, then the class grepped; history keeps its date.
+  *E — nudge:* the meta-task reminder is a mid-turn user message, after the head, so naming the rule command adds no head
+  byte: it now says that a standing instruction needs the owner to send `learn this rule: <the rule>`, because only that
+  command saves one. "What have you learned?" has no routing any more. Left that way, on purpose: no new head text.
+  *F:* `Trajectory` / `ToolOutcome` left as reported.
+
+- **Fix-round numbers.** `scripts/mutate_4td.py`: 98 mutants + 2 controls, `check` OK. Rerun of the 8 prior survivors, the 2
+  HARNESS mutants and the 20 new ones (W1–W4, PG2–PG17): 30 of 30 killed. In that first rerun the no-op control was KILLED
+  by `test_gepa_epoch_swap.py::TestTheTickIntegration::test_a_swap_mid_process_is_noticed_and_notified` (a comment was the
+  only change; the file passed 3 of 3 alone) and PG4 by the unrelated `test_clockwork_ux`, both flakes under load; a
+  second rerun gave no-op SURVIVED (7,612 passed) and PG4 killed by its own pin. Known-bad killed both times. The other 68
+  mutants of the full run were not rerun after the cleanups; their anchors still check OK. Tests in the two §4TD files:
+  101. Suite + lint: 29,959 passed, 82 skipped, 1 failed — the location test `test_bin_symlink_points_into_repo`, not a
+  finding; lint gate OK (the suite ran after the battery, with nothing else on the machine).
+- **A third, short review** of that fix round found no CRITICAL or MAJOR. Its MINORs were fixed: the record nudge offered
+  the rule command on a public surface, where the command does not run (it now names it only on an owner's private
+  turn); `learn this rule: <the rule>` stored the placeholder as a rule (refused now); a re-export could replace a row's
+  first text; the read-back ignored metadata; a failed delete printed a bare traceback; `meta_insights` and
+  `last_hydration` docs. Battery on the final tree: 103 mutants + 2 controls, all killed, no-op survived on rerun. Two
+  kinds of false kill were rerun rather than counted: the no-op fell to `test_gepa_epoch_swap` under load (3 of 3 alone),
+  and three mutants to the unrelated `test_clockwork_ux`; on rerun each died to its own pin. Suite in the copy: 29,964
+  passed, 82 skipped, 1 failed (the location test), lint OK.
+- **Deploy 2026-11-06.** Agent stopped 10:45:39 gated on `foreground_requests == 0`; `lesson_purge_4td.py` on the live
+  store (26 rows exported, read back and deleted, 3 files moved, to the backup dir); tree swapped; the launcher's two
+  comment lines changed; ready 10:48:13 after a 136 s prefill. Head 23,740 tokens (was about 24,600). Bytes are not
+  scrubbed: freed pages of `chroma.sqlite3`, older store copies and the backup dir still hold lesson text; `forget` is
+  true for what the agent reads. Whether to compact or delete them is the operator's call.
+- **Scrub, later the same day (operator: "proceed now").** Agent stopped 11:07:55, `VACUUM` of the live
+  `chroma.sqlite3` (row counts unchanged, integrity ok, 61 matching lines of the sampled lesson text → 0), ready 11:09:08.
+  The lesson-only backups (`lessons-4td/`, the earlier `skills_playbook.json`) were deleted. NOT touched: the rolling
+  automatic backups and the older whole-store copies, which hold all of the memory, not only lessons; and trajectories,
+  the episodic store, logs and eval files, where the same words are the owner's original requests.
+  Then the operator had the two older whole-store copies deleted as well; the rolling automatic backups stay.
+- **After deploy:** suite on the live tree 29,965 passed, 82 skipped, 0 failed, lint OK. Labelled live probes: stale
+  `list_lessons` and `learn_skill` requests get "no such tool" (the model then offers neighbours; on the `learn_skill`
+  probe it tried `knowledge_base` + `update_profile`, both refused on a probe); `manage_skills` lists the custom tool;
+  `introspect(learning)` has no lesson row; the health line says `Rules: 1 owner rule`; `forget` of an unknown name
+  says nothing is stored. The store holds no `skill` row and the playbook did not come back.
+
+## §4TE — the CLI does not print a trimmed reply twice (2026-11-06, operator: "during request 0cbbc995 … in the cli client, it showed 2 similar replies, why ?" → "proceed.")
+
+- **Cause.** A reply streams live through `ReplyTap`. Finalize then trimmed 53 chars of narration (3906 → 3853), so the final no longer extended what was shown, and `finish` sent a retract plus the whole reply. The web client clears its bubble. The CLI cannot erase printed lines, so it printed `↺ revised` and the reply again.
+- **Fix.** Finalize reports both of its narration removals (`drop_pre_tool_segments`, `delivery_view`) with `ReplyTap.note_trim`; consecutive trims chain. `_trim_tail` flags the retract (`trimmed`, `tail_chars`) only when what was shown equals a reported input (compared through the client's view, quote markers hidden) and the final starts with the last reported output. Text after that is the tail. The whole reply still follows, so the web and ClockworkPi clients are unchanged. The CLI (`_StreamPrinter.adopt`, `_release_trim` in `stream_reply` and `one_shot`) keeps what is printed, stores the final as the reply, and prints only the tail. A cut stream, an error, a malformed flag or an empty reply fall back to `↺ revised`.
+- **First design removed (live 11:09–this deploy).** `narration_trim_tail` inferred a trim from the text diff (whole paragraphs or sentences, at most 300 chars). A fresh-eye reader confirmed it would flag `Result: 7 passed. 3 failed.` → `Result: 7 passed.`, a removed warning, an edit moved to the end, and code removed inside a fence. Not patched ([[fuzzy-judge-as-gate-does-not-converge]]): the code that makes the trim now says so. Also fixed from that review: `one_shot` counted `tail_chars` on sanitised text, lost the held reply on Ctrl-C, and printed notices before the text they refer to.
+- **Limits, all the old reprint.** A correction banner opening the stream; a reply ending in an unclosed `<`; a tail starting inside an open fence.
+- **Second reader.** Nothing but the reported trim reaches a client flagged. It found two content losses in existing `smooth_reply` rules, not added here and not changed: the Jaccard "superseded summary" pass deletes a parallel result (`The first run reached accuracy 0.91 …` next to `The second run reached accuracy 0.84 …`), and pass 1 deletes `Let me note that the API key expires on Friday.` The CLI now leaves such text on screen while history and `/save` lack it. Frequency in live replies not measured. **Open: operator decision.** Also read, not run: a project leaf inside a streamed turn can reset the parent tap's `quote_view` (`coding_loop.py:514` does not clear `reply_tap_context`).
+- **Tests.** `test_4mp_reply_tap.py`, `test_4rz_cli.py`, and two real-finalize wiring tests in `test_judged_text_is_delivered_text.py`. Hand-picked mutants (`mutate.py`, on a copy): 28 plus a no-op, after discarding a run whose baseline already failed. First valid run: 5 survivors → 2 redundant checks removed, 2 tests tightened, 1 test added. The 3 mutants left to rerun were killed, no-op survived. CLI mutants were not exhaustive.
+- **Suite.** 30,100 tests, 6 failed, lint OK. All 6 are web face tests (`app.js?v=18.1` vs 18.2, `_temperResync`), from `interface/static` edits at 11:58 by another session during the run; this change does not touch those files.
+
+
+## §4TF — the face is calm at rest (2026-11-06, operator: "the face tesseract in the webui, is sometimes gittery and eratic, mostly while idle, investigate why" → "yeah proceed")
+
+**Cause, measured** on the real `animate()` under the node harness, projected to 1440×900, "step" = the median visible node's move in one frame. With the temperament's body and the twitch off, ten idle minutes never passed 0.20 px. With them on: 1.59 px. In order of what the operator sees: idle actions turned the whole scene unsmoothed by about 25° every ~14 s; the twitch popped a neighbourhood every ~13.5 s (0.7–2.4 px against 0.13 at rest), and on the tesseract pulled corners off the wireframe, which is computed apart from the nodes; one log line could start the ~7 Hz startle; web/image/recall lines restarted the tilt on a random side; a cancelled action stepped in one frame (9–37 px); below 20 fps the clock jumped 5 s about every 20 s. Median real idle has 0.27 log lines a minute, so the first two are the usual regime.
+
+**Change** (`temperament.js` 1.5, `matrix_graph.js` and `app.js` 18.4). Operator's choice: reactions to real events stay at intensity 1.5, the idle body drops to a third (`IDLE_BODY`). Slow body channels are eased (`BODY_TAU` 0.25 s), so no input can step the scene in a frame; the startle's shake and flare stay instant, and the speech nod bypasses the easing. A cue during a tilt joins it. No twitch on the tesseract only. `logRowIcon`: only a row's own icon reports to the face; `is_error` now only colours the console. The clock integrates true frame time and re-syncs only on a gap over 1 s, on the frame stamps or the wall clock.
+
+**Result on the same measure.** Idle p99 0.45 → 0.19 px, worst frame 1.59 → under 0.3 px; cancelled action 9–37 → under 1 px; 20 web lines 20 tilt steps → 0; 15 fps 7 lurches in 3 min → 0. A real ❌ row still shakes and flares (+52 %).
+
+**Behaviour change the operator should know.** Of 415 lines the server flags (words ERROR/Exception), 157 were continuation text, 33 thoughts (`ON_ERROR_STOP`), and 211 were 🔶 rows: `tool warning` (143), `transient fail` (65). Those 🔶 rows used to fire the full startle and now react as warnings. My first count said 338 continuation lines: the script required a clock column and misfiled rows without one. The fresh-eye reader caught it.
+
+**Review.** One reader, code not conclusions: 1 MAJOR, 5 MINOR, 12 of 21 mutants surviving. MAJOR, fixed: removing the 5 s catch-up left no wall-clock check, so a system sleep (rAF stamps stopped, wall jumped) or a tab opened hidden left the clock hours behind, losing the wake and reading the wrong night. Fixed: free-text icons still set the working state and tint; the nod halved by the easing; stale version pins; the weak pins. Battery on copies outside the repo, 28 mutants + 2 controls: no-op survived, known-bad killed, 26 of 28 killed. Survivors: `pitch` at full size (now pinned, killed) and the pause flag, dead code after the wall-clock fix, deleted rather than pinned (bump to 18.4). Rerun on the final code for the clock mutants and the new pin, all killed; the other mutants were not rerun after the flag's deletion.
+
+**Left as is, deliberately.** The gaze keeps its full size: it only reaches the camera look target of cube/descent/empty, eased (~3° of pan). Under 1 fps every frame counts as an absence, so the temperament crawls; nothing is animating there anyway. The handheld's `webface/` copies stay on 1.3 until its next deploy. A step in `ampMul`/`stillness` on a cancelled action remains (a rate change, not a jump).
+
+**Not measured:** the operator's real device and GPU; the harness stubs the renderer. Rollback: `interface/face_backups/20261106-preidlecalm/`, bump `?v=` above 18.4. Tests: `tests/test_interface_face_idle_calm_2026_11_06.py`, key scenarios also run on the pre-fix copy, where they must fail; the client's real `ws.onmessage` is executed.
+
+
+## §4TG — mood tesseract, the only face; animations button (2026-11-06, operator: "build it, make it as a copy of tesseract"; "throw away all faces except mood tesseract and empty … replace it with a button animations enabled / disabled"; "also implement the same changes for clockworkPI")
+
+**Look.** `MOOD_LOOKS` in `matrix_graph.js` gives cheerful, irritable and tired their own tempo, breath, spin, brightness, heat gradient, droop, idle gap, doze and reaction strength, scaled by intensity. `MOOD_RINGS` gives each its own five colours (operator: "blue to red is not a requirement, i want it as is when neutral"): sunrise, fire, dusk. Stops are the `COLORS.palette` objects all materials read; at neutral they land back exactly. Other six moods have no look yet. `__ghostFace.previewMood(label, n)` tries a look by hand. The label's old hue shift is gated off on this form so a preview equals the live mood; a failed health poll keeps the look.
+
+**Removal.** cube, tesseract, vortex, descent and the dive-only motes gone (732 lines). `FORMS = ['moodtesseract', 'empty']`; old stored picks alias to `moodtesseract`. `#animations-btn` replaces the menu. Rollback: `interface/face_backups/20261106-premoodonly/` (handheld files in `clockwork/`).
+
+**Handheld.** Deployed 2026-11-06 at the operator's word (probe 111/111, opened on `moodtesseract`). `◈ ANIM ON/OFF` chip; `FALLBACK_FORM = moodtesseract`; `mood_loop` polls `/api/health` every 25 s (`agentapi.fetch_mood` validates the label, since it goes into a JS call) and calls the new `ghostFace.agentMood`. Before this the handheld was never told the mood.
+
+**Evidence.** Both remaining faces frame-for-frame identical to the pre-removal copy on nodes, uniforms, colours, lines drawn, bloom, scene and inner state, across neutral and live moods, once the motes' random draws are neutralised (their removal shifted the seeded node jitter, which only moved the sums). Browser clicks at 320, 390 and 1280 px: state, label and form correct, no horizontal scroll, no page errors. Mutants: 46/49 then pins for the 2 survivors; after the removal 15/15 plus no-op.
+
+**Not run, on the operator's word for this work ("localized testing only"):** the full suite. Face, clockwork, cachebust and interface pin tests only. Not looked at on the handheld's panel. **Test changes:** about 40 tests of removed forms deleted; a helper bug mangled them mid-way and was repaired by compile-driven deletion, so the deleted set was not reviewed test by test. `test_busy_is_hotter_than_idle` was load-dependent (real clock): now on a simulated clock, with its margin lowered from 0.015 to 0.005.
+
+
+## §4TH — handheld: modern interface; Save, Load and face-only mode removed (2026-11-06, operator: "the buttons / icons / UI in general looks old and outdated. remove save / load buttons and full screen face altogether, change enable / disable animation and all the rest of the icons, text, and UI feel to a modern one")
+
+Noto Sans for the interface (`T.SANS`; `T.FONT` stays mono, for code), soft rounded controls without outlines, an icon and a sentence-case word on each (`set_chip`), `icons.py` drawing Lucide paths with QPainter (QtSvg is absent on the device, so paths are parsed locally, arcs included). Chat bubbles are tinted cards with no notch or side rule; the user's text is no longer monospace, reversing an earlier choice. The `fault →` prefix is gone. Removed with their code: Save, Load, all workspace methods, the F11 face-only mode. The agent's workspace routes are untouched.
+
+Caught by the staged probe and by looking: the removal took `snap_shortcut.setAutoRepeat(False)` with it (restored; the held-key check failed); default-colour icons drew BLACK, because QColor reads `rgba(...)` as invalid (fixed in `icons.rgba`, pinned on the device and off it).
+
+Tests: local clockwork tests plus the device probe; no full suite (operator: localized testing).
+
+**§4TH addendum (operator: "make animations on/off much more discreet, without all that text").** Handheld only: 34 px icon, dim, no fill and no word; the state is the icon (sparkles / crossed out) and the tooltip. It sits in the bottom bar, left of the status readout. The web button was already icon-only.

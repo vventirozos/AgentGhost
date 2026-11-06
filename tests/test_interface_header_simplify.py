@@ -101,7 +101,7 @@ class TestWiring:
         header = html[html.index("<header>"):html.index("</header>")]
         ids = re.findall(r'<button id="([\w-]+)"', header)
         assert ids == ["rail-toggle", "status-indicator", "notif-btn", "upload-btn",
-                       "download-btn", "face-form-btn", "fullscreen-btn"], ids
+                       "download-btn", "animations-btn", "fullscreen-btn"], ids
 
     def test_the_chip_restates_none_of_the_button_chrome(self):
         """'Fit the button theme' means INHERIT it: the chip's own rule may
@@ -208,7 +208,7 @@ def _open(playwright_browser, **ctx_kwargs):
 
 
 _HEADER_CONTROLS = ["rail-toggle", "status-indicator", "notif-btn", "upload-btn",
-                    "download-btn", "face-form-btn", "fullscreen-btn"]
+                    "download-btn", "animations-btn", "fullscreen-btn"]
 
 
 def _boxes(page, ids):

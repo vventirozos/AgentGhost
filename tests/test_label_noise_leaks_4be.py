@@ -48,10 +48,8 @@ DIRECTIVES = [
     "learn from this mistake",
     "update your profile: I use zsh",
     "please memorize this",
-    "call learn_skill when you are done",
     "save this for later",
     "record this for future runs",
-    "take a lesson from what just happened",
 ]
 
 # Every one of these ARMED the old nudge on live traffic and carries no
@@ -120,7 +118,7 @@ def test_nudge_message_does_not_assert_an_instruction_that_may_not_exist():
     i = src.index("Checklist Nudge")
     block = src[i:i + 1600]
     assert "You have not fulfilled the learning/profile instructions" not in block
-    assert "do NOT invent a lesson" in block
+    assert "do NOT invent" in block
     assert "If that reading is right" in block or "appears to" in block
 
 

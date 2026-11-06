@@ -353,7 +353,7 @@ class TestBenchAndSimulationAreExcluded:
         agent = GhostAgent.__new__(GhostAgent)
         agent.context = NS(verifier=StubVerifier(),
                            args=NS(no_verifier=False),
-                           skill_memory=NS(is_read_only=True))
+                           simulated=True)
         agent._active_constraint_note = lambda limit=5, **_kw: ""
         await agent._compute_verifier_verdict(
             tools_run_this_turn=[{"name": "web_search", "content": "x"}],
@@ -379,8 +379,7 @@ class TestBenchAndSimulationAreExcluded:
 
         agent = GhostAgent.__new__(GhostAgent)
         agent.context = NS(verifier=StubVerifier(),
-                           args=NS(no_verifier=False),
-                           skill_memory=NS(is_read_only=False))
+                           args=NS(no_verifier=False))
         agent._active_constraint_note = lambda limit=5, **_kw: ""
         await agent._compute_verifier_verdict(
             tools_run_this_turn=[{"name": "web_search", "content": "x"}],

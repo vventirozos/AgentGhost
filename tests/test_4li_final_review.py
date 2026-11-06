@@ -42,7 +42,6 @@ async def test_a_members_research_verdict_never_reads_the_owners_files(agent, mo
     agent.context.sandbox_dir = str(sbx)
     verifier, vmock = _make_verifier([_verdict(VerifyVerdict.CONFIRMED)])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     agent.available_tools["web_search"] = AsyncMock(return_value="It launched in 2017.")
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=[
         {"choices": [{"message": {"content": "", "tool_calls": [
@@ -150,61 +149,6 @@ def test_an_identifier_that_contains_the_postcode_is_left_alone(tmp_path, args):
 def test_the_postcode_in_any_form_is_scrubbed(tmp_path, q):
     out, changed = _scrub(tmp_path, "web_search", {"query": q})
     assert changed and "10101" not in out["query"] and "101-01" not in out["query"]
-
-
-# ── lessons ──────────────────────────────────────────────────────────────────
-def test_tombstones_survive_every_archive_rotation(tmp_path):
-    """Fails where the reader opened only .jsonl.1: from the second rotation
-    on, "never re-learn" markers were dropped again."""
-    from ghost_agent.memory.skills import SkillMemory, _TOMBSTONE_REASONS
-    sm = SkillMemory(tmp_path)
-    reason = sorted(_TOMBSTONE_REASONS)[0]
-    base = tmp_path / "skills_pruned_archive.jsonl"
-    base.with_suffix(".jsonl.1").write_text(json.dumps({"reason": "cap", "lesson": {"trigger": "x"}}) + "\n")
-    base.with_suffix(".jsonl.2").write_text(
-        json.dumps({"reason": reason, "lesson": {"trigger": "never relearn this lesson"}}) + "\n")
-    assert any("never relearn" in t for t in sm._tombstones())
-
-
-def test_a_refuted_version_never_comes_back_on_a_later_retraction(tmp_path):
-    """Fails where t-a → t-b → t-c, retract t-b, retract t-c restored t-b's
-    refuted text."""
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    trig = "When extracting text from a scanned PDF page"
-
-    def learn(fix, tid):
-        sm.learn_lesson(trig, "it used the wrong tool for the job", fix, None, trigger=trig, source="dream",
-                        origin="user", source_trajectory_id=tid)
-    learn("Run tesseract on the page image.", "t-a")
-    learn("Run tesseract on the page image, BAD refuted variant xx.", "t-b")
-    learn("Run tesseract on the page image, then the language pack, longest variant.", "t-c")
-    sm.retract_lessons_from_trajectory("t-b")
-    sm.retract_lessons_from_trajectory("t-c")
-    assert "BAD refuted" not in sm.file_path.read_text()
-
-
-@pytest.mark.parametrize("name", ["unquarantine_lesson", "reconcile_vector_orphans", "heal_missing_twins",
-                                  "_update_lesson_fields", "set_document_text", "some_future_writer"])
-def test_the_read_only_facade_blocks_every_writer(name):
-    """Fails where writers added after the façade's list passed through to
-    the operator's real store."""
-    from ghost_agent.memory.readonly import ReadOnlySkillMemory, ReadOnlyVectorMemory
-    real = MagicMock()
-    for proxy in (ReadOnlySkillMemory(real), ReadOnlyVectorMemory(real)):
-        if name == "some_future_writer":
-            getattr(proxy, "update_" + name)("x")
-        else:
-            getattr(proxy, name)("x")
-    assert not real.method_calls
-
-
-def test_forget_finds_a_name_in_the_saved_previous_version(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.file_path.write_text(json.dumps([{"trigger": "send the weekly report", "solution": "email it",
-                                         "previous_version": {"solution": "email it to Denaxas"}}]))
-    assert sm.lessons_mentioning("Denaxas")
 
 
 # ── links and narration ──────────────────────────────────────────────────────
@@ -352,21 +296,6 @@ def test_a_fresh_chat_still_prunes_expired_corrections(agent):
     agent._pending_corrections = [{"member": True, "note": "old", "conv": "x", "ts": time.monotonic() - _CORRECTION_TTL - 5}]
     agent._consume_pending_corrections([{"role": "user", "content": "hi"}], conv_fp="x")
     assert agent._pending_corrections == []
-
-
-def test_the_saved_version_keeps_its_own_frequency(tmp_path):
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    trig = "When extracting text from a scanned PDF page"
-    sm.learn_lesson(trig, "used the wrong tool for the job", "Run tesseract on the page image.", None,
-                    trigger=trig, source="learn_skill", origin="user", source_trajectory_id="t-a")
-    before = json.loads(sm.file_path.read_text())[0].get("frequency", 1)
-    sm.learn_lesson(trig, "used the wrong tool for the job here as well",
-                    "Run tesseract on the page image, then check the language pack first.", None,
-                    trigger=trig, source="learn_skill", origin="user", source_trajectory_id="t-b")
-    row = json.loads(sm.file_path.read_text())[0]
-    if row.get("frequency", 1) > before:               # the +1 was counted this turn
-        assert row["previous_version"]["frequency"] == before
 
 
 def test_a_timeout_strike_is_remembered_for_an_hour_only():

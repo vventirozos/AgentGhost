@@ -27,11 +27,13 @@ from the first one. The ordered transcript is kept beside the store
 order, the outline record lists one entry per passage, and the summary row
 carries the title and the first words, not just counts.
 
-Why this is not a shell step in a composed skill any more: the sandbox
+Why this was moved out of a composed skill's shell step (§4KE): the sandbox
 ``execute`` tool promotes anything still running at 90 s to a background
-job, and a sequential macro books that as a failed step — the old
+job, and a sequential macro booked that as a failed step — the old
 ``youtube_transcribe`` macro could not complete by construction (live: 3
-uses, 0 successes). Here the tool owns its whole duration.
+uses, 0 successes). Here the tool owns its whole duration. (The macro engine
+itself is removed, §4TA 2026-11-05; ``youtube_transcribe`` is a built-in tool
+that calls this route — ``tools/registry.py``.)
 
 Everything egresses through Tor (``socks5h`` — DNS through the proxy). No
 cookies, no accounts, no keyed APIs: the no-identity-egress rule stands.

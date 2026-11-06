@@ -10,7 +10,7 @@ import datetime
 import subprocess
 import time
 import cv2
-from PyQt6.QtCore import Qt, pyqtSignal, QEvent, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QEvent, QSize, QTimer
 from PyQt6.QtGui import QPixmap, QFont, QShortcut, QKeySequence, QImage, QCursor
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
@@ -25,6 +25,7 @@ from turnstatus import (
     face_signals_for_ticker,
 )
 import agentapi
+import icons
 import commands
 import devstatus
 from markup import (
@@ -53,8 +54,7 @@ AGENT_BASE = os.environ.get("GHOST_AGENT_BASE", "http://eva:8000").rstrip("/")
 
 # A voice transcript sits in the input for this long before it sends itself,
 # so a misheard word can be fixed (any key cancels the countdown). 0 sends at
-# once — which is also what happens in face-only mode, where there is no input
-# to look at.
+# once.
 STT_REVIEW_S = _env_float("GHOST_STT_REVIEW_S", 2.5)
 # A recording that was never stopped (Shift+Esc is a TOGGLE) ends itself here.
 PTT_MAX_S = _env_float("GHOST_PTT_MAX_S", 120)
@@ -69,6 +69,7 @@ CHIME_AFTER_S = _env_float("GHOST_CHIME_AFTER_S", 20)
 # the agent's pending notifications. 0 disables a poll.
 LINK_POLL_S = _env_float("GHOST_LINK_POLL_S", 15)
 NOTIFY_POLL_S = _env_float("GHOST_NOTIFY_POLL_S", 60)
+MOOD_POLL_S = _env_float("GHOST_MOOD_POLL_S", 25)
 # Camera capture size. It was forced to 1920x1080@60 with a 16 ms timer: a
 # 6 MB frame decoded and colour-converted on the UI thread, on a CM4, up to
 # 60 times a second, to show a 640x480 preview. 720p is ample for the vision
@@ -78,7 +79,7 @@ CAM_H = int(_env_float("GHOST_CAM_H", 720))
 CAM_FPS = int(_env_float("GHOST_CAM_FPS", 30))
 CAM_PREVIEW_MS = 66        # ~15 previews a second is plenty for framing a shot
 
-INPUT_PLACEHOLDER = "speak to the ghost…   ( /help )"
+INPUT_PLACEHOLDER = "Message Ghost…   /help"
 
 
 def _power(argv):
@@ -236,13 +237,15 @@ class T:
     # from the tint alone — hence a heavier fill behind long-form text than
     # behind chips, rather than the uniform low alpha the web UI can afford.
     GLASS       = "rgba(9, 11, 22, 0.46)"     # chat surface (text legibility)
-    GLASS_SOFT  = "rgba(9, 11, 22, 0.30)"     # inputs, chips
-    GLASS_HOT   = "rgba(40, 26, 60, 0.55)"    # hover / active
-    HAIRLINE    = "rgba(255, 255, 255, 0.10)"
+    GLASS_SOFT  = "rgba(255, 255, 255, 0.07)" # inputs, chips
+    GLASS_HOT   = "rgba(255, 255, 255, 0.16)" # pressed
+    HAIRLINE    = "rgba(255, 255, 255, 0.08)"
     HAIRLINE_HOT = "rgba(201, 166, 255, 0.55)"
 
     TEXT        = "#ecebf6"
     TEXT_DIM    = "rgba(236, 235, 246, 0.52)"
+    TEXT_SOFT   = "rgba(236, 235, 246, 0.82)"  # controls
+    ACCENT_FILL = "rgba(201, 166, 255, 0.18)"
     USER        = "#ffc08a"   # warm sand — sits with the face's crimson core
     ASSISTANT   = "#e9e6ff"
     ACCENT      = "#c9a6ff"   # violet, from the face's mid palette
@@ -261,20 +264,33 @@ class T:
     BORDER_HOT  = HAIRLINE_HOT
 
     FONT        = "'Fira Code', 'JetBrains Mono', 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', monospace"
+    # The interface is sans (operator, 2026-11-06: "modern"); FONT stays mono, for code.
+    SANS        = "'Noto Sans', 'Cantarell', 'Liberation Sans', 'Noto Color Emoji', sans-serif"
 
 
-def chip_style(fg=T.TEXT_DIM, border=T.HAIRLINE, hover=T.GLASS_HOT):
+_CHIP_SHAPE = f"""
+            border-radius: 18px;
+            padding: 8px 15px;
+            font-family: {T.SANS};
+            font-size: 17px;
+            font-weight: 500;
+"""
+
+
+def set_chip(btn, icon_name, text, color=T.TEXT_SOFT):
+    """A control's icon and word. The colour is the icon's: the text takes the style's."""
+    btn.setIcon(icons.icon(icon_name, color))
+    btn.setIconSize(QSize(20, 20))
+    btn.setText(f" {text}")
+
+
+def chip_style(fg=T.TEXT_SOFT, hover=T.GLASS_HOT):
     return f"""
         QPushButton {{
             background-color: {T.GLASS_SOFT};
             color: {fg};
-            border: 1px solid {border};
-            border-radius: 12px;
-            padding: 9px 16px;
-            font-family: {T.FONT};
-            font-size: 18px;
-            font-weight: bold;
-            letter-spacing: 1px;
+            border: 1px solid transparent;
+            {_CHIP_SHAPE}
         }}
         QPushButton:hover {{
             border: 1px solid {T.HAIRLINE_HOT};
@@ -284,50 +300,37 @@ def chip_style(fg=T.TEXT_DIM, border=T.HAIRLINE, hover=T.GLASS_HOT):
             color: {T.TEXT};
         }}
         QPushButton:disabled {{
-            color: rgba(236, 235, 246, 0.22);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background-color: rgba(255, 255, 255, 0.03);
+            color: rgba(236, 235, 246, 0.26);
         }}
     """
 
 
 def chip_style_on(fg=None, fill="rgba(159, 227, 184, 0.16)"):
-    """A chip whose function is ON (spoken replies, a latched rating).
+    """A control whose function is ON (spoken replies, a latched rating).
 
-    Hover used to recolour a chip to the accent and fill it — on a device
-    whose pointer is a trackball that stays wherever it was last left, a chip
-    under the parked pointer looked switched on. Hover now only brightens the
-    border; a FILL means on, and nothing else does.
+    A FILL means on, and nothing else does: on a device whose pointer is a
+    trackball that stays where it was left, a hover fill looked switched on.
     """
     fg = fg or T.OK
     return f"""
         QPushButton {{
             background-color: {fill};
             color: {fg};
-            border: 1px solid {fg};
-            border-radius: 12px;
-            padding: 9px 16px;
-            font-family: {T.FONT};
-            font-size: 18px;
-            font-weight: bold;
-            letter-spacing: 1px;
+            border: 1px solid transparent;
+            {_CHIP_SHAPE}
         }}
     """
 
 
 def chip_style_hot(fg, border):
-    """Armed state (recording). Same glass geometry as chip_style so the chip
-    does not change shape when it lights up — only its colour does."""
+    """Armed state (recording): only the colour changes, not the shape."""
     return f"""
         QPushButton {{
-            background-color: rgba(255, 84, 112, 0.20);
+            background-color: rgba(255, 84, 112, 0.22);
             color: {fg};
             border: 1px solid {border};
-            border-radius: 12px;
-            padding: 9px 16px;
-            font-family: {T.FONT};
-            font-size: 18px;
-            font-weight: bold;
-            letter-spacing: 1px;
+            {_CHIP_SHAPE}
         }}
     """
 
@@ -336,17 +339,16 @@ INPUT_STYLE = f"""
     QLineEdit {{
         background-color: {T.GLASS_SOFT};
         color: {T.TEXT};
-        border: 1px solid {T.HAIRLINE};
-        border-radius: 16px;
-        padding: 16px 20px;
-        font-family: {T.FONT};
-        font-size: 22px;
-        selection-background-color: {T.GLASS_HOT};
+        border: 1px solid transparent;
+        border-radius: 20px;
+        padding: 10px 18px;
+        font-family: {T.SANS};
+        font-size: 20px;
+        selection-background-color: {T.HAIRLINE_HOT};
         selection-color: {T.TEXT};
     }}
     QLineEdit:focus {{
         border: 1px solid {T.HAIRLINE_HOT};
-        background-color: {T.GLASS};
     }}
 """
 
@@ -355,15 +357,6 @@ DIALOG_STYLE = f"""
         background-color: {T.BG_PANEL};
         border: 1px solid {T.BORDER_HOT};
         border-radius: 14px;
-    }}
-"""
-
-FILEDIALOG_STYLE = f"""
-    QFileDialog, QListView, QTreeView, QLineEdit, QComboBox, QPushButton, QLabel {{
-        background-color: {T.BG_PANEL};
-        color: {T.TEXT};
-        border-color: {T.BORDER};
-        font-family: {T.FONT};
     }}
 """
 
@@ -386,43 +379,6 @@ NOTE_WARN = f"<div style='color:{T.ACCENT_WARM};'><i>"
 NOTE_ERR = f"<div style='color:{T.DANGER};'><i>"
 
 
-def _restore_note(data) -> str:
-    """The one line the operator reads after a workspace restore.
-
-    ⚠ THE LOAD SIDE WAS NEVER MIGRATED (§4GK round 7). Round 6 taught the
-    SAVE side here to read `X-Ghost-Archive-Omitted` — a 200 can mean a
-    short archive — and taught `app.js` to read the restore's own
-    `not_cleared`/`unrestored`, and then left this client printing
-    "workspace restored." unconditionally. The route answers 200 with
-    `unrestored` naming files that are NOT on disk and `not_cleared` naming
-    directories whose STALE contents were carried into the "restored"
-    workspace; on the handheld both read as a clean load, which is how a
-    permissions glitch becomes data loss the operator meets weeks later in a
-    missing file. Same fields, same wording as the web client, so the two
-    consoles describe one restore the same way.
-
-    A helper rather than three lines inline because Qt is not importable in
-    this project's venv — PyQt6 lives on the handheld — so this is the part
-    a pin can actually EXECUTE.
-    """
-    nc = data.get("not_cleared") if isinstance(data, dict) else None
-    ur = data.get("unrestored") if isinstance(data, dict) else None
-    nc = nc if isinstance(nc, list) else []
-    ur = ur if isinstance(ur, list) else []
-    if not nc and not ur:
-        return f"{NOTE_OK}workspace restored.</i></div>"
-    bits = []
-    if ur:
-        bits.append(f"{len(ur)} file(s) could NOT be written")
-    if nc:
-        bits.append(f"{len(nc)} path(s) survived the wipe (stale content)")
-    def _esc(text):         # member paths come from the archive: not markup
-        return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    names = [_esc(u.get("path", u)) if isinstance(u, dict) else _esc(u)
-             for u in list(ur) + list(nc)][:3]
-    return (f"{NOTE_WARN}workspace restored INCOMPLETE — {'; '.join(bits)}. "
-            f"First few: {', '.join(names)}.</i></div>")
-
 class ImageViewer(QDialog):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
@@ -433,9 +389,12 @@ class ImageViewer(QDialog):
         self.setStyleSheet(DIALOG_STYLE)
 
         top_bar = QHBoxLayout()
-        self.close_btn = QPushButton("✕  CLOSE")
-        self.zoom_in_btn = QPushButton("+  ZOOM")
-        self.zoom_out_btn = QPushButton("−  ZOOM")
+        self.close_btn = QPushButton()
+        set_chip(self.close_btn, "x", "Close")
+        self.zoom_in_btn = QPushButton()
+        set_chip(self.zoom_in_btn, "zoom-in", "Zoom in")
+        self.zoom_out_btn = QPushButton()
+        set_chip(self.zoom_out_btn, "zoom-out", "Zoom out")
 
         for btn in (self.close_btn, self.zoom_in_btn, self.zoom_out_btn):
             btn.setStyleSheet(chip_style())
@@ -492,9 +451,10 @@ class CameraPreviewDialog(QDialog):
         self.layout.setContentsMargins(18, 18, 18, 18)
 
         top_bar = QHBoxLayout()
-        self.title_label = QLabel("◉ OPTIC FEED")
-        self.title_label.setStyleSheet(f"color: {T.ACCENT}; font-family: {T.FONT}; font-size: 18px; font-weight: bold; letter-spacing: 2px;")
-        self.close_btn = QPushButton("✕  CLOSE")
+        self.title_label = QLabel("Camera")
+        self.title_label.setStyleSheet(f"color: {T.TEXT}; font-family: {T.SANS}; font-size: 20px; font-weight: 600;")
+        self.close_btn = QPushButton()
+        set_chip(self.close_btn, "x", "Close")
         self.close_btn.setStyleSheet(chip_style())
         self.close_btn.clicked.connect(self.close_and_stop)
         top_bar.addWidget(self.title_label)
@@ -509,21 +469,9 @@ class CameraPreviewDialog(QDialog):
         self.live_controls = QWidget()
         live_layout = QHBoxLayout(self.live_controls)
         live_layout.setContentsMargins(0, 8, 0, 0)
-        self.capture_btn = QPushButton("◉  CAPTURE")
-        self.capture_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: rgba(255, 51, 68, 0.15);
-                color: {T.REC};
-                border: 1px solid {T.REC};
-                border-radius: 8px;
-                padding: 14px 28px;
-                font-family: {T.FONT};
-                font-size: 22px;
-                font-weight: bold;
-                letter-spacing: 2px;
-            }}
-            QPushButton:hover {{ background-color: rgba(255, 51, 68, 0.28); }}
-        """)
+        self.capture_btn = QPushButton()
+        set_chip(self.capture_btn, "camera", "Capture", T.ACCENT)
+        self.capture_btn.setStyleSheet(chip_style_on(T.ACCENT, T.ACCENT_FILL))
         self.capture_btn.clicked.connect(self.take_picture)
         live_layout.addStretch()
         live_layout.addWidget(self.capture_btn)
@@ -537,12 +485,14 @@ class CameraPreviewDialog(QDialog):
         self.prompt_input.setPlaceholderText("annotate the capture…")
         self.prompt_input.setStyleSheet(INPUT_STYLE)
 
-        self.upload_btn = QPushButton("↑  TRANSMIT")
-        self.upload_btn.setStyleSheet(chip_style(fg=T.OK, border="#2a5a3a"))
+        self.upload_btn = QPushButton()
+        set_chip(self.upload_btn, "send", "Send", T.ACCENT)
+        self.upload_btn.setStyleSheet(chip_style_on(T.ACCENT, T.ACCENT_FILL))
         self.upload_btn.clicked.connect(self.upload_picture)
 
-        self.download_btn = QPushButton("↓  STASH")
-        self.download_btn.setStyleSheet(chip_style(fg=T.ACCENT, border=T.BORDER_HOT))
+        self.download_btn = QPushButton()
+        set_chip(self.download_btn, "download", "Save")
+        self.download_btn.setStyleSheet(chip_style())
         self.download_btn.clicked.connect(self.download_picture)
         
         rev_layout.addWidget(self.prompt_input, 1)
@@ -663,7 +613,6 @@ class CameraPreviewDialog(QDialog):
 class MainWindow(QWidget):
     update_chat_signal = pyqtSignal(str, str)
     show_image_signal = pyqtSignal(str)
-    update_workspace_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -714,7 +663,6 @@ class MainWindow(QWidget):
         self.initUI()
         self.update_chat_signal.connect(self._update_chat)
         self.show_image_signal.connect(self._show_image_popup)
-        self.update_workspace_signal.connect(self.update_workspace_btn_state)
 
         # The waiting bubble's caption: elapsed clock + what the agent is doing
         # right now, fed by the log socket (see turnstatus.py). The timer only
@@ -766,10 +714,8 @@ class MainWindow(QWidget):
         # frameless full-screen kiosk), so nothing has to react to a resize.
         self.web_face = WebFaceWidget(self)
         self.web_face.setGeometry(0, 0, win_w, win_h)
-        # The face is decorative — it must never take focus. If it did, key
-        # presses would go to the web view and the any-key escape out of
-        # fullscreen-face mode (keyPressEvent) would never fire, stranding the
-        # operator in a frameless kiosk with no visible controls.
+        # The face is decorative — it must never take focus: key presses would
+        # go to the web view instead of the input.
         self.web_face.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.faces = (self.web_face,)
         # Face state the client owns (the face itself is async JS now).
@@ -790,9 +736,8 @@ class MainWindow(QWidget):
         main_layout.setSpacing(10)
 
         left_widget = QWidget()
-        # Holds the ONLY stretch factor in the main column. It must stay
-        # VISIBLE even in fullscreen-face mode — see toggle_fullscreen_face()
-        # for what hiding it does to the bottom bar. Toggle self.chat_display.
+        # Holds the ONLY stretch factor in the main column: hiding it collapses
+        # the bottom bar. Toggle self.chat_display instead.
         self.left_widget = left_widget
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -820,49 +765,33 @@ class MainWindow(QWidget):
         # the bottom bar so it can share that row with the action chips.
         left_layout.addWidget(self.chat_display)
 
-        # Every chip carries a WORD. The top row used to be three bare glyphs
-        # (◆ ◈ ◐) whose meaning lived in tooltips — which need a hover, on a
+        # Every control carries an icon and a word: a tooltip needs a hover, on a
         # device with a trackball.
-        self.fs_btn = QPushButton("◐  FACE")
-        self.fs_btn.setStyleSheet(chip_style())
-        self.fs_btn.setToolTip("Face only — any key brings the controls back (F11)")
-        self.fs_btn.clicked.connect(self.toggle_fullscreen_face)
-
-        self.switch_face_btn = QPushButton("◈  FORM")
-        self.switch_face_btn.setStyleSheet(chip_style())
-        self.switch_face_btn.setToolTip("Next face form")
-        self.switch_face_btn.clicked.connect(self.toggle_face_style)
+        self.animations_btn = QPushButton()
+        self.animations_btn.setFixedSize(34, 34)
+        self.animations_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; border: 1px solid transparent; border-radius: 17px; }}
+            QPushButton:hover {{ border: 1px solid {T.HAIRLINE}; }}
+            QPushButton:pressed {{ background-color: {T.GLASS_SOFT}; }}
+        """)
+        self._show_animations(self.web_face.animations_on_at_start())
+        self.animations_btn.clicked.connect(self.toggle_animations)
 
         top_right_layout = QHBoxLayout()
         top_right_layout.setContentsMargins(0, 0, 0, 0)
         top_right_layout.setSpacing(8)
 
-        # Rate the last reply. Geometric glyphs, like every other chip.
-        self.good_btn = QPushButton("▲  GOOD")
+        # Rate the last reply.
+        self.good_btn = QPushButton()
         self.good_btn.setToolTip("The last reply was right (Ctrl+Up)")
         self.good_btn.clicked.connect(lambda: self.rate_last("positive"))
-        self.bad_btn = QPushButton("▼  BAD")
+        self.bad_btn = QPushButton()
         self.bad_btn.setToolTip("The last reply was wrong (Ctrl+Down)")
         self.bad_btn.clicked.connect(lambda: self.rate_last("negative"))
         top_right_layout.addWidget(self.good_btn)
         top_right_layout.addWidget(self.bad_btn)
         top_right_layout.addStretch()
 
-        # Two chips, not one that flips. The single chip was LOAD only while
-        # the conversation was empty and SAVE ever after, so a workspace could
-        # not be loaded once anything had been said.
-        self.load_btn = QPushButton("◇  LOAD")
-        self.load_btn.setStyleSheet(chip_style())
-        self.load_btn.setToolTip("Load a workspace archive")
-        self.load_btn.clicked.connect(self.load_workspace)
-        self.workspace_btn = QPushButton("◆  SAVE")
-        self.workspace_btn.setToolTip("Save the workspace and this conversation")
-        self.workspace_btn.clicked.connect(self.save_workspace)
-
-        top_right_layout.addWidget(self.load_btn)
-        top_right_layout.addWidget(self.workspace_btn)
-        top_right_layout.addWidget(self.switch_face_btn)
-        top_right_layout.addWidget(self.fs_btn)
 
         # Bottom row: the input keeps its left position, the action chips and
         # the status readout keep theirs on the right — now sharing one row
@@ -873,34 +802,39 @@ class MainWindow(QWidget):
         stats_layout.addWidget(self.text_input, 1)
 
         # Shown only while a turn runs — the one moment it means anything.
-        self.stop_btn = QPushButton("■  STOP")
-        self.stop_btn.setStyleSheet(chip_style(fg=T.DANGER, border=T.DANGER))
+        self.stop_btn = QPushButton()
+        set_chip(self.stop_btn, "stop", "Stop", T.DANGER)
+        self.stop_btn.setStyleSheet(chip_style(fg=T.DANGER))
         self.stop_btn.setToolTip("Stop the running turn (Esc)")
         self.stop_btn.clicked.connect(self.request_stop)
         self.stop_btn.hide()
 
-        self.snap_btn = QPushButton("◉  SNAP")
+        self.snap_btn = QPushButton()
+        set_chip(self.snap_btn, "camera", "Camera")
         self.snap_btn.setStyleSheet(chip_style())
         self.snap_btn.clicked.connect(self.take_picture)
 
-        self.ptt_btn = QPushButton("●  PTT")
+        self.ptt_btn = QPushButton()
+        set_chip(self.ptt_btn, "mic", "Talk")
         self.ptt_btn.setStyleSheet(chip_style())
         self.ptt_btn.pressed.connect(self.start_recording)
         self.ptt_btn.released.connect(self.stop_recording)
 
-        self.tts_btn = QPushButton("◌  TTS")
-        self.tts_btn.setStyleSheet(chip_style(fg=T.TEXT_DIM))
+        self.tts_btn = QPushButton()
+        set_chip(self.tts_btn, "volume-x", "Voice off")
+        self.tts_btn.setStyleSheet(chip_style())
         self.tts_btn.clicked.connect(self.toggle_tts)
 
         stats_layout.addWidget(self.stop_btn)
         stats_layout.addWidget(self.snap_btn)
         stats_layout.addWidget(self.ptt_btn)
         stats_layout.addWidget(self.tts_btn)
+        stats_layout.addWidget(self.animations_btn)
 
         self.stats_label = QLabel("●   --%   ··:··")
         self.stats_label.setTextFormat(Qt.TextFormat.RichText)
         self.stats_label.setToolTip("agent link · wifi · battery · time")
-        self.stats_label.setStyleSheet(f"color: {T.TEXT_DIM}; font-family: {T.FONT}; font-size: 18px; font-weight: bold; padding: 0 12px; letter-spacing: 1px;")
+        self.stats_label.setStyleSheet(f"color: {T.TEXT_SOFT}; font-family: {T.SANS}; font-size: 17px; font-weight: 500; padding-left: 8px;")
         stats_layout.addWidget(self.stats_label)
 
         # top chips · transcript (stretch) · input + actions
@@ -920,15 +854,13 @@ class MainWindow(QWidget):
         self.stats_timer.timeout.connect(self.update_stats)
         self.stats_timer.start(5000) # Every 5s
         self.update_stats()
-
-        self.update_workspace_btn_state()
         self._refresh_rating_chips()
 
         # The Esc family (operator, 2026-10-17): Shift+Esc talks, Esc cancels,
         # Alt+Esc speaks, Ctrl+Esc looks. Both are WINDOW shortcuts, not
         # application ones: an application-wide Esc would also fire inside the
         # camera dialog, where Esc must close the dialog. The window holds the
-        # face, so they still work in face-only mode.
+        # face.
         self.esc_shortcut = QShortcut(QKeySequence("Shift+Escape"), self)
         self.esc_shortcut.activated.connect(self._ptt_key)
 
@@ -956,112 +888,8 @@ class MainWindow(QWidget):
         self.snap_shortcut = QShortcut(QKeySequence("Ctrl+Escape"), self)
         self.snap_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.snap_shortcut.activated.connect(self.take_picture)
-
-        # The way back out of fullscreen-face mode. ApplicationShortcut, not
-        # the default WindowShortcut: with the overlay hidden the QWebEngineView
-        # is the only thing left, and a shortcut scoped to the focused widget
-        # could be swallowed by it. F11 is the conventional fullscreen key;
-        # keyPressEvent accepts any other key as a backstop.
-        self.fullscreen_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
-        self.fullscreen_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        self.fullscreen_shortcut.activated.connect(self.toggle_fullscreen_face)
         self.snap_shortcut.setAutoRepeat(False)
-        self.fullscreen_shortcut.setAutoRepeat(False)
 
-    def update_workspace_btn_state(self):
-        """SAVE is live only when there is a conversation to put in the archive."""
-        if not hasattr(self, 'workspace_btn'):
-            return
-        has_history = bool(self.conversation_history)
-        self.workspace_btn.setEnabled(has_history)
-        self.workspace_btn.setStyleSheet(
-            chip_style(fg=T.ACCENT_WARM if has_history else T.TEXT_DIM))
-
-    def _workspace_dialog(self, title, start, save):
-        dialog = QFileDialog(self, title, start, "Zip Files (*.zip)")
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
-        dialog.setStyleSheet(FILEDIALOG_STYLE)
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave if save
-                             else QFileDialog.AcceptMode.AcceptOpen)
-        if save:
-            dialog.setDefaultSuffix("zip")
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selectedFiles():
-            return dialog.selectedFiles()[0]
-        return None
-
-    def load_workspace(self):
-        if self._busy():
-            self._note("a turn is running — stop it before loading a workspace", NOTE_WARN)
-            return
-        filename = self._workspace_dialog("Load Workspace", os.path.expanduser("~"), save=False)
-        if filename:
-            asyncio.ensure_future(self._async_load_workspace(filename))
-
-    def save_workspace(self):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = os.path.join(os.path.expanduser("~"), f"ghost_workspace_{timestamp}.zip")
-        filename = self._workspace_dialog("Save Workspace", default_path, save=True)
-        if filename:
-            asyncio.ensure_future(self._async_save_workspace(filename))
-
-    async def _async_save_workspace(self, filename):
-        url = f"{AGENT_BASE}/api/workspace/save"
-        headers = {"X-Ghost-Key": GHOST_API_KEY}
-        payload = {"chat_history": self.conversation_history}
-        self.update_chat_signal.emit("append", f"<br>{NOTE_DIM}archiving workspace…</i></div>")
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(url, json=payload, headers=headers)
-                if response.status_code == 200:
-                    with open(filename, 'wb') as f:
-                        f.write(response.content)
-                    # §4GK round 6: a SHORT archive is a 200. The agent names
-                    # the count in `X-Ghost-Archive-Omitted` (and lists them in
-                    # an `omitted.json` member); reading no headers meant this
-                    # client reported a clean save over an archive that was
-                    # missing files.
-                    _omitted = response.headers.get("X-Ghost-Archive-Omitted")
-                    if _omitted and _omitted not in ("0", ""):
-                        self.update_chat_signal.emit(
-                            "error",
-                            f"archived → {filename}, but {_omitted} file(s) could "
-                            f"NOT be read and are MISSING from it (see omitted.json)")
-                    else:
-                        self.update_chat_signal.emit("append", f"<br>{NOTE_OK}archived → {escape_user(filename)}</i></div>")
-                else:
-                    self.update_chat_signal.emit("error", f"Save failed: HTTP {response.status_code}")
-        except Exception as e:
-            self.update_chat_signal.emit("error", f"Save error: {str(e)}")
-
-    async def _async_load_workspace(self, filename):
-        url = f"{AGENT_BASE}/api/workspace/load"
-        headers = {"X-Ghost-Key": GHOST_API_KEY}
-        self.update_chat_signal.emit("append", f"<br>{NOTE_DIM}restoring workspace…</i></div>")
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                with open(filename, 'rb') as f:
-                    files = {'file': (os.path.basename(filename), f, 'application/zip')}
-                    response = await client.post(url, files=files, headers=headers)
-                    
-                if response.status_code == 200 and self._busy():
-                    self._note("the workspace files were restored, but a turn started "
-                               "meanwhile — this conversation was left as it is", NOTE_WARN)
-                elif response.status_code == 200:
-                    data = response.json()
-                    history = data.get("chat_history", [])
-                    # A NEW session id: the archive's conversation is not the
-                    # one stored under the current id, and replaying it there
-                    # would append it to whatever was being said before.
-                    self._begin_session(agentapi.new_session_id(),
-                                        history if isinstance(history, list) else [])
-                    # §4GK round 7: a restore can be INCOMPLETE and still be a
-                    # 200 — `_restore_note` reads the fields that say so.
-                    self.chat_display.add(_restore_note(data), "system")
-                    self._render_history(self.conversation_history)
-                else:
-                    self.update_chat_signal.emit("error", f"Load failed: HTTP {response.status_code}")
-        except Exception as e:
-            self.update_chat_signal.emit("error", f"Load error: {str(e)}")
 
     # ── conversation: sessions, history, notes ───────────────────────────
     def _note(self, text, tone=None):
@@ -1078,7 +906,6 @@ class MainWindow(QWidget):
         self._rated = None
         self.chat_display.clear()
         self._refresh_rating_chips()
-        self.update_workspace_btn_state()
 
     def _render_history(self, messages):
         """Draw a stored conversation. Its images are NOT popped open again —
@@ -1112,7 +939,6 @@ class MainWindow(QWidget):
         self.conversation_history = agentapi.history_for_model(messages)
         self._render_history(messages)
         self._note("conversation restored — /new starts a fresh one")
-        self.update_workspace_btn_state()
 
     async def _show_sessions(self):
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -1155,7 +981,6 @@ class MainWindow(QWidget):
         self._begin_session(row["id"], agentapi.history_for_model(messages))
         self._render_history(messages)
         self._note(f"opened: {str(row.get('title') or 'untitled')[:60]}")
-        self.update_workspace_btn_state()
 
     def toggle_ptt(self):
         if self.is_recording:
@@ -1240,7 +1065,7 @@ class MainWindow(QWidget):
         self.is_recording = True
         self._rec_started = time.monotonic()
         self.ptt_btn.setStyleSheet(chip_style_hot(T.REC, T.REC))
-        self.ptt_btn.setText("●  0:00")
+        set_chip(self.ptt_btn, "mic", "0:00", T.REC)
         self.rec_timer.start(500)
         self.set_face_mood("listen")
         # Its OWN file per recording. They all used to be written to
@@ -1269,7 +1094,7 @@ class MainWindow(QWidget):
             self.rec_timer.stop()
             return
         elapsed = time.monotonic() - self._rec_started
-        self.ptt_btn.setText(f"●  {clock_label(elapsed)}")
+        self.ptt_btn.setText(f" {clock_label(elapsed)}")
         if PTT_MAX_S > 0 and elapsed >= PTT_MAX_S:
             # Shift+Esc is a toggle, so a recording can be left running by accident.
             self._note(f"recording stopped at the {int(PTT_MAX_S)} s limit")
@@ -1283,7 +1108,7 @@ class MainWindow(QWidget):
         self._ptt_press_open = False
         self.rec_timer.stop()
         self.ptt_btn.setStyleSheet(chip_style())
-        self.ptt_btn.setText("●  PTT")
+        set_chip(self.ptt_btn, "mic", "Talk")
         self._stop_arecord()
         path, self._rec_path = self._rec_path, None
         self._discard_recording(path)
@@ -1298,7 +1123,7 @@ class MainWindow(QWidget):
         self._ptt_press_open = False
         self.rec_timer.stop()
         self.ptt_btn.setStyleSheet(chip_style())
-        self.ptt_btn.setText("●  PTT")
+        set_chip(self.ptt_btn, "mic", "Talk")
         self._stop_arecord()
         path, self._rec_path = self._rec_path, None
         if time.monotonic() - self._rec_started < PTT_MIN_S:
@@ -1425,8 +1250,8 @@ class MainWindow(QWidget):
     def _after_transcript(self):
         """The transcript is in the input. Send it — after a short, visible
         countdown when the operator can see and fix it."""
-        if STT_REVIEW_S <= 0 or not self.overlay.isVisible():
-            # Face-only mode has no input to review; hands-free means send.
+        if STT_REVIEW_S <= 0:
+            # No review window configured: send.
             self.handle_input()
             return
         self.set_face_mood("idle")
@@ -1451,7 +1276,7 @@ class MainWindow(QWidget):
             self.review_timer.stop()
             if not self.is_recording:
                 self.ptt_btn.setStyleSheet(chip_style())
-                self.ptt_btn.setText("●  PTT")
+                set_chip(self.ptt_btn, "mic", "Talk")
 
     def _on_text_edited(self, _text):
         # The operator touched the transcript: it is theirs now, and it goes
@@ -1524,16 +1349,6 @@ class MainWindow(QWidget):
 
     def keyPressEvent(self, event):
         self._note_activity()
-        # Escape hatch. With the glass UI hidden there is no visible control to
-        # bring it back and this is a frameless always-on-top kiosk, so ANY key
-        # restores it rather than only the documented F11. Escape/Alt+Escape/
-        # Ctrl+Escape never reach here — they are QShortcuts and fire first —
-        # so push-to-talk, TTS and SNAP still work with the UI hidden, which is
-        # the point of a face-only mode.
-        if not self.overlay.isVisible():
-            self._restore_overlay()
-            return
-
         if self._scroll_key(event):
             return
 
@@ -1577,11 +1392,11 @@ class MainWindow(QWidget):
         self.tts_enabled = not self.tts_enabled
         self._voice_fault_shown = False
         if self.tts_enabled:
-            self.tts_btn.setText("◉  TTS")
+            set_chip(self.tts_btn, "volume", "Voice on", T.OK)
             self.tts_btn.setStyleSheet(chip_style_on())
         else:
-            self.tts_btn.setText("◌  TTS")
-            self.tts_btn.setStyleSheet(chip_style(fg=T.TEXT_DIM))
+            set_chip(self.tts_btn, "volume-x", "Voice off")
+            self.tts_btn.setStyleSheet(chip_style())
             self._silence()
 
     def set_face_mood(self, mood):
@@ -1598,58 +1413,25 @@ class MainWindow(QWidget):
         except Exception:  # noqa: BLE001 — a face must never break a turn
             pass
 
-    def toggle_face_style(self):
-        """Cycle the face FORM.
+    def _show_animations(self, on):
+        # Discreet (operator, 2026-11-06): a faint icon, no word and no fill.
+        word = "Animations on" if on else "Animations off"
+        self.animations_btn.setIcon(icons.icon("sparkles" if on else "sparkles-off", T.TEXT_DIM, 18))
+        self.animations_btn.setIconSize(QSize(18, 18))
+        self.animations_btn.setToolTip(word)
+        self.animations_btn.setAccessibleName(word)
 
-        This used to swap between three separate QPainter renderers. Those are
-        gone; the web face carries the browser's own FORMS list, so the button
-        walks that list and the two clients stay in step.
-        """
+    def toggle_animations(self):
+        """Animations on (the mood tesseract) or off (the empty form), as the
+        web UI's button. The web face owns the two forms; the chip shows what
+        it reports back."""
+        def _got(name):
+            if name:
+                self._show_animations(name != "empty")
         try:
-            self.web_face.cycle_form()
+            self.web_face.cycle_form(_got)
         except Exception:  # noqa: BLE001
             pass
-
-    def toggle_fullscreen_face(self):
-        """Hide the ENTIRE glass UI so nothing but the face remains.
-
-        This hides `self.overlay` — the single translucent sheet that carries
-        the top chips, the transcript and the bottom bar. Two earlier attempts
-        hid something smaller and both were wrong:
-
-        * Hiding `left_widget` (the transcript's container) left the chips and
-          the bottom bar on screen AND moved the bar to the middle of the deck:
-          it carries the main column's only stretch factor, so hiding it handed
-          the freed space to the bottom row, which grew from 25px to 659px tall
-          and vertically centred its fixed-height chips. Measured on-device at
-          1280x720: bottom bar y=683 → y=49.
-        * Hiding `chat_display` fixed the placement but still left the chips
-          and the bar visible — so the button still did not hide the UI.
-
-        Hiding the overlay sidesteps the stretch trap entirely (nothing inside
-        the layout changes) and is what "fullscreen face" actually means.
-
-        Getting back matters as much as leaving: this is a frameless,
-        always-on-top kiosk, so once the overlay is hidden there is no visible
-        control to restore it. Two independent paths exist — F11 (an
-        ApplicationShortcut, so it fires even if the web view holds focus) and
-        ANY other key press (see keyPressEvent). PTT/TTS/SNAP keep working
-        while hidden, which makes this a usable face-only voice mode rather
-        than a dead end.
-        """
-        if self.overlay.isVisible():
-            self.overlay.hide()
-            self.fs_btn.setText("○  FACE")
-            self.setFocus()          # so keyPressEvent reaches the window
-        else:
-            self._restore_overlay()
-
-    def _restore_overlay(self):
-        """Bring the glass UI back and put the caret where the operator left it."""
-        self.overlay.show()
-        self.overlay.raise_()        # the face must never composite over it
-        self.fs_btn.setText("◐  FACE")
-        self.text_input.setFocus()
 
     # ── one turn at a time ───────────────────────────────────────────────
     def _busy(self):
@@ -1675,7 +1457,6 @@ class MainWindow(QWidget):
         self.update_chat_signal.emit("user", shown_html)
         self.conversation_history.append({"role": "user", "content": content})
         self.web_face.wake()
-        self.update_workspace_signal.emit()
         self._start_turn()
         return True
 
@@ -1737,12 +1518,13 @@ class MainWindow(QWidget):
     # ── rating the last reply ────────────────────────────────────────────
     def _refresh_rating_chips(self):
         can = bool(self._last_reply_rid)
-        for btn, signal, fg, fill in (
-                (self.good_btn, "positive", T.OK, "rgba(159, 227, 184, 0.16)"),
-                (self.bad_btn, "negative", T.DANGER, "rgba(255, 123, 145, 0.16)")):
+        for btn, signal, icon_name, label, fg, fill in (
+                (self.good_btn, "positive", "thumbs-up", "Good", T.OK, "rgba(159, 227, 184, 0.16)"),
+                (self.bad_btn, "negative", "thumbs-down", "Bad", T.DANGER, "rgba(255, 123, 145, 0.16)")):
+            latched = can and self._rated == signal
             btn.setEnabled(can)
-            btn.setStyleSheet(chip_style_on(fg, fill) if can and self._rated == signal
-                              else chip_style())
+            set_chip(btn, icon_name, label, fg if latched else T.TEXT_SOFT)
+            btn.setStyleSheet(chip_style_on(fg, fill) if latched else chip_style())
 
     def rate_last(self, signal, note=""):
         """A human label for the last reply — the scarcest signal the agent's
@@ -1857,7 +1639,7 @@ class MainWindow(QWidget):
         elif name == "tts":
             self.toggle_tts()
         elif name == "face":
-            self.toggle_face_style()
+            self.toggle_animations()
         elif name == "shutdown":
             self._note("powering down hardware…", NOTE_WARN)
             _power(['sudo', 'shutdown', '-h', 'now'])
@@ -2035,7 +1817,6 @@ class MainWindow(QWidget):
             self._say(self.speech.flush())
             if self.current_response_text:
                 self.conversation_history.append({"role": "assistant", "content": self.current_response_text})
-                self.update_workspace_signal.emit()
             recorded = True
             
         except asyncio.CancelledError:
@@ -2062,7 +1843,6 @@ class MainWindow(QWidget):
                 # what the operator read: it stays in the conversation.
                 self.conversation_history.append(
                     {"role": "assistant", "content": self.current_response_text})
-                self.update_workspace_signal.emit()
             self.update_chat_signal.emit("stop_thinking", "")
             self.stop_btn.hide()
             # §4ML: a stop still on its way when the reply finished ON ITS OWN
@@ -2173,7 +1953,7 @@ class MainWindow(QWidget):
         for rec in records:
             line = agentapi.format_notification(rec)
             self.chat_display.add(
-                f"<span style='color:{T.ACCENT};'>◆</span>&nbsp; {escape_user(line)}", "system")
+                f"<span style='color:{T.ACCENT};'>•</span>&nbsp; {escape_user(line)}", "system")
             self._say([str(rec.get("summary") or "")] if rec.get("summary") else [])
         self.web_face.wake()
 
@@ -2188,6 +1968,21 @@ class MainWindow(QWidget):
                 except Exception as e:  # noqa: BLE001
                     print(f"[notify] poll failed: {e}", flush=True)
                 await asyncio.sleep(NOTIFY_POLL_S)
+
+    async def mood_loop(self):
+        """Every MOOD_POLL_S: hand the agent's mood to the face, as the web UI's
+        status poll does. A failed poll keeps the look it has."""
+        if MOOD_POLL_S <= 0:
+            return
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while True:
+                mood = await agentapi.fetch_mood(client, AGENT_BASE, GHOST_API_KEY)
+                if mood:
+                    try:
+                        self.web_face.set_agent_mood(*mood)
+                    except Exception:  # noqa: BLE001 — a face must never break the client
+                        pass
+                await asyncio.sleep(MOOD_POLL_S)
 
     def _animate_thinking(self):
         if getattr(self, 'is_thinking', False):
@@ -2278,7 +2073,7 @@ class MainWindow(QWidget):
             # `data` is a server message or an exception's text — escaped, or a
             # `<` in it would be swallowed as markup.
             self.chat_display.add(
-                f"<span style='color:{T.DANGER};'>fault → {escape_user(data)}</span>", "system")
+                f"<span style='color:{T.DANGER};'>{escape_user(data)}</span>", "system")
 
     def _show_image_popup(self, image_path):
         if image_path in self.shown_images:
@@ -2437,6 +2232,7 @@ if __name__ == "__main__":
     loop.create_task(window.restore_session())
     loop.create_task(window.link_loop())
     loop.create_task(window.notify_loop())
+    loop.create_task(window.mood_loop())
     # Live turn status. Started unconditionally: the reader reconnects forever
     # and never raises, so an interface that is down (or a device without the
     # `websockets` package) just leaves the waiting bubble on its offline

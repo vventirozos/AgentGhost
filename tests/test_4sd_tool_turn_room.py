@@ -56,7 +56,7 @@ def agent(monkeypatch):
     ctx.args = MagicMock(smart_memory=0.0, max_context=4000, temperature=0.7,
                          native_tools=False, tool_turn_max_tokens=0)
     for k in ("verifier", "self_model", "sandbox_dir", "memory_system", "profile_memory",
-              "semantic_memory", "skill_memory", "journal"):
+              "semantic_memory", "journal"):
         setattr(ctx, k, None)
     ctx.llm_client = MagicMock()
     ctx.llm_client.upstream_url = "http://main:8088/v1"

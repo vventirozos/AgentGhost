@@ -208,35 +208,3 @@ async def test_a_probe_notification_says_it_was_not_sent(monkeypatch):
     assert not _notify_delivered({"name": "notify_operator", "content": out})
 
 
-def test_a_macro_registered_during_a_save_does_not_break_it(tmp_path, monkeypatch, caplog):
-    """Deterministic interleaving: while save() snapshots the dict, another
-    thread registers a macro. Under the lock it waits; unlocked, the dict
-    changes size mid-snapshot and that save is lost."""
-    import threading
-    from ghost_agent.tools.composed_skills import ComposedSkill, ComposedSkillRegistry
-    reg = ComposedSkillRegistry(tmp_path)
-    step = [{"tool": "web_search", "params": {"query": "$q"}}]
-    reg.compile_from_pattern("seed", step, "t")
-    real = ComposedSkill.to_dict
-    fired = {"done": False}
-
-    def to_dict_racing(self):
-        if not fired["done"]:
-            fired["done"] = True
-            th = threading.Thread(target=reg.compile_from_pattern, args=("late", step, "t"))
-            th.start()
-            th.join(0.3)          # let it run if nothing holds it back
-        return real(self)
-    monkeypatch.setattr(ComposedSkill, "to_dict", to_dict_racing)
-    import logging
-    with caplog.at_level(logging.WARNING, logger="GhostAgent"):
-        reg.record_usage("seed", True)
-    monkeypatch.setattr(ComposedSkill, "to_dict", real)
-    # no save failed — a later save heals the file, but until then (or
-    # after a crash) the failed one is a lost write
-    assert not [r for r in caplog.records if "Failed to save composed skills" in r.getMessage()]
-    for t in threading.enumerate():
-        if t is not threading.current_thread() and t.name.startswith("Thread"):
-            t.join(5)
-    on_disk = json.loads((tmp_path / "composed_skills.json").read_text())
-    assert on_disk["seed"]["usage_count"] == 1 and "late" in on_disk

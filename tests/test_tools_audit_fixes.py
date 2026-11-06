@@ -48,7 +48,6 @@ class TestAcquiredSkillsClosure:
         ctx.scratchpad = MagicMock()
         ctx.scheduler = MagicMock()
         ctx.profile_memory = MagicMock()
-        ctx.skill_memory = MagicMock()
         ctx.args = MagicMock()
         ctx.args.anonymous = True
         ctx.args.max_context = 8192
@@ -287,66 +286,7 @@ class TestFallbackHint:
         assert get_fallback_hint("execute", None) is None  # type: ignore
 
 
-# ---------------------------------------------------------------------------
-# Fix #12: composed_skills.register_composed_skills mutates the list
-# ---------------------------------------------------------------------------
-class TestRegisterComposedSkills:
-    def test_register_appends_definitions(self, tmp_path):
-        from ghost_agent.tools.composed_skills import (
-            ComposedSkill,
-            ComposedSkillRegistry,
-            SkillStep,
-            register_composed_skills,
-        )
-
-        # Build a context with a pre-populated composed-skill registry
-        storage = tmp_path / "composed_skills"
-        reg = ComposedSkillRegistry(storage_dir=storage)
-        reg.register(ComposedSkill(
-            name="my_macro",
-            trigger_description="do the thing",
-            steps=[
-                SkillStep(tool_name="execute", description="step1",
-                          param_template={"command": "$cmd"}),
-            ],
-        ))
-
-        ctx = MagicMock()
-        ctx.sandbox_dir = tmp_path
-        # Pre-cache the registry on the context so the helper finds it.
-        ctx._composed_skill_registry = reg
-
-        defs = []
-        added = register_composed_skills(defs, ctx)
-        assert added >= 1
-        names = {d["function"]["name"] for d in defs}
-        assert "my_macro" in names
-
-    def test_register_skips_shadowed_names(self, tmp_path):
-        from ghost_agent.tools.composed_skills import (
-            ComposedSkill,
-            ComposedSkillRegistry,
-            SkillStep,
-            register_composed_skills,
-        )
-
-        storage = tmp_path / "composed_skills"
-        reg = ComposedSkillRegistry(storage_dir=storage)
-        reg.register(ComposedSkill(
-            name="shadow_me",
-            trigger_description="ignored",
-            steps=[SkillStep(tool_name="execute", description="x")],
-        ))
-
-        ctx = MagicMock()
-        ctx.sandbox_dir = tmp_path
-        ctx._composed_skill_registry = reg
-
-        defs = [{"type": "function", "function": {"name": "shadow_me"}}]
-        added = register_composed_skills(defs, ctx)
-        # No new entries should be added; the only entry is the original.
-        assert added == 0
-        assert len(defs) == 1
+# (Fix #12 — composed_skills.register_composed_skills mutates the list — went with the macro engine, §4TA)
 
 
 # ---------------------------------------------------------------------------

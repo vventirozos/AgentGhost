@@ -179,7 +179,6 @@ def test_registry_dispatch_lambdas_wire_workspace_into_browser_and_execute(tmp_p
         memory_dir=str(tmp_path),
         memory_system=MagicMock(),
         graph_memory=None,
-        skill_memory=MagicMock(),
         llm_client=MagicMock(image_gen_clients=None),
         scratchpad=MagicMock(),
         scheduler=MagicMock(),

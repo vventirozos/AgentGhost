@@ -166,9 +166,9 @@ def test_a_long_yes_confirms_only_the_items_it_names():
 
 def test_the_forget_preview_numbers_its_items_once_defaults_first(monkeypatch):
     """Turn 18: the list read 1, 2, 15 — the model renumbered it and its
-    "remove 1, 2, 3" would have deleted an episode instead of the lesson.
+    "remove 1, 2, 3" would have deleted the wrong item.
     The REAL forget_preview, with a sweep that lists defaults and extras
-    interleaved and a lesson appended last."""
+    interleaved."""
     import re
     from ghost_agent.tools import memory as M
 
@@ -179,16 +179,13 @@ def test_the_forget_preview_numbers_its_items_once_defaults_first(monkeypatch):
         plan.add("episode", {"id": 8}, "episode #8", default=False)
         return "ok"
 
-    class _Skills:
-        def lessons_mentioning(self, target):
-            return [("the pdf lesson", False)]
     monkeypatch.setattr(M, "tool_unified_forget", sweep)
     monkeypatch.setattr(M, "_store_plan", lambda plan: "tok123")
-    out = asyncio.run(M.forget_preview("pdf", skill_memory=_Skills()))
+    out = asyncio.run(M.forget_preview("pdf"))
     nums = [int(n) for n in re.findall(r"^(\d+)\. ", out, re.M)]
-    assert nums == [1, 2, 3, 4], out
+    assert nums == [1, 2, 3], out
     head = out.split("Also found")[0]
-    assert "1. fact 'a'" in head and "2. lesson 'the pdf lesson'" in head, out
+    assert "1. fact 'a'" in head and "episode" not in head, out
 
 
 # ── F5: the "While you were away" digest (turn 16) ─────────────────────────

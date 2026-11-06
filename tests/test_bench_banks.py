@@ -17,15 +17,13 @@ import types
 class TestOriginOverride:
     def test_label_wins(self):
         from ghost_agent.core.agent import turn_origin
-        ctx = types.SimpleNamespace(turn_origin_label="bench",
-                                    skill_memory=None)
+        ctx = types.SimpleNamespace(turn_origin_label="bench")
         assert turn_origin(ctx) == "bench"
 
     def test_heuristic_unchanged_without_label(self):
         from ghost_agent.core.agent import turn_origin
-        ro = types.SimpleNamespace(is_read_only=True)
-        assert turn_origin(types.SimpleNamespace(skill_memory=ro)) == "sim"
-        assert turn_origin(types.SimpleNamespace(skill_memory=None)) == "user"
+        assert turn_origin(types.SimpleNamespace(simulated=True)) == "sim"
+        assert turn_origin(types.SimpleNamespace()) == "user"
 
 
 class TestTrajectorySeams:

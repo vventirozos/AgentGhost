@@ -182,7 +182,7 @@ def test_wakeup_prefix_no_query_has_no_relevant_block(tmp_path: Path):
 # #4 — meta-cognitive narrative
 # --------------------------------------------------------------------------
 
-async def test_narrative_folds_in_meta_insights(tmp_path: Path):
+async def test_the_prompt_carries_the_cluster_patterns(tmp_path: Path):
     captured = {}
 
     async def fake_llm(prompt: str) -> str:
@@ -193,24 +193,12 @@ async def test_narrative_folds_in_meta_insights(tmp_path: Path):
     sm.capture_turn(trajectory_id="t1", user_request="debug a python error",
                     tool_names=["execute"], outcome="failed",
                     final_response="", failure_reason="x")
-    out = await sm.consolidate_narrative(
-        meta_insights="I keep slipping on type-coercion in SQL.")
+    out = await sm.consolidate_narrative()
     assert out
-    # The meta-insight reached the LLM prompt...
-    assert "type-coercion in SQL" in captured["prompt"]
-    # ...under the dedicated patterns section...
     assert "PATTERNS" in captured["prompt"]
-    # ...alongside the self-derived cluster patterns.
     assert "Recurring kinds of work" in captured["prompt"]
 
 
-async def test_narrative_template_fallback_includes_meta_insights(tmp_path: Path):
-    # No critique_fn → template fallback path.
-    sm = SelfModel(root=tmp_path)
-    sm.capture_turn(trajectory_id="t1", user_request="a task",
-                    tool_names=[], outcome="passed", final_response="ok")
-    out = await sm.consolidate_narrative(meta_insights="I keep doing X.")
-    assert "What I've noticed about myself: I keep doing X." in out
 
 
 def test_stats_reports_clusters(tmp_path: Path):

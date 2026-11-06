@@ -329,30 +329,6 @@ class _T:
         self.outcome, self.session_id = "unknown", "s"
 
 
-async def test_the_no_tool_judge_writes_its_own_cache(tmp_path, monkeypatch):
-    """Fails where the no-tool pass judges tool turns, writes into the
-    tool-turn cache the failure-replay seeds read, or the tool pass starts
-    judging no-tool turns."""
-    from ghost_agent.core import owner_seeds as O
-    from ghost_agent.distill import reaction_judge as RJ
-    monkeypatch.setattr(RJ, "enabled", lambda: True)
-    trajs = [_T("a", "what is x?", "x is 1."), _T("b", "no, wrong", "ok", ts="2026-10-15T10:01:00Z"),
-             _T("c", "check ram", "fine", tools=[{"name": "system_utility"}], ts="2026-10-15T10:02:00Z"),
-             _T("d", "thanks", "np", ts="2026-10-15T10:03:00Z")]
-    monkeypatch.setattr(O, "reaction_pairs", lambda ts: [(trajs[0], trajs[1]), (trajs[2], trajs[3])])
-    import ghost_agent.memory.skills as SK
-    monkeypatch.setattr(SK, "iter_teachable", lambda it, consumer=None: list(it))
-    col = type("C", (), {"iter_trajectories": lambda self, since_days=None: trajs})()
-    llm = type("L", (), {})()
-    llm.chat_completion = AsyncMock(return_value={"choices": [{"message": {"content": "FAILED"}}]})
-    made = await O.judge_reactions(col, tmp_path, llm, "m", no_tool=True)
-    assert made == 1
-    assert set(O.load_reactions(tmp_path, no_tool=True)) == {"a"}
-    assert O.load_reactions(tmp_path) == {}                    # the replay seeds' cache is untouched
-    made = await O.judge_reactions(col, tmp_path, llm, "m")
-    assert made == 1 and set(O.load_reactions(tmp_path)) == {"c"}
-
-
 def test_the_gold_window_ends_yesterday(tmp_path):
     """Review r1 M3: today's turns are still arriving — they are not drawn."""
     s = tmp_path / "system" / "trajectories"
@@ -527,42 +503,6 @@ def test_concurrent_appends_through_a_rotation_lose_nothing(tmp_path, monkeypatc
     for k in range(8):                       # each writer's surviving rows are one unbroken tail
         mine = [r["i"] for r in rows if r["k"] == k]
         assert mine == list(range(mine[0], 300)) if mine else True
-
-
-async def test_the_idle_slot_runs_the_no_tool_judge_after_the_tool_pass(tmp_path, monkeypatch):
-    """r3 (hooks) MAJOR: the second pass was pinned by nothing."""
-    from ghost_agent.core import agent as A
-    from ghost_agent.core import owner_seeds as O
-    from ghost_agent.core import failure_replay as FR
-    from ghost_agent.core import regression as RG
-    calls = []
-
-    async def judge(col, home, llm, model, **kw):
-        calls.append(kw)
-        return 0
-
-    async def none(*a, **k):
-        return None
-    monkeypatch.setattr(O, "judge_reactions", judge)
-    monkeypatch.setattr(FR, "advance_one", none)
-    monkeypatch.setattr(RG, "advance", none)
-    a = A.GhostAgent.__new__(A.GhostAgent)
-    stops = iter([""])
-
-    async def run(coro, label, cap_s=0):
-        a._last_idle_stop = next(stops, "")
-        return await coro
-    a._run_idle_job = run
-    ctx = type("C", (), {"memory_dir": str(tmp_path / "memory"), "trajectory_collector": None,
-                         "llm_client": object(), "args": type("G", (), {"model": "m"})()})()
-    with pytest.raises(A._NoOwnerSeed):
-        await a._self_play_slot_body_inner(ctx)
-    assert calls == [{}, {"no_tool": True, "cap": O.NOTOOL_CAP_PER_PASS}]
-    calls.clear()
-    stops = iter(["owner"])                                   # the owner stopped the first pass
-    with pytest.raises(A._NoOwnerSeed):
-        await a._self_play_slot_body_inner(ctx)
-    assert calls == [{}]
 
 
 async def test_a_probe_turn_leaves_no_prompt_in_the_stash(tmp_path, monkeypatch):

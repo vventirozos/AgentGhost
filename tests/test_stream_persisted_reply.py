@@ -143,13 +143,24 @@ async def test_executed_an_all_consumed_scrub_gets_the_fallback_not_the_note():
 
 
 @pytest.mark.asyncio
-async def test_executed_the_watchdog_marker_gets_no_note_and_stays_in_the_record():
-    """The cognitive watchdog's synthetic replan call is appended to the
-    durable text on purpose (replayed by the trajectory machinery)."""
-    deltas = ["Here is the analysis so far.\n\n", "<tool_call>\n<function=replan>\n<parameter=reason>\nloop\n</parameter>\n</function>\n</tool_call>", "\n\nRecovering."]
+async def test_executed_the_watchdog_note_gets_no_call_note_and_stays_in_the_record():
+    """The cognitive watchdog's note is plain text (§4TB: it was a synthetic
+    `replan` call): no "tool call NOT executed" note, and the record keeps it."""
+    deltas = ["Here is the analysis so far.\n\n",
+              "[SYSTEM OVERRIDE: my internal reasoning got stuck in a loop and the reply was cut off here.]",
+              "\n\nRecovering."]
     client, recorded = await _drive_and_record(deltas, tools=[{"name": "a"}, {"name": "b"}])
     assert UNPARSED_TOOL_CALL_NOTE not in client, client
-    assert "replan" in recorded, recorded
+    assert UNPARSED_TOOL_CALL_NOTE not in recorded and "SYSTEM OVERRIDE" in recorded, recorded
+
+
+@pytest.mark.asyncio
+async def test_executed_a_streamed_replan_call_gets_the_note_like_any_other_call():
+    """§4TB: nothing exempts the removed tool's call shape any more."""
+    deltas = ["Here is the analysis so far.\n\n", "<tool_call>\n<function=replan>\n<parameter=reason>\nloop\n</parameter>\n</function>\n</tool_call>", "\n\nRecovering."]
+    client, recorded = await _drive_and_record(deltas, tools=[{"name": "a"}, {"name": "b"}])
+    assert "<function=replan>" not in client and "<function=replan>" not in recorded, recorded
+    assert UNPARSED_TOOL_CALL_NOTE in client, client
 
 
 @pytest.mark.asyncio

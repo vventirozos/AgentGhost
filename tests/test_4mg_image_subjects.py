@@ -427,7 +427,6 @@ async def test_a_late_pass_lifts_the_no_photo_ask_turn_for_a_real_user(tmp_path,
              "him? Or should I generate the scene with a generic violinist instead?")
     ctx = MagicMock()
     ctx.trajectory_collector = TrajectoryCollector(root=tmp_path / "system" / "trajectories", session_id="s")
-    ctx.skill_memory = SimpleNamespace(is_read_only=False)
     del ctx.turn_origin_label
     ctx._recent_trajectories_for_correction = OrderedDict()
     ctx.self_model = None

@@ -92,66 +92,6 @@ def test_store_hygiene_has_its_own_cooldown_constant():
     assert isinstance(GhostAgent._STORE_HYGIENE_COOLDOWN, int)
 
 
-def test_hygiene_not_nested_under_trajectory_collector_gate():
-    """The heal is a SkillMemory↔vector repair with no trajectory dependency.
-    Nested under phase 2.6's collector gate it was dead under
-    --no-trajectories, so lessons whose twin went missing stayed dark."""
-    import inspect
-    src = inspect.getsource(GhostAgent._biological_tick)
-    idx_heal = src.index("heal_missing_twins")
-    # Walk back to the enclosing phase header and confirm it is 2.6b (its own
-    # phase), not the skills-auto phase body.
-    header = src.rindex("# Phase ", 0, idx_heal)
-    assert "2.6b" in src[header:header + 40], (
-        "heal is no longer inside its own phase — check it did not get "
-        "re-nested under the trajectory-collector gate")
-
-
-def test_reconcile_failure_cannot_skip_the_heal():
-    """A raise in reconcile_vector_orphans must NOT prevent heal_missing_twins:
-    they were in one try, and reconcile genuinely raises (it calls
-    _load_playbook, which re-raises OSError by design)."""
-    import ast
-    import inspect
-    import textwrap
-    src = inspect.getsource(GhostAgent._biological_tick)
-    seg = src[src.index("# Phase 2.6b"):src.index("# Phase 2.7")]
-    # ⚠ `seg.count("try:") >= 2` CANNOT SEE NESTING. Moving the heal's try
-    # INSIDE the reconcile's try keeps both `try:` tokens, both
-    # `logger.warning`s and no `logger.debug` — and it survived 1,420 tests.
-    # `reconcile_vector_orphans` calls `_load_playbook`, which re-raises
-    # OSError by design, and this project has a live root-owned-file failure
-    # class: one unreadable playbook then silently skips `heal_missing_twins`
-    # for the process lifetime (the audit that added it measured 36/50
-    # lessons dark), with a warning that names reconcile and never mentions
-    # healing.
-    assert "logger.debug" not in seg, "hygiene failures must not be DEBUG-only"
-    assert seg.count("logger.warning") >= 2
-
-    # Parse the WHOLE method and select by line range — a slice of a method
-    # body is not independently parseable.
-    ded = textwrap.dedent(src)
-    lines = ded.split("\n")
-    lo = next(i for i, l in enumerate(lines, 1) if "# Phase 2.6b" in l)
-    hi = next(i for i, l in enumerate(lines, 1) if "# Phase 2.7" in l)
-    tree = ast.parse(ded)
-    tries = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Try) and lo <= n.lineno < hi]
-    assert len(tries) >= 2, "reconcile and heal must have separate try blocks"
-    # SIBLINGS, not nested: no `try` may contain another.
-    nested = [t for t in tries
-              if any(isinstance(x, ast.Try) and x is not t
-                     for x in ast.walk(t))]
-    assert not nested, (
-        "the heal's try is INSIDE the reconcile's try — a reconcile failure "
-        "skips the heal entirely, which is the defect this phase split exists "
-        "to prevent")
-    # ...and each must actually call the thing it guards.
-    _calls = [ast.unparse(t) for t in tries]
-    assert any("reconcile_vector_orphans" in c for c in _calls), _calls
-    assert any("heal_missing_twins" in c for c in _calls), _calls
-
-
 # ── dream must not abort the rest of the tick ─────────────────────────────
 
 def test_dream_phase_catches_so_later_phases_still_run():
@@ -174,11 +114,7 @@ def test_dream_phase_catches_so_later_phases_still_run():
 # ── journal tee shares the miner's type set ───────────────────────────────
 
 
-
 # ── stash path no longer silently disables itself ─────────────────────────
-
-
-
 
 
 # ── #40/#41: an over-aggressive --bio-time-scale silently kills most phases ──
@@ -201,8 +137,6 @@ def test_usable_scale_does_not_warn():
     for scale in (1.0, 5.0, 15.0, 20.0):
         assert _Scaled(scale)._warn_if_scale_breaks_the_window() == "", (
             f"false warning at scale {scale}, whose window is still usable")
-
-
 
 
 # ── #38: the idle-cycle summary reported 4 of 14 phases ──────────────────────

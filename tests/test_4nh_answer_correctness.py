@@ -105,36 +105,6 @@ def test_the_rate_limit_lets_a_follow_up_through():
     assert K.MIN_INTERVAL_S <= 90
 
 
-def test_a_knowledge_error_seeds_the_failure_replay_and_nothing_else(tmp_path, monkeypatch):
-    monkeypatch.setenv("GHOST_KNOWLEDGE_SHADOW", "1")         # §4OH: off by default, and off seeds nothing
-    """Review r1 (MAJOR ×2): routed through `_verdicts_by_trajectory` it could
-    pull a proven lesson (lesson withdrawal reads it) and never reached the
-    replay (both pickers admit tool turns only). Now a separate source."""
-    from ghost_agent.core.owner_seeds import _verdicts_by_trajectory, knowledge_errors
-    (tmp_path / "verifier").mkdir()
-    rows = [{"ts": time.time(), "trajectory_id": "t-err", "verdict": "errors",
-             "issues": [{"quote": "VEM", "why": "not Vanguard's EU EM ETF"}]},
-            {"ts": time.time(), "trajectory_id": "t-ok", "verdict": "ok", "issues": []},
-            {"ts": time.time(), "trajectory_id": "t-noissue", "verdict": "errors", "issues": []}]
-    (tmp_path / "verifier" / "knowledge_shadow.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    assert knowledge_errors(tmp_path, 7) == {"t-err"}
-    assert "t-err" not in _verdicts_by_trajectory(tmp_path, 7)          # lesson withdrawal never sees it
-
-
-def test_the_replay_picks_a_flagged_no_tool_answer(tmp_path, monkeypatch):
-    from ghost_agent.core import failure_replay as FR
-    from ghost_agent.core import owner_seeds as OS
-    t = SimpleNamespace(id="t-err", user_request="which emerging markets ETF is best for a small monthly amount",
-                        final_response="VEM.", tool_calls=[], extra={"req_id": "web-1"}, outcome="unknown",
-                        timestamp="2026-10-10T05:04:00Z", session_id="s")
-    coll = MagicMock()
-    coll.iter_trajectories.return_value = [t]
-    monkeypatch.setattr(OS, "knowledge_errors", lambda home, days: {"t-err"})
-    monkeypatch.setattr("ghost_agent.memory.skills.trajectory_may_teach", lambda tr, consumer="": True)
-    case = FR.pick_case(coll, tmp_path)
-    assert case is not None and case["source_id"] == "t-err" and case["signal"] == "knowledge_errors"
-
-
 def test_a_passed_turn_keeps_its_note_plain():
     """Review r1: a write that failed then succeeded on retry, verifier PASSED —
     the note must not say "unverified" next to "verifier:passed"."""
@@ -151,9 +121,9 @@ def test_learning_warnings_lead_the_overview_section(monkeypatch):
     must come first so a cut drops headlines, not warnings."""
     from ghost_agent.tools import introspect as I
     monkeypatch.setattr(I, "_learning_report_cached",
-                        lambda md, args, allow_stale=True: ("LESSONS: 3 live\nCALIBRATION: ranking\n⚠ CONSUMER DEAD x", 0))
+                        lambda md, args, allow_stale=True: ("### LEARNING HEALTH\nEPISODES: 3\n⚠ CONSUMER DEAD x", 0))
     out = asyncio.run(I._overview_learning(SimpleNamespace(memory_dir="/tmp", args=None)))
-    assert out.index("⚠ CONSUMER DEAD") < out.index("LESSONS:")
+    assert "⚠ CONSUMER DEAD" in out and "EPISODES" not in out   # §4TD: the warnings ARE the section
 
 
 def test_the_knowledge_shadow_is_off_by_default(monkeypatch):

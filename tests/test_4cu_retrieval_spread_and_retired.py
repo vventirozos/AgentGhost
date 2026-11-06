@@ -44,8 +44,7 @@ from ghost_agent.core.liveness import (
 
 @pytest.fixture
 def home(tmp_path):
-    for rel in ("system/memory/composed_skills",
-                "system/memory/acquired_skills",
+    for rel in ("system/memory/acquired_skills",
                 "system/evolve", "system/optim"):
         (tmp_path / rel).mkdir(parents=True, exist_ok=True)
     return tmp_path
@@ -180,8 +179,8 @@ class TestPowerFloor:
         exhaustively, for every total from 1 to 2000 — so a perfectly
         even two-item store was reported as a broken retriever with a
         claim that is arithmetically false ("more than every other item
-        combined": 5 is not more than 5). Two active skills or two
-        approved macros is an ordinary shape."""
+        combined": 5 is not more than 5). Two active skills is an
+        ordinary shape."""
         sp = _spread([5, 5])
         assert sp.top1_share == pytest.approx(0.5)
         assert sp.verdict == SPREAD_OK
@@ -218,8 +217,8 @@ class TestEligiblePopulation:
             rows, lambda r: r["c"], lambda r: r["on"])) == [0, 4]
 
     def test_an_item_with_a_COUNT_stays_in_even_when_no_longer_eligible(self):
-        """THE INVARIANT. A macro un-approved after being run, or a skill
-        degraded after being used, still contributed to `invoked`. Dropping
+        """THE INVARIANT. A skill
+        degraded after being used still contributed to `invoked`. Dropping
         it from the denominator would make `total` disagree with the row
         it describes."""
         rows = [{"c": 7, "on": False}, {"c": 1, "on": True}]
@@ -240,12 +239,6 @@ class TestSpreadMatchesItsOwnRow:
     separately-computed `invoked`, not merely that it is 'reasonable'."""
 
     def _stores(self, home):
-        _w(home, "system/memory/skills_playbook.json", [
-            {"retrievals": 9, "helpful_retrievals": 4},
-            {"retrievals": 3},
-            {"retrievals": 0},
-            {"retrievals": 41, "quarantined": True},   # excluded BOTH sides
-        ])
         _w(home, "system/memory/auto_skills.json", {
             "a": {"retrievals": 6}, "b": {"retrievals": 0},
         })
@@ -259,42 +252,17 @@ class TestSpreadMatchesItsOwnRow:
             # mutation deleting it left the suite green.
             "w": {"usage_count": 0, "status": "degraded"},
         })
-        _w(home, "system/memory/composed_skills/composed_skills.json", {
-            "auto_p": {"usage_count": 2, "status": "active",
-                       "trigger_description": "auto-mined from"},
-            "auto_q": {"usage_count": 0, "status": "proposed",
-                       "trigger_description": "auto-mined from"},
-        })
 
     @pytest.mark.parametrize("name", [
-        "lessons.playbook",
-        "skills.acquired", "macros.auto_mined",
+        "skills.acquired",          # ("macros.auto_mined" went with the macro engine, §4TA)
     ])
-    def test_total_equals_invoked(self, home, monkeypatch, name):
-        monkeypatch.setattr(L, "_macro_marks", lambda: ("auto-mined from", "gr"))
+    def test_total_equals_invoked(self, home, name):
         self._stores(home)
         row = _row(yield_all(home)["rows"], name)
         assert row["spread"] is not None, f"{name} lost its spread"
         assert row["spread"]["total"] == row["invoked"], (
             f"{name}: spread describes a different population than its row")
 
-    def test_a_quarantined_lesson_is_in_NEITHER_total_nor_n(self, home):
-        """Quarantine is retention without service — `_filter_quarantined`
-        runs at both retrieval surfaces, so a quarantined lesson can never
-        be drawn again. Its 41 retrievals are dead history."""
-        self._stores(home)
-        row = _row(yield_all(home)["rows"], "lessons.playbook")
-        assert row["spread"]["total"] == 12          # 9 + 3, NOT 53
-        assert row["spread"]["n"] == 3               # NOT 4
-
-    def test_a_proposed_macro_is_not_in_the_denominator(self, home, monkeypatch):
-        """26 of 29 live macros are `proposed`; scoring over all of them
-        would report 100% top-1 about a store with one runnable item."""
-        monkeypatch.setattr(L, "_macro_marks", lambda: ("auto-mined from", "gr"))
-        self._stores(home)
-        row = _row(yield_all(home)["rows"], "macros.auto_mined")
-        assert row["spread"]["n"] == 1               # only auto_p is active
-        assert row["spread"]["verdict"] == UNDEFINED
 
     def test_a_degraded_but_USED_skill_stays_in(self, home):
         """It contributed to `invoked`; dropping it breaks the invariant."""
@@ -326,8 +294,8 @@ class TestRetiredSortsWithTheSettledStates:
 # ══════════════════════════════════════════════════════════════════════
 class TestRender:
     def test_a_spread_line_is_printed_for_stores_that_have_one(self, home):
-        _w(home, "system/memory/skills_playbook.json",
-           [{"retrievals": 30} for _ in range(6)])
+        _w(home, "system/memory/acquired_skills/skills_registry.json",
+           {str(i): {"usage_count": 30, "status": "active"} for i in range(6)})
         assert "retrieval spread:" in render_yield(home)
 
     def test_no_spread_line_is_invented_for_stores_without_one(self, home):
@@ -355,7 +323,7 @@ class TestRender:
                         "spread": None}
             return {"rows": [_r("prompts.gepa", RETIRED),
                              _r("evolve.candidates", GATED),
-                             _r("lessons.playbook", YIELDING)],
+                             _r("skills.acquired", YIELDING)],
                     "n_probes": 3, "barren": [], "blocked": [],
                     "unmeasured": [], "gaps": [], "empty": [],
                     "retired": ["prompts.gepa"], "concentrated": []}
@@ -370,7 +338,7 @@ class TestRender:
         """The negative control: without it the branch above could be an
         unconditional rewrite that never prints the all-clear at all."""
         def _fake(_home=None):
-            return {"rows": [{"name": "lessons.playbook", "source": "s",
+            return {"rows": [{"name": "skills.acquired", "source": "s",
                               "status": YIELDING, "minted": 1,
                               "activated": 1, "invoked": 1, "age_h": None,
                               "note": "", "derived_zero": "",
@@ -383,8 +351,8 @@ class TestRender:
         assert "every probed loop has a live consumer" in render_yield(home)
 
     def test_a_concentrated_loop_says_the_remedy_is_the_RETRIEVER(self, home):
-        _w(home, "system/memory/skills_playbook.json",
-           [{"retrievals": 200}] + [{"retrievals": 0} for _ in range(9)])
+        _w(home, "system/memory/acquired_skills/skills_registry.json",
+           {str(i): {"usage_count": 200 if i == 0 else 0, "status": "active"} for i in range(10)})
         out = render_yield(home)
         assert "CONSUMED BUT COLLAPSED" in out
         assert "the RETRIEVER, not more" in out
@@ -396,7 +364,7 @@ class TestRender:
         list left every other test green, because the concentrated LINE
         still printed — the contradiction was two lines apart."""
         def _fake(_home=None):
-            return {"rows": [{"name": "lessons.playbook", "source": "s",
+            return {"rows": [{"name": "skills.acquired", "source": "s",
                               "status": YIELDING, "minted": 9,
                               "activated": 1, "invoked": 90, "age_h": None,
                               "note": "", "derived_zero": "",
@@ -409,7 +377,7 @@ class TestRender:
                                          "why": "one item takes all"}}],
                     "n_probes": 1, "barren": [], "blocked": [],
                     "unmeasured": [], "gaps": [], "empty": [],
-                    "retired": [], "concentrated": ["lessons.playbook"]}
+                    "retired": [], "concentrated": ["skills.acquired"]}
         monkeypatch.setattr(L, "yield_all", _fake)
         out = render_yield(home)
         assert "CONSUMED BUT COLLAPSED" in out
@@ -417,8 +385,8 @@ class TestRender:
 
     def test_an_underpowered_loop_is_NOT_called_collapsed(self, home):
         """The §4CE failure, rebuilt here, would be exactly this."""
-        _w(home, "system/memory/skills_playbook.json",
-           [{"retrievals": 3}] + [{"retrievals": 0} for _ in range(9)])
+        _w(home, "system/memory/acquired_skills/skills_registry.json",
+           {str(i): {"usage_count": 3 if i == 0 else 0, "status": "active"} for i in range(10)})
         out = render_yield(home)
         assert "CONSUMED BUT COLLAPSED" not in out
         assert UNDERPOWERED in out
@@ -444,23 +412,25 @@ class TestAbsenceIsDetectable:
     tests green. A test that cannot fail when the feature is gone is not a
     test of the feature."""
 
-    def test_at_least_three_probes_carry_a_real_spread(self, home):
-        _w(home, "system/memory/skills_playbook.json",
-           [{"retrievals": 30} for _ in range(6)])
+    def test_both_per_item_probes_carry_a_real_spread(self, home):
+        # (three until the macro row was removed, §4TA; a macro registry left
+        # on disk is not read and adds no row)
+        _w(home, "system/memory/acquired_skills/skills_registry.json",
+           {str(i): {"usage_count": 30, "status": "active"} for i in range(6)})
         _w(home, "system/memory/acquired_skills/skills_registry.json",
            {str(i): {"usage_count": 30, "status": "active"} for i in range(6)})
         _w(home, "system/memory/composed_skills/composed_skills.json",
            {f"auto_{i}": {"usage_count": 30, "status": "active",
                           "trigger_description": "auto-mined from"}
             for i in range(6)})
-        with_spread = [r["name"] for r in yield_all(home)["rows"]
-                       if r["spread"] is not None]
-        assert len(with_spread) >= 3, with_spread
+        with_spread = sorted(r["name"] for r in yield_all(home)["rows"]
+                             if r["spread"] is not None)
+        assert with_spread == ["skills.acquired"], with_spread
 
     def test_the_concentrated_bucket_is_reachable(self, home):
-        _w(home, "system/memory/skills_playbook.json",
-           [{"retrievals": 500}] + [{"retrievals": 1} for _ in range(9)])
-        assert yield_all(home)["concentrated"] == ["lessons.playbook"]
+        _w(home, "system/memory/acquired_skills/skills_registry.json",
+           {str(i): {"usage_count": 500 if i == 0 else 1, "status": "active"} for i in range(10)})
+        assert yield_all(home)["concentrated"] == ["skills.acquired"]
 
     def test_the_spread_verdicts_are_all_reachable(self, home):
         seen = {
@@ -503,38 +473,6 @@ class TestTop1IsTheMAXNotTheFirst:
 class TestTimestampAndLabelChannelRegressions:
     """Two guards a mutation showed were unpinned."""
 
-    def test_a_macro_with_an_ISO_last_used_does_not_break_its_row(self, home):
-        """⚠ `_yield_macros` used a raw `float()` where every peer probe
-        uses `_parse_ts`. Fed the ISO stamp that `auto_skills.json`
-        writes for the same concept, the probe raised ValueError and a
-        populated 29-macro store rendered `no_source` — a live store
-        reported as a MISSING one."""
-        import ghost_agent.core.liveness as _L
-        _w(home, "system/memory/composed_skills/composed_skills.json",
-           {"auto_a": {"usage_count": 4, "status": "active",
-                       "trigger_description": "auto-mined from",
-                       "last_used": "2026-08-24T10:00:00Z"}})
-        import unittest.mock as _m
-        with _m.patch.object(_L, "_macro_marks",
-                             lambda: ("auto-mined from", "gr")):
-            row = _row(yield_all(home)["rows"], "macros.auto_mined")
-        assert row["status"] != "no_source", row["note"]
-        assert row["minted"] == 1 and row["invoked"] == 4
-        assert row["age_h"] is not None, "the ISO stamp was not parsed"
-
-    def test_a_float_last_used_still_works(self, home):
-        """Negative control — the fix must not break the live shape."""
-        import time
-        import unittest.mock as _m
-        import ghost_agent.core.liveness as _L
-        _w(home, "system/memory/composed_skills/composed_skills.json",
-           {"auto_a": {"usage_count": 4, "status": "active",
-                       "trigger_description": "auto-mined from",
-                       "last_used": time.time() - 3600}})
-        with _m.patch.object(_L, "_macro_marks",
-                             lambda: ("auto-mined from", "gr")):
-            row = _row(yield_all(home)["rows"], "macros.auto_mined")
-        assert row["age_h"] is not None and 0.5 < row["age_h"] < 2.0
 
     def test_operator_overlay_counts_as_a_HUMAN_label(self, home):
         """`operator_overlay` is documented as a manual out-of-process
@@ -748,10 +686,10 @@ class TestTheDerivedZeroReachesTheOperator:
         assert "deliberately not arming" in out
 
     def test_a_row_with_no_derived_zero_prints_no_such_line(self, home):
-        _w(home, "system/memory/skills_playbook.json",
-           [{"retrievals": 30} for _ in range(6)])
+        _w(home, "system/memory/acquired_skills/skills_registry.json",
+           {str(i): {"usage_count": 30, "status": "active"} for i in range(6)})
         out = [l for l in render_yield(home).splitlines()
-               if "lessons.playbook" in l or "why the zero" in l]
+               if "skills.acquired" in l or "why the zero" in l]
         assert not any("why the zero" in l for l in out)
 
     def test_a_retired_loop_with_an_UNREADABLE_log_claims_no_count(self, home):

@@ -42,12 +42,12 @@ STREAM_KEEPALIVE_FRAME = b": keepalive\n\n"
 STREAM_CUT_NOTE = "_(Reply cut off: the stream was closed before it ended.)_"
 
 # ── Store calls off the event loop (§4GI, 2026-09-13) ─────────────────────────
-# The operator "surgery" routes (memory correct/delete, skill-twin delete,
-# lesson quarantine) called the vector store and the playbook DIRECTLY from
-# an `async def` handler. `VectorMemory.correct_fragment` takes the store's
-# `threading.RLock` — the same lock the biological tick's consolidation
-# holds from a worker thread for seconds — and `quarantine_lesson` takes an
-# `fcntl.flock(LOCK_EX)` with no timeout. Either one froze the event loop:
+# The operator "surgery" routes (memory correct/delete; until §4TD also the
+# lesson-twin delete and the lesson quarantine, removed with the lesson store)
+# called the vector store DIRECTLY from an `async def` handler.
+# `VectorMemory.correct_fragment` takes the store's `threading.RLock` — the
+# same lock the idle tick's maintenance holds from a worker thread for
+# seconds. That froze the event loop:
 # every SSE stream, `/api/health` and the reaper stalled for the duration,
 # and past `GHOST_STREAM_IDLE_TIMEOUT` the user's turn was aborted as an
 # "upstream stall". ONE helper now runs every such call in a worker thread
@@ -698,23 +698,6 @@ async def youtube_canary_run(request: Request):
         return JSONResponse({"started": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
-@router.post("/api/operator/self-play-slot", dependencies=[Security(verify_api_key)])
-async def operator_self_play_slot(request: Request):
-    """Operator trigger (§4MT supervised run): run the self-play idle slot ONCE
-    now — the same `_self_play_slot_body` the idle tick runs (the
-    reaction-judge pass, one owner-failure replay stage (§4MW), else one
-    regression-suite step (§4NE)). Refused while a user request is live or
-    another slot runs. Starts off-loop and returns at once; poll the GET for
-    the outcome."""
-    agent = get_agent(request)
-    llm = getattr(getattr(agent, "context", None), "llm_client", None)
-    if int(getattr(llm, "foreground_requests", 0) or 0) > 0:
-        return JSONResponse({"started": False, "error": "a user request is live"}, status_code=409)
-    started = agent.start_supervised_self_play_slot()
-    return JSONResponse({"started": started, "poll": "GET /api/operator/self-play-slot"},
-                        status_code=200 if started else 409)
-
-
 # §4SX D5: the Phase C operator route POST /api/operator/run-probe is REMOVED — `run` is advertised to the model,
 # and live checks drive it through probe-header chat turns (X-Ghost-Origin: probe).
 
@@ -750,12 +733,6 @@ async def operator_lab_secrets(lab_id: str, request: Request):
     # the host answers names only — pass that through, never the values
     return JSONResponse({k: out.get(k) for k in ("lab_id", "secrets", "error", "message") if k in out},
                         status_code=st)
-
-
-@router.get("/api/operator/self-play-slot", dependencies=[Security(verify_api_key)])
-async def operator_self_play_slot_status(request: Request):
-    agent = get_agent(request)
-    return JSONResponse(dict(getattr(agent, "_supervised_slot", None) or {"state": "never run"}))
 
 
 def _effort_enabled() -> bool:
@@ -851,20 +828,27 @@ async def api_health(request: Request):
     except Exception:  # noqa: BLE001 — health must never raise
         node_health = {}
 
-    # Functional mood (2026-09-11, for the web face's slow baseline tint):
-    # label + provenance + when. getattr-chained so a mock or a boot
-    # without a self-model can never 500 the health endpoint.
-    mood = None
+    # The mood (2026-09-11, for the web face's slow baseline tint; §4TC: one
+    # shape, always an object): label ("neutral" when there is none),
+    # intensity 0–3, the manner the owner set, since when, and who set it
+    # ("auto" | "owner"). A read — it never moves the mood. getattr-chained
+    # so a mock or a boot without a self-model can never 500 the endpoint.
+    mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}
     try:
-        _sm = getattr(context, "self_model", None)
-        _st = getattr(_sm, "state", None)
-        _m = getattr(_st, "mood", None)
-        _m = _m() if callable(_m) else _m
-        if _m is not None and getattr(_m, "label", None):
-            mood = {"label": str(_m.label), "source": str(getattr(_m, "source", "") or ""),
-                    "set_at": str(getattr(_m, "set_at", "") or "")}
+        _st = getattr(getattr(context, "self_model", None), "state", None)
+        _read = getattr(_st, "mood", None)
+        _m = _read() if callable(_read) else None
+        _label = getattr(_m, "label", None)
+        _n = getattr(_m, "intensity", None)
+        if isinstance(_label, str) and isinstance(_n, int) and not isinstance(_n, bool):
+            _n = max(0, min(3, _n))
+            _manner = getattr(_m, "manner", "")
+            mood = {"label": (_label if _n else "neutral") or "neutral", "intensity": _n,
+                    "manner": _manner if isinstance(_manner, str) else "",
+                    "set_at": str(getattr(_m, "set_at", "") or "") if _n else "",
+                    "source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto"}
     except Exception:  # noqa: BLE001 — health must never raise
-        mood = None
+        mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}
 
     # §4RQ: seconds the main slot is still kept for the conversation that last
     # used it (§4RP, GHOST_SLOT_KEEP_S); 0 when nothing owns it. Read by
@@ -3220,26 +3204,25 @@ async def feedback(request: Request):
         str(body.get("source") or "")[:80],
     )
     if result.get("ok"):
-        # Lesson-outcome flush HERE, on the event loop — the helper spawns
-        # loop-bound background work, so calling it from the worker thread
-        # popped the stash and then lost the write (R1 review). Called on
-        # EVERY ok including idempotent repeats (R2): the flush is
-        # sign-aware and no-op-safe, and repeating it heals the case where
-        # the first attempt's post-write path failed after the label
-        # landed. A human label also revokes any queued machine correction
-        # banner for the turn — the verdict-then-label ordering is the
-        # common one, and the banner would otherwise apologize on the next
-        # reply for an answer the human just endorsed.
+        # A human label revokes any queued machine correction banner for the
+        # turn — the verdict-then-label ordering is the common one, and the
+        # banner would otherwise apologize on the next reply for an answer
+        # the human just endorsed. On EVERY ok including idempotent repeats
+        # (R2): it is no-op-safe, and repeating it heals the case where the
+        # first attempt's post-write path failed after the label landed.
+        # (§4TD: the lesson-outcome credit that also ran here is removed
+        # with the lesson store.)
         try:
-            flush = getattr(agent, "_flush_stashed_lesson_outcome", None)
-            if callable(flush):
-                flush(result.get("trajectory_id"),
-                      result.get("outcome") == "passed")
             drop = getattr(agent, "_drop_pending_corrections_for", None)
             if callable(drop):
                 drop(result.get("trajectory_id"))
-        except Exception:  # noqa: BLE001 — credit must not fail the label
+        except Exception:  # noqa: BLE001 — the banner drop must not fail the label
             pass
+        if signal == "negative" and not result.get("unchanged"):
+            # §4SZ: a thumbs-down no longer feeds a replay; what changes the
+            # agent is a rule the owner states — the client shows this once
+            from ..core.owner_rules import FEEDBACK_HINT
+            result["hint"] = FEEDBACK_HINT
         return JSONResponse(result)
     # Status from the machine-readable code, not the error prose — rewording
     # a message must never reroute a client's retry logic.
@@ -3263,15 +3246,20 @@ async def notifications_pending(request: Request, consumer: str = "default",
     first-run baseline)."""
     agent = get_agent(request)
     from ..core.autonomous_activity import (
-        get_activity_log, load_consumer_offset, SEVERITY_NOTIFY,
+        get_activity_log, load_consumer_offset, note_consumer_poll, SEVERITY_NOTIFY,
     )
-    log = get_activity_log(agent.context)
-    if log is None:
-        return JSONResponse({"enabled": False, "records": [], "watermark": 0})
     from pathlib import Path as _Path
     consumers_path = (_Path(str(agent.context.memory_dir)).parent
                       / "notify_consumers.json")
     offset = load_consumer_offset(consumers_path, consumer)
+    # §4TB: this poll is the only sign that the consumer is there NOW — the
+    # offsets file is not rewritten by an unchanged ack. `notify_operator`
+    # reads it to say who will actually get a notification. (A first-contact
+    # name that is not a plain token is served like any other, not recorded.)
+    note_consumer_poll(agent.context, consumer, acknowledged=offset is not None)
+    log = get_activity_log(agent.context)
+    if log is None:
+        return JSONResponse({"enabled": False, "records": [], "watermark": 0})
     if offset is None:
         # First contact: baseline silently. The caller acks this watermark
         # and subsequent polls return only NEW records.
@@ -3445,72 +3433,6 @@ async def memory_delete(request: Request):
     if not ok:
         return JSONResponse({"ok": False, "error": detail}, 409)
     return {"ok": True, **detail}
-
-
-@router.post("/api/memory/delete_skill_twin", dependencies=[Security(verify_api_key)])
-async def memory_delete_skill_twin(request: Request):
-    """Delete the vector TWINS of named skill lessons (type=skill + trigger).
-
-    Cleanup companion for a JSON-playbook prune: the JSON is canonical, but a
-    lesson removed from it leaves its embedded twin behind. Runs in-process
-    (a second PersistentClient against the live Chroma dir risks HNSW
-    corruption). Body: {"triggers": [<trigger str>, ...]} (or {"trigger": …}).
-    """
-    agent = get_agent(request)
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
-        return JSONResponse({"error": f"Invalid JSON: {e}"}, 400)
-    triggers = body.get("triggers")
-    if not triggers and body.get("trigger"):
-        triggers = [body["trigger"]]
-    if not isinstance(triggers, list) or not triggers:
-        return JSONResponse({"error": "body needs 'triggers' (list) or 'trigger'"}, 400)
-    memory = getattr(getattr(agent, "context", None), "memory_system", None)
-    if memory is None or not hasattr(memory, "delete_skill_twins"):
-        return JSONResponse({"error": "memory system unavailable"}, 503)
-    try:
-        removed, detail = await _store_call(memory.delete_skill_twins, triggers)
-    except StoreCallTimeout as e:
-        return _store_timeout_response(e)
-    return {"ok": True, "requested": len(triggers), "removed": removed, **detail}
-
-
-@router.post("/api/lessons/quarantine", dependencies=[Security(verify_api_key)])
-async def lessons_quarantine(request: Request):
-    """Quarantine a playbook lesson by trigger — IN-PROCESS (§4FB, 2026-09-06).
-
-    The playbook has a single-writer contract (memory/skills.py
-    `_crossproc_lock`): an external script must not write it while the agent
-    runs, and launchd respawns the agent immediately on exit, so there is no
-    process-free window either. This is the designed, reversible path
-    (`SkillMemory.quarantine_lesson`: excluded from injection, kept on disk
-    with the reason + timestamp, announced on the stream). First use: lesson
-    49, a bench-probe prompt minted by reflection (see turn_origin "probe").
-    Body: {"trigger": <exact trigger text>, "reason": <why>}.
-    """
-    agent = get_agent(request)
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
-        return JSONResponse({"error": f"Invalid JSON: {e}"}, 400)
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "body must be a JSON object"}, 400)
-    trigger = str(body.get("trigger") or "").strip()
-    reason = str(body.get("reason") or "").strip()
-    if not trigger:
-        return JSONResponse({"error": "body needs a non-empty 'trigger'"}, 400)
-    if not reason:
-        return JSONResponse({"error": "body needs a non-empty 'reason' (it is written on the record)"}, 400)
-    sm = getattr(getattr(agent, "context", None), "skill_memory", None)
-    if sm is None or not callable(getattr(sm, "quarantine_lesson", None)) \
-            or getattr(sm, "is_read_only", False) is True:
-        return JSONResponse({"error": "skill memory unavailable or read-only"}, 503)
-    try:
-        n = int(await _store_call(sm.quarantine_lesson, trigger, reason) or 0)
-    except StoreCallTimeout as e:
-        return _store_timeout_response(e)
-    return {"ok": n > 0, "quarantined": n, "trigger": trigger[:120]}
 
 
 def _session_focus_pid(agent, request) -> "str | None":

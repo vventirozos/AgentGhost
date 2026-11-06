@@ -59,19 +59,13 @@ def _write_traj(collector, req_id, *, traj_id=None, session_id="",
 
 
 def _fake_agent(collector, cache=None):
-    flush_calls = []
-
-    def _flush(tid, success):
-        flush_calls.append((tid, success))
-
     agent = SimpleNamespace(
         context=SimpleNamespace(
             trajectory_collector=collector,
             _recent_trajectories_for_correction=cache if cache is not None else {},
         ),
-        _flush_stashed_lesson_outcome=_flush,
     )
-    return agent, flush_calls
+    return agent, []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -315,7 +309,6 @@ class TestApplyLabel:
         _write_traj(c, "r1")
         agent, flushes = _fake_agent(c)
         assert apply_human_label(agent, "r1", "positive")["ok"]
-        assert flushes == []
 
     def test_second_source_still_writes(self, tmp_path):
         # Same signal from a DIFFERENT source is a real event, not a repeat
@@ -484,59 +477,12 @@ class TestWriterSkipIdentical:
         assert c.latest_correction(t.id)["outcome"] == "passed"
 
 
-class TestFlushRebook:
-    """R2 review: the stash pops once, so the FIRST resolver consumed the
-    trigger set and a later opposite-sign human label vanished — lesson
-    counters kept the machine's sign for a turn the human overruled."""
-
-    def _agent(self):
-        from ghost_agent.core.agent import GhostAgent
-        from collections import OrderedDict
-        booked = []
-
-        class _SM:
-            def record_surfaced_outcomes(self, triggers, success):
-                booked.append((tuple(triggers), success))
-
-        fake = SimpleNamespace(
-            _FLUSHED_TRIG_RETAIN_MAX=GhostAgent._FLUSHED_TRIG_RETAIN_MAX,
-            context=SimpleNamespace(
-                _surfaced_triggers_by_traj=OrderedDict(),
-                skill_memory=_SM()))
-        flush = GhostAgent._flush_stashed_lesson_outcome.__get__(fake)
-        return fake, flush, booked
-
-    def test_opposite_sign_rebooks_from_the_retained_set(self):
-        fake, flush, booked = self._agent()
-        fake.context._surfaced_triggers_by_traj["t1"] = ["lesson-a"]
-
-        async def go():
-            flush("t1", False)   # machine refute books the failure
-            flush("t1", False)   # same sign again → no-op
-            flush("t1", True)    # human 👍 → compensating success booking
-            await asyncio.sleep(0.05)
-
-        asyncio.run(go())
-        assert booked == [(("lesson-a",), False), (("lesson-a",), True)]
-
-    def test_never_flushed_stays_a_noop(self):
-        fake, flush, booked = self._agent()
-
-        async def go():
-            flush("missing", True)
-            await asyncio.sleep(0.02)
-
-        asyncio.run(go())
-        assert booked == []
-
-
 # ──────────────────────────────────────────────────────────────────────
 # The late-verdict backfill YIELDS to a human label
 # ──────────────────────────────────────────────────────────────────────
 
 class TestHumanLabelWins:
     def _fake_self(self, collector, cached):
-        flushes = []
         update_calls = []
 
         class _Rec:
@@ -554,11 +500,9 @@ class TestHumanLabelWins:
                 trajectory_collector=rec,
                 _recent_trajectories_for_correction={"fp": cached},
             ),
-            _flush_stashed_lesson_outcome=lambda tid, ok: flushes.append(
-                (tid, ok)),
             _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
-        return fake, flushes, update_calls
+        return fake, update_calls
 
     @staticmethod
     async def _drain(update_calls, expect):
@@ -576,7 +520,7 @@ class TestHumanLabelWins:
         cached = Trajectory(id=t.id, session_id="r1", outcome="failed",
                             failure_reason="bad",
                             extra={"req_id": "r1", "human_labeled": True})
-        fake, flushes, update_calls = self._fake_self(c, cached)
+        fake, update_calls = self._fake_self(c, cached)
 
         async def go():
             # NOTE: _backfill_trajectory_outcome is SYNC — asyncio.run
@@ -587,7 +531,6 @@ class TestHumanLabelWins:
 
         asyncio.run(go())
         assert update_calls == []      # no sidecar overwrite
-        assert flushes == []           # already flushed by the label
         assert cached.outcome == "failed"  # the human verdict stands
 
     def test_late_refuted_cannot_overwrite_a_human_thumbs_up(self, tmp_path):
@@ -601,7 +544,7 @@ class TestHumanLabelWins:
         t = _write_traj(c, "r1")
         cached = Trajectory(id=t.id, session_id="r1", outcome="passed",
                             extra={"req_id": "r1", "human_labeled": True})
-        fake, flushes, update_calls = self._fake_self(c, cached)
+        fake, update_calls = self._fake_self(c, cached)
 
         async def go():
             GhostAgent._backfill_trajectory_outcome(fake, t.id, "failed",
@@ -611,7 +554,6 @@ class TestHumanLabelWins:
         asyncio.run(go())
         assert update_calls == []
         assert cached.outcome == "passed"
-        assert flushes == []
 
     def test_late_verdict_proceeds_without_human_label(self, tmp_path):
         from ghost_agent.core.agent import GhostAgent
@@ -620,7 +562,7 @@ class TestHumanLabelWins:
         cached = Trajectory(id=t.id, session_id="r1",
                             outcome=Outcome.UNKNOWN.value,
                             extra={"req_id": "r1"})
-        fake, flushes, update_calls = self._fake_self(c, cached)
+        fake, update_calls = self._fake_self(c, cached)
 
         async def go():
             GhostAgent._backfill_trajectory_outcome(fake, t.id, "failed",
@@ -630,7 +572,6 @@ class TestHumanLabelWins:
         asyncio.run(go())
         # Control: without the stamp the backfill still does its job —
         # the guard must not over-block (the §4AN over-removal lesson).
-        assert flushes == [(t.id, False)]
         assert update_calls and update_calls[0][1] == "failed"
 
     def test_integration_label_then_backfill_one_cache(self, tmp_path):
@@ -648,7 +589,7 @@ class TestHumanLabelWins:
             _recent_trajectories_for_correction=cache))
         assert apply_human_label(agent, "r1", "positive")["ok"]
 
-        fake, flushes, update_calls = self._fake_self(c, cached)
+        fake, update_calls = self._fake_self(c, cached)
         fake.context._recent_trajectories_for_correction = cache
 
         async def go():
@@ -673,7 +614,6 @@ class TestWholeChainGuard:
         fake = SimpleNamespace(
             context=SimpleNamespace(
                 _recent_trajectories_for_correction={"fp": cached},
-                skill_memory=None,
                 trajectory_collector=None,
             ),
             _backfill_trajectory_outcome=lambda *a, **k: calls.append(
@@ -773,7 +713,6 @@ class TestWholeChainGuard:
                 trajectory_collector=_RefusingRec(),
                 _recent_trajectories_for_correction={"fp": cached},
             ),
-            _flush_stashed_lesson_outcome=lambda tid, ok: None,
             _drop_pending_corrections_for=lambda tid: drops.append(tid),
             _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
@@ -811,7 +750,6 @@ class TestWholeChainGuard:
                 trajectory_collector=_BrokenRec(),
                 _recent_trajectories_for_correction={"fp": cached},
             ),
-            _flush_stashed_lesson_outcome=lambda tid, ok: None,
             _drop_pending_corrections_for=lambda tid: drops.append(tid),
             _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
@@ -879,14 +817,10 @@ class TestFeedbackEndpoint:
                        json={"request_id": "ghost", "signal": "positive"})
             assert r.status_code == 404
 
-    def test_flush_happens_on_the_route_not_the_worker(self, tmp_path):
-        # The route flushes the lesson-outcome stash ON the event loop
-        # after apply_human_label returns (R1 review: the worker-thread
-        # flush popped the stash then lost the loop-bound write). Called on
-        # EVERY ok — including idempotent repeats (R2: the flush is
-        # sign-aware/no-op-safe, and repeating heals a first attempt whose
-        # post-write path failed) — and a human label revokes any queued
-        # machine correction banner for the turn.
+    def test_a_human_label_revokes_the_queued_machine_correction(self, tmp_path):
+        # A human label revokes any queued machine correction banner for the
+        # turn, on EVERY ok including an idempotent repeat. (§4TD: the lesson
+        # outcome flush that ran beside it is removed with the lesson store.)
         c_ = _collector(tmp_path)
         t = _write_traj(c_, "r9")
         app = self._make_app(c_)
@@ -895,13 +829,11 @@ class TestFeedbackEndpoint:
             r = c.post("/api/feedback", headers=self.HDRS,
                        json={"request_id": "r9", "signal": "negative"})
             assert r.status_code == 200
-            agent._flush_stashed_lesson_outcome.assert_called_with(
-                t.id, False)
             agent._drop_pending_corrections_for.assert_called_with(t.id)
             r2 = c.post("/api/feedback", headers=self.HDRS,
                         json={"request_id": "r9", "signal": "negative"})
             assert r2.status_code == 200 and r2.json().get("unchanged")
-            assert agent._flush_stashed_lesson_outcome.call_count == 2
+            assert agent._drop_pending_corrections_for.call_count == 2
 
     def test_sidecar_write_failure_is_503(self, tmp_path, monkeypatch):
         c_ = _collector(tmp_path)

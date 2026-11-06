@@ -30,9 +30,7 @@ for p in (str(_ROOT), str(_SRC)):
 
 from ghost_agent.memory import audio_ingest as ai  # noqa: E402
 from ghost_agent.memory import youtube_ingest as yi  # noqa: E402
-from ghost_agent.tools import composed_skills as cs  # noqa: E402
 from ghost_agent.tools import memory as mem  # noqa: E402
-from ghost_agent.tools import yt_download as ytd  # noqa: E402
 
 VID = "jNQXAC9IVRw"
 URL = f"https://www.youtube.com/watch?v={VID}"
@@ -847,86 +845,37 @@ def test_a_sandbox_recording_gets_structure_text_and_a_content_summary():
     assert "[0:00–1:40] opening words of the talk" in msg and "action='transcript'" in msg
 
 
-# ─────────────────────────── composed skills ───────────────────────────
+# ─────────────────────────── the youtube_transcribe tool ───────────────────────────
+# (The macro resolver's shell-splice refusal and the code-owned macro's reconcile-at-load went with the macro
+# engine, §4TA 2026-11-05. `youtube_transcribe` is a built-in: one knowledge-base call, no shell, no template.)
 
-def _step(tool, **params):
-    return cs.SkillStep(tool_name=tool, description="s", param_template=params)
-
-
-def test_a_line_break_in_a_value_spliced_into_a_shell_command_is_refused():
-    """A quoted heredoc blocks expansion but not its own TERMINATOR: a value
-    with a line break followed by the delimiter line ends it, and the rest
-    runs as shell. Tool arguments decode ``\\n`` to real newlines, so the
-    resolver refuses control characters in any value it splices into
-    ``execute.command``. A tab is not a line break; other params and other
-    tools are not shell sinks; a WHOLE-value command is the caller's own."""
-    reg = cs.ComposedSkillRegistry()
-    hostile = "https://x/\n__DELIM__\ntouch /tmp/pwned"
-    with pytest.raises(cs.ComposedArgError) as exc:
-        reg._resolve_args(_step("execute", command="cat > f <<'__DELIM__'\n$url\n__DELIM__"), {"url": hostile})
-    assert "line break" in str(exc.value) and "command" in str(exc.value)
-    with pytest.raises(cs.ComposedArgError):
-        reg._resolve_args(_step("execute", command="echo ${url}"), {"url": "a\rb"})
-    assert reg._resolve_args(_step("execute", command="echo $url"), {"url": "a\tb"}) == {"command": "echo a\tb"}
-    assert reg._resolve_args(_step("knowledge_base", filename="$url"), {"url": hostile}) == {"filename": hostile}
-    assert reg._resolve_args(_step("execute", command="$cmd"), {"cmd": "a\nb"}) == {"command": "a\nb"}
-
-
-@pytest.mark.asyncio
-async def test_the_sequential_runner_records_the_refusal_and_never_calls_the_tool():
-    reg = cs.ComposedSkillRegistry()
-    skill = cs.ComposedSkill(name="m", trigger_description="t",
-                             steps=[_step("execute", command="echo $url"), _step("knowledge_base", filename="x")])
-    calls = []
-
-    async def executor(tool, args):
-        calls.append(tool)
-        return "SUCCESS"
-    out = await reg._execute_sequential(skill, executor, {"url": "a\nrm -rf /"})
-    assert out["success"] is False and calls == []
-    assert out["results"][0]["success"] is False and "line break" in out["results"][0]["error"]
-    par = await reg._run_parallel_step(_step("execute", command="echo $u"), executor, {"u": "x\ny"})
-    assert par["success"] is False and calls == []
-
-
-def test_the_youtube_macro_is_one_knowledge_base_step_with_no_shell():
-    d = ytd.build_youtube_transcribe_definition()
-    assert d["name"] == "youtube_transcribe" and d["mode"] == "sequential"
-    assert [s["tool"] for s in d["steps"]] == ["knowledge_base"]
-    assert d["steps"][0]["params"] == {"action": "transcribe", "filename": "$url"}
+def test_youtube_transcribe_is_one_knowledge_base_call_with_no_shell(mock_context, monkeypatch):
+    """What the one-step macro did, as a built-in: the URL goes to the knowledge-base transcribe action as
+    DATA, whatever is in it — there is no shell and no template for a line break to end."""
+    import asyncio
+    from ghost_agent.tools import registry as R
+    d = next(t["function"] for t in R.get_active_tool_definitions(mock_context, serve_tuned=False)
+             if t["function"]["name"] == "youtube_transcribe")
+    assert d["parameters"]["required"] == ["url"] and list(d["parameters"]["properties"]) == ["url"]
     assert "Tor" in d["description"] and "transcript" in d["description"]
-    assert not (Path(ytd.__file__).with_name("yt_tor_download.sh")).exists(), "the smuggled script is gone"
-    assert "youtube_transcribe" in ytd.CODE_OWNED_MACROS
+    assert not (Path(R.__file__).with_name("yt_tor_download.sh")).exists(), "the smuggled script is gone"
+    seen, ran = [], []
 
+    async def fake_kb(**kw):
+        seen.append({k: kw[k] for k in ("action", "filename")})
+        return "TRANSCRIPT (12 of 12 chars):\nhello there"
 
-def test_a_stored_copy_of_a_code_owned_macro_is_reconciled_at_load(tmp_path):
-    """The live store held the two-step shell version; changing the code used
-    to need the agent stopped and a sync script. Now the registry overwrites
-    the stored steps at load (usage counters kept) and never CREATES one."""
-    store = {"youtube_transcribe": {
-        "name": "youtube_transcribe", "trigger_description": "old words",
-        "steps": [{"tool_name": "execute", "description": "dl", "param_template": {"command": "echo $url"}},
-                  {"tool_name": "knowledge_base", "description": "t", "param_template": {"action": "transcribe", "filename": "yt_audio.m4a"}}],
-        "branches": {}, "execution_mode": "sequential", "status": "active",
-        "usage_count": 3, "success_count": 0, "last_used": 1.0, "created_at": 1.0,
-    }, "other_macro": {
-        "name": "other_macro", "trigger_description": "mine",
-        "steps": [{"tool_name": "execute", "description": "x", "param_template": {"command": "ls"}}],
-        "status": "active",
-    }}
-    (tmp_path / "composed_skills.json").write_text(json.dumps(store))
-    reg = cs.ComposedSkillRegistry(storage_dir=tmp_path)
-    sk = reg.skills["youtube_transcribe"]
-    assert [(s.tool_name, s.param_template) for s in sk.steps] == [("knowledge_base", {"action": "transcribe", "filename": "$url"})]
-    assert sk.usage_count == 3 and sk.success_count == 0, "history survives the reconcile"
-    assert sk.trigger_description == ytd.build_youtube_transcribe_definition()["description"]
-    on_disk = json.loads((tmp_path / "composed_skills.json").read_text())
-    assert len(on_disk["youtube_transcribe"]["steps"]) == 1, "the store was rewritten, not just the in-memory copy"
-    assert on_disk["other_macro"]["steps"][0]["param_template"] == {"command": "ls"}, "operator macros untouched"
-    # a store WITHOUT the macro stays without it
-    (tmp_path / "composed_skills.json").write_text(json.dumps({"other_macro": store["other_macro"]}))
-    reg2 = cs.ComposedSkillRegistry(storage_dir=tmp_path)
-    assert "youtube_transcribe" not in reg2.skills
+    async def fake_execute(**kw):
+        ran.append(kw)
+        return "ran"
+    monkeypatch.setattr(R, "tool_knowledge_base", fake_kb)
+    monkeypatch.setattr(R, "tool_execute", fake_execute)
+    hostile = "https://x/\n__DELIM__\ntouch /tmp/pwned"
+    tools = R.get_available_tools(mock_context)
+    assert asyncio.run(tools["youtube_transcribe"](url=URL)) == "TRANSCRIPT (12 of 12 chars):\nhello there"
+    asyncio.run(tools["youtube_transcribe"](url=hostile))
+    assert seen == [{"action": "transcribe", "filename": URL}, {"action": "transcribe", "filename": hostile}]
+    assert ran == [], "no shell step"
 
 
 # ─────────────────────────── the store sidecar ───────────────────────────

@@ -165,14 +165,9 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
         except Exception as e:
             return False, f"cannot import GhostAgent: {e}"
         dream = getattr(GhostAgent, "_DREAM_COOLDOWN", None)
-        sp = getattr(GhostAgent, "_SELFPLAY_COOLDOWN", None)
         if not (isinstance(dream, (int, float)) and dream > 0):
             return False, f"_DREAM_COOLDOWN not set: {dream!r}"
-        if not (isinstance(sp, (int, float)) and sp > 0):
-            return False, f"_SELFPLAY_COOLDOWN not set: {sp!r}"
-        if dream >= sp:
-            return False, f"dream cooldown ({dream}) should be < self-play cooldown ({sp})"
-        return True, ""
+        return True, ""          # (§4SZ: the self-play slot and its cooldown are gone)
 
     def probe_telemetry_disabled(_ctx) -> Tuple[bool, str]:
         # The meaningful check is "does importing ghost_agent harden
@@ -304,18 +299,18 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
         except Exception as e:
             return False, f"cannot import repair helper: {e}"
         corrupt = ("summary</parameter>\n</function>\n</tool_call>\n<tool_call>\n"
-                   "<function=list_lessons>\n<parameter=scope>\nall")
+                   "<function=manage_skills>\n<parameter=action>\nlist")
         tc = {"id": "c", "type": "function", "function": {
             "name": "introspect",
             "arguments": json.dumps({"action": corrupt, "limit": 10})}}
-        out, repaired = _repair_native_tool_calls([tc], ["introspect", "list_lessons"])
+        out, repaired = _repair_native_tool_calls([tc], ["introspect", "manage_skills"])
         if not repaired:
             return False, "leak not detected — corrupt native tool_call left uncorrected"
         action = json.loads(out[0]["function"]["arguments"]).get("action")
         if action not in _VALID_ACTIONS:
             return False, f"recovered action {action!r} still invalid"
         names = [t["function"]["name"] for t in out]
-        if "list_lessons" not in names:
+        if "manage_skills" not in names:
             return False, "leaked second tool call was dropped, not recovered"
         # A clean call must pass through byte-for-byte.
         clean = {"id": "d", "type": "function", "function": {

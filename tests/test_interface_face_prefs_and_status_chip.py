@@ -194,7 +194,7 @@ class TestBootPrecedence:
         return _forms_js() + extract_js_function(_js("matrix_graph.js"), "resolveInitialForm")
 
     def test_the_servers_record_beats_this_browsers(self, resolver):
-        assert eval_js(resolver, "resolveInitialForm('descent', 'cube', 'vortex')") == "descent"
+        assert eval_js(resolver, "resolveInitialForm('empty', 'moodtesseract', 'moodtesseract')") == "empty"
 
     def test_retired_names_fall_through_to_the_default(self, resolver):
         # 2026-09-20: `lattice` became `cube`, `embedding` and the old cube
@@ -203,12 +203,12 @@ class TestBootPrecedence:
         for retired in ("lattice", "embedding", "stack", "horizon"):
             assert eval_js(resolver, f"resolveInitialForm('{retired}', '{retired}', 'cube')") == "cube", retired
         # …but a RENAMED form's old name resolves to its new one (2026-09-22)
-        assert eval_js(resolver, "resolveInitialForm('cube2', null, 'cube')") == "tesseract"
+        assert eval_js(resolver, "resolveInitialForm('cube2', null, 'cube')") == "moodtesseract"
 
     def test_local_storage_is_the_fallback(self, resolver):
         for server_value in ("null", "undefined", "''", "'bogus'", "42", "{}"):
-            got = eval_js(resolver, f"resolveInitialForm({server_value}, 'cube', 'vortex')")
-            assert got == "cube", f"server={server_value} -> {got!r}"
+            got = eval_js(resolver, f"resolveInitialForm({server_value}, 'empty', 'moodtesseract')")
+            assert got == "empty", f"server={server_value} -> {got!r}"
 
     def test_the_default_is_last(self, resolver):
         for stored in ("null", "'nope'", "''", "7"):
@@ -289,16 +289,9 @@ class TestRememberFaceForm:
         assert "Failed to fetch" in out["warned"][0]
 
     def test_both_pick_paths_call_it(self):
-        """The menu pick AND the stale-cache cycle fallback. A save call
-        nobody makes is the whole feature missing."""
+        """A save call nobody makes is the whole feature missing."""
         js = _js("app.js")
-        menu = js[js.index("function buildFaceFormMenu("):js.index("function markActiveFaceForm(")]
-        assert "const picked = activeFace.setForm(name);" in menu
-        assert "rememberFaceForm(picked);" in menu
-        cycle = js[js.index("faceFormBtn.addEventListener('click'"):]
-        cycle = cycle[:cycle.index("const menu = buildFaceFormMenu()")]
-        assert "const name = activeFace.cycleForm();" in cycle
-        assert "rememberFaceForm(name);" in cycle
+        assert "rememberFaceForm(activeFace.setForm(off ? ANIMATIONS_OFF_FORM : ANIMATIONS_ON_FORM));" in js
 
 
 # ═══════════════════════════════════════════════════════════════════════

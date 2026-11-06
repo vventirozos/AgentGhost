@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -204,7 +204,7 @@
   <div class="pager">
     <a class="prev" href="learning-loop.html">
       <span class="dir">Previous</span>
-      <span class="to">The learning loop</span>
+      <span class="to">Owner rules</span>
     </a>
     <a class="next" href="configuration.html">
       <span class="dir">Next</span>
@@ -223,11 +223,11 @@
         <li>reads of uploaded files, and anything downloaded or cloned;</li>
         <li><code>execute</code> code that fetches from the network;</li>
         <li>job output;</li>
-        <li>the answers of skills and macros.</li>
+        <li>the answers of skills.</li>
       </ul>
       A failed result counts too. A sub-agent inherits its parent's record, and "what you said" for a sub-agent is your message, not the task text the model wrote.</li>
-    <li><strong>No standing instructions from content.</strong> A request that read outside content cannot create, watch or stop scheduled tasks, create skills, or define or activate macros. Ghost says what it would set up and asks you to confirm in a new message.</li>
-    <li><strong>No lessons or memories from content.</strong> A lesson needs your own dictation. The per-turn episode never stores outside content: it is stamped when the turn is journalled, so a later idle pass cannot pick it up. Scratchpad notes are labelled. A conversation summary that includes outside content is kept out of automatic recall.</li>
+    <li><strong>No standing instructions from content.</strong> A request that read outside content cannot create, watch or stop scheduled tasks or create skills. Ghost says what it would set up and asks you to confirm in a new message.</li>
+    <li><strong>No rules or memories from content.</strong> A rule needs your own dictation. The per-turn episode never stores outside content: it is stamped when the turn is journalled, so a later idle pass cannot pick it up. Scratchpad notes are labelled. A conversation summary that includes outside content is kept out of automatic recall.</li>
     <li><strong>Facts about you come from you.</strong> After reading outside content, <code>update_profile</code> and <code>remember</code> save only what your own message states. A quoted "USER: …" line inside a reply is never taken as you speaking. A project constraint the model passes counts as yours only if your message says it.</li>
     <li><strong>A confirmation is your "yes".</strong> To confirm a delete, reset, release or forget preview, your message must open with yes (English or Greek: "yes", "ok", "go ahead", "ναι", "εντάξει" …), quote the token, or pick items, and must not hold back ("wait", "no", "όχι"). A confirm is refused if outside content was read before it in the same request. A whole project folder is deleted (or moved away) only through <code>manage_projects</code>, which shows you a preview first. After outside content, database DROP and TRUNCATE stay locked.</li>
     <li><strong>Your identifiers stay home.</strong> After outside content, Ghost refuses a call that would send your identifiers out, unless your own message contained that value:

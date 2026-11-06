@@ -2,7 +2,7 @@
 
 Why this exists (2026-08-13): 57–84% of real turns end ``outcome=unknown``
 because free-form chat has no validator, and every measurement clock in the
-learning stack (experiment arms, lesson utility, resolved-rate) is gated on
+measurement stack (experiment arms, resolved-rate) is gated on
 RESOLVED outcomes. The cheapest resolver is the human who just read the
 reply: a 👍/👎 Slack reaction or a web-UI tap is an explicit ground-truth
 label. This module turns "request_id + thumb" into a corrections-sidecar
@@ -14,8 +14,8 @@ label up with zero new plumbing.
 Authority model: an explicit human label OUTRANKS machine verdicts, enforced
 at TWO layers (R1 review, 2026-08-13). In-process: the label stamps
 ``human_labeled`` on the cached trajectory and ``_human_label_locked`` makes
-the whole late-verdict consequence chain (backfill, stream re-render, lesson
-retraction, follow-up filing, correction banner) yield. At the writer: the
+the whole late-verdict consequence chain (backfill, stream re-render,
+follow-up filing, correction banner) yield. At the writer: the
 late-verdict sidecar append passes ``yield_to_human=True`` and
 ``update_outcome`` refuses, inside its lock, to supersede a
 ``human_feedback:*`` record with a machine one — race-proof against the
@@ -56,6 +56,43 @@ _SCAN_DAYS = 8
 # by the collector (the writer-side authority check is the load-bearing
 # consumer); imported so there is exactly ONE copy of the literal.
 from ..distill.collector import HUMAN_SOURCE_PREFIX as _SOURCE_PREFIX  # noqa: E402
+
+
+#: §4TC: the label sources that are the OWNER's own hand — the web console,
+#: the handheld, the CLI, and the Slack bot when the reactor IS the owner
+#: (`slack:owner`; another person's reaction arrives as `slack:requester`).
+#: An allow-list: a script that posts a label (no source → "api", or any
+#: other name) does not move the mood.
+OWNER_LABEL_SOURCES = frozenset({"web", "clockwork", "cli", "slack:owner"})
+
+
+def is_owner_label_source(source: Any) -> bool:
+    return str(source or "").strip().lower() in OWNER_LABEL_SOURCES
+
+
+#: §4TC (review): a thumb moves the mood only when the turn it labels is at
+#: most this old
+THUMB_MAX_TURN_AGE_S = 24 * 3600.0
+
+
+def turn_is_recent_enough(traj: Any, now: Any = None) -> bool:
+    """Is the labelled turn at most `THUMB_MAX_TURN_AGE_S` old — and not
+    dated in the FUTURE? A turn whose time cannot be read, or lies ahead of
+    the clock, is not (fail closed: the label is still recorded, the mood
+    stays)."""
+    try:
+        from ..selfhood.mood import parse_iso_utc
+        at = parse_iso_utc(str(getattr(traj, "timestamp", "") or ""))
+        if at is None:
+            return False
+        if now is None:
+            now = datetime.datetime.now(datetime.timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        age = (now - at).total_seconds()
+    except Exception:  # noqa: BLE001
+        return False
+    return 0.0 <= age <= THUMB_MAX_TURN_AGE_S
 
 
 def normalize_request_id(raw: Any) -> str:
@@ -154,11 +191,10 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
          real_only like every other selfhood write site;
       4. one pretty-log line — the operator watches the stream.
 
-    The lesson-outcome stash flush deliberately does NOT happen here: this
-    function runs on a ``to_thread`` worker, and the flush helper spawns
-    loop-bound background work (R1 review — calling it off-loop popped the
-    stash and then lost the write). The /api/feedback route performs the
-    flush ON the event loop after this returns.
+    Loop-bound work does NOT happen here: this function runs on a
+    ``to_thread`` worker (R1 review — a helper that spawned loop-bound
+    background work lost its write when called off-loop). The /api/feedback
+    route does what needs the event loop after this returns.
 
     Returns a JSON-safe dict: ``{"ok": True, "trajectory_id", "outcome"}``
     (plus ``"unchanged": True`` on an idempotent repeat) or ``{"ok": False,
@@ -238,7 +274,7 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
         # The label is COMMITTED from here — post-write side effects must
         # not convert success into a 503 (R2 review: a pretty_log failure
         # made the client retry, hit the dedupe as "unchanged", and the
-        # route then skipped the lesson flush forever).
+        # route then skipped its own follow-up forever).
         try:
             # In-process cache: make the label visible to next-turn logic
             # and arm the human-labeled guard against a late machine
@@ -250,7 +286,8 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
             # until now it reached the trajectory corpus, the cache and the
             # calibration clock but NEVER the agent's autobiographical
             # record — which recall, the wake-up prefix and §4CC's derived
-            # mood all read. Runs on repeats too: `update_outcome` is a
+            # mood all read (the prefix left the prompt in §4NM, the derived
+            # mood was replaced in §4TC; recall and the diary still read it). Runs on repeats too: `update_outcome` is a
             # no-op when the record already carries this outcome, so a
             # re-click also HEALS a diary row written before this leg
             # existed (same doctrine as the cache stamp above).
@@ -272,9 +309,19 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     # already runs on a to_thread worker, so the full-file
                     # rewrite is off the event loop — and spawning
                     # loop-bound work from here is the R1 trap the
-                    # lesson-flush note in the docstring records.
+                    # note in the docstring records.
                     _sm.record_outcome(traj.id, outcome,
                                        failure_reason=reason)
+                    # §4TC: the owner's thumb moves the mood — the OWNER's own
+                    # label on a real owner turn (the gate above; a member's
+                    # turn was refused earlier), sent by a client the owner
+                    # uses, once per label (a repeat is not a new thumb), and
+                    # on a RECENT turn (review: a thumb on last week's reply
+                    # is housekeeping, not how the owner feels about now).
+                    if (not unchanged and is_owner_label_source(source)
+                            and turn_is_recent_enough(traj)):
+                        from ..selfhood.mood import KIND_THUMB_DOWN, KIND_THUMB_UP
+                        _sm.note_owner_reaction(KIND_THUMB_UP if positive else KIND_THUMB_DOWN)
             except Exception as _sfe:  # noqa: BLE001 — label already committed
                 logger.debug("selfhood human-label backfill skipped: %s: %s",
                              type(_sfe).__name__, _sfe)

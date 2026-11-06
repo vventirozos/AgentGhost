@@ -1,7 +1,5 @@
 """The hydration stash and the vector helpful-credit (2026-07-14).
 
-`hydrate_context` stashes this turn's surviving items (+ intent, ts) on
-`bus.last_hydration` (and per turn in `_hydration_by_turn`), and
 `VectorMemory.bump_helpful` is the double-half-life credit for an item a
 reply actually drew on. (§4NM: the post-turn usefulness judge, its
 observations ledger and the dream's RRF refit were removed — the stash
@@ -15,19 +13,14 @@ from ghost_agent.memory.vector import VectorMemory
 
 
 class TestStash:
-    async def test_hydrate_context_stashes_survivors(self):
-        skill = MagicMock()
-        skill.get_playbook_items.return_value = [
-            {"text": "Ask the supervisor for a port.", "trigger": "deploy the web app"},
-        ]
-        bus = MemoryBus(skill_memory=skill)
+    async def test_hydrate_context_returns_the_survivors(self):
+        graph = MagicMock()
+        graph.owner_facts_matching = MagicMock(return_value=["(Elena) -[LIVES_IN]-> (Kalopetres)"])
+        bus = MemoryBus(graph_memory=graph)
 
-        out = await bus.hydrate_context("how do I deploy the web app")
+        out = await bus.hydrate_context("where do I live")
 
-        assert out
-        assert bus.last_hydration is not None
-        assert bus.last_hydration["survivors"][0]["trigger"] == "deploy the web app"
-        assert "intent" in bus.last_hydration and "ts" in bus.last_hydration
+        assert "Kalopetres" in out
 
 
 class TestVectorBumpHelpful:

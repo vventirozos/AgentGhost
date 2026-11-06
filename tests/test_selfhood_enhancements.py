@@ -2,11 +2,10 @@
 
 Covers all the changes in the rated-suggestions pass:
   #1  verdict backfill (autobio update_outcome from facade)
-  #2  meta_insights sanitisation
   #3  template-prompt rollup
   #4  utcnow() replacement (smoke check via timestamp shape)
   #5  user_handle propagation through capture_turn
-  #6  stale-question gardener
+  #6  stale-question gardener (removed §4TB with open questions; its tests went with it)
   #7  meta cluster keyword bin
   #8  narrative blends recent + relevant past
   #9  session-boundary markers
@@ -39,9 +38,8 @@ from ghost_agent.selfhood.autobiographical import (
 from ghost_agent.selfhood.model import SelfModel
 from ghost_agent.selfhood.narrative import (
     NarrativeSummariser,
-    sanitise_meta_insights,
 )
-from ghost_agent.selfhood.schema import Experience, OpenQuestion, _utcnow_iso
+from ghost_agent.selfhood.schema import Experience, _utcnow_iso
 from ghost_agent.selfhood.state import SelfStateThread
 
 
@@ -59,40 +57,13 @@ def test_utcnow_iso_uses_z_suffix_and_naive_iso():
     assert parsed.tzinfo is None
 
 
-# ---------------------------------------------------------------------
-# #2 — meta_insights sanitisation
-# ---------------------------------------------------------------------
-
-def test_sanitise_strips_traceback_and_abort_marker():
-    raw = (
-        "Recurring kinds of work: coding (5x)\n"
-        "ERROR/MISTAKE: runtime abort marker [ATTEMPT_ABORTED_THINKING_LOOP]\n"
-        "Traceback (most recent call last):\n"
-        '  File "/workspace/x.py", line 27, in <module>\n'
-        "    asyncio.run(main())\n"
-        "RuntimeError: bad\n"
-    )
-    out = sanitise_meta_insights(raw)
-    assert "ATTEMPT_ABORTED_THINKING_LOOP" not in out
-    assert "Traceback" not in out
-    assert "/workspace/x.py" not in out
-    # The voice-safe placeholders signal we substituted.
-    assert "abort marker" in out or "traceback" in out
 
 
-def test_sanitise_strips_system_banner():
-    raw = "### SYNTHETIC TRAINING EXERCISE Solve this puzzle. step 1: ..."
-    out = sanitise_meta_insights(raw)
-    assert "SYNTHETIC TRAINING EXERCISE" not in out
 
 
-def test_sanitise_empty_returns_empty():
-    assert sanitise_meta_insights("") == ""
 
 
-def test_sanitise_caps_length():
-    out = sanitise_meta_insights("x" * 5000, max_chars=200)
-    assert len(out) <= 200
+
 
 
 # ---------------------------------------------------------------------
@@ -332,57 +303,6 @@ def test_normal_user_prompt_not_rolled_up(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------
-# #6 — stale-question gardener
-# ---------------------------------------------------------------------
-
-def test_stale_open_questions_surfaces_old_entries(tmp_path: Path):
-    state = SelfStateThread(tmp_path)
-    state.note_open_question("fresh question")
-    # Manually backdate one question.
-    q = state.note_open_question("old question")
-    assert q is not None
-    long_ago = (
-        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10)
-    ).replace(tzinfo=None).isoformat() + "Z"
-    q.opened_at = long_ago
-    # Bypass the cap helper; just rewrite to disk.
-    state._flush()  # type: ignore[attr-defined]
-
-    stale = state.stale_open_questions(max_age_days=3.0)
-    assert len(stale) == 1
-    assert stale[0].text == "old question"
-
-
-def test_stale_open_questions_ignores_resolved(tmp_path: Path):
-    state = SelfStateThread(tmp_path)
-    q = state.note_open_question("old resolved")
-    assert q is not None
-    q.opened_at = (
-        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10)
-    ).replace(tzinfo=None).isoformat() + "Z"
-    q.resolved_at = _utcnow_iso()
-    state._flush()  # type: ignore[attr-defined]
-    assert state.stale_open_questions(max_age_days=3.0) == []
-
-
-def test_selfmodel_stale_open_questions_proxy(tmp_path: Path):
-    sm = SelfModel(tmp_path)
-    q = sm.state.note_open_question("ancient")
-    assert q is not None
-    q.opened_at = (
-        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10)
-    ).replace(tzinfo=None).isoformat() + "Z"
-    sm.state._flush()  # type: ignore[attr-defined]
-    out = sm.stale_open_questions(max_age_days=3.0)
-    assert len(out) == 1
-
-
-def test_selfmodel_stale_open_questions_disabled(tmp_path: Path):
-    sm = SelfModel(tmp_path, enabled=False)
-    assert sm.stale_open_questions() == []
-
-
-# ---------------------------------------------------------------------
 # #9 — session boundary markers
 # ---------------------------------------------------------------------
 
@@ -416,14 +336,22 @@ def test_mark_session_boot_disabled(tmp_path: Path):
 # #10 — mood history JSONL
 # ---------------------------------------------------------------------
 
-def test_mood_history_appends_per_set(tmp_path: Path):
+def _owner_sets(state, label, intensity=2):
+    from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+    return state.set_owner_mood(label, ANCHOR_DIRECTION[label], intensity)
+
+
+def test_mood_history_appends_per_change(tmp_path: Path):
+    """§4TC: one row per CHANGE of label or intensity (it was one per set)."""
     state = SelfStateThread(tmp_path)
-    state.set_mood("curious", "first")
-    state.set_mood("stuck", "second")
-    state.set_mood("satisfied", "third")
+    _owner_sets(state, "curious")
+    _owner_sets(state, "irritable")
+    _owner_sets(state, "irritable")            # the same again: no row
+    _owner_sets(state, "irritable", 3)         # the intensity changed: a row
+    _owner_sets(state, "content")
     hist = state.mood_history(limit=10)
-    labels = [m.label for m in hist]
-    assert labels == ["curious", "stuck", "satisfied"]
+    assert [(m["label"], m["intensity"]) for m in hist] == [
+        ("curious", 2), ("irritable", 2), ("irritable", 3), ("content", 2)]
 
 
 def test_mood_history_empty_when_no_writes(tmp_path: Path):
@@ -433,39 +361,54 @@ def test_mood_history_empty_when_no_writes(tmp_path: Path):
 
 def test_mood_history_handles_corrupt_lines(tmp_path: Path):
     state = SelfStateThread(tmp_path)
-    state.set_mood("curious", "ev")
-    # Inject junk after the legitimate write.
+    _owner_sets(state, "curious")
+    # Inject junk after the legitimate write: not JSON, a JSON value that is
+    # no row, a row from before §4TC (a label with no pair), then a good row.
     with state.mood_history_path.open("a", encoding="utf-8") as f:
         f.write("not json\n")
-        f.write(json.dumps({"label": "satisfied", "evidence": "ev2"}) + "\n")
+        f.write("[1, 2]\n")
+        f.write(json.dumps({"label": "satisfied", "evidence": "ev2", "set_at": "t", "source": "derived"}) + "\n")
+        f.write(json.dumps({"label": "content", "intensity": 1, "p": 0.3, "e": 0.0,
+                            "at": "2026-11-06T10:00:00Z", "cause": "c", "kind": "turn"}) + "\n")
     hist = state.mood_history()
-    assert [m.label for m in hist] == ["curious", "satisfied"]
+    assert [m["label"] for m in hist] == ["curious", "content"]
 
 
 def test_mood_history_compaction_caps_file(tmp_path: Path):
     from ghost_agent.selfhood.state import (
-        _MOOD_COMPACT_KEEP_LINES,
-        _MOOD_COMPACT_MAX_BYTES,
+        MOOD_HISTORY_KEEP_ROWS,
+        MOOD_HISTORY_MAX_ROWS,
     )
     state = SelfStateThread(tmp_path)
-    # Prefill the history past the byte cap with fat records.
-    pad = "e" * 1024
+    # Prefill the journal up to its cap.
     with state.mood_history_path.open("w", encoding="utf-8") as f:
-        for i in range(1500):
+        for i in range(MOOD_HISTORY_MAX_ROWS):
             f.write(json.dumps(
-                {"label": f"mood{i}", "evidence": pad, "set_at": "t"}
+                {"label": "content", "intensity": 1, "p": 0.3, "e": 0.0,
+                 "at": "2026-11-05T10:00:00Z", "cause": f"row {i}", "kind": "turn"}
             ) + "\n")
-    assert state.mood_history_path.stat().st_size > _MOOD_COMPACT_MAX_BYTES
 
-    state.set_mood("satisfied", "shipped it")
+    _owner_sets(state, "tired")                # one more row: over the cap
 
     lines = [l for l in state.mood_history_path.read_text(
         encoding="utf-8").splitlines() if l]
-    assert len(lines) == _MOOD_COMPACT_KEEP_LINES
+    assert len(lines) == MOOD_HISTORY_KEEP_ROWS
     # Newest tail kept — the just-written mood is the last record, the
     # oldest prefilled records are gone.
-    assert json.loads(lines[-1])["label"] == "satisfied"
-    assert json.loads(lines[0])["label"] != "mood0"
+    assert json.loads(lines[-1])["label"] == "tired"
+    assert json.loads(lines[0])["cause"] == f"row {MOOD_HISTORY_MAX_ROWS + 1 - MOOD_HISTORY_KEEP_ROWS}"
+
+
+def test_mood_history_under_the_cap_is_left_whole(tmp_path: Path):
+    from ghost_agent.selfhood.state import MOOD_HISTORY_MAX_ROWS
+    state = SelfStateThread(tmp_path)
+    with state.mood_history_path.open("w", encoding="utf-8") as f:
+        for i in range(MOOD_HISTORY_MAX_ROWS - 1):
+            f.write(json.dumps({"label": "content", "intensity": 1, "p": 0.3, "e": 0.0,
+                                "at": "2026-11-05T10:00:00Z", "cause": f"row {i}", "kind": "turn"}) + "\n")
+    _owner_sets(state, "tired")
+    lines = [l for l in state.mood_history_path.read_text(encoding="utf-8").splitlines() if l]
+    assert len(lines) == MOOD_HISTORY_MAX_ROWS and json.loads(lines[0])["cause"] == "row 0"
 
 
 # ---------------------------------------------------------------------
@@ -542,45 +485,27 @@ def test_detect_referenced_experiences_filters_stopword_trigrams():
     assert matches == []
 
 
-def test_note_referenced_experiences_bumps_counter(tmp_path: Path):
-    sm = SelfModel(tmp_path)
-    exp = sm.capture_turn(
-        trajectory_id="t-z",
-        user_request="parse nginx access logs",
-        tool_names=["execute"],
-        outcome="passed",
-        final_response="done",
-    )
-    assert exp is not None
-    n = sm.note_referenced_experiences(
-        prefix_text="parse nginx access logs",
-        response_text=(
-            "Last time I worked on parse nginx access logs I used "
-            "the execute tool — same approach again."
-        ),
-    )
-    assert n >= 1
-    assert sm.autobio.reference_count(exp.id) >= 1
-
-
 # ---------------------------------------------------------------------
 # #8 — narrative blends recent + relevant past
 # ---------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_narrative_blends_relevant_when_state_has_open_question(tmp_path: Path):
+async def test_narrative_blends_relevant_when_state_has_a_fresh_mood(tmp_path: Path):
+    """The blend is driven by the state's recall query — the label of the
+    mood as it is now (§4TB: open questions fed it too, until nothing could
+    write them; §4TC: the label is one of the closed list)."""
     mem = AutobiographicalMemory(tmp_path)
     state = SelfStateThread(tmp_path)
-    # Older entry that should resurface via IDF retrieval on the open question.
+    # Older entry that should resurface via IDF retrieval on the mood label.
     mem.append(Experience(
-        summary="I investigated trapdoor functions in cryptography.",
-        user_first_words="trapdoor",
+        summary="I was irritable about trapdoor functions in cryptography.",
+        user_first_words="irritable trapdoor",
     ))
     # A wall of recent unrelated entries to push the trapdoor record
     # out of the recency window.
     for i in range(8):
         mem.append(Experience(summary=f"I did unrelated thing {i}."))
-    state.note_open_question("Are trapdoor functions still considered safe?")
+    _owner_sets(state, "irritable")        # §4TC: the query is the mood's label, from the closed list
 
     captured: List[str] = []
 
@@ -593,7 +518,8 @@ async def test_narrative_blends_relevant_when_state_has_open_question(tmp_path: 
     await nm.regenerate(autobio=mem, state=state)
     assert captured, "critique_fn should have been called"
     # The blended block should mention the older relevant entry.
-    assert "trapdoor" in captured[0]
+    assert "older entries that connect" in captured[0]
+    assert "I was irritable about trapdoor functions" in captured[0]
 
 
 @pytest.mark.asyncio
@@ -617,29 +543,6 @@ async def test_narrative_no_blend_when_state_empty(tmp_path: Path):
     assert "older entries that connect" not in captured[0]
 
 
-@pytest.mark.asyncio
-async def test_narrative_sanitises_meta_insights(tmp_path: Path):
-    mem = AutobiographicalMemory(tmp_path)
-    mem.append(Experience(summary="I did the thing."))
-    state = SelfStateThread(tmp_path)
-
-    seen: List[str] = []
-
-    async def fake_critique(prompt: str) -> str:
-        seen.append(prompt)
-        return "diary entry"
-
-    nm = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
-    raw_insights = (
-        "ERROR/MISTAKE: [ATTEMPT_ABORTED_THINKING_LOOP]\n"
-        "Traceback (most recent call last):\n"
-        '  File "/x.py", line 1, in <module>\n'
-        "RuntimeError: bad\n"
-    )
-    await nm.regenerate(autobio=mem, state=state, meta_insights=raw_insights)
-    prompt = seen[0]
-    assert "ATTEMPT_ABORTED_THINKING_LOOP" not in prompt
-    assert "Traceback" not in prompt
 
 
 def test_redact_pii_digit_run_inside_hex_id_survives():

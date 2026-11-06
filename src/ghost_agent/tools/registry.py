@@ -5,7 +5,7 @@ from .labs import tool_lab
 from .file_system import tool_file_system
 from .tasks import tool_manage_tasks
 from .system import tool_system_utility
-from .memory import tool_knowledge_base, tool_recall, tool_unified_forget, tool_update_profile, tool_learn_skill, tool_scratchpad
+from .memory import tool_knowledge_base, tool_recall, tool_unified_forget, tool_update_profile, tool_scratchpad
 from .execute import tool_execute
 from .browser import tool_browser
 # §4SX D5: tool_manage_services / tool_jobs and their definitions are no longer advertised — `run` replaced them
@@ -16,13 +16,7 @@ from .notify_tool import (
     tool_notify_operator, NOTIFY_OPERATOR_TOOL_DEFINITION,
 )
 from .acquired_skills import tool_create_skill, tool_manage_skills, AcquiredSkillManager
-from .composed_skills import (
-    register_composed_skills,
-    register_composed_skill_runners,
-    tool_manage_composed_skills,
-)
 from .projects import tool_manage_projects_for_model, MANAGE_PROJECTS_TOOL_DEF
-from .self_state import tool_self_state
 from .introspect import tool_introspect
 from .workspace import tool_workspace
 from .workspace_track import tool_workspace_track
@@ -701,22 +695,18 @@ TOOL_DEFINITIONS = [
     _RUN_TOOL_DEFINITION,
     NOTIFY_OPERATOR_TOOL_DEFINITION,
     PROBE_MODEL_TOOL_DEFINITION,
-    {"type": "function", "function": {"name": "learn_skill", "description": "MANDATORY when you solve a complex bug or task after initial failure. Save the lesson so you don't repeat the mistake.", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "mistake": {"type": "string"}, "solution": {"type": "string"}}, "required": ["task", "mistake", "solution"]}}},
     {"type": "function", "function": {"name": "workspace", "description": "READ-ONLY ACTIVITY LEDGER of the user's workspace — a record of what ALREADY HAPPENED: which TRACKED files changed since the last snapshot, what scheduled tasks concluded, which URLs research already pulled, which significant commands ran. It cannot read, write, edit, build, fix, run or continue anything. NEVER call this to work on files, code, games, pages, apps or projects, to fix a bug, to add a feature, or to proceed with a project's next task — those are file_system (read/write/edit files), execute (run commands), browser (web pages and UIs), manage_projects (project tasks, advancing the current one). Call this ONLY for questions about history: 'what changed since yesterday?', 'what did my scheduled task do?', 'have I already pulled this URL?', 'which commands ran overnight?'. Actions: 'summary' (default; stats + narrative + recent changes + recent tasks/research); 'stats' (counts); 'files' (the watchlist); 'changes' (diff tracked files against last-seen snapshot); 'tasks' (recent scheduled-task outcomes); 'research' (URLs you've already pulled); 'commands' (significant command outcomes); 'narrative' (the running workspace summary); 'recent' (the activity log, mixed kinds); 'search' (keyword search over the activity log — pass 'query').", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "files", "changes", "tasks", "research", "commands", "narrative", "recent", "search"], "description": "Default 'summary' if omitted."}, "limit": {"type": "integer", "description": "For tasks/research/commands/recent/search: how many entries to return. Defaults to 10; capped at 50."}, "query": {"type": "string", "description": "For action='search': keywords to find in past workspace events (filenames, commands, URLs, task names)."}}, "required": []}}},
     {"type": "function", "function": {"name": "workspace_track", "description": "WRITE path into the workspace ACTIVITY LEDGER — author the watchlist of files to track, free-form workspace notes, and manual research dedup markers. Counterpart to the read-only workspace tool (which only reads that ledger; neither does file work). Actions: 'track' (add a file path to the watchlist; optional 'label' for a human descriptor); 'untrack' (remove a path); 'note' (record a free-form workspace observation); 'mark_seen' (record a URL as already-pulled so future research dedups against it). Tracked files get a stat-cache diff on every wake-up, so 'track' is how you get 'what changed in this file since last session' to surface automatically.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["track", "untrack", "note", "mark_seen"]}, "path": {"type": "string", "description": "For track/untrack: the file path to add/remove from the watchlist."}, "label": {"type": "string", "description": "Optional for track: a short human descriptor (e.g. 'main config', 'experiment log')."}, "text": {"type": "string", "description": "Required for note: the free-form observation."}, "url": {"type": "string", "description": "Required for mark_seen: the URL to record as already-pulled."}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "introspect", "description": "READ-ONLY introspection over your OWN selfhood and your own background systems — mood (with its evidence), open questions, your running first-person diary, recent experiences INCLUDING what you answered, what you learned, what ran while the user was away. YOU MUST call this before answering anything about yourself: never answer 'how are you' / 'how are you feeling' / 'how's things' / 'how are things going' / 'what have you been doing' / 'what did you do while I was away' from nothing. Distinct from: system_utility action='check_health' (the HEALTH CHECK of the machine and of the stores and services you run on: CPU/RAM/disk, network, memory stores, labs, backups — NOT how you are or how your learning is doing; call that action only when the user asks for a health check or diagnostics), self_state (AUTHORS open questions / threads / mood for the next session), knowledge_base (facts about the world), update_profile (facts about the USER), list_lessons (the lesson playbook). Actions: 'overview' (THE one-call briefing for 'how are you' / 'how are you feeling' / 'how's things' / 'give me a briefing / status report': mood with evidence, open questions, the last 24h of background work led by what changed, learning headlines, workspace changes — bounded to ~3KB); 'summary' (tell me about yourself: stats + open questions + diary + principles + recent experiences); 'stats' (counts and the topic cluster mix); 'narrative' (just the running diary); 'recent' (the last N first-person experiences; optional 'hours' window); 'recall' (relevance-ranked search over your past, over the request AND your answer — pass 'query'; THE answer to 'what do you remember about X'); 'activity' (the background-activity ledger: maintenance passes, self-play, scheduled-task conclusions — THE answer to 'what did you do while I was away?' / 'what ran in the background?'; default is a kind-grouped brief that leads with notify-severity changes, verbose=true for the line-by-line ledger; optional 'hours' and 'limit'); 'learning' (learning-loop health telemetry — THE answer to 'is my learning actually working?' / 'how are your lessons doing?'). Nothing here writes.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["overview", "summary", "stats", "narrative", "recent", "recall", "activity", "learning"], "description": "Default 'summary' if omitted. Use 'overview' for any how-are-you / briefing question."}, "query": {"type": "string", "description": "Required for action='recall': what to search your past for (e.g. 'postgres migrations', 'the trapdoor question'). Matches the request and your answer."}, "limit": {"type": "integer", "description": "For action='recent'/'recall': how many results (default 5, cap 25). For action='activity' with verbose=true: how many ledger lines (default 30, cap 100)."}, "hours": {"type": "number", "description": "For action='activity': look-back window in hours (default 24; capped at 336 = 14 days). For action='recent': keep only experiences younger than this."}, "verbose": {"type": "boolean", "description": "For action='activity'/'learning': true = the full untrimmed report (line-by-line ledger, every learning block). Default false = the brief."}, "section": {"type": "string", "description": "For action='learning': expand ONE block of the report by name (e.g. 'lessons', 'episodes'); the brief lists the available names."}}, "required": []}}},
-    {"type": "function", "function": {"name": "self_state", "description": "Author your OWN cross-session continuity state — the open questions, unfinished threads, and mood you carry from this session into the next. This is YOUR forward-looking self, not facts about the world. Use it when you finish a turn but something is left unresolved that the next session of you should pick up. Distinct from: knowledge_base (facts/documents), update_profile (facts about the USER), scratchpad (notes for THIS conversation only). action='note_question' records something you are still trying to figure out; 'resolve_question' marks one answered; 'add_unfinished' notes a task left mid-flight; 'close_unfinished' completes one; 'set_mood' records your current functional state (e.g. 'curious', 'stuck', 'satisfied') — a current self-assessment that expires (~6h), not a durable note; 'note_principle' records an operating principle — how you CHOOSE to work (e.g. 'I verify before asserting', 'I prefer reversible actions') — surfaced in your wake-up prefix every session to shape your behaviour; 'list' shows what is currently on file. Whatever you record here is shown to you at the start of your next session.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["note_question", "resolve_question", "add_unfinished", "close_unfinished", "set_mood", "note_principle", "list"]}, "text": {"type": "string", "description": "For note_question/add_unfinished/note_principle: the question, thread, or principle text. For resolve_question/close_unfinished: the id (or id-prefix, or a text substring) of the item to close."}, "mood": {"type": "string", "description": "Required for set_mood: a short functional-state label (e.g. 'curious', 'stuck', 'satisfied')."}, "evidence": {"type": "string", "description": "Optional for set_mood: one sentence on why."}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "introspect", "description": "Your OWN selfhood and background systems: mood (and why), your running first-person diary, recent experiences INCLUDING what you answered, what ran while the user was away. YOU MUST call this before answering anything about yourself: never answer 'how are you' / 'how are you feeling' / 'how's things' / 'what have you been doing' / 'what did you do while I was away' from nothing. Distinct from: system_utility action='check_health' (the HEALTH CHECK of the machine and of the stores and services you run on — NOT how you are; call that action only when the user asks for a health check or diagnostics), update_profile (facts about the USER). Every action READS, except 'set_mood'. Actions: 'overview' (THE one-call briefing for 'how are you' / 'how's things' / 'give me a briefing / status report': mood with its cause, the last 24h of background work led by what changed, loop-health warnings, workspace changes); 'summary' (tell me about yourself: stats + diary + recent experiences); 'stats' (counts and the topic mix); 'narrative' (the diary); 'recent' (the last N experiences; optional 'hours'); 'recall' (search your past, the request AND your answer — pass 'query'; THE answer to 'what do you remember about X'); 'activity' (the background-activity ledger — THE answer to 'what did you do while I was away?' / 'what ran in the background?'; a brief by default, verbose=true for every line; optional 'hours', 'limit'); 'learning' (health of the background loops: which ran, what they produced); 'mood' (your mood now, why, since when, today's timeline); 'set_mood' (the ONE write, on the OWNER's word: 'mood' = cheerful, content, calm, restless, bored, irritable, down, tired or curious — 'neutral' takes mood and manner off; 'intensity' 1-3; 'manner' = sarcastic, playful, formal, terse, gentle or dramatic — 'none' clears it. Translate a relative ask yourself: \"cheer up\" → mood='cheerful'; \"don't be so grumpy\" → mood='calm', intensity=1. Refused after reading outside content.)", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["overview", "summary", "stats", "narrative", "recent", "recall", "activity", "learning", "mood", "set_mood"], "description": "Default 'summary' if omitted. Use 'overview' for any how-are-you / briefing question."}, "query": {"type": "string", "description": "Required for action='recall': what to search your past for (e.g. 'postgres migrations', 'the trapdoor question'). Matches the request and your answer."}, "limit": {"type": "integer", "description": "For action='recent'/'recall': how many results (default 5, cap 25). For action='activity' with verbose=true: how many ledger lines (default 30, cap 100)."}, "hours": {"type": "number", "description": "For action='activity': look-back window in hours (default 24; capped at 336 = 14 days). For action='recent': keep only experiences younger than this."}, "verbose": {"type": "boolean", "description": "For action='activity'/'learning': true = the full untrimmed report (line-by-line ledger, every block). Default false = the brief."}, "section": {"type": "string", "description": "For action='learning': expand ONE block of the report by name (e.g. 'episodes'); the brief lists the available names."}, "mood": {"type": "string", "description": "For action='set_mood': one of the moods listed there, or 'neutral'."}, "intensity": {"type": "integer", "description": "For action='set_mood': 1-3 (default 2), for the mood and/or manner being set."}, "manner": {"type": "string", "description": "For action='set_mood': one of the manners listed there, or 'none'."}, "evidence": {"type": "string", "description": "Optional for action='set_mood': one sentence on why."}}, "required": []}}},
     {"type": "function", "function": {"name": "web_search", "description": "Search the internet (Anonymous via Tor). ALWAYS use this FIRST for simple factual questions and general web searches. CRITICAL: Keep your queries concise: 3–6 keywords (e.g., 'PostgreSQL 16 release notes'); every extra word lowers the chance a result matches. DO NOT use long conversational sentences. PLAIN KEYWORDS ONLY — do NOT use search operators like 'site:', quoted \"exact phrases\", or boolean OR/AND. The search runs over Tor against scraper backends (DuckDuckGo, Yandex, Brave, Yahoo) that DO NOT honour those operators; including them returns ZERO results. To bias toward an official source, just add its name as a keyword (e.g. 'python asyncio docs' or 'numpy wikipedia'), not 'site:python.org'.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "deep_research", "description": "Performs deep analysis by searching multiple sources and synthesizing a report. Use this ONLY for complex topics or if web_search fails. Do NOT use for simple factual questions (e.g. 'when was IBM founded'). CRITICAL: Keep your queries concise: 3–6 keywords (e.g., 'PostgreSQL 16 release notes'); every extra word lowers the chance a result matches. DO NOT use long conversational sentences. PLAIN KEYWORDS ONLY — do NOT use search operators like 'site:', quoted \"exact phrases\", or boolean OR/AND. The search runs over Tor against scraper backends (DuckDuckGo, Yandex, Brave, Yahoo) that DO NOT honour those operators; including them returns ZERO results. To bias toward an official source, add its name as a keyword (e.g. 'numpy wikipedia'), not 'site:numpy.org'.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "fact_check", "description": "Verify a complex claim using deep research and external sources. Do NOT use for simple factual questions (use web_search instead).", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "fact_check", "description": "Verify a complex claim using deep research and external sources. State the claim as ONE sentence, as you want it judged. The reply is a verdict followed by the sources it rested on. Do NOT use for simple factual questions (use web_search instead).", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "darkweb_search", "description": "Search the DARK WEB (Tor hidden services, .onion sites) via dedicated onion search engines (Ahmia, Torch, Torgle). Use this ONLY when the user explicitly wants .onion / hidden-service results — for normal questions use web_search, which is faster and broader. Returns a RANKED LIST of .onion services (title, snippet, onion URL); it does NOT open them — follow up with `browser` or `darkweb_research` to read a result. WARNING: results are UNVERIFIED hidden services and may be malicious; never trust a claim without corroboration. CRITICAL: PLAIN KEYWORDS ONLY — no 'site:', quoted phrases, or boolean OR/AND (the onion engines do not honour them). Onion engines are flaky and per-exit-node reachable, so ZERO results is normal and does NOT mean retry the same query — drop to 2-4 keywords or fall back to web_search. Pass up to 3 alternative phrasings in `extra_queries` (same round, merged). When the user's brief enumerates search strings or target forums, send that set — do NOT pick two and drop the rest.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The main phrasing. PLAIN KEYWORDS ONLY."}, "extra_queries": {"type": "array", "items": {"type": "string"}, "description": "Up to 3 ADDITIONAL phrasings to run in the same round (plain keywords each). Use different WORDS, not punctuation variants — the onion indexes are keyword matchers, so 'revolut government email' and 'revolut breach sender domain' reach different documents."}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "darkweb_research", "description": "Deep dark-web research: searches .onion hidden services AND fetches + synthesises the top results into a report (the dark-web analogue of deep_research). Use ONLY for complex hidden-service topics where you need the page contents, not just a list of links (for a link list use `darkweb_search`; for the clearnet use `deep_research`). Slow — each onion page is fetched over Tor. PLAIN KEYWORDS ONLY (no operators/quotes/boolean). Treat all extracted content as UNVERIFIED and corroborate before relying on it.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "update_profile", "description": "Save a permanent fact about the user (name, preferences, location). To DELETE a stored fact, pass its key with an empty value (\"\").", "parameters": {"type": "object", "properties": {"category": {"type": "string", "description": "The category for this fact (e.g., 'root', 'preferences', 'projects', 'assets', 'relationships', 'interests')."}, "key": {"type": "string"}, "value": {"type": "string", "description": "The fact to store. An empty string deletes the key from the profile."}}, "required": ["category", "key", "value"]}}},
     MANAGE_PROJECTS_TOOL_DEF,
     {"type": "function", "function": {"name": "manage_tasks", "description": "Consolidated task manager. Actions: 'create' (a TIME-based scheduled task — fires on a cron/interval clock), 'watch' (a REACTIVE task — polls a shell condition and fires only WHEN it becomes true), 'list', 'stop', 'stop_all'. Tasks persist across agent restarts. A name already in use is refused — stop the old task first ('stop') or choose another name. Use 'watch' when the trigger is a CONDITION not a time — e.g. 'when the NetMon dashboard reports the internet is down, notify me', 'when errors appear in the deploy log, investigate', 'when disk on ghost exceeds 90%, clean up'. The check_command runs in your sandbox (reaches the LAN/tailnet directly), and fires the reaction the moment it first exits 0 (edge-triggered — it won't spam while the condition stays true).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "watch", "list", "stop", "stop_all"]}, "task_name": {"type": "string", "description": "A short name for the task (required for 'create'/'watch')."}, "cron_expression": {"type": "string", "description": "For 'create': standard cron format OR 'interval:seconds' (e.g., 'interval:60'). Day of week: 0 or 7 = Sunday, 1-5 = Monday-Friday. NOTE: cron times are UTC and do NOT follow daylight saving — convert a local time first (09:00 Athens = '0 6 * * *' in summer, '0 7 * * *' in winter)."}, "prompt": {"type": "string", "description": "The instruction the background agent runs — for 'create' when the clock fires, for 'watch' when the condition becomes true (required for both)."}, "check_command": {"type": "string", "description": "For 'watch': a shell command that EXITS 0 when the thing to react to is TRUE (shell 'if' semantics), e.g. \"grep -q ' ERROR ' /path/app.log\", \"! curl -sf https://host/health\", \"[ $(some-metric) -gt 90 ]\". Runs in the sandbox."}, "interval_secs": {"type": "integer", "description": "For 'watch': how often (seconds, >=60) to poll the check_command."}, "task_identifier": {"type": "string", "description": "The ID of the task to kill (required for 'stop')."}, "project_owned": {"type": "boolean", "description": "For 'create'/'watch': true makes the task part of the project in focus — it is listed with the project's inventory and removed when the project is deleted. Default false (the task is the user's own)."}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "list_lessons", "description": "Show LESSONS the agent has learned (mistakes-and-fixes the agent has internalized). Use this EVERY TIME the user asks 'what have you learned today / this week / so far' or asks to see the LESSON playbook / your lessons / what mistakes you've fixed. Do NOT call this for 'show me your skills' — that means the agent's TOOLS / custom skills and routes to `manage_skills`. Do NOT answer from memory — always call this tool so the list is authoritative. These are NOT the owner's rules (### OWNER RULES, candidate/proposed rules): no tool lists or changes those.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "enum": ["today", "week", "all", "self_play_only"], "description": "Time / source filter. 'today' = since local midnight. 'week' = last 7 days. 'all' = every lesson on file. 'self_play_only' = only lessons whose source is self-play, no time filter. Default: 'today'."}, "limit": {"type": "integer", "description": "Max lessons to return (1-100). Default 20."}}, "required": []}}},
-    {"type": "function", "function": {"name": "replan", "description": "Call this tool if your current strategy is failing or if you need to pause and rethink. It forces a fresh planning step.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Why are you replanning?"}}, "required": ["reason"]}}},
-    {"type": "function", "function": {"name": "abort_attempt", "description": "ESCAPE HATCH. Call this ONLY when you have proven the current task cannot be completed as specified — e.g. you have demonstrated that the validator / test has a structural bug (like `''.split('\\n')` comparing to `len(exp)==0`), the spec is internally contradictory, or a mandatory file the task depends on was never provided and cannot be generated. Do NOT call this for normal retries, for tasks you simply don't know how to solve, or to escape a hard problem — use `replan` for those. After this tool runs, the turn loop exits and the outer simulation stops retrying.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Concrete, specific proof that the task is unwinnable. Name the exact line of the broken validator, the contradictory spec clauses, or the missing dependency. Vague reasons ('too hard', 'keeps failing') are not valid."}}, "required": ["reason"]}}},
+    {"type": "function", "function": {"name": "abort_attempt", "description": "ESCAPE HATCH. Call this ONLY when you have proven the current task cannot be completed as specified — e.g. you have demonstrated that the validator / test has a structural bug (like `''.split('\\n')` comparing to `len(exp)==0`), the spec is internally contradictory, or a mandatory file the task depends on was never provided and cannot be generated. Do NOT call this for normal retries, for tasks you simply don't know how to solve, or to escape a hard problem. After this tool runs, the turn loop exits and the outer simulation stops retrying.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "Concrete, specific proof that the task is unwinnable. Name the exact line of the broken validator, the contradictory spec clauses, or the missing dependency. Vague reasons ('too hard', 'keeps failing') are not valid."}}, "required": ["reason"]}}},
     {
         "type": "function",
         "function": {
@@ -755,7 +745,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "manage_skills",
-            "description": "List or delete the agent's SKILLS. `action='list'` returns the COMPLETE, COMPACT custom-skill inventory in ONE call — acquired tools (created via `create_skill`) AND composed macros — and is the AUTHORITATIVE answer to 'show me your skills', 'list your skills', 'what skills do you have', 'what custom tools do you have'. Call it EVERY TIME that's asked and answer FROM ITS OUTPUT: do NOT additionally reproduce every built-in tool with its full schema — that blows the token budget and truncates before the custom skills. The built-in tools are standing capabilities; summarise them by category if asked. Also handles 'forget skill X'. Do NOT call this for 'lessons learned' / 'what have you learned' / 'show me the lesson playbook' — that means lessons (mistake-and-fix entries) and routes to `list_lessons`.",
+            "description": "List or delete the agent's SKILLS. `action='list'` returns the COMPLETE, COMPACT custom-skill inventory in ONE call — the custom tools created via `create_skill` — and is the AUTHORITATIVE answer to 'show me your skills', 'list your skills', 'what skills do you have', 'what custom tools do you have'. Call it EVERY TIME that's asked and answer FROM ITS OUTPUT: do NOT additionally reproduce every built-in tool with its full schema — that blows the token budget and truncates before the custom skills. The built-in tools are standing capabilities; summarise them by category if asked. Also handles 'forget skill X'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -857,149 +847,35 @@ TOOL_DEFINITIONS.append({
 from .labs import LAB_TOOL_DEFINITION as _LAB_TOOL_DEFINITION  # noqa: E402
 TOOL_DEFINITIONS.append(_LAB_TOOL_DEFINITION)
 
-TOOL_DEFINITIONS.append({
+# §4TA (2026-11-05): the macro engine (`manage_composed_skills`, tools/composed_skills.py) is removed.
+# `youtube_transcribe` was its one real entry — a ONE-step alias for the knowledge-base transcribe action —
+# and stays under the same name as a plain built-in. Its handler is in `get_available_tools`.
+YOUTUBE_TRANSCRIBE_TOOL_DEFINITION = {
     "type": "function",
     "function": {
-        "name": "manage_composed_skills",
+        "name": "youtube_transcribe",
         "description": (
-            "Group several tool calls into ONE reusable named macro (a 'composed skill') (e.g. "
-            "'morning_briefing' = weather + news + diagnostics). Use action='define' to create one from a "
-            "list of steps, 'list' to see existing macros (and any PROPOSED ones waiting for approval), "
-            "'approve' to activate a proposed macro, 'delete' to remove one. Once active, the macro is a "
-            "TOP-LEVEL TOOL you invoke by its name like any built-in. To RUN an existing macro you can "
-            "EITHER call it directly by its name (preferred) OR use action='run' with name='<macro>' and "
-            "params={...} for its inputs. action='define' ONLY CREATES a macro — never use 'define' to "
-            "run one that already exists (it just errors 'already exists'). Default mode='parallel' fans "
-            "the steps out concurrently (ideal for independent read-only steps); use mode='sequential' "
-            "when a later step depends on an earlier one (bind with 'save_as', consume as \"$name\"). NOTE: "
-            "a macro's steps may only call built-in tools or acquired skills — NOT other composed skills "
-            "(no nesting). A PROPOSED macro stays inert until you 'approve' it."
+            "Transcribe a YouTube video into the knowledge base in one call and "
+            "return the opening of its transcript: the link is fetched over Tor "
+            "(captions when the video has them, otherwise the audio is transcribed "
+            "on the private audio node), indexed with timestamps under "
+            "'yt-<video id>…', and readable in order with "
+            "knowledge_base(action='transcript'). Input: url."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["define", "run", "list", "approve", "delete"],
-                    "description": "What to do.",
-                },
-                "name": {
-                    "type": "string",
-                    "description": (
-                        "Macro name (required for define/run/delete/approve). "
-                        "Becomes the tool name, so use a bare identifier like "
-                        "'morning_briefing' — letters, digits and underscores only."
-                    ),
-                },
-                "params": {
-                    "type": "object",
-                    "description": (
-                        "For action='run': the macro's runtime inputs as an "
-                        "object, e.g. params={\"url\": \"https://…\"}. Keys are the "
-                        "macro's advertised parameters. Ignored for other actions."
-                    ),
-                },
-                "description": {
-                    "type": "string",
-                    "description": (
-                        "For define: a short natural-language description of when "
-                        "to use this macro (shown in the tool list and used for "
-                        "matching)."
-                    ),
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["parallel", "sequential"],
-                    "description": (
-                        "For define: 'parallel' (default) runs every step "
-                        "concurrently; 'sequential' runs them in order."
-                    ),
-                },
-                "steps": {
-                    "type": "array",
-                    "description": (
-                        "For define: the list of tool calls this macro bundles. "
-                        "Each item is an object describing one step."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "tool": {
-                                "type": "string",
-                                "description": (
-                                    "Exact name of the tool to call in this step "
-                                    "(e.g. 'system_utility', 'web_search', "
-                                    "'list_lessons')."
-                                ),
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Short human label for this step (e.g. 'Local weather').",
-                            },
-                            "params": {
-                                "type": "object",
-                                "description": (
-                                    "Arguments to pass to that tool (e.g. "
-                                    "{\"action\": \"check_weather\"}). Use "
-                                    "\"$varname\" to pull from the macro's own "
-                                    "runtime parameters at call time, OR from a "
-                                    "value an EARLIER step bound with 'save_as'. "
-                                    "$var also interpolates inside text, e.g. "
-                                    "\"Summarise this: $page_text\"."
-                                ),
-                            },
-                            "save_as": {
-                                "type": "string",
-                                "description": (
-                                    "Bind THIS step's result to a name that later steps can use as \"$name\". Requires "
-                                    "mode='sequential' (parallel steps can't see each other's results). Bindings only flow "
-                                    "FORWARD."
-                                ),
-                            },
-                            "optional": {
-                                "type": "boolean",
-                                "description": (
-                                    "If true, this step failing does NOT fail the "
-                                    "whole macro. Default false."
-                                ),
-                            },
-                            "branch_condition": {
-                                "type": "string",
-                                "description": (
-                                    "Sequential mode only: if this step's result "
-                                    "CONTAINS this substring, jump to the "
-                                    "'branch_target' sequence instead of the "
-                                    "remaining steps. Pair with branch_target and "
-                                    "a matching key in the top-level 'branches'."
-                                ),
-                            },
-                            "branch_target": {
-                                "type": "string",
-                                "description": (
-                                    "Name of the branch (a key in 'branches') to "
-                                    "jump to when branch_condition matches."
-                                ),
-                            },
-                        },
-                        "required": ["tool"],
-                    },
-                },
-                "branches": {
-                    "type": "object",
-                    "description": (
-                        "For define (sequential mode only): alternative step "
-                        "sequences, keyed by branch name. A step whose result "
-                        "contains its 'branch_condition' jumps to its "
-                        "'branch_target' sequence (replacing the remaining main "
-                        "steps). Each value is a step list with the same shape "
-                        "as 'steps'."
-                    ),
-                },
+                "url": {"type": "string", "description": "The YouTube link of the video to transcribe."},
             },
-            "required": ["action"],
+            "required": ["url"],
         },
     },
-})
+}
+TOOL_DEFINITIONS.append(YOUTUBE_TRANSCRIBE_TOOL_DEFINITION)
+#: The tool its handler calls. The handler holds the FULL dispatch dict, so a surface that forbids this tool
+#: must forbid `youtube_transcribe` too (`core/isolation.restrict_tool_surface` — §4LS M3 forbade every macro
+#: for this reason).
+YOUTUBE_TRANSCRIBE_INNER_TOOL = "knowledge_base"
 
 
 def _intent_filter(tools: list, query: str | None, *, drop_unconfigured: set | None = None) -> list:
@@ -1025,8 +901,8 @@ def _intent_filter(tools: list, query: str | None, *, drop_unconfigured: set | N
 # Built-in tools whose LLM-facing schemas are appended INSIDE
 # get_active_tool_definitions below (vision availability / image-node config)
 # rather than living in TOOL_DEFINITIONS. Their schemas are still static
-# module literals with known parameters — they are BUILT-INS, not runtime
-# macros. Consumers that need "the set of built-in tool names" (the usable-
+# module literals with known parameters — they are BUILT-INS, not runtime-
+# registered tools. Consumers that need "the set of built-in tool names" (the usable-
 # native gate's `_STATIC_TOOL_NAMES` in core/agent.py) must union these with
 # TOOL_DEFINITIONS' names: classifying them as runtime-registered let a
 # degenerate empty-args native `vision_analysis {}` shadow a fully-specified
@@ -1305,14 +1181,6 @@ def get_active_tool_definitions(context, query: str = None, *,
         except Exception as e:
             logger.debug(f"Acquired skill definition loading failed: {type(e).__name__}: {e}")
 
-    # Composed (multi-step) skills follow the same advertise-as-a-tool
-    # pattern as acquired skills above. Failure here is non-fatal — the
-    # rest of the registry still works.
-    try:
-        register_composed_skills(active_tools, context)
-    except Exception as e:
-        logger.debug(f"Composed skill definition loading failed: {type(e).__name__}: {e}")
-
     # Only drop tools that genuinely require configuration the agent
     # doesn't have. We no longer prune image/vision/SQL tools based on
     # intent heuristics — too many false negatives.
@@ -1382,7 +1250,8 @@ def _egress_scrubbed(name, fn, context):
     calling contract it had."""
 
     def _run(**kwargs):
-        # §4MB: macros and delegates call this wrapper, never the dispatch hook
+        # §4MB: a tool that calls another tool (`youtube_transcribe` → knowledge_base) calls this wrapper,
+        # never the dispatch hook
         from ..memory.egress import content_egress_refusal
         _ref = content_egress_refusal(name, kwargs, context)
         if _ref is not None:
@@ -1400,8 +1269,6 @@ def _egress_scrubbed(name, fn, context):
 
 
 def get_available_tools(context):
-    from .memory import tool_list_lessons  # Lazy import to avoid circular dependencies
-
     def _proj_ws(stateful: bool = False):
         """Working directory for file ops + code execution — see
         ``file_system.project_scoped_sandbox`` (the shared source of truth).
@@ -1500,7 +1367,18 @@ def get_available_tools(context):
             **kwargs,
         )
 
-    async def _replan(reason, **kwargs): return f"Strategy Reset Triggered. Reason: {reason}\nSYSTEM: The planner will see this and should update the TaskTree accordingly."
+    def _fact_check_research(q, source_titles=None):
+        """§4TB: the research half of `fact_check` — deep_research with the
+        claim as the query. It also hands the search results' titles out
+        (``source_titles``, filled in place), which is what lets the verdict
+        name its sources by title; the mark below tells `tool_fact_check` it
+        may ask."""
+        return tool_deep_research(query=q, anonymous=context.args.anonymous, tor_proxy=context.tor_proxy,
+                                  llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'),
+                                  max_context=context.args.max_context,
+                                  workspace_model=getattr(context, "workspace_model", None),
+                                  source_titles=source_titles)
+    _fact_check_research.accepts_source_titles = True
 
     # Escape hatch for the agent when it has PROVEN a task cannot be
     # solved — broken validator, contradictory spec, missing data the
@@ -1519,6 +1397,18 @@ def get_available_tools(context):
             "specified. No more tool calls will be attempted."
         )
     
+    async def _youtube_transcribe(url=None, **_ignored):
+        """§4TA: the built-in that replaced the one-step `youtube_transcribe` macro — the knowledge-base
+        transcribe action on the link, and that tool's own result. The knowledge-base callable is read from
+        `tools` at CALL time: by then it is the egress-guarded one (the loop over CONTENT_GUARDED_TOOLS
+        below), the one the macro's step called."""
+        if not isinstance(url, str) or not url.strip():
+            from .outcome import ToolOutcome as _TOy
+            return _TOy.rejected("Error: youtube_transcribe needs `url` — the YouTube link of the video "
+                                 "(nothing was fetched).", world_changed=False,
+                                 reason_code="youtube_transcribe_no_url")
+        return await tools[YOUTUBE_TRANSCRIBE_INNER_TOOL](action="transcribe", filename=url)
+
     tools = {
         "system_utility": lambda **kwargs: tool_system_utility(tor_proxy=context.tor_proxy, profile_memory=context.profile_memory, context=context, **kwargs),
         "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, read_budget=getattr(context, "_read_budget", None), project_store=getattr(context, "project_store", None), confine_to_sandbox=bool(getattr(context, "confine_writes_to_project", False)), **kwargs),
@@ -1531,7 +1421,7 @@ def get_available_tools(context):
         "run": lambda **kwargs: tool_run(context=context, **kwargs),
         "notify_operator": lambda **kwargs: tool_notify_operator(context=context, **kwargs),
         "probe_model": lambda **kwargs: tool_probe_model(context=context, **kwargs),
-        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), project_store=getattr(context, "project_store", None), skill_memory=getattr(context, "skill_memory", None), owner_agent=getattr(context, "agent", None), **kwargs),
+        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), project_store=getattr(context, "project_store", None), owner_agent=getattr(context, "agent", None), **kwargs),
         "recall": lambda **kwargs: (_ISOLATED_RECALL_REFUSAL if getattr(context, "owner_memory_isolated", False) is True
                                     else tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None),
                                                     session_store=getattr(context, "session_store", None),
@@ -1539,14 +1429,12 @@ def get_available_tools(context):
                                                     profile_memory=getattr(context, "profile_memory", None), **kwargs)),
         "execute": _run_execute,
         "browser": _run_browser,
-        "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),
-        "self_state": lambda **kwargs: tool_self_state(self_model=getattr(context, "self_model", None), **kwargs),
         "introspect": lambda **kwargs: tool_introspect(self_model=getattr(context, "self_model", None), context=context, **kwargs),
         "workspace": lambda **kwargs: tool_workspace(workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "workspace_track": lambda **kwargs: tool_workspace_track(workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "web_search": lambda **kwargs: tool_search(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, context=context, **kwargs),
         "deep_research": lambda **kwargs: tool_deep_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None), **kwargs),
-        "fact_check": lambda **kwargs: tool_fact_check(llm_client=context.llm_client, model_name=getattr(context.args, 'model', "qwen3.8-27b"), max_context=context.args.max_context, deep_research_callable=lambda q: tool_deep_research(query=q, anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None)), **kwargs),
+        "fact_check": lambda **kwargs: tool_fact_check(llm_client=context.llm_client, model_name=getattr(context.args, 'model', "qwen3.8-27b"), max_context=context.args.max_context, deep_research_callable=_fact_check_research, **kwargs),
         "darkweb_search": lambda **kwargs: tool_darkweb_search(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, **kwargs),
         "darkweb_research": lambda **kwargs: tool_darkweb_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "update_profile": lambda **kwargs: tool_update_profile(profile_memory=context.profile_memory, memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), memory_bus=getattr(context, "memory_bus", None), **kwargs),
@@ -1555,36 +1443,25 @@ def get_available_tools(context):
                                                            **{k: v for k, v in kwargs.items() if k != "_ctx_project_id"},
                                                            _ctx_project_id=getattr(context, "current_project_id", None)),
         "manage_projects": lambda **kwargs: tool_manage_projects_for_model(context, **kwargs),
-        "list_lessons": lambda **kwargs: tool_list_lessons(context=context, **kwargs),
-        "replan": _replan,
         "abort_attempt": _abort_attempt,
         "lab": lambda **kwargs: tool_lab(context=context, **kwargs),
         "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
         "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
-        "manage_composed_skills": lambda **kwargs: tool_manage_composed_skills(
-            context=context,
-            # Derive the known-tool set at CALL time from the fully-populated
-            # dispatch table, so it includes the dynamically-appended tools
-            # (vision_analysis, image_generation) AND acquired skills — a
-            # composed-skill step that calls an acquired skill otherwise got
-            # a spurious "not a recognised built-in" warning.
-            known_tools=(set(tools.keys()) | {"vision_analysis", "image_generation"}),
-            **kwargs,
-        ),
+        "youtube_transcribe": _youtube_transcribe,
     }
     
     from .vision import tool_vision_analysis
     tools["vision_analysis"] = lambda **kwargs: tool_vision_analysis(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, **kwargs)
 
     # §4MG: registered BEFORE the egress wrap below — `subjects` leave the
-    # machine, and macros/delegates call the wrapped callable directly
+    # machine, and a caller that holds the callable gets the wrapped one
     if getattr(context.llm_client, 'image_gen_clients', None):
         from .image_gen import tool_generate_image
         tools["image_generation"] = lambda **kwargs: tool_generate_image(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, **{k: v for k, v in kwargs.items() if k != "tor_proxy"})
 
     # §4LB r2: the owner's street address is scrubbed at the TOOL boundary
-    # too — composed-skill macros and delegates call these callables
-    # directly, never through the dispatch hook
+    # too — a tool that calls another (`youtube_transcribe` → knowledge_base)
+    # calls these callables directly, never through the dispatch hook
     from ..memory.egress import CONTENT_GUARDED_TOOLS
     for _name in CONTENT_GUARDED_TOOLS:
         if _name in tools:
@@ -1721,14 +1598,5 @@ def get_available_tools(context):
                     tools[skill_name] = make_skill_runner(skill_name)
         except Exception as e:
             logger.debug(f"Acquired skill handler loading failed: {type(e).__name__}: {e}")
-
-    # Wire a runner for every registered composed skill (macro) so the names
-    # advertised by register_composed_skills in get_active_tool_definitions
-    # are actually dispatchable here. Mirrors the acquired-skill loop above;
-    # non-fatal — a failure just means macros aren't callable this build.
-    try:
-        register_composed_skill_runners(tools, context)
-    except Exception as e:
-        logger.debug(f"Composed skill runner wiring failed: {type(e).__name__}: {e}")
 
     return tools

@@ -82,7 +82,7 @@ def _make_ts(tool_calls, *, strikes, steered, messages, rows, force_final=False)
         tool_calls=tool_calls, msg={"role": "assistant", "content": ""},
         ui_content="", parse_failure_reason="", model="test-model",
         last_user_content="find the sender domain", char_budget=4000,
-        strikes=strikes, task_tree=MagicMock(), _user_batch_intent=None,
+        strikes=strikes, _user_batch_intent=None,
         _request_constraints=[], repeated_action_steered=steered, messages=messages,
         seen_tools=set(), executed_idempotent=set(), raw_tools_called=set(),
         tool_usage={}, tools_run_this_turn=rows, request_state=MagicMock(),

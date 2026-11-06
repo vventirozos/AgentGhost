@@ -328,8 +328,8 @@ async def _not_found_with_recall(context, term) -> str:
     # owner's facts into a public channel reply
     try:
         from ..utils.logging import reply_is_public, requester_is_member
-        from ..memory.skills import _mostly_non_latin
-        if reply_is_public() or requester_is_member() or _mostly_non_latin(str(term)):
+        from ..memory.request_text import mostly_non_latin
+        if reply_is_public() or requester_is_member() or mostly_non_latin(str(term)):
             search = None
     except Exception:  # noqa: BLE001 — unknown requester: no memory probe
         search = None
@@ -915,7 +915,7 @@ def begin_request_focus(context) -> Optional[str]:
     Called once at request start, inside the turn lock, after the request's
     scope is installed and BEFORE anything touches the sandbox. Only a
     persisting scope (owner + session id) reads a row; every other scope
-    starts with no project (members, replays, probes, unattended requests,
+    starts with no project (members, probes, unattended requests,
     clients without a session id) unless it was built with one (a leaf).
     The shared scratchpad follows the request's project: when its live
     write scope is another project's, that project's keys are snapshotted
@@ -995,15 +995,15 @@ def _constraint_origin(context) -> str:
     verifier or the prompt as "user-mandated"."""
     try:
         from ..core.agent import turn_origin
-        from ..memory.skills import LESSON_ORIGIN_USER, _derive_lesson_origin
+        from ..memory.population import ORIGIN_USER, write_origin
         if turn_origin(context) != "user":
             return "auto"
-        # ONE derivation for "is the current request a real user request",
-        # shared with the lesson chokepoint (§4FH M2): the contextvar default
+        # ONE derivation for "is the current request a real user request"
+        # (`memory/population.py`, §4FH M2): the contextvar default
         # "SYSTEM" (idle phases, `_aa_tool_runner` dispatching a tool by name
         # from the watchdog) is auto, internal prefixes are auto, probes are
         # not user.
-        return "user" if _derive_lesson_origin() == LESSON_ORIGIN_USER else "auto"
+        return "user" if write_origin() == ORIGIN_USER else "auto"
     except Exception:  # noqa: BLE001 — provenance is best-effort; unknown = user
         return "user"
 
@@ -2503,7 +2503,7 @@ def _teardown_refusal(context, proj: Dict[str, Any], act: str) -> str:
     origin = str(getattr(sc, "origin", "") or "") if sc is not None else ""
     if origin == "probe" and not (proj.get("metadata") or {}).get("probe_created"):
         return f"a probe may {act} only a project it created — nothing was changed"
-    if origin in ("unattended", "leaf", "member", "replay"):
+    if origin in ("unattended", "leaf", "member"):
         return f"{act} is the owner's decision — not available to {origin} work; nothing was changed"
     return ""
 
@@ -4029,8 +4029,8 @@ async def tool_manage_projects(
                         "note": "Project, its tasks/artifacts/events, its workspace files, its "
                                 "knowledge-graph edges and the episodes that name it were "
                                 "permanently removed. KEPT (say so if asked — do not claim "
-                                "'no trace remains'): past conversation records (trajectories), "
-                                "general lessons learned while working on it, and vector-memory "
+                                "'no trace remains'): past conversation records (trajectories) "
+                                "and vector-memory "
                                 "entries until the next memory reconcile."})
 
         if act == "archive":

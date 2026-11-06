@@ -30,7 +30,6 @@ from pathlib import Path
 from itertools import zip_longest
 
 from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
-from .planning import TaskTree
 # Shared "what did this call operate on" helper — same definition the
 # in-run no-progress loop-breaker and the pre-flight guard agree on what
 # "the same target" means.
@@ -54,11 +53,11 @@ from ..utils.tool_stop import is_user_interrupted as _s5_is_intr  # §4RZ step 5
 from ..tools.outcome import with_text as _s5_with_text  # §4RZ step 5 (s5-r13)
 from . import effort as _effort
 from . import head_saves as _head_saves
+from .isolation import is_simulated_context   # §4TD: THE marker of a simulated context (was skill_memory.is_read_only)
 from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
 # Live randomized arms + the risk governor that is measured by one of them.
 # Imported as modules (not names) so a test can monkeypatch either surface in
 # one place, and so the turn loop pays no per-iteration import lookup.
-from . import regression as _regression_boot  # noqa: F401 — §4NE r1: fingerprints the code this process runs
 
 # Sampling parameters for the current upstream model
 # (HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive). The model
@@ -287,10 +286,10 @@ def _privacy_area(context) -> str:
 
 def _owner_context_hidden(context=None) -> bool:
     """The owner's PRIVATE context (scrapbook, past requests, open questions,
-    competence, lessons, the project briefing) stays out: a member's turn, an
+    the project briefing) stays out: a member's turn, an
     owner turn whose reply is PUBLIC (§4LB — the public notice said "not
     loaded" while all of it was), or an owner-memory-isolated delegate
-    (§4LB r2: its lessons still came from the owner's playbook)."""
+    (§4LB r2)."""
     return (requester_is_member() or reply_is_public()
             or getattr(context, "owner_memory_isolated", False) is True)
 
@@ -324,7 +323,7 @@ _MEMBER_PROFILE_PLACEHOLDER = (
 # generated for a member, never the owner's files.
 _MEMBER_ALLOWED_TOOLS = frozenset({
     "web_search", "darkweb_search", "image_generation", "vision_analysis",
-    "abort_attempt", "replan",
+    "abort_attempt",
 })
 _MEMBER_TOOL_BLOCK = ("SYSTEM BLOCK: this tool reads or writes the owner's data and this request is "
                       "from a channel member. It is not available; answer from the conversation and "
@@ -346,19 +345,20 @@ _STABLE_SKILL_INSTRUCTION = "\n\nYou have Natural-born tools and Acquired Skills
 #
 # 2026-08-19 review (§ turn-loop R2, lens B): the previous DENYLIST
 # (`_BATCH_COLLAPSE_UNSAFE`) could never enumerate side-effecting tools that are
-# registered at RUNTIME under their own names — composed macros
-# (`register_composed_skill_runners` → `tools[name]`) and acquired skills
-# (`make_skill_runner` → `tool_execute`, arbitrary code). Those user-defined
+# registered at RUNTIME under their own names — acquired skills
+# (`make_skill_runner` → `tool_execute`, arbitrary code; and, until §4TA
+# removed them on 2026-11-05, composed macros). Those user-defined
 # names bypassed the denylist, so two byte-identical `deploy(...)` /
 # `rotate_secrets(...)` calls in one batch collapsed to one execution — a
 # silently dropped side effect. Inverting to an allowlist makes every unlisted
 # tool (static OR dynamic) safe-by-default. Per-action refinement for mixed
-# read/write tools (file_system read vs write, knowledge_base query vs ingest)
+# read/write tools (file_system read vs write, knowledge_base query vs ingest,
+# introspect reads vs its one write `set_mood` — §4TB)
 # is handled by the `is_mutating` gate, which is OR'd in first, so a listed
 # tool still does not collapse when the specific call mutates.
 _COLLAPSE_READSAFE = frozenset({
     "recall", "web_search", "deep_research", "fact_check",
-    "darkweb_search", "darkweb_research", "introspect", "list_lessons",
+    "darkweb_search", "darkweb_research", "introspect",
     "file_system", "knowledge_base",
 })
 
@@ -369,18 +369,6 @@ _COLLAPSE_READSAFE = frozenset({
 # result-processing site). Keyed on the raw arg because the alias healing
 # lives inside the tool; an unknown action errors out and never resets.
 _SERVICE_READONLY_OPS = frozenset({"", "status", "logs", "log", "list", "ls"})
-
-# Actions of `manage_composed_skills` that move the macro REGISTRY the pre-flight
-# guard reasons about: a `delete` makes a blocked `define` of the same name
-# legal again, and `approve`/`define` change what is dispatchable. `run` is
-# DELIBERATELY EXCLUDED — a macro can be entirely read-only (an ls/grep/curl
-# "status" bundle), so treating every successful run as world-mutating would
-# reintroduce the exact read-only-probe hole the `execute` branch guards
-# against, and a model interleaving such a run between failing calls could
-# reset the guard on each attempt and defeat it permanently. `list` is
-# read-only too. See `_call_mutated_world` and the 2026-08-12 deadlock.
-_COMPOSED_SKILL_MUTATING_ACTIONS = frozenset({"define", "approve", "delete"})
-
 
 #: §4LD: a failing idle phase is said ONCE an hour at WARNING (26 handlers
 #: logged at DEBUG, and production logs no GhostAgent DEBUG line — every
@@ -424,20 +412,16 @@ IDLE_SCHEDULER_JOBS = (
     ("maintenance", "maintenance",
      lambda args, ctx: getattr(args, "no_dream", False) is not True),
     ("store-hygiene", "store-hygiene",
-     lambda args, ctx: getattr(ctx, "skill_memory", None) is not None),
+     lambda args, ctx: getattr(ctx, "memory_system", None) is not None),
     ("tidy", "workspace tidy",
      lambda args, ctx: getattr(ctx, "project_store", None) is not None),
     ("autoadvance", "project autoadvance (autopilot projects only)",
      lambda args, ctx: (getattr(args, "autoadvance_idle", False) is True
                         and getattr(ctx, "project_store", None) is not None)),
     ("selfhood-narrative", "self narrative", _self_model_on),
-    ("stale-questions", "stale open questions", _self_model_on),
     ("workspace-narrative", "workspace narrative", _workspace_model_on),
     ("mirror", "mirror (one I-sentence a day)",
      lambda args, ctx: getattr(ctx, "llm_client", None) is not None),
-    ("failure-replay", "failure replay + regression suite (when an owner failure "
-                  "or a due test exists)",
-     lambda args, ctx: True),
 )
 
 
@@ -458,14 +442,12 @@ def idle_scheduler_jobs(args, ctx) -> List[str]:
 IDLE_JOB_PURPOSE = {
     "maintenance": ("project activity digests, file descriptions, daily store backup, "
                     "memory-graph cleanup and store consistency checks"),
-    "store-hygiene": "repairs the lesson index and removes expired temporary video transcripts",
+    "store-hygiene": "removes expired temporary video transcripts",
     "tidy": "deletes leftover screenshots and scratch files in project workspaces",
     "autoadvance": "one unattended step on a project you put on autopilot",
     "selfhood-narrative": "rewrites the agent's running diary",
-    "stale-questions": "lists its open questions older than 3 days",
     "workspace-narrative": "rewrites the running summary of the workspace",
     "mirror": "rewrites its one-sentence self-description from its earlier ones plus a few of your replies",
-    "failure-replay": "replays one of your past failures or runs your regression tests",
 }
 
 
@@ -489,20 +471,16 @@ def idle_cycle_line(ran, notes, idle_min: float) -> str:
     return f"idle {idle_min:.0f}m — ran " + " | ".join(parts)
 
 
-def _store_hygiene_note(orphans, healed, temp_docs, failed=()) -> str:
-    """The store-hygiene job's outcome in words (§4PQ)."""
-    o = orphans if isinstance(orphans, int) else 0
-    h = healed if isinstance(healed, int) else 0
+def _store_hygiene_note(temp_docs, failed=()) -> str:
+    """The store-hygiene job's outcome in words (§4PQ). §4TD: the job is the
+    temporary-document sweep alone — its two lesson-index passes went with
+    the lesson store."""
     td = temp_docs if isinstance(temp_docs, dict) else {}
     rm, mk = list(td.get("removed") or []), list(td.get("marked") or [])
     bad = [f"{x} FAILED" for x in (failed or ())]
-    if not (o or h or rm or mk):
+    if not (rm or mk):
         return "; ".join(bad) if bad else "nothing to fix"
     bits = []
-    if o:
-        bits.append(f"{o} orphaned lesson-index entr{'y' if o == 1 else 'ies'} dropped")
-    if h:
-        bits.append(f"{h} lesson(s) re-indexed")
     if rm:
         bits.append(f"{len(rm)} expired video transcript(s) removed")
     if mk:
@@ -608,18 +586,12 @@ def _call_mutated_world(fname: str, t_args: dict, is_mutating: bool) -> bool:
     if fname == "run":
         # §4SX D5: start / stop / restart change what runs; status / logs / url / collect read
         return not _run_is_read_call(t_args)
-    if fname == "manage_composed_skills":
-        # ONLY the named `action` param: the tool reads no `operation`/`op`
-        # alias, so honouring one here would let `operation='delete'` (which
-        # the tool rejects as a missing-action error) be scored a mutation.
-        return (str(t_args.get("action") or "").strip().lower()
-                in _COMPOSED_SKILL_MUTATING_ACTIONS)
     return False
 
 
 # Headroom reserved for the per-turn injection that `_compose_injection`
 # adds to the shipped payload AFTER history pruning — tool schemas (~7-8k
-# tok), hydrated playbook/memory, continuity + workspace blocks, the
+# tok), hydrated memory, continuity + workspace blocks, the
 # project briefing, and the scratchpad. Pruning history to the full
 # `max_context` and THEN adding this overshoots the model window → HTTP 400
 # → destructive emergency recovery (2026-07-20). Prune and steer against
@@ -687,7 +659,7 @@ async def _stream_or_abort_frames(it):
     handler — AST-verified, not read off the indentation. Any raise there
     (`_do_stream_chat_completion` still re-raises on HTTP 4xx/5xx and on the
     generic path) skipped the ENTIRE durable tail: episode, hydration judge,
-    trajectory, project work_log, verifier spawn, lesson outcomes. The client
+    trajectory, project work_log, verifier spawn. The client
     got routes.py's error event, but the turn vanished from every persistent
     record — the worst possible outcome for a turn that already streamed
     most of an answer.
@@ -794,16 +766,17 @@ _EDIT_CHURN_VERIFY_TOOLS = frozenset({
 #
 # The damage is not just a wasted turn. Production trace req 32a8101d: the
 # model reasoned "there's no explicit learning or profile instruction in
-# their message… But the system is requiring it", called `learn_skill` to
-# silence the nudge, and minted a junk lesson that vector-dedup then
-# reinforced to freq=11 — i.e. the false nudge writes into the corpus that
-# retrieval later injects. req 207e0702 shows the other failure mode: the
+# their message… But the system is requiring it", called the (since removed)
+# lesson tool to silence the nudge, and minted a junk lesson that vector-dedup
+# then reinforced to freq=11. req 207e0702 shows the other failure mode: the
 # same nudge drove a repetition loop the thinking guard had to abort.
 #
 # So the predicate now requires an IMPERATIVE DIRECTIVE to record something,
 # not a mention of the topic. Deliberately narrow — a missed true positive
-# costs one un-nudged turn (the model can still call learn_skill on its own),
-# while a false positive corrupts the lesson corpus.
+# costs one un-nudged turn (the model can still call update_profile on its
+# own), while a false positive writes a fact nobody stated.
+# §4TD: the lesson tool is gone — the one recording tool the nudge names is
+# `update_profile`, and "learn a lesson from …" is no longer a directive.
 _META_TASK_DIRECTIVE_RE = re.compile(
     r"\b(?:"
     # Inherently MEMORY-ish verbs: "learn/remember/memorize THIS".
@@ -827,7 +800,7 @@ _META_TASK_DIRECTIVE_RE = re.compile(
     r"(?:(?=that\s+(?:i|we|my|our)\b)|(?!that\b))"
     r"(?:this|that|it|the\s+following|these|from\s+this)"
     # Storage verbs are ambiguous — "save it to the knowledge base" is a
-    # DOCUMENT write, not a lesson (live false positive: the youtube
+    # DOCUMENT write, not a fact to record (live false positive: the youtube
     # project request said "transcribe it, save it to the knowledge base"
     # and armed the nudge). Require the destination NOT to be a data store.
     r"|(?:record|note|save|store)\s+"
@@ -845,10 +818,8 @@ _META_TASK_DIRECTIVE_RE = re.compile(
     r"|(?:update|add\s+to|write\s+to|amend|correct)\s+(?:your\s+|the\s+)?"
     r"(?:profile|memory|user\s+profile)"
     # direct tool directives
-    r"|call\s+(?:learn_skill|update_profile)"
-    r"|use\s+(?:learn_skill|update_profile)"
-    # "learn a lesson from …" / "take a lesson"
-    r"|(?:learn|take)\s+a\s+lesson"
+    r"|call\s+update_profile"
+    r"|use\s+update_profile"
     # "don't forget to remember/record"
     r"|(?:remember|record)\s+(?:for|next\s+time)"
     r")\b",
@@ -859,7 +830,7 @@ _META_TASK_DIRECTIVE_RE = re.compile(
 def _has_meta_task_directive(text: str) -> bool:
     """True when the user actually INSTRUCTED the agent to record something.
 
-    A mention of the words 'skill' / 'lesson' / 'profile' is NOT a directive:
+    A mention of the words 'skill' / 'profile' is NOT a directive:
     "Define a composed skill", "show me all custom skills" and "what have you
     learned today" are ordinary requests, and the nudge that fired on them
     told the model a falsehood about its own instructions."""
@@ -874,8 +845,8 @@ _CORRECTION_JUDGE_TIMEOUT_S = float(
 
 _BOOKKEEPING_TOOL_NAMES = frozenset({
     "manage_projects", "manage_tasks", "manage_skills",
-    "scratchpad", "learn_skill", "update_profile",
-    "replan", "abort_attempt", "list_lessons",
+    "scratchpad", "update_profile",
+    "abort_attempt",
     "knowledge_base",  # insert_fact / forget return confirmations only
 })
 
@@ -1057,14 +1028,13 @@ def _tool_is_bookkeeping(tool) -> bool:
 # A verdict can land BEFORE the turn's own records exist: a tool-free turn's
 # verdict branch has no await, so the verdict task completes on the next loop
 # tick and its done-callback runs at finalize's next yield — ahead of
-# `_record_turn_trajectory` (the corpus row + correction cache) and of
-# `_record_lesson_outcomes` (the lesson stash). Two bounded, context-keyed
-# rings make both consumers order-independent: an in-flight trajectory's
-# early verdict is parked and replayed by the record; an early lesson sign is
-# parked and booked by the stash write. Module-level (not methods) so the
-# fakes that stand in for the agent in the backfill tests keep working.
+# `_record_turn_trajectory` (the corpus row + correction cache). A bounded,
+# context-keyed ring makes that consumer order-independent: an in-flight
+# trajectory's early verdict is parked and replayed by the record.
+# Module-level (not methods) so the fakes that stand in for the agent in the
+# backfill tests keep working. (§4TD: the second ring, for an early lesson
+# sign, went with the lesson store.)
 _TRAJ_IN_FLIGHT_MAX = 64
-_PENDING_LESSON_SIGN_MAX = 256
 
 
 def _bounded_ring(context, attr: str, cap: int):
@@ -1120,28 +1090,6 @@ def _take_deferred_late_backfill(context, trajectory_id):
     if isinstance(ring, dict):
         ring.pop(trajectory_id, None)
     pend = getattr(context, "_pending_late_backfill", None)
-    if not isinstance(pend, dict) or trajectory_id not in pend:
-        return None
-    return pend.pop(trajectory_id)
-
-
-def _park_pending_lesson_sign(context, trajectory_id, success: bool) -> None:
-    pend = _bounded_ring(context, "_pending_lesson_outcome_by_traj",
-                         _PENDING_LESSON_SIGN_MAX)
-    pend[trajectory_id] = bool(success)
-    pend.move_to_end(trajectory_id)
-    while len(pend) > _PENDING_LESSON_SIGN_MAX:
-        pend.popitem(last=False)
-    logger.info(
-        "lesson-outcome: verdict for traj %s landed before its stash — "
-        "sign parked (%s)", str(trajectory_id)[:8],
-        "success" if success else "failure",
-    )
-
-
-def _take_pending_lesson_sign(context, trajectory_id):
-    """The parked sign for ``trajectory_id`` (popped), or None."""
-    pend = getattr(context, "_pending_lesson_outcome_by_traj", None)
     if not isinstance(pend, dict) or trajectory_id not in pend:
         return None
     return pend.pop(trajectory_id)
@@ -1496,7 +1444,7 @@ def system_command_reply(staged: str) -> str:
 
 def _owner_command_line(kind: str, text, note) -> str:
     """§4NV: the owner's command AND what it did (the note's ``banner``:
-    "rule 3 adopted", "no such proposed rule", "test kept")."""
+    "✓ Rule 3 added", "There is no rule 4")."""
     line = f"{kind} command: {str(text or '').strip()[:100]}"
     banner = " ".join(str(getattr(note, "banner", "") or "").split())
     return f"{line} → {banner[:160]}" if banner else line
@@ -1569,6 +1517,43 @@ def stamp_loop_breaker(context, req_id, kind: str) -> None:
     d[str(req_id or "")] = kind
     while len(d) > _LOOP_BREAKER_REPORTS_MAX:
         d.pop(next(iter(d)))
+    note_guard_event(context, req_id, kind)        # §4TC: a breaker that closes a request is a guard event
+
+
+#: §4TC: request id → how many times a loop guard stepped in during that
+#: request (an edit-churn or futility steer or stop, a killed thinking loop,
+#: a breaker that closed the request). Read once, at the end of an owner's
+#: turn, by the mood (`GhostAgent._mood_turn_signals`). Keyed like the breaker
+#: reports above and for the same reason: a streamed final records after the
+#: next request has started.
+_GUARD_EVENTS_MAX = 64
+
+
+def note_guard_event(context, req_id, kind: str) -> None:
+    """Count one guard event for ``req_id``. Never raises."""
+    try:
+        d = getattr(context, "_guard_events", None)
+        if not isinstance(d, dict):
+            d = {}
+            context._guard_events = d
+        key = str(req_id or "")
+        if not key:
+            return
+        d[key] = (d.pop(key) if isinstance(d.get(key), list) else []) + [str(kind or "")]
+        while len(d) > _GUARD_EVENTS_MAX:
+            d.pop(next(iter(d)))
+    except Exception:  # noqa: BLE001 — bookkeeping for a gauge never breaks a turn
+        pass
+
+
+def guard_events_for(context, req_id, *, pop: bool = False) -> List[str]:
+    """The guard events counted for ``req_id`` (their kinds, in order)."""
+    d = getattr(context, "_guard_events", None)
+    if not isinstance(d, dict):
+        return []
+    key = str(req_id or "")
+    v = d.pop(key, None) if pop else d.get(key)
+    return list(v) if isinstance(v, list) else []
 
 
 def loop_breaker_for(context, req_id, *, pop: bool = False) -> str:
@@ -1803,7 +1788,7 @@ def _latch_forces_final(task_closed_this_req: bool,
     return bool(task_closed_this_req) and not bool(repair_reentry_active)
 
 
-_SELF_REPORT_TOOLS = frozenset({"introspect", "self_state", "list_lessons"})
+_SELF_REPORT_TOOLS = frozenset({"introspect"})   # §4TB: `self_state` removed; §4TD: `list_lessons` removed
 
 
 def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
@@ -1969,18 +1954,20 @@ def turn_origin(context) -> str:
     their own simulation gates had excluded those very turns. The denominator
     and the ledgers were counting opposite populations.
 
-    Derived from the read-only skill store, which is what dream builds its
-    isolated context with — the SAME derivation as the §4K foresight gate and
-    finalize's `is_simulation`. Deliberately not a second definition: a private
-    notion of "is this real traffic" that can drift from the gates' notion is
-    how the two came to disagree in the first place.
+    Derived from the context's ``simulated`` flag (``core/isolation.py``:
+    stamped on every isolated replay context and every coding leaf; until
+    §4TD the marker was the read-only wrapper of the lesson store those
+    contexts carried) — the SAME derivation as finalize's `is_simulation`.
+    Deliberately not a second definition: a private notion of "is this real
+    traffic" that can drift from the gates' notion is how the two came to
+    disagree in the first place.
 
     §4BF Track 1b: an EXPLICIT label on the context wins — bench-bank runs
     ride the same read-only isolation as self-play but are a third
     population ("bench", externally graded), and inheriting "sim" would
     fold them into the population the flywheel exists to be distinguished
     from. This is an override set by the bench path, not a second
-    heuristic — the read-only derivation stays the one inference.
+    heuristic — the simulated flag stays the one inference.
     """
     # §4FB (2026-09-06): a DIAGNOSTIC PROBE is a fourth population, decided
     # by the request id the route stamped (`X-Ghost-Origin: probe` →
@@ -1989,8 +1976,8 @@ def turn_origin(context) -> str:
     # late verifier, judge and trajectory writer all see the same answer.
     # Checked FIRST: a probe is a probe whatever context it runs in, and no
     # bench/sim context ever carries a probe-prefixed id. Every consumer
-    # that gates on `== "user"` (calibration booking, selfhood, foresight,
-    # feedback, lesson credit …) therefore excludes diagnostics for free.
+    # that gates on `== "user"` (selfhood, feedback, the mood …)
+    # therefore excludes diagnostics for free.
     try:
         from ..utils.logging import (ORIGIN_PROBE, is_probe_request_id,
                                      request_id_context)
@@ -2001,7 +1988,7 @@ def turn_origin(context) -> str:
     label = getattr(context, "turn_origin_label", None)
     if isinstance(label, str) and label:
         return label
-    if getattr(getattr(context, "skill_memory", None), "is_read_only", False) is True:
+    if is_simulated_context(context):
         return "sim"
     # §4KW (fresh review): a background-job wake, a scheduled task or a watch
     # callback (`job-`/`sched-`/`sub-` ids) is the agent talking to itself —
@@ -2017,17 +2004,6 @@ def turn_origin(context) -> str:
     except Exception:  # noqa: BLE001
         pass
     return "user"
-
-
-def _query_has_tokens(text) -> bool:
-    """§4KW: does the request carry a significant token? A request of "?" or
-    an emoji is non-empty but token-less, and `credit_recent_retrievals`
-    then falls back to crediting every recent lesson (third review)."""
-    try:
-        from ..memory.skills import _trigger_token_set
-        return bool(_trigger_token_set(str(text or "")))
-    except Exception:  # noqa: BLE001
-        return False
 
 
 #: the extractor's free-form category → the profile's standard drawer
@@ -2111,12 +2087,13 @@ def _owner_sentence_for(value: str, episode: str, cue: str = None) -> str:
 
 
 def turn_may_teach(context) -> bool:
-    """§4KD/§4KJ: may THIS turn write to the playbook? False for a
-    diagnostic probe (§4FB/§4FS) and for a MEMBER's turn (real traffic, so
-    `turn_origin` still says "user", but a non-owner's prompt must not
-    become the owner's lesson). The writer itself has the same rule as a
-    backstop (`memory.skills.playbook_writes_blocked`). No client name
-    appears here: the role header is the only multi-user signal."""
+    """§4KD/§4KJ: may THIS turn leave something the owner's later turns
+    learn from (the conversation archive, the user-correction machinery)?
+    False for a diagnostic probe (§4FB/§4FS) and for a MEMBER's turn (real
+    traffic, so `turn_origin` still says "user", but a non-owner's prompt
+    must not become the owner's). No client name appears here: the role
+    header is the only multi-user signal. (§4TD: its first consumer, the
+    lesson playbook, is removed.)"""
     try:
         # (§4LA) sim and bench too — they were kept out only because isolation
         # nulled the store handle
@@ -2422,7 +2399,7 @@ def _all_lookup_calls(tool_calls) -> bool:
 
 #: §4OG-4 (e): the one kind of batch whose text-alongside IS the answer — a
 #: memory write ("Saved that." / the profile fact) at the end of a reply
-_PRE_TOOL_BOOKKEEPING_TOOLS = frozenset({"remember", "update_profile", "forget", "reset_all", "learn_skill"})
+_PRE_TOOL_BOOKKEEPING_TOOLS = frozenset({"remember", "update_profile", "forget", "reset_all"})
 
 
 def _narration_batch(tool_calls) -> bool:
@@ -2886,13 +2863,13 @@ def _state_sections(parts, sandbox_root) -> dict:
     return out
 
 
-def _state_sections_pinned(sections: dict, final_directive, playbook) -> dict:
-    """Under the pin the final-answer directive and the playbook ride the
-    front of the block (unscrubbed, as before); joined, the pinned block."""
-    return {"final_directive": (final_directive + "\n") if final_directive else "",
-            "playbook": playbook or "", **sections}
+def _state_sections_pinned(sections: dict, final_directive) -> dict:
+    """Under the pin the final-answer directive rides the front of the block
+    (unscrubbed, as before); joined, the pinned block."""
+    return {"final_directive": (final_directive + "\n") if final_directive else "", **sections}
 
 
+MOOD_LINE_UPDATED = "UPDATED — this replaces the earlier mood line. "
 _STATE_CHANGES_INTRO = ("(Changes since the state update at the start of this request — "
                         "every section not listed here is unchanged.)\n")
 _STATE_NO_CHANGE = "(No change since the state update at the start of this request.)"
@@ -2960,6 +2937,11 @@ def _state_changes(base: dict, sections: dict) -> str:
             d = _listing_changes(base[k], t)
             if d and len(d) < len(t):
                 t = d
+        if k == "mood_tone" and base.get(k):
+            # §4TC (review): the request's first block still holds the OLD
+            # mood line — say that this one replaces it, or the model is
+            # left with two that contradict each other
+            t = MOOD_LINE_UPDATED + t
         out.append(t)
     for key, text in base.items():
         if text and not sections.get(key):
@@ -2999,6 +2981,28 @@ _QUEUED_CARRIER_LABEL = (
     "quoted above as PENDING REQUEST]")
 
 
+#: §4TB: what the cognitive watchdog appends to the DURABLE text when it severs a
+#: think loop in the final stream (the client gets its own short notice). Plain text:
+#: it closes the open think block and says what happened. No tool-call markup — the
+#: `replan` tool it used to name is removed.
+WATCHDOG_BREAK_NOTE = ("\n</think>\n[SYSTEM OVERRIDE: my internal reasoning got stuck in a loop and "
+                       "the reply was cut off here.]")
+
+
+#: §4TA: names of REMOVED tools (normalised: lower-case, letters and digits only) that the
+#: mistyped-name healer must not map onto a neighbour. The macro manager's name is a 0.75
+#: match for `manage_skills`: a model that still called it from old history with
+#: `action="delete", skill_name=…` deleted a custom tool there, and ANY such call ran that
+#: tool's owner sweep (review). It gets the ordinary unknown-tool reply instead.
+#: §4TD: `learn_skill` and `list_lessons`. Measured against the tools that are
+#: left, neither heals today ("learnskill" is closest to `create_skill`, 0.667,
+#: under the 0.7 cut-off; "listlessons" is close to nothing) — they are named
+#: here so that stays true whatever custom tool is created later: a tool called
+#: `learn_skills` would be a 0.95 match for a stale lesson call.
+_REMOVED_TOOL_NAMES = frozenset({"managecomposedskills", "managecomposedskill",
+                                 "learnskill", "listlessons"})
+
+
 def _message_text(content) -> str:
     """The text of a message's content (a string, or the text parts of a
     structured list), whitespace-collapsed — the form two copies of one
@@ -3007,6 +3011,17 @@ def _message_text(content) -> str:
         content = " ".join(str(i.get("text", "")) for i in content
                            if isinstance(i, dict) and i.get("type") == "text")
     return " ".join(str(content or "").split())
+
+
+def _message_lines(content) -> str:
+    """The text of a message's content WITH its line breaks (text parts of a
+    structured list are separate lines). An owner command is matched on this,
+    not on `_message_text`: a dictated rule is ONE line, and the collapsed
+    form made "remember this rule: X\\n\\nnow write me …" one line (§4SZ r2)."""
+    if isinstance(content, list):
+        content = "\n".join(str(i.get("text") or "") for i in content
+                            if isinstance(i, dict) and i.get("type") == "text")
+    return str(content or "")
 
 
 def _carrier_label(carrier_content, pending_request, otherwise: str, *,
@@ -3919,11 +3934,6 @@ def interruption_marker(req_id, remaining_s: Optional[float] = None) -> str:
     return TURN_INTERRUPTED_MARKER
 
 
-class _NoOwnerSeed(Exception):
-    """§4MS: no owner failure to replay and no regression test due — the
-    self-play slot has nothing to do this tick."""
-
-
 def _owner_wrote(phrase: str, owner_fold: str) -> bool:
     """§4NG: the folded phrase occurs in the owner's folded words as WHOLE
     words ("ai" is not in "said", "it" is not in "with"). The owner text is
@@ -3933,19 +3943,6 @@ def _owner_wrote(phrase: str, owner_fold: str) -> bool:
     text = re.sub(r"(?m)^\s*user\s*:\s*", " ", owner_fold or "")
     return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text) is not None
 
-
-class _SlotBusy(Exception):
-    """§4MW r2: another self-play slot body is running."""
-
-
-class _ProofLegRan(Exception):
-    """§4MW/§4NE: the self-play slot ran one failure-replay stage or one
-    regression-suite step (the slot's work for this tick is done)."""
-
-
-#: §4MS: the wall cap of one idle job (a replay stage, a regression step,
-#: the reaction judge) — a self-play tick once ran 2,140 s unbounded
-IDLE_JOB_CAP_S = 900.0
 
 #: §4MO: the loop's own pre-dispatch blocks that ASK the user (clarify-first;
 #: an image retry that drops or replaces a subject with no photo). A batch
@@ -4062,6 +4059,17 @@ def _lab_is_read_call(args) -> bool:
         return is_read_call(args)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _introspect_is_write_call(args) -> bool:
+    """§4TB: an `introspect` call that WRITES (action='set_mood') — the tool
+    is on the read-safe list for every other action. Fails to "write": a call
+    that cannot be classified is never collapsed with its twin."""
+    try:
+        from ..tools.introspect import is_write_call
+        return is_write_call(args)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _run_is_read_call(args) -> bool:
@@ -4617,9 +4625,10 @@ def _fs_norm(path) -> str:
 # ⚠ Evidence over names. The first gate listed `workspace` (a READ-ONLY
 # reporting tool) and `system_utility` (weather/diagnostics) — each silently
 # neutralised real turns' absence checks — while an arbitrarily-named
-# composed skill embedding an `execute` step walked past it. A shell run is
+# custom tool that runs a shell walked past it. A shell run is
 # recognised by the record itself: the execute tool's own result header,
-# which composed-skill records embed verbatim for their shell steps.
+# which an acquired skill's result carries verbatim (its runner returns the
+# execute result; composed-skill records, removed in §4TA, embedded it too).
 # `manage_projects` is still NOT here — its removal paths (DONE-flip sweep,
 # hard delete) stamp the store instead (see workspace_cleanup._mark_removal
 # and ProjectStore.delete_project).
@@ -6102,7 +6111,8 @@ def unopened_citation_note(tools_run, roots) -> str:
             docs.append(p)
     if not docs:
         return ""
-    _FETCHERS = ("browser", "web_search", "deep_research", "darkweb_search", "darkweb_research")
+    _FETCHERS = ("browser", "web_search", "deep_research", "darkweb_search", "darkweb_research",
+                 "fact_check")       # §4TB r2: a request whose only research was a fact check fetched pages too
     if not any(isinstance(t, dict) and not t.get("_synthetic")
                and (t.get("name") in _FETCHERS
                     or str(t.get("content") or "").lstrip().startswith("SUCCESS: Downloaded"))   # r3: a download is a fetch
@@ -7675,7 +7685,7 @@ _MEMBER_STEER_HEAD_RE = re.compile(
     r"\A\s*(?:<tool_response[^>]*>\s*)?(?:SYSTEM [A-Z0-9][A-Z0-9 _-]{0,30}?\s*[:(\u2014#]|AUTO-DIAGNOSTIC:)")
 _MEMBER_STEER_KNOWN_TOOLS = ("browser", "deep_research", "execute", "file_system", "workspace")
 MEMBER_STEER_CAVEAT = (
-    "\n(On this channel only " + ", ".join(sorted(set(_MEMBER_ALLOWED_TOOLS) - {"abort_attempt", "replan"}))
+    "\n(On this channel only " + ", ".join(sorted(set(_MEMBER_ALLOWED_TOOLS) - {"abort_attempt"}))
     + " exist — ignore any other tool named above and use what those give you.)")
 
 
@@ -8520,8 +8530,9 @@ _DUPLICATE_KWARG_RE = re.compile(
 
 #: A shell-style envelope reporting a non-zero exit. `execute` has its own
 #: rescue for this, gated on `fname == "execute"` — but 12 live calls from
-#: other tools (`manage_projects`, `manage_composed_skills`, `jobs`,
-#: `youtube_transcribe`, `create_skill`) carry the same banner and got none.
+#: other tools (`manage_projects`, `jobs`, `youtube_transcribe`,
+#: `create_skill`, and the macro manager removed in §4TA) carry the same
+#: banner and got none.
 # `0*[1-9]` — any number containing a non-zero digit. A negative
 # lookahead on a single `0` called "EXIT CODE: 00" a failure.
 
@@ -8636,7 +8647,6 @@ def call_runs_a_memory_wipe(fname: str, raw_arguments, available=None) -> bool:
 
 
 from ..tools.tasks import tool_list_tasks
-from ..memory.skills import SkillMemory
 
 logger = logging.getLogger("GhostAgent")
 
@@ -8669,11 +8679,10 @@ _PURE_TRIGGER_TOOLS = _compute_pure_trigger_tools()
 # misclassified those two as runtime tools, so a degenerate empty-args native
 # `vision_analysis {}` shadowed a fully-specified XML call — a regression the
 # R4 comment's "schema unknowable at import" claim did not actually cover).
-# A dispatchable tool NOT in this set is runtime-registered (a composed macro
-# via register_composed_skill_runners, or an acquired skill) — its schema
-# really is unknowable at import, so the trigger set above can never contain
-# it even when it genuinely takes no parameters (a zero-`$var` macro
-# advertises `properties: {}`). The usable-native gate treats an empty-args
+# A dispatchable tool NOT in this set is runtime-registered (an acquired
+# skill) — its schema really is unknowable at import, so the trigger set
+# above can never contain it even when it genuinely takes no parameters.
+# The usable-native gate treats an empty-args
 # call to such a tool as USABLE (§ turn-loop R4): dispatching it errors
 # recoverably at worst if it did need args, whereas the alternative —
 # executing content-XML of unknown provenance (possibly a mutating ECHO)
@@ -9866,7 +9875,10 @@ class GhostContext:
         self.memory_system = None
         self.profile_memory = None
         self.graph_memory = None
-        self.skill_memory = None
+        # §4TD: THE marker of a simulated context (an isolated replay, a
+        # coding leaf) — False on the live context; stamped True on a copy by
+        # `core/isolation.mark_simulated` and read by `is_simulated_context`
+        self.simulated = False
         self.scratchpad = None
         self.sandbox_manager = None
         self.scheduler = None
@@ -12059,7 +12071,6 @@ class TurnState:
     last_user_content: Any
     char_budget: Any
     strikes: Any
-    task_tree: Any
     _user_batch_intent: Any
     _request_constraints: Any
     repeated_action_steered: Any
@@ -12160,7 +12171,8 @@ class StreamState:
     _proj_task_closed_this_req: Any
     _turn_reg: Any
     # Snapshot of `context._ctx_pressure_lockdown` taken UNDER the request
-    # semaphore (mood rework 2026-08-20, review R1). The SSE drain runs
+    # semaphore (mood rework 2026-08-20, review R1; since §4TC the end-of-turn
+    # mood hook counts it as one guard event). The SSE drain runs
     # post-semaphore, where the live flag belongs to whichever request
     # holds the semaphore NOW — reading it there mis-attributes the next
     # turn's pressure to this one (same hazard class as _drain_pid /
@@ -12308,7 +12320,7 @@ _owner_rule_banner_ctx: "contextvars.ContextVar[str]" = contextvars.ContextVar(
 
 def _turn_surface_extra() -> dict:
     """The trajectory's surface stamp: {"surface": "public"} on a
-    public-channel turn, else {} (§4MZ — the reaction judge keys threads on it)."""
+    public-channel turn, else {} (§4MZ — the experience store leaves such a turn out)."""
     try:
         return {"surface": "public"} if reply_is_public() else {}
     except Exception:  # noqa: BLE001
@@ -12316,28 +12328,111 @@ def _turn_surface_extra() -> dict:
 
 
 def _owner_rules_block(context) -> str:
-    """§4NA: the rules the owner adopted, on every turn that may see the
-    owner's private context (never a member, a public reply or an isolated
-    delegate) — retrieval missed them where they mattered (greetings), and
-    they were the lessons that changed replies. "" when there are none or a
-    compliance probe withholds every lesson."""
+    """§4NA / §4SZ: the owner's rules, on every turn that may see the owner's
+    private context (never a member, a public reply or an isolated delegate).
+    Since §4SZ they come from `core/owner_rules.py` — one store the owner
+    dictates into — not from the lesson playbook. "" when there are none or a
+    compliance probe withholds them."""
     try:
-        from ..memory.skills import _lessons_withheld
-        sm = getattr(context, "skill_memory", None)
-        if sm is None or _owner_context_hidden(context) or _lessons_withheld():
+        if _owner_context_hidden(context):
             return ""
-        rows = sm.owner_rules()
-        rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        md = getattr(context, "memory_dir", None)
+        if not isinstance(md, (str, Path)) or not str(md):
+            return ""
+        from .owner_rules import rules_block
+        return rules_block(Path(md).parent)
     except Exception:  # noqa: BLE001 — a malformed store never breaks a turn
         return ""
-    if not rows:
+
+
+# ── §4TC: the mood on the request path ──────────────────────────────────
+#
+# Two questions, two predicates, both FAIL CLOSED (an exception is "no"):
+# whose turns MOVE the mood, and whose replies HEAR it.
+
+def _mood_model(context):
+    """This context's live self-model, or None. isinstance, not truthiness:
+    a MagicMock context auto-vivifies the attribute."""
+    from ..selfhood import SelfModel as _SelfModelMood
+    sm = getattr(context, "self_model", None)
+    return sm if isinstance(sm, _SelfModelMood) and getattr(sm, "enabled", False) else None
+
+
+def _mood_run_is_contained(context) -> bool:
+    """A contained copy (an isolated replay), an owner-memory-isolated
+    delegate (a coding leaf), or a context that is not the live population
+    (self-play, a bench run, a leaf's own kind)."""
+    from .isolation import is_contained_context
+    if is_contained_context(context):
+        return True
+    if getattr(context, "owner_memory_isolated", False) is True:
+        return True
+    return turn_origin(context) not in ("user", ORIGIN_PROBE, "internal")
+
+
+def mood_moves_on_this_request(context) -> bool:
+    """May what happens in this request MOVE the mood? Only a real OWNER
+    request: not a probe, a member's turn, a scheduled task, a job wake, a
+    sub-agent, self-play, a bench or replay run, a coding leaf."""
+    try:
+        from ..utils.logging import request_kind as _rk
+        return (_rk() == "owner" and turn_origin(context) == "user"
+                and not _mood_run_is_contained(context))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def mood_is_heard_on_this_request(context) -> bool:
+    """Does this request's reply carry the tone line? Every main-loop reply
+    to somebody: the owner (private or public surface), a channel member, a
+    probe (it must see what a real turn sees), a scheduled task's turn, the
+    wake-up of a job the owner started. NOT a sub-agent or self-play
+    (`sub-` / `sim-`), a bench or replay run, a coding leaf, a contained
+    copy, or code running outside any request."""
+    try:
+        from ..utils.logging import request_kind as _rk
+        if _mood_run_is_contained(context):
+            return False
+        kind = _rk()
+        if kind in ("owner", "member", "probe", "job"):
+            return True
+        return kind == "background" and str(request_id_context.get() or "").startswith("sched-")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: §4TC (review): refusals that are the system working as designed — a tool
+#: row carrying one of these reason codes is not "trouble" for the mood
+MOOD_BLIND_REASONS = frozenset({"untrusted_content", "owner_data_blocked", "owner_only"})
+
+
+def _mood_blind_row(m) -> bool:
+    """A tool row the mood does not look at: any `introspect` result, and a
+    designed refusal (`MOOD_BLIND_REASONS`)."""
+    if not isinstance(m, dict) or m.get("role") != "tool":
+        return False
+    if str(m.get("name") or "").strip() == "introspect":
+        return True
+    return str(getattr(m.get("content"), "reason_code", "") or "") in MOOD_BLIND_REASONS
+
+
+def _mood_tone_block(context) -> str:
+    """§4TC: the ONE line that makes the mood audible — a section of the
+    per-turn state block, after the cached head; never the system slot, never
+    a tool description. "" (zero bytes) for a neutral mood with no manner,
+    and for a run that does not hear it. The text depends on the label, the
+    intensity and the manner only (`selfhood.mood.tone_line`): no time, no
+    number of the pair, no cause."""
+    try:
+        if not mood_is_heard_on_this_request(context):
+            return ""
+        sm = _mood_model(context)
+        if sm is None:
+            return ""
+        line = sm.mood().tone()
+        return (line + "\n\n") if isinstance(line, str) and line else ""
+    except Exception:  # noqa: BLE001 — a state block never breaks a turn
         return ""
-    lines = []
-    for r in rows:
-        when = _defuse_rule_text(str(r.get("trigger") or r.get("task") or "").strip().rstrip("."))
-        rule = _defuse_rule_text(str(r.get("solution") or "").strip())[:300]
-        lines.append(f"- {when[:120]}: {rule}" if when else f"- {rule}")
-    return "### OWNER RULES (adopted by the owner — follow them whenever they apply)\n" + "\n".join(lines) + "\n\n"
 
 
 def _defuse_rule_text(text: str) -> str:
@@ -13287,8 +13382,6 @@ class GhostAgent:
         "manage-skills": "manage_skills",
         "managetasks": "manage_tasks",
         "manage-tasks": "manage_tasks",
-        "learnskill": "learn_skill",
-        "learn-skill": "learn_skill",
         "systemutility": "system_utility",
         "system-utility": "system_utility",
         "system": "system_utility",
@@ -13297,10 +13390,6 @@ class GhostAgent:
         "postgres": "lab",
         "postgresql": "lab",
         "psql": "lab",
-        "listlessons": "list_lessons",
-        "list-lessons": "list_lessons",
-        "whathaveyoulearned": "list_lessons",
-        "lessons": "list_lessons",
     }
 
     @classmethod
@@ -13327,6 +13416,8 @@ class GhostAgent:
         if name in available:
             return name
         normalised = re.sub(r'[^a-z0-9]', '', str(name).lower())
+        if normalised in _REMOVED_TOOL_NAMES:
+            return None
         # Normalised → canonical map of the actually-available tools.
         norm_to_real = {re.sub(r'[^a-z0-9]', '', t.lower()): t for t in available}
         # A REAL name wins over an alias. The alias table used to be
@@ -13369,7 +13460,6 @@ class GhostAgent:
         return MemoryBus(
             vector_memory=getattr(self.context, 'memory_system', None),
             graph_memory=getattr(self.context, 'graph_memory', None),
-            skill_memory=getattr(self.context, 'skill_memory', None),
             profile_memory=getattr(self.context, 'profile_memory', None),
             episodic_memory=getattr(self.context, 'episodic_memory', None),
             experience_memory=getattr(self.context, 'experience_memory', None),   # §4QL
@@ -13502,18 +13592,15 @@ class GhostAgent:
     # Per-phase cooldowns (in seconds) so the watchdog can't fire two REM
     # cycles or two self-play sessions back-to-back when the user remains AFK.
     _DREAM_COOLDOWN = 1800        # 30 min between dreams
-    # Skill-store hygiene (reconcile orphans + heal missing twins), phase 2.6b.
+    # Store hygiene (the temporary-document sweep; until §4TD also the lesson
+    # index's two passes), phase 2.6b.
     # Its OWN anchor, so it runs even when trajectory logging is off (§4Q Lens-B).
     _STORE_HYGIENE_COOLDOWN = 7200
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
-    _STALE_QUESTIONS_COOLDOWN = 7200  # 2 h between stale open-question surfacings (phase 2.8b)
     _MIRROR_TRY_COOLDOWN = 3600       # §4SV: 1 h between mirror attempts (the diary itself allows one row a day)
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
-    # §4LF (operator, 2026-10-04): the self-play slot (failure replay +
-    # regression suite, §4MW/§4NE) runs at most this often (env-tunable)
-    _SELFPLAY_COOLDOWN = _env_cooldown_s("GHOST_SELFPLAY_COOLDOWN_S", 14400)   # 4 h (was 60 min)
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
     # already prevents same-batch refire, but a journal write that
     # raises mid-loop (or a misbehaving consumer that fails to drain)
@@ -13566,7 +13653,7 @@ class GhostAgent:
             idle 1..10   ... forever
 
         so the (15, 60] band is never sampled at a tick boundary and EVERY
-        phase gated (900, 3600] — workspace-tidy, both narratives, stale-questions, autoadvance — is
+        phase gated (900, 3600] — workspace-tidy, both narratives, autoadvance — is
         structurally unreachable. The ablation silently
         measured dream + self-play ONLY, and reported the rest as "0 firings"
         as though that were a result.
@@ -13584,7 +13671,7 @@ class GhostAgent:
             f"--bio-time-scale {scale:g} compresses the idle window to "
             f"{width:.0f}s, which is NARROWER than a single phase's real "
             f"runtime (an LLM call is ~60s at any scale). Dream will consume "
-            f"the window and self-play will reset the idle clock, so "
+            f"the window, so "
             f"tidy / narratives / autoadvance "
             f"can NEVER fire — "
             f"they will silently report 0. Use a scale <= 20 "
@@ -13606,51 +13693,6 @@ class GhostAgent:
             pretty_log(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
             logger.debug("pretty_log suppressed in idle phase: %s", exc)
-
-    def _owner_active(self) -> bool:
-        """§4MS: a user request is being served (the idle tick checked this
-        only at its START, and a self-play tick ran up to 2,140 s)."""
-        _lc = getattr(self.context, "llm_client", None)
-        return (getattr(_lc, "foreground_requests", 0) or 0) > 0
-
-    async def _run_idle_job(self, coro, label: str, cap_s: float = IDLE_JOB_CAP_S):
-        """§4MS: run one idle job with a wall cap, and stop it the moment a
-        user request arrives. The former synthetic self-play had NO bound
-        and never re-checked for the owner: 19 owner turns started inside
-        one and waited a median 37 s for their first model call (12 s
-        clean). Returns the job's result, or None when it was stopped."""
-        task = asyncio.ensure_future(coro)
-        t0 = time.monotonic()
-        why = ""
-        # §4MT r2: WHY the last job stopped ("owner" / "cap" / "") — a seed's
-        # run cut by the cap every time must count against it, an owner stop
-        # must not, and both return None
-        self._last_idle_stop = ""
-        try:
-            while not task.done():
-                await asyncio.wait({task}, timeout=1.0)
-                if task.done():
-                    break
-                if self._owner_active():
-                    why = "a user request arrived"
-                    self._last_idle_stop = "owner"
-                    break
-                if time.monotonic() - t0 > cap_s:
-                    why = f"it passed its {int(cap_s)} s cap"
-                    self._last_idle_stop = "cap"
-                    break
-            if why:
-                task.cancel()
-                pretty_log("Idle Job", f"{label} stopped — {why}", level="WARNING", icon=Icons.STOP)
-                try:
-                    await asyncio.wait({task}, timeout=60.0)     # let its cleanup run, bounded
-                except Exception:  # noqa: BLE001
-                    pass
-                return None
-            return task.result()
-        finally:
-            if not task.done():
-                task.cancel()
 
     def _bio_roll(self, p: float) -> bool:
         """Probability gate for the idle phases. Returns True deterministically
@@ -13703,43 +13745,6 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001
             logger.debug("autonomous-activity record skipped: %s", e)
 
-    def start_supervised_self_play_slot(self) -> bool:
-        """§4MT: the operator's supervised run of the self-play slot. False when
-        one is already running. The idle tick's own anchor is moved so the
-        tick does not run the slot again right after."""
-        cur = getattr(self, "_supervised_slot", None) or {}
-        if cur.get("state") == "running" or getattr(self, "_self_play_slot_busy", False):
-            return False
-        self._supervised_slot = {"state": "running", "started": datetime.datetime.now().isoformat()}
-
-        async def _run():
-            ctx = self.context
-            self._self_play_slot_busy = True
-            self._last_slot_outcome = ""
-            outcome = "practice run finished"
-            try:
-                self._last_selfplay_at = datetime.datetime.now()
-                _sync_idle_anchors(self, ctx)
-                await self._self_play_slot_body(ctx)
-            except _SlotBusy:
-                outcome = "another self-play slot is running — nothing done"
-            except _ProofLegRan:
-                outcome = str(getattr(self, "_last_slot_outcome", "") or "ran one lesson-proof leg")
-            except _NoOwnerSeed:
-                outcome = "no unpractised owner failure — nothing to practise"
-            except Exception as e:  # noqa: BLE001
-                outcome = f"failed: {type(e).__name__}: {e}"
-                logger.warning("supervised self-play slot failed: %s", e, exc_info=True)
-            finally:
-                self._self_play_slot_busy = False
-                self._supervised_slot = {**self._supervised_slot, "state": "done",
-                                         "finished": datetime.datetime.now().isoformat(),
-                                         "outcome": outcome}
-                pretty_log("Replay Slot", outcome, icon=Icons.RETRY)
-        from ..utils.logging import spawn_bg as _spawn_bg
-        _spawn_bg(_run(), name="supervised-self-play-slot")
-        return True
-
     async def _mirror_phase(self, ctx, ran: list, notes: dict) -> None:
         """§4SV idle phase 2.8c: at most one try an hour, one diary row a day.
         Never raises (a failure is booked on the Idle Cycle line)."""
@@ -13777,47 +13782,39 @@ class GhostAgent:
 
     async def _owner_rule_note(self, body) -> str:
         """The state-block note for an owner's rule command, or "" (§4MX r3,
-        see `failure_replay.owner_rule_command`). Never raises."""
+        see `owner_rules.rule_command`). Never raises."""
         try:
             from ..utils.logging import request_kind as _rk
             if _rk() != "owner" or reply_is_public():
                 return ""
             msgs = body.get("messages") if isinstance(body, dict) else None
             last = next((m for m in reversed(msgs or []) if isinstance(m, dict) and m.get("role") == "user"), None)
-            text = _message_text(last.get("content")) if last else ""
+            text = _message_lines(last.get("content")) if last else ""
             from ..selfhood.mirror import is_mirror_command, mirror_banner, home_from_memory_dir
             if is_mirror_command(text):          # §4SV: the Mirror's diary, shown by the system
                 home = home_from_memory_dir(getattr(self.context, "memory_dir", None))
                 if home is None:
                     return ""
-                from .failure_replay import _rn
-                note = _rn("The system showed the owner the Mirror diary.",
-                          await asyncio.to_thread(mirror_banner, home))
+                from .owner_rules import _note as _rn
+                note = _rn(await asyncio.to_thread(mirror_banner, home))
                 pretty_log("Owner Command", _owner_command_line("mirror", text, note), icon=Icons.MIRROR)
                 return note
-            from .failure_replay import is_rule_command, owner_rule_command, rule_command_hint
-            from .regression import is_test_command, owner_test_command
-            if not (is_rule_command(text) or is_test_command(text)):
-                # §4PX: about the rules but no command — the model is told it cannot change them
-                hint = rule_command_hint(text)
+            # §4SZ: the owner's rules live in core/owner_rules.py
+            from .owner_rules import is_rule_command, rule_command, rule_command_hint
+            md = getattr(self.context, "memory_dir", None)
+            # (an empty path's parent is the working directory — review r2)
+            home = Path(md).parent if isinstance(md, (str, Path)) and str(md) else None
+            if home is None:
+                return ""
+            if not is_rule_command(text):
+                # about the rules but no command (or a "yes" to a forget preview) — the model is
+                # told nothing changed and which exact message does it
+                hint = await asyncio.to_thread(rule_command_hint, text, home)
                 if hint:
                     pretty_log("Owner Command", f"not a rule command: {text.strip()[:100]} → told the model "
                                f"the exact rule commands", icon=Icons.BRAIN_PLAN)
                 return hint
-            md = getattr(self.context, "memory_dir", None)
-            home = Path(md).parent if isinstance(md, (str, Path)) else None
-            if home is None:
-                return ""
-            if is_test_command(text):        # §4NE: the owner's regression tests
-                note = await asyncio.to_thread(owner_test_command, text, home)
-                if note:
-                    # §4NV: the OWNER's command, not the model-facing note text
-                    pretty_log("Owner Command", _owner_command_line("test", text, note),
-                               icon=Icons.BRAIN_PLAN)
-                return note
-            note = await asyncio.to_thread(owner_rule_command, text, home,
-                                           getattr(self.context, "skill_memory", None),
-                                           getattr(self.context, "memory_system", None))
+            note = await asyncio.to_thread(rule_command, text, home)
             if note:
                 pretty_log("Owner Command", _owner_command_line("rule", text, note),
                            icon=Icons.BRAIN_PLAN)
@@ -13825,78 +13822,6 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001 — a command must never break the turn
             logger.warning("owner rule command failed: %s", e)
             return ""
-
-    async def _self_play_slot_body(self, ctx) -> None:
-        # §4MW r1: one slot at a time — the idle tick and the operator's
-        # supervised run could advance the same replay case together
-        if getattr(self, "_slot_body_running", False):
-            raise _SlotBusy()
-        self._slot_body_running = True
-        try:
-            await self._self_play_slot_body_inner(ctx)
-        finally:
-            self._slot_body_running = False
-
-    async def _self_play_slot_body_inner(self, ctx) -> None:
-        """The self-play idle slot (§4MS/§4MW/§4NE): judge the owner's
-        reactions, then run ONE failure-replay stage (raises `_ProofLegRan`
-        when it did), else ONE regression-suite step (likewise); raises
-        `_NoOwnerSeed` when neither had work. Extracted from
-        `_biological_tick` (whose except/finally — heartbeats, the idle-clock
-        reset, the cooldown — stay there) so the operator's supervised run
-        (`POST /api/operator/self-play-slot`) executes the same code.
-        Synthetic practice (generated challenges, templates, the frontier)
-        was removed in §4NM: only the owner's real failures are practised."""
-        _seed_home = (Path(ctx.memory_dir).parent
-                      if isinstance(getattr(ctx, "memory_dir", None), (str, Path)) else None)
-        # §4MT T2: judge the owner's reactions first (cached; a
-        # bounded pass on the main slot, background priority)
-        try:
-            from .owner_seeds import judge_reactions as _judge_reactions
-            await self._run_idle_job(
-                _judge_reactions(getattr(ctx, "trajectory_collector", None), _seed_home,
-                                 getattr(ctx, "llm_client", None),
-                                 getattr(ctx.args, 'model', 'default')),
-                "reaction judge")
-        except Exception as _rje:
-            logger.warning("reaction judge pass skipped: %s", _rje)
-        # §4PM: the same judge on NO-TOOL turns, cached apart (census only —
-        # the failure-replay seeds read the tool-turn cache, unchanged); not
-        # when the owner just stopped the first pass
-        if getattr(self, "_last_idle_stop", "") != "owner":
-            try:
-                from .owner_seeds import judge_reactions as _judge_reactions_nt, NOTOOL_CAP_PER_PASS as _nt_cap
-                await self._run_idle_job(
-                    _judge_reactions_nt(getattr(ctx, "trajectory_collector", None), _seed_home,
-                                        getattr(ctx, "llm_client", None),
-                                        getattr(ctx.args, 'model', 'default'), no_tool=True, cap=_nt_cap),
-                    "reaction judge (no-tool)")
-            except Exception as _rje2:
-                logger.warning("reaction judge (no-tool) pass skipped: %s", _rje2)
-        # §4MW: the owner's real failures are REPLAYED — one stage per slot
-        from .failure_replay import advance_one as _replay_step
-        _rs = await self._run_idle_job(_replay_step(self, ctx, _seed_home), "failure replay")
-        if _rs is None and getattr(self, "_last_idle_stop", "") == "owner":
-            # §4MW r2: an owner stop is not the stage's failure — give its try back
-            from .failure_replay import refund_try as _refund_try
-            await asyncio.to_thread(_refund_try, _seed_home)
-            raise _ProofLegRan()
-        if _rs:
-            self._record_autonomous_activity("self_play", _rs[:200])
-            self._last_slot_outcome = _rs          # the supervised run reports the stage
-            raise _ProofLegRan()
-        # §4NE: the owner's regression suite — draft a proposal from the
-        # owner's evidence, redraft an edited test, or run the due tests
-        from .regression import advance as _regression_step
-        _rg = await self._run_idle_job(_regression_step(self, ctx, _seed_home), "regression")
-        if _rg is None and getattr(self, "_last_idle_stop", "") == "owner":
-            from .regression import owner_stopped as _rg_owner_stopped
-            await asyncio.to_thread(_rg_owner_stopped, _seed_home)   # §4NE r2: not the test's fault
-            raise _ProofLegRan()
-        if _rg:
-            self._last_slot_outcome = _rg
-            raise _ProofLegRan()
-        raise _NoOwnerSeed()
 
     async def _biological_tick(self):
         """One pass of the biological hook state machine. Extracted from the
@@ -14022,20 +13947,12 @@ class GhostAgent:
             self._last_narrative_at = datetime.datetime.min
         if not hasattr(self, '_last_workspace_narrative_at'):
             self._last_workspace_narrative_at = datetime.datetime.min
-        if not hasattr(self, '_last_stale_questions_at'):
-            self._last_stale_questions_at = datetime.datetime.min
         if not hasattr(self, '_last_mirror_try_at'):
             self._last_mirror_try_at = datetime.datetime.min
         if not hasattr(self, '_last_workspace_tidy_at'):
             self._last_workspace_tidy_at = datetime.datetime.min
         if not hasattr(self, '_last_autoadvance_at'):
             self._last_autoadvance_at = datetime.datetime.min
-        if not hasattr(self, '_last_selfplay_at'):
-            self._last_selfplay_at = datetime.datetime.min
-        # The self-play slot's cooldown. (§4NM: the frontier-driven adaptive
-        # cooldown left with synthetic self-play; this is the static value.)
-        if not hasattr(self, '_current_selfplay_cooldown'):
-            self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
         # §4LD: the cooldown anchors survive a restart (50 boots in a week:
         # 37/73 postmortem and router runs and 32/93 skills-auto runs fell
         # inside their cooldown — empty re-runs)
@@ -14043,7 +13960,7 @@ class GhostAgent:
 
         # §4LF: the phases' idle WINDOW reads the later of the user clock and
         # the window's own roll (`_idle_window_at`) — the roll never touches
-        # the user clock, which bench, the drain and replay read
+        # the user clock, which the drain reads
         idle_secs = (datetime.datetime.now()
                      - max(ctx.last_activity_time,
                            getattr(self, "_idle_window_at", datetime.datetime.min))).total_seconds()
@@ -14055,7 +13972,6 @@ class GhostAgent:
         # answerable from the log. Frequent all-cooldown ticks stay silent
         # (nothing appends → no summary).
         _idle_ran: list = []
-        _slot_note = ""   # §4NN: the failure-replay slot's outcome, for the cycle line
         _idle_notes: dict = {}   # §4PQ: each job's outcome, for the cycle line
 
         # Phase 1: Process Short-Term Journal (>120s idle)
@@ -14205,86 +14121,42 @@ class GhostAgent:
                             # prevents a refire.
                             self._last_dream_at = datetime.datetime.now()
 
-        # Phase 2.6b: Skill-store hygiene — reconcile orphans + heal missing
-        # twins. Promoted from a RIDER inside the (since removed) skills-auto
-        # phase 2.6 to a phase of its own (§4Q Lens-B, 2026-08-08) for two
-        # independent reasons:
-        #
-        #   1. It was nested under that phase's `traj_collector is not None`
-        #      gate, but neither call touches the trajectory corpus — they read
-        #      ctx.skill_memory + ctx.memory_system. Under --no-trajectories
-        #      (a supported ablation) BOTH the orphan reconcile and the §4M
-        #      heal were dead for the whole process lifetime, so lessons whose
-        #      vector twin went missing stayed dark to retrieval forever.
-        #   2. Both calls shared ONE try whose handler logged at DEBUG. The
-        #      call site claimed "never raises", which is false:
-        #      `reconcile_vector_orphans` calls `_load_playbook` outside any
-        #      try, and that deliberately RE-RAISES OSError (fail-loud policy).
-        #      So one unreadable playbook (EIO/EACCES — this project has a live
-        #      root-owned-file failure class) propagated out of reconcile and
-        #      skipped the heal entirely, with the only trace a debug line that
-        #      does not even mention healing.
-        #
-        # Now: independent try per call, WARNING not debug, its own cooldown
-        # anchor so it cannot be starved by (or starve) another phase.
+        # Phase 2.6b: store hygiene. Until §4TD this was the lesson index's
+        # orphan reconcile and twin heal (a phase of its own since §4Q Lens-B,
+        # 2026-08-08, so it ran without the trajectory corpus) plus the §4PP
+        # sweep; the lesson store is removed and the sweep is what is left.
+        # Its own cooldown anchor, so it cannot be starved by (or starve)
+        # another phase.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_hygiene = (datetime.datetime.now()
                                   - self._last_store_hygiene_at).total_seconds()
             if since_last_hygiene >= self._bio_cooldown(self._STORE_HYGIENE_COOLDOWN):
-                _sk = getattr(ctx, "skill_memory", None)
                 _ms = getattr(ctx, "memory_system", None)
-                if _sk is not None:
+                if _ms is not None:
                     _idle_ran.append("store-hygiene")
                     self._last_store_hygiene_at = datetime.datetime.now()
-                    _hy_orph = _hy_healed = 0
                     _hy_failed: list = []
                     _tds = {"removed": [], "marked": []}
-                    try:
-                        # Drop vector skill entries whose JSON playbook twin is
-                        # gone: an orphan wins the vector-dedup race and vetoes
-                        # every future re-learn of that lesson (2026-07-29 audit).
-                        if hasattr(_sk, "reconcile_vector_orphans"):
-                            _hy_orph = await asyncio.to_thread(
-                                _sk.reconcile_vector_orphans, _ms)
-                    except Exception as e:
-                        _hy_failed.append("orphan check")
-                        logger.warning("skill-store orphan reconcile FAILED "
-                                       "(heal still runs): %s", e)
-                    try:
-                        # §4M CRIT-1 heal: the inverse pass — re-embed playbook
-                        # lessons whose vector twin is missing (weeks of
-                        # task-first orphan deletes left 36/50 lessons dark).
-                        # Idempotent, and deliberately in its OWN try so a
-                        # reconcile failure can never suppress this recovery.
-                        if hasattr(_sk, "heal_missing_twins"):
-                            _hy_healed = await asyncio.to_thread(
-                                _sk.heal_missing_twins, _ms)
-                    except Exception as e:
-                        _hy_failed.append("re-index")
-                        logger.warning("skill-twin heal FAILED: %s", e)
-                    finally:
-                        self._last_store_hygiene_at = datetime.datetime.now()
                     # §4PP: temporary knowledge-base documents (summarised
-                    # videos' transcripts) past their expiry are removed;
-                    # its own try, like the two passes above
+                    # videos' transcripts) past their expiry are removed
                     try:
-                        if _ms is not None:
-                            from ..memory import temp_documents as _TD
-                            _tds = await asyncio.to_thread(_TD.sweep, _ms)
-                            if _tds["removed"] or _tds["marked"]:
-                                pretty_log(
-                                    "Temporary Docs",
-                                    (f"removed {len(_tds['removed'])} expired: {', '.join(_tds['removed'][:5])}"
-                                     if _tds["removed"] else "")
-                                    + ("; " if _tds["removed"] and _tds["marked"] else "")
-                                    + (f"marked {len(_tds['marked'])} video transcript(s) temporary"
-                                       if _tds["marked"] else ""),
-                                    icon=Icons.MEM_LIBRARY)
+                        from ..memory import temp_documents as _TD
+                        _tds = await asyncio.to_thread(_TD.sweep, _ms)
+                        if _tds["removed"] or _tds["marked"]:
+                            pretty_log(
+                                "Temporary Docs",
+                                (f"removed {len(_tds['removed'])} expired: {', '.join(_tds['removed'][:5])}"
+                                 if _tds["removed"] else "")
+                                + ("; " if _tds["removed"] and _tds["marked"] else "")
+                                + (f"marked {len(_tds['marked'])} video transcript(s) temporary"
+                                   if _tds["marked"] else ""),
+                                icon=Icons.MEM_LIBRARY)
                     except Exception as e:
                         _hy_failed.append("transcript sweep")
                         logger.warning("temporary-document sweep FAILED: %s", e)
-                    _idle_notes["store-hygiene"] = _store_hygiene_note(
-                        _hy_orph, _hy_healed, _tds, _hy_failed)
+                    finally:
+                        self._last_store_hygiene_at = datetime.datetime.now()
+                    _idle_notes["store-hygiene"] = _store_hygiene_note(_tds, _hy_failed)
 
 
         # Phase 2.7d: Recurring workspace tidy (2026-07-18). The DONE
@@ -14502,27 +14374,10 @@ class GhostAgent:
                 self_model = getattr(ctx, 'self_model', None)
                 if self_model is not None and getattr(self_model, 'enabled', False):
                     self._last_narrative_at = datetime.datetime.now()
-                    # Meta-cognitive narrative (proposal item #4): fold the
-                    # learning phases' output into the diary. Recent
-                    # mistakes from SkillMemory are the convergence point —
-                    # both dream-extracted heuristics and reflection-phase
-                    # failure patterns land there — so the regenerated
-                    # narrative reflects what the agent has LEARNED about
-                    # itself, not merely what it did.
-                    meta_insights = ""
+                    # (§4TD: the diary no longer folds in "recent mistakes"
+                    # from the lesson store — that store is removed.)
                     try:
-                        _sm_narr = getattr(ctx, 'skill_memory', None)
-                        if _sm_narr is not None:
-                            _recent_fail = _sm_narr.get_recent_failures(limit=5)
-                            if _recent_fail and "No recent failures" not in _recent_fail \
-                                    and "Failed to load" not in _recent_fail:
-                                meta_insights = _recent_fail
-                    except Exception as e:
-                        logger.debug(f"meta-insight gather skipped: {e}")
-                    try:
-                        text = await self_model.consolidate_narrative(
-                            meta_insights=meta_insights,
-                        )
+                        text = await self_model.consolidate_narrative()
                         if text:
                             _idle_ran.append("selfhood-narrative")   # §4CB R1 A-F4; §4MI: not on the unchanged-key skip
                             _idle_notes["selfhood-narrative"] = f"rewritten ({len(text)} chars)"
@@ -14540,35 +14395,9 @@ class GhostAgent:
                     finally:
                         self._last_narrative_at = datetime.datetime.now()
 
-        # Phase 2.8b: Surface STALE open questions (previously unwired). Every
-        # few hours, pull self-questions the agent has carried unresolved past
-        # `max_age_days` and log them so they can be re-engaged instead of
-        # silently accreting. Same idle window + cooldown discipline.
-        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
-            since_last_sq = (datetime.datetime.now() - self._last_stale_questions_at).total_seconds()
-            if since_last_sq >= self._bio_cooldown(self._STALE_QUESTIONS_COOLDOWN):
-                _sm = getattr(ctx, 'self_model', None)
-                if _sm is not None and getattr(_sm, 'enabled', False):
-                    self._last_stale_questions_at = datetime.datetime.now()
-                    try:
-                        stale = _sm.stale_open_questions(max_age_days=3.0)
-                        if stale:
-                            _idle_ran.append("stale-questions")   # §4CB R1 A-F4; §4MI: only when any
-                            _idle_notes["stale-questions"] = f"{len(stale)} found"
-                            preview = "; ".join(getattr(q, "text", str(q))[:60] for q in stale[:3])
-                            pretty_log(
-                                "Selfhood",
-                                f"{len(stale)} stale open question(s) carried >3d — re-engage: {preview}",
-                                icon=Icons.SELF_STATE,
-                            )
-                            self._record_autonomous_activity(
-                                "open_questions",
-                                f"{len(stale)} open question(s) carried "
-                                f">3 days: {preview}")
-                    except Exception as e:
-                        _idle_phase_failed(self, _idle_ran, "stale-questions", e)
-                    finally:
-                        self._last_stale_questions_at = datetime.datetime.now()
+        # (Phase 2.8b — the stale open-questions listing — is removed, §4TB
+        # 2026-11-05: open questions went with the `self_state` tool, their
+        # only writer.)
 
         # Phase 2.8c (§4SV): the Mirror — a toy strange loop. Once a day the
         # main model rewrites the agent's one-sentence self-description from
@@ -14623,116 +14452,28 @@ class GhostAgent:
                 finally:
                     self._last_workspace_narrative_at = datetime.datetime.now()
 
-        # §4LF: the idle WINDOW rolls over without self-play. Its finally (below)
-        # was the only idle-time writer of the clock, so a long self-play
-        # cooldown left idle_secs past 3600 for a whole away stretch and
-        # silently stopped calibration, the narratives and autoadvance. When
-        # the slot cannot run this tick (in its cooldown), roll the window
-        # here. The roll moves only the WINDOW anchor (read above), never the
-        # user clock: the replay reads `last_activity_time`.
-        if idle_secs > self._bio_scaled(3600) and (
-                (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
-                < self._bio_cooldown(self._current_selfplay_cooldown)):
+        # §4LF / §4SZ: the idle WINDOW rolls over every hour of quiet. The 10–60
+        # min jobs above are gated by `idle_secs <= 3600`; without a roll, a long
+        # away stretch leaves idle_secs past 3600 and silently stops the
+        # narratives, the tidy and autoadvance. The roll moves only the WINDOW
+        # anchor (read above), NEVER the user clock (`last_activity_time`).
+        # (Until §4SZ the failure-replay slot lived here: when it ran, its
+        # finally reset the user clock itself, and this roll covered only the
+        # slot's 4 h cooldown. The slot is gone — it had found nothing to
+        # replay for 17 days — so the roll is unconditional and no idle phase
+        # writes the user clock any more.)
+        if idle_secs > self._bio_scaled(3600):
             self._idle_window_at = datetime.datetime.now()
-            # §4NV: nothing RAN — the line read "ran idle-window". It is still
-            # the deep-idle liveness line (~hourly on a quiet night), so it
-            # stays, saying what happened.
-            # §4PQ: say WHY the window restarts and what that lets run
-            _fr_ago = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
-            _fr_next = max(0.0, self._bio_cooldown(self._current_selfplay_cooldown) - _fr_ago)
+            # §4NV: nothing RAN — it is the deep-idle liveness line (~hourly
+            # on a quiet night), saying what happened and what it lets run
             self._safe_pretty_log(
                 "Idle Cycle",
                 # the real time since the last request (idle_secs is the
                 # WINDOW's age — it reads ~60m after hours away)
-                # (r1 n13: the replay's finally resets that clock too, so it
-                # is "quiet for", not "no request for")
-                f"quiet for {(datetime.datetime.now() - ctx.last_activity_time).total_seconds() / 60.0:.0f}m — "
-                f"the failure-replay slot last ran {_fr_ago / 60.0:.0f}m ago and waits ~{_fr_next / 60.0:.0f}m more, "
-                "so the idle window restarted: maintenance, store hygiene, tidy and the "
+                f"no request for {(datetime.datetime.now() - ctx.last_activity_time).total_seconds() / 60.0:.0f}m — "
+                "the idle window restarted: maintenance, store hygiene, tidy and the "
                 "other 10–60 min jobs can run again as their own cooldowns allow",
                 icon=Icons.ACTIVITY)
-
-        # Phase 3: the self-play slot (>60 min idle) — the owner's failure
-        # replay (§4MW) and regression suite (§4NE). Synthetic self-play was
-        # removed in §4NM.
-        if idle_secs > self._bio_scaled(3600):
-            since_last_selfplay = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
-            # Split the old combined `cooldown and dice` so each outcome is
-            # DISTINGUISHABLE in the log — this was the flagged blind spot:
-            # "self-play never fired" was indistinguishable from a crash, a lost
-            # dice roll, or "not idle enough".
-            if since_last_selfplay < self._bio_cooldown(self._current_selfplay_cooldown):
-                logger.debug("idle failure-replay slot: skip — cooldown %d/%ds",
-                             int(since_last_selfplay),
-                             int(self._current_selfplay_cooldown))
-            elif not self._bio_roll(0.2):
-                # Eligible (idle >60m, cooldown elapsed) but lost the 20% roll.
-                logger.debug(
-                    "idle failure-replay slot: eligible, skipped this tick (%s roll missed)", "20%")
-            else:
-                _idle_ran.append("failure-replay")
-                # C3: anchor `_last_selfplay_at` in a try/finally so a
-                # slot exception doesn't leave the
-                # cooldown un-reset. Previously, an exception skipped
-                # the assignment and the biological hook would refire
-                # the failing self-play on every tick until the 60-min
-                # window elapsed on its own. Advance the anchor BEFORE
-                # the await so even a ctrl-C / timeout mid-flight gets
-                # caught by the cooldown next tick.
-                # §4CB R1 A-F2: anchor hoisted ABOVE the preamble and the
-                # preamble moved INSIDE the try (same starvation identity
-                # as phase 2 — a raising pretty_log between the eligibility
-                # claim and the try escaped with the cooldown unadvanced;
-                # here the finally now also guarantees the LOAD-BEARING
-                # idle-clock reset runs even on a preamble raise).
-                self._last_selfplay_at = datetime.datetime.now()
-                # §4MS: on DISK now — the file was written only at the next
-                # tick, so a restart mid-phase lost the anchor and the phase
-                # re-ran inside its cooldown (self-play 85 min after a 4 h one)
-                _sync_idle_anchors(self, ctx)
-                self._last_slot_outcome = ""
-                try:
-                    await self._self_play_slot_body(ctx)
-                except _ProofLegRan:
-                    # §4NN: the cycle line reports WHAT the slot did
-                    _slot_note = (" ".join(str(getattr(self, "_last_slot_outcome", "")
-                                               or "").split())[:120]
-                                  or ("stopped — the owner returned"
-                                      if getattr(self, "_last_idle_stop", "") == "owner"
-                                      else "one stage ran"))
-                except _SlotBusy:
-                    _slot_note = "skipped — a supervised run holds the slot"
-                except _NoOwnerSeed:
-                    # a heartbeat: "ran and correctly declined" — without it
-                    # the EXPECT_PERIODIC liveness view reads DEAD (r1 M4)
-                    self._record_idle_attempt("self_play", "declined")
-                    _slot_note = "nothing to do (no owner failure to replay, no test due)"
-                    logger.debug("Self-play: no owner failure to replay and no test due — not running")
-                except Exception as _spe:
-                    # NAME self-play in the log (the tick handler's catch-all
-                    # otherwise attributes the crash to "the tick"), then
-                    # RE-RAISE — self-play is the last phase and deliberately
-                    # propagates to the tick handler, with the cooldown anchor
-                    # still moved by the finally below. Contract pinned by
-                    # test_anchor_updates_even_when_self_play_raises (C3).
-                    logger.warning("Self-play phase failed: %s: %s",
-                                   type(_spe).__name__, _spe)
-                    raise
-                finally:
-                    # ⚠ LOAD-BEARING — DO NOT "CLEAN UP" (§4Q Lens-A/C).
-                    # Every other phase carries a "do NOT reset
-                    # last_activity_time" warning, so this line reads like the
-                    # exact anti-pattern they forbid. It is the opposite: this
-                    # is the ONLY idle-time writer of the user-idle clock, and
-                    # resetting it here is what RE-OPENS the (900, 3600] window
-                    # for phases 2–2.9. Remove it and, during a long AFK
-                    # stretch, idle_secs climbs past 3600 forever: every
-                    # mid-phase (tidy, narratives, autoadvance)
-                    # is gated out by its `<= 3600` ceiling and only phase 1
-                    # survives. (§4LF: when the slot is cooling down, the
-                    # "idle-window" roll above does this instead.)
-                    ctx.last_activity_time = datetime.datetime.now()
-                    self._last_selfplay_at = datetime.datetime.now()
 
         # One durable summary per idle cycle that actually did work (phase-1
         # journal returns early above and logs itself). Reconstructs the loop:
@@ -14740,10 +14481,6 @@ class GhostAgent:
         if _idle_ran:
             logger.info("idle cycle: ran %s (idle %.0fm since last activity)",
                         ", ".join(_idle_ran), idle_secs / 60.0)
-            # §4NN: the console line carries the failure-replay slot's RESULT
-            # (it only said "ran self-play" — ran what, with what outcome?)
-            if _slot_note:
-                _idle_notes["failure-replay"] = _slot_note
             # §LOG-6a (2026-08-20): the summary above is logger.info →
             # FILE-ONLY, so the watched console had NO liveness signal
             # during deep idle — a wedged event loop and a healthy quiet
@@ -15550,7 +15287,6 @@ class GhostAgent:
     #   * profile context string         (was: thread-call per turn)
     #   * active tool definitions        (was: re-filtered per turn)
     #   * tool XML schema                 (was: re-serialised per turn)
-    #   * skill playbook (per-query)     (was: thread-call per turn)
     #   * sandbox state                  (was: re-listed per turn)
     #
     # Mutating tools call `state.invalidate(...)` to drop the relevant
@@ -15561,7 +15297,7 @@ class GhostAgent:
             "_agent_ref", "_profile_str", "_profile_loaded",
             "_active_tool_defs_cache", "_active_tool_defs_resolved",
             "_xml_schema_cache",
-            "_skill_playbook_cache", "_sandbox_state",
+            "_sandbox_state",
             "_stable_tool_query", "_edit_churn",
         )
 
@@ -15577,7 +15313,6 @@ class GhostAgent:
             self._active_tool_defs_cache: Dict[str, list] = {}
             self._active_tool_defs_resolved = None
             self._xml_schema_cache: Dict[str, str] = {}
-            self._skill_playbook_cache: Dict[str, str] = {}
             self._sandbox_state = None
             # #7: the acquired-skill semantic router filters the advertised
             # tool set by query. Feeding it the PER-TURN query (which becomes
@@ -15651,26 +15386,6 @@ class GhostAgent:
             self._xml_schema_cache[key] = xml
             return xml
 
-        async def get_skill_playbook(self, query: str) -> str:
-            sm = getattr(self._agent_ref.context, "skill_memory", None)
-            if sm is None:
-                return ""
-            key = query or ""
-            cached = self._skill_playbook_cache.get(key)
-            if cached is not None:
-                return cached
-            try:
-                playbook = await asyncio.to_thread(
-                    sm.get_playbook_context,
-                    query=key,
-                    memory_system=getattr(self._agent_ref.context, "memory_system", None),
-                )
-            except Exception:
-                playbook = ""
-            playbook = playbook or ""
-            self._skill_playbook_cache[key] = playbook
-            return playbook
-
         async def get_sandbox_state(self):
             if self._sandbox_state is not None:
                 return self._sandbox_state
@@ -15690,9 +15405,6 @@ class GhostAgent:
 
         def invalidate_sandbox(self):
             self._sandbox_state = None
-
-        def invalidate_skill_playbook(self):
-            self._skill_playbook_cache.clear()
 
         def invalidate_tool_defs(self):
             """Drop the cached tool schema list so the next LLM call
@@ -18329,7 +18041,7 @@ class GhostAgent:
 
         Extracted from the post-loop verifier gate so the same verdict can
         drive (a) the in-loop AUTO-REPAIR decision at finalisation and
-        (b) the post-loop gate's auditor-note / backfill / lesson-retraction
+        (b) the post-loop gate's auditor-note / backfill
         consumption, computed exactly once per final answer (the gate
         reuses the cached in-loop result). Returns
         ``(v_result_or_None, last_tool_or_None)``. Side effects (note,
@@ -18617,8 +18329,7 @@ class GhostAgent:
         # rate it exists to measure (§4J: self-play was writing the production
         # calibration corpus). Withholding the identity is what suppresses the
         # row — `verifier.record_escalation` requires a live-turn req_id.
-        _is_sim = getattr(getattr(self.context, "skill_memory", None),
-                          "is_read_only", False) is True
+        _is_sim = is_simulated_context(self.context)
         _trace = None if _is_sim else {
             "req_id": str(req_id or ""),
             "trajectory_id": str(trajectory_id or ""),
@@ -19087,7 +18798,7 @@ class GhostAgent:
                     # ⚠ …but only merge into a refute that ALREADY carries
                     # weight. `max(conf)` on a 0.55 text refute would stamp it
                     # 0.9 — pushing a verdict that no gate would have acted on
-                    # across the repair, backfill and lesson-scrub thresholds,
+                    # across the repair and backfill thresholds,
                     # carrying its own issues while the grounded evidence is
                     # what gets truncated away. Below the gate, replace.
                     if (v_result is not None
@@ -19745,7 +19456,7 @@ class GhostAgent:
         ``_render_volatile_block`` and opens with "not from the user, this
         request is still pending" — see that function for the live failure
         (req 2422eb25) a lone trailing user-role block produced. The per-turn injection has two parts:
-        a large STABLE block (tool schemas + persona + playbook + hydrated
+        a large STABLE block (tool schemas + persona + hydrated
         memory + continuity — byte-identical across the turns of one
         request) and a small VOLATILE ``dynamic_state`` (timestamp /
         sandbox state / plan focus — changes every turn).
@@ -19895,9 +19606,8 @@ class GhostAgent:
     def _critic_async_enabled(self) -> bool:
         """When ``GHOST_CRITIC_ASYNC=1`` the verifier never sits on the
         critical path: the in-loop repair-before-ship is skipped and the
-        verdict runs purely AFTER the response ships — it logs, scrubs any
-        poisoned lesson the turn wrote, and (on a high-confidence REFUTED)
-        queues a correction surfaced at the top of the NEXT turn. Trades
+        verdict runs purely AFTER the response ships — it logs and (on a
+        high-confidence REFUTED) queues a correction surfaced at the top of the NEXT turn. Trades
         before-ship repair of the rare wrong answer for not paying the
         slow, off-host verdict latency on every turn.
         """
@@ -19993,8 +19703,7 @@ class GhostAgent:
 
         Reverting is one env var — ``GHOST_CRITIC_REPAIR_BUDGET=25`` — and
         the fallback if the latency reads badly in practice: a late refute
-        still scrubs its poisoned lessons, still queues the next-turn
-        correction banner, and since 2026-08-21 still reaches the corpus AND
+        still queues the next-turn correction banner, and since 2026-08-21 still reaches the corpus AND
         the diary (§4CD), so the pre-2026-08-22 behaviour is a correction one
         turn later, not a lost one."""
         if not self._critic_async_enabled():
@@ -20103,10 +19812,10 @@ class GhostAgent:
         and the gate waits at most ``_critic_gate_timeout()`` seconds:
 
         * verdict lands in time → drives the response exactly as the old
-          inline gate did (note / backfill / lesson-retraction);
+          inline gate did (note / backfill);
         * verdict misses the budget → the response ships unverified (the
           existing ``v_result is None`` path) and the verdict finishes in
-          the background, still scrubbing any poisoned lesson THIS turn
+          the background, still booking the outcome of THIS turn
           produced (the safety-critical side effect) via a done-callback.
 
         With no critic pool the timeout is ``inf`` and this degrades to a
@@ -20118,7 +19827,7 @@ class GhostAgent:
         last_tool = _act_tool or _ev_tool
 
         # --no-verifier ablation off-switch: skip the post-response verifier
-        # entirely (no verdict computed, no lesson scrubbing, no backfill). The
+        # entirely (no verdict computed, no backfill). The
         # response ships exactly as the "verdict missed the budget" path already
         # handles (v_result is None). Lets the ablation harness measure whether
         # the late verifier's cost earns its (cross-session-only) keep.
@@ -20383,11 +20092,11 @@ class GhostAgent:
 
         The response can't be amended at this point, so the auditor note
         and confidence backfill are forgone (logged for the operator).
-        The one effect that must still happen is lesson retraction: a
-        high-confidence REFUTED means any lesson THIS turn wrote is
-        suspect, and the next user query must not retrieve it. Retraction
-        is keyed by ``trajectory_id`` and idempotent, so running it a beat
-        late is safe. ``conv_fp`` tags any queued correction with the
+        What still happens: the outcome is booked on the trajectory (keyed
+        by ``trajectory_id``) and a high-confidence REFUTED queues the
+        next-turn correction. (§4TD: the lesson retraction that was the
+        first of these effects is removed with the lesson store.)
+        ``conv_fp`` tags any queued correction with the
         conversation it belongs to, so it only surfaces back there.
 
         ``force_correction``: queue the next-turn correction banner on a
@@ -20420,8 +20129,8 @@ class GhostAgent:
                 # This used to be a bare silent return — which hid the fact
                 # that the async verdict NEVER completed in production (the
                 # live log had 5 "verdict deferred" lines and 0 "LATE …"
-                # lines): every safety side effect downstream (lesson scrub,
-                # correction banner, corpus backfill) was dead without a
+                # lines): every safety side effect downstream (the
+                # correction banner, the corpus backfill) was dead without a
                 # trace. A dying verdict task must be loud.
                 pretty_log(
                     "Verifier",
@@ -20522,31 +20231,18 @@ class GhostAgent:
             # THE VERDICT BEAT THE RECORD (2026-09-13). A tool-free turn's
             # verdict branch has no await, so the verdict task completes on
             # the next loop tick and this callback ran at finalize's next
-            # yield — BEFORE `_record_turn_trajectory` wrote the row and
-            # before `_record_lesson_outcomes` wrote the lesson stash. The
-            # cache miss then skipped the calibration re-label and the
-            # lesson flush found nothing to drain; the stash written moments
-            # later was never consumed. Measured: 47 of 121 human-labelled
-            # turns were zero-tool. Defer to the record: the trajectory
-            # write replays this call with the row in the cache. A miss on
-            # a trajectory that is NOT in flight is a genuine eviction and
-            # keeps the immediate path.
+            # yield — BEFORE `_record_turn_trajectory` wrote the row. The
+            # cache miss then skipped the re-label. Measured: 47 of 121
+            # human-labelled turns were zero-tool. Defer to the record: the
+            # trajectory write replays this call with the row in the cache.
+            # A miss on a trajectory that is NOT in flight is a genuine
+            # eviction and keeps the immediate path.
             if cached is None and _trajectory_is_in_flight(self.context, trajectory_id):
-                # The lesson arm gets its sign NOW, exactly as the pre-fix
-                # cache-miss path did (flush before the PASSED guard, raw
-                # sign — `_late_pass_ok` is True on a miss): a stash that
-                # already exists drains, a missing one parks the sign. The
-                # replay's own flush then finds the same sign in the retained
-                # ring and books nothing twice. Without this, a record that
-                # raises or is skipped after the deferral (streamed reply
-                # with no treated text) would leave the stash undrained.
-                self._flush_stashed_lesson_outcome(
-                    trajectory_id, outcome == _Outcome.PASSED.value)
                 _defer_late_backfill(self.context, trajectory_id, outcome, reason)
                 return
             # HUMAN LABEL WINS (2026-08-13, /api/feedback). An explicit
-            # human thumb on this turn already resolved the outcome, flushed
-            # the lesson stash with it, and wrote the sidecar; the sidecar is
+            # human thumb on this turn already resolved the outcome
+            # and wrote the sidecar; the sidecar is
             # last-write-wins per id, so letting this late machine verdict
             # append AFTER the label would silently invert the authority
             # order the user-correction path established. Yield entirely —
@@ -20575,13 +20271,9 @@ class GhostAgent:
                 resolve_turn_outcome as _resolve_late,
                 unacknowledged_total_failure_for_trajectory as _unacked_late,
             )
-            # Decided BEFORE the flush below but WITHOUT returning early —
-            # the cache-miss return must stay after it (see the flush's own
-            # comment; moving it earlier silently re-opened the 2026-07-26
-            # lost-success-tick bug, which its regression test caught).
             # A cache miss leaves this True: the shape rule cannot be
-            # evaluated without the record, and the pre-2026-08-04 behaviour
-            # was to tick the lesson success.
+            # evaluated without the record (the PASSED branch below returns
+            # on a miss).
             _late_pass_ok = True
             if outcome == _Outcome.PASSED.value and cached is not None:
                 _late_pass_ok = _resolve_late(
@@ -20590,20 +20282,8 @@ class GhostAgent:
                     verifier="passed",
                     unacked_total_failure=_unacked_late(cached),
                 ) == _Outcome.PASSED.value
-            # Outcome-gated lesson feedback: drain any surfaced-trigger set
-            # stashed for this turn at finalize (async-critic mode), now that
-            # the verdict has landed. No-op when the turn recorded inline.
-            # MUST run BEFORE the PASSED direction guard below: that guard
-            # protects the CORPUS from outcome upgrades, but a PASSED verdict
-            # whose trajectory was cache-evicted / unfingerprintable /
-            # heuristic-promoted returned early here and the stashed lesson
-            # success-tick was silently lost — FAILED verdicts always got
-            # through, so succeeded_retrievals systematically undercounted.
-            # It books the RESOLVED outcome, not the raw verdict: a PASS the
-            # shape rule withheld must not still tick the lesson as a success.
-            self._flush_stashed_lesson_outcome(
-                trajectory_id,
-                outcome == _Outcome.PASSED.value and _late_pass_ok)
+            # (§4TD: the lesson-outcome credit that ran here is removed with
+            # the lesson store.)
             if outcome == _Outcome.PASSED.value:
                 if cached is None:
                     return
@@ -20676,7 +20356,7 @@ class GhostAgent:
                         "late %s for trajectory %s was withheld by a "
                         "standing authoritative label (human, or the bench "
                         "oracle on bench turns) AFTER its side effects ran "
-                        "— any lesson retraction/follow-up tasks from this "
+                        "— any follow-up tasks from this "
                         "verdict stand",
                         outcome, str(trajectory_id)[:8])
                     return
@@ -20782,234 +20462,10 @@ class GhostAgent:
                 type(e).__name__, e,
             )
 
-    # Bounded map trajectory_id -> surfaced lesson triggers, for turns whose
-    # verdict is still pending at finalize (async-critic mode is production).
-    # The late verdict (_backfill_trajectory_outcome) drains it. Bounded so a
-    # stream of never-verdicted turns can't grow it without limit.
-    _SURFACED_TRIG_STASH_MAX = 256
-
-    async def _credit_turn_lessons(self, execution_failure_count, last_user_content,
-                                   final_text: str = "") -> None:
-        """Credit the lessons surfaced in this turn — both turn paths (the
-        finalize path and the streamed path) call this. Only a clean turn
-        that may teach (not a probe, member or internal turn) and has a
-        real request credits; only lessons that share words with THAT
-        request get credit. NOT `top_triggers` (fresh review §4KW): that
-        list is every lesson IN THE PROMPT and `credit_recent_retrievals`
-        counts membership as relevance — every surfaced lesson got helpful
-        +1 on every clean turn (154 of 290 reached confidence 1.0). A
-        token-less request would fall back to the legacy credit-all path."""
-        sm = getattr(self.context, 'skill_memory', None)
-        # an ABORTED turn (an upstream outage, a strike cap …) helped nobody
-        # (§4MD M3: every retry during an outage gave each shown lesson +1)
-        if _ABORT_MARKER_RE.search(str(final_text or "")):
-            return
-        if not (sm is not None and execution_failure_count == 0 and turn_may_teach(self.context)
-                and _query_has_tokens(last_user_content)):
-            return
-        try:
-            if hasattr(sm, 'credit_recent_retrievals'):
-                await asyncio.to_thread(sm.credit_recent_retrievals, 300, query=str(last_user_content or ""))
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _surfaced_lesson_triggers(self, sm, turn_id: str = "") -> list:
-        """Every lesson trigger that entered THIS turn's prompt, across BOTH
-        injection surfaces: the ### SKILL PLAYBOOK block
-        (``skill_memory.last_playbook_triggers``) and the MemoryBus skill
-        tier (fused survivors with ``source == "skill"``). The outcome arms
-        used to read only the former, so a lesson surfacing exclusively via
-        the bus kept riding failing turns invisibly. Applies the same
-        turn_id guard as the hydration judge so a foreign turn's stash
-        can't contaminate attribution. Order-preserving dedup."""
-        out = []
-        try:
-            if sm is not None:
-                _pk = str(getattr(sm, "_playbook_turn_key", "") or "")
-                # Foreign-turn restamp guard (§4L R3 MINOR-2); empty key
-                # = pre-key writer or non-turn caller → fail-open.
-                if not (_pk and turn_id and _pk != str(turn_id)):
-                    out.extend(
-                        t for t in
-                        (getattr(sm, "last_playbook_triggers", []) or [])
-                        if t)
-            # ⚠ Read the bus surface from the JUDGE-IMMUNE stamp first
-            # (§4L R3 MAJOR-1; the hydration judge was removed in §4NM — the
-            # stamp stays the primary read): the judge consumed
-            # `last_hydration = None` at coroutine ENTRY, and on the
-            # streamed path (the common case) it is scheduled before the
-            # credit read — so bus-only lessons vanished from this union
-            # exactly on the turns fix 2's dedup removed them from the
-            # playbook list. `last_bus_triggers` + its turn key are set
-            # at delivery time and consumed by nobody.
-            if sm is not None and turn_id and str(turn_id) == str(
-                    getattr(sm, "_bus_delivered_turn_key", "") or ""):
-                out.extend(t for t in
-                           (getattr(sm, "last_bus_triggers", []) or []) if t)
-            bus = getattr(self.context, "memory_bus", None)
-            stash = getattr(bus, "last_hydration", None) if bus is not None else None
-            if stash and not (turn_id and stash.get("turn_id")
-                              and stash["turn_id"] != str(turn_id)):
-                for it in stash.get("survivors") or []:
-                    if isinstance(it, dict) and it.get("source") == "skill" \
-                            and it.get("trigger"):
-                        out.append(it["trigger"])
-        except Exception:
-            pass
-        return list(dict.fromkeys(out))
-
-    async def _record_lesson_outcomes(self, *, surfaced_triggers,
-                                      execution_failure_count,
-                                      verifier_backfill, trajectory_id,
-                                      unacked_total_failure=False):
-        """Attribute this turn's outcome to the lessons it surfaced — the
-        FAILURE ARM the success-only credit path (`credit_recent_retrievals`)
-        cannot produce.
-
-        Decisive now (structural execution failure, or an inline verifier
-        verdict) -> record immediately. Undecided (clean turn, async verdict
-        still pending) -> stash by trajectory_id for `_backfill_trajectory_
-        outcome` to drain. Grounded-only: a turn that never earns a verdict
-        contributes nothing (its stash entry is evicted uncounted), so the
-        arms never fill from mere absence-of-failure. Never raises —
-        post-turn feedback must not break finalize.
-        """
-        try:
-            sm = getattr(self.context, "skill_memory", None)
-            triggers = [t for t in (surfaced_triggers or []) if t]
-            if sm is None or not triggers:
-                return
-            # §4FB: diagnostics never teach — no outcome credit (and no
-            # late-verdict stash, which is written below) for a probe turn;
-            # §4KD: nor for a Slack turn.
-            if not turn_may_teach(self.context):
-                return
-            rec = getattr(sm, "record_surfaced_outcomes", None)
-            if not callable(rec):
-                return
-            verifier_failed = bool(
-                verifier_backfill and verifier_backfill[0] == "failed")
-            verifier_passed = bool(
-                verifier_backfill and verifier_backfill[0] == "passed")
-            # ⚠ MIRROR THE HONEST-FAILURE LADDER (§4L Lens-B MAJOR-2).
-            # The corpus label and the calibration grade both let a
-            # verifier PASS outrank structural execution failure (with
-            # the rule-2b unacked-total-failure carve-out); this arm was
-            # the un-mirrored third consumer, so lessons hydrated into
-            # honest-failure turns were BLAMED for turns the operator's
-            # own rule declares good — and `failed_retrievals` feeds
-            # prune-eligibility and the cap-trim eviction ranking.
-            # Ladder: checked-and-wrong > checked-and-right (shape
-            # guard) > structural failure > undecided.
-            if verifier_failed:
-                await asyncio.to_thread(rec, triggers, False)
-                return
-            if verifier_passed and not unacked_total_failure:
-                await asyncio.to_thread(rec, triggers, True)
-                return
-            if execution_failure_count > 0:
-                await asyncio.to_thread(rec, triggers, False)
-                return
-            # Undecided: clean turn, no inline verdict. Stash for the late
-            # verdict; if none lands (e.g. a no-evidence chat turn) the entry
-            # is evicted uncounted rather than booked as a success.
-            if not trajectory_id:
-                return
-            # ...unless the late verdict already landed and parked its sign
-            # (2026-09-13): book it now, through the same retained ring the
-            # flush uses, so a later opposite-sign human label can still
-            # re-book.
-            parked = _take_pending_lesson_sign(self.context, trajectory_id)
-            if parked is not None:
-                flushed = getattr(self.context, "_flushed_triggers_by_traj", None)
-                if flushed is None:
-                    from collections import OrderedDict
-                    flushed = OrderedDict()
-                    self.context._flushed_triggers_by_traj = flushed
-                flushed[trajectory_id] = (triggers, bool(parked))
-                flushed.move_to_end(trajectory_id)
-                while len(flushed) > self._FLUSHED_TRIG_RETAIN_MAX:
-                    flushed.popitem(last=False)
-                logger.info(
-                    "lesson-outcome: late verdict had already landed for traj "
-                    "%s — booked %d surfaced trigger(s) as %s",
-                    str(trajectory_id)[:8], len(triggers),
-                    "success" if parked else "failure",
-                )
-                await asyncio.to_thread(rec, triggers, bool(parked))
-                return
-            stash = getattr(self.context, "_surfaced_triggers_by_traj", None)
-            if stash is None:
-                from collections import OrderedDict
-                stash = OrderedDict()
-                self.context._surfaced_triggers_by_traj = stash
-            stash[trajectory_id] = triggers
-            stash.move_to_end(trajectory_id)
-            while len(stash) > self._SURFACED_TRIG_STASH_MAX:
-                stash.popitem(last=False)
-            logger.info(
-                "lesson-outcome: stashed %d surfaced trigger(s) for traj %s "
-                "(await late verdict)", len(triggers), str(trajectory_id)[:8],
-            )
-        except Exception as e:
-            logger.debug("record_lesson_outcomes skipped: %s", e)
-
-    # Retained flushed-trigger sets (R2 review): the stash pops once, so the
-    # FIRST resolver (usually the late machine verdict) consumed the set and
-    # a later human label with the OPPOSITE sign vanished — lesson counters
-    # kept the machine's sign for a turn the human overruled, and a changed
-    # mind (👍 then 👎) booked only the first thumb. Bounded ring of
-    # (triggers, booked_sign) lets a later opposite-sign resolver book a
-    # compensating observation. Not a reversal (the counters are additive);
-    # one wrong + one right observation is a wash, which beats a bias.
-    # Sized to the reply-index horizon (R3): reactions arrive minutes-to-
-    # days after the reply, and 64 flushed turns was under an hour of
-    # open-channel traffic.
-    _FLUSHED_TRIG_RETAIN_MAX = 512
-
-    def _flush_stashed_lesson_outcome(self, trajectory_id, success):
-        """Drain a stashed surfaced-trigger set when a verdict/label lands.
-        No-op when nothing is stashed AND no retained set needs re-booking
-        (same sign, or never flushed)."""
-        try:
-            stash = getattr(self.context, "_surfaced_triggers_by_traj", None)
-            flushed = getattr(self.context, "_flushed_triggers_by_traj", None)
-            if flushed is None:
-                from collections import OrderedDict
-                flushed = OrderedDict()
-                self.context._flushed_triggers_by_traj = flushed
-            triggers = None
-            if stash and trajectory_id in stash:
-                triggers = stash.pop(trajectory_id)
-            elif trajectory_id in flushed \
-                    and flushed[trajectory_id][1] != bool(success):
-                # Opposite-sign re-book: a human label overriding the
-                # machine's flush, or a changed mind.
-                triggers = flushed[trajectory_id][0]
-            if not triggers:
-                # Nothing stashed and nothing flushed: the verdict landed
-                # BEFORE `_record_lesson_outcomes` wrote the stash (the
-                # streamed path records the trajectory — and replays the
-                # deferred verdict — before it books lessons; a user
-                # correction can land at any time). Park the sign so the
-                # stash write books it immediately instead of waiting for
-                # a second verdict that never comes (2026-09-13).
-                if trajectory_id and trajectory_id not in flushed:
-                    _park_pending_lesson_sign(self.context, trajectory_id, bool(success))
-                return
-            flushed[trajectory_id] = (triggers, bool(success))
-            flushed.move_to_end(trajectory_id)
-            while len(flushed) > self._FLUSHED_TRIG_RETAIN_MAX:
-                flushed.popitem(last=False)
-            sm = getattr(self.context, "skill_memory", None)
-            rec = getattr(sm, "record_surfaced_outcomes", None) if sm else None
-            if callable(rec):
-                _glog.spawn_bg(
-                    asyncio.to_thread(rec, triggers, bool(success)),
-                    name="lesson-outcome-late-flush",
-                )
-        except Exception as e:
-            logger.debug("flush stashed lesson outcome skipped: %s", e)
+    # (§4TD: the lesson-credit arm that lived here — `_credit_turn_lessons`,
+    # `_surfaced_lesson_triggers`, `_record_lesson_outcomes`,
+    # `_flush_stashed_lesson_outcome` and their two rings on the context — is
+    # removed with the lesson store.)
 
     # Late-refute follow-up filing bounds: at most N tasks per verdict, and
     # only issues substantial enough to be actionable (a bare "unsupported"
@@ -21392,7 +20848,7 @@ class GhostAgent:
             # EVER-human, not latest-human (review R2 MAJOR-1). The writer
             # guard in `update_outcome` was moved to `has_human_label` and
             # THIS site — which gates the whole late-verdict consequence
-            # chain: lesson scrubbing, follow-up task filing, the
+            # chain: follow-up task filing, the
             # "correction to my previous answer" banner, the stream
             # re-render — was left reading only the LATEST sidecar record.
             # So an intermediate `user_correction` row protected the
@@ -21406,7 +20862,7 @@ class GhostAgent:
             #
             # The guard must FAIL CLOSED: when in doubt, treat the turn as
             # human-labelled and withhold the machine verdict, because the
-            # consequences it gates — lesson retraction, follow-up filing,
+            # consequences it gates — follow-up filing,
             # the correction banner — are irrecoverable, while withholding
             # merely defers. `is True` fails OPEN for any truthy non-bool:
             # the chain runs against a human-approved turn.
@@ -21454,9 +20910,8 @@ class GhostAgent:
                              project_id=None, n_tools=None):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
-        unit-testable. On a high-confidence REFUTED: log it, scrub any
-        poisoned lesson the turn wrote, and — in async mode — queue a
-        correction to surface on the next turn. Either way, fold the
+        unit-testable. On a high-confidence REFUTED: log it and — in async
+        mode — queue a correction to surface on the next turn. Either way, fold the
         high-confidence verdict into the trajectory corpus (the async
         counterpart of ``resolve_turn_outcome`` at record time).
         """
@@ -21591,7 +21046,7 @@ class GhostAgent:
         # memory claim, pixels) stands behind it — is a measurement, not a
         # consequence. Measured on real traffic 10-07…10-14: 9 of 17 refutes
         # false (the judge lacked evidence or misread); none of these may mark
-        # the turn failed, relabel its episode, retract lessons, file tasks or
+        # the turn failed, relabel its episode, file tasks or
         # queue a correction until precision is re-measured.
         if (v_result.verdict == VerifyVerdict.REFUTED and v_result.confidence >= 0.7
                 and not refute_is_grounded(v_result) and not judge_refute_consequences_enabled()):
@@ -21645,18 +21100,7 @@ class GhostAgent:
                 self._relabel_episode(str(request_id_context.get() or ""), "refuted after the reply")
             except Exception:  # noqa: BLE001
                 pass
-            _sm = getattr(self.context, "skill_memory", None)
-            if _sm is not None and trajectory_id:
-                # spawn_bg: a GC'd retraction leaves a poisoned lesson
-                # retrievable with nothing logged — this write must land
-                # or fail loudly.
-                _glog.spawn_bg(asyncio.to_thread(
-                    _sm.retract_lessons_from_trajectory,
-                    trajectory_id,
-                    memory_system=getattr(
-                        self.context, "memory_system", None
-                    ),
-                ), name="late-verdict-lesson-retraction")
+            # (§4TD: no lesson retraction — the lesson store is removed.)
             # Concrete leftovers the refute named become project tasks —
             # the banner tells the USER, this puts the work on the books.
             try:
@@ -21703,13 +21147,13 @@ class GhostAgent:
                 elif not requester_is_member():
                     # §4NF (operator: "silent until proven"): 2 of the last 3
                     # shown corrections were false. The verdict still backfills
-                    # the outcome and seeds the failure replay; the OWNER is
+                    # the outcome; the OWNER is
                     # shown nothing (§4NM removed the switch that showed it).
                     # A Slack member's correction still reaches the member (§4LH).
                     pretty_log(
                         "Verifier",
                         "correction not shown — the owner is not shown verifier corrections "
-                        "(the verdict is recorded for the failure replay)",
+                        "(the verdict is recorded on the turn's outcome)",
                         icon=Icons.VERIFIER_LAB,
                     )
                 elif any(c.get("note") == _corr_note
@@ -21924,7 +21368,7 @@ class GhostAgent:
         # memory_dir — it loaded the owner's corrections and saved a stale copy
         # back, so a shown correction returned after a restart)
         if (getattr(ctx, "owner_memory_isolated", False) is True
-                or getattr(getattr(ctx, "skill_memory", None), "is_read_only", False) is True):
+                or is_simulated_context(ctx)):
             return None
         md = getattr(ctx, "memory_dir", None)
         if not isinstance(md, (str, Path)) or not str(md):
@@ -22469,7 +21913,7 @@ class GhostAgent:
                 return True   # real args → usable
             # Empty args: usable for a pure-trigger tool (a complete call with
             # no parameters), OR for a RUNTIME-registered tool (not in the
-            # static definitions — a composed macro / acquired skill whose
+            # static definitions — an acquired skill whose
             # schema is unknowable here; § turn-loop R4). For a STATIC tool
             # that takes parameters, empty args is degenerate and must yield
             # to a competing XML call — keying off `not has_tool_tag` instead
@@ -23194,7 +22638,6 @@ class GhostAgent:
         last_user_content = ts.last_user_content
         char_budget = ts.char_budget
         strikes = ts.strikes
-        task_tree = ts.task_tree
         _user_batch_intent = ts._user_batch_intent
         _request_constraints = ts._request_constraints
         repeated_action_steered = ts.repeated_action_steered
@@ -23493,25 +22936,6 @@ class GhostAgent:
                     last_was_failure = True
                     continue
 
-                # §4KD: a Slack turn never teaches — the model's explicit
-                # `learn_skill` is refused here, deterministically, next to
-                # the writers' own backstop.
-                if _cname == "learn_skill" and not turn_may_teach(self.context):
-                    pretty_log("Local Guard",
-                               "learn_skill refused — this turn must not teach (probe/member)",
-                               icon=Icons.STOP, level="WARNING")
-                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
-                               "content": _TO.rejected(
-                                   "SYSTEM BLOCK: lessons are not recorded from this "
-                                   "channel. Continue without saving a lesson.",
-                                   reason_code="lesson_channel_blocked")}
-                    messages.append(err_msg)
-                    # A member's learn_skill is a member refusal too (it is off the
-                    # allowlist); it must count toward the refusal limit (§4KL R6).
-                    tools_run_this_turn.append({**err_msg, "_synthetic": True,
-                                                **({"_member_refused": True} if requester_is_member() else {})})
-                    continue
-
                 # §4LB EGRESS: the owner's private on-demand values (the street
                 # address) never leave the machine in a query — the model wrote
                 # "restaurants Kaledonias 83 Kalopetres" into Tor searches.
@@ -23560,12 +22984,6 @@ class GhostAgent:
                 _member_refusal = (self._member_tool_refusal(
                     _cname, tool["function"].get("arguments"), tools_run_this_turn)
                     if requester_is_member() and fname != "system_parse_error" else None)
-                # §4MW r1 (CRIT): an unattended failure replay may only read
-                from .failure_replay import replay_tool_refusal as _replay_refusal
-                _replay_block = (_replay_refusal(_cname, tool["function"].get("arguments"))
-                                 if fname != "system_parse_error" else "")
-                if _replay_block and not _member_refusal:
-                    _member_refusal = _replay_block
                 if _member_refusal:
                     pretty_log("Local Guard",
                                f"{_cname} refused — {_member_refusal}",
@@ -23573,9 +22991,7 @@ class GhostAgent:
                     # An allowlisted tool refused for its ARGUMENTS is still
                     # available; "not available" would contradict the notice
                     # and lose the tool for the rest of the request (§4KL).
-                    _mblock = (f"SYSTEM BLOCK: {_member_refusal}. Answer with the read-only tools."
-                               if _replay_block else
-                               f"SYSTEM BLOCK: {_member_refusal}. The {_cname} tool itself "
+                    _mblock = (f"SYSTEM BLOCK: {_member_refusal}. The {_cname} tool itself "
                                "is available on this channel — call it again within that "
                                "limit, or answer without it."
                                if _cname in _MEMBER_ALLOWED_TOOLS else _MEMBER_TOOL_BLOCK)
@@ -23807,9 +23223,6 @@ class GhostAgent:
                         self.context.cached_sandbox_state = None
                         request_sandbox_state = None
                         request_state.invalidate_sandbox()
-                    # Skill writes invalidate the playbook cache too.
-                    if _cname == "learn_skill":
-                        request_state.invalidate_skill_playbook()
                     # Acquired-skill registry mutations
                     # (create_skill / manage_skills delete) change
                     # the schema list the LLM sees. Without this
@@ -23820,17 +23233,14 @@ class GhostAgent:
                     # cached schema didn't contain X yet.
                     # `.strip()` as well as `.lower()`. The tool itself does
                     # `str(action).strip().lower()`, and `is_mutating` four
-                    # lines below does the same — this one only lowered, so
-                    # `action=" define "` registered the macro and left the
-                    # tool-definition cache STALE: the model then narrates
-                    # "now invoking X" against a schema that does not carry
-                    # X, which is the loop this invalidation exists to stop.
+                    # lines below does the same — an action that was only
+                    # lowered (`action=" delete "`) changed the registry and
+                    # left the tool-definition cache STALE: the model then
+                    # narrates "now invoking X" against a schema that does not
+                    # match, which is the loop this invalidation exists to stop.
                     if _cname == "create_skill" or (
                         _cname == "manage_skills"
                         and str(t_args.get("action") or "").strip().lower() == "delete"
-                    ) or (
-                        _cname == "manage_composed_skills"
-                        and str(t_args.get("action") or "").strip().lower() in ("define", "delete", "approve")
                     ):
                         request_state.invalidate_tool_defs()
 
@@ -23877,12 +23287,12 @@ class GhostAgent:
                 # `copy` mutates (creates a file) and was likewise missing (F2b).
                 # ...and on the HEALED TOOL NAME (`_cname`, resolved once at
                 # the top of this block), for the same reason.
-                is_mutating = _cname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
+                is_mutating = _cname in ["execute", "image_generation", "manage_tasks", "update_profile", "vision_analysis"] or \
                               (_cname == "lab" and not _lab_is_read_call(t_args)) or \
                               (_cname == "run" and not _run_is_read_call(t_args)) or \
+                              (_cname == "introspect" and _introspect_is_write_call(t_args)) or \
                               (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
-                              (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
-                              (_cname == "manage_composed_skills" and str(t_args.get("action") or "").strip().lower() in ["define", "approve", "delete"])
+                              (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"])
 
                 # --- IDEMPOTENCY GUARD (production loop fix) ---
                 # Pure setters with no value in repetition. Re-issuing
@@ -23895,7 +23305,7 @@ class GhostAgent:
                 # applied" — 30 times in one live request, nothing deleted.
                 _kb_act = str(t_args.get("action") or "").strip().lower()
                 is_idempotent_setter = (
-                    _cname in ("update_profile", "learn_skill")
+                    _cname == "update_profile"
                     or (_cname == "knowledge_base"
                         and (_kb_act == "insert_fact"
                              or (_kb_act == "forget" and t_args.get("confirm"))))
@@ -24243,7 +23653,7 @@ class GhostAgent:
                         # Collapse is now gated by an ALLOWLIST of read-safe
                         # tools (`_COLLAPSE_READSAFE`) rather than a denylist
                         # (§ turn-loop R2): a denylist could not name the
-                        # runtime-registered macro/skill runners, which run
+                        # runtime-registered skill runners, which run
                         # arbitrary side-effecting code. Anything not read-safe
                         # (or any mutating call, via the `is_mutating` OR) is
                         # collapse-unsafe. Dropping a real call is far worse
@@ -25121,6 +24531,7 @@ class GhostAgent:
                             self.context._breaker_reason = (          # §4OA: the fallback names it
                                 f"'{_churn_t}' was edited again and again without being run, after "
                                 f"{_churn['steers']} reminders to test it")
+                            note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "edit_churn")   # §4TC
                             pretty_log(
                                 "Edit Churn Stop",
                                 f"'{_churn_t}' edited {_EDIT_CHURN_STEER_AFTER}x more "
@@ -25151,6 +24562,7 @@ class GhostAgent:
                                     "verification shows."
                                 ),
                             })
+                            note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "edit_churn")   # §4TC
                             pretty_log(
                                 "Edit Churn",
                                 f"{_EDIT_CHURN_STEER_AFTER} unverified "
@@ -25172,7 +24584,8 @@ class GhostAgent:
                             _churn["steers"] = 0
 
                     shield_limit = max(16000, int(char_budget * 0.1))
-                    if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base"]:
+                    if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base",
+                                                                 "youtube_transcribe"]:   # §4TA: the same result as knowledge_base's
                         # Use a DISTINCT variable, not `payload`: the
                         # outer `payload` is reused later (e.g. the
                         # Perfect-It optimization call), and rebinding
@@ -25637,6 +25050,7 @@ class GhostAgent:
                                 self.context._breaker_forced_final = True
                                 self.context._breaker_reason = "the same script kept being rewritten and rerun without a result"   # §4OA: named in the fallback
                                 force_final_response = True
+                                note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "futility")   # §4TC
                                 pretty_log(
                                     "Futility Breaker",
                                     f"'{_bn}' rewritten {_rec['writes']}x / rerun "
@@ -25653,6 +25067,7 @@ class GhostAgent:
                                 if _bn is not None:
                                     if _rec is not None:
                                         self.context._futility_steer_done = True
+                                        note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "futility")   # §4TC
                                         pretty_log(
                                             "Futility Breaker",
                                             f"'{_bn}' rewritten {_rec['writes']}x and "
@@ -25742,7 +25157,13 @@ class GhostAgent:
                     except Exception:  # noqa: BLE001
                         pass
 
-                    if fname and not is_mutating and not _res_is_error and not _intr:   # §4RZ step 5: nothing observed
+                    # §4TB (review): `introspect(action="set_mood")` is mutating (it
+                    # must not collapse with its twin, and a read after it re-runs)
+                    # but it is NOT exempt here: the same mood set again with the
+                    # same result is the no-progress repeat `self_state set_mood`
+                    # was stopped for (alert on the 2nd, stop on the 3rd)
+                    if (fname and (not is_mutating or fname == "introspect")
+                            and not _res_is_error and not _intr):   # §4RZ step 5: nothing observed
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge
                         # immediately, abort on the third (chess
@@ -25905,8 +25326,8 @@ class GhostAgent:
                                     icon=Icons.OK)
 
                             # --- SIMULATION SHORT-CIRCUIT ---
-                            # In self-play (read-only skill memory
-                            # sentinel), when the solver has just
+                            # In a simulated context (the `simulated`
+                            # flag), when the solver has just
                             # executed `solution.py` with exit=0 and
                             # produced non-empty stdout, the inner
                             # agent is done — the outer validator
@@ -25917,11 +25338,7 @@ class GhostAgent:
                             # turn to emit a "task complete" summary
                             # that nobody reads (log-eval: turns 3→4
                             # of every cycle were pure dead time).
-                            _is_sim = getattr(
-                                getattr(self.context, "skill_memory", None),
-                                "is_read_only",
-                                False,
-                            ) is True
+                            _is_sim = is_simulated_context(self.context)
                             # A DETACHED solution.py has NOT run to
                             # completion (sandbox/jobs.py): its result is exit
                             # 0 with a banner as "stdout", which would satisfy
@@ -26032,7 +25449,7 @@ class GhostAgent:
                         else:
                             pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")  # §LOG-5b
 
-                    elif fname in ["manage_tasks", "learn_skill", "update_profile"] and "SUCCESS" in str_res.upper():
+                    elif fname in ["manage_tasks", "update_profile"] and "SUCCESS" in str_res.upper():
                         if is_mutating: seen_tools.clear()
                         pass
                     elif fname == "image_generation" and "SUCCESS" in str_res.upper():
@@ -26279,16 +25696,16 @@ class GhostAgent:
                         force_stop = True
                     elif _asig not in repeated_action_steered:
                         repeated_action_steered.add(_asig)
-                        # Read/write tools (manage_composed_skills,
+                        # Read/write tools (manage_projects,
                         # file_system, ...) get a SOFTER steer: the
                         # loop is the agent re-READING to orient
                         # itself, and the action it was asked to do is
                         # a WRITE through the SAME tool. Forcing a
                         # text-only final turn here would bar that
                         # pending mutation forever — the agent would
-                        # "finish" having silently done nothing (the
-                        # reconfigure-a-composed-skill bug: looped on
-                        # action="list", force-finalised, never reached
+                        # "finish" having silently done nothing (first
+                        # seen on the macro manager, removed in §4TA: looped
+                        # on action="list", force-finalised, never reached
                         # action="define"). So we keep tools available
                         # and tell it to perform the WRITE now instead
                         # of reading again. The >=5 hard stop above is
@@ -27075,8 +26492,8 @@ class GhostAgent:
         #      (`<tool_call name="...">`) without being fooled by
         #      a stray `>` in the body.
         # §4FS: remember whether an UNPARSED CALL is about to be scrubbed —
-        # the shared predicate (not inline code, not the watchdog's replan
-        # marker, not a <tool_response>) — so the reply can SAY a step did
+        # the shared predicate (not inline code, not a <tool_response>)
+        # — so the reply can SAY a step did
         # not happen. A first version ran its own scrub AFTER this one and
         # therefore never saw anything (review, 2026-09-09).
         try:
@@ -27191,6 +26608,10 @@ class GhostAgent:
                         f"{len(final_ai_content)} → {len(_no_pre)} chars",
                         icon=Icons.BRAIN_SUM,
                     )
+                    from .reply_tap import reply_tap_context    # §4TE: the tap may not reprint for this
+                    _trim_tap = reply_tap_context.get()
+                    if _trim_tap is not None:
+                        _trim_tap.note_trim(final_ai_content, _no_pre)
                     final_ai_content = _no_pre
             except Exception as _pt_exc:  # noqa: BLE001
                 logger.debug("pre-tool text scrub skipped: %s", _pt_exc)
@@ -27206,8 +26627,7 @@ class GhostAgent:
                 # reply (§4LH design: the result proves the page exists); the strict
                 # "cite only what was fetched" list applies to a continued report file
                 _hay = _lg.haystack_from(messages, (
-                    f"{t.get('content') or ''}\n{getattr(t.get('content'), 'call_args', '') or ''}"
-                    for t in tools_run_this_turn if isinstance(t, dict)))
+                    _lg.tool_row_text(t) for t in tools_run_this_turn if isinstance(t, dict)))
                 _grounded, _removed = _lg.ground_links(final_ai_content, _hay)
                 if _removed:
                     pretty_log("Link Grounding",
@@ -27238,6 +26658,10 @@ class GhostAgent:
                     f"{len(final_ai_content)} → {len(_smoothed)} chars",
                     icon=Icons.BRAIN_SUM,
                 )
+                from .reply_tap import reply_tap_context    # §4TE: the tap may not reprint for this
+                _trim_tap = reply_tap_context.get()
+                if _trim_tap is not None:
+                    _trim_tap.note_trim(final_ai_content, _smoothed)
                 final_ai_content = _smoothed
         except Exception as _sm_exc:
             logger.debug("reply smoothing skipped: %s", _sm_exc)
@@ -27400,23 +26824,18 @@ class GhostAgent:
         # Only trigger proactive optimization for heavy engineering/research tasks
         heavy_tools_used = any(t.get('name') in ['execute', 'deep_research', 'lab'] for t in tools_run_this_turn)
 
-        # Skip the whole Perfect-It block during self-play: the
-        # isolated context's `ReadOnlySkillMemory.learn_lesson`
-        # is a no-op, so the write at the bottom lands in
-        # /dev/null — but before we realised that, every single
-        # self-play cycle was burning ~15s on a follow-up LLM
-        # call to generate an "optimisation strategy" that was
-        # silently discarded, and the misleading
-        # `"Saved optimization strategy to playbook"` log line
-        # was firing on the inner sub-agent's request ID
-        # (production trace 16:36, request C6). The marker
-        # lives on the ReadOnlySkillMemory class set up by
-        # dream.py's isolation code. We check `is True`
-        # explicitly (not `bool(...)`) so a MagicMock used in
-        # production-agent unit tests doesn't accidentally
-        # trigger the guard — MagicMock.is_read_only returns
-        # another MagicMock (truthy), but not the sentinel.
-        is_simulation = getattr(getattr(self.context, "skill_memory", None), "is_read_only", False) is True
+        # Skip the whole Perfect-It block in a SIMULATED context (an
+        # isolated replay, a coding leaf): every self-play cycle was
+        # burning ~15s on a follow-up LLM call to generate an
+        # "optimisation strategy" nobody read (production trace 16:36,
+        # request C6). The marker is the context's `simulated` flag
+        # (`core/isolation.py`; until §4TD it was the read-only wrapper
+        # of the lesson store). `is_simulated_context` tests `is True`,
+        # so a MagicMock context in a production-agent unit test — whose
+        # every attribute is another truthy MagicMock — does not trigger
+        # the guard. `is_simulation` also gates the notify-promise
+        # backstop and the stored-promise fire further down.
+        is_simulation = is_simulated_context(self.context)
         # §4PV: a turn that stopped to ask the user (clarify, confirm wait…)
         # is not a finished task — §4PS made those stops non-failures, which
         # let an optimisation suggestion land under the open question
@@ -27426,13 +26845,9 @@ class GhostAgent:
 
         if not is_simulation and tools_run_this_turn and heavy_tools_used and execution_failure_count == 0 and not last_was_failure and not _pp_asked_user and (not final_ai_content or len(final_ai_content) < 50):
             # Whether the optimization is part of the user-facing
-            # response. When the flag is OFF the generation is pure
-            # internal learning — so it runs as a tracked background
-            # task instead of blocking the reply (observed: a 24s
-            # task delivered at +271s because the response waited on
-            # this call, which also let the watchdog cross its 120s
-            # idle threshold and pile hippocampus consolidation onto
-            # the same single-slot upstream).
+            # response. When the flag is OFF nothing is generated (the
+            # background variant, whose only output was a lesson, is
+            # gone).
             _pp_show_to_user = getattr(self.context.args, 'perfect_it', False) is True
             if _pp_show_to_user:
                 # §4NV: only when it runs — without --perfect-it nothing is
@@ -27489,13 +26904,11 @@ class GhostAgent:
                     p_req_messages.append({"role": m.get("role", "user"), "content": content_val})
 
             # Build a payload COPY: the original is left untouched
-            # for anything downstream, and the deferred task must
-            # not share mutable state with the live request.
+            # for anything downstream.
             # 🔴 Physically remove tools so it cannot hallucinate a tool call
             p_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
             p_payload["messages"] = p_req_messages
             p_payload["stream"] = False  # Prevent SSE streaming leak from the main loop
-            _pp_lesson_label = f"Optimization Analysis: {last_user_content[:50]}..."
 
             if _pp_show_to_user:
                 # --perfect-it: the optimization IS part of the
@@ -27503,10 +26916,7 @@ class GhostAgent:
                 # foreground=True, or the call self-stalls waiting
                 # for its own request to clear.
                 try:
-                    p_msg = await self._perfect_it_generate_and_learn(
-                        p_payload, _pp_lesson_label, current_trajectory_id,
-                        foreground=True,
-                    )
+                    p_msg = await self._perfect_it_generate(p_payload, foreground=True)
                     if p_msg:
                         if final_ai_content:
                             final_ai_content += "\n\n" + p_msg
@@ -27760,42 +27170,8 @@ class GhostAgent:
                         f"REFUTED ({v_result.confidence:.0%}): {issues_str[:120]}",
                         icon=Icons.VERIFIER_LAB,
                     )
-                    # Verifier-driven retraction: the
-                    # Perfection-Protocol's `learn_lesson`
-                    # runs BEFORE this gate, so by the time
-                    # we get here a poisoned lesson tagged
-                    # with `current_trajectory_id` may
-                    # already be on disk. The verifier just
-                    # said the response was REFUTED with
-                    # high confidence — scrub anything that
-                    # turn produced before the user even
-                    # sees the response, so the next user
-                    # query can't retrieve a lesson born
-                    # from a turn we just disagreed with.
-                    # Belt-and-braces with the user-
-                    # correction retraction path: the user
-                    # may never go on to correct, and we
-                    # shouldn't depend on them noticing.
-                    try:
-                        _sm = getattr(self.context, "skill_memory", None)
-                        if _sm is not None and current_trajectory_id:
-                            # to_thread: retraction takes a file lock,
-                            # rewrites the playbook and does a sync
-                            # Chroma delete — run it off the event
-                            # loop like every other SkillMemory call
-                            # on this path.
-                            await asyncio.to_thread(
-                                _sm.retract_lessons_from_trajectory,
-                                current_trajectory_id,
-                                memory_system=getattr(
-                                    self.context, "memory_system", None
-                                ),
-                            )
-                    except Exception as _e:
-                        logger.debug(
-                            "verifier-driven retraction skipped: %s: %s",
-                            type(_e).__name__, _e,
-                        )
+                    # (§4TD: no lesson retraction here — the lesson
+                    # store is removed.)
                 else:
                     if v_result:
                         # Include the REASONING so a CONFIRMED says WHAT it
@@ -27900,28 +27276,12 @@ class GhostAgent:
                         execution_failure_count=execution_failure_count,
                         req_id=str(req_id or '')), name="episode-record")
 
-        # Retrieval feedback: a clean, non-failing turn credits
-        # any lesson surfaced in the last ~5min. Hoisted out of
-        # the `was_complex_task` gate above — simple successful
-        # turns are exactly where retrieved lessons are most
-        # likely to be paying off, and excluding them biased
-        # the utility signal toward complex tasks only.
-        # `credit_recent_retrievals` is idempotent and no-ops
-        # when nothing was retrieved, so running it on every
-        # clean-exit turn is safe.
-        sm = getattr(self.context, 'skill_memory', None)
-        await self._credit_turn_lessons(execution_failure_count, last_user_content,
-                                       final_text=final_ai_content)
-
-        # Outcome-gated lesson feedback (2026-07-24): attribute THIS turn's
-        # verified outcome — including the FAILURE arm the credit block above
-        # lacks — to the lessons it surfaced. Runs on BOTH outcome classes
-        # (outside the execution_failure_count==0 gate), like the calibration
-        # spine below, so present-on-failure is actually recorded.
+        # (§4TD: the lesson retrieval credit and the outcome-gated lesson
+        # feedback that ran here are removed with the lesson store.)
         # Shape rule (2026-08-04) for this turn, computed ONCE here and
-        # reused by the lesson arm just below, the selfhood backfill and
+        # reused by the selfhood backfill and
         # the Turn Outcome line further down (hoisted 2026-08-07, §4L
-        # Lens-B MAJOR-2 — the lesson arm needs it too). Deliberately
+        # Lens-B MAJOR-2). Deliberately
         # BEFORE the deferred-correction prepend: that banner is the
         # verifier's prose, not the agent's answer, and its failure
         # vocabulary would make an unacknowledged turn read as
@@ -27939,53 +27299,9 @@ class GhostAgent:
         except Exception:  # noqa: BLE001 — labelling must not break finalize
             _unacked_turn = False
 
-        try:
-            await self._record_lesson_outcomes(
-                # BOTH injection surfaces (playbook block + bus skill tier) —
-                # bus-only lessons were invisible to the FAILURE arm.
-                surfaced_triggers=self._surfaced_lesson_triggers(
-                    sm, turn_id=str(req_id or "")),
-                execution_failure_count=execution_failure_count,
-                verifier_backfill=verifier_backfill,
-                trajectory_id=current_trajectory_id,
-                unacked_total_failure=_unacked_turn,
-            )
-        except Exception:
-            pass
-
-        # Value-alignment gate (opt-in --principle-gate). If the
-        # agent has authored operating principles (selfhood/values),
-        # an independent LLM check flags a response that contradicts
-        # one and appends a brief self-note — turning the principles
-        # from prompt decoration into an actual behavioural check.
-        # Default off (adds one LLM call to final turns); never
-        # blocks, only annotates.
-        try:
-            if (getattr(getattr(self.context, "args", None), "principle_gate", False) is True
-                    and final_ai_content):
-                _sm = getattr(self.context, "self_model", None)
-                if _sm is not None and getattr(_sm, "enabled", False) and _sm.principles():
-                    async def _pg_critique(p):
-                        _r = await self.context.llm_client.chat_completion({
-                            "model": self.context.args.model,
-                            "messages": [{"role": "user", "content": p}],
-                            "temperature": 0.0, "max_tokens": 512, "stream": False,
-                        })
-                        return ((_r or {}).get("choices", [{}])[0]
-                                .get("message", {}).get("content", "") or "")
-                    _aligned, _note = await _sm.evaluate_response_alignment(
-                        final_ai_content, critique_fn=_pg_critique,
-                    )
-                    if not _aligned:
-                        final_ai_content = (
-                            f"{final_ai_content}\n\n---\n"
-                            f"**Self-check (principle):** {_note}"
-                        )
-                        pretty_log("Principle Gate",
-                                   f"response flagged: {_note[:80]}",
-                                   icon=Icons.SHIELD)
-        except Exception as e:
-            logger.debug(f"principle gate skipped: {e}")
+        # (The opt-in value-alignment gate, `--principle-gate`, is removed —
+        # §4TB 2026-11-05: operating principles went with the `self_state`
+        # tool, their only writer. The flag is still accepted and ignored.)
 
         # Autonomous-progress digest — closes the user-facing half of
         # phase 2.95. If projects were advanced in the background (by
@@ -28060,9 +27376,8 @@ class GhostAgent:
             # and would page the operator "stopped early after repeated
             # failures — Dream cycle complete." The strike shape is the
             # failure count itself. `is_simulation` (computed above from
-            # skill_memory.is_read_only) keeps synthetic self-play/dream
-            # turns whose PROMPTS contain "notify me…" off the operator's
-            # phone.
+            # the context's `simulated` flag) keeps simulated turns whose
+            # PROMPTS contain "notify me…" off the operator's phone.
             _np_pid = getattr(self.context, "current_project_id", None)
             _np_store = getattr(self.context, "project_store", None)
             # A live project-scoped promise OWNS delivery: the per-request
@@ -28344,8 +27659,8 @@ class GhostAgent:
             # warning temporarily.
             logger.debug(f"trajectory logging skipped: {type(e).__name__}: {e}")
 
-        # (Shape rule hoisted above the lesson-outcome attribution — §4L
-        # Lens-B MAJOR-2; computed once, further up this method.)
+        # (Shape rule: computed once, further up this method — §4L
+        # Lens-B MAJOR-2.)
 
         # Selfhood outcome backfill (proposal item #3): the
         # autobiographical record was just written `outcome=
@@ -28426,7 +27741,7 @@ class GhostAgent:
         # the registry resolves `context._read_budget` AT CALL TIME, so a
         # leftover (possibly zero/spent) budget from this request would
         # otherwise govern every out-of-band tool call (project advancer,
-        # research, composed skills, API routes) until the next interactive
+        # research, API routes) until the next interactive
         # batch. The request-START clear covers crashed paths on the next
         # request; this covers the overnight window in between.
         try:
@@ -29350,6 +28665,7 @@ class GhostAgent:
                     msg["tool_calls"] = []
                     execution_failure_count += 1
                     thinking_cap_events += 1
+                    note_guard_event(self.context, req_id, "thinking_loop")        # §4TC
                     messages.append({"role": "assistant", "content": (
                         "[Tool-call generation aborted: a runaway burst of tool "
                         "calls was discarded unrun.]" if tool_call_flood_detected
@@ -30243,27 +29559,26 @@ class GhostAgent:
                 # measurement that forced this (59/59 false
                 # positives; the nudge's own text asserts the user
                 # gave instructions, so a keyword match made it a
-                # lie and the model wrote a junk lesson to comply).
+                # lie and the model wrote a junk record to comply).
                 has_meta_intent = _has_meta_task_directive(
                     user_request_context)
-                meta_tools_called = any(t in raw_tools_called for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
+                meta_tools_called = any(t in raw_tools_called for t in ["update_profile", "create_skill", "manage_skills"])
                 # Read-only SURFACE tools discharge the meta-task
-                # nudge: if the user asks "what have you learned
-                # today" the right answer is `list_lessons`, not a
-                # bogus `learn_skill` write. Before this exemption
-                # the nudge kept firing for 3-5 extra turns after
-                # `list_lessons` returned, and the model eventually
-                # caved and wrote a deduplicated no-op skill just
-                # to silence it (production trace 15:17, request
-                # 5C: 6 turns / 73s for one read-only query).
+                # nudge: a question the model answered by READING
+                # (recall, the skill list) asked for no write. Before
+                # this exemption the nudge kept firing for 3-5 extra
+                # turns after the read returned, and the model
+                # eventually caved and wrote a no-op record just to
+                # silence it (production trace 15:17, request 5C: 6
+                # turns / 73s for one read-only query).
                 read_only_meta_tools_called = any(
                     t in raw_tools_called
-                    for t in ["list_lessons", "recall", "manage_skills"]
+                    for t in ["recall", "manage_skills"]
                 )
                 if read_only_meta_tools_called:
                     meta_tools_called = True
 
-                meta_tools_available = any(t in self.available_tools for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
+                meta_tools_available = any(t in self.available_tools for t in ["update_profile", "create_skill", "manage_skills"])
                 # Self-play (and any isolated simulation) sets
                 # `suppress_meta_task_nudges` to skip this check —
                 # the nudge is a production-mode feature that
@@ -30279,26 +29594,31 @@ class GhostAgent:
                 # reply discarded each time. Live req 32a8101d: the
                 # model declined twice ("there's no explicit learning
                 # or profile instruction in their message") and caved
-                # on turn 4, minting the junk lesson. The rewritten
+                # on turn 4, minting a junk record. The rewritten
                 # message invites declining, which would have made
                 # that pressure WORSE without this latch: now correct
                 # refusal ends the loop exactly as compliance does.
                 if _meta_nudge_fired:
                     has_meta_intent = False
-                # §4KW (review): learn_skill / update_profile write the OWNER's
-                # memory and profile; a member has neither tool
+                # §4KW (review): update_profile writes the OWNER's
+                # profile; a member does not have the tool
                 if (not suppress_nudge and has_meta_intent and meta_tools_available
                         and not meta_tools_called and turn < 4 and not requester_is_member()):
                     _meta_nudge_fired = True
                     pretty_log("Checklist Nudge", "Enforcing meta-task compliance", icon=Icons.SHIELD)
+                    # §4TD: the rule command runs on the owner's private turns only (`_owner_rule_note`)
+                    from ..utils.logging import request_kind as _nudge_kind
+                    _rule_clause = (" — or, for a standing instruction on how you should work, tell the user to "
+                                    "send \"learn this rule: <the rule>\": only that command saves one"
+                                    if _nudge_kind() == "owner" and not reply_is_public() else "")
                     messages.append({"role": "user", "content": (
                         "REMINDER: the user's request appears to ask you to RECORD "
-                        "something (a lesson, a skill, or a profile fact) and no "
+                        "something (a fact about them or a preference) and no "
                         "recording tool has run this turn. If that reading is right, "
-                        "call 'learn_skill' or 'update_profile' now. If it is NOT — "
-                        "the user only mentioned skills/lessons in passing, or asked "
-                        "you to show or define one — say so in your reply and finish "
-                        "normally; do NOT invent a lesson to satisfy this reminder."
+                        f"call 'update_profile' now{_rule_clause}. If it is NOT — "
+                        "the user only mentioned it in passing, or asked "
+                        "you to show or define something — say so in your reply and finish "
+                        "normally; do NOT invent a fact to satisfy this reminder."
                     )})
                     return "continue"
 
@@ -30854,13 +30174,13 @@ class GhostAgent:
             # gap clock (`_idle_s`) under 600 s, so a new level's head file or
             # the members' head was never made and the tick deferred for hours.
             # (Review: the idle scheduler keeps its own clock above — probes
-            # must go on holding its phases off, or self-play and the failure
-            # replays start between the operator's probes and queue them.)
+            # must go on holding its phases off, or the idle jobs
+            # start between the operator's probes and queue them.)
             if not is_probe_request_id(_rid):
                 self.context.last_real_activity_time = datetime.datetime.now()
             # §4MI: the quiet-hours hold asks "was the OWNER here?" — the
-            # window clock above is also written by self-play's finally,
-            # so a 03:41 self-play run counted as the owner being present;
+            # window clock above was once also written by an idle job (a
+            # 03:41 run counted as the owner being present; removed §4SZ);
             # a channel member's turn is not the owner either (fresh review)
             try:
                 from ..utils.logging import request_kind as _rk
@@ -30869,25 +30189,49 @@ class GhostAgent:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _mood_owner_arrived(self) -> None:
+        """§4TC (review): an OWNER's request has arrived — the quiet, if there
+        was one, is over. Boredom is never written into the mood, so there
+        is nothing to carry into this turn: `SelfModel.owner_arrived` writes
+        down what time did to the mood, closes a boredom the journal holds
+        ("the quiet ended") and stamps the owner's presence in the mood's own
+        state file (the quiet is measured from that stamp, so a restart does
+        not change it). It never writes the agent's activity clocks. Only a
+        real owner request (`mood_moves_on_this_request`). Never raises."""
+        try:
+            if not mood_moves_on_this_request(self.context):
+                return
+            sm = _mood_model(self.context)
+            if sm is not None:
+                sm.owner_arrived()
+        except Exception as e:  # noqa: BLE001 — the mood never breaks a request
+            logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
+
+    def _mood_owner_reaction(self, kind: str) -> None:
+        """§4TC: the owner's reaction in chat (a correction of the last
+        reply, thanks) moves the mood — an owner request only. Never raises."""
+        try:
+            if not mood_moves_on_this_request(self.context):
+                return
+            sm = _mood_model(self.context)
+            if sm is not None:
+                sm.note_owner_reaction(kind)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("mood reaction skipped: %s: %s", type(e).__name__, e)
+
     def _build_request_scope(self, body, req_id: str, turn_origin_value: str, scope=None):
         """§4SX B0: this request's scope. Only an owner request (a real user
         turn, not a probe / replay / unattended request) with a session id
         persists its project to its conversation's focus row. A leaf passes a
         pre-built scope (its pinned project)."""
         from .request_scope import (RequestScope, conversation_key_for_session, ORIGIN_MEMBER,
-                                    ORIGIN_OWNER, ORIGIN_PROBE, ORIGIN_REPLAY, ORIGIN_UNATTENDED)
+                                    ORIGIN_OWNER, ORIGIN_PROBE, ORIGIN_UNATTENDED)
         if scope is not None:
             scope.context = self.context
             return scope
         sid = (body.get("session_id") if isinstance(body, dict) else "") or ""
         if requester_is_member():
             return RequestScope(origin=ORIGIN_MEMBER, context=self.context)
-        try:
-            from .failure_replay import is_replay_request as _is_replay
-            if _is_replay(req_id):
-                return RequestScope(origin=ORIGIN_REPLAY, context=self.context)
-        except Exception:  # noqa: BLE001
-            pass
         key = conversation_key_for_session(sid)
         persist = bool(key)
         if not key:
@@ -30945,10 +30289,13 @@ class GhostAgent:
         # a job resume (sched-/job-/sub-) every <15 min kept the agent
         # "busy" and silently starved every idle phase
         self._heartbeat()
-        # §4MX r3 (after the role and origin are set): the owner's "show rule N" / "learn rule N" / "learn this
-        # rule: …" for a replay's candidate rule — adopted HERE, before the
-        # model runs, not left to its choice of tool; the note tells it what
-        # was done. Owner turns only (never a member, a channel or a probe).
+        self._mood_owner_arrived()                  # §4TC: an owner's request ends the quiet
+        # §4MX r3 (after the role and origin are set): the owner's rule command ("learn this rule: …",
+        # "show rule N", "forget rule N" — core/owner_rules.py) is carried out HERE, before the
+        # model runs, not left to its choice of tool. Owner turns only (never a member, a channel
+        # or a probe). Known limit (§4SZ review r2): this is at ARRIVAL, before the turn lock — a
+        # command sent while another request holds the lock is carried out at once and its reply
+        # waits; if that wait is cancelled the change stays and its "✓" line is never shown.
         _rn_note = await self._owner_rule_note(body)
         _owner_rule_note_ctx.set(str(_rn_note or ""))
         _rb = str(getattr(_rn_note, "banner", "") or "")
@@ -31081,19 +30428,12 @@ class GhostAgent:
                     pass
 
                 # Pre-allocate the trajectory id for THIS turn. Several
-                # in-turn paths (Perfection-Protocol's lesson save, the
-                # post-turn user-correction retraction on the *next*
-                # turn) need a stable id BEFORE `_record_turn_trajectory`
-                # runs at end-of-turn. Threading the same id through to
-                # the eventual `Trajectory(id=...)` keeps lesson
-                # provenance (`source_trajectory_id`) and the persisted
-                # trajectory in sync — the prerequisite for
-                # `SkillMemory.retract_lessons_from_trajectory` to
-                # actually find the lessons it needs to scrub.
+                # in-turn paths (the verdict ledger, the late-verdict
+                # backfill, the next turn's user correction) need a stable
+                # id BEFORE `_record_turn_trajectory` runs at end-of-turn;
+                # the same id is threaded through to the eventual
+                # `Trajectory(id=...)`.
                 current_trajectory_id = uuid.uuid4().hex
-                # §4LC: in-turn lesson writes stamp it (learn_skill left "")
-                from ..utils.logging import trajectory_id_context as _tid_ctx
-                _tid_ctx.set(current_trajectory_id)
                 # ...and mark it IN FLIGHT until `_record_turn_trajectory`
                 # writes it: a late verdict that lands first is deferred to
                 # that write instead of finding no record (2026-09-13).
@@ -31121,8 +30461,8 @@ class GhostAgent:
 
                 # §4PY (e85e344a, a69fb76d): an owner rule / test command the system already
                 # carried out is answered by the system's own line — no model call. Told "add
-                # nothing", the model still ran tools in 3 of 4 such turns, listed the LESSONS as
-                # the "proposed rules", reached for knowledge_base and asked where the rules live.
+                # nothing", the model still ran tools in 3 of 4 such turns, listed the lessons (a
+                # store since removed) as the "proposed rules", reached for knowledge_base and asked where the rules live.
                 # Every command matches the WHOLE message, so nothing else is left to answer.
                 # A system line, deliberately: no project start-with rule, no conversation
                 # reconcile, no model-facing note (those serve a model's reply).
@@ -31165,11 +30505,11 @@ class GhostAgent:
                     last_user_content = " ".join([i.get("text", "") for i in last_user_content_raw if isinstance(i, dict) and i.get("type") == "text"])
                 else:
                     last_user_content = str(last_user_content_raw)
-                # §4KW: the request a request-scoped lesson is judged against,
-                # on EVERY retrieval path of this turn (the planner's and the
-                # volatile block's queries are prose, not the request)
+                # the request text of THIS turn, for its readers outside the
+                # loop (the fact ledger's "the owner's own words", the forget
+                # tool) — `memory/request_text.py`
                 try:
-                    from ..memory.lesson_scope import current_request as _cur_req
+                    from ..memory.request_text import current_request as _cur_req
                     _cur_req.set(str(last_user_content or ""))
                 except Exception:  # noqa: BLE001
                     pass
@@ -31273,7 +30613,7 @@ class GhostAgent:
                 # (core/failure_dimension.py). Filled in the dispatch loop
                 # next to classify_tool_failure; classified and consumed by
                 # the finalize chain's work-log write-back. Not project-
-                # gated: future lesson producers read it too.
+                # gated.
                 self.context._turn_failure_texts = []
                 self.context._pre_tool_segments = []      # §4LH
                 self.context._offproject_steer_done = False
@@ -31304,6 +30644,7 @@ class GhostAgent:
                 # (a behavioural failure for the corpus), and how many repeated-
                 # opening answers the cross-turn breaker has let through.
                 loop_breaker_for(self.context, req_id, pop=True)   # a reused id starts clean
+                guard_events_for(self.context, req_id, pop=True)   # §4TC: and with no guard event counted
                 try:                                               # §4SB r2: and no stale §4PO carry (sched-/probe ids)
                     getattr(self.context, "_po_carries", {}).pop(str(req_id or ""), None)
                 except Exception:  # noqa: BLE001
@@ -31356,9 +30697,7 @@ class GhostAgent:
                     if (_user_asked_for_notification(last_user_content)
                             and not _np_is_internal(
                                 request_id_context.get())
-                            and getattr(getattr(self.context, "skill_memory",
-                                                None),
-                                        "is_read_only", False) is not True):
+                            and not is_simulated_context(self.context)):
                         _np_pid = getattr(self.context,
                                           "current_project_id", None)
                         if _np_pid:
@@ -31411,11 +30750,22 @@ class GhostAgent:
                     # _note_defect_on_done_project.
                     self._note_defect_on_done_project(lc)
 
+                # §4TC: thanks / praise in the owner's message lifts the mood
+                # a little — once per request (this block runs once), for a
+                # real owner request only (`mood_moves_on_this_request`).
+                try:
+                    from ..selfhood.mood import (KIND_PRAISE as _MOOD_KIND_PRAISE,
+                                                 has_praise as _mood_has_praise)
+                    if _mood_has_praise(last_user_content):
+                        self._mood_owner_reaction(_MOOD_KIND_PRAISE)
+                except Exception as e:  # noqa: BLE001 — the mood never breaks a turn
+                    logger.debug("mood praise skipped: %s: %s", type(e).__name__, e)
+
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the
                 # immediately-prior assistant turn, promote that
-                # trajectory to FAILED via the corrections sidecar (and
-                # retract the lessons it taught). Non-fatal: a failure here
+                # trajectory to FAILED via the corrections sidecar.
+                # Non-fatal: a failure here
                 # must never break the user turn.
                 try:
                     # A member's message never relabels a prior turn (R8, CRIT:
@@ -31448,7 +30798,7 @@ class GhostAgent:
                 has_coding_intent, is_meta_task = detect_coding_intent(lc, messages)
 
                 # ARCHITECTURAL OPTIMISATION #4: Request-scoped lazy cache.
-                # Profile / playbook / tool defs / XML schema all become
+                # Profile / tool defs / XML schema all become
                 # one-and-done per request instead of per-turn.
                 request_state = GhostAgent._RequestState(self)
                 profile_context = await request_state.get_profile_str()
@@ -31571,8 +30921,6 @@ class GhostAgent:
                     if m.get("role") == "system": m["content"] = base_prompt; found_system = True; break
                 if not found_system: messages.insert(0, {"role": "system", "content": base_prompt})
 
-                is_fact_check = "fact-check" in lc or "verify" in lc
-
                 tool_action_verbs = [
                     "search", "download", "run", "execute", "schedule", "read", "fetch",
                     "calculate", "count", "summarize", "find", "open", "check", "test",
@@ -31589,8 +30937,12 @@ class GhostAgent:
                 # §4RP-c) also caught "where do i live ?", "what's my dogs name ?",
                 # "news", "weather" — and none of them reached a single memory tier
                 # (§4QM operator item 1; hydration costs ~0.6 s).
-                should_fetch_memory = (not is_fact_check
-                                       and not self._is_strict_trivial_chat(lc)
+                # §4TB r2: no fact-check exception. A lexical test on the message
+                # ("verify", then "fact-check" on its first line) switched memory
+                # off for the turn; it misfired in two shapes over two review
+                # rounds and was removed, not refined. The verdict never used
+                # memory: `fact_check` judges the claim on its research only.
+                should_fetch_memory = (not self._is_strict_trivial_chat(lc)
                                        # §4KY: no private memory in a public reply
                                        and not reply_is_public())
 
@@ -31626,11 +30978,8 @@ class GhostAgent:
                                 search_query,
                                 context_budget=4000,
                                 raw_user_text=last_user_content,
-                                # Stamp the stash so only THIS turn's judge
-                                # consumes it, and keep the active session's
-                                # own stored history out of the PAST
-                                # CONVERSATIONS tier.
-                                turn_id=str(req_id or ""),
+                                # keep the active session's own stored
+                                # history out of the PAST CONVERSATIONS tier
                                 exclude_session_id=str(
                                     body.get("session_id") or ""),
                             )
@@ -31645,8 +30994,6 @@ class GhostAgent:
                 # prompts ("Markos born ~2017-03", the role-play "user plays
                 # Black against Vasilis") and nothing ever cleaned it. The
                 # profile is the current truth and is always in the prompt.
-
-                fetched_playbook = ""  # Now dynamically populated inside the loop
 
                 # ============================================================
                 # ARCHITECTURAL OPTIMISATION #1: KV-CACHE-STABLE SYSTEM PROMPT
@@ -31687,7 +31034,7 @@ class GhostAgent:
                 final_ai_content, created_time = "", int(datetime.datetime.now().timestamp())
                 force_stop, seen_tools, tool_usage, last_was_failure = False, set(), {}, False
                 # Per-request idempotency ledger. Tools that are pure setters
-                # (update_profile, learn_skill, knowledge_base.insert_fact /
+                # (update_profile, knowledge_base.insert_fact /
                 # forget) get refused on repeat-with-identical-args within the
                 # same request. Without this guard, the model can lose track
                 # of "I already did X" and loop the same call 9 turns in a
@@ -31760,7 +31107,6 @@ class GhostAgent:
                 payload = None
                 was_complex_task = False
 
-                task_tree = TaskTree()
                 _request_sys3_fired_once = 0
                 _request_sys3_prev_justification = ""
                 force_final_response = False
@@ -32376,18 +31722,8 @@ class GhostAgent:
                             f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
                             f"{render_think_budget_guidance(think_budget)}\n"
                         ).replace("\r", "")
-                    # --- INTENT-DRIVEN SKILL RECALL ---
-                    # ARCHITECTURAL OPTIMISATION #4: the playbook lookup is
-                    # cached per (skill_query) inside `request_state`, so a
-                    # multi-turn request with a stable query pays the cost
-                    # exactly once.
-                    fetched_playbook = ""
-                    if self.context.skill_memory:
-                        skill_query = last_user_content
-                        playbook = ("" if _owner_context_hidden(self.context)
-                                    else await request_state.get_skill_playbook(skill_query or ""))
-                        if playbook:
-                            fetched_playbook = f"### SKILL PLAYBOOK:\n{playbook}\n\n"
+                    # (§4TD: no "### SKILL PLAYBOOK" block — lesson retrieval,
+                    # off behind a flag since §4ON, is removed with the store.)
 
                     # Top-of-state CWD pin (coding turns only). The rule
                     # previously sat between SCRAPBOOK and SANDBOX STATE,
@@ -32447,6 +31783,7 @@ class GhostAgent:
                     if _owner_rule_note_ctx.get():
                         _ds_parts.append(("owner_rule_command", f"### OWNER RULE COMMAND\n{_owner_rule_note_ctx.get()}\n\n"))
                     _ds_parts.append(("owner_rules", _owner_rules_block(self.context)))    # §4NA
+                    _ds_parts.append(("mood_tone", _mood_tone_block(self.context)))        # §4TC
                     try:
                         from .prompts import build_project_briefing
                         _proj_store = getattr(self.context, "project_store", None)
@@ -32662,15 +31999,11 @@ class GhostAgent:
                     # the first differing byte, so pushing the only per-turn-
                     # varying blocks to the end maximises the cached region.
                     #
-                    # Under pin (2026-07-22), two per-turn-varying pieces are
-                    # moved OUT of the "stable" block into the volatile front so
-                    # the pinned prefix is genuinely byte-identical across turns:
-                    #   (a) fetched_playbook — its skill_query is rebuilt from the
-                    #       planner's per-turn required_tool + thought_content, so
-                    #       it changed every planned turn and busted the prefix
-                    #       from its position; it is per-turn-relevant, so it
-                    #       BELONGS in the volatile block.
-                    #   (b) the final-gen directive — see above.
+                    # Under pin (2026-07-22), the per-turn-varying final-gen
+                    # directive (see above) is moved OUT of the "stable" block
+                    # into the volatile front so the pinned prefix is genuinely
+                    # byte-identical across turns. (The lesson playbook block
+                    # moved with it until §4TD removed it.)
                     # Unpinned mode keeps the exact original composition (cache is
                     # not a concern there, and the existing layout tests pin it).
                     _stable_first = _pin_stable and _stable_first_message()   # §4RV
@@ -32679,10 +32012,8 @@ class GhostAgent:
                         _volatile_prefix = ""
                         if _final_gen_directive:
                             _volatile_prefix += _final_gen_directive + "\n"
-                        if fetched_playbook:
-                            _volatile_prefix += fetched_playbook
                         dynamic_state = _volatile_prefix + dynamic_state
-                        _ds_sections = _state_sections_pinned(_ds_sections, _final_gen_directive, fetched_playbook)
+                        _ds_sections = _state_sections_pinned(_ds_sections, _final_gen_directive)
                         if _stable_first:
                             # §4RV: the first message is the same on every request
                             # of a conversation; what each request brings (thinking
@@ -32694,7 +32025,7 @@ class GhostAgent:
                             dynamic_state = "".join(_req_ctx.values()) + dynamic_state
                             _ds_sections = {**_req_ctx, **_ds_sections}
                     else:
-                        _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{_continuity_tail}"
+                        _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_context}{_continuity_tail}"
                     # Measurement hook: a stable hash across a request's turns
                     # means the prefix is cacheable; a changing hash points at a
                     # remaining buster. Cheap (one sha1 of already-built text).
@@ -32734,12 +32065,10 @@ class GhostAgent:
                         # perfect_it=False) — comparing there fired a FALSE
                         # "MISS" on the operator stream (the instrument
                         # lying on the stream it was built to verify). An
-                        # isolate is identifiable by its read-only skill
-                        # store; skip it and leave the stash for the first
+                        # isolate is identifiable by its `simulated` flag;
+                        # skip it and leave the stash for the first
                         # real main-context request to consume.
-                        _iso = (getattr(getattr(self.context, "skill_memory",
-                                                None), "is_read_only",
-                                        False) is True
+                        _iso = (is_simulated_context(self.context)
                                 or getattr(self.context, "profile_memory",
                                            None) is None
                                 # §4LE: a member's / a channel's head differs
@@ -33245,7 +32574,6 @@ class GhostAgent:
                         last_user_content=last_user_content,
                         char_budget=char_budget,
                         strikes=strikes,
-                        task_tree=task_tree,
                         _user_batch_intent=_user_batch_intent,
                         _request_constraints=_request_constraints,
                         repeated_action_steered=repeated_action_steered,
@@ -34201,6 +33529,9 @@ class GhostAgent:
                 # promotions on the owner's real push-backs) could not be measured
                 logger.info("user-correction judge: contradicts=%s on %r",
                             _contradicts, str(last_user_content or "")[:80])
+            if _contradicts is True:
+                from ..selfhood.mood import KIND_CORRECTION
+                self._mood_owner_reaction(KIND_CORRECTION)        # §4TC: once per turn (one judge per request)
             self._maybe_promote_prior_turn_via_user_correction(
                 messages, last_user_content, contradicts=_contradicts)
         except Exception as e:  # noqa: BLE001 — bookkeeping never breaks anything
@@ -34398,74 +33729,19 @@ class GhostAgent:
         # doesn't re-fire on the same prior turn.
         cache.pop(fp, None)
 
-        # Lesson-outcome negative. The same user-correction is the strongest
-        # FAILED signal the loop can get, but it once reached only the
-        # (since removed) calibration corpus — the outcome-gated lesson arm
-        # never saw it. Those
-        # turns are exactly the ones the arm exists for: the turn looked
-        # clean (no execution error, no verifier refute, so it was stashed
-        # "awaiting a late verdict"), the surfaced lessons did NOT prevent a
-        # wrong answer, and with no verdict ever landing the stash entry was
-        # evicted UNCOUNTED. Draining it as a failure is the whole point of
-        # the stash. Uses the existing flush helper, so a turn that already
-        # recorded inline is a no-op.
-        try:
-            if getattr(traj, "id", None):
-                self._flush_stashed_lesson_outcome(traj.id, False)
-        except Exception as _lox:
-            logger.debug("lesson correction-negative skipped: %s", _lox)
-
-        # Scrub any lessons the just-failed trajectory produced
-        # before the user could push back. The dominant case is the
-        # Perfection-Protocol writing an "Optimization Analysis"
-        # lesson at end-of-turn from a turn the user is now
-        # correcting — without retraction, that poisoned lesson
-        # would survive in the playbook and surface on future
-        # similar queries. Best-effort: a failed retraction must
-        # not block the rest of the promotion path. The reflection
-        # task scheduled below will write a CORRECT lesson tagged
-        # with the reflection trajectory's id, so the playbook ends
-        # up with the right entry rather than both.
+        # (§4TD: the lesson-outcome negative and the retraction of the
+        # corrected turn's lessons that ran here are removed with the lesson
+        # store.)
         # the corrected turn's episode stops saying SUCCESS (§4LA)
         try:
             self._relabel_episode("", "the owner corrected this answer", trigger=str(getattr(traj, "user_request", "") or ""))
         except Exception:  # noqa: BLE001
             pass
-        skill_memory = getattr(ctx, "skill_memory", None)
-        vector_memory = getattr(ctx, "memory_system", None)
-        if skill_memory is not None and traj.id:
-            try:
-                # Retraction blocks (file lock + playbook rewrite + sync
-                # Chroma delete). This helper runs ON the event loop, so
-                # offload to a thread like the PRM online-update below;
-                # inline only when no loop is running (sync/test callers).
-                try:
-                    asyncio.get_running_loop()
-                    # spawn_bg: strong ref (won't be GC'd mid-write) + failure
-                    # is logged, not swallowed. Previously a bare unstored
-                    # create_task in violation of this file's own GC-safety
-                    # rule (agent.py ~2025).
-                    _glog.spawn_bg(asyncio.to_thread(
-                        skill_memory.retract_lessons_from_trajectory,
-                        traj.id,
-                        memory_system=vector_memory,
-                    ), name="lesson-retract")
-                except RuntimeError:
-                    skill_memory.retract_lessons_from_trajectory(
-                        traj.id,
-                        memory_system=vector_memory,
-                    )
-            except Exception as e:
-                logger.debug(
-                    "lesson retraction skipped: %s: %s",
-                    type(e).__name__, e,
-                )
-
 
     def _stream_final_generation(self, ss: "StreamState"):
         # The wrapper below runs AFTER handle_chat's finally has reset the
         # request contextvars; everything the drain does (the smart-memory
-        # write, the late verdict, the playbook backstop) would otherwise
+        # write, the late verdict) would otherwise
         # read "SYSTEM" / no role (R2 review, 2026-09-24).
         requester_role = ss.requester_role
         pre_tool_segments = ss.pre_tool_segments
@@ -34869,23 +34145,20 @@ class GhostAgent:
                         if last_60.strip() and tail.count(last_60) >= 5:
                             pretty_log("Cognitive Watchdog", "Infinite <think> loop detected. Severing stream.", level="WARNING", icon=Icons.STOP)
                             loop_detected = True
-                            # Path-aware dialect (2026-08-01): this synthetic
-                            # call is persisted into episode/trajectory and
-                            # replayed as assistant history — on the native
-                            # path an attribute-dialect exemplar here was a
-                            # standing dual-dialect nudge.
-                            _bt_reason = "SYSTEM OVERRIDE: My internal monologue got stuck in an infinite loop. I am forcing a strategy reset."
-                            if bool(getattr(getattr(self.context, "args", None), "native_tools", False)):
-                                break_text = f"\n</think>\n<tool_call>\n<function=replan>\n<parameter=reason>\n{_bt_reason}\n</parameter>\n</function>\n</tool_call>"
-                            else:
-                                break_text = f"\n</think>\n<tool_call>\n<function name=\"replan\">\n<parameter name=\"reason\">{_bt_reason}</parameter>\n</function>\n</tool_call>"
+                            # §4TB: a plain NOTE, not a call. Until 2026-11-05
+                            # this was a synthetic `replan` tool call, kept in
+                            # the durable text; the record is read back in later
+                            # turns (the work log, an episode, the "my answer"
+                            # line of a recalled experience), where it was an
+                            # exemplar of a call to a tool that no longer exists.
+                            break_text = WATCHDOG_BREAK_NOTE
                             # § finalize/stream R1 B-2: on the scrub path the
                             # client must NEVER receive the raw synthetic tool
                             # XML (it bypassed the active scrub and the user's
                             # visible reply became `</think><tool_call>…SYSTEM
                             # OVERRIDE…`). Emit a clean notice instead; the
-                            # XML still lands in durable full_content, which
-                            # is what the replay/trajectory machinery reads.
+                            # note above still lands in durable full_content,
+                            # which is what the record keeps.
                             if _stream_scrub_active:
                                 _client_text = ("\n\n[⚠ stream interrupted — "
                                                 "internal reasoning loop "
@@ -35070,8 +34343,8 @@ class GhostAgent:
                     unparsed_call_markup_present as _ucm_present)
                 # The shared predicate, on the text this stream produced
                 # (the prefix was delivered before the scrub existed): not
-                # a <tool_response> echo, not inline code, not the
-                # watchdog's own replan marker (review, 2026-09-09).
+                # a <tool_response> echo, not inline code (review,
+                # 2026-09-09).
                 # §4IS (req 309f45f8): the note is DUE here but yielded after
                 # the forced-final retry below, so an answer that retry
                 # supplies comes first and the caveat last — the order the
@@ -35744,8 +35017,7 @@ class GhostAgent:
                 try:
                     from .autonomous_activity import (
                         is_internal_request as _is_internal_req_snb)
-                    _sim = getattr(getattr(self.context, "skill_memory", None),
-                                   "is_read_only", False) is True
+                    _sim = is_simulated_context(self.context)
                     # _drain_pid, NOT live current_project_id: this drain runs
                     # post-semaphore, and a concurrent turn can re-point the
                     # global pointer mid-drain — firing (or consuming) another
@@ -35846,8 +35118,8 @@ class GhostAgent:
                 # could never amend it: the verdict ALWAYS runs
                 # late here, regardless of GHOST_CRITIC_ASYNC —
                 # spawn the pure computation and hand it to the
-                # late handler (logs every outcome, scrubs
-                # poisoned lessons, backfills the trajectory).
+                # late handler (logs every outcome,
+                # backfills the trajectory).
                 # force_correction=True because a streamed reply
                 # never carries an inline Verifier note — a
                 # high-conf REFUTED queues a banner that the next
@@ -35984,41 +35256,9 @@ class GhostAgent:
                         f"{str(_svx)[:160]}",
                         icon=Icons.WARN, level="WARNING")
 
-                # Retrieval feedback loop: credit lessons that
-                # were surfaced during this turn whenever the
-                # turn finished without an execution failure.
-                # `credit_recent_retrievals` is idempotent per
-                # retrieval (via `last_credited_at`) and only
-                # touches lessons whose `last_retrieved_at`
-                # falls inside the window, so calling it on
-                # turns that didn't surface any lesson is a
-                # no-op. The previous gate
-                # (`was_complex_task or execution_failure_count
-                # > 0`) excluded simple successful tool turns
-                # — exactly the population where lessons are
-                # most likely to be helping — so the feedback
-                # signal was biased toward complex tasks and
-                # the pruner drifted accordingly.
-                sm = getattr(self.context, 'skill_memory', None)
-                await self._credit_turn_lessons(execution_failure_count, last_user_content,
-                                       final_text=_treated_content)
-
-                # Outcome-gated lesson feedback (streamed path): the verifier runs
-                # LATE here (trajectory recorded with verifier=None), so only a
-                # structural execution failure is decisive now; a clean turn is
-                # stashed by trajectory_id and drained when the async verdict lands
-                # via _backfill_trajectory_outcome.
-                try:
-                    await self._record_lesson_outcomes(
-                        # BOTH injection surfaces — see the finalize-path call.
-                        surfaced_triggers=self._surfaced_lesson_triggers(
-                            sm, turn_id=str(req_id or "")),
-                        execution_failure_count=execution_failure_count,
-                        verifier_backfill=None,
-                        trajectory_id=current_trajectory_id,
-                    )
-                except Exception:
-                    pass
+                # (§4TD: the lesson retrieval credit and the outcome-gated
+                # lesson feedback that closed the streamed tail are removed
+                # with the lesson store.)
 
             except Exception as _tail_exc:  # noqa: BLE001
                 # The handler itself must not be able to raise — a throw here
@@ -36034,8 +35274,8 @@ class GhostAgent:
             # ── RELEASE THE HELD [DONE] SENTINEL — LAST STATEMENT OF THE
             # GENERATOR (2026-08-11, §4AT-A) ────────────────────────────────
             # Everything that must survive the turn has now run: episode,
-            # hydration judge, trajectory, project work_log, verifier spawn,
-            # lesson outcomes. A client closing on the sentinel can no longer
+            # hydration judge, trajectory, project work_log, verifier spawn.
+            # A client closing on the sentinel can no longer
             # discard any of it. The reader waits for the end-of-stream marker,
             # not for content — the answer text was fully streamed long before.
             #
@@ -36589,64 +35829,27 @@ class GhostAgent:
                 # §4OK (operator): bookkeeping after a late verdict — information, never an error
                 pretty_log("Episode Relabelled", f"{str(req_id or trigger)[:30]}: {note}",
                            icon=Icons.VERDICT_NOTE, level="INFO")
-                # §4LC: the lessons built from those episodes stop being taught
-                _sm = getattr(self.context, "skill_memory", None)
-                _ids = getattr(em, "last_relabelled_ids", None)
-                if _sm is not None and hasattr(_sm, "quarantine_citing") and isinstance(_ids, list) and _ids:
-                    _q = _sm.quarantine_citing([f"ep:{i}" for i in _ids], f"its episode was {note}")
-                    if _q:
-                        pretty_log("Lessons Quarantined", f"{_q} lesson(s) built from a relabelled episode",
-                                   icon=Icons.VERDICT_NOTE, level="INFO")
         except Exception as e:  # noqa: BLE001
             logger.debug("episode relabel failed: %s", e)
 
-    async def _perfect_it_generate_and_learn(
-        self,
-        p_payload: dict,
-        lesson_label: str,
-        trajectory_id: str,
-        foreground: bool = False,
-    ) -> str:
-        """Run the Perfect-It completion and persist the lesson.
+    async def _perfect_it_generate(self, p_payload: dict, foreground: bool = False) -> str:
+        """Run the Perfect-It completion (--perfect-it: the text joins the
+        reply, so the caller awaits it on the response path — that caller
+        MUST pass foreground=True, or the LLM call parks in
+        _wait_for_foreground_clear against its own still-active request for
+        up to 600s). Returns the generated optimization text ('' when the
+        model produced nothing usable). Raises on LLM failure — the caller
+        decides how to surface that.
 
-        Shared by the inline path (--perfect-it: the text joins the reply,
-        so the caller awaits it on the response path — that caller MUST pass
-        foreground=True, or the LLM call parks in _wait_for_foreground_clear
-        against its own still-active request for up to 600s) and the
-        deferred path (flag off: internal learning only, scheduled as a
-        background task — default foreground=False yields to live users).
-        Returns the generated optimization text ('' when the model produced
-        nothing usable). Raises on LLM failure — each caller decides how to
-        surface that.
-
-        The lesson is tagged with this turn's trajectory id: if the user
-        corrects on the next turn, `retract_lessons_from_trajectory` scrubs
-        this exact entry from both the JSON playbook and the vector store.
-        Without provenance, the rubber-stamped opt-prot lesson would survive
-        the correction and poison future retrieval.
+        §4TD: it writes nothing. Until then it also saved the text as a
+        lesson (a source the store had refused since §4NC); the lesson
+        store is removed.
         """
         perfection_data = await self.context.llm_client.chat_completion(
             p_payload, use_worker=True, is_background=not foreground, off_main_only=not foreground, task_label="perfect-it"  # §4O A-MAJOR-2: off-main only for the idle (background) variant
         )
         p_msg = perfection_data["choices"][0]["message"].get("content", "")
         p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
-
-        if not turn_may_teach(self.context):
-            # The inline (--perfect-it) path reaches here without the
-            # scheduling gate above; same rule, same reason (§4FS; §4KD
-            # adds Slack).
-            return p_msg
-        if p_msg and getattr(self.context, 'skill_memory', None):
-            await asyncio.to_thread(
-                self.context.skill_memory.learn_lesson,
-                task=lesson_label,
-                mistake="Sub-optimal pattern identified via Perfection Protocol",
-                solution=p_msg,
-                memory_system=self.context.memory_system,
-                source_trajectory_id=trajectory_id,
-                source="perfection_protocol",
-            )
-            # §4NV: no "saved" line — this source is refused since §4NC
         return p_msg
 
     #: §4O R2 MINOR-1: prefixes of SYNTHETIC user-role messages the turn
@@ -36681,6 +35884,19 @@ class GhostAgent:
         synthetic. Only when the request text is unavailable/unmatched do
         we fall back to "last non-synthetic user message" (denylist)."""
         msgs = msgs or []
+        boundary = GhostAgent._this_turn_boundary(msgs, real_request)
+        return sum(
+            1 for m in msgs[boundary + 1:]
+            if isinstance(m, dict) and m.get("role") == "assistant"
+        )
+
+    @staticmethod
+    def _this_turn_boundary(msgs, real_request: str = "") -> int:
+        """The index of this turn's REAL user message in ``msgs`` (-1 when
+        there is none): everything after it is this turn. The rule is
+        `_this_turn_step_count`'s, extracted (§4TC) so the mood's end-of-turn
+        signals count the same turn the corpus does."""
+        msgs = msgs or []
         boundary = -1
         rr = str(real_request or "").strip()
         if rr:
@@ -36701,9 +35917,49 @@ class GhostAgent:
                         not GhostAgent._msg_text(m).lstrip().startswith(
                             GhostAgent._SYNTHETIC_USER_PREFIXES):
                     boundary = i
-        return sum(
-            1 for m in msgs[boundary + 1:]
-            if isinstance(m, dict) and m.get("role") == "assistant"
+        return boundary
+
+    def _mood_turn_signals(self, msgs, real_request: str, req_id: str, *,
+                           duration_s: float = 0.0, lockdown: bool = False,
+                           completed: bool = True):
+        """§4TC: what happened in THIS turn, as the mood reads it — from
+        signals the loop already has: the turn's tool calls and which of
+        them failed (the corpus's own reconstruction, so "failed" means here
+        what it means there; a designed stop is not a failure), the pages its
+        research tools read (`link_grounding.fetched_urls`), how many times a
+        loop guard stepped in (`guard_events_for`), whether it ended under
+        the context-pressure lockdown, and how long it took.
+
+        Review: two kinds of rows are not the mood's business and are left
+        out before anything is counted — every `introspect` call (the agent
+        reading or setting itself is not work that went well or badly), and
+        a refusal that is the system working as designed
+        (`MOOD_BLIND_REASONS`: outside content, a member's or a non-owner's
+        call). And when the owner SET the mood or the manner in this turn,
+        `owner_set` says so: his word holds for the turn."""
+        from ..selfhood.mood import TurnSignals
+        from ..tools.introspect import is_write_call as _is_mood_write
+        from .link_grounding import fetched_urls
+        turn = list(msgs or [])[self._this_turn_boundary(msgs, real_request) + 1:]
+        owner_set = any(c.name == "introspect" and _is_mood_write(c.arguments)
+                        and c.result and not c.error
+                        for c in self._reconstruct_tool_calls(turn))
+        seen = [m for m in turn if not _mood_blind_row(m)]
+        calls = [c for c in self._reconstruct_tool_calls(seen) if (c.result or c.error)]
+        rows = [m for m in seen if isinstance(m, dict) and m.get("role") == "tool"]
+        try:
+            sources = len(fetched_urls(rows))
+        except Exception:  # noqa: BLE001
+            sources = 0
+        return TurnSignals(
+            tool_calls=len(calls),
+            failures=sum(1 for c in calls if c.error),
+            guards=len(guard_events_for(self.context, req_id)),
+            sources=sources,
+            duration_s=float(duration_s or 0.0),
+            completed=bool(completed),
+            pressure=bool(lockdown),
+            owner_set=bool(owner_set),
         )
 
     @staticmethod
@@ -36895,7 +36151,8 @@ class GhostAgent:
                 pressure_lockdown=(bool(pressure_lockdown) if pressure_lockdown is not None
                                    else bool(getattr(self.context, "_pressure_lockdown", False))),
                 project_id=project_id, elapsed_s=elapsed_s,
-                trajectory_id=trajectory_id, temperature=temperature)
+                trajectory_id=trajectory_id, temperature=temperature,
+                aborted=True)        # §4TC: an abort from outside is not something that happened to me
         except Exception as _exc:  # noqa: BLE001 — recording must never break the unwind
             logger.warning("aborted-turn record skipped for %s: %s: %s",
                            req_id, type(_exc).__name__, _exc)
@@ -37119,18 +36376,22 @@ class GhostAgent:
         project_id: Optional[str] = None,
         elapsed_s: Optional[float] = None,
         temperature: Optional[float] = None,
+        aborted: bool = False,
     ) -> Optional["Trajectory"]:
         """Build and persist a Trajectory for the turn that just finished.
         Returns the row it wrote (None when the collector is not wired), so
         the Turn Outcome line can mirror the corpus verdict from the row
         itself rather than re-finding it through a cache (§4EE R3).
 
-        ``pressure_lockdown`` feeds the derived-mood hook at the bottom.
+        ``pressure_lockdown`` feeds the mood hook at the bottom (§4TC: a
+        turn that ended under the lockdown counts as one guard event).
         None means "caller runs INSIDE this request's semaphore — read the
         live context flag" (true for the finalize chain). Any caller that
         runs post-semaphore (the SSE drain) MUST pass its semaphore-time
         snapshot instead: the live flag there describes whichever request
-        holds the semaphore now, not this turn.
+        holds the semaphore now, not this turn. ``aborted`` (§4TC): the turn
+        was cut from outside (`_record_aborted_turn`) — it is recorded, and
+        it does not move the mood.
 
         No-op when `ctx.trajectory_collector` isn't wired. Walks the
         final `messages` list to reconstruct the tool-call sequence
@@ -37250,14 +36511,10 @@ class GhostAgent:
                 traj_kwargs["duration_s"] = round(_elapsed, 3)
         except Exception:
             pass
-        # Hydrated-lesson attribution (2026-07-17): stamp WHICH playbook
-        # lessons were injected into this turn's prompt (side-channel set
-        # by get_playbook_context — turns are globally serialized), so a
-        # refuted turn can retract what it was taught.
         _extra: Dict[str, Any] = {}
-        # The requester's role rides the trajectory so the idle phases
-        # (reflection, dream, distillation) can refuse a member's turn as a
-        # lesson source without knowing which client it came from.
+        # The requester's role rides the trajectory so a later reader of the
+        # corpus (`memory/population.trajectory_may_teach`) can refuse a
+        # member's turn without knowing which client it came from.
         try:
             _extra["requester_role"] = str(requester_role_context.get() or "")
         except Exception:  # noqa: BLE001
@@ -37308,32 +36565,7 @@ class GhostAgent:
                 _extra.update({str(k): v for k, v in _static.items()})
         except Exception:  # noqa: BLE001
             pass
-        try:
-            # §4BF 1c (R5 review MAJOR, belt): USER turns only. The
-            # read-only wrapper no longer passes `last_playbook_triggers`
-            # through (the sim read stamps nothing, so a passthrough read
-            # served the LAST REAL TURN's lesson set — bench trajectories
-            # were stamped with real lessons as their hydration, a
-            # lesson-attribution poison). This gate is the belt
-            # for any future wrapper drift.
-            _sm_h = (getattr(self.context, "skill_memory", None)
-                     if turn_origin(self.context) == "user" else None)
-            # §4KW: the SAME turn-guarded union the outcome credit reads
-            # (`_surfaced_lesson_triggers`). The playbook list was read
-            # unguarded, so a turn that ran no playbook lookup recorded the
-            # PREVIOUS turn's lessons (live 2026-10-02: "what about Veronica
-            # Moser ?" recorded the five project lessons of the turn before).
-            try:
-                from ..utils.logging import request_id_context as _ric
-                _cur_key = str(_ric.get() or "") or str(req_id or "")
-            except Exception:
-                _cur_key = str(req_id or "")
-            _trigs = (list(dict.fromkeys(self._surfaced_lesson_triggers(_sm_h, turn_id=_cur_key)))
-                      if (_sm_h is not None and _cur_key) else [])
-            if _trigs:
-                _extra["hydrated_lessons"] = _trigs[:10]
-        except Exception:
-            pass
+        # (§4TD: no `hydrated_lessons` stamp — no lesson enters a prompt.)
         if _prompt_arm_now():
             _extra["prompt_arm"] = _prompt_arm_now()        # §4MV: a probe's experiment arm
         # §4MW r2: the turn's position in its conversation — the failure
@@ -37431,7 +36663,7 @@ class GhostAgent:
         if _extra:
             traj_kwargs["extra"] = _extra
         # Use the pre-allocated id from `handle_chat` when present so
-        # in-turn writers (Perfection-Protocol's lesson save) and the
+        # in-turn writers (the verdict ledger) and the
         # eventual on-disk record share one stable id. Falls back to
         # the Trajectory dataclass's uuid factory when the caller
         # didn't pre-allocate (legacy callers, isolated unit tests).
@@ -37597,8 +36829,7 @@ class GhostAgent:
             )
         # The row exists now: replay any late verdict that arrived before
         # it (2026-09-13) — the deferred `_backfill_trajectory_outcome`
-        # call runs with the row in the cache, so the corpus write, the
-        # calibration re-label and the lesson flush all land.
+        # call runs with the row in the cache, so the corpus write lands.
         self._replay_deferred_late_backfill(getattr(traj, "id", None))
 
         # Selfhood capture (proposal item #1 + #2): write a first-person
@@ -37657,53 +36888,40 @@ class GhostAgent:
                 type(e).__name__, e,
             )
 
-        # Derived-mood update (mood rework 2026-08-20): recompute the
-        # functional mood from the verdict streak plus this turn's
-        # context-pressure lockdown flag. On the non-streamed path the
-        # capture above already carries the verifier-resolved verdict;
-        # on the streamed path verifier=None here, so the just-captured
-        # experience is outcome="unknown" until the late verifier
-        # backfills it — streak-derived moods can lag one turn there
-        # (unknowns are filtered, never miscounted).
-        # Separate try + same real_only origin gate as the capture:
-        # sim/bench turns must never author production mood (§4AT-G /
-        # §4BF 1c), and a fresh self-authored mood is respected inside
-        # update_derived_mood (grace window), so this cannot clobber a
-        # set_mood the model made this very turn. Ambiguous signals
-        # write nothing. Runs on both streamed and non-streamed turns —
-        # this method is the shared trajectory-append path (and like the
-        # capture, only when a trajectory_collector is wired: the
-        # early-return at the top of this method gates both).
+        # §4TC: the end of an OWNER's turn moves the mood, from what happened
+        # in it (`selfhood.mood.turn_events`): failed tool calls and guard
+        # events, a clean multi-tool turn, a research turn, a very long one.
+        # A plain chat turn changes nothing. Only a real owner request —
+        # never a probe, a member's turn, a scheduled task, a job wake, a
+        # sub-agent, self-play, a bench run or a leaf
+        # (`mood_moves_on_this_request`) — and never a turn that was cut from
+        # outside. Separate try: the mood is secondary to the record. Runs on
+        # both streamed and non-streamed turns — this method is the shared
+        # trajectory-append path (and, like the capture above, only when a
+        # trajectory_collector is wired: the early return at the top of this
+        # method gates both).
         try:
-            from ..selfhood import SelfModel as _SelfModelDM
-            _sm_dm = getattr(self.context, 'self_model', None)
-            if (isinstance(_sm_dm, _SelfModelDM)
-                    and getattr(_sm_dm, 'enabled', False)
-                    and turn_origin(self.context) == "user"
-                    and not requester_is_member()):
-                # See the docstring: None = in-semaphore caller, read
-                # live; the SSE drain passes its semaphore-time snapshot.
-                _plock = (pressure_lockdown
-                          if pressure_lockdown is not None
-                          else bool(getattr(
-                              self.context, "_ctx_pressure_lockdown",
-                              False)))
-                # operator_turn (review R4): scheduled tasks and job
-                # resumes run this same hook with origin "user" (live
-                # context, writable store) — but a 3am "sched-"/"job-"
-                # turn is NOT proof the operator is active, and letting
-                # it retire "idle" re-created the retire→re-derive
-                # flap. Same req_id-prefix discriminator the activity
-                # digest uses.
-                from .autonomous_activity import (
-                    is_internal_request as _is_internal_dm)
-                _sm_dm.update_derived_mood(
-                    pressure_lockdown=bool(_plock),
-                    operator_turn=not _is_internal_dm(req_id),
-                )
+            if mood_moves_on_this_request(self.context):
+                _sm_mood = _mood_model(self.context)
+                if _sm_mood is not None:
+                    # the owner was here — the next quiet is measured from
+                    # the end of this turn (a turn that was cut included)
+                    _sm_mood.owner_turn_ended()
+                    if not aborted:
+                        # See the docstring: None = in-semaphore caller, read
+                        # live; the SSE drain passes its semaphore-time snapshot.
+                        _plock = (pressure_lockdown
+                                  if pressure_lockdown is not None
+                                  else bool(getattr(
+                                      self.context, "_ctx_pressure_lockdown",
+                                      False)))
+                        _sm_mood.note_owner_turn(self._mood_turn_signals(
+                            msgs, user_request, req_id,
+                            duration_s=float(traj_kwargs.get("duration_s") or 0.0),
+                            lockdown=bool(_plock)))
         except Exception as e:
             logger.debug(
-                "derived-mood update skipped: %s: %s",
+                "mood turn update skipped: %s: %s",
                 type(e).__name__, e,
             )
         return traj

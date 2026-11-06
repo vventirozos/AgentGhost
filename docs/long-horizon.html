@@ -22,7 +22,7 @@
     <a href="tools.html">What it can do</a>
     <a href="ghost-labs.html">Labs: real machines</a>
     <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">The learning loop</a>
+    <a href="learning-loop.html">Owner rules</a>
     <a class="current" href="long-horizon.html">Long tasks</a>
 
     <h3>Running it</h3>
@@ -58,7 +58,7 @@
   <p>The fallback reply of a turn that produced no answer used to carry the last tool output only (700 characters of forty-nine fetched pages). It now carries the heads of every successful evidence-tool output, newest first, within a bound — what exists, so a "continue" can start from it.</p>
 
   <h2 id="record">The record of a delivered task</h2>
-  <p>Two things wrote a false failure over a delivered long task (§4OF). The "same tool error three times" rule that marks a turn failed for the learning loop fired on a build that went green after three failing runs and on a research turn whose report was on disk after four blocked pages; since §4OG it yields when the turn delivered — its last <code>execute</code> exited clean, or the reply hands over a file this turn wrote. And the verifier judged a report written as a file on the reply's one-line summary (it refuted the report for "lacking the Sources section" the file had): the document files a turn wrote (<code>.md</code>, <code>.txt</code>, <code>.html</code>, <code>.csv</code>…) were then read back from disk into the judge's evidence, as code already was for the code lens. (The LLM judge itself has been off since §4OW, 2026-10-14; the mechanical checks that remain read the files on disk.)</p>
+  <p>Two things wrote a false failure over a delivered long task (§4OF). The "same tool error three times" rule that marks a turn failed fired on a build that went green after three failing runs and on a research turn whose report was on disk after four blocked pages; since §4OG it yields when the turn delivered — its last <code>execute</code> exited clean, or the reply hands over a file this turn wrote. And the verifier judged a report written as a file on the reply's one-line summary (it refuted the report for "lacking the Sources section" the file had): the document files a turn wrote (<code>.md</code>, <code>.txt</code>, <code>.html</code>, <code>.csv</code>…) were then read back from disk into the judge's evidence, as code already was for the code lens. (The LLM judge itself has been off since §4OW, 2026-10-14; the mechanical checks that remain read the files on disk.)</p>
 
   <h2 id="reply">What the reply carries</h2>
   <p>Text the model writes beside a tool call predates that tool's result, so it is working narration ("Two remaining fixes…"), not the answer. It used to be dropped from the non-streamed reply only for lookup batches; the §4OF coding reply therefore opened with five superseded status notes written beside file and execute calls. Since §4OG the text beside any batch except a memory write is recorded and dropped — whole paragraphs only, never the answer itself, and never when what remains would not stand on its own; text beside a work batch (a file write, a command, a task update) goes only when what remains is at least one and a half times as long as it.</p>

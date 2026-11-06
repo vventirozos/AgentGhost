@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from ghost_agent.core.autonomous_activity import (
-    ActivityLog, SEVERITY_NOTIFY, save_consumer_offset,
+    ActivityLog, SEVERITY_NOTIFY, note_consumer_poll, save_consumer_offset,
 )
 from ghost_agent.tools import notify_tool
 from ghost_agent.tools.notify_tool import tool_notify_operator, PHASE
@@ -105,8 +105,11 @@ class TestDeliveryChannelHonesty:
         assert "push (webhook/ntfy)" in out
 
     def test_reports_a_client_only_after_its_consumer_has_polled(self, tmp_path):
-        """No client name is special (§4KJ, de-Slacked): any consumer that has
-        polled is reported by the name it registered under."""
+        """No client name is special (§4KJ, de-Slacked): any consumer that is
+        polling is reported by the name it registered under. §4TB: "polling"
+        is now — a stored position alone (it acknowledged once, some day) no
+        longer makes it a channel; tests/test_4tb_notify_delivery.py has the
+        rest."""
         ctx = _ctx(tmp_path)
         out0 = asyncio.run(tool_notify_operator(message="hi", context=ctx))
         assert "'slack' client" not in out0 and "'pager' client" not in out0
@@ -114,7 +117,13 @@ class TestDeliveryChannelHonesty:
             save_consumer_offset(
                 Path(str(ctx.memory_dir)).parent / "notify_consumers.json", name, 0)
         out = asyncio.run(tool_notify_operator(message="hi", context=ctx))
-        assert "'slack' client" in out and "'pager' client" in out
+        head = out.split("\n")[0]
+        assert "'slack' client" not in head and "'pager' client" not in head     # known, not polling
+        for name in ("slack", "pager"):
+            note_consumer_poll(ctx, name)
+        head = asyncio.run(tool_notify_operator(message="hi", context=ctx)).split("\n")[0]
+        assert "the operator's 'slack' client (last polled " in head
+        assert "the operator's 'pager' client (last polled " in head
 
 
 class TestWiring:

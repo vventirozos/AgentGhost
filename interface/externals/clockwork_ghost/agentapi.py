@@ -312,6 +312,24 @@ async def fetch_turns(client, base: str, key: str):
     return data if isinstance(data, dict) else None
 
 
+async def fetch_mood(client, base: str, key: str):
+    """``(label, intensity)`` from ``/api/health``, or None when the agent did
+    not answer or sent something else: the face then keeps the look it has."""
+    try:
+        r = await client.get(f"{base}/api/health", headers=headers(key))
+        if r.status_code != 200:
+            return None
+        mood = r.json().get("mood")
+        label, n = mood.get("label"), mood.get("intensity")
+    except Exception:  # noqa: BLE001
+        return None
+    if not (isinstance(label, str) and re.fullmatch(r"[a-z]{1,24}", label)):
+        return None
+    if not (isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 3):
+        return None
+    return label, n
+
+
 CANCEL_RETRY_S = 1.0
 
 

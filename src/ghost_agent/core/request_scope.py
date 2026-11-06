@@ -19,7 +19,7 @@ leaf's ``handle_chat`` installs its own scope for the leaf context.
 
 Who writes the per-conversation focus row (``conversation_focus`` in the
 project store): only a scope with ``persist=True`` — an owner request that
-carries a ``session_id``. Members, replays, probes, unattended requests
+carries a ``session_id``. Members, probes, unattended requests
 (sched-/sub-/job-), leaves and clients that send no session id get a
 request-only scope: they may switch for the request, nothing is stored.
 """
@@ -32,7 +32,6 @@ from typing import Any, Optional
 #: origins (who the request is)
 ORIGIN_OWNER = "owner"
 ORIGIN_MEMBER = "member"
-ORIGIN_REPLAY = "replay"
 ORIGIN_PROBE = "probe"
 ORIGIN_UNATTENDED = "unattended"
 ORIGIN_LEAF = "leaf"

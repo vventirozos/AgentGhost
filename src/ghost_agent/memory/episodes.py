@@ -977,7 +977,7 @@ class EpisodicMemory:
         Never raises: usage accounting must not break recall.
         """
         try:                                   # §4KW: probe/member/internal turns
-            from .skills import usage_credit_blocked
+            from .population import usage_credit_blocked
             if usage_credit_blocked():
                 return
         except Exception:  # noqa: BLE001
@@ -1444,7 +1444,6 @@ class EpisodicMemory:
                              "WHERE id = ? AND outcome NOT LIKE ?",
                              (1 if success else 0, (f"[{note}] " if note else ""), i, f"[{note}]%"))
             conn.commit()
-            self.last_relabelled_ids = list(ids)      # §4LC: the lessons citing them follow
             return len(ids)
 
     def get_episode(self, episode_id: int) -> Optional[Dict]:

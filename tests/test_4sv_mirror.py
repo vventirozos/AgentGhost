@@ -261,8 +261,11 @@ def test_the_sentence_reaches_introspect_and_nothing_else():
                      else n.name if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.alias)) else "")
             if ident in ("self_image_line", "_self_image"):
                 namers.add(rel)
-    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py"}
+    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py", "memory/experience.py"}
     assert taken["tools/introspect.py"] == {"home_from_memory_dir", "self_image_line"}   # the one-line reader only
+    # §4SZ: the experience store asks whether a message is the "mirror" COMMAND (a system command is
+    # not an experience) — the matcher only, nothing that reads the diary
+    assert taken["memory/experience.py"] == {"is_mirror_command"}
     assert namers == {"selfhood/mirror.py", "tools/introspect.py"}
 
 
@@ -537,8 +540,7 @@ def _self_model():
     from types import SimpleNamespace
     stats = {"last_mood": "", "last_mood_set_at": ""}
     return SimpleNamespace(enabled=True, stats=lambda: stats, narrative=None, state=None,
-                           autobio=SimpleNamespace(recent=lambda **k: []),
-                           open_questions=lambda *a, **k: [])
+                           autobio=SimpleNamespace(recent=lambda **k: []))
 
 
 def test_a_sentence_with_failure_words_is_not_a_tool_error(tmp_path, monkeypatch):
@@ -554,7 +556,6 @@ def test_a_sentence_with_failure_words_is_not_a_tool_error(tmp_path, monkeypatch
                              "sentence": "I say when a run failed, when a file was not found, and what I cannot do."}) + "\n")
     ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
     monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
-    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
     for out in (I._overview_selfhood(_self_model(), ctx), I._render_summary(_self_model(), ctx)):
         assert "a run failed" in out and error_line(out, tool="introspect") == ""
 
@@ -573,7 +574,6 @@ def test_introspect_overview_and_summary_carry_the_line_the_phase_wrote(tmp_path
             f"in the Mirror, last on {today}; the owner types \"mirror\" to see the diary. "
             "A self-description, not a report of work done and not a checked fact)")
     monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
-    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
     over = I._overview_selfhood(_self_model(), ctx).splitlines()
     assert over[0] == "How I am:" and over[1].startswith("  mood:") and over[2] == "  " + want
     summ = I._render_summary(_self_model(), ctx).splitlines()
@@ -584,7 +584,6 @@ def test_introspect_shows_no_line_before_the_first_look_or_without_a_context(tmp
     from types import SimpleNamespace
     from ghost_agent.tools import introspect as I
     monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
-    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
     ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
     for c in (ctx, None, SimpleNamespace(memory_dir=None)):
         assert "self-image" not in I._overview_selfhood(_self_model(), c)
@@ -613,7 +612,6 @@ def test_the_tool_passes_its_context_to_both_views(tmp_path, monkeypatch):
     ctx = SimpleNamespace(memory_dir=str(tmp_path / "system" / "memory"))
     monkeypatch.setattr(I, "_member_block", lambda: None)
     monkeypatch.setattr(I, "_render_stats", lambda stats: "stats")
-    monkeypatch.setattr(I, "_render_principles", lambda sm: "")
     for blank in ("_overview_health", "_overview_activity", "_overview_workspace"):
         monkeypatch.setattr(I, blank, lambda context: "")
 

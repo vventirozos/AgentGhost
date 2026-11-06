@@ -32,13 +32,6 @@ def test_the_task_tool_says_a_used_name_is_refused():
     assert out and "already exists" in out and "stop it first" in out      # what the text now says
 
 
-def test_the_macro_tool_does_not_promise_dream_proposals():
-    """Auto-proposed macros come from REM / skills-auto, both off since §4NC."""
-    text = _tool_description("manage_composed_skills")
-    assert "dream" not in text.lower() and "auto-proposes" not in text
-    assert "PROPOSED" in text and "approve" in text
-
-
 # (The RRF ledger re-fit pins — unchanged-ledger skip, trim-is-not-new-data,
 # fingerprint on the context, failed-save retry — went with the fit itself:
 # `Dreamer._refit_rrf_weights` and the usefulness ledger were removed in §4NM.)

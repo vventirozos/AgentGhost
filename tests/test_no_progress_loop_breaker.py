@@ -171,10 +171,11 @@ def test_scenario_genuine_progress_never_trips():
 # Tripping the breaker is only half the story; the OTHER half is the remedy.
 # For an ordinary re-observation loop the first-trip remedy is to set
 # `force_final_response` (drop tools, finish as text). For a tool that both
-# READS and WRITES through one dispatch name (manage_composed_skills,
+# READS and WRITES through one dispatch name (manage_projects,
 # file_system, ...) that remedy is destructive: the loop is the agent
 # re-READING before it performs the WRITE it was asked to do, and forcing a
-# text-only turn bars that pending mutation forever. Observed bug: a request
+# text-only turn bars that pending mutation forever. Observed bug (on the
+# macro manager, a tool removed in §4TA): a request
 # to reconfigure a composed skill looped on action="list", got force-
 # finalised at 3x, and the follow-up action="define" never ran — the change
 # silently never landed. For those tools the breaker must STEER but keep
@@ -188,7 +189,8 @@ from ghost_agent.core.agent import _is_readwrite_loop_exempt
 
 
 def test_readwrite_exempt_identifies_read_write_tools():
-    assert is_readwrite_loop_exempt("manage_composed_skills") is True
+    assert is_readwrite_loop_exempt("manage_composed_skills") is False     # removed tool (§4TA): nothing special
+    assert is_readwrite_loop_exempt("manage_projects") is True
     assert is_readwrite_loop_exempt("file_system") is True
     assert is_readwrite_loop_exempt("knowledge_base") is True
     assert is_readwrite_loop_exempt("manage_tasks") is True
@@ -217,10 +219,12 @@ def _first_trip_remedy(fname):
     return not _is_readwrite_loop_exempt(fname)
 
 
-def test_remedy_keeps_tools_for_composed_skill_reconfigure():
-    # The exact reported bug: looping on a read of manage_composed_skills must
-    # NOT force a text-only turn — the pending define/update has to run.
-    assert _first_trip_remedy("manage_composed_skills") is False
+def test_remedy_keeps_tools_for_a_read_then_write_tool():
+    # The reported bug (first seen on the macro manager, removed in §4TA): looping
+    # on a READ of a read/write tool must NOT force a text-only turn — the
+    # pending write has to run.
+    assert _first_trip_remedy("manage_tasks") is False
+    assert _first_trip_remedy("manage_projects") is False
 
 
 def test_remedy_forces_final_for_browser_reobservation_loop():
@@ -234,11 +238,11 @@ def test_readwrite_tools_still_trip_the_detector():
     # a read/write tool still trips (so the steer fires) — it just doesn't
     # force a text-only final turn.
     calls = [
-        ("manage_composed_skills", "morning_briefing",
-         "Composed skills (macros): ...", False, False)
+        ("manage_tasks", "morning_briefing",
+         "Scheduled tasks: ...", False, False)
         for _ in range(3)
     ]
     trip = _replay(calls)
-    assert trip is not None and trip[2] == "manage_composed_skills"
+    assert trip is not None and trip[2] == "manage_tasks"
     # And the remedy for that tripped tool keeps tools available.
     assert _first_trip_remedy(trip[2]) is False

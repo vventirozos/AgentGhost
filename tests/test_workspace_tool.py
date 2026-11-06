@@ -277,7 +277,6 @@ def test_workspace_dispatch_lambdas_bind_workspace_model(tmp_path: Path):
         memory_dir=str(tmp_path),
         memory_system=MagicMock(),
         graph_memory=None,
-        skill_memory=MagicMock(),
         llm_client=MagicMock(image_gen_clients=None),
         scratchpad=MagicMock(),
         scheduler=MagicMock(),

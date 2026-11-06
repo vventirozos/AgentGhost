@@ -384,28 +384,6 @@ class TestEveryDeclarationIsTheRightOne:
             "the success path declares and the error path returns a bare "
             "string — a split inside one tool")
 
-    def test_the_skill_leg_reads_what_learn_lesson_returned(self):
-        """`learn_lesson` returns None on every drop path and catches its own
-        exceptions, so discarding the return made the leg report ok whenever
-        nothing escaped — and the caller's failure branch was dead code that
-        looked like coverage."""
-        import ghost_agent.core.bus as BUS
-
-        # §4GJ: was a 1400-char window after `async def _skill()`. The AST
-        # finds the leg wherever it moves, and asks the real question: is
-        # `learn_lesson`'s ANSWER bound, and does the result branch on it?
-        leg = next(f for f in ast.walk(ast.parse(inspect.getsource(BUS)))
-                   if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   and f.name == "_skill")
-        bound = {t.id for n in ast.walk(leg) if isinstance(n, ast.Assign)
-                 and "learn_lesson" in ast.unparse(n.value)
-                 for t in n.targets if isinstance(t, ast.Name)}
-        assert bound, "the skill leg discards `learn_lesson`'s answer"
-        consulted = {n.id for n in ast.walk(leg)
-                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-        assert bound & consulted, (
-            "`learn_lesson`'s answer is bound and never read — the leg "
-            "reports ok whenever nothing escaped")
 
     def test_the_enveloped_execute_refusals_declare(self):
         """`_format_error` wraps a refusal in `--- EXECUTION RESULT ---`, and
@@ -511,4 +489,3 @@ class TestTheInstrumentsAgain:
         assert f({"profile": "ok", "vector": "error: lag"},
                  "update_profile") is False
         assert f({"profile": "error: disk"}, "update_profile") is True
-        assert f({"skill": "error: dropped"}, "learn_skill") is True

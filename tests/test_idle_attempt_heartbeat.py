@@ -77,9 +77,9 @@ def test_a_crash_looping_phase_still_alarms(tmp_path):
     """The same property, driven through the real liveness view."""
     led = _live_ledger(tmp_path)
     for _ in range(12):                       # twelve consecutive crashes
-        record_attempt(led, "self_play", ATTEMPT_ENTERED)
-    assert _row(led, "self_play")["alarm"] is True
-    assert "self_play" in activity_liveness(led)["alarms"]
+        record_attempt(led, "maintenance", ATTEMPT_ENTERED)
+    assert _row(led, "maintenance")["alarm"] is True
+    assert "maintenance" in activity_liveness(led)["alarms"]
 
 
 def test_a_declining_phase_does_not_alarm(tmp_path):
@@ -122,9 +122,9 @@ def test_non_finite_timestamps_are_dropped(tmp_path, bad):
                                     time.time(), _WINDOW_S) is False
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(
-        '{"self_play": {"ts": %s, "result": "declined"}}'
+        '{"maintenance": {"ts": %s, "result": "declined"}}'
         % ("NaN" if bad != bad else ("Infinity" if bad > 0 else "-Infinity")))
-    row = _row(led, "self_play")
+    row = _row(led, "maintenance")
     assert row["attempted_at"] is None, f"a non-finite ts reached the row: {row}"
     json.dumps(activity_liveness(led), allow_nan=False)   # must not raise
 
@@ -132,9 +132,9 @@ def test_non_finite_timestamps_are_dropped(tmp_path, bad):
 def test_a_stale_decline_alarms_again(tmp_path):
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(json.dumps(
-        {"self_play": {"ts": time.time() - 48 * 3600,
+        {"maintenance": {"ts": time.time() - 48 * 3600,
                           "result": ATTEMPT_DECLINED}}))
-    assert _row(led, "self_play")["alarm"] is True
+    assert _row(led, "maintenance")["alarm"] is True
 
 
 # ══ the store: concurrency, corruption, failure ══════════════════════════
@@ -188,22 +188,22 @@ def test_one_bad_row_does_not_discard_the_others(tmp_path):
 
 @pytest.mark.parametrize("content", [
     "{ corrupt", "", "[]", "null",
-    '{"self_play": true}', '{"self_play": "123"}',
-    '{"self_play": {"ts": "x"}}',
+    '{"maintenance": true}', '{"maintenance": "123"}',
+    '{"maintenance": {"ts": "x"}}',
     # ⚠ THE LEGACY FORMAT, AND IT IS ON THE LIVE BOX RIGHT NOW. The
     # first-generation code wrote a BARE timestamp; that file cannot prove a
     # run declined, so it must read as ENTERED and keep the alarm. The
     # earlier params were keyed "p" while the assertion is on
     # the phase under test, so this branch was never exercised for the phase
     # under test — one unpinned line away from a permanent false green.
-    '{"self_play": 1788068709.491002}',
+    '{"maintenance": 1788068709.491002}',
 ])
 def test_unreadable_shapes_degrade_to_the_alarm(tmp_path, content):
     """Every corrupt shape must fall back to the OLD alarm. Failure may not
     buy silence — this module's own comment calls a false green worse."""
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(content)
-    assert _row(led, "self_play")["alarm"] is True
+    assert _row(led, "maintenance")["alarm"] is True
 
 
 def test_record_attempt_never_raises():
@@ -252,7 +252,7 @@ def test_the_suppression_is_reported_not_silent(tmp_path):
     zero nobody looked at."""
     from ghost_agent.core.learning_health import render_learning_health
     led = _live_ledger(tmp_path)
-    record_attempt(led, "self_play", ATTEMPT_DECLINED)
+    record_attempt(led, "maintenance", ATTEMPT_DECLINED)
     mem = tmp_path / "memory"
     mem.mkdir()
     out = render_learning_health(mem)
@@ -262,7 +262,7 @@ def test_the_suppression_is_reported_not_silent(tmp_path):
     # `dream` (which never ran) while `prm_train` — the row that actually
     # declined — got nothing, and the test stayed green.
     lines = out.splitlines()
-    idx = next(i for i, ln in enumerate(lines) if "self_play" in ln)
+    idx = next(i for i, ln in enumerate(lines) if "maintenance" in ln)
     assert lines[idx + 1].strip().startswith("└ RAN"), (
         f"the explanation is not attached to the prm_train row:\n"
         + "\n".join(lines[max(0, idx - 2):idx + 3]))
@@ -276,7 +276,7 @@ def test_the_reported_age_is_the_real_one(tmp_path):
     from ghost_agent.core.learning_health import render_learning_health
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(json.dumps(
-        {"self_play": {"ts": time.time() - 20 * 3600,
+        {"maintenance": {"ts": time.time() - 20 * 3600,
                           "result": ATTEMPT_DECLINED}}))
     mem = tmp_path / "memory"
     mem.mkdir()
@@ -458,8 +458,8 @@ def test_a_missing_result_key_does_not_suppress(tmp_path):
     if the default is wrong. It was absent from the corrupt-shape list."""
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(json.dumps(
-        {"self_play": {"ts": time.time()}}))
-    assert _row(led, "self_play")["alarm"] is True
+        {"maintenance": {"ts": time.time()}}))
+    assert _row(led, "maintenance")["alarm"] is True
 
 
 def test_the_default_outcome_is_entered():

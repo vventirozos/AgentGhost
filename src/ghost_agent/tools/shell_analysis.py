@@ -11,7 +11,7 @@ of their own; variables assigned in the command are substituted. Each simple
 command's OWN verb is read — not a regex over the whole text (which took
 `grep -rn 'rm -rf'` and `--rm` for removals and missed `bash -c "rm -rf
 projects"`). Used by the execute guards (bulk removal, released workspaces,
-the re-run heal) and by the lesson destruction screen.
+the re-run heal).
 
 This is the soft layer: the hard guarantee for a RELEASED workspace is the
 user-immutable flag its release sets (memory/projects.py).

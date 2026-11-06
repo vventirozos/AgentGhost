@@ -126,141 +126,26 @@ def test_rss_watchdog_execv_uses_this_modules_spelling():
 # ── Lens D: delivery path ────────────────────────────────────────────
 
 
-def test_cap_trim_archives_before_deleting(tmp_path):
-    """D-CRIT-1: the playbook cap-trim destroyed lessons with NO archive
-    row on EVERY write once the playbook was full (7 lessons — two of
-    them distillation output — gone within a day, with GHOST_SKILL_PRUNE
-    never enabled): the 13-destroyed-lessons class through a different
-    door. Archive-before-delete belongs to every destructive path."""
-    import json as _json
-    from ghost_agent.memory.skills import SkillMemory, PLAYBOOK_MAX
-
-    sm = SkillMemory(tmp_path)
-    for i in range(PLAYBOOK_MAX + 3):
-        sm.learn_lesson(f"task {i}", "mistake", "solution",
-                        trigger=f"trigger {i}",
-                        anti_pattern="anti", correct_pattern="correct", source="learn_skill")
-    arch = tmp_path / "skills_pruned_archive.jsonl"
-    assert arch.exists(), "cap-trim ran with no archive file"
-    rows = [_json.loads(l) for l in arch.read_text().splitlines()
-            if l.strip()]
-    assert any(r.get("reason") == "playbook_cap_trim" for r in rows)
-    # Every trimmed lesson is recoverable: playbook + archive ≥ writes.
-    pb = _json.loads((tmp_path / "skills_playbook.json").read_text())
-    assert len(pb) <= PLAYBOOK_MAX
-    assert len(pb) + len(rows) >= PLAYBOOK_MAX + 3
-
-
-def test_remove_by_trigger_archives_and_fails_closed(tmp_path,
-                                                     monkeypatch):
-    """D-CRIT-1b: the second unarchived destructive path."""
-    import json as _json
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("t", "m", "s", trigger="the trigger",
-                    anti_pattern="a", correct_pattern="c", source="learn_skill")
-    assert sm.remove_by_trigger("the trigger") is True
-    arch = tmp_path / "skills_pruned_archive.jsonl"
-    rows = [_json.loads(l) for l in arch.read_text().splitlines()]
-    assert any(r.get("reason") == "removed_by_trigger" for r in rows)
-    # Fail CLOSED: unarchivable → not removed.
-    sm.learn_lesson("t2", "m", "s", trigger="keep me",
-                    anti_pattern="a", correct_pattern="c", source="learn_skill")
-    monkeypatch.setattr(SkillMemory, "_archive_lessons",
-                        lambda self, lessons, reason: False)
-    assert sm.remove_by_trigger("keep me") is False
-    pb = _json.loads((tmp_path / "skills_playbook.json").read_text())
-    assert any(l.get("trigger") == "keep me" for l in pb)
-
-
 # ── Cross-lens: the honest-failure ladder mirror + late calibration ──
-
-
-@pytest.mark.asyncio
-async def test_lesson_arm_mirrors_the_honest_failure_ladder():
-    """B-MAJOR-2: the lesson tick fired FAILURE before consulting the
-    verifier PASS — the un-mirrored third consumer of the ladder, so
-    lessons hydrated into honest-failure turns were blamed for turns the
-    operator's rule declares good (and failed_retrievals feeds both
-    prune-eligibility and the cap-trim eviction ranking)."""
-    from ghost_agent.core.agent import GhostAgent
-
-    ticks = []
-
-    class _SM:
-        def record_surfaced_outcomes(self, triggers, ok):
-            ticks.append((tuple(triggers), ok))
-
-    class _Ctx:
-        skill_memory = _SM()
-
-    agent = GhostAgent.__new__(GhostAgent)
-    agent.context = _Ctx()
-    # Verifier PASS + execution failures + acknowledged → SUCCESS tick.
-    await agent._record_lesson_outcomes(
-        surfaced_triggers=["t1"], execution_failure_count=2,
-        verifier_backfill=("passed", ""), trajectory_id="x",
-        unacked_total_failure=False)
-    assert ticks[-1] == (("t1",), True)
-    # PASS withheld by the shape rule → falls to structural FAILURE.
-    await agent._record_lesson_outcomes(
-        surfaced_triggers=["t2"], execution_failure_count=2,
-        verifier_backfill=("passed", ""), trajectory_id="x",
-        unacked_total_failure=True)
-    assert ticks[-1] == (("t2",), False)
-    # Checked-and-wrong stays the hard negative.
-    await agent._record_lesson_outcomes(
-        surfaced_triggers=["t3"], execution_failure_count=0,
-        verifier_backfill=("failed", "r"), trajectory_id="x",
-        unacked_total_failure=False)
-    assert ticks[-1] == (("t3",), False)
 
 
 def test_fused_hydration_groups_items_under_their_own_headers():
     """D-MAJOR-3: the fused formatter emitted items in rank order with
     lazily-emitted headers, so interleaved sources landed under the
-    WRONG header — three SKILL lessons rendered inside MEMORY CONTEXT
-    (live req 61ebaeeb), framed as memories instead of rules."""
+    WRONG header."""
     from ghost_agent.core.bus import MemoryBus
     fused = [
-        ({"source": "skill", "text": "LESSON A", "trigger": "a"}, 1.0),
+        ({"source": "graph", "text": "EDGE A"}, 1.0),
         ({"source": "vector", "text": "memory one"}, 0.9),
-        ({"source": "skill", "text": "LESSON B", "trigger": "b"}, 0.8),
+        ({"source": "graph", "text": "EDGE B"}, 0.8),
     ]
     out, surv = MemoryBus._format_markdown_with_survivors(fused, 6000)
     assert len(surv) == 3
-    sk = out.index("SKILL PLAYBOOK")
+    gr = out.index("TOPOLOGICAL KNOWLEDGE GRAPH")
     mem = out.index("MEMORY CONTEXT")
-    block = out[sk:mem] if sk < mem else out[sk:]
-    assert "LESSON A" in block and "LESSON B" in block
+    block = out[gr:mem] if gr < mem else out[gr:]
+    assert "EDGE A" in block and "EDGE B" in block
     assert "memory one" not in block
-
-
-def test_retrieval_booking_dedups_within_a_turn(tmp_path):
-    """D-MAJOR-2: both injection surfaces booked retrievals for the same
-    lesson (+2/turn) while success credit books once — structurally
-    deflating hit-rate for the MOST-surfaced lessons, the exact ranking
-    the cap-trim eviction uses."""
-    from ghost_agent.memory.skills import SkillMemory
-    from ghost_agent.utils.logging import request_id_context
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("t", "m", "s", trigger="the trigger",
-                    anti_pattern="a", correct_pattern="c", source="learn_skill")
-    tok = request_id_context.set("turn-1")
-    try:
-        assert sm.record_retrievals_bulk(["the trigger"]) == 1
-        assert sm.record_retrievals_bulk(["the trigger"]) == 0  # same turn
-    finally:
-        request_id_context.reset(tok)
-    tok = request_id_context.set("turn-2")
-    try:
-        assert sm.record_retrievals_bulk(["the trigger"]) == 1  # new turn
-    finally:
-        request_id_context.reset(tok)
-    pb = sm._load_playbook()
-    assert pb[0]["retrievals"] == 2                       # not 3
 
 
 def test_gepa_loader_warns_on_pre_gate_artifacts(tmp_path, monkeypatch,
@@ -307,71 +192,6 @@ def test_credit_sees_both_surfaces_after_delivery_dedup():
     assert src.count("top_triggers=self._surfaced_lesson_triggers(") == 0
 
 
-def test_delivery_dedup_targets_bus_deliveries_not_bookings(tmp_path):
-    """R2-NEW-2: deduping against ALL bookings made the planner call's
-    bookings erase lessons from the MAIN execution prompt under
-    --use-planning. Only bus-tier deliveries are duplicates."""
-    from ghost_agent.memory.skills import SkillMemory
-    from ghost_agent.utils.logging import request_id_context
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("t", "m", "s", trigger="planner booked me",
-                    anti_pattern="a", correct_pattern="c", source="learn_skill")
-    tok = request_id_context.set("turn-np")
-    try:
-        # A NON-bus booking (the planner call) must NOT suppress
-        # delivery in the main block.
-        assert sm.record_retrievals_bulk(["planner booked me"]) == 1
-        ctx = sm.get_playbook_context("planner booked me anywhere")
-        assert "planner booked me" in ctx
-        # A BUS delivery (stamped with the turn key) does suppress it.
-        sm.last_bus_triggers = ["planner booked me"]
-        sm._bus_delivered_turn_key = "turn-np"
-        ctx2 = sm.get_playbook_context("planner booked me anywhere")
-        assert "planner booked me" not in ctx2
-    finally:
-        request_id_context.reset(tok)
-
-
-def test_bus_triggers_reset_per_turn(tmp_path):
-    """R2-NEW-3: last_bus_triggers was never cleared, so a turn with no
-    skill survivors inherited the previous turn's list into its
-    trajectory attribution stamp."""
-    import asyncio
-    from ghost_agent.core.bus import MemoryBus
-
-    class _Skill:
-        pass
-
-    sk = _Skill()
-    sk.last_bus_triggers = ["stale from last turn"]
-    sk._bus_delivered_turn_key = "old-turn"
-    bus = MemoryBus(skill_memory=sk)
-    asyncio.run(bus.hydrate_context("some query"))
-    assert sk.last_bus_triggers == []
-
-
-def test_duplicate_check_compares_the_trigger_field(tmp_path):
-    """R2 (escalated D-MINOR-3): self-play wrote distinct `task` texts
-    with byte-identical `trigger`s and the JSON dedup fallback never
-    compared the trigger — three twins coexisted, booking ×3 counters
-    per surfacing while deletion hit only the first."""
-    import json as _json
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("challenge text ONE", "m1", "s1",
-                    trigger="Parallel processing with strict ordering",
-                    anti_pattern="a", correct_pattern="c", source="learn_skill")
-    out = sm.learn_lesson("challenge text TWO — different", "m2", "s2",
-                          trigger="Parallel processing with strict ordering",
-                          anti_pattern="a2", correct_pattern="c2", source="learn_skill")
-    pb = _json.loads((tmp_path / "skills_playbook.json").read_text())
-    same = [l for l in pb
-            if l.get("trigger") == "Parallel processing with strict ordering"]
-    assert len(same) == 1, (out, len(same))
-
-
 def test_learning_health_renders_the_other_bucket(tmp_path, monkeypatch):
     """R2-NEW-6: the counter existed but the renderer omitted it."""
     import json as _json
@@ -388,57 +208,6 @@ def test_learning_health_renders_the_other_bucket(tmp_path, monkeypatch):
 
 
 # ── Round-3 regressions (2026-08-07).
-
-
-def test_surfaced_triggers_survive_the_judge_consuming_the_stash():
-    """R3-MAJOR-1: the hydration judge consumes `last_hydration` at
-    coroutine ENTRY, and on the streamed path it runs before the credit
-    read — bus-only lessons vanished from the union exactly on the
-    turns the delivery dedup removed them from the playbook list. The
-    union now reads the judge-immune delivery stamp first."""
-    from ghost_agent.core.agent import GhostAgent
-
-    class _SM:
-        last_playbook_triggers = ["pb-lesson"]
-        _playbook_turn_key = "t1"
-        last_bus_triggers = ["bus-only-lesson"]
-        _bus_delivered_turn_key = "t1"
-
-    class _Bus:
-        last_hydration = None          # judge already consumed it
-
-    class _Ctx:
-        memory_bus = _Bus()
-
-    agent = GhostAgent.__new__(GhostAgent)
-    agent.context = _Ctx()
-    out = agent._surfaced_lesson_triggers(_SM(), turn_id="t1")
-    assert "bus-only-lesson" in out and "pb-lesson" in out
-    # Foreign turn keys contribute nothing.
-    out2 = agent._surfaced_lesson_triggers(_SM(), turn_id="OTHER")
-    assert out2 == []
-
-
-def test_reinforce_swaps_trajectory_id_when_solution_overwritten(tmp_path):
-    """R3-MINOR-3: the merged row kept the FIRST source_trajectory_id
-    even when the reinforcing trajectory's longer solution overwrote the
-    content — retraction keyed to the reinforcing trajectory missed it."""
-    import json as _json
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("task A", "m", "s", trigger="the shared trigger",
-                    anti_pattern="a", correct_pattern="short",
-                    source_trajectory_id="traj-OLD", source="learn_skill")
-    out = sm.learn_lesson("task B", "m", "s", trigger="the shared trigger",
-                          anti_pattern="a2",
-                          correct_pattern="a much longer replacement solution",
-                          source_trajectory_id="traj-NEW", source="learn_skill")
-    pb = _json.loads((tmp_path / "skills_playbook.json").read_text())
-    row = [l for l in pb if l.get("trigger") == "the shared trigger"][0]
-    assert out == "reinforced"
-    assert row["source_trajectory_id"] == "traj-NEW"
-    assert "traj-OLD" in (row.get("source_refs") or [])
 
 
 # ── §4M memory-substrate round 1: skill-store twin destruction ───────
@@ -482,134 +251,6 @@ class _M4Mem:
 
     def add(self, text, meta):
         self.added.append((text, meta))
-
-
-def test_reconcile_keeps_twin_stored_under_trigger_when_task_differs(tmp_path):
-    """§4M CRIT-1: the twin write stores the row's TRIGGER (:200); the
-    reconcile keyed the playbook task-first, so every task≠trigger
-    lesson's healthy twin read as an orphan and was DELETED."""
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson(
-        "Close the loop on notification promises at finalize",
-        "m", "s",
-        trigger="User asked for a notification that was never sent", source="learn_skill")
-    coll = _M4Coll(get_result={
-        "ids": ["twin-1"],
-        "metadatas": [
-            {"trigger": "User asked for a notification that was never sent"}],
-        "documents": [""],
-    })
-    n = sm.reconcile_vector_orphans(_M4Mem(coll))
-    assert n == 0
-    assert coll.deleted_ids == []
-
-
-def test_reconcile_deletes_orphan_hiding_as_subset_of_unrelated_lesson(tmp_path):
-    """§4M CRIT-1b: bare token-subset let a TRUE orphan survive forever
-    behind any unrelated lesson whose trigger contained its few tokens.
-    Untruncated metadata must cover ≥half the matched field set."""
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson(
-        "Repeated relative path failures inside the Docker sandbox "
-        "during multi step file operations with copy and move commands",
-        "m", "s", source="learn_skill")
-    coll = _M4Coll(get_result={
-        "ids": ["orphan-3"],
-        # 3 tokens, all ⊂ the lesson's trigger set, but far below half
-        # coverage and NOT truncated — a shadowed true orphan.
-        "metadatas": [{"trigger": "docker sandbox failures"}],
-        "documents": [""],
-    })
-    n = sm.reconcile_vector_orphans(_M4Mem(coll))
-    assert n == 1
-    assert coll.deleted_ids == ["orphan-3"]
-
-
-def test_relocate_finds_twin_by_trigger_field_not_just_task(tmp_path):
-    """§4M (Lens C): the reworded-twin re-locate compared task-or-trigger
-    only — the §4L R2 fix missed this branch, so a vector dup stored
-    under the row's own trigger was deleted + duplicated fresh."""
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    stored_trigger = ("Multi step tool chains losing intermediate "
-                      "outputs mid sequence")
-    sm.learn_lesson(
-        "Verify chained tool outputs before final reply synthesis",
-        "m", "s", trigger=stored_trigger, source="learn_skill")
-    # Incoming trigger shares no tokens with task OR trigger (JSON dedup
-    # and the primary vector re-locate both miss); the vector hit points
-    # at the stored twin under the row's TRIGGER wording.
-    hit = {"id": "vec-9", "distance": 0.05, "trigger": stored_trigger,
-           "text": f"SITUATION: {stored_trigger}\nMISTAKE: m\nSOLUTION: s"}
-    ms = _M4Mem(_M4Coll(query_hit=hit))
-    out = sm.learn_lesson(
-        "Database connection pool exhaustion under concurrent spikes",
-        "m", "s", memory_system=ms, source="learn_skill")
-    assert out == "reinforced"
-    assert ms.collection.deleted_ids == []        # twin NOT destroyed
-    lessons = sm.list_lessons(scope="all", limit=10)
-    assert len(lessons) == 1                      # no duplicate row
-    assert int(lessons[0].get("frequency", 1)) == 2
-
-
-def test_heal_missing_twins_reembeds_dark_lessons_idempotently(tmp_path):
-    """§4M CRIT-1 heal: a twin-less lesson is invisible to the bus skill
-    fetch (vector branch, no BM25 fallback). The heal re-embeds exactly
-    the missing twins, preserves the lesson's own timestamp, and is
-    idempotent when the twin exists."""
-    from ghost_agent.memory.skills import SkillMemory
-
-    sm = SkillMemory(tmp_path)
-    sm.learn_lesson("Alpha task about queue draining", "m", "s",
-                    trigger="Alpha beta gamma delta workflow stalls", source="learn_skill")
-    sm.learn_lesson("Epsilon task about cache warming", "m", "s",
-                    trigger="Epsilon zeta eta theta pipeline misses", source="learn_skill")
-    # Store holds a twin for lesson 1 only.
-    coll = _M4Coll(get_result={
-        "ids": ["t1"],
-        "metadatas": [{"trigger": "Alpha beta gamma delta workflow stalls"}],
-        "documents": [""],
-    })
-    ms = _M4Mem(coll)
-    assert sm.heal_missing_twins(ms) == 1
-    assert len(ms.added) == 1
-    text, meta = ms.added[0]
-    assert meta["type"] == "skill"
-    assert meta["trigger"].startswith("Epsilon zeta eta theta")
-    row = next(l for l in sm.list_lessons(scope="all", limit=10)
-               if (l.get("trigger") or "").startswith("Epsilon"))
-    # Same instant as the row (not minted fresh), converted to the vector
-    # store's UTC-"Z" convention (§4M Lens C: twins were the only naive
-    # rows in the store).
-    from ghost_agent.memory.skills import _twin_ts
-    assert meta["timestamp"] == _twin_ts(row.get("timestamp"))
-    assert meta["timestamp"].endswith("Z")
-    # Second run with both twins present: nothing re-embedded.
-    coll2 = _M4Coll(get_result={
-        "ids": ["t1", "t2"],
-        "metadatas": [
-            {"trigger": "Alpha beta gamma delta workflow stalls"},
-            {"trigger": "Epsilon zeta eta theta pipeline misses"},
-        ],
-        "documents": ["", ""],
-    })
-    assert sm.heal_missing_twins(_M4Mem(coll2)) == 0
-
-
-def test_heal_wired_into_idle_rider():
-    """The heal must run on the same cooldown as the reconcile — both
-    directions of store convergence, or the 36-dark-lessons state can
-    silently recur."""
-    src = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
-    assert "heal_missing_twins" in src
-    i_rec = src.index("reconcile_vector_orphans, _ms")
-    i_heal = src.index("heal_missing_twins, _ms")
-    assert i_rec < i_heal
 
 
 def test_dream_isolate_vector_reads_never_book_credit():
@@ -762,54 +403,6 @@ def _dedup_mem_at(dist, doc):
     return m
 
 
-def test_dedup_thresholds_sit_inside_the_2026_08_corridor(tmp_path):
-    """§4M (Lens B MAJOR-1): live rewordings reach 0.1921 (past the old
-    0.15 twin cutoff → reworded re-saves) and distinct rules come as
-    close as 0.2134 (inside the old 0.25 rule cutoff → over-merge risk).
-    Recalibrated to 0.20/0.21. Two boundary probes, one per failure
-    direction."""
-    import json as _json
-    from ghost_agent.memory.skills import SkillMemory
-
-    # (1) Mistake-FUL rewording at 0.19 (the live §4L twin-pair reading,
-    # rounded): must DEDUP under 0.20 — under the old 0.15 it re-saved.
-    (tmp_path / "a").mkdir(exist_ok=True)
-    sm = SkillMemory(tmp_path / "a")
-    sm.save_playbook([{
-        "timestamp": "2025-01-01T00:00:00",
-        "task": "parallel processing with strict output ordering",
-        "mistake": "unordered gather output", "solution": "index results",
-        "frequency": 1,
-    }])
-    mem = _dedup_mem_at(0.19, "SITUATION: parallel processing with strict "
-                              "output ordering\nMISTAKE: unordered gather "
-                              "output\nSOLUTION: index results")
-    sm.learn_lesson(
-        "parallel workers must keep strict result ordering",
-        "collected results without preserving order",
-        "carry the source index through the gather", memory_system=mem, source="learn_skill")
-    pb = _json.loads((tmp_path / "a" / "skills_playbook.json").read_text())
-    assert len(pb) == 1 and int(pb[0]["frequency"]) == 2
-
-    # (2) DISTINCT mistake-less rules at 0.214 (the live chess-postmortem
-    # pair): must be WRITTEN NEW under 0.21 — the old 0.25 merged them.
-    (tmp_path / "b").mkdir(exist_ok=True)
-    sm2 = SkillMemory(tmp_path / "b")
-    mem2 = _dedup_mem_at(0.214, "SITUATION: When reviewing chess games, "
-                                "annotate blunders\nMISTAKE: none\n"
-                                "SOLUTION: annotate blunders with engine "
-                                "lines")
-    sm2.learn_lesson(
-        "When querying weather, ensure the query names the exact "
-        "requested location to avoid ambiguity.",
-        "none",
-        "When querying weather, ensure the query names the exact "
-        "requested location to avoid ambiguity.",
-        memory_system=mem2, source="learn_skill")
-    pb2 = _json.loads((tmp_path / "b" / "skills_playbook.json").read_text())
-    assert len(pb2) == 1  # written, NOT absorbed into the distinct rule
-
-
 def test_profile_canonicalize_is_shared_and_graph_edge_uses_it():
     """§4M (Lens C MAJOR-4): profile stored `assets.car` while the graph
     edge was minted from the RAW key (`HAS_VEHICLE`) — 11/15 live pairs
@@ -885,23 +478,6 @@ def test_episodes_fallback_search_is_stat_pure(tmp_path):
     assert calls["record_retrievals"] is False
 
 
-def test_twin_ts_converts_naive_local_to_store_utc_z():
-    """§4M (Lens C MINOR): skill twins were the only naive-timestamp rows
-    in the vector store (+3h ahead of UTC rows in the eviction sort)."""
-    from datetime import datetime, timezone
-    from ghost_agent.memory.skills import _twin_ts
-
-    naive = "2026-08-08T12:00:00"
-    out = _twin_ts(naive)
-    assert out.endswith("Z")
-    back = datetime.strptime(out, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-        tzinfo=timezone.utc)
-    local = datetime.fromisoformat(naive).astimezone()
-    assert back == local.astimezone(timezone.utc)
-    # Already-Z input round-trips to the same instant.
-    assert _twin_ts("2026-08-08T09:00:00+00:00").startswith("2026-08-08T09:00:00")
-
-
 def test_bus_graph_leg_filters_removal_triplets():
     """§4M (Lens C MINOR): tombstone parity — consolidation filtered
     removal-shaped triplets, the bus fan-out (and remember's extraction)
@@ -942,16 +518,6 @@ def test_session_corrupt_file_preserved_as_sidecar(tmp_path):
     assert sidecars[0].read_text() == '{"id": "half a session'
 
 
-def test_atomic_saves_fsync_before_rename():
-    """§4M (Lens A MINOR): playbook/session saves published
-    the rename with content possibly still in the page cache."""
-    for rel, fn in (("memory/skills.py", "def _save_playbook_unlocked"),
-                    ("core/sessions.py", "def _write")):
-        src = (REPO / "src" / "ghost_agent" / rel).read_text()
-        i = src.index(fn)
-        assert "os.fsync" in src[i:i + 2200], rel
-
-
 def test_tasks_manual_rows_carry_timestamps():
     """§4M (Lens C MINOR): 'manual' is a prunable vector type and a
     MISSING timestamp sorts as oldest — first eviction victim."""
@@ -960,67 +526,7 @@ def test_tasks_manual_rows_carry_timestamps():
     assert src.count('"timestamp": _uts()') >= 2
 
 
-def test_learning_health_f6_labels_are_honest():
-    """§4M (Lens D F6): five mislabels on the learning surface — lifetime
-    stamp denominator, undated escalation ledger, context-only 'cluster'
-    coverage, saturated-cap lesson total, 'graduated' name collision."""
-    src = (REPO / "src" / "ghost_agent" / "core" /
-           "learning_health.py").read_text()
-    # (§4NN: the lifetime stamp-coverage label left with the experiments block)
-    assert "ledger span" in src
-    assert "cluster coverage: " in src
-    assert "AT CAP" in src
-
-
 # ── §4M round-2 fixes (same-pass, 2026-08-08) ────────────────────────
-
-
-def test_heal_converges_on_empty_trigger_and_long_task_rows(tmp_path):
-    """§4M R2 MINOR-1: an empty-string trigger minted a keyless twin the
-    existence check could never match, and a >200-char doc-recovered key
-    was compared untruncated against [:200] playbook keys — either way a
-    phantom 're-embedded 1' every idle cycle forever."""
-    import json as _json
-    from ghost_agent.memory.skills import SkillMemory
-
-    long_task = ("Diagnose repeated tor circuit build failures across "
-                 "multiple guard nodes when the vanguard layer rotates "
-                 "faster than the circuit pool refills and searches "
-                 "start racing each other across engines simultaneously")
-    assert len(long_task) > 200
-    sm = SkillMemory(tmp_path)
-    pb = [{"timestamp": "2026-08-01T10:00:00", "task": long_task,
-           "trigger": "", "mistake": "m", "solution": "s", "frequency": 1}]
-    (tmp_path / "skills_playbook.json").write_text(_json.dumps(pb))
-
-    coll = _M4Coll(get_result={"ids": [], "metadatas": [], "documents": []})
-    ms = _M4Mem(coll)
-    assert sm.heal_missing_twins(ms) == 1
-    _, meta = ms.added[0]
-    assert meta["trigger"] == long_task[:200]   # task fallback, not ""
-    # Second cycle with that twin present (trigger truncated, as written):
-    coll2 = _M4Coll(get_result={
-        "ids": ["t1"], "metadatas": [{"trigger": long_task[:200]}],
-        "documents": [""]})
-    assert sm.heal_missing_twins(_M4Mem(coll2)) == 0   # converged
-    # Doc-recovered UNTRUNCATED key (legacy twin, no metadata trigger)
-    # must also match — symmetric [:200] truncation.
-    coll3 = _M4Coll(get_result={
-        "ids": ["t2"], "metadatas": [{}],
-        "documents": [f"SITUATION: {long_task}\nMISTAKE: m\nSOLUTION: s"]})
-    assert sm.heal_missing_twins(_M4Mem(coll3)) == 0
-
-
-def test_twin_ts_round_trips_its_own_output():
-    """§4M R2 MINOR-2: py3.10 fromisoformat rejects "Z", so a Z-stamped
-    input fell to the except branch and was replaced with NOW — a healed
-    twin suddenly looked newer than the lesson it mirrors."""
-    from ghost_agent.memory.skills import _twin_ts
-
-    z = "2026-08-08T10:00:00.000000Z"
-    assert _twin_ts(z) == z                     # identity, NOT now()
-    assert _twin_ts(_twin_ts("2026-08-08T12:00:00")) == \
-        _twin_ts("2026-08-08T12:00:00")
 
 
 def test_removal_predicates_match_on_token_boundaries():

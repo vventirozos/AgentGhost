@@ -15,7 +15,6 @@ def mock_context():
     context.memory_system.collection = MagicMock()
     context.llm_client = MagicMock()
     context.llm_client.chat_completion = AsyncMock()
-    context.skill_memory = MagicMock()
     return context
 
 
@@ -42,16 +41,14 @@ async def test_dream_without_a_memory_system_is_an_error_outcome(mock_context):
 
 @pytest.mark.asyncio
 async def test_dream_is_housekeeping_only_and_never_calls_the_model(mock_context):
-    """The idle cycle must not reach the model: lessons come only from
-    learn_skill / operator repairs, and the message says so."""
+    """The idle cycle must not reach the model."""
     dreamer = Dreamer(mock_context)
     stubs = _housekeeping_stubs(dreamer)
     with stubs[0], stubs[1] as care, stubs[2], stubs[3] as maint, \
             patch("ghost_agent.core.dream.pretty_log"):
         result = await dreamer.dream()
 
-    assert result.startswith("Housekeeping cycle done (lessons come only")
-    assert "learn_skill" in result
+    assert result.startswith("Housekeeping cycle done")
     mock_context.llm_client.chat_completion.assert_not_awaited()
     care.assert_awaited_once()                 # every cycle, no gate
     maint.assert_not_awaited()                 # not due → not run

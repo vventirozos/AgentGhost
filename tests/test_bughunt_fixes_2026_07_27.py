@@ -344,52 +344,5 @@ class TestSessionMerge:
         assert sum(1 for m in merged if m["role"] == "system") == 1
 
 
-# ──────────────────────────────────────────────────────────────────────
-# composed_skills.py — swallowed diagnostics + invalid names
-# ──────────────────────────────────────────────────────────────────────
+# (composed_skills.py — swallowed diagnostics + invalid names: removed with the macro engine, §4TA)
 
-class TestComposedSkills:
-    def test_failed_step_surfaces_the_tool_error_string(self):
-        """Tools signal failure by RETURNING an error string (no "error"
-        key), so the model saw "FAILED — unknown error" and could not
-        recover or re-route."""
-        from ghost_agent.tools.composed_skills import _format_execution_result
-        out = _format_execution_result("m", {
-            "success": False, "mode": "sequential",
-            "steps_completed": 1, "total_steps": 2,
-            "results": [{
-                "tool": "file_system", "step": "read it", "success": False,
-                "result": "[error] disk full at /x/y",
-            }],
-        })
-        assert "disk full at /x/y" in out
-        assert "unknown error" not in out
-
-    def test_explicit_error_key_still_preferred(self):
-        from ghost_agent.tools.composed_skills import _format_execution_result
-        out = _format_execution_result("m", {
-            "success": False, "mode": "sequential",
-            "steps_completed": 0, "total_steps": 1,
-            "results": [{"tool": "t", "step": "s", "success": False,
-                         "error": "BoomError", "result": "ignored"}],
-        })
-        assert "BoomError" in out
-
-    def test_invalid_names_are_quarantined_on_load(self, tmp_path):
-        """A dotted legacy name (the live registry still held one) would
-        reach to_tool_definitions and emit an illegal LLM function name."""
-        from ghost_agent.tools.composed_skills import ComposedSkillRegistry
-        store = tmp_path / "composed_skills"
-        store.mkdir()
-        (store / "composed_skills.json").write_text(json.dumps({
-            "auto.generic.bad_name.c73e69": {
-                "trigger_description": "legacy", "steps": [],
-                "status": "proposed",
-            },
-            "good_macro": {
-                "trigger_description": "fine", "steps": [], "status": "active",
-            },
-        }))
-        reg = ComposedSkillRegistry(storage_dir=store)
-        assert "good_macro" in reg.skills
-        assert "auto.generic.bad_name.c73e69" not in reg.skills

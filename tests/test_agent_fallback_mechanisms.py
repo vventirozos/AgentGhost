@@ -21,7 +21,6 @@ def mock_context():
     context.memory_system = MagicMock()
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string = lambda: ""
-    context.skill_memory = MagicMock()
     context.sandbox_dir = "/tmp/sandbox"
     context.cached_sandbox_state = None
     

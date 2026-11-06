@@ -1,20 +1,30 @@
 """Self-state thread — proposal item #3.
 
-The cross-session "state vector": open questions the agent is still
-chewing on, threads it left mid-flight, last-known qualitative mood.
-This is the artifact that, when rehydrated at session start, gives a
-new instance the sense of *resuming* instead of *waking up blank*.
+The cross-session "state vector": the mood and when the agent was last
+active.
+
+§4TC (2026-11-06): the mood is a PAIR of numbers that decays and is moved by
+events (``selfhood/mood.py`` holds the arithmetic; this file holds the stored
+pair, the journal and the read-modify-write). ``mood()`` is a pure read — it
+returns what the stored pair is worth NOW; ``nudge`` is the one function
+every event goes through; ``set_owner_mood`` / ``reset_mood`` /
+``set_manner`` are the owner's word (``introspect(action="set_mood")``).
+Every change of label or intensity appends one row to
+``mood.history.jsonl``.
+
+§4TB (2026-11-05): the open questions and unfinished threads this file also
+held are gone with the `self_state` tool that authored them. A ``state.json``
+written before that still carries the two lists: they are ignored on read
+and are no longer written (``SelfState.from_dict`` filters unknown keys). A
+mood written before §4TC (a label with ``source`` self / derived) has no
+pair: it is ignored and the mood starts neutral; rows of that shape in the
+history file are skipped by the reader.
 
 Storage: a single JSON file at ``$GHOST_HOME/system/selfhood/
 state.json``. Read-modify-write under a process lock; corruption
 (JSON decode error, partial write) is treated as "no prior state"
 rather than crashed — we always start from a known-good empty state
 rather than poison the next session with a half-state.
-
-Bounded: open_questions and unfinished_threads are capped (most-recent
-wins on overflow) because a self-state that never forgets is
-indistinguishable from a complete trajectory log, and the load-bearing
-property here is "small, dense, immediately relevant on wake-up".
 """
 
 from __future__ import annotations
@@ -24,16 +34,12 @@ import datetime
 import json
 import logging
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .mood import (
-    age_seconds,
-    describe_mood_provenance,
-    mood_is_stale,
-    provenance_phrase,
-)
-from .schema import Mood, OpenQuestion, SelfState, UnfinishedThread, _utcnow_iso
+from . import mood as M
+from .schema import MOOD_RECENT_CAUSES, Mood, SelfState, _utcnow_iso
 
 logger = logging.getLogger("GhostSelfhood")
 
@@ -41,24 +47,20 @@ logger = logging.getLogger("GhostSelfhood")
 STATE_FILENAME = "state.json"
 MOOD_HISTORY_FILENAME = "mood.history.jsonl"
 
-# Bounded so the wake-up prefix stays compact. The numbers are
-# deliberate floors, not tuned: ten of each is enough for a multi-day
-# thread, more than that starts feeling like a journal.
-MAX_OPEN_QUESTIONS = 10
-MAX_UNFINISHED = 10
+#: Bounded growth for the mood journal: once it holds more than
+#: ``MOOD_HISTORY_MAX_ROWS`` rows the oldest are dropped, down to
+#: ``MOOD_HISTORY_KEEP_ROWS``.
+MOOD_HISTORY_MAX_ROWS = 1200
+MOOD_HISTORY_KEEP_ROWS = 1000
 
-# Bounded growth for the mood audit trail (mirrors autobiographical's
-# _COMPACT_MAX_BYTES pattern). The file is append-only and
-# ``mood_history()`` does a full read on every narrative regeneration,
-# so an uncapped file grows both disk and read cost without bound.
-_MOOD_COMPACT_MAX_BYTES = 512 * 1024
-_MOOD_COMPACT_KEEP_LINES = 1000
-
-# Input caps for set_mood (review R2): keep one mood record small
-# relative to both the 1200-char prefix budget and the history
-# compaction's line-count cap.
+# Input caps for the texts a mood row carries.
 _MOOD_LABEL_MAX_CHARS = 64
 _MOOD_EVIDENCE_MAX_CHARS = 300
+
+#: the cause a row carries when the owner set the mood in chat
+OWNER_CAUSE = "the owner said so (set_mood)"
+#: … and when a mood stepped down or ended with nothing happening
+DECAY_CAUSE = "it wore off"
 
 
 def _cap_text(s: str, cap: int) -> str:
@@ -67,6 +69,69 @@ def _cap_text(s: str, cap: int) -> str:
     if len(s) <= cap:
         return s
     return s[: cap - 1].rstrip() + "…"
+
+
+def _aware(now: Optional[datetime.datetime]) -> datetime.datetime:
+    """``now`` as an aware UTC datetime (None = the wall clock)."""
+    if now is None:
+        return datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=datetime.timezone.utc)
+    return now.astimezone(datetime.timezone.utc)
+
+
+def _owner_is_asking() -> bool:
+    """Is the request being served the OWNER's? (Then no boredom is read:
+    his message ended the quiet.) Unknown → no."""
+    try:
+        from ..utils.logging import request_kind
+        return request_kind() == "owner"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: two readings of where a quiet began that are this close are the same quiet
+_SAME_QUIET_S = 60.0
+#: how far back in the journal an open quiet is looked for
+_BORED_SCAN_ROWS = 50
+
+
+def _iso(now: Optional[datetime.datetime]) -> str:
+    """The on-disk timestamp for ``now`` (None = the wall clock)."""
+    if now is None:
+        return _utcnow_iso()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return now.isoformat() + "Z"
+
+
+@dataclass(frozen=True)
+class MoodView:
+    """The mood as it is NOW — what every reader gets."""
+    label: str = M.NEUTRAL
+    intensity: int = 0
+    p: float = 0.0
+    e: float = 0.0
+    manner: str = ""
+    manner_intensity: int = 0
+    source: str = M.SOURCE_AUTO
+    set_at: str = ""            # when this label and intensity began
+    cause: str = ""             # why it is what it is
+    manner_set_at: str = ""
+    recent: Tuple[Dict[str, str], ...] = ()   # the last events that moved it
+
+    @property
+    def neutral(self) -> bool:
+        return self.intensity == 0
+
+    def tone(self) -> str:
+        """The one line a reply's prompt carries ("" when there is nothing
+        to say)."""
+        return M.tone_line(self.label, self.intensity, self.manner, self.manner_intensity)
+
+    def describe(self) -> str:
+        """"irritable, 2 of 3" / "neutral"."""
+        return M.NEUTRAL if self.neutral else f"{self.label}, {self.intensity} of 3"
 
 
 class SelfStateThread:
@@ -83,6 +148,13 @@ class SelfStateThread:
         self.enabled = bool(enabled)
         self._lock = threading.RLock()
         self._state: SelfState = self._read_or_empty()
+        #: how long the owner has been quiet, in seconds (None = unknown) —
+        #: attached by the process that owns the clock (``main.py``); this
+        #: class only ever READS it
+        self._quiet_fn: Optional[Callable[[], Optional[float]]] = None
+        #: (start of the quiet as a timestamp, highest boredom level the
+        #: journal has a row for) — what `_note_bored` last worked out
+        self._bored_seen: Optional[Tuple[float, int]] = None
 
     # -----------------------------------------------------------------
     # Persistence
@@ -135,151 +207,171 @@ class SelfStateThread:
     @property
     def lock(self) -> threading.RLock:
         """Public handle on the state RLock, for callers that need a
-        read-modify-write to be atomic against concurrent mutators
-        (e.g. SelfModel.update_derived_mood's grace-window check).
-        Re-entrant, so holding it across a set_mood/clear_mood call is
-        safe. Exposed deliberately: reaching into ``_lock`` from
+        read-modify-write to be atomic against concurrent mutators.
+        Re-entrant. Exposed deliberately: reaching into ``_lock`` from
         another module would turn a future rename into a silent no-op
         inside that caller's blanket exception guard."""
         return self._lock
 
-    def open_questions(self) -> List[OpenQuestion]:
-        with self._lock:
-            return [q for q in self._state.open_questions if not q.resolved_at]
+    def attach_owner_clock(self, quiet_fn: Optional[Callable[[], Optional[float]]]) -> None:
+        """Give the thread a way to ask how long the owner has been quiet —
+        the FALLBACK, used only while no owner turn has been stamped in the
+        state file (``last_owner_turn_at``)."""
+        self._quiet_fn = quiet_fn if callable(quiet_fn) else None
 
-    def unfinished_threads(self) -> List[UnfinishedThread]:
-        with self._lock:
-            return [t for t in self._state.unfinished_threads if not t.closed_at]
+    def quiet_seconds(self, *, now: Optional[datetime.datetime] = None) -> Optional[float]:
+        """How long the owner has been quiet, or None when nobody knows.
+        Measured from the PERSISTED stamp of the last owner turn, so a
+        restart does not change it; the in-memory clock of the process is
+        asked only when there is no stamp yet."""
+        age = M.age_seconds(self._state.last_owner_turn_at, now=now)
+        if age is not None:
+            return age
+        fn = self._quiet_fn
+        if fn is None:
+            return None
+        try:
+            q = fn()
+            return float(q) if q is not None else None
+        except Exception as e:  # noqa: BLE001 — an unreadable clock is an unknown quiet
+            logger.debug("owner clock unreadable: %s", e)
+            return None
 
-    def mood(self) -> Optional[Mood]:
-        return self._state.mood
+    def _quiet(self, quiet_s, now: Optional[datetime.datetime]) -> Optional[float]:
+        """The quiet a READ applies. An explicit value wins; a request being
+        answered by the owner is never quiet (his message ended it)."""
+        if quiet_s is not None:
+            return quiet_s
+        if _owner_is_asking():
+            return None
+        return self.quiet_seconds(now=now)
+
+    @staticmethod
+    def _evolve(stored: Optional[Mood], now: Optional[datetime.datetime]):
+        """What the stored pair is worth at ``now``: ``(p, e, label,
+        intensity, novelty)``. Pure — decay, then the label and intensity
+        read off with what was held. (Boredom is not here: it is never a
+        value of the pair.)"""
+        if stored is None:
+            return 0.0, 0.0, M.NEUTRAL, 0, False
+        # an age that cannot be established is not "now": the pair is
+        # worth nothing (a mood must never be presented as current on a
+        # timestamp nobody can read)
+        age = M.age_seconds(stored.updated_at, now=now)
+        if age is None:
+            p = e = 0.0
+        else:
+            p, e = M.decay(stored.p, age), M.decay(stored.e, age)
+        label, n, novelty = M.read_off(p, e, held_label=stored.label, held_intensity=stored.intensity,
+                                       novelty=stored.novelty)
+        return p, e, label, n, novelty
+
+    @staticmethod
+    def _wore_off_at(stored: Optional[Mood], n: int, now: Optional[datetime.datetime]) -> str:
+        """WHEN a mood that only decayed came down to intensity ``n`` — the
+        stamp its journal row and its "since" carry, though nobody was
+        looking at that moment. Never later than ``now``, never before the
+        pair was stored; ``now`` when it cannot be worked out."""
+        try:
+            start = M.parse_iso_utc(stored.updated_at) if stored is not None else None
+            if start is None:
+                return _iso(now)
+            end = _aware(now)
+            at = start + datetime.timedelta(
+                seconds=M.decay_step_s(max(abs(stored.p), abs(stored.e)), n))
+            return _iso(min(max(at, start), end).replace(microsecond=0))
+        except Exception:  # noqa: BLE001 — a stamp never costs the mood
+            return _iso(now)
+
+    def mood(self, *, now: Optional[datetime.datetime] = None, quiet_s=None) -> MoodView:
+        """The mood NOW. A read never MOVES the mood, whoever asks: no event
+        is applied and nothing of a boredom is stored. What a read can do,
+        and only while it sees a boredom (``_note_bored``): settle a mood
+        that wore off unseen — the stored pair is rewritten to its decayed
+        value, the same value any reader computes from it, and the "it wore
+        off" row is added — and add the journal row of a boredom level it is
+        the first to see (at most one per level per quiet)."""
+        stored = self._state.mood
+        p, e, label, n, _nov = self._evolve(stored, now)
+        manner = stored.manner if stored is not None else ""
+        base = dict(
+            p=round(p, 4), e=round(e, 4),
+            manner=manner,
+            manner_intensity=(stored.manner_intensity if manner else 0),
+            manner_set_at=(stored.manner_set_at if manner else ""),
+            recent=tuple(dict(r) for r in (stored.recent if stored is not None else ())),
+        )
+        if n == 0:
+            # boredom: only over a NEUTRAL mood — a real mood that has not
+            # worn off (the owner's included) is not replaced by it
+            quiet = self._quiet(quiet_s, now)
+            level = M.boredom_level(quiet)
+            if level:
+                start = _aware(now) - datetime.timedelta(seconds=float(quiet))
+                self._note_bored(level, start, now)
+                return MoodView(label=M.BORED, intensity=level, source=M.SOURCE_AUTO,
+                                set_at=_iso(self._bored_since(level, start, now)),
+                                cause=M.quiet_cause(level), **base)
+        base.update(label=label, intensity=n)
+        if stored is None and n == 0:
+            return MoodView(**base)                     # nothing on file, nothing to say
+        if stored is not None and (label, n) == (stored.label, stored.intensity):
+            return MoodView(source=(stored.source if n else M.SOURCE_AUTO),
+                            set_at=stored.set_at, cause=(stored.cause if n else ""), **base)
+        # the pair has decayed past a boundary since it was stored and nobody
+        # has written that down yet
+        keeps_owner = (stored is not None and stored.source == M.SOURCE_OWNER
+                       and n and label == stored.label)
+        return MoodView(source=(M.SOURCE_OWNER if keeps_owner else M.SOURCE_AUTO),
+                        set_at=self._wore_off_at(stored, n, now),
+                        cause=(DECAY_CAUSE if n else ""), **base)
 
     # -----------------------------------------------------------------
-    # Write API
+    # The journal
     # -----------------------------------------------------------------
 
-    def note_open_question(self, text: str, *, source_trajectory_id: str = "") -> Optional[OpenQuestion]:
-        text = (text or "").strip()
-        if not text:
-            return None
-        with self._lock:
-            # Dedup by text — re-noting the same question is a no-op.
-            for q in self._state.open_questions:
-                if q.text == text and not q.resolved_at:
-                    return q
-            q = OpenQuestion(text=text, source_trajectory_id=source_trajectory_id)
-            self._state.open_questions.append(q)
-            self._cap(self._state.open_questions, MAX_OPEN_QUESTIONS)
-            self._flush()
-            return q
-
-    def mark_question_resolved(self, question_id: str) -> bool:
-        with self._lock:
-            for q in self._state.open_questions:
-                if q.id == question_id and not q.resolved_at:
-                    q.resolved_at = _utcnow_iso()
-                    self._flush()
-                    return True
-            return False
-
-    def add_unfinished(self, descriptor: str, *, source_trajectory_id: str = "") -> Optional[UnfinishedThread]:
-        descriptor = (descriptor or "").strip()
-        if not descriptor:
-            return None
-        with self._lock:
-            for t in self._state.unfinished_threads:
-                if t.descriptor == descriptor and not t.closed_at:
-                    return t
-            t = UnfinishedThread(descriptor=descriptor, source_trajectory_id=source_trajectory_id)
-            self._state.unfinished_threads.append(t)
-            self._cap(self._state.unfinished_threads, MAX_UNFINISHED)
-            self._flush()
-            return t
-
-    def close_unfinished(self, thread_id: str) -> bool:
-        with self._lock:
-            for t in self._state.unfinished_threads:
-                if t.id == thread_id and not t.closed_at:
-                    t.closed_at = _utcnow_iso()
-                    self._flush()
-                    return True
-            return False
-
-    def set_mood(
-        self, label: str, evidence: str = "", *, source: str = "self",
-    ) -> Optional[Mood]:
-        # Bounded inputs (review R2): the tool path caps nothing, and a
-        # single oversized evidence line would defeat the history
-        # compaction's LINE cap (it can never bring the file under the
-        # byte cap → full rewrite on every transition forever) and
-        # crowd everything else out of the 1200-char prefix. Truncation
-        # carries an ellipsis so a cut never reads as a complete
-        # sentence (derived writers stay well under the caps; only
-        # tool-authored text can hit them).
-        label = _cap_text(label, _MOOD_LABEL_MAX_CHARS)
-        if not label:
-            return None
-        evidence = _cap_text(evidence, _MOOD_EVIDENCE_MAX_CHARS)
-        # Constrain provenance to the two known values so a caller typo
-        # can't mint a third population in the history file.
-        source = "derived" if source == "derived" else "self"
-        with self._lock:
-            prior = self._state.mood
-            if (prior is not None and prior.label == label
-                    and getattr(prior, "source", "self") == source):
-                # Same functional state re-confirmed: refresh the
-                # staleness clock (and evidence, when fresh evidence is
-                # supplied) WITHOUT a history append — the history
-                # records transitions, not heartbeats, so the "mood arc"
-                # stays an arc and the file doesn't fill with identical
-                # lines at one-per-turn rate. Swap in a NEW Mood rather
-                # than mutating the prior one field-by-field: readers
-                # (mood(), format_as_prefix) don't take the lock, and a
-                # single reference assignment can't be observed torn.
-                refreshed = Mood(
-                    label=label,
-                    evidence=evidence or prior.evidence,
-                    source=source,
-                )
-                self._state.mood = refreshed
-                self._flush()
-                return refreshed
-            mood = Mood(label=label, evidence=evidence, source=source)
-            self._state.mood = mood
-            self._flush()
-            # Mood history — append-only audit trail so the narrative
-            # can describe arcs ("I shifted from stuck to satisfied")
-            # rather than just the latest slot. Failures are swallowed
-            # — the latest mood is already persisted in state.json.
-            try:
-                self.mood_history_path.parent.mkdir(parents=True, exist_ok=True)
-                rec = {
-                    "label": mood.label,
-                    "evidence": mood.evidence,
-                    "set_at": mood.set_at,
-                    "source": mood.source,
-                }
-                with open_append(self.mood_history_path) as f:
-                    f.write(json.dumps(rec, ensure_ascii=False))
-                    f.write("\n")
-                self._maybe_compact_mood_history_locked()
-            except Exception as e:
-                logger.warning("mood history append failed: %s", e)
-            return mood
+    def _append_history_locked(self, m: Mood, kind: str, note: str = "",
+                               prev: str = "") -> None:
+        """One journal row for a change of label or intensity — and one
+        operator line (🪞). Failures are swallowed — the mood itself is
+        already in state.json."""
+        try:
+            from ..utils.logging import Icons, pretty_log
+            pretty_log("Selfhood", f"mood {prev or M.NEUTRAL} → {self._describe(m)}: {m.cause}",
+                       icon=Icons.SELF_STATE)
+        except Exception:  # noqa: BLE001 — a log line never costs the row
+            pass
+        if not self.enabled:
+            return
+        try:
+            self.mood_history_path.parent.mkdir(parents=True, exist_ok=True)
+            rec = {"label": m.label, "intensity": m.intensity,
+                   "p": round(m.p, 3), "e": round(m.e, 3),
+                   "at": m.set_at, "cause": m.cause, "kind": kind}
+            if note:
+                rec["note"] = note
+            with open_append(self.mood_history_path) as f:
+                f.write(json.dumps(rec, ensure_ascii=False))
+                f.write("\n")
+            self._maybe_compact_mood_history_locked()
+        except Exception as e:
+            logger.warning("mood history append failed: %s", e)
 
     def _maybe_compact_mood_history_locked(self) -> None:
-        """Rewrite the mood history keeping the newest
-        ``_MOOD_COMPACT_KEEP_LINES`` records once it passes the byte cap.
-        Caller holds ``self._lock``. Best-effort — a failed compaction
-        must never fail the mood write that triggered it."""
+        """Keep the newest ``MOOD_HISTORY_KEEP_ROWS`` rows once the journal
+        holds more than ``MOOD_HISTORY_MAX_ROWS``. Caller holds the lock.
+        Works on BYTES: a line that is not UTF-8 (a torn write, a hand edit)
+        is counted and carried like any other, so one bad byte cannot switch
+        the cap off. Best-effort — a failed compaction never fails the mood
+        write."""
         try:
-            if self.mood_history_path.stat().st_size <= _MOOD_COMPACT_MAX_BYTES:
+            with self.mood_history_path.open("rb") as f:
+                lines = f.readlines()
+            if len(lines) <= MOOD_HISTORY_MAX_ROWS:
                 return
-            from collections import deque
-            with self.mood_history_path.open("r", encoding="utf-8") as f:
-                tail = deque(f, maxlen=_MOOD_COMPACT_KEEP_LINES)
+            tail = lines[-MOOD_HISTORY_KEEP_ROWS:]
             tmp = self.mood_history_path.with_suffix(".jsonl.tmp")
-            with tmp.open("w", encoding="utf-8") as f:
+            with tmp.open("wb") as f:
                 f.writelines(tail)
             tmp.replace(self.mood_history_path)
             logger.info(
@@ -288,75 +380,327 @@ class SelfStateThread:
         except Exception as e:
             logger.warning("mood history compaction failed: %s", e)
 
-    def clear_mood(self) -> bool:
-        """Retire the current mood slot (review R2: acute derived states
-        whose basis has been falsified — "idle" while the operator is
-        actively chatting, "overloaded" after a clean turn — must not
-        stand as current for the full 48h TTL). Clears the latest slot
-        only; the history keeps the state the mood transitioned INTO
-        (the arc records states held, and a retirement is the absence
-        of a state, not a new one). Returns True when something was
-        cleared."""
-        with self._lock:
-            if self._state.mood is None:
-                return False
-            self._state.mood = None
-            self._flush()
-            return True
+    def _open_boredom(self, since: Optional[float] = None) -> int:
+        """The highest boredom level the journal holds a row for in the quiet
+        that is still open — i.e. since the last "the quiet ended" row, and,
+        when ``since`` (a timestamp) is given, not before the quiet began.
+        0 when there is none. Other rows in between (a thumb that came
+        without a turn, a wearing off) do not close a quiet."""
+        level = 0
+        for row in reversed(self.mood_history(limit=_BORED_SCAN_ROWS)):
+            kind = row.get("kind")
+            if kind == M.KIND_QUIET_END:
+                break
+            if kind != M.KIND_QUIET:
+                continue
+            at = M.parse_iso_utc(str(row.get("at") or ""))
+            if since is not None and (at is None or at.timestamp() < since - _SAME_QUIET_S):
+                break
+            level = max(level, int(row.get("intensity") or 0))
+        return level
 
-    def mood_history(self, *, limit: int = 20) -> List[Mood]:
-        """Tail of the mood history, oldest first within the returned
-        window. Returns empty list when the file is missing or limit
-        <= 0."""
+    def _bored_since(self, level: int, start: datetime.datetime,
+                     now: Optional[datetime.datetime]) -> datetime.datetime:
+        """Since when a reader sees boredom at ``level`` in the quiet that
+        began at ``start``: when the quiet crossed that level's threshold —
+        or, if a mood was still alive then (a thumb that came without a
+        turn), when that mood wore off. (Both lie behind ``now``: the level
+        is only read once its threshold is crossed and the mood is neutral.)
+        The same moment dates the journal row, so a bored row never precedes
+        the "it wore off" row of the mood it followed."""
+        at = start + datetime.timedelta(seconds=M.BOREDOM_THRESHOLDS[level])
+        stored = self._state.mood
+        if stored is not None:
+            neutral_at = M.parse_iso_utc(stored.set_at if stored.intensity == 0
+                                         else self._wore_off_at(stored, 0, now))
+            if neutral_at is not None and neutral_at > at:
+                at = neutral_at
+        return at.replace(microsecond=0)
+
+    def _note_bored(self, level: int, start: datetime.datetime,
+                    now: Optional[datetime.datetime]) -> None:
+        """A read saw boredom at ``level`` in the quiet that began at
+        ``start``. FIRST, whenever the stored mood is not neutral, it is
+        settled — a mood that wore off unseen gets its "it wore off" row
+        before any bored row, whatever is remembered about this quiet. THEN
+        the journal row of each level this quiet has not had one for is
+        written ("bored 1", "bored 2"), dated by ``_bored_since`` — and
+        nothing when it has them (a poller must not add a row per poll).
+        What the quiet already has is read off the journal
+        (``_open_boredom``); the answer is remembered in memory. Rows are
+        appended in time order. Never raises: a read is a read."""
+        try:
+            with self._lock:
+                stored = self._state.mood
+                if stored is not None and stored.intensity > 0:
+                    self._settle_locked(now)
+                seen = self._bored_seen
+                if seen is not None and abs(seen[0] - start.timestamp()) < _SAME_QUIET_S:
+                    logged = seen[1]
+                else:
+                    logged = self._open_boredom(start.timestamp())
+                for k in range(logged + 1, level + 1):
+                    cur = self._state.mood
+                    row = Mood(p=(cur.p if cur is not None else 0.0), e=(cur.e if cur is not None else 0.0),
+                               label=M.BORED, intensity=k, set_at=_iso(self._bored_since(k, start, now)),
+                               cause=M.quiet_cause(k))
+                    self._append_history_locked(
+                        row, M.KIND_QUIET,
+                        prev=(M.NEUTRAL if k == 1 else f"{M.BORED}, {k - 1} of 3"))
+                self._bored_seen = (start.timestamp(), max(logged, level))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("boredom not journalled: %s: %s", type(e).__name__, e)
+
+    # -----------------------------------------------------------------
+    # Write API — the mood
+    # -----------------------------------------------------------------
+
+    def _store_locked(self, m: Mood) -> Mood:
+        m.p, m.e = round(m.p, 4), round(m.e, 4)
+        self._state.mood = m          # one reference swap: a reader never sees it torn
+        self._flush()
+        return m
+
+    def _settle_locked(self, now: Optional[datetime.datetime]) -> Mood:
+        """Bring the stored pair to ``now`` (decay) and write it down when
+        that crossed a boundary. Returns the mood as it stands (stored or
+        not). Caller holds the lock."""
+        stored = self._state.mood
+        p, e, label, n, novelty = self._evolve(stored, now)
+        base = stored if stored is not None else Mood()
+        cur = Mood(
+            p=p, e=e, updated_at=_iso(now), label=label, intensity=n, novelty=novelty,
+            source=base.source, set_at=base.set_at, cause=base.cause,
+            recent=list(base.recent), manner=base.manner,
+            manner_intensity=base.manner_intensity, manner_set_at=base.manner_set_at,
+        )
+        if (label, n) == (base.label, base.intensity):
+            return cur                       # nothing to write: decay is a function of time
+        cur.cause = DECAY_CAUSE
+        # a mood that wore off is dated when it did, not when it was noticed
+        cur.set_at = self._wore_off_at(stored, n, now)
+        # an owner-set mood that only steps down is still the owner's
+        if not (base.source == M.SOURCE_OWNER and n and label == base.label):
+            cur.source = M.SOURCE_AUTO
+        self._store_locked(cur)
+        self._append_history_locked(cur, M.KIND_DECAY, prev=self._describe(base))
+        return cur
+
+    def settle(self, *, now: Optional[datetime.datetime] = None) -> MoodView:
+        """Write down what time did to the mood (a step down, a wearing
+        off). Boredom is never settled: it is not in the pair."""
+        with self._lock:
+            return self._view_of(self._settle_locked(now))
+
+    def owner_arrived(self, *, now: Optional[datetime.datetime] = None) -> None:
+        """An owner's request has arrived: the quiet, if there was one, is
+        over. Writes down what time did to the mood, adds ONE "the quiet
+        ended" row when the journal holds a boredom of this quiet, and stamps
+        the owner's presence. The pair is not touched by the quiet."""
+        with self._lock:
+            cur = self._settle_locked(now)
+            was = self._open_boredom()
+            if was > 0:
+                row = Mood(p=cur.p, e=cur.e, label=cur.label, intensity=cur.intensity,
+                           set_at=_iso(now), cause=M.QUIET_ENDED_CAUSE)
+                self._append_history_locked(row, M.KIND_QUIET_END, prev=f"{M.BORED}, {was} of 3")
+            self.mark_owner_turn(now=now)
+
+    def mark_owner_turn(self, *, now: Optional[datetime.datetime] = None) -> None:
+        """Stamp that the owner is here (a request of his arrived, or ended).
+        The next quiet is measured from this."""
+        with self._lock:
+            self._state.last_owner_turn_at = _iso(now)
+            self._bored_seen = None
+            self._flush()
+
+    def nudge(self, dp: float, de: float, cause: str, kind: str, *, novelty: bool = False,
+              now: Optional[datetime.datetime] = None) -> Tuple[MoodView, MoodView]:
+        """THE function every event goes through: move the pair by
+        ``(dp, de)``, clamp it, record it. Returns ``(before, after)``."""
+        with self._lock:
+            base = self._settle_locked(now)
+            before = self._view_of(base)
+            try:
+                dp, de = float(dp), float(de)
+            except (TypeError, ValueError):
+                return before, before
+            if dp == 0.0 and de == 0.0:
+                return before, before
+            at = _iso(now)
+            p, e = M.clamp(base.p + dp), M.clamp(base.e + de)
+            # the novelty tag belongs to the move that set it: a later event
+            # that is not itself a research event clears it (review r2 —
+            # research, then three thumbs, read "curious, 3 of 3: the owner
+            # gave a thumbs-up")
+            label, n, nov = M.read_off(p, e, held_label=base.label, held_intensity=base.intensity,
+                                       novelty=bool(novelty))
+            changed = (label, n) != (base.label, base.intensity)
+            cause = _cap_text(str(cause or ""), _MOOD_EVIDENCE_MAX_CHARS)
+            new = Mood(
+                p=p, e=e, updated_at=at, label=label, intensity=n, novelty=nov,
+                source=(M.SOURCE_AUTO if changed else base.source),
+                set_at=(at if changed else base.set_at),
+                cause=(cause if changed else base.cause),
+                recent=(list(base.recent) + [{"at": at, "cause": cause, "kind": str(kind or "")}]
+                        )[-MOOD_RECENT_CAUSES:],
+                manner=base.manner, manner_intensity=base.manner_intensity,
+                manner_set_at=base.manner_set_at,
+            )
+            self._store_locked(new)
+            if changed:
+                self._append_history_locked(new, str(kind or ""), prev=before.describe())
+            return before, self._view_of(new)
+
+    @staticmethod
+    def _describe(m: Mood) -> str:
+        return M.NEUTRAL if not m.intensity else f"{m.label}, {m.intensity} of 3"
+
+    @staticmethod
+    def _view_of(m: Mood) -> MoodView:
+        return MoodView(
+            label=m.label, intensity=m.intensity, p=round(m.p, 4), e=round(m.e, 4),
+            manner=m.manner, manner_intensity=(m.manner_intensity if m.manner else 0),
+            source=(m.source if m.intensity else M.SOURCE_AUTO), set_at=m.set_at,
+            cause=(m.cause if m.intensity else ""),
+            manner_set_at=(m.manner_set_at if m.manner else ""),
+            recent=tuple(dict(r) for r in m.recent),
+        )
+
+    def set_owner_mood(self, label: str, direction: Tuple[float, float], intensity: int, *,
+                       note: str = "", now: Optional[datetime.datetime] = None,
+                       ) -> Tuple[MoodView, MoodView]:
+        """The owner said how to be: put the pair on ``label``'s anchor at
+        ``intensity``. From there it decays and reacts like any mood.
+        Returns ``(before, after)``."""
+        with self._lock:
+            base = self._settle_locked(now)
+            before = self._view_of(base)
+            n = max(1, min(3, int(intensity)))
+            p, e = M.anchor_for(direction, n)
+            at = _iso(now)
+            changed = (label, n) != (base.label, base.intensity)
+            new = Mood(
+                p=p, e=e, updated_at=at, label=label, intensity=n,
+                novelty=(label == M.CURIOUS), source=M.SOURCE_OWNER,
+                set_at=(at if changed else (base.set_at or at)), cause=OWNER_CAUSE,
+                recent=(list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}]
+                        )[-MOOD_RECENT_CAUSES:],
+                manner=base.manner, manner_intensity=base.manner_intensity,
+                manner_set_at=base.manner_set_at,
+            )
+            self._store_locked(new)
+            if changed:
+                self._append_history_locked(new, M.KIND_OWNER,
+                                            _cap_text(note, _MOOD_EVIDENCE_MAX_CHARS),
+                                            prev=before.describe())
+            return before, self._view_of(new)
+
+    def reset_mood(self, *, note: str = "", now: Optional[datetime.datetime] = None,
+                   ) -> Tuple[MoodView, MoodView]:
+        """The owner said "neutral": the pair goes to 0, 0 AND the manner is
+        cleared. Returns ``(before, after)``."""
+        with self._lock:
+            base = self._settle_locked(now)
+            before = self._view_of(base)
+            at = _iso(now)
+            was_mood = base.intensity > 0
+            if not was_mood and not base.manner and base.p == 0.0 and base.e == 0.0:
+                return before, before            # nothing on file to reset
+            new = Mood(
+                p=0.0, e=0.0, updated_at=at, label=M.NEUTRAL, intensity=0, novelty=False,
+                source=M.SOURCE_AUTO, set_at=(at if was_mood else base.set_at),
+                cause=(OWNER_CAUSE if was_mood else base.cause),
+                recent=(list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}]
+                        )[-MOOD_RECENT_CAUSES:],
+            )
+            self._store_locked(new)
+            if was_mood:
+                self._append_history_locked(new, M.KIND_OWNER,
+                                            _cap_text(note, _MOOD_EVIDENCE_MAX_CHARS),
+                                            prev=before.describe())
+            return before, self._view_of(new)
+
+    def set_manner(self, manner: str, intensity: int, *,
+                   now: Optional[datetime.datetime] = None) -> Tuple[MoodView, MoodView]:
+        """The owner set a way of talking ("" clears it). It does not decay
+        and stays until the owner changes or clears it. The mood itself is
+        left as it is. Returns ``(before, after)``."""
+        with self._lock:
+            base = self._settle_locked(now)
+            before = self._view_of(base)
+            man = M.resolve_manner(manner)
+            if not man and not base.manner:
+                return before, before
+            new = Mood(
+                p=base.p, e=base.e, updated_at=base.updated_at or _iso(now), label=base.label,
+                intensity=base.intensity, novelty=base.novelty, source=base.source,
+                set_at=base.set_at, cause=base.cause, recent=list(base.recent),
+                manner=man,
+                manner_intensity=(max(1, min(3, int(intensity))) if man else 0),
+                manner_set_at=(_iso(now) if man else ""),
+            )
+            if man and man == base.manner and new.manner_intensity == base.manner_intensity:
+                new.manner_set_at = base.manner_set_at or new.manner_set_at
+            self._store_locked(new)
+            return before, self._view_of(new)
+
+    def mood_history(self, *, limit: int = 20) -> List[Dict[str, object]]:
+        """The newest ``limit`` rows of the mood journal, oldest first. Rows
+        written before §4TC (a label with no pair) are skipped. Empty when
+        the file is missing or ``limit`` <= 0."""
         if limit <= 0 or not self.mood_history_path.exists():
             return []
         try:
-            lines = self.mood_history_path.read_text(encoding="utf-8").splitlines()
+            # errors="replace": one byte that is not UTF-8 costs its own line
+            # (it no longer parses, or parses with a replaced character) —
+            # not the whole journal
+            lines = self.mood_history_path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as e:
             logger.warning("mood history read failed: %s", e)
             return []
-        out: List[Mood] = []
-        for line in lines[-limit:]:
+        out: List[Dict[str, object]] = []
+        for line in lines:
             s = line.strip()
             if not s:
                 continue
             try:
                 d = json.loads(s)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                continue                       # not JSON (a bad byte, a torn line, nesting too deep)
+            if not isinstance(d, dict) or "at" not in d or "p" not in d:
+                continue                       # a pre-§4TC row
+            label = str(d.get("label") or "")
+            try:
+                n = max(0, min(3, int(d.get("intensity") or 0)))
+            except (TypeError, ValueError):
+                n = 0
+            if label not in M.LABELS and label != M.NEUTRAL:
                 continue
-            out.append(Mood(
-                label=str(d.get("label") or ""),
-                evidence=str(d.get("evidence") or ""),
-                set_at=str(d.get("set_at") or ""),
-                # Lines predating the provenance field were tool-authored.
-                source=str(d.get("source") or "self"),
-            ))
-        return out
+            out.append({"label": label, "intensity": n,
+                        "p": M.clamp(d.get("p")), "e": M.clamp(d.get("e")),
+                        "at": str(d.get("at") or ""), "cause": str(d.get("cause") or ""),
+                        "kind": str(d.get("kind") or ""), "note": str(d.get("note") or "")})
+        return out[-limit:]
 
-    def stale_open_questions(self, *, max_age_days: float = 3.0) -> List[OpenQuestion]:
-        """Return open questions whose ``opened_at`` is older than
-        ``max_age_days``. Used by an idle gardener hook so the
-        open-question list stays alive — a question that sits for a
-        week with no engagement should either be re-engaged or
-        resolved, not silently accumulated."""
-        threshold = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            days=max(0.0, float(max_age_days))
-        )
-        out: List[OpenQuestion] = []
-        with self._lock:
-            for q in self._state.open_questions:
-                if q.resolved_at:
-                    continue
-                try:
-                    # Tolerate either "...Z" or full-iso timestamps.
-                    raw = (q.opened_at or "").rstrip("Z")
-                    opened = datetime.datetime.fromisoformat(raw).replace(
-                        tzinfo=datetime.timezone.utc
-                    )
-                except Exception:
-                    continue
-                if opened < threshold:
-                    out.append(q)
+    def mood_timeline(self, *, now: Optional[datetime.datetime] = None, tz=None,
+                      limit: int = 200) -> List[Dict[str, object]]:
+        """Today's rows of the journal (the local day of ``now``), oldest
+        first, each with its local time as ``"hhmm"``."""
+        if now is None:
+            now = datetime.datetime.now(datetime.timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        today = now.astimezone(tz).date()
+        out: List[Dict[str, object]] = []
+        for row in self.mood_history(limit=limit):
+            at = M.parse_iso_utc(str(row.get("at") or ""))
+            if at is None:
+                continue
+            local = at.astimezone(tz)
+            if local.date() != today:
+                continue
+            out.append({**row, "hhmm": local.strftime("%H:%M")})
         return out
 
     def touch_session(self) -> None:
@@ -368,92 +712,32 @@ class SelfStateThread:
     # Helpers
     # -----------------------------------------------------------------
 
-    @staticmethod
-    def _cap(seq, limit: int) -> None:
-        # Bounded list, most-recent-wins. Mutates in place so the
-        # caller's reference stays valid. Resolved/closed entries are
-        # evicted first — they count toward the cap but carry no live
-        # value, and a blind head-first eviction could drop the only
-        # still-open entry while retaining dead ones.
-        overflow = len(seq) - limit
-        if overflow <= 0:
-            return
-        i = 0
-        while overflow > 0 and i < len(seq):
-            item = seq[i]
-            if getattr(item, "resolved_at", None) or getattr(item, "closed_at", None):
-                del seq[i]
-                overflow -= 1
-            else:
-                i += 1
-        if overflow > 0:
-            del seq[:overflow]
+    def format_as_prefix(self, *, max_chars: int = 1200,
+                         now: Optional[datetime.datetime] = None,
+                         include_mood: bool = True) -> str:
+        """Render the current state as first-person text (the wake-up text
+        the functional harness renders, and the head of the state block of
+        the diary's prompt).
 
-    def format_as_prefix(
-        self,
-        *,
-        max_chars: int = 1200,
-        now: Optional[datetime.datetime] = None,
-        include_mood_age: bool = True,
-    ) -> str:
-        """Render the current state as a first-person prefix the wake-up
-        layer can splice into the system prompt.
-
-        Empty when there's nothing worth surfacing — a wake-up prefix
-        containing only "I have no open questions" is noise.
-
-        The mood line carries its provenance and age, and is dropped
-        entirely once past ``mood.MOOD_STALE_AFTER_HOURS`` (or when its
-        timestamp doesn't parse): a 23-day-old label presented as
-        current is exactly how "curious" became the eternal answer.
-        ``now`` is injectable for tests; None means wall-clock.
-
-        ``include_mood_age=False`` renders the mood line as label +
-        provenance ONLY — no age phrase and no evidence (staleness drop
-        still applies) — for the narrative consumer, whose prompt sha1
-        is the regenerate skip-guard: a wall-clock-varying "2h ago"
-        (R2) or an evidence count draining as verdicts cross the 7-day
-        age bound (R6) would defeat that guard and bake clock-derived
-        text into a diary that persists for days."""
-        open_qs = self.open_questions()
-        unfin = self.unfinished_threads()
-        mood = self.mood()
-        if not (open_qs or unfin or mood or self._state.last_session_at):
+        Empty when there's nothing worth surfacing. The mood line is the
+        label and its intensity only — no time, no cause. A neutral mood has
+        no line. ``include_mood=False`` leaves the mood line out: the diary
+        reads the mood from the JOURNAL, not from what a read shows at this
+        instant (a boredom level, a step of decay), because its prompt's
+        hash is its regenerate skip-guard."""
+        view = self.mood(now=now, quiet_s=(None if include_mood else 0.0))
+        if ((view.neutral or not include_mood) and not view.manner
+                and not self._state.last_session_at):
             return ""
 
         lines: List[str] = []
         if self._state.last_session_at:
             lines.append(f"I was last active on {self._state.last_session_at}.")
-        if mood and mood.label and not mood_is_stale(mood.set_at, now=now):
-            if include_mood_age:
-                prov = describe_mood_provenance(
-                    getattr(mood, "source", "self"),
-                    age_seconds(mood.set_at, now=now),
-                )
-                ev = f" ({mood.evidence})" if mood.evidence else ""
-                lines.append(f"My mood, {prov}: {mood.label}{ev}.")
-            else:
-                # Narrative-facing rendering: label + provenance ONLY —
-                # no age AND no evidence. Evidence strings legitimately
-                # vary with the clock (streak counts drain as verdicts
-                # cross the 7-day age bound with zero new events, R6),
-                # and this block feeds the regenerate skip-guard's
-                # sha1: stability here must hold by CONSTRUCTION, not
-                # by policing every evidence template. New-verdict
-                # regenerations are not lost — a new verdict changes
-                # the experiences block of the same prompt anyway.
-                # Shared wording helper so this rendering can't drift
-                # from the tool/prefix surface (review R7).
-                prov = provenance_phrase(getattr(mood, "source", "self"))
-                lines.append(f"My mood, {prov}: {mood.label}.")
-        if open_qs:
-            lines.append("Questions I am still working through:")
-            for q in open_qs[-5:]:  # only the freshest 5
-                lines.append(f"  - {q.text}")
-        if unfin:
-            lines.append("Threads I left unfinished:")
-            for t in unfin[-5:]:
-                lines.append(f"  - {t.descriptor}")
+        if include_mood and not view.neutral:
+            lines.append(f"My mood: {view.describe()}.")
+        if view.manner:
+            lines.append(f"My manner (set by the owner): {view.manner}, "
+                         f"{view.manner_intensity} of 3.")
         text = "\n".join(lines)
         if len(text) > max_chars:
             text = text[: max_chars - 1] + "…"

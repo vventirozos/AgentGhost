@@ -35,7 +35,6 @@ from pathlib import Path
 import pytest
 
 from ghost_agent.memory.episodes import EpisodicMemory
-from ghost_agent.memory.skills import SkillMemory, lesson_embedding_text
 from ghost_agent.memory.vector import VectorMemory
 from ghost_agent.tools.acquired_skills import AcquiredSkillManager
 
@@ -349,39 +348,6 @@ def test_a_refused_skill_description_keeps_the_embedding_it_could_not_replace(tm
     assert mgr.get_all_skills()["tail_net_ping"]["description"] == new_desc
     # …and the colliding row keeps its owner
     assert vm.collection.get(where={"type": "auto"})["ids"]
-
-
-def test_a_refused_lesson_twin_is_said_out_loud(tmp_path, caplog, monkeypatch):
-    """`add_lesson`'s own twin write ignored the answer. The playbook row
-    lands (it is the canonical store) while the vector copy the playbook's
-    semantic path reads never exists — the lesson is reachable only by the
-    substring fallback, and "SKILL ACQUIRED" said nothing about it."""
-    vm = _mem()
-    sm = SkillMemory(tmp_path)
-    trigger = "the sandbox lost egress after a restart"
-    anti = "assuming the container kept its netns"
-    correct = "re-run the transparent tor setup before any fetch"
-    text = lesson_embedding_text({"trigger": trigger, "anti_pattern": anti,
-                                  "correct_pattern": correct})
-    vm.add(text, {"type": "auto", "timestamp": "2026-01-01T00:00:00Z"})
-
-    import ghost_agent.memory.skills as _SKM
-    _said = []
-    monkeypatch.setattr(_SKM, "pretty_log", lambda *a, **k: _said.append(a))
-    with caplog.at_level(logging.WARNING, logger="GhostAgent"):
-        out = sm.learn_lesson("", "", "", memory_system=vm, trigger=trigger,
-                              anti_pattern=anti, correct_pattern=correct,
-                              origin="test", source="learn_skill")
-
-    assert out == "written"
-    assert any(l.get("trigger") == trigger
-               for l in json.loads(sm.file_path.read_text()))
-    assert vm.collection.get(where={"type": "skill"})["ids"] == [], (
-        "the twin landed after all — then this pin is testing the wrong world")
-    # §4NV: said once, on the watched stream (the duplicate logger.warning
-    # beside it is DEBUG now) — the durable record carries the same line
-    assert any("dark to semantic recall" in str(c) for c in _said), (
-        "the lesson is invisible to semantic recall and nobody was told")
 
 
 # ── 6. an episode store REBUILD re-issues ids the old twins still carry ─────

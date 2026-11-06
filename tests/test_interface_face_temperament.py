@@ -152,7 +152,7 @@ def test_an_error_startles_once_and_failures_strain(lab):
     r = _node(lab, """
 const T = mk(); let t = at(15); T.event('error');
 const a = { ...T.step(1 / 60, t += 16) }, b = { ...T.step(1 / 60, t += 16) };   // step() reuses one object
-const U = mk(); U.ingestLog('12:01 🐍 Sandbox Exec · python x.py ❌ exit 1');
+const U = mk(); U.ingestLog('│  **  12:01:00  ❌  +1.0s  sandbox exec   python x.py exit 1');
 emit({ k1: a.startleKick, k2: b.startleKick, jitter: a.jitter, strain: U.debug().drives.strain, valence: U.debug().drives.valence });
 """)
     assert r["k1"] > 0.5 and r["k2"] == 0, r                    # the kick is consumed once
@@ -174,19 +174,17 @@ emit({ d });
 
 
 @pytest.mark.parametrize("line,expect", [
-    ("🌐 Web Search · postgres 18 release", ["work:web"]),
-    ("🐍 Sandbox Exec · python x.py ❌ exit 1", ["work:code", "outcome:fail"]),
-    ("📀 head disk — restored the head in 0.5s", ["outcome:restore"]),
-    ("🔄 retry 2/3", ["outcome:retry"]),
+    ("│  **  12:00:01  🌐  +1.0s  web search   postgres 18 release", ["work:web"]),
+    ("│  **  12:00:01  🐍  +1.0s  sandbox exec   python x.py", ["work:code"]),
+    ("│  **  12:00:01  ❌  +1.0s  sandbox exec   exit 1", ["outcome:fail"]),
+    ("│  **  12:00:01  📀  +1.0s  head disk   restored the head in 0.5s", ["outcome:restore"]),
+    ("│  **  12:00:01  🔄  +1.0s  retry   2/3", ["outcome:retry"]),
+    ("│  **  12:00:01  💬  +1.0s  llm request   no reaction for this icon", []),
     ("plain line, no icon", []),
 ])
 def test_log_lines_say_what_ran_and_how_it_went(lab, line, expect):
-    r = _node(lab, f"emit(M.classifyLogLine({json.dumps(line)}, false));")
+    r = _node(lab, f"emit(M.classifyLogLine({json.dumps(line)}));")
     assert r == expect
-
-
-def test_an_error_flag_counts_as_a_failure(lab):
-    assert _node(lab, "emit(M.classifyLogLine('something broke', true));") == ["outcome:fail"]
 
 
 # ── the wiring: the REAL matrix_graph.js under the face harness ──────────
@@ -200,7 +198,7 @@ def face_lab(tmp_path_factory):
 import { face, tick } from './harness.mjs';
 tick(120);
 const r0 = face.getTemperament().out;
-face.noteLogLine('🐍 Sandbox Exec ❌ exit 1', false); tick(2);
+face.noteLogLine('│  **  12:00:00  ❌  +1.0s  sandbox exec   exit 1'); tick(2);
 const strain = face.getTemperament().drives.strain;
 face.setUserTurn(true); tick(360);
 const waiting = face.getTemperament().out.anticipation;
@@ -233,7 +231,7 @@ def test_app_js_feeds_log_lines_and_stream_chunks():
     """World: the face exports the hooks but the client never calls them."""
     app = (_STATIC / "app.js").read_text(encoding="utf-8")
     i = app.index("noteTickerLine(data.content);")
-    assert "activeFace.noteLogLine(data.content, data.is_error)" in app[i:i + 400]
+    assert "activeFace.noteLogLine(data.content)" in app[i:i + 400]
     j = app.index("chunkContent = data.choices[0].delta.content;")
     assert "activeFace.noteStreamChunk(chunkContent)" in app[j:j + 300]
 
@@ -268,7 +266,7 @@ function arc(intensity) {
 emit({ on: arc(undefined), off: arc(0) });
 """)
     on, off = r["on"], r["off"]
-    assert on["maxYaw"] > 0.25, on                      # > ~14° head turn at rest
+    assert on["maxYaw"] > 0.06, on                      # still turns at rest, at a third (v1.4, §4TF)
     assert on["minS"] < 0.95 and on["maxS"] > 1.04, on  # coil, then release
     assert on["maxB"] > 1.3, on                          # a startle flares
     assert abs(on["rest"]["scaleMul"] - 1) < 0.03 and abs(on["rest"]["yaw"]) < 0.1, on["rest"]

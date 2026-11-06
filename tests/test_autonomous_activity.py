@@ -682,7 +682,8 @@ class TestWiring:
             r'_record_autonomous_activity\(\s*"(\w+)"', src))
         # (reflection / postmortem / prm_train were removed with their
         # subsystems, §4NM; calibration with the refit, §4PJ)
-        expected = {"maintenance", "open_questions", "self_play"}   # §4NM: dream → maintenance
+        expected = {"maintenance"}   # §4NM: dream → maintenance; §4SZ: self_play (the replay slot) removed; §4TB: open_questions (the stale-questions job)
+        assert "open_questions" not in recorded
         missing = expected - recorded
         assert not missing, f"phases without an activity record: {missing}"
 

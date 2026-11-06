@@ -940,8 +940,6 @@ def _number_kinds(request):
             if c.kind == "number_only"]
 
 
-
-
 @pytest.mark.parametrize("reply", [
     _STEPS + "98",                 # the live first answer, refuted 3 of 3
     _STEPS + "**98**",
@@ -956,8 +954,6 @@ def _number_kinds(request):
 ])
 def test_step_by_step_with_the_number_last_is_not_refuted(reply):
     assert refute_turn_state(request=_GSM_REQ, reply=reply) == []
-
-
 
 
 @pytest.mark.parametrize("request_text", [
@@ -1006,14 +1002,9 @@ def test_the_last_line_of_a_file_is_not_the_last_line_of_the_reply(req):
         request=req, reply="I opened the file and read every row.\n\n42")] == ["number_only"]
 
 
-
-
 # ══════════════════════════════════════════════════════════════════════
 # H — a frequency bump needs new evidence
 # ══════════════════════════════════════════════════════════════════════
-from ghost_agent.memory.skills import (
-    SkillMemory, incoming_evidence, evidence_is_new, remember_evidence,
-    seen_evidence, EVIDENCE_KEYS_MAX)
 
 
 def _rule(sm, **kw):
@@ -1066,216 +1057,6 @@ def _vrule(sm, vec, **kw):
         "Parsing CSV exports", "reading rows by position",
         "Always read CSV columns by header name, never by index.",
         memory_system=vec, trigger="Parsing CSV exports", **kw)
-
-
-def test_the_vector_branch_is_the_one_under_test(tmp_path, monkeypatch):
-    """The fixture must reach the VECTOR dedup branch, or the tests below
-    pin the JSON one twice."""
-    sm, vec = SkillMemory(tmp_path), _VectorStore()
-    seen = []
-    real = sm._find_duplicate_lesson
-
-    def spy(*a, **k):
-        out = real(*a, **k)
-        seen.append((out or {}).get("source"))
-        return out
-
-    monkeypatch.setattr(sm, "_find_duplicate_lesson", spy)
-    assert _vrule(sm, vec, source_challenge_hash="c1") == "written"
-    assert _vrule(sm, vec, source_challenge_hash="c1") == "reinforced"
-    assert seen == [None, "vector"]
-
-
-def test_vector_branch_same_evidence_does_not_bump(tmp_path):
-    sm, vec = SkillMemory(tmp_path), _VectorStore()
-    for _ in range(3):
-        _vrule(sm, vec, source_challenge_hash="c1")
-    assert _freq(sm) == 1
-
-
-def test_vector_branch_new_evidence_bumps_once(tmp_path):
-    sm, vec = SkillMemory(tmp_path), _VectorStore()
-    _vrule(sm, vec, source_challenge_hash="c1")
-    _vrule(sm, vec, source_challenge_hash="c2")
-    _vrule(sm, vec, source_challenge_hash="c2")
-    _vrule(sm, vec, source_trajectory_id="t9")
-    assert _freq(sm) == 3
-
-
-def test_vector_branch_no_evidence_bumps_as_before(tmp_path):
-    sm, vec = SkillMemory(tmp_path), _VectorStore()
-    _vrule(sm, vec)
-    _vrule(sm, vec)
-    assert _freq(sm) == 2
-
-
-def test_vector_branch_dream_window(tmp_path):
-    sm, vec = SkillMemory(tmp_path), _VectorStore()
-    kw = dict(evidence_min_new_fraction=0.5)
-    window = [f"traj:{i}" for i in range(60)]
-    _vrule(sm, vec, evidence_refs=window, **kw)
-    _vrule(sm, vec, evidence_refs=window[3:] + ["a", "b", "c"], **kw)      # 3 of 60 fresh
-    assert _freq(sm) == 1
-    _vrule(sm, vec, evidence_refs=window[30:] + [f"n{i}" for i in range(30)], **kw)
-    assert _freq(sm) == 2
-
-
-def test_vector_branch_uncounted_evidence_stays_unseen(tmp_path):
-    """A re-learn that did not count must not REMEMBER its keys: they are
-    still fresh the day the window has enough of them."""
-    sm, vec = SkillMemory(tmp_path), _VectorStore()
-    kw = dict(evidence_min_new_fraction=0.5)
-    window = [f"traj:{i}" for i in range(60)]
-    _vrule(sm, vec, evidence_refs=window, **kw)
-    _vrule(sm, vec, evidence_refs=window[3:] + ["a", "b", "c"], **kw)      # 3 fresh: no
-    assert _freq(sm) == 1
-    _vrule(sm, vec, evidence_refs=window[30:] + ["a", "b", "c"]
-           + [f"n{i}" for i in range(27)], **kw)                           # 30 fresh: yes
-    assert _freq(sm) == 2
-
-
-def test_same_challenge_replayed_does_not_bump(tmp_path):
-    sm = SkillMemory(tmp_path)
-    assert _rule(sm, source_challenge_hash="c1") == "written"
-    assert _rule(sm, source_challenge_hash="c1") == "reinforced"
-    assert _rule(sm, source_challenge_hash="c1") == "reinforced"
-    assert _freq(sm) == 1
-
-
-def test_a_new_challenge_bumps_once(tmp_path):
-    sm = SkillMemory(tmp_path)
-    _rule(sm, source_challenge_hash="c1")
-    _rule(sm, source_challenge_hash="c2")
-    _rule(sm, source_challenge_hash="c2")
-    assert _freq(sm) == 2
-
-
-def test_each_new_trajectory_is_new_evidence(tmp_path):
-    sm = SkillMemory(tmp_path)
-    for tid in ("t1", "t2", "t3", "t2"):
-        _rule(sm, source_trajectory_id=tid)
-    assert _freq(sm) == 3
-
-
-def test_a_relearn_that_names_no_evidence_bumps_as_before(tmp_path):
-    sm = SkillMemory(tmp_path)
-    _rule(sm)
-    _rule(sm)
-    assert _freq(sm) == 2
-
-
-def test_distilled_lesson_counts_cases_not_passes(tmp_path):
-    """freq=84 'from 5 cases': one bump per NEW case handle."""
-    sm = SkillMemory(tmp_path)
-    _rule(sm, source_refs=["case:1", "case:2", "case:3"])
-    _rule(sm, source_refs=["case:1", "case:2", "case:3"])           # unchanged
-    _rule(sm, source_refs=["case:2", "case:3", "case:1"])           # reordered
-    assert _freq(sm) == 1
-    _rule(sm, source_refs=["case:1", "case:2", "case:3", "case:4"])
-    assert _freq(sm) == 2
-    _rule(sm, source_refs=["case:4", "case:1"])
-    assert _freq(sm) == 2
-
-
-def test_dream_window_needs_half_of_it_fresh(tmp_path):
-    """13 → 14 → 15 → 16 in a day: a 60-fragment window sliding by 3
-    (the dream producer is gone, §4NM; the fraction gate in `learn_lesson`
-    is what is pinned)."""
-    sm = SkillMemory(tmp_path)
-    window = [f"traj:{i}" for i in range(60)]
-    kw = dict(evidence_min_new_fraction=0.5)
-    _rule(sm, evidence_refs=window, **kw)
-    for step in range(1, 10):                     # nine re-dreams, 3 fresh each
-        window = window[3:] + [f"traj:{60 + step * 3 + j}" for j in range(3)]
-        _rule(sm, evidence_refs=window, **kw)
-    assert _freq(sm) == 1                         # 27 of 60 fresh: not yet half
-    window = window[3:] + ["traj:n1", "traj:n2", "traj:n3"]
-    _rule(sm, evidence_refs=window, **kw)         # 30 of 60 fresh
-    assert _freq(sm) == 2
-    _rule(sm, evidence_refs=window, **kw)         # the same window again
-    assert _freq(sm) == 2
-
-
-def test_evidence_refs_do_not_leak_into_source_refs(tmp_path):
-    sm = SkillMemory(tmp_path)
-    _rule(sm, evidence_refs=["traj:1", "traj:2"], source_refs=["ep:9"])
-    row = json.loads(sm.file_path.read_text())[0]
-    assert row["source_refs"] == ["ep:9"]
-    assert len(row["evidence_keys"]) == 3
-    assert not any("traj" in k for k in row["evidence_keys"])     # digests
-
-
-def test_legacy_row_counts_its_own_provenance_as_seen():
-    legacy = {"source_trajectory_id": "t1", "source_challenge_hash": "c1",
-              "source_refs": ["ep:1"]}
-    assert evidence_is_new(legacy, incoming_evidence(None, "t1")) is False
-    assert evidence_is_new(legacy, incoming_evidence(["ep:1"], "", "c1")) is False
-    assert evidence_is_new(legacy, incoming_evidence(None, "t2")) is True
-    assert len(seen_evidence(legacy)) == 3
-
-
-@pytest.mark.parametrize("fraction,unseen,total,expected", [
-    (0.0, 1, 60, True), (0.5, 29, 60, False), (0.5, 30, 60, True),
-    (0.5, 0, 60, False), (1.0, 59, 60, False), (1.0, 60, 60, True),
-    (None, 1, 5, True), ("bad", 1, 5, True),
-])
-def test_evidence_is_new_fraction_table(fraction, unseen, total, expected):
-    lesson = {}
-    remember_evidence(lesson, incoming_evidence([f"old:{i}" for i in range(total - unseen)]))
-    inc = incoming_evidence([f"old:{i}" for i in range(total - unseen)]
-                            + [f"new:{i}" for i in range(unseen)])
-    assert len(inc) == total
-    assert evidence_is_new(lesson, inc, fraction) is expected
-
-
-def test_remembered_evidence_is_bounded_newest_kept():
-    lesson = {}
-    remember_evidence(lesson, incoming_evidence([f"r:{i}" for i in range(EVIDENCE_KEYS_MAX + 50)]))
-    assert len(lesson["evidence_keys"]) == EVIDENCE_KEYS_MAX
-    newest = incoming_evidence([f"r:{EVIDENCE_KEYS_MAX + 49}"])[0]
-    oldest = incoming_evidence(["r:0"])[0]
-    assert newest in lesson["evidence_keys"] and oldest not in lesson["evidence_keys"]
-    # the dream's 150-fragment window fits whole, twice over at most: a
-    # window larger than the bound would count as new on every re-read
-    assert 150 <= EVIDENCE_KEYS_MAX <= 300
-
-
-def test_incoming_evidence_is_ordered_and_deduplicated():
-    a = incoming_evidence(["x", "y", "x", "", None], "t", "c", ["y", "z"])
-    assert len(a) == 5 and len(set(a)) == 5
-    assert a[:2] == incoming_evidence(["x", "y"])
-    assert incoming_evidence(None, "", "") == []
-    assert incoming_evidence("single") == incoming_evidence(["single"])
-
-
-def test_every_frequency_bump_is_evidence_gated():
-    """Enumeration (R1): no `frequency … + 1` in the lesson store outside an
-    `if` that asked `evidence_is_new`. The two dedup branches were bumped
-    independently once already (§4L)."""
-    tree = ast.parse((SRC / "memory" / "skills.py").read_text(encoding="utf-8"))
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "learn_lesson")
-    parents = {}
-    for node in ast.walk(fn):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-    bumps = []
-    for node in ast.walk(fn):
-        if (isinstance(node, ast.Assign)
-                and any(isinstance(t, ast.Subscript)
-                        and isinstance(t.slice, ast.Constant)
-                        and t.slice.value == "frequency" for t in node.targets)):
-            bumps.append(node)
-    assert len(bumps) >= 2, "the walk found no bumps — the enumeration is blind"
-    for b in bumps:
-        p, gated = parents.get(b), False
-        while p is not None and p is not fn:
-            if isinstance(p, ast.If) and isinstance(p.test, ast.Name) \
-                    and p.test.id == "_counted":
-                gated = True
-                break
-            p = parents.get(p)
-        assert gated, f"frequency bumped without an evidence gate at line {b.lineno}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1767,7 +1548,6 @@ async def test_displayed_thinking_keeps_a_lone_less_than(monkeypatch):
     context.memory_system = None
     context.profile_memory = None
     context.semantic_memory = None
-    context.skill_memory = None
     context.journal = None
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
@@ -1834,7 +1614,6 @@ def _chat_context(tmp_path):
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
     ctx.memory_system = None
-    ctx.skill_memory = None
     ctx.scratchpad = MagicMock()
     ctx.scratchpad.list_all.return_value = ""
     ctx.memory_dir = tmp_path
@@ -1949,7 +1728,6 @@ async def _thinking_shown(monkeypatch, deltas):
     context.memory_system = None
     context.profile_memory = None
     context.semantic_memory = None
-    context.skill_memory = None
     context.journal = None
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""

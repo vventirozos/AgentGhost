@@ -1,5 +1,5 @@
 """§4LL follow-up 2 (2026-10-04, operator: "remove them"): the three diary rows
-`memory_repair_4ll_b.py` left — the two non-git §4KB test turns of 09-23
+`memory_repair_4ll_b.py` (deleted in §4TD) left — the two non-git §4KB test turns of 09-23
 (dup_probe, r5) and the 09-22 row of the image request whose lesson was
 retired. By id; each row must still carry its expected text, or nothing is
 applied. Agent STOPPED; backup first.

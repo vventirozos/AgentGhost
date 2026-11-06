@@ -247,7 +247,8 @@ async def test_narrative_includes_state_in_prompt(tmp_path: Path):
     autobio = AutobiographicalMemory(tmp_path / "auto")
     autobio.append(Experience(summary="Did a turn."))
     state = SelfStateThread(tmp_path / "state")
-    state.note_open_question("Why does X happen?")
+    from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+    state.set_owner_mood("irritable", ANCHOR_DIRECTION["irritable"], 2)      # §4TC: a label from the closed list
 
     captured = []
 
@@ -257,7 +258,8 @@ async def test_narrative_includes_state_in_prompt(tmp_path: Path):
 
     n = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
     await n.regenerate(autobio=autobio, state=state)
-    assert "Why does X happen?" in captured[0]
+    # §4TC (review): the diary reads the mood from the day's journal rows
+    assert "My mood today: irritable 2 (the owner said so (set_mood))." in captured[0]
 
 
 async def test_narrative_disabled_returns_empty(tmp_path: Path):

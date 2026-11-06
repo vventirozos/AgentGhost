@@ -38,29 +38,3 @@ def _make_deeply_idle_agent(tmp_path):
     agent._current_selfplay_cooldown = 3600
     return agent
 
-
-@pytest.mark.asyncio
-async def test_selfplay_dice_miss_is_logged_and_does_not_run(tmp_path, caplog):
-    agent = _make_deeply_idle_agent(tmp_path)
-    # random 0.99 → _bio_roll(0.2) is False → the dice-miss branch.
-    with patch("ghost_agent.core.agent.random.random", return_value=0.99):
-        with patch("ghost_agent.core.dream.Dreamer") as D:
-            with caplog.at_level(logging.DEBUG, logger="GhostAgent"):   # §4NV: DEBUG (per minute)
-                await agent._biological_tick()
-            D.assert_not_called()  # eligible, but skipped this tick
-    assert any("eligible, skipped this tick" in r.getMessage()
-               for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_selfplay_run_emits_idle_cycle_summary(tmp_path, caplog):
-    agent = _make_deeply_idle_agent(tmp_path)
-    # random 0.0 → all _bio_roll gates pass → the self-play slot runs
-    # (§4NM: the slot is the owner-failure replay / regression step; with a
-    # MagicMock context it declines, which still counts as "ran").
-    with patch("ghost_agent.core.agent.random.random", return_value=0.0):
-        with patch("ghost_agent.core.dream.Dreamer"):
-            with caplog.at_level(logging.INFO, logger="GhostAgent"):
-                await agent._biological_tick()
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("idle cycle: ran" in m and "failure-replay" in m for m in msgs)   # §4NV: was "self-play"

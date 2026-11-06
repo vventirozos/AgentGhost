@@ -125,7 +125,7 @@ async def test_a_public_owner_reply_carries_no_private_context(monkeypatch, tmp_
     finally:
         reply_surface_context.reset(t)
     text = _all_prompt_text(ctx)
-    for m in ("MARK-SCRATCH", "MARK-AUTOSKILL", "MARK-UNCERTAINTY", "MARK-COMPETENCE", "MARK-PLAYBOOK"):
+    for m in ("MARK-SCRATCH", "MARK-AUTOSKILL", "MARK-UNCERTAINTY", "MARK-COMPETENCE"):
         assert m not in text, m
 
 
@@ -235,8 +235,9 @@ def test_every_outbound_tool_name_is_a_registered_tool():
 
 @pytest.mark.asyncio
 async def test_the_tool_itself_scrubs_a_call_that_skips_the_dispatch(tmp_path):
-    """Fails where a composed-skill macro or a delegate called the tool
-    callable directly, past the dispatch hook."""
+    """Fails where a caller that holds the tool callable (a composed-skill
+    macro or a delegate then; `youtube_transcribe` → knowledge_base now)
+    called it directly, past the dispatch hook."""
     from ghost_agent.tools.registry import _egress_scrubbed
     inner = AsyncMock(return_value="ok")
     ctx = SimpleNamespace(profile_memory=_profile(tmp_path))
@@ -276,7 +277,7 @@ def _bind_project(monkeypatch, ctx, P):
 
 
 @pytest.mark.asyncio
-async def test_a_public_owner_reply_hides_the_planner_lessons_and_the_project(monkeypatch, tmp_path):
+async def test_a_public_owner_reply_hides_the_project(monkeypatch, tmp_path):
     """Fails where the project briefing (file map, journal) had no gate at
     all (the planner arm this also covered was deleted in §4NM)."""
     import ghost_agent.core.prompts as P
@@ -290,7 +291,7 @@ async def test_a_public_owner_reply_hides_the_planner_lessons_and_the_project(mo
     finally:
         reply_surface_context.reset(t)
     text = _all_prompt_text(ctx)
-    for m in ("MARK-PLAYBOOK", "MARK-BRIEFING", "MARK-SCRATCH", "MARK-WAKEUP"):
+    for m in ("MARK-BRIEFING", "MARK-SCRATCH", "MARK-WAKEUP"):
         assert m not in text, m
 
 

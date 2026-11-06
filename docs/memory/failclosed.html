@@ -76,7 +76,7 @@
   <code>NodeCircuitBreaker</code> (open &rarr; cooldown &rarr; half-open &rarr; a success closes it, and it
   documents its own known limitation rather than hiding it), the darkweb per-engine breaker (same shape, with
   a "recovered &mdash; breaker cleared" line), the sandbox provisioning backoff (set before the installs,
-  lifted on success), and the self-play cooldown (recomputed adaptively each cycle). One more counter was
+  lifted on success), and the self-play cooldown (recomputed adaptively each cycle; removed with its slot on 2026-11-05, §4SZ). One more counter was
   repaired: <code>manage_projects</code>'s duplicate-create loop counter was a LIFETIME total on the project
   record, so a project that saw three duplicates once kept the alarmed "STOP. This is retry #N" instruction
   and its operator WARNING for every duplicate create it ever saw again. It now measures a burst

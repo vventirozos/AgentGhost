@@ -37,12 +37,11 @@ from .api.app import create_app
 from .core.agent import GhostAgent, GhostContext
 from .core.llm import LLMClient
 
-print(" - Importing memory modules (vector, profile, skills)...", flush=True)
+print(" - Importing memory modules (vector, profile)...", flush=True)
 from .memory.vector import VectorMemory
 from .memory.graph import GraphMemory
 from .memory.profile import ProfileMemory
 from .memory.scratchpad import Scratchpad
-from .memory.skills import SkillMemory
 from .memory.journal import MemoryJournal
 from .memory.frontier import FrontierTracker
 from .memory.projects import ProjectStore
@@ -327,8 +326,8 @@ def parse_args():
     parser.add_argument("--visual-nodes", default=None, help="Comma-separated list of url|model nodes for vision models")
     parser.add_argument("--coding-nodes", default=None, help="Comma-separated list of url|model nodes for code generation")
     parser.add_argument("--image-gen-nodes", default=None, help="Comma-separated list of url|model nodes for image generation")
-    parser.add_argument("--critic-nodes", default=None, help="Comma-separated list of url|model nodes for the self-evaluation verifier (e.g. a spare off-host box running a small judge model). When set, verifier LLM calls run on this pool instead of competing with the foreground model, and the post-response gate becomes non-blocking — the response ships without waiting on the (slower) critic, which still scrubs poisoned lessons when it lands. Tune the optional inline wait with GHOST_CRITIC_GATE_TIMEOUT (seconds; 0 = pure async, the default when this is set).")
-    parser.add_argument("--no-verifier", action="store_true", help="Disable the post-response self-verification (critic) entirely — no verdict is computed, nothing is scrubbed/backfilled. This is an ABLATION off-switch: the late (async) verifier costs a full extra LLM call per substantive turn, and its in-session value is zero by construction (the reply already shipped); its only claimed payoff is cross-session (lesson scrubbing / next-turn correction). Use `--no-verifier` as an ablation arm to measure whether it pays for itself. NOT recommended for production unless the ablation says so.")
+    parser.add_argument("--critic-nodes", default=None, help="Comma-separated list of url|model nodes for the self-evaluation verifier (e.g. a spare off-host box running a small judge model). When set, verifier LLM calls run on this pool instead of competing with the foreground model, and the post-response gate becomes non-blocking — the response ships without waiting on the (slower) critic, which still queues the next-turn correction when it lands. Tune the optional inline wait with GHOST_CRITIC_GATE_TIMEOUT (seconds; 0 = pure async, the default when this is set).")
+    parser.add_argument("--no-verifier", action="store_true", help="Disable the post-response self-verification (critic) entirely — no verdict is computed, nothing is scrubbed/backfilled. This is an ABLATION off-switch: the late (async) verifier costs a full extra LLM call per substantive turn, and its in-session value is zero by construction (the reply already shipped); its only claimed payoff is cross-session (the next-turn correction). Use `--no-verifier` as an ablation arm to measure whether it pays for itself. NOT recommended for production unless the ablation says so.")
     parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen3.8-27b"))
     parser.add_argument("--daemon", "-d", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -358,9 +357,9 @@ def parse_args():
     parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log.")
     parser.add_argument("--no-dream", action="store_true", help="Disable the idle scheduler's MAINTENANCE job (project digests, file-manifest backfill, trajectory archive, daily store snapshot, graph upkeep). The other idle jobs (tidy, narratives, failure replay) keep running. Off by default = production runs maintenance.")
     parser.add_argument("--bio-time-scale", type=float, default=1.0, help="B3 idle-loop ablation (IMPROVEMENTS.md #4): divide every idle-scheduler window bound, job cooldown and the scheduler tick period by N, so hours-long idle windows compress into minutes. Default 1.0 = production timings. e.g. 60 → a 1h window fires after ~1min idle. Used by scripts/ablation_trackb3.py to exercise the pure-idle learning loops in accelerated epochs. DO NOT set in production.")
-    parser.add_argument("--bio-deterministic", action="store_true", default=False, help="B3 idle-loop ablation: make the probabilistic idle jobs (maintenance 0.5, failure replay 0.2) fire deterministically every eligible tick instead of sampling, so the ablation's control/treatment arms exercise the same phases each accelerated epoch. Default off (production sampling). Pairs with --bio-time-scale.")
+    parser.add_argument("--bio-deterministic", action="store_true", default=False, help="B3 idle-loop ablation: make the probabilistic idle jobs (maintenance 0.5) fire deterministically every eligible tick instead of sampling, so the ablation's control/treatment arms exercise the same phases each accelerated epoch. Default off (production sampling). Pairs with --bio-time-scale.")
     parser.add_argument("--calib-refit-cooldown", type=int, default=None, help=argparse.SUPPRESS)   # §4PJ: deprecated no-op, see _DEPRECATED_NOOP_ARGS
-    parser.add_argument("--principle-gate", action="store_true", default=False, help="After a final response, run an independent LLM check against the agent's own authored operating principles (selfhood/values) and append a self-note if the response contradicts one. Never blocks — annotates only. Adds one LLM call per final turn; off by default.")
+    parser.add_argument("--principle-gate", action="store_true", default=False, help=argparse.SUPPRESS)   # §4TB: deprecated no-op, see _DEPRECATED_NOOP_ARGS
     parser.add_argument("--autoadvance-idle", action="store_true", default=False, help="Idle-scheduler job: when idle, autonomously advance ONE autopilot project by a single tick (the autoadvancer was previously only reachable via the tool/HTTP). Runs on the existing hard per-project budgets + human gates; coding tasks now generate+run real code instead of a no-op stub. One project / one tick per 30-min cooldown. Off by default.")
     # Selfhood / unified self. The five-piece module (autobiographical
     # log, self-state thread, recognition layer, narrative summariser,
@@ -424,6 +423,9 @@ _DEPRECATED_NOOP_ARGS = {
     # launcher passed this flag, so it stays accepted until the launcher no
     # longer does (then it goes, as --deep-reason did in §4NO).
     "calib_refit_cooldown": "§4PJ: the calibration refit was removed",
+    # §4TB (2026-11-05): operating principles went with the `self_state` tool
+    # (their only writer), and the gate that checked a reply against them with it.
+    "principle_gate": "§4TB: operating principles and their gate were removed",
 }
 
 
@@ -639,7 +641,7 @@ async def _handle_chat_foreground(context, body, request_id: str, project_id=Non
     from fastapi import BackgroundTasks
     from .api.routes import _mark_foreground
     from .utils.logging import (requester_role_context, reply_surface_context, client_deadline_context,
-                                verify_purpose_context, trajectory_id_context, requester_member_context,
+                                verify_purpose_context, requester_member_context,
                                 effort_override_context)
     # §4LD: an autonomous turn is the OWNER's, on no surface, with no client
     # deadline — never the context of whichever turn last added a scheduler
@@ -656,7 +658,7 @@ async def _handle_chat_foreground(context, body, request_id: str, project_id=Non
     _clean = [(v, v.set(x)) for v, x in ((requester_role_context, "owner"), (reply_surface_context, ""),
                                          (requester_member_context, ""),            # §4QG
                                          (client_deadline_context, 0.0), (verify_purpose_context, ""),
-                                         (trajectory_id_context, ""), (_EVENT_PROJECT_OVERRIDE, None),
+                                         (_EVENT_PROJECT_OVERRIDE, None),
                                          (reply_tap_context, None),
                                          (effort_override_context, ""))]                # §4RB: no web override
     # r13 m3: the store read (and its retries' sleeps) off the event loop
@@ -1038,37 +1040,6 @@ def shutdown_line(agent) -> str:
     except Exception:  # noqa: BLE001
         parts.append("turn registry unreadable")
     return " · ".join(parts)
-
-
-def _start_boot_skill_reconcile(context) -> None:
-    """Boot-time skill-store reconcile, both directions, off the loop.
-
-    §4FS review: a pruned lesson's vector twin is rendered VERBATIM by the
-    retrieval path when its playbook row is gone, and the idle-phase
-    reconcile needs 15-60 min of idle plus a 2 h cooldown — so it runs at
-    boot too. §4KW: it lived in `main()`, which runs BEFORE `lifespan` creates
-    the vector store, so it never ran; and the inverse (re-embed a lesson
-    whose twin write failed — 44 general lessons, live) now runs with it.
-    Never raises."""
-    try:
-        _ms = getattr(context, "memory_system", None)
-        _sk = getattr(context, "skill_memory", None)
-        if _ms is None or _sk is None:
-            return
-        import threading as _thr
-
-        def _run():
-            for fn, msg in ((_sk.reconcile_vector_orphans, "removed {} orphan lesson twin(s)"),
-                            (_sk.heal_missing_twins, "re-embedded {} missing lesson twin(s)")):
-                try:
-                    n = fn(_ms)
-                    if n:
-                        pretty_log("Lesson Store", "boot reconcile " + msg.format(n), icon=Icons.MEM_SAVE)
-                except Exception as e:  # noqa: BLE001
-                    logging.getLogger("GhostAgent").debug("boot skill reconcile step skipped: %s", e)
-        _thr.Thread(target=_run, name="skill-boot-reconcile", daemon=True).start()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _wire_fact_ledger(context) -> None:
@@ -1456,7 +1427,6 @@ async def lifespan(app):
             if context.memory_system.collection:
                 count = context.memory_system.collection.count()
                 pretty_log("Memory Ready", f"{count} fragments indexed", icon=Icons.MEM_LIBRARY)
-                _start_boot_skill_reconcile(context)
             else:
                 pretty_log("Memory Offline", "Collection not loaded", level="WARNING", icon=Icons.WARN)
         except Exception as e:
@@ -1952,12 +1922,11 @@ async def lifespan(app):
     _wire_experience_memory(context)   # §4QL
     _wire_fact_ledger(context)         # §4QM
     # §4NN: the learned RRF weights loader (core/rrf_weights.py, reading
-    # system/rrf/weights.json) was removed — the bus fuses its two live
+    # system/rrf/weights.json) was removed — the bus fuses its live
     # sources with the hand-tuned intent weights in core/bus.py.
     context.memory_bus = MemoryBus(
         vector_memory=getattr(context, 'memory_system', None),
         graph_memory=getattr(context, 'graph_memory', None),
-        skill_memory=getattr(context, 'skill_memory', None),
         profile_memory=getattr(context, 'profile_memory', None),
         episodic_memory=getattr(context, 'episodic_memory', None),
         # Raw-conversation tier: stored sessions become retrievable
@@ -1970,7 +1939,7 @@ async def lifespan(app):
     )
     # §4NN: was "Cognitive event bus initialized" — say what it hydrates.
     pretty_log("Prompt Hydration",
-               "each owner prompt gets the owner's matching facts and lessons; "
+               "each owner prompt gets the owner's matching facts; "
                "recall searches every store", icon=Icons.BRAIN_CTX)
 
     # Self-evaluation gate. Verifier owns no persistent state; it just
@@ -2029,8 +1998,8 @@ async def lifespan(app):
     # End of the trajectory-collector block, after all three branches.
 
     # Selfhood module: the five-component "unified self" — first-person
-    # autobiographical log, self-state thread (open questions / mood /
-    # unfinished threads), recognition / wake-up retrieval, and a
+    # autobiographical log, self-state thread (mood; §4TB removed its open
+    # questions and unfinished threads), recognition / wake-up retrieval, and a
     # periodic narrative summariser. Disabled when --no-memory (the
     # whole module persists to disk) or when --no-self-model is set
     # explicitly. The biological watchdog phase 2.8 calls into
@@ -2090,6 +2059,12 @@ async def lifespan(app):
             enabled=self_enabled,
             narrative_critique_fn=_selfhood_critique_fn if self_enabled else None,
         )
+        # §4TC: boredom is read off how long the owner has been quiet. The
+        # mood measures that from the owner stamp in its own state file; this
+        # clock — the context's, written by the turn loop — is the fallback
+        # it reads while there is no stamp yet
+        from .selfhood.model import owner_quiet_seconds as _owner_quiet_seconds
+        context.self_model.attach_owner_clock(lambda: _owner_quiet_seconds(context))
         if self_enabled:
             # Emit the "Session resumed…" boot marker (symmetric to the
             # workspace_model.mark_session_boot() call below). Previously
@@ -2103,7 +2078,7 @@ async def lifespan(app):
             pretty_log(
                 "Selfhood",
                 f"unified self model initialised at {self_root}: {stats['experience_count']} prior experiences, "
-                f"{stats['open_questions']} open questions, narrative={'yes' if stats['narrative_present'] else 'no'}",
+                f"narrative={'yes' if stats['narrative_present'] else 'no'}",
                 icon=Icons.BRAIN_THINK,
             )
         else:
@@ -2423,8 +2398,8 @@ async def lifespan(app):
                     )
             except Exception as e:
                 logger.warning(f"Background-task drain error: {e}")
-        # Drain the unified spawn_bg registry (graph extraction, lesson
-        # retraction, PRM updates, …). Bounded so a stuck write can't pin
+        # Drain the unified spawn_bg registry (graph extraction, mirror
+        # syncs, …). Bounded so a stuck write can't pin
         # shutdown; never raises.
         try:
             from .utils.logging import drain_background_tasks
@@ -2498,7 +2473,7 @@ def main():
     memory_dir.mkdir(parents=True, exist_ok=True)
 
     # §4MN r2: the single-writer lock FIRST — before any store is opened
-    # (the profile, playbook and journal constructors write on a fresh
+    # (the profile and journal constructors write on a fresh
     # store) and before the embedder loads. Here, outside the ASGI
     # lifespan, the exit code is really 75 (inside it uvicorn turns any
     # startup exit into 3); launchd KeepAlive retries.
@@ -2527,18 +2502,16 @@ def main():
     context = GhostContext(args, sandbox_dir, memory_dir, tor_proxy)
     if args.no_memory:
         # --no-memory promises NOTHING is written to any persistent memory
-        # store (the lifespan gate covers profile/graph/vector). These three
-        # were previously constructed against the real memory dir regardless
-        # — SkillMemory.__init__ writes skills_playbook.json immediately,
-        # and lesson writers keep appending. They have no
-        # disable flag and are dereferenced un-guarded across the codebase,
-        # so back them with a session-scoped throwaway dir instead of None.
+        # store (the lifespan gate covers profile/graph/vector). These two
+        # were previously constructed against the real memory dir regardless.
+        # They have no disable flag and are dereferenced un-guarded across the
+        # codebase, so back them with a session-scoped throwaway dir instead
+        # of None. (§4TD: the lesson store, the third, is removed.)
         # The scratchpad likewise stays purely in-memory here.
         import tempfile
         _ephemeral_dir = Path(tempfile.mkdtemp(prefix="ghost_no_memory_"))
         context.scratchpad = Scratchpad()
         context.journal = MemoryJournal(_ephemeral_dir)
-        context.skill_memory = SkillMemory(_ephemeral_dir)
         context.frontier_tracker = FrontierTracker(_ephemeral_dir)
     else:
         # Persistent scratchpad: deploys are a plain `kill` under the
@@ -2555,10 +2528,7 @@ def main():
         except Exception:  # noqa: BLE001
             logger.warning("legacy binding drop failed", exc_info=True)
         context.journal = MemoryJournal(context.memory_dir)
-        context.skill_memory = SkillMemory(memory_dir)
         context.frontier_tracker = FrontierTracker(memory_dir)
-        # (the boot skill-store reconcile runs in `lifespan`, once the vector
-        # store exists — `_start_boot_skill_reconcile`, §4KW)
     
     app = create_app()
     app.router.lifespan_context = lifespan

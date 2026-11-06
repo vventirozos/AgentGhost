@@ -365,9 +365,11 @@ def experiment_name(signature_name: str) -> str:
     # ⚠ A BARE TRUNCATION COLLIDES ON LIVE NAMES. `_NAME_RE` caps the name
     # at 40 chars, and "gepa_" + "tool_description_" already spends 22 of
     # them — leaving 18 characters of tool name. The 39 static tools are
-    # clean, but this read site also covers COMPOSED SKILLS, which the
-    # optimizer's docstring explicitly anticipates artifacts for: over the
-    # 70 live names there are 7 collision groups covering 17 names
+    # clean, but this read site also covered COMPOSED SKILLS (removed
+    # §4TA, 2026-11-05 — a runtime-registered acquired skill's name can be
+    # as long), which the
+    # optimizer's docstring explicitly anticipated artifacts for: over the
+    # 70 live names there were 7 collision groups covering 17 names
     # (`auto_file_system_file_system_execute` and
     # `auto_file_system_file_system_report_pdf` both truncate to
     # `gepa_tool_description_auto_file_system_f`).

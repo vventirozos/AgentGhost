@@ -814,7 +814,7 @@ other tools. On real traffic the rate was 15%. The code review found the defects
     <ul>
       <li>An unknown tool now says what to use: a shell-like name (<code>git</code>, <code>bash</code>…) runs through
       <code>execute</code>, anything else gets the tool list.</li>
-      <li>A lesson that prescribes a tool call that does not exist (a removed tool, a file_system operation it lacks)
+      <li><em>(History: the lesson store was removed, §4TD.)</em> A lesson that prescribes a tool call that does not exist (a removed tool, a file_system operation it lacks)
       is refused when written (<code>lesson_quality.unknown_tool_calls</code>). The reflection on the §4KB checks had
       taught "call <code>git(operation=write…)</code>" after the git tool was removed.</li>
     </ul></li>

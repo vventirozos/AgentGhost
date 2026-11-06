@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=18.0';
+import * as matrixGraphFace from './matrix_graph.js?v=18.8';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -703,7 +703,8 @@ function connectWebSocket() {
         try {
             const data = JSON.parse(event.data);
             if (data.type === 'log') {
-                const icon = extractIcon(data.content);
+                // Only a log row's own icon: free text can hold any emoji.
+                const icon = typeof activeFace.logRowIcon === 'function' ? activeFace.logRowIcon(data.content) : extractIcon(data.content);
                 const flashColor = getIconColor(icon);
 
                 // Feed the live log console's ring buffer (renders only
@@ -714,7 +715,7 @@ function connectWebSocket() {
                 noteTickerLine(data.content);
                 // …and the face's temperament: the line's icons say what
                 // kind of work ran and how it came out (2026-10-30).
-                if (typeof activeFace.noteLogLine === 'function') activeFace.noteLogLine(data.content, data.is_error);
+                if (typeof activeFace.noteLogLine === 'function') activeFace.noteLogLine(data.content);
 
                 // Log lines feed the face's activity ENVELOPE — a small
                 // energy contribution each, smoothed inside matrix_graph —
@@ -734,9 +735,11 @@ function connectWebSocket() {
                     // Genuine failures only: ⚠️ warnings are routine (node
                     // fallbacks, heals) and kept tinting the face on
                     // ordinary healthy turns.
+                    // The server's is_error (the words ERROR/Exception anywhere)
+                    // only colours the console: it shook the face over a thought
+                    // about `ON_ERROR_STOP` (2026-11-06).
                     if (['❌', '🛑'].includes(icon)) activeFace.triggerSpike();
                 }
-                if (data.is_error) activeFace.triggerSpike();
 
                 // Check for Planner Monologue
                 const plannerMatch = data.content.match(/PLANNER MONOLOGUE\s*:\s*(.*)/);
@@ -1832,6 +1835,8 @@ function _stampReqId(div, id, unlabelable) {
 // The agent resolves request_id → trajectory and writes its corrections
 // sidecar, turning this turn's outcome=unknown into a real label for the
 // learning stack. Fire-and-forget with a visual latch on the tapped thumb.
+let _ruleHintShown = false;   // §4SZ: the 👎 hint speaks once per page load
+
 async function sendFeedback(div, signal, retryReqId) {
     const reqId = div.dataset.reqId;
     // Same-signal repeats are a no-op CLIENT-side too (the server also
@@ -1914,6 +1919,14 @@ async function sendFeedback(div, signal, retryReqId) {
             }
         }
         if (typeof saveChatState === 'function') saveChatState();
+        // §4SZ: a 👎 is answered with how to state a rule — once per page,
+        // and only after the label is latched (a hint that fails to parse
+        // must not report a recorded label as lost)
+        const done = await r.json().catch(() => ({}));
+        if (done && typeof done.hint === 'string' && done.hint && !_ruleHintShown) {
+            _ruleHintShown = true;
+            addMessage('system', done.hint);
+        }
     } catch (e) {
         console.warn('feedback failed:', e);
         _noteFeedbackFailure(div, 'Feedback not recorded: network error — tap again.');
@@ -4798,22 +4811,11 @@ if (fullscreenBtn) {
     fullscreenBtn.addEventListener('click', () => { document.body.classList.toggle('zen-mode'); });
 }
 
-// Face-form picker (2026-07-29 — replaced the blind cycle: at 9 forms,
-// reaching the one you wanted took up to 8 clicks × 1.4s reorganization
-// blends, each through a form you didn't ask for). The button now opens
-// a menu built from matrix_graph's own roster (getForms — a form added
-// there appears here with no edit), current form highlighted, one click
-// jumps straight to it. Falls back to the old cycle if the face module
-// predates getForms/setForm (stale cache).
-const FACE_FORM_HINTS = {
-    cube: 'weight tensor',
-    tesseract: 'infinite corridor',
-    vortex: 'black hole',
-    descent: 'loss landscape',
-    empty: 'no face',
-};
-const faceFormBtn = document.getElementById('face-form-btn');
-let faceFormMenu = null;
+// The face button: animations enabled (the mood tesseract) or disabled (the empty
+// form, which draws nothing). Operator, 2026-11-06: it replaced the form menu.
+const ANIMATIONS_ON_FORM = 'moodtesseract';
+const ANIMATIONS_OFF_FORM = 'empty';
+const animationsBtn = document.getElementById('animations-btn');
 
 // Persist a pick SERVER-side (2026-09-05). setForm() writes localStorage,
 // which is per-origin / per-browser / per-device — so the form picked
@@ -4841,101 +4843,24 @@ function rememberFaceForm(name) {
     });
 }
 
-function closeFaceFormMenu() {
-    if (faceFormMenu) faceFormMenu.classList.add('hidden');
+function showAnimationsState() {
+    const on = activeFace.getForm() !== ANIMATIONS_OFF_FORM;
+    const text = on ? 'Animations enabled' : 'Animations disabled';
+    animationsBtn.classList.toggle('animations-off', !on);
+    animationsBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    animationsBtn.setAttribute('aria-label', text);
+    animationsBtn.title = text;
+    return text;
 }
 
-function buildFaceFormMenu() {
-    if (faceFormMenu) return faceFormMenu;
-    faceFormMenu = document.createElement('div');
-    faceFormMenu.id = 'face-form-menu';
-    faceFormMenu.className = 'hidden';
-    faceFormMenu.setAttribute('role', 'menu');
-    faceFormMenu.setAttribute('aria-label', 'Face form');
-    for (const name of activeFace.getForms()) {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.className = 'face-form-item';
-        item.dataset.form = name;
-        item.setAttribute('role', 'menuitemradio');
-        const label = document.createElement('span');
-        label.className = 'face-form-name';
-        label.textContent = name;
-        item.appendChild(label);
-        const hint = document.createElement('span');
-        hint.className = 'face-form-hint';
-        hint.textContent = FACE_FORM_HINTS[name] || '';
-        item.appendChild(hint);
-        item.addEventListener('click', () => {
-            const picked = activeFace.setForm(name);
-            rememberFaceForm(picked);
-            markActiveFaceForm();
-            closeFaceFormMenu();
-            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
-            if (toast) toast(`Face form: ${picked}`);
-        });
-        faceFormMenu.appendChild(item);
-    }
-    document.body.appendChild(faceFormMenu);
-    // Outside click / Escape closes — standard menu manners.
-    document.addEventListener('click', (ev) => {
-        if (!faceFormMenu.classList.contains('hidden')
-            && !faceFormMenu.contains(ev.target)
-            && ev.target !== faceFormBtn && !faceFormBtn.contains(ev.target)) {
-            closeFaceFormMenu();
-        }
-    });
-    document.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Escape') closeFaceFormMenu();
-    });
-    return faceFormMenu;
-}
-
-function markActiveFaceForm() {
-    if (!faceFormMenu) return;
-    const current = typeof activeFace.getForm === 'function' ? activeFace.getForm() : '';
-    for (const item of faceFormMenu.querySelectorAll('.face-form-item')) {
-        item.classList.toggle('active', item.dataset.form === current);
-        item.setAttribute('aria-checked', item.dataset.form === current ? 'true' : 'false');
-    }
-}
-
-if (faceFormBtn) {
-    faceFormBtn.addEventListener('click', () => {
-        if (typeof activeFace.getForms !== 'function'
-            || typeof activeFace.setForm !== 'function') {
-            // Stale-cache fallback: the old blind cycle still works.
-            if (typeof activeFace.cycleForm !== 'function') return;
-            const name = activeFace.cycleForm();
-            rememberFaceForm(name);
-            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
-            if (toast) toast(`Face form: ${name}`);
-            return;
-        }
-        const menu = buildFaceFormMenu();
-        if (!menu.classList.contains('hidden')) {
-            closeFaceFormMenu();
-            return;
-        }
-        markActiveFaceForm();
-        // Anchor under the button, right-aligned to it, clamped on-screen
-        // on BOTH axes (the #msg-menu manners — workspace.js). The old code
-        // clamped only the right offset: on a phone the centered header
-        // puts this button near the LEFT edge, so a right-anchored 230px+
-        // menu hung ~half off the left of the screen. Must be visible
-        // before measuring (hidden = display:none).
-        const rect = faceFormBtn.getBoundingClientRect();
-        menu.classList.remove('hidden');
-        const mw = menu.offsetWidth;
-        const mh = menu.offsetHeight;
-        const rightMax = Math.max(8, window.innerWidth - mw - 8);
-        menu.style.right = `${Math.min(
-            Math.max(8, Math.round(window.innerWidth - rect.right)), rightMax)}px`;
-        let top = Math.round(rect.bottom + 8);
-        if (top + mh > window.innerHeight - 8) {
-            top = Math.max(8, window.innerHeight - mh - 8);
-        }
-        menu.style.top = `${top}px`;
+if (animationsBtn) {
+    showAnimationsState();
+    animationsBtn.addEventListener('click', () => {
+        const off = activeFace.getForm() !== ANIMATIONS_OFF_FORM;
+        rememberFaceForm(activeFace.setForm(off ? ANIMATIONS_OFF_FORM : ANIMATIONS_ON_FORM));
+        const text = showAnimationsState();
+        const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+        if (toast) toast(text);
     });
 }
 
@@ -7066,7 +6991,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.2').catch(e => {
+import('./workspace.js?v=9.3').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

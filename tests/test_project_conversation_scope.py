@@ -203,7 +203,7 @@ def test_reading_a_row_refreshes_it(store):
 
 # -------------------------------------- request-only scopes never touch rows
 
-@pytest.mark.parametrize("origin", ["probe", "member", "replay", "unattended", "leaf"])
+@pytest.mark.parametrize("origin", ["probe", "member", "unattended", "leaf"])
 async def test_request_only_scopes_never_read_or_write_rows(context, store, origin):
     start_request(context, A)
     p = await _create(context, "Owner's")
@@ -413,7 +413,6 @@ def test_scope_builder_no_session_is_request_only(tmp_path):
 
 @pytest.mark.parametrize("rid,origin,role,want", [
     ("abcd", "user", "member", "member"),
-    ("probe-fr-1", "probe", "", "replay"),
     ("probe-x1", "probe", "", "probe"),
     ("sched-job1", "user", "", "unattended"),
     ("abcd", "sim", "", "unattended"),

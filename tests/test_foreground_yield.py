@@ -242,7 +242,7 @@ def test_inline_request_path_summarizers_are_foreground():
     assert ("chat_completion(shield_payload, use_worker=True, "
             "is_background=False") in chat_src
 
-    pi_src = inspect.getsource(GhostAgent._perfect_it_generate_and_learn)
+    pi_src = inspect.getsource(GhostAgent._perfect_it_generate)
     assert "is_background=not foreground" in pi_src
 
 
@@ -257,8 +257,7 @@ def test_perfect_it_inline_path_passes_foreground():
     # step-3 extraction (2026-07-09) — inspect the method that has it now.
     src = inspect.getsource(GhostAgent._finalize_and_return)
     assert re.search(
-        r"_perfect_it_generate_and_learn\(\s*p_payload,\s*_pp_lesson_label,"
-        r"\s*current_trajectory_id,\s*foreground=True",
+        r"_perfect_it_generate\(\s*p_payload,\s*foreground=True",
         src,
     )
     assert "_deferred_perfect_it" not in src

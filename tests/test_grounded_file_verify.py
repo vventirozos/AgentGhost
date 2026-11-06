@@ -1234,9 +1234,11 @@ class TestRemovalAwareAbsence:
             removable_keys=_keys_removable_after_write(tools))
         assert r is not None and r.verdict == VerifyVerdict.REFUTED
 
-    def test_a_composed_skill_with_a_shell_step_disarms_by_evidence(self):
-        # arbitrarily-named composed skills embed the execute tool's result
-        # header verbatim for their shell steps — that is the evidence.
+    def test_a_custom_tool_that_ran_a_shell_disarms_by_evidence(self):
+        # an arbitrarily-named custom tool's result carries the execute tool's
+        # result header verbatim (an acquired skill's runner returns the
+        # execute result; composed skills embedded it per shell step until
+        # §4TA) — that is the evidence.
         from ghost_agent.core.agent import _keys_removable_after_write
         tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
                  {"role": "tool", "name": "auto_cleanup_task",

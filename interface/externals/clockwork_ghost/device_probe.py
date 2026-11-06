@@ -590,7 +590,7 @@ async def main(app):
     QApplication.sendEvent(w.text_input, QKeyEvent(
         QEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
     check("moving the caret cancels the countdown (not only typing)",
-          not w.review_timer.isActive() and "PTT" in w.ptt_btn.text())
+          not w.review_timer.isActive() and "Talk" in w.ptt_btn.text())
     w._after_transcript()
     w._on_text_edited("a corrected transcript")
     check("an edit cancels the countdown", not w.review_timer.isActive())
@@ -639,7 +639,7 @@ async def main(app):
     check("a held key is ONE action, not twenty-five a second",
           not any(sc.autoRepeat() for sc in (
               w.esc_shortcut, w.tts_shortcut, w.stop_shortcut, w.snap_shortcut,
-              w.fullscreen_shortcut, w.good_shortcut, w.bad_shortcut)))
+              w.good_shortcut, w.bad_shortcut)))
 
     check("Shift+Esc talks and Esc cancels (operator 2026-10-17), both window-scoped "
           "so Esc still closes the camera dialog",
@@ -751,6 +751,38 @@ async def main(app):
     await asyncio.sleep(0.5)       # let the reply-landed helpers finish
     check("every call the client made to the face is one the real widget accepts",
           FACE_ERRORS == [], str(FACE_ERRORS[:3]))
+    # What the modern controls actually draw (2026-11-06: QtSvg is not on the device).
+    step("15b. icons and controls")
+    from PyQt6.QtGui import QIcon as _QIcon
+    for _name in client.icons.PATHS:
+        _im = client.icons.icon(_name, "#ffffff").pixmap(20, 20).toImage()
+        _lit = sum(1 for _y in range(_im.height()) for _x in range(_im.width())
+                   if _im.pixelColor(_x, _y).alpha() > 80)
+        check(f"icon {_name} draws", _lit > 15, str(_lit))
+    _soft = client.icons.icon("x", client.T.TEXT_SOFT).pixmap(20, 20).toImage()
+    _lit = [_soft.pixelColor(_x, _y) for _y in range(_soft.height()) for _x in range(_soft.width())
+            if _soft.pixelColor(_x, _y).alpha() > 150]
+    check("a theme colour in rgba() draws light, not black",
+          _lit and max(c.red() for c in _lit) > 180, str(len(_lit)))
+    check("the animations control is a discreet icon: no word, its state in the tooltip",
+          w.animations_btn.text() == "" and not w.animations_btn.icon().isNull()
+          and w.animations_btn.width() <= 36 and w.animations_btn.toolTip().startswith("Animations o"))
+    check("every other control has an icon and a word, and none are left in capitals",
+          all(not b.icon().isNull() and b.text().strip() and not b.text().strip().isupper()
+              for b in (w.good_btn, w.bad_btn, w.snap_btn, w.ptt_btn, w.tts_btn, w.stop_btn)))
+    check("Save, Load and the face-only mode are gone",
+          not any(hasattr(w, n) for n in ("load_btn", "workspace_btn", "fs_btn", "fullscreen_shortcut")))
+    if os.environ.get("GHOST_PROBE_SHOT"):
+        # The panel's own size: offscreen Qt reports 800×800.
+        w.setFixedSize(1280, 720)
+        w.overlay.setGeometry(0, 0, 1280, 720)
+        w._show_animations(True)
+        w._last_reply_rid, w._rated = "shot", "positive"
+        w._refresh_rating_chips()
+        for _ in range(5):
+            QApplication.processEvents()
+            await asyncio.sleep(0.05)
+        w.grab().save(os.environ["GHOST_PROBE_SHOT"])
     w.close()
     step("16. closed")
 

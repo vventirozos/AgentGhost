@@ -78,30 +78,24 @@ async def test_a_rolled_window_reopens_the_mid_phases_on_the_next_tick():
     instead of never."""
     from ghost_agent.core.agent import GhostAgent
     ctx = _tick_ctx(4000)
+    from unittest.mock import AsyncMock
     ctx.self_model = MagicMock(enabled=True)
-    ctx.self_model.stale_open_questions.return_value = []
+    ctx.self_model.consolidate_narrative = AsyncMock(return_value="")
     agent = GhostAgent.__new__(GhostAgent)
     agent.context = ctx
     agent._last_selfplay_at = datetime.datetime.now()       # §4NM: no --no-self-play; the slot cools down
     await agent._biological_tick()
-    assert agent._last_stale_questions_at == datetime.datetime.min      # idle 4000 s: outside the window
+    # (§4TB: the witness was the stale-questions job; it is removed, and the
+    # diary — the same (900, 3600] window — is the mid phase observed now)
+    assert agent._last_narrative_at == datetime.datetime.min      # idle 4000 s: outside the window
+    assert ctx.self_model.consolidate_narrative.await_count == 0
     agent._idle_window_at = datetime.datetime.now() - datetime.timedelta(seconds=1200)
     await agent._biological_tick()                      # window idle now 1200 s: inside (900, 3600]
-    assert agent._last_stale_questions_at > datetime.datetime.min
+    assert agent._last_narrative_at > datetime.datetime.min
+    assert ctx.self_model.consolidate_narrative.await_count == 1
 
 
 # ── the operator's frequency decisions (2026-10-04) ──────────────────────────
-def test_self_play_runs_less_often_and_is_tunable(monkeypatch):
-    # §4NM: the bench and its cooldown are gone; the self-play slot keeps its 4 h
-    from ghost_agent.core.agent import GhostAgent, _env_cooldown_s
-    assert GhostAgent._SELFPLAY_COOLDOWN == 14400
-    monkeypatch.setenv("GHOST_X_COOLDOWN", "7200")
-    assert _env_cooldown_s("GHOST_X_COOLDOWN", 1) == 7200
-    for bad in ("-5", "abc", "0"):
-        monkeypatch.setenv("GHOST_X_COOLDOWN", bad)
-        assert _env_cooldown_s("GHOST_X_COOLDOWN", 99) == 99
-
-
 @pytest.mark.parametrize("hour,quiet", [(23, True), (2, True), (6, True), (7, False), (13, False), (22, False)])
 def test_quiet_hours_wrap_midnight(hour, quiet):
     from ghost_agent.core.autonomous_activity import in_quiet_hours

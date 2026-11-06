@@ -397,15 +397,6 @@ class TestBrokenReplayScrub:
         gate_region = src.split("grammar_payload_fields", 1)[0]
         assert '"native_tools"' in gate_region.rsplit("is_final_generation and all_tools", 1)[1]
 
-    def test_watchdog_break_text_is_path_aware(self):
-        # The think-loop sever injects a synthetic replan call that is
-        # persisted and replayed as assistant history — it must speak
-        # the active path's dialect.
-        src = inspect.getsource(GhostAgent._stream_final_generation)
-        assert "<function=replan>" in src
-        assert '<function name=\\"replan\\">' in src
-        assert '"native_tools"' in src
-
     def test_renderer_never_renders_synthetic_parse_error_entries(self):
         # Review catch: after the scrub removed '<tool_call' from the
         # replayed content, the history serializer's already-inline

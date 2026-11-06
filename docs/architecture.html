@@ -31,7 +31,7 @@
     <h3>Algorithms</h3>
     <a href="algorithms/request_lifecycle.html">Request lifecycle</a>
     <a href="algorithms/memory_hydration.html">Memory hydration</a>
-    <a href="algorithms/dream_cycle.html">Maintenance &amp; failure replay</a>
+    <a href="algorithms/dream_cycle.html">Maintenance cycle</a>
     <a href="algorithms/skill_acquisition.html">Skill acquisition</a>
     <a href="algorithms/circuit_breaker.html">Circuit breaker</a>
     <a href="algorithms/selfhood.html">Selfhood (unified self)</a>
@@ -205,7 +205,7 @@
       </g>
       <g>
         <rect class="card purple" x="230" y="325" width="160" height="40" rx="6"/>
-        <text class="label" x="310" y="349" text-anchor="middle">Failure replay · rules</text>
+        <text class="label" x="310" y="349" text-anchor="middle">Owner rules</text>
       </g>
       <g>
         <rect class="card purple" x="400" y="325" width="140" height="40" rx="6"/>
@@ -231,7 +231,7 @@
 
       <g>
         <rect class="card amber" x="60" y="420" width="240" height="30" rx="6"/>
-        <text class="label" x="180" y="440" text-anchor="middle">Maintenance · failure replay</text>
+        <text class="label" x="180" y="440" text-anchor="middle">Idle maintenance</text>
       </g>
       <g>
         <rect class="card amber" x="310" y="420" width="230" height="30" rx="6"/>
@@ -319,13 +319,13 @@
       </g>
       <g>
         <rect class="card purple" x="280" y="580" width="260" height="50" rx="7"/>
-        <text class="label"    x="410" y="603" text-anchor="middle">Acquired + Composed Skills</text>
+        <text class="label"    x="410" y="603" text-anchor="middle">Acquired Skills</text>
         <text class="sublabel" x="410" y="618" text-anchor="middle">TDD-validated · semantic-routed</text>
       </g>
 
       <g>
         <rect class="card green" x="60" y="645" width="480" height="40" rx="7"/>
-        <text class="label" x="300" y="670" text-anchor="middle">Idle scheduler · maintenance · regression suite</text>
+        <text class="label" x="300" y="670" text-anchor="middle">Idle scheduler · maintenance · housekeeping</text>
       </g>
 
       <!-- ==========  UPSTREAM LLM TOPOLOGY  ========== -->
@@ -382,7 +382,7 @@
       <tr><td>Memory writes</td><td>thread-locked, atomic temp-file replace</td><td>Each store guards itself with <code>threading.RLock</code>.</td></tr>
       <tr><td>Memory bus fan-out</td><td>asyncio.gather + asyncio.to_thread</td><td>Per-tier writes run in parallel.</td></tr>
       <tr><td>Docker sandbox</td><td>blocking docker SDK in worker thread</td><td>Container reused across calls; <code>execute()</code> wraps in <code>timeout</code>.</td></tr>
-      <tr><td>Idle scheduler (formerly "biological watchdog"; code: <code>biological_watchdog</code>)</td><td>asyncio daemon task</td><td>Idle jobs, listed at boot by <code>Idle Scheduler — started; jobs: …</code>: memory-journal drain, store maintenance (logged as <code>maintenance</code>, formerly <code>dream</code>), narratives, failure replay with rule proposals, regression tests. The lesson-producing phases (reflection, post-mortem, REM, skills-auto, PRM/router retrains) were removed on 2026-10-11 (&sect;4NM); the calibration refit in &sect;4PJ (2026-10-16). Cancelled at shutdown.</td></tr>
+      <tr><td>Idle scheduler (formerly "biological watchdog"; code: <code>biological_watchdog</code>)</td><td>asyncio daemon task</td><td>Idle jobs, listed at boot by <code>Idle Scheduler — started; jobs: …</code>: memory-journal drain, store maintenance (logged as <code>maintenance</code>, formerly <code>dream</code>), store hygiene, workspace tidy, project autoadvance, narratives, the Mirror. The failure replay with its rule proposals and the regression tests were removed on 2026-11-05 (&sect;4SZ). The lesson-producing phases (reflection, post-mortem, REM, skills-auto, PRM/router retrains) were removed on 2026-10-11 (&sect;4NM); the calibration refit in &sect;4PJ (2026-10-16). Cancelled at shutdown.</td></tr>
       <tr><td>APScheduler</td><td>internal AsyncIO scheduler</td><td>Cron / interval triggers for user-defined tasks.</td></tr>
     </tbody>
   </table></div>
@@ -392,22 +392,22 @@
   <ol>
     <li>Client posts <code>/api/chat</code> with OpenAI-format messages and <code>X-Ghost-Key</code>.</li>
     <li><code>routes.py</code> validates the key, picks streaming vs JSON, and hands the payload to <code>GhostAgent.handle_chat</code>.</li>
-    <li><code>MemoryBus.hydrate_context</code> fans out to the skill tier (lessons, owner rules) and the owner-facts lookup and fuses results with Reciprocal Rank Fusion. The vector, topical graph, episodic and session tiers were removed from hydration on 2026-10-11 (&sect;4NM) and answer through <code>recall</code>.</li>
+    <li><code>MemoryBus.hydrate_context</code> runs the owner-facts lookup (plus, behind their switches, the experience and fact-history tiers) and fuses results with Reciprocal Rank Fusion. The lesson tier was removed with the lesson store on 2026-11-06 (&sect;4TD); the owner's rules are their own file and prompt block, outside the bus. The vector, topical graph, episodic and session tiers were removed from hydration on 2026-10-11 (&sect;4NM) and answer through <code>recall</code>.</li>
     <li>The combined system prompt + history + hydration is forwarded to the upstream LLM via <code>LLMClient.chat_completion</code>.</li>
     <li>The agent streams chunks back, parses any <code>&lt;tool_call&gt;</code> XML, executes the tool inside the Docker sandbox, and re-injects results.</li>
     <li>The verifier's mechanical checks run (page loads, claimed files exist, reply is an answer, image matches the reply). The reply waits up to 15 s for them (<code>GHOST_MECHANICAL_REPAIR_BUDGET</code>, §4OX) so a page that throws or a missing file gets one repair round; otherwise the reply ships and the checks finish in the background. (The uncertainty tracker was removed on 2026-10-11, §4NN; the LLM judge is off, §4OW.)</li>
   </ol>
 
-  <p><strong>Prompt prefix caching.</strong> Per-turn latency is dominated by <em>prefill</em> of the context, not generation (probe: tiny prompt ~0.1s; ~17k-token context ~15.8s cold but ~2.7s when the upstream KV-cache is warm). To keep that cache warm across the turns of one request, the per-turn injection is ordered STABLE-first / VOLATILE-last: tool schemas, persona, playbook, hydrated memory and per-request continuity (all byte-identical across turns) precede the <code>dynamic_state</code> block, which is the only per-turn-varying content (sandbox state, plan focus, and a <em>minute</em>-precision timestamp — second precision would change every turn and bust the cache). A <code>Prefill Cache</code> log line emits a hash of the stable prefix each turn; a constant hash across a request means the prefix is cacheable.</p>
+  <p><strong>Prompt prefix caching.</strong> Per-turn latency is dominated by <em>prefill</em> of the context, not generation (probe: tiny prompt ~0.1s; ~17k-token context ~15.8s cold but ~2.7s when the upstream KV-cache is warm). To keep that cache warm across the turns of one request, the per-turn injection is ordered STABLE-first / VOLATILE-last: tool schemas, persona, hydrated memory and per-request continuity (all byte-identical across turns) precede the <code>dynamic_state</code> block, which is the only per-turn-varying content (sandbox state, plan focus, and a <em>minute</em>-precision timestamp — second precision would change every turn and bust the cache). A <code>Prefill Cache</code> log line emits a hash of the stable prefix each turn; a constant hash across a request means the prefix is cacheable.</p>
 
-  <p><strong>Verifier placement.</strong> In production the verifier's LLM judge is <strong>off</strong> (§4OW, 2026-10-14: wrong on 9 of 17 refusals); only the mechanical arms run, and the image look check runs on Nova (<code>--critic-nodes</code> points at the same Nova server as <code>--worker-nodes</code>; the separate critic server was removed on 2026-10-25). The launcher sets <code>GHOST_CRITIC_ASYNC=1</code>, so checks finish after the reply ships, apart from the short mechanical repair window above. A failed check is recorded with the turn and can seed a <a href="learning-loop.html">failure replay</a>; it is not shown to the user. If <code>GHOST_VERIFIER_JUDGE=1</code> turns the judge back on, its calls run on the <code>--critic-nodes</code> pool (or the worker pool when none is set), off the foreground slot; its inline wait is <code>GHOST_CRITIC_REPAIR_BUDGET</code> (production sets 0) and <code>GHOST_CRITIC_GATE_TIMEOUT</code> (see the <a href="cli_reference.html#critic-gate">CLI reference</a>).</p>
+  <p><strong>Verifier placement.</strong> In production the verifier's LLM judge is <strong>off</strong> (§4OW, 2026-10-14: wrong on 9 of 17 refusals); only the mechanical arms run, and the image look check runs on Nova (<code>--critic-nodes</code> points at the same Nova server as <code>--worker-nodes</code>; the separate critic server was removed on 2026-10-25). The launcher sets <code>GHOST_CRITIC_ASYNC=1</code>, so checks finish after the reply ships, apart from the short mechanical repair window above. A failed check is recorded with the turn; it is not shown to the user (the failure replay it used to seed was removed on 2026-11-05, &sect;4SZ). If <code>GHOST_VERIFIER_JUDGE=1</code> turns the judge back on, its calls run on the <code>--critic-nodes</code> pool (or the worker pool when none is set), off the foreground slot; its inline wait is <code>GHOST_CRITIC_REPAIR_BUDGET</code> (production sets 0) and <code>GHOST_CRITIC_GATE_TIMEOUT</code> (see the <a href="cli_reference.html#critic-gate">CLI reference</a>).</p>
 
   <h2>Repository layout</h2>
 <pre><code>Agent/
 ├── src/ghost_agent/
 │   ├── main.py             CLI + FastAPI lifespan
 │   ├── api/                routes.py, projects_routes.py, app.py
-│   ├── core/               agent, llm, planning, dream, failure_replay, regression,
+│   ├── core/               agent, llm, planning, dream, owner_rules,
 │   │                       verifier, prompts, bus, context_manager, …
 │   ├── memory/             vector, graph, profile, skills, journal,
 │   │                       scratchpad, episodes, frontier, projects,

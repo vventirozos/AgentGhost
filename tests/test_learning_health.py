@@ -15,16 +15,8 @@ from ghost_agent.core.learning_health import (
 def _seed(md: Path):
     md.mkdir(parents=True, exist_ok=True)
     (md.parent / "calibration").mkdir(parents=True, exist_ok=True)
-    # Playbook: one fail-only lesson, one pass-only, one stale.
-    playbook = [
-        {"trigger": "a", "succeeded_retrievals": 5, "failed_retrievals": 0,
-         "retrievals": 6, "helpful_retrievals": 5, "verified": True},
-        {"trigger": "b", "succeeded_retrievals": 0, "failed_retrievals": 4,
-         "retrievals": 8, "helpful_retrievals": 0},
-        {"trigger": "c", "retrievals": 10, "helpful_retrievals": 1,
-         "graduated": True},
-    ]
-    (md / "skills_playbook.json").write_text(json.dumps(playbook))
+    # §4TD: an old playbook on disk is not read — the report must not render it.
+    (md / "skills_playbook.json").write_text(json.dumps([{"trigger": "a", "retrievals": 6}]))
     # Competence + calibration: §4PJ removed both, but a live install still
     # has these files on disk — the report must ignore them, not render them.
     comp = {
@@ -60,10 +52,7 @@ def test_collect_sections(tmp_path):
     md = tmp_path / "memory"
     _seed(md)
     r = collect_learning_health(md)
-    assert r["lessons"]["total"] == 3
-    assert r["lessons"]["present_on_failure_only"] == 1
-    assert r["lessons"]["present_on_pass_only"] == 1
-    assert r["lessons"]["stale_prune_candidates"] == 2   # b and c: ret≥5, low hit-rate
+    assert "lessons" not in r
     assert r["episodes"]["total"] == 2
     assert r["episodes"]["with_context"] == 1
     # §4PJ: leftover competence/calibration files are NOT reported — a
@@ -75,49 +64,8 @@ def test_render_is_a_string(tmp_path):
     md = tmp_path / "memory"
     _seed(md)
     out = render_learning_health(md)
-    assert "LEARNING HEALTH" in out and "LESSONS:" in out
+    assert "LEARNING HEALTH" in out and "LESSONS:" not in out
     assert "COMPETENCE" not in out and "CALIBRATION" not in out   # §4PJ
-
-
-def test_failure_arm_inert_warning(tmp_path):
-    """The arm is flagged inert only when the success side clearly flows
-    (≥20 ticks) while not a single failure tick ever landed. (Rewritten
-    2026-07-27: the old fail-ONLY-lesson test was a metric artifact — at
-    a ~96% turn pass rate any retrieved lesson accrues a success, so the
-    bucket was near-impossible by construction.)"""
-    md = tmp_path / "memory"
-    md.mkdir(parents=True)
-    (md / "skills_playbook.json").write_text(json.dumps([
-        {"trigger": f"t{i}", "succeeded_retrievals": 5, "failed_retrievals": 0,
-         "retrievals": 5, "helpful_retrievals": 4} for i in range(6)]))
-    out = render_learning_health(md)
-    assert "ZERO failed-retrieval ticks" in out
-
-
-def test_failure_arm_flowing_is_not_flagged(tmp_path):
-    """Failure ticks on mixed lessons = the arm is alive; the report must
-    say so instead of warning (the live 2026-07-27 state: 29 failed ticks,
-    0 fail-only lessons)."""
-    md = tmp_path / "memory"
-    md.mkdir(parents=True)
-    (md / "skills_playbook.json").write_text(json.dumps([
-        {"trigger": f"t{i}", "succeeded_retrievals": 4, "failed_retrievals": 2,
-         "retrievals": 6, "helpful_retrievals": 3} for i in range(5)]))
-    out = render_learning_health(md)
-    assert "ZERO failed-retrieval ticks" not in out
-    assert "failure ticks flow" in out
-
-
-def test_failure_arm_thin_corpus_not_flagged(tmp_path):
-    """Zero failure ticks with a THIN success side (<20 ticks) is 'not
-    enough signal', not inertness — no warning either way."""
-    md = tmp_path / "memory"
-    md.mkdir(parents=True)
-    (md / "skills_playbook.json").write_text(json.dumps([
-        {"trigger": "t0", "succeeded_retrievals": 5, "failed_retrievals": 0,
-         "retrievals": 5, "helpful_retrievals": 4}]))
-    out = render_learning_health(md)
-    assert "ZERO failed-retrieval ticks" not in out
 
 
 def test_missing_stores_degrade_gracefully(tmp_path):
@@ -233,95 +181,6 @@ class TestVerifierEscalationHealth:
 
 # ── the lesson hit-rate's contaminated denominator ──────────────────────────
 #
-# MEASURED 2026-08-10. The report printed `mean hit-rate: 0.62` with the caveat
-# "denominator includes the pre-2026-08-01 double-booking era — do not trend
-# across that date". That gave the reader a number they were told not to use
-# and NO number they could — while a clean one was computable all along:
-# lessons CREATED after the cut accumulated every retrieval in the clean era.
-# Measured: contaminated 0.620 vs CLEAN 0.557 over 13 lessons / 600 retrievals.
-# The caveat was hiding a 0.06 OVERSTATEMENT.
-
-def _pb(tmp_path, lessons):
-    md = tmp_path / "memory"
-    md.mkdir(parents=True, exist_ok=True)
-    (md / "skills_playbook.json").write_text(json.dumps(lessons))
-    return md
-
-
-def _lesson(ts, retr, helpful):
-    return {"task": "t", "mistake": "m", "solution": "s", "timestamp": ts,
-            "retrievals": retr, "helpful_retrievals": helpful}
-
-
-def test_the_clean_hit_rate_excludes_the_double_booking_era(tmp_path):
-    """Only lessons created AFTER the cut count toward the honest figure."""
-    md = _pb(tmp_path, [
-        _lesson("2026-07-01T00:00:00", 100, 90),   # contaminated era
-        _lesson("2026-08-05T00:00:00", 10, 2),     # clean era
-    ])
-    les = collect_learning_health(md)["lessons"]
-    assert les["clean_lessons"] == 1
-    assert les["clean_retrievals"] == 10
-    # clean = (2+1)/(10+2) = 0.25 ; the all-lessons mean is dragged up by the
-    # 0.89 contaminated lesson, which is exactly the overstatement.
-    assert les["mean_hit_rate_clean"] == 0.25
-    assert les["mean_hit_rate"] > les["mean_hit_rate_clean"]
-
-
-def test_the_CLEAN_number_is_the_headline(tmp_path):
-    """⚠ The contaminated mean must not lead. It is shown, labelled, second."""
-    md = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 90),
-                        _lesson("2026-08-05T00:00:00", 10, 2)])
-    out = render_learning_health(md)
-    assert "mean hit-rate: 0.25 (CLEAN" in out
-    assert "not comparable" in out
-
-
-def test_the_direction_of_the_distortion_is_COMPUTED_not_asserted(tmp_path):
-    """Introspect review M1. This line used to hardcode "OVERSTATES" —
-    true when written (0.620 vs 0.557), FALSE on live data within a month
-    (0.673 vs 0.681: the "overstating" number was lower). A report that
-    prints both values and then asserts their ordering from memory is an
-    instrument stating a stale fact as a measurement.
-
-    Both directions constructed; each must render its own truth.
-    """
-    # Contaminated era dragged UP -> all-lessons overstates.
-    md = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 90),
-                        _lesson("2026-08-05T00:00:00", 10, 2)])
-    out = render_learning_health(md)
-    assert "currently overstates the clean figure" in out
-    assert "OVERSTATES" not in out          # the old hardcoded shout is gone
-
-    # Contaminated era dragged DOWN -> all-lessons understates. The live
-    # store is in THIS state today; the old text called it overstated.
-    md2 = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 5),
-                         _lesson("2026-08-05T00:00:00", 10, 9)])
-    out2 = render_learning_health(md2)
-    assert "currently understates the clean figure" in out2
-
-
-def test_NO_clean_lesson_says_so_rather_than_quoting_the_dirty_one(tmp_path):
-    """⚠ The state that matters most: when no post-cut lesson has retrievals,
-    there IS no honest denominator, and the report must say CONTAMINATED
-    instead of silently falling back to the number it just disowned."""
-    md = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 90)])
-    les = collect_learning_health(md)["lessons"]
-    assert les["mean_hit_rate_clean"] is None and les["clean_lessons"] == 0
-    out = render_learning_health(md)
-    assert "CONTAMINATED" in out and "no clean denominator exists" in out
-
-
-def test_an_unparseable_lesson_timestamp_is_excluded_not_assumed_clean(tmp_path):
-    """A lesson whose creation time cannot be read must NOT be counted as
-    post-cut — that would launder unknown-era data into the honest figure."""
-    md = _pb(tmp_path, [{"task": "t", "mistake": "m", "solution": "s",
-                         "timestamp": "not-a-date",
-                         "retrievals": 10, "helpful_retrievals": 9}])
-    les = collect_learning_health(md)["lessons"]
-    assert les["clean_lessons"] == 0
-
-
 # (§4BM R1/R2/R3's PRM wiring-row pins — the `.uncertainty()` flag read,
 # `_flag_state`, the --frontier-selfplay / --prm-online-update parser types —
 # went with ghost_agent/prm and the PRM section of learning_health, §4NM.)

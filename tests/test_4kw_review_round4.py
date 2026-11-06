@@ -150,7 +150,6 @@ def test_turn_origin_by_request_id(rid, origin):
     from ghost_agent.utils.logging import request_id_context
     ctx = MagicMock()
     ctx.turn_origin_label = None
-    ctx.skill_memory.is_read_only = False
     tok = request_id_context.set(rid)
     try:
         assert A.turn_origin(ctx) == origin
@@ -166,17 +165,12 @@ def test_a_probe_turn_writes_no_episode():
     agent = A.GhostAgent.__new__(A.GhostAgent)
     agent.context = MagicMock()
     agent.context.turn_origin_label = None
-    agent.context.skill_memory.is_read_only = False
     tok = request_id_context.set("probe-deadbeef")
     try:
         asyncio.run(agent._record_episode_safe("q", [], "a", req_id="probe-deadbeef"))
     finally:
         request_id_context.reset(tok)
     agent.context.episodic_memory.record_episode.assert_not_called()
-
-
-
-
 
 
 # ── scheduler ────────────────────────────────────────────────────────────────
@@ -201,8 +195,6 @@ async def test_a_restored_interval_task_keeps_its_cadence(tmp_path, monkeypatch)
         assert 0 < nxt < 200                         # due in ~100 s, not in an hour
     finally:
         s.shutdown(wait=False)
-
-
 
 
 # ── memory: forget, update_profile, a degraded store ────────────────────────
@@ -287,74 +279,6 @@ async def test_the_bus_reports_a_refused_profile_write():
     bus.profile.update.return_value = "Error: the profile store could not be read"
     rep = await bus.publish_fact("update_profile", {"profile_update": {"category": "root", "key": "x", "value": "y"}})
     assert str((rep or {}).get("profile", "")).startswith("error")
-
-
-# ── lessons: credit, admission, merge ───────────────────────────────────────
-def _pb(tmp_path, lessons):
-    from ghost_agent.memory.skills import SkillMemory
-    sm = SkillMemory(tmp_path)
-    sm.save_playbook(lessons)
-    return sm
-
-
-def test_an_unrelated_lesson_is_not_credited_for_being_in_the_prompt(tmp_path):
-    """Fails in the world where every lesson in the prompt got helpful +1 on
-    every clean turn (membership in `top_triggers` counted as relevance)."""
-    from datetime import datetime
-    now = datetime.now().isoformat()
-    sm = _pb(tmp_path, [{"task": "When querying a database, quote identifiers", "mistake": "x",
-                         "solution": "quote identifiers", "last_retrieved_at": now, "helpful_retrievals": 0}])
-    assert sm.credit_recent_retrievals(300, query="what is the weather in Athens") == 0
-    assert sm.credit_recent_retrievals(300, query="the database query fails on quoted identifiers") == 1
-
-
-
-
-@pytest.mark.parametrize("fix,bad", [
-    ("1. file_system(operation=list_files, path=/)\n2. file_system(operation=delete, path=/*)", True),
-    ("rm -rf /workspace/*", True), ("rm -rf *", True), ("Use DROP TABLE users to reset", True),
-    ("find . -mindepth 1 -delete", True), ("git reset --hard origin/main", True), ("Delete everything in the folder", True),
-    ("Use a single operation to clear the entire directory if supported", True), ("purge all cached files", True),
-    ("clear the cache entry for that key", False), ("empty the trash file you created", False),
-    ("Run rm -rf build/ before rebuilding", False), ("Remove the old log file with rm app.log", False),
-    ("Never run rm -rf /", False), ("Avoid DROP TABLE; migrate instead", False),
-    ("use `find . -name '*.pyc' -delete`", False), ("verify each file before deleting it", False),
-])
-def test_a_lesson_may_not_prescribe_bulk_destruction(fix, bad):
-    from ghost_agent.memory.lesson_quality import prescribes_destruction
-    assert prescribes_destruction(fix) is bad
-
-
-def test_the_write_point_refuses_a_destructive_fix(tmp_path):
-    sm = _pb(tmp_path, [])
-    out = sm.learn_lesson("lots of stuff in your sandbox, clean it up", "left files",
-                          "1. file_system(operation=delete, path=/*)", source="reflection")
-    assert out is None and json.loads(sm.file_path.read_text()) == []
-
-
-
-
-def test_a_twin_from_another_producer_does_not_rewrite_the_lesson(tmp_path):
-    """Fails in the world where a dream rule merged into a reflection lesson
-    (frequency 1 → 17, fix replaced, verified inherited). §4NM: exercised with
-    the two live writers (learn_skill row, operator_repair twin)."""
-    sm = _pb(tmp_path, [{"timestamp": "2025-01-01T00:00:00", "task": "lots of stuff in your sandbox, clean it up",
-                         "mistake": "left files", "solution": "list then remove the temp files", "frequency": 1,
-                         "source": "learn_skill"}])
-    mem = MagicMock()
-    mem.collection.query.return_value = {
-        "ids": [["id1"]], "distances": [[0.1]],
-        "documents": [["SITUATION: lots of stuff in your sandbox, clean it up\nMISTAKE: left files\n"
-                       "SOLUTION: list then remove the temp files"]]}
-    sm.learn_lesson("When cleaning the sandbox, verify each file before deleting it", "deleted needed files",
-                    "verify each file before deleting it and keep skills and projects", memory_system=mem,
-                    source="operator_repair", verified=True)
-    pb = json.loads(sm.file_path.read_text())
-    # written separately (a refused twin let a stale lesson block a correction
-    # forever — second review); the stored lesson is untouched
-    old = next(r for r in pb if r.get("source") == "learn_skill")
-    assert len(pb) == 2 and old["solution"] == "list then remove the temp files"
-    assert int(old.get("frequency", 1)) == 1 and not old.get("verified")
 
 
 # ── second fresh review ─────────────────────────────────────────────────────
@@ -453,29 +377,11 @@ def test_a_refused_profile_write_is_not_reported_as_removed(tmp_path, monkeypatc
     assert _profile_line("Error: x", "Removed a.b").startswith("⚠️")
 
 
-@pytest.mark.parametrize("rid", ["probe-1234", "job-job-1", "sched-x"])
-def test_probe_and_internal_turns_bump_no_usage_counters(rid, tmp_path):
-    from ghost_agent.utils.logging import request_id_context
-    from ghost_agent.memory.skills import usage_credit_blocked
-    tok = request_id_context.set(rid)
-    try:
-        assert usage_credit_blocked()
-        sm = _pb(tmp_path, [{"task": "a lesson", "solution": "x", "retrievals": 0}])
-        assert sm.record_retrievals_bulk(["a lesson"]) == 0
-    finally:
-        request_id_context.reset(tok)
-    tok = request_id_context.set("abc12345")
-    try:
-        assert not usage_credit_blocked()
-    finally:
-        request_id_context.reset(tok)
-
-
 def test_a_sub_agent_stays_sim_and_a_labelled_turn_keeps_its_label():
     from ghost_agent.utils.logging import request_id_context
     ctx = MagicMock()
     ctx.turn_origin_label = None
-    ctx.skill_memory.is_read_only = True
+    ctx.simulated = True
     tok = request_id_context.set("sub-agent-1")
     try:
         assert A.turn_origin(ctx) == "sim"
@@ -483,20 +389,6 @@ def test_a_sub_agent_stays_sim_and_a_labelled_turn_keeps_its_label():
         assert A.turn_origin(ctx) == "bench"
     finally:
         request_id_context.reset(tok)
-
-
-
-
-
-
-@pytest.mark.parametrize("fix,bad", [
-    ("Remove all debug print statements before committing", False), ("Clear all filters before searching", False),
-    ("Use DROP TABLE IF EXISTS in the test fixture", False), ("rm -rf /tmp/build", False),
-    ("remove all the files in the sandbox", True), ("Delete everything.", True),
-])
-def test_the_destruction_screen_second_review(fix, bad):
-    from ghost_agent.memory.lesson_quality import prescribes_destruction
-    assert prescribes_destruction(fix) is bad
 
 
 def test_forget_scoped_inside_a_released_project_keeps_its_files(tmp_path):
@@ -507,7 +399,6 @@ def test_forget_scoped_inside_a_released_project_keeps_its_files(tmp_path):
     ms.collection.query.return_value = {"ids": None}
     asyncio.run(tool_unified_forget("app.py", sb / "projects" / RELEASED, ms, project_store=_Store()))
     assert (sb / "projects" / RELEASED / "app.py").exists()
-
 
 
 def test_deleting_a_link_to_the_projects_folder_removes_only_the_link(tmp_path):
@@ -591,24 +482,6 @@ def test_bulk_removal_bypasses_are_refused(cmd, wd):
 def test_rerun_safety_third_review(cmd, unsafe):
     from ghost_agent.tools.execute import _rerun_unsafe
     assert _rerun_unsafe(cmd) is unsafe
-
-
-@pytest.mark.parametrize("fix,bad", [
-    ("rm -rf /tmp/../workspace", True), ("rm -rf ./projects", True), ("find . -type f -delete", True),
-    ("shutil.rmtree('projects')", True), ("TRUNCATE users", True), ("DELETE FROM users", True), ("git clean -fdx", True),
-    ("Clear the workspace first", True), ("delete the projects folder", True), ("delete path=projects/aaaaaaaaaaaa", True),
-    ("remove all duplicate rows from the dataframe", False), ("Remove all items from the cart", False),
-    ("remove all files matching *.pyc", False), ("DELETE FROM users WHERE id = 3", False),
-])
-def test_the_destruction_screen_third_review(fix, bad):
-    from ghost_agent.memory.lesson_quality import prescribes_destruction
-    assert prescribes_destruction(fix) is bad
-
-
-def test_a_token_less_request_credits_nothing():
-    assert not A._query_has_tokens("?") and not A._query_has_tokens("👍") and A._query_has_tokens("restart the service")
-
-
 
 
 def test_only_named_relations_and_birthdates_are_durable():

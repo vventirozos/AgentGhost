@@ -183,7 +183,7 @@ class TestManageProjectsLoopExempt:
         assert is_readwrite_loop_exempt("manage_projects") is True
 
     def test_peer_readwrite_tools_still_exempt(self):
-        for t in ("file_system", "manage_tasks", "manage_composed_skills",
+        for t in ("file_system", "manage_tasks",
                   "knowledge_base", "update_profile"):
             assert is_readwrite_loop_exempt(t) is True
 

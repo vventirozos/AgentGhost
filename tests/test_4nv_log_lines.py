@@ -303,9 +303,9 @@ def test_an_owner_command_line_says_what_it_did():
     """Fails where the line showed only the command ("rule command: learn
     rule 3") and not whether anything happened."""
     from ghost_agent.core.agent import _owner_command_line
-    from ghost_agent.core.failure_replay import _rn
-    line = _owner_command_line("rule", "learn rule 3", _rn("note for the model", "Rule 3 adopted\nas a lesson."))
-    assert line == "rule command: learn rule 3 → Rule 3 adopted as a lesson."
+    from ghost_agent.core.owner_rules import _note
+    line = _owner_command_line("rule", "forget rule 3", _note("Forget this rule?\n\n> answer in English"))
+    assert line == "rule command: forget rule 3 → Forget this rule? > answer in English"
     assert _owner_command_line("test", "keep test 2", "plain") == "test command: keep test 2"
 
 

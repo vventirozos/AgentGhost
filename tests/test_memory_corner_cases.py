@@ -22,136 +22,16 @@ import pytest
 
 from ghost_agent.distill.collector import TrajectoryCollector, CORRECTIONS_FILENAME
 from ghost_agent.distill.schema import Outcome, ToolCall, Trajectory
-from ghost_agent.memory.skills import SkillMemory
 
 
 # ──────────────────────────────────────────────────────────────────────
 # SkillMemory edge cases
 # ──────────────────────────────────────────────────────────────────────
 
-class TestSkillMemoryEdges:
-    def test_fresh_playbook_has_zero_lessons(self, tmp_path: Path):
-        sm = SkillMemory(tmp_path)
-        playbook = sm.list_lessons()
-        assert isinstance(playbook, (list, dict))
-
-    def test_learn_lesson_with_empty_strings(self, tmp_path: Path):
-        sm = SkillMemory(tmp_path)
-        # Empty strings might be rejected or accepted; either is fine
-        # as long as it doesn't crash.
-        try:
-            sm.learn_lesson(
-                task="", mistake="", solution="",
-                memory_system=None,
-             source="learn_skill")
-        except (ValueError, RuntimeError):
-            pass
-
-    def test_learn_lesson_with_huge_strings(self, tmp_path: Path):
-        """The lesson API truncates inputs; it must not raise."""
-        sm = SkillMemory(tmp_path)
-        sm.learn_lesson(
-            task="x" * 10_000,
-            mistake="y" * 10_000,
-            solution="z" * 10_000,
-            memory_system=None,
-         source="learn_skill")
-        # Should not crash; playbook should be non-empty
-        assert len(sm.list_lessons()) >= 1
-
-    def test_retract_with_unknown_id_returns_zero(self, tmp_path: Path):
-        sm = SkillMemory(tmp_path)
-        # No lessons → retract by id is a no-op
-        assert sm.retract_lessons_from_trajectory("nonexistent-id") == 0
-
-    def test_retract_empty_string_is_protected(self, tmp_path: Path):
-        sm = SkillMemory(tmp_path)
-        sm.learn_lesson(
-            task="t", mistake="m", solution="s",
-            memory_system=None, source_trajectory_id="", source="learn_skill",  # legacy
-        )
-        # Even with a legacy lesson present, "" must not bulk-scrub it
-        assert sm.retract_lessons_from_trajectory("") == 0
-        assert len(sm.list_lessons()) >= 1
-
-    def test_retract_specific_id_scrubs_only_that_one(self, tmp_path: Path):
-        sm = SkillMemory(tmp_path)
-        sm.learn_lesson(
-            task="t1", mistake="m1", solution="s1",
-            memory_system=None, source_trajectory_id="traj-a",
-         source="learn_skill")
-        sm.learn_lesson(
-            task="t2", mistake="m2", solution="s2",
-            memory_system=None, source_trajectory_id="traj-b",
-         source="learn_skill")
-        before = len(sm.list_lessons())
-        sm.retract_lessons_from_trajectory("traj-a")
-        after = len(sm.list_lessons())
-        assert after == before - 1, (
-            f"retraction removed wrong count: {before} → {after}"
-        )
-
-    def test_retract_idempotent(self, tmp_path: Path):
-        """Calling retract twice on the same id must not crash or
-        accidentally remove other lessons."""
-        sm = SkillMemory(tmp_path)
-        sm.learn_lesson(
-            task="t", mistake="m", solution="s",
-            memory_system=None, source_trajectory_id="t1",
-         source="learn_skill")
-        n1 = sm.retract_lessons_from_trajectory("t1")
-        n2 = sm.retract_lessons_from_trajectory("t1")  # already gone
-        assert n1 >= 0
-        assert n2 == 0
-
-    def test_corrupted_playbook_recoverable(self, tmp_path: Path):
-        """If the playbook JSON is malformed, SkillMemory should
-        recover gracefully — start fresh rather than crash."""
-        playbook = tmp_path / "skills_playbook.json"
-        playbook.write_text("{this is not valid json")
-        try:
-            sm = SkillMemory(tmp_path)
-            # If it loads, must produce a valid (empty) state
-            assert isinstance(sm.list_lessons(), (list, dict))
-        except (json.JSONDecodeError, ValueError):
-            # Acceptable: explicit failure on corruption
-            pass
-
 
 # ──────────────────────────────────────────────────────────────────────
 # SkillMemory concurrency
 # ──────────────────────────────────────────────────────────────────────
-
-class TestSkillMemoryConcurrency:
-    def test_concurrent_learn_lesson_does_not_lose_writes(self, tmp_path: Path):
-        """N threads each calling learn_lesson must produce roughly N
-        lessons (some dedup is OK; gross loss is a bug)."""
-        sm = SkillMemory(tmp_path)
-        errors: List[Exception] = []
-
-        def writer(tid: int):
-            try:
-                for i in range(5):
-                    sm.learn_lesson(
-                        task=f"task {tid}-{i}",
-                        mistake=f"unique mistake {tid}-{i}",
-                        solution=f"solution {tid}-{i}",
-                        memory_system=None,
-                        source_trajectory_id=f"traj-{tid}-{i}",
-                     source="learn_skill")
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
-        assert errors == [], f"concurrent writes failed: {errors[:3]}"
-        # At least most writes should have landed (dedup may collapse
-        # near-identical ones, but unique tids/i should be distinct)
-        n = len(sm.list_lessons())
-        assert n >= 5, f"only {n} lessons after 20 writes"
 
 
 # ──────────────────────────────────────────────────────────────────────

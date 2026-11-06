@@ -17,7 +17,8 @@ beside the first. A message that arrives mid-turn is ROUTED by the system
      (tools.memory.note_queued_withdrawal, by time).
   4. a status question and nothing else → STATUS, answered here from the
      registry (with anything more it is an instruction → 7).
-  5. a rule command (the system answers those at request start) → QUEUE.
+  5. a system command — a rule command or "mirror" (the system answers
+     those at request start) → QUEUE.
   6. the turn no longer accepts (its loop has exited) → QUEUE.
   7. everything else → INJECT: read at the turn's next model call, the
      model decides now / after / instead. The row starts with
@@ -135,10 +136,9 @@ def route(text: str, turn, *, session_id: str, kind: str) -> Tuple[str, str]:
     # message, and refuses the request that showed the preview), while
     # queued it would run AFTER the turn — and confirm a preview the user had
     # not seen when they typed it.
-    from .failure_replay import is_rule_command
     from ..memory.experience import is_system_command
-    if is_rule_command(t) or is_system_command(t):
-        return PATH_QUEUE, "a rule command"
+    if is_system_command(t):
+        return PATH_QUEUE, "a system command"
     if not turn.accepting:
         return PATH_QUEUE, "the turn is finishing"
     return PATH_INJECT, ""

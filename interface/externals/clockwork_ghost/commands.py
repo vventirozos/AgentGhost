@@ -47,7 +47,6 @@ SHORTCUTS = (
     ("Ctrl+Esc", "camera"),
     ("PgUp / PgDn", "scroll (also Shift+↑ / Shift+↓)"),
     ("Ctrl+↑ / Ctrl+↓", "rate the last reply good / bad"),
-    ("F11", "face only (any key returns)"),
 )
 
 # After the word: nothing, an argument after a space, an argument attached

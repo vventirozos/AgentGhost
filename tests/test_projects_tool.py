@@ -1099,7 +1099,7 @@ async def test_tool_is_registered(tmp_path):
                              temperature=0.1, default_db=None),
         llm_client=SimpleNamespace(image_gen_clients=None),
         memory_system=None, profile_memory=None, graph_memory=None,
-        skill_memory=None, scratchpad=None, sandbox_manager=None,
+        scratchpad=None, sandbox_manager=None,
         scheduler=None, memory_bus=None,
         project_store=ProjectStore(tmp_path / "mem"),
         current_project_id=None,

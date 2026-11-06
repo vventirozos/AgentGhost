@@ -366,7 +366,7 @@ async def test_a_confined_leaf_cannot_write_outside_its_project(tmp_path):
 
 def test_the_leaf_context_and_the_pinned_context_are_confined():
     from ghost_agent.core.coding_loop import build_leaf_context
-    ctx = SimpleNamespace(current_project_id="aaaaaaaaaaaa", scratchpad=None, memory_system=None, skill_memory=None,
+    ctx = SimpleNamespace(current_project_id="aaaaaaaaaaaa", scratchpad=None, memory_system=None, 
                           graph_memory=None, args=SimpleNamespace(perfect_it=True, smart_memory=0.5, native_tools=True),
                           workspace_model=None, episodic_memory=None, journal=None, scheduler=None, profile_memory=None,
                           memory_bus=None, tor_proxy=None)

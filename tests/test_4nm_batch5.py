@@ -45,27 +45,24 @@ def test_the_project_task_tree_is_kept():
 
 # ── utility pruning and the derived-mood idle job ────────────────────────────
 
-def test_utility_pruning_is_gone():
-    from ghost_agent.memory.skills import SkillMemory
-    from ghost_agent.memory.readonly import ReadOnlySkillMemory
-    assert not hasattr(SkillMemory, "prune_low_utility")
-    assert "prune_low_utility" not in ReadOnlySkillMemory._MUTATORS
 
-
-def test_the_idle_tick_derives_no_mood():
-    """The post-turn derived mood stays (self_state reads it); the idle phase
-    that minted "idle" moods was dropped by the operator."""
+def test_the_idle_tick_moves_no_mood():
+    """The idle phase that minted "idle" moods was dropped by the operator
+    (§4NM); the derived updater itself is gone (§4TC). No idle job writes the
+    mood: it decays when it is read, and only an owner's turn, the owner's
+    reactions and the owner's word move it."""
     import ast
     import inspect
     import ghost_agent.core.agent as A
     import textwrap
+    writers = {"update_derived_mood", "note_owner_turn", "note_owner_reaction", "settle_mood",
+               "nudge", "set_owner_mood", "reset_mood", "set_manner"}
     tick = ast.parse(textwrap.dedent(inspect.getsource(A.GhostAgent._biological_tick)))
-    assert not [n for n in ast.walk(tick)
-                if isinstance(n, ast.Attribute) and n.attr == "update_derived_mood"]
+    assert not [n for n in ast.walk(tick) if isinstance(n, ast.Attribute) and n.attr in writers]
     assert not hasattr(A.GhostAgent, "_DERIVED_MOOD_COOLDOWN")
     calls = [n for n in ast.walk(ast.parse(inspect.getsource(A)))
              if isinstance(n, ast.Attribute) and n.attr == "update_derived_mood"]
-    assert len(calls) == 1, "the post-turn hook is the one caller left"
+    assert not calls, "the derived updater has no caller left"
 
 
 # ── dream → maintenance ──────────────────────────────────────────────────────

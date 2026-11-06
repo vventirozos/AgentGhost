@@ -29,7 +29,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from ghost_agent.core.bus import MemoryBus
-from ghost_agent.memory.skills import SkillMemory
 
 
 # ------------------------------------------------------------ #13 episodic
@@ -49,34 +48,20 @@ def test_episodes_format_episode_matches_blob_lines():
 # ------------------------------------------------------------- #14 per-item
 
 
-async def test_fetch_skill_emits_one_item_per_lesson():
-    skill = MagicMock()
-    skill.get_playbook_items = MagicMock(return_value=[
-        {"text": "lesson A", "trigger": "trig-a"},
-        {"text": "lesson B", "trigger": "trig-b"},
-        {"text": "lesson C", "trigger": "trig-c"},
-    ])
-    bus = MemoryBus(skill_memory=skill)
-    items = await bus._fetch_skill("query")
-    assert [it["text"] for it in items] == ["lesson A", "lesson B", "lesson C"]
-    assert [it["trigger"] for it in items] == ["trig-a", "trig-b", "trig-c"]
-    assert all(it["source"] == "skill" for it in items)
-
-
 def test_format_markdown_with_survivors_returns_emitted_items():
     fused = [
         ({"source": "vector", "text": "kept-1", "mem_id": "a"}, 0.9),
-        ({"source": "skill", "text": "kept-2", "trigger": "t"}, 0.8),
+        ({"source": "graph", "text": "kept-2", "mem_id": "t"}, 0.8),
         ({"source": "vector", "text": "dropped-too-big", "mem_id": "b"}, 0.7),
     ]
     # Budget fits the first two items + headers but not the third.
     header_cost = len("### MEMORY CONTEXT:") + 1 + len(
-        "### SKILL PLAYBOOK (lessons from prior runs — follow to avoid repeats):") + 1
+        "### TOPOLOGICAL KNOWLEDGE GRAPH:") + 1
     budget = header_cost + len("kept-1") + 1 + len("kept-2") + 1
     out, survivors = MemoryBus._format_markdown_with_survivors(fused, max_chars=budget)
     assert "kept-1" in out and "kept-2" in out
     assert "dropped-too-big" not in out
-    assert [s.get("mem_id") or s.get("trigger") for s in survivors] == ["a", "t"]
+    assert [s.get("mem_id") for s in survivors] == ["a", "t"]
 
 
 def test_format_markdown_wrapper_unchanged_contract():
@@ -86,40 +71,6 @@ def test_format_markdown_wrapper_unchanged_contract():
 
 
 # ------------------------------------------------------- #16 deferred credit
-
-
-async def test_credit_goes_only_to_surviving_items():
-    """End-to-end hydrate: candidates beyond the per-source cap must NOT be
-    credited; survivors are credited exactly once via the bulk API. (§4NM:
-    lessons are the only credited tier left — the vector tier is retired.)"""
-    vec = MagicMock()
-    vec.bump_retrievals = MagicMock()
-    skill = MagicMock()
-    skill.get_playbook_items = MagicMock(return_value=[
-        {"text": f"lesson {i}", "trigger": f"trig-{i}"}
-        for i in range(8)  # _PER_SOURCE_CAP is 6 → trig-6, trig-7 must not be credited
-    ])
-    skill.record_retrievals_bulk = MagicMock()
-
-    bus = MemoryBus(vector_memory=vec, skill_memory=skill)
-    out = await bus.hydrate_context("what did I learn about docker probes")
-    assert out  # something was injected
-
-    vec.bump_retrievals.assert_not_called()
-    skill.record_retrievals_bulk.assert_called_once()
-    credited = skill.record_retrievals_bulk.call_args.args[0]
-    assert set(credited).issubset({f"trig-{i}" for i in range(6)})
-    assert "trig-6" not in credited and "trig-7" not in credited
-
-
-async def test_no_credit_calls_when_nothing_survives():
-    skill = MagicMock()
-    skill.get_playbook_items = MagicMock(return_value=[])
-    skill.record_retrievals_bulk = MagicMock()
-    bus = MemoryBus(skill_memory=skill)
-    out = await bus.hydrate_context("query with no hits")
-    assert out == ""
-    skill.record_retrievals_bulk.assert_not_called()
 
 
 # ------------------------------------------------- SkillMemory bulk credit
@@ -137,63 +88,6 @@ def skill_store(tmp_path):
          "retrievals": 1, "helpful_retrievals": 1},
     ])
     return sm
-
-
-def test_record_retrievals_bulk_single_write(skill_store, monkeypatch):
-    """N lessons credited → exactly ONE playbook save (the old per-lesson
-    record_retrieval path cost one full-file rewrite per lesson)."""
-    saves = []
-    real_save = skill_store._save_playbook_unlocked
-    monkeypatch.setattr(
-        skill_store, "_save_playbook_unlocked",
-        lambda pb: (saves.append(1), real_save(pb)))
-    updated = skill_store.record_retrievals_bulk(["docker probe", "tor circuit"])
-    assert updated == 2
-    assert len(saves) == 1
-
-    pb = skill_store._load_playbook()
-    by_task = {(p.get("trigger") or p.get("task")): p for p in pb}
-    assert by_task["docker probe"]["retrievals"] == 1
-    assert by_task["tor circuit"]["retrievals"] == 6
-    assert by_task["untouched"]["retrievals"] == 1  # not credited
-
-
-def test_record_retrievals_bulk_dedups_and_ignores_empty(skill_store):
-    updated = skill_store.record_retrievals_bulk(
-        ["docker probe", "DOCKER PROBE", "", None, "no-such-lesson"])
-    assert updated == 1
-    pb = skill_store._load_playbook()
-    lesson = next(p for p in pb if (p.get("trigger") or p.get("task")) == "docker probe")
-    assert lesson["retrievals"] == 1  # bumped once despite the duplicate
-
-
-def test_get_playbook_items_has_no_side_effects(skill_store):
-    before = json.dumps(skill_store._load_playbook(), sort_keys=True)
-    items = skill_store.get_playbook_items("docker probe failed again")
-    assert items and all("text" in it and "trigger" in it for it in items)
-    after = json.dumps(skill_store._load_playbook(), sort_keys=True)
-    assert before == after  # NO counter bumps from the items API
-
-
-def test_get_playbook_context_contracts_preserved(skill_store, tmp_path):
-    # query + BM25 hit → relevant-lessons header, counters bumped in ONE write
-    out = skill_store.get_playbook_context(query="docker probe broke")
-    assert out.startswith("## RELEVANT LESSONS LEARNED")
-    pb = skill_store._load_playbook()
-    lesson = next(p for p in pb if (p.get("trigger") or p.get("task")) == "docker probe")
-    assert lesson["retrievals"] == 1
-
-    # query with zero keyword overlap → "" (no recency dump)
-    assert skill_store.get_playbook_context(query="zzz qqq xyzzy") == ""
-
-    # no query → recency header
-    out = skill_store.get_playbook_context()
-    assert out.startswith("## RECENT LESSONS LEARNED")
-
-    # empty playbook → legacy sentinel string
-    (tmp_path / "empty").mkdir()
-    empty = SkillMemory(tmp_path / "empty")
-    assert empty.get_playbook_context() == ""          # §4LC: no placeholder block
 
 
 # ------------------------------------------------- VectorMemory deferral

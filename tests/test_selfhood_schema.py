@@ -6,9 +6,7 @@ from ghost_agent.selfhood.schema import (
     SCHEMA_VERSION,
     Experience,
     Mood,
-    OpenQuestion,
     SelfState,
-    UnfinishedThread,
 )
 
 
@@ -47,18 +45,20 @@ def test_experience_from_dict_ignores_unknown_fields():
 
 def test_self_state_roundtrip():
     s = SelfState(
-        open_questions=[OpenQuestion(text="What is consciousness?")],
-        unfinished_threads=[UnfinishedThread(descriptor="rewrite the parser")],
-        mood=Mood(label="curious", evidence="just saw a new paper"),
+        mood=Mood(p=0.6, e=0.45, updated_at="2026-05-11T12:00:00Z", label="cheerful", intensity=2,
+                  cause="the owner gave a thumbs-up", manner="playful", manner_intensity=1),
         last_session_at="2026-05-11T12:00:00Z",
+        last_owner_turn_at="2026-05-11T11:58:00Z",
     )
     d = s.to_dict()
+    assert set(d) == {"schema_version", "mood", "last_session_at",
+                      "last_owner_turn_at"}                           # §4TB: no question / thread lists; §4TC: the owner stamp
     s2 = SelfState.from_dict(d)
-    assert s2.open_questions[0].text == "What is consciousness?"
-    assert s2.unfinished_threads[0].descriptor == "rewrite the parser"
     assert s2.mood is not None
-    assert s2.mood.label == "curious"
+    assert (s2.mood.label, s2.mood.intensity, s2.mood.p, s2.mood.e) == ("cheerful", 2, 0.6, 0.45)
+    assert (s2.mood.manner, s2.mood.manner_intensity, s2.mood.cause) == ("playful", 1, "the owner gave a thumbs-up")
     assert s2.last_session_at == "2026-05-11T12:00:00Z"
+    assert s2.last_owner_turn_at == "2026-05-11T11:58:00Z"
     assert s2.schema_version == SCHEMA_VERSION
 
 
@@ -72,8 +72,6 @@ def test_self_state_handles_null_mood():
 
 def test_self_state_from_empty_dict():
     s = SelfState.from_dict({})
-    assert s.open_questions == []
-    assert s.unfinished_threads == []
     assert s.mood is None
     assert s.last_session_at == ""
     assert s.schema_version == SCHEMA_VERSION

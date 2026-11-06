@@ -210,7 +210,6 @@ async def test_a_late_correction_is_bound_to_its_answer(agent, monkeypatch):
     monkeypatch.setenv("GHOST_CRITIC_REPAIR_BUDGET", "0")
     verifier, _ = _make_verifier([_verdict(VerifyVerdict.REFUTED, conf=0.97, issues=["the year is 2017"])])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
     agent.available_tools["web_search"] = AsyncMock(return_value="It launched in 2017.")
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=[
         {"choices": [{"message": {"content": "", "tool_calls": [

@@ -76,7 +76,7 @@
   <h2 id="who">Who is asking: origin and owner</h2>
   <p>Both come from the request scope (<code>core.request_scope</code>, &sect;4SX B0):</p>
   <ul>
-    <li><strong>Origin</strong> is sent as the header <code>X-Labs-Origin</code>: <code>owner</code> &rarr; <code>owner</code>, <code>probe</code> &rarr; <code>probe</code>, and <code>unattended</code>, <code>leaf</code> or no scope at all &rarr; <code>autopilot</code> (fail closed). <code>member</code> and <code>replay</code> are refused before any request: labs are the owner's machines, and a replay never touches real ones. The service enforces its own rules per origin, for example "autopilot creates disposable labs only".</li>
+    <li><strong>Origin</strong> is sent as the header <code>X-Labs-Origin</code>: <code>owner</code> &rarr; <code>owner</code>, <code>probe</code> &rarr; <code>probe</code>, and <code>unattended</code>, <code>leaf</code> or no scope at all &rarr; <code>autopilot</code> (fail closed). <code>member</code> is refused before any request: labs are the owner's machines. (Until 2026-11-05 a <code>replay</code> origin was refused here too; that origin was removed with the failure replay, &sect;4SZ.) The service enforces its own rules per origin, for example "autopilot creates disposable labs only".</li>
     <li><strong>Owner</strong> is <code>project:&lt;id&gt;</code> when the request has a project, otherwise <code>conversation:&lt;key&gt;</code>. <code>list</code> filters by owner unless <code>all_owners</code> is set.</li>
   </ul>
 
@@ -147,7 +147,7 @@ PostgreSQL 18.1 …</pre>
     <li><strong>Egress:</strong> <code>lab</code> is code (<code>memory.egress</code>): <code>OUTBOUND_TOOLS["lab"] = "url_literals"</code> and it is in <code>CODE_TOOLS</code>. The owner's identifiers inside URLs are scrubbed. After outside content, a command that would send uploads or memory files is refused, and so is a <code>lab put</code> of such a file: the put is itself the network step.</li>
     <li><strong>Outside content</strong> (<code>utils.provenance.is_untrusted_source</code>): an <code>exec</code> whose command fetches (curl, wget, git clone …), every <code>http</code> answer and every <code>get</code> arm the request's outside-content rules, as an <code>execute</code> curl does. <code>status</code>, <code>list</code>, <code>logs</code> and <code>spec</code> are the labs host's own records (review r2).</li>
     <li><strong>Probes</strong> destroy only their own labs. The service restricts only <code>autopilot</code>, so the tool refuses a probe-origin destroy of another owner's lab.</li>
-    <li><strong>Replays</strong> cannot call it (<code>isolation.REPLAY_FORBIDDEN_TOOLS</code>), and their args copy has <code>labs_host</code> cleared. Members do not get it (<code>_MEMBER_ALLOWED_TOOLS</code>), composed macros cannot use it as a step, and leaves do not get it in Phase B.</li>
+    <li><strong>Replays</strong> cannot call it (<code>isolation.REPLAY_FORBIDDEN_TOOLS</code>), and their args copy has <code>labs_host</code> cleared. Members do not get it (<code>_MEMBER_ALLOWED_TOOLS</code>), and leaves do not get it in Phase B. (Composed macros could not use it as a step; the macro engine was removed in &sect;4TA.)</li>
     <li>Proxy: <code>core.llm.compute_tor_proxy</code>. A tailnet IP, a LAN address or a dotless name is reached directly; a public host would go over Tor. A <code>*.ts.net</code> FQDN is treated as public (it would go over Tor and fail), so configure the IP or the bare MagicDNS name.</li>
   </ul>
 

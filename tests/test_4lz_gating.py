@@ -19,19 +19,20 @@ def test_one_classification_for_every_request(rid, kind):
     assert request_kind(rid) == kind
 
 
-# ── F1: a simulated turn cannot touch production macros or page the owner ──
+# ── F1: a simulated turn cannot touch the production skill store or page the owner ──
 # (§4NM: the SELF_PLAY_FORBIDDEN_TOOLS pin left with synthetic self-play)
 
-async def test_a_self_play_turn_cannot_change_the_macro_store(tmp_path):
-    from ghost_agent.tools.composed_skills import _registry_from_context, tool_manage_composed_skills
-    ctx = type("C", (), {"memory_dir": tmp_path, "sandbox_dir": tmp_path})()
-    _registry_from_context(ctx).compile_from_pattern("keep", [{"tool": "web_search", "params": {"query": "$q"}}], "t")
+async def test_a_self_play_turn_cannot_change_the_skill_store(tmp_path):
+    # (pinned on the macro store until the macro engine was removed, §4TA; the
+    # acquired-skill store has the same rule)
+    from ghost_agent.tools.acquired_skills import AcquiredSkillManager, tool_manage_skills
+    AcquiredSkillManager(tmp_path, memory_system=None).save_skill("keep", "desc", {}, "def run(args):\n    return 1\n")
     tok = request_id_context.set("sim-0001")
     try:
-        await tool_manage_composed_skills(context=ctx, action="delete", name="keep")
+        await tool_manage_skills(memory_dir=tmp_path, sandbox_dir=tmp_path, action="delete", skill_name="keep")
     finally:
         request_id_context.reset(tok)
-    assert "keep" in _registry_from_context(ctx).skills
+    assert "keep" in AcquiredSkillManager(tmp_path, memory_system=None).get_all_skills()
 
 
 @pytest.mark.parametrize("rid,refused", [("sched-x", True), ("sim-1", True), ("bench-2", True),

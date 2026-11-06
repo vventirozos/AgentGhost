@@ -19,7 +19,6 @@ def mock_agent():
     ctx.scratchpad.list_all.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.graph_memory = MagicMock()
-    ctx.skill_memory = MagicMock()
     ctx.sandbox_dir = "/tmp/sandbox"
     return GhostAgent(ctx)
 

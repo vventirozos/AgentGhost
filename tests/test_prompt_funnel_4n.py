@@ -15,68 +15,6 @@ REPO = Path(__file__).resolve().parent.parent
 
 # ── Lens A MAJOR-1: self-play delivery-dedup wrapper attribute split ──
 
-def test_credit_surfaced_stamps_the_real_store_through_the_wrapper():
-    """The bus books delivery on `self.skill`, but on self-play that is a
-    ReadOnlySkillMemory whose get_playbook_context DELEGATES to real_sm and
-    reads the dedup keys off THAT object — so a stamp on the wrapper was
-    invisible and the §4L dedup failed open on 89/89 self-play turns."""
-    from ghost_agent.core.bus import MemoryBus
-    from ghost_agent.utils.logging import request_id_context
-
-    class _RealStore:
-        def __init__(self):
-            self.booked = None
-        def record_retrievals_bulk(self, trigs):
-            self.booked = list(trigs)
-            return len(trigs)
-
-    class _Wrapper:
-        """Minimal stand-in for ReadOnlySkillMemory: delegates the booking
-        method but is a DISTINCT object (attribute writes land on it, not
-        on real_sm) — exactly the split that made the stamp invisible."""
-        def __init__(self, real):
-            self.real_sm = real
-        def record_retrievals_bulk(self, trigs):
-            return self.real_sm.record_retrievals_bulk(trigs)
-
-    real = _RealStore()
-    wrapper = _Wrapper(real)
-    bus = MemoryBus(skill_memory=wrapper)
-    tok = request_id_context.set("turn-xyz")
-    try:
-        bus._credit_surfaced([
-            {"source": "skill", "trigger": "lesson-A"},
-            {"source": "skill", "trigger": "lesson-B"},
-        ])
-    finally:
-        request_id_context.reset(tok)
-    # The stamp must land on the REAL store (what get_playbook_context reads),
-    # NOT on the wrapper.
-    assert getattr(real, "last_bus_triggers", None) == ["lesson-A", "lesson-B"]
-    assert getattr(real, "_bus_delivered_turn_key", None) == "turn-xyz"
-    assert not hasattr(wrapper, "last_bus_triggers")
-
-
-def test_credit_surfaced_direct_path_unchanged():
-    """On the interactive (non-wrapped) path self.skill IS the real store —
-    the resolution must be a no-op that still stamps it."""
-    from ghost_agent.core.bus import MemoryBus
-    from ghost_agent.utils.logging import request_id_context
-
-    class _Store:
-        def record_retrievals_bulk(self, trigs):
-            return len(trigs)
-
-    store = _Store()
-    bus = MemoryBus(skill_memory=store)
-    tok = request_id_context.set("turn-direct")
-    try:
-        bus._credit_surfaced([{"source": "skill", "trigger": "L"}])
-    finally:
-        request_id_context.reset(tok)
-    assert store.last_bus_triggers == ["L"]
-    assert store._bus_delivered_turn_key == "turn-direct"
-
 
 # ── Lens A MAJOR-3: skill twins leak into the MEMORY (vector) tier ─────
 
@@ -373,15 +311,13 @@ def test_r2_warmup_miss_skips_isolate_contexts():
     src = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
     i = src.index("if _warmed is not None and not _iso:")
     seg = src[i - 1000:i + 60]          # §4LE added the member/public clause
-    assert "_iso = (" in seg and "is_read_only" in seg
+    assert "_iso = (" in seg and "is_simulated_context" in seg
     assert "profile_memory" in seg
     # NIT-3: the warmed hash is stashed AFTER the prefill request succeeds
     # §4FM: the label became `"main-prefix-rewarm" if quiet else "main-prefix-warmup"`;
     # the property is unchanged — the stash comes AFTER the request succeeded
     assert (src.index("self.context._warmed_sys_hash = _sys_h")
             > src.index('else "main-prefix-warmup"'))
-
-
 
 
 def test_r2_goal_is_first_user_not_first_nonsystem():

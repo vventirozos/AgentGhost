@@ -34,30 +34,27 @@ from ghost_agent.core.bus import MemoryBus
 # =====================================================================
 
 def test_budget_loop_skips_oversized_and_keeps_filling():
-    """A big vector item at rank 2 must NOT discard the small skill + graph
+    """A big vector item at rank 2 must NOT discard the small
     items ranked below it — nor drop their lazily-emitted headers."""
     headers_cost = (len("### MEMORY CONTEXT:") + 1
-                    + len("### SKILL PLAYBOOK (lessons from prior runs — "
-                          "follow to avoid repeats):") + 1
                     + len("### TOPOLOGICAL KNOWLEDGE GRAPH:") + 1)
-    small_skill = "do X"      # tiny
+    small_vector = "do X"      # tiny
     small_graph = "- A->B"    # tiny
     fused = [
         ({"source": "vector", "text": "seed", "mem_id": "v0"}, 0.99),
         ({"source": "vector", "text": "B" * 900, "mem_id": "v1"}, 0.90),  # oversized
-        ({"source": "skill", "text": small_skill, "trigger": "t"}, 0.80),
+        ({"source": "vector", "text": small_vector, "mem_id": "v2"}, 0.80),
         ({"source": "graph", "text": small_graph}, 0.70),
     ]
     budget = (headers_cost + len("seed") + 1
-              + len(small_skill) + 1 + len(small_graph) + 1 + 5)
+              + len(small_vector) + 1 + len(small_graph) + 1 + 5)
     out, survivors = MemoryBus._format_markdown_with_survivors(fused, max_chars=budget)
     # The oversized item is skipped, everything else survives — headers too.
     assert "B" * 900 not in out
-    assert small_skill in out and small_graph in out
-    assert "SKILL PLAYBOOK" in out
+    assert small_vector in out and small_graph in out
     assert "TOPOLOGICAL KNOWLEDGE GRAPH" in out
     texts = [s["text"] for s in survivors]
-    assert small_skill in texts and small_graph in texts
+    assert small_vector in texts and small_graph in texts
     assert "B" * 900 not in texts
 
 
@@ -128,11 +125,10 @@ async def test_hydrate_threads_raw_user_text():
 @pytest.mark.asyncio
 async def test_caller_budget_respected_for_simple_query():
     """A simple query gets exactly the caller's budget, not a 6000 floor."""
-    skill = MagicMock()
-    skill.get_playbook_items = MagicMock(return_value=[
-        {"text": f"lesson {i} " + "x" * 300, "trigger": f"t{i}"} for i in range(20)])
-    bus = MemoryBus(skill_memory=skill)
-    out = await bus.hydrate_context("short simple query",
+    graph = MagicMock()
+    graph.owner_facts_matching = MagicMock(return_value=[f"fact {i} " + "x" * 300 for i in range(20)])
+    bus = MemoryBus(graph_memory=graph)
+    out = await bus.hydrate_context("what is my simple question",
                                     context_budget=1000)
     assert out, "nothing hydrated — the budget assertion below would be vacuous"
     # Old code floored at 6000; the fix honours 1000. Allow the truncation
@@ -144,10 +140,10 @@ async def test_caller_budget_respected_for_simple_query():
 async def test_complex_query_scales_above_base_budget():
     """A >30-word query reaches up to 3x the base budget (capped 12000)."""
     big = "y" * 40000
-    skill = MagicMock()
-    skill.get_playbook_items = MagicMock(return_value=[{"text": big, "trigger": "big"}])
-    bus = MemoryBus(skill_memory=skill)
-    complex_q = " ".join(["word"] * 40)
+    graph = MagicMock()
+    graph.owner_facts_matching = MagicMock(return_value=[big])
+    bus = MemoryBus(graph_memory=graph)
+    complex_q = "what is my " + " ".join(["word"] * 40)
     out = await bus.hydrate_context(complex_q, context_budget=4000)
     # 4000 base → 12000 for a complex query. Must exceed the simple-query
     # budget of 4000, proving the documented scaling is reachable.
@@ -210,21 +206,19 @@ async def test_hydration_emits_instrumentation_line(caplog):
     vec = MagicMock()
     graph = MagicMock()
     graph.owner_facts_matching = MagicMock(return_value=[])
-    # skill wired with one lesson; episodic/session unwired (None); vector
-    # wired but retired (§4NM) — both read "-".
-    skill = MagicMock()
-    skill.get_playbook_items = MagicMock(return_value=[{"text": "a lesson", "trigger": "t"}])
-    bus = MemoryBus(vector_memory=vec, graph_memory=graph, skill_memory=skill)
+    # episodic/session unwired (None); vector wired but retired (§4NM) —
+    # both read "-".
+    bus = MemoryBus(vector_memory=vec, graph_memory=graph)
     with caplog.at_level(logging.INFO, logger="GhostAgent"):
         await bus.hydrate_context("tell me about the thing")
     line = next((r.message for r in caplog.records
                  if "Hydration tiers" in r.message), None)
     assert line is not None, "no instrumentation line emitted"
-    # skill produced 1 candidate, graph 0 (no owner question), the retired
-    # vector tier and the unwired ones '-'. All five tags, survivors, intent.
+    # graph 0 (no owner question), the retired vector tier and the unwired
+    # ones '-'. All tags, survivors, intent.
     assert "v=-" in line          # retired, even though wired
     assert "g=0" in line
-    assert "s=1" in line
+    assert " s=" not in line      # §4TD: no lesson tier
     assert "e=-" in line          # episodic unwired
     assert "sess=-" in line       # session unwired
     assert "survivors" in line and "intent=" in line
@@ -252,8 +246,8 @@ def test_rrf_requires_source_and_does_not_raise():
 def test_rrf_backcompat_default_k_and_no_normalisation():
     """Direct classmethod callers keep k=60 and the exact legacy arithmetic
     (normalize_consensus defaults off)."""
-    a = [{"source": "skill", "text": "X"}]
-    b = [{"source": "skill", "text": "X"}]
+    a = [{"source": "graph", "text": "X"}]
+    b = [{"source": "graph", "text": "X"}]
     fused = MemoryBus._reciprocal_rank_fusion([a, b])  # k defaults 60
-    sw = MemoryBus._INTENT_WEIGHTS["contextual"]["skill"]
+    sw = MemoryBus._INTENT_WEIGHTS["contextual"]["graph"]
     assert fused[0][1] == pytest.approx(2 * (sw / 61))

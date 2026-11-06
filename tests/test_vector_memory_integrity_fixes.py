@@ -50,7 +50,7 @@ class TestAmbientExcludesDocumentCorpus:
         }
         vm._search_selection("where do I live?", inject_identity=False)
         where = vm.collection.query.call_args.kwargs["where"]
-        assert where == {"type": {"$nin": ["document", "document_summary", "episode_outside"]}}   # §4LT M5, §4MB
+        assert where == {"type": {"$nin": ["document", "document_summary", "episode_outside", "skill"]}}   # §4LT M5, §4MB, §4TD
 
     def test_document_qa_path_is_unaffected(self):
         # Ambient hydration excludes docs; the scoped doc-QA path must not.
@@ -86,10 +86,10 @@ class TestSearchAdvancedStatBump:
         vm.search_advanced("q", where={"type": "episode"})
         assert vm.collection.query.call_args.kwargs["where"] == {"type": "episode"}
 
-    def test_no_where_key_when_unscoped(self):
+    def test_only_the_retired_rows_are_filtered_when_unscoped(self):
         vm = self._vm_with_hits()
-        vm.search_advanced("q")
-        assert "where" not in vm.collection.query.call_args.kwargs
+        vm.search_advanced("q")      # §4TD: a lesson twin is never served
+        assert vm.collection.query.call_args.kwargs["where"] == {"type": {"$nin": ["skill"]}}
 
 
 class TestSmartUpdateSameTypeOnly:

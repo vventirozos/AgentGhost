@@ -286,7 +286,7 @@ class MemoryJournal:
         """Corruption: PRESERVE the raw bytes in a timestamped sidecar
         BEFORE any subsequent _save() overwrites them, then start clean.
         Without this, a partial write silently discarded every queued
-        smart_memory entry (the hippocampus work queue). Matches the SkillMemory / FrontierTracker recovery policy."""
+        smart_memory entry (the hippocampus work queue). Matches the FrontierTracker recovery policy."""
         return self._preserve_corrupt(self.file_path, "memory_journal.json")
 
     def load(self):
@@ -319,8 +319,8 @@ class MemoryJournal:
             # treating a transient read failure as "empty journal" let the
             # next append() atomically overwrite the intact on-disk queue
             # with a single-entry list — silent data loss. Callers' append
-            # wrappers log a warning (same fail-loud policy as
-            # SkillMemory._load_playbook).
+            # wrappers log a warning (fail loud, never read a
+            # failed read as an empty store).
             if not content.strip():
                 return []
             try:

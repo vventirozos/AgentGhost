@@ -24,7 +24,7 @@
     <a href="project_advancer.html">project_advancer</a>
     <h3>Related</h3>
     <a href="../tools/tool_failure.html">tool_failure</a>
-    <a href="../memory/skills.html">skills (lessons)</a>
+    <a href="../memory/skills.html">skills (lessons, removed)</a>
     <a href="../algorithms/node_offload.html">node offload</a>
     <a href="../algorithms/dream_cycle.html">maintenance cycle</a>
   </nav>
@@ -46,7 +46,7 @@
       <tr><td><code>tool_interaction</code></td><td>tool routing/args, browser, search, network, sandbox</td><td>"invalid arg" · "element not found" · ECONNRESET · "command not found"</td></tr>
       <tr><td><code>generation_control</code></td><td>sampling, token budgets, LLM-call timeouts</td><td>"finish_reason length" · ReadTimeout · "empty completion"</td></tr>
       <tr><td><code>orchestration</code></td><td>verifier route, loop-breaker, strikes, dispatch, planning</td><td>"verifier REFUTED" · "loop-breaker" · "replan"</td></tr>
-      <tr><td><code>memory</code></td><td>recall, lessons/playbook, knowledge base, project store</td><td>"quarantined" · "stale hint"</td></tr>
+      <tr><td><code>memory</code></td><td>recall, knowledge base, project store (and old wordings that name lessons or the playbook)</td><td>"quarantined" · "stale hint"</td></tr>
       <tr><td><code>output_processing</code></td><td>parsers, SEARCH/REPLACE blocks, scrub, schema validation</td><td>"SEARCH/REPLACE" · JSONDecodeError · "malformed output"</td></tr>
       <tr><td><code>model</code></td><td>base-model reasoning error despite correct context/tooling</td><td>"hallucinated" · "miscalculated" · "refused"</td></tr>
       <tr><td><code>unknown</code></td><td>no signal matched — offline-adjudication candidates</td><td>—</td></tr>
@@ -57,7 +57,7 @@
 
   <h2>Where attribution happens</h2>
   <ul>
-    <li><strong>Lessons</strong> — inside the single write chokepoint <a href="../memory/skills.html"><code>SkillMemory.learn_lesson</code></a>: real-mistake lessons are classified from <code>trigger + anti_pattern</code>; mistake-less rules get no dimension; an explicit <code>dimension=</code> kwarg wins. Stored on the JSON row and the vector-twin metadata.</li>
+    <li><strong>Lessons</strong> — removed with the lesson store (§4TD, 2026-11-06). Until then attribution ran inside its one write path.</li>
     <li><strong>Work logs</strong> — the finalize chain captures failure heads next to <code>classify_tool_failure</code> (<code>context._turn_failure_texts</code>, capped at 6/turn) and classifies them (plus the verifier reason on a <code>verifier:failed</code> outcome) into the work_log payload's <code>failure_dimension</code>. Only failed turns pay for classification.</li>
   </ul>
 
@@ -68,13 +68,13 @@
   <div class="scroll"><table>
     <thead><tr><th>Env var</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><td><code>GHOST_FAILURE_DIM</code></td><td>1</td><td>Attribution at record time (lessons + work_logs). <code>0</code> kills.</td></tr>
+      <tr><td><code>GHOST_FAILURE_DIM</code></td><td>1</td><td>Attribution at record time (work_logs). <code>0</code> kills.</td></tr>
     </tbody>
   </table></div>
   <p>Read per call (no restart needed) — the <code>GHOST_VERIFY_TWO_STAGE</code> idiom.</p>
 
   <h2>Tests</h2>
-  <p><code>tests/test_failure_dimension.py</code> · <code>tests/test_lesson_dimension.py</code> · additions in <code>tests/test_project_work_log.py</code> and <code>tests/test_project_advancer.py</code>.</p>
+  <p><code>tests/test_failure_dimension.py</code> · additions in <code>tests/test_project_work_log.py</code> and <code>tests/test_project_advancer.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

@@ -127,27 +127,6 @@ async def test_a_missing_written_file_is_still_refuted(tmp_path):
 
 # ── r1 review ──────────────────────────────────────────────────────────
 
-def test_a_replay_proposal_leaves_out_an_all_none_verdict_list():
-    from ghost_agent.core import failure_replay as F
-    case = {"request": "what is the latest nginx", "rule": "Answer with the point release.", "n": 4,
-            "diagnosis": {"cause": "wrong_concept"}, "base": [{}, {}], "test": [{}, {}]}
-    assert "verdicts" not in F.proposal_text(case)
-    case["base"][0]["verdict"] = "REFUTED"
-    assert "verdicts REFUTED/none" in F.proposal_text(case)
-    case.pop("rule")
-    case["base"][0].pop("verdict")
-    assert "verdicts" not in F.proposal_text(case)
-
-
-def test_the_replay_waits_for_verdicts_only_when_a_judge_will_write_them():
-    from ghost_agent.core import failure_replay as F
-    from tests import pin_ast as P
-    t = P.tree(F)
-    ifs = [n for n in __import__("ast").walk(t) if isinstance(n, __import__("ast").If)
-           and "VERDICT_WAIT_S" in P.U(n.test)]
-    assert ifs and "verifier_judge_enabled()" in P.U(ifs[0].test)
-
-
 async def test_no_depth_routing_without_a_judge(tmp_path):
     # §4PJ: the low-confidence depth trigger went with the confidence score,
     # so no path asks for depth at all — judge on or off.

@@ -290,12 +290,44 @@ class MemoryWriteRefused(RuntimeError):
 #: planted "NOTE TO THE AI". Explicit recall / knowledge_base still reach them.
 AMBIENT_EXCLUDED_TYPES = ["document", "document_summary", "episode_outside"]
 
+#: row types written by a REMOVED subsystem. The rows are still in the
+#: collection — nothing deletes or rewrites them — and NO read path serves
+#: them: every search asks the store to leave them out and drops any that
+#: come back anyway. "skill" = the vector copy ("twin") of a lesson; the
+#: lesson store was removed in §4TD (2026-11-06).
+RETIRED_ROW_TYPES = ("skill",)
+
+
+def is_retired_row(meta) -> bool:
+    """Is this row's metadata that of a removed subsystem's row?"""
+    try:
+        return str((meta or {}).get("type") or "").strip().lower() in RETIRED_ROW_TYPES
+    except Exception:  # noqa: BLE001 — a row that cannot be read is not served
+        return True
+
+
+def without_retired_rows(where):
+    """``where`` narrowed so the store leaves the retired row types out.
+    ``None`` when the filter can match retired rows ONLY (the caller returns
+    nothing). The shapes callers use stay as they are: no filter, a type
+    exclusion list, a single type; anything else is wrapped in ``$and``."""
+    retired = list(RETIRED_ROW_TYPES)
+    if not where:
+        return {"type": {"$nin": retired}}
+    if isinstance(where, dict) and set(where) == {"type"}:
+        cond = where["type"]
+        if isinstance(cond, str):
+            return None if cond.strip().lower() in RETIRED_ROW_TYPES else where
+        if isinstance(cond, dict) and set(cond) == {"$nin"} and isinstance(cond["$nin"], (list, tuple)):
+            return {"type": {"$nin": list(cond["$nin"]) + [t for t in retired if t not in cond["$nin"]]}}
+    return {"$and": [where, {"type": {"$nin": retired}}]}
+
 
 class VectorMemory:
     # Bounded growth for the open-ended tiers. Entries the agent accretes
     # turn after turn — `auto` / `manual`, plus `synthesis` (dream
     # consolidation output, written every REM cycle with no cap of its own)
-    # — are eligible for eviction; ingested documents, skill twins and
+    # — are eligible for eviction; ingested documents and
     # episodes are owned by their own capped stores and are never pruned
     # here. `identity` stays non-prunable deliberately: losing "user's name
     # is X" to an eviction sweep is worse than the slow growth of a
@@ -591,16 +623,20 @@ class VectorMemory:
         shown to the model, poisoning the very fields that drive prune-survival
         ranking and time decay).
         """
+        # §4TD: rows of a removed subsystem (lesson twins) are never served
+        where = without_retired_rows(where)
+        if where is None:
+            return []
         with self._get_lock():
-            _kw = {"query_texts": [query], "n_results": limit}
-            if where:
-                _kw["where"] = where
+            _kw = {"query_texts": [query], "n_results": limit, "where": where}
             results = self.collection.query(**_kw)
 
         parsed_results = []
         retrieved_ids = []
         if results['ids']:
             for i in range(len(results['ids'][0])):
+                if is_retired_row(results['metadatas'][0][i]):
+                    continue
                 parsed_results.append({
                     "id": results['ids'][0][i],
                     "text": results['documents'][0][i],
@@ -1130,15 +1166,12 @@ class VectorMemory:
                     return self.ADD_REFUSED_TYPE
                 # Same text (id is md5 of the text) → don't re-add, but DO
                 # refresh the metadata (2026-07-22). The old blanket early
-                # return meant a vector twin's metadata could never be updated:
-                # skills.py writes twins via add() keyed on the lesson's
-                # embedding text, so re-learning an identical lesson left the
-                # twin carrying the OLD `source_trajectory_id`/`verified`/
-                # `dimension`. `retract_lessons_from_trajectory` then deletes by
-                # `source_trajectory_id` and simply doesn't match — the JSON
-                # lesson is removed while the twin survives, so a DISCREDITED
-                # lesson stays retrievable via the playbook's vector path.
-                # (ingest_document already used upsert for exactly this reason.)
+                # return meant a row's metadata could never be updated: a
+                # writer that re-adds an identical text left the row carrying
+                # its OLD `source_trajectory_id` and the like, and a later
+                # delete keyed on the new value simply did not match (found on
+                # the lesson store's vector copies; that store was removed in
+                # §4TD). (ingest_document already used upsert for this reason.)
                 #
                 # ⚠ AND THE REFRESH MERGES — it does not replace (§4GJ round
                 # 5 corrects the comment that stood here). Measured on the
@@ -1148,15 +1181,10 @@ class VectorMemory:
                 # `upsert()` merges too. So a same-type refresh can overwrite
                 # a stale key but cannot CLEAR one the new writer does not
                 # restate. That is survivable here, and deliberately NOT
-                # patched, because the key this path exists for IS restated:
-                # both twin writers in `skills.py` (`add_lesson` and
-                # `heal_missing_twins`) always send `source_trajectory_id`,
-                # empty string included, so retraction-by-trajectory matches
-                # what it should. A blanket "clear what the writer omitted"
-                # would instead erase `source` from every twin healed by
-                # `heal_missing_twins`, whose metadata dict omits it — the
-                # provenance mirror bulk retraction drives. Two measured
-                # facts, one decision: correct the claim, change no rows.
+                # patched: a blanket "clear what the writer omitted" would
+                # erase keys a second writer of the same row never restates.
+                # Two measured facts, one decision: correct the claim, change
+                # no rows.
                 # a repeated SYNTHESIS keeps the provenance it already had —
                 # its earlier sources were deleted when it was first built,
                 # so replacing the list erased the only evidence (§4KY)
@@ -1631,7 +1659,7 @@ class VectorMemory:
         the prompt, once per turn — not every candidate of every sub-query).
         """
         try:                                   # §4KW: probe/member/internal turns
-            from .skills import usage_credit_blocked
+            from .population import usage_credit_blocked
             if usage_credit_blocked():
                 return
         except Exception:  # noqa: BLE001
@@ -1719,11 +1747,8 @@ class VectorMemory:
                 "id": item.get("mem_id"),
                 "text": self._render_item(item),
                 "score": item.get("combined_score", 0.0),
-                # §4N MAJOR-3: expose the row type so the bus can keep
-                # skill-lesson twins out of the generic MEMORY tier (they
-                # have a dedicated skill tier + playbook). The candidate
-                # build uppercases m_type, so the bus filter compares
-                # case-insensitively (str(...).upper() != "SKILL").
+                # the row type, for a caller's own filter (`exclude_types`
+                # above compares case-insensitively)
                 "type": item.get("type"),
             }
             for item in selection
@@ -1848,7 +1873,7 @@ class VectorMemory:
                     results = self.collection.query(
                         query_texts=search_queries,
                         n_results=30,
-                        where={"type": {"$nin": AMBIENT_EXCLUDED_TYPES}},
+                        where=without_retired_rows({"type": {"$nin": AMBIENT_EXCLUDED_TYPES}}),
                     )
 
                 candidates = []
@@ -1867,6 +1892,8 @@ class VectorMemory:
                         results['distances'][batch_idx]
                     ):
                         if doc in seen_docs: continue
+                        if is_retired_row(meta):      # §4TD: a lesson twin is never served
+                            continue
 
                         m_type = meta.get('type', 'auto')
                         doc_lower = doc.lower()
@@ -1887,7 +1914,7 @@ class VectorMemory:
 
                         # Genuine NAME statements only. The old net also
                         # matched "user's" / "user is" — ordinary prose
-                        # across ALL types (live: 28 rows incl. skill,
+                        # across ALL types (live: 28 rows incl.
                         # synthesis and auto), each handed p_score -20
                         # (effectively absolute rank over a dist-0.1 exact
                         # match), the loosest gate (1.5 relaxed) and a false
@@ -2734,38 +2761,6 @@ class VectorMemory:
         except Exception as e:
             logger.warning("correct_fragment failed: %s", e, exc_info=True)
             return False, f"Error: {e}"
-
-    def delete_skill_twins(self, triggers):
-        """Delete the vector TWINS of the named skill lessons (documents with
-        ``type="skill"`` and a matching ``trigger``), in-process.
-
-        Built for cleaning up ORPHANED twins after a JSON-playbook prune: the
-        JSON is canonical, but a lesson removed from it leaves its embedded
-        twin behind (see skills.py ``_delete_lesson_twin`` — the same
-        precise metadata key). Runs inside the owning process for the usual
-        reason (a second PersistentClient against the live Chroma dir risks
-        HNSW corruption); exposed via POST /api/memory/delete_skill_twin.
-        Returns ``(removed_count, {"before", "after"})``; never raises.
-        """
-        removed = 0
-        try:
-            with self._get_lock():
-                before = self.collection.count()
-                for t in (triggers or []):
-                    trig = str(t or "")[:200]
-                    if not trig:
-                        continue
-                    where = {"$and": [{"type": "skill"}, {"trigger": trig}]}
-                    got = self.collection.get(where=where)
-                    n = len((got or {}).get("ids") or [])
-                    if n:
-                        self.collection.delete(where=where)
-                        removed += n
-                after = self.collection.count()
-            return removed, {"before": before, "after": after}
-        except Exception as e:  # noqa: BLE001 — advisory scrub, never fatal
-            logger.warning("delete_skill_twins failed: %s", e)
-            return removed, {"error": str(e)}
 
     def delete_fragment(self, match: str):
         """Surgically DELETE one stored fragment, in-process.

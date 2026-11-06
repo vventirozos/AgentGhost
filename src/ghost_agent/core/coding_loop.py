@@ -386,9 +386,14 @@ def build_leaf_context(context, *, leaf_id: str, project_id: Optional[str] = Non
     """An isolated context for one leaf: project PINNED (explicitly — the
     advancer's context carries no binding), workspace shared, memory
     read-only, nothing recorded into user-population ledgers."""
-    from ..memory.readonly import (ReadOnlyGraphMemory, ReadOnlySkillMemory,
-                                   ReadOnlyVectorMemory)
+    from ..memory.readonly import ReadOnlyGraphMemory, ReadOnlyVectorMemory
+    from .isolation import mark_simulated
     iso = copy.copy(context)
+    # §4TD: FIRST and unconditionally — the simulation guards (no selfhood
+    # capture, no operator notification, no objection pass …) read this flag.
+    # It was the read-only lesson-store wrapper, installed inside the `try`
+    # below, where a failed wrap left the leaf looking like the live context.
+    mark_simulated(iso)
     # Keep sandbox_dir; PIN the project id: file_system must resolve the
     # PROJECT workspace, which is the whole point of the leaf. Copying the
     # context's binding is not enough — idle ticks and the HTTP route run
@@ -426,7 +431,6 @@ def build_leaf_context(context, *, leaf_id: str, project_id: Optional[str] = Non
         iso.scratchpad = None
     try:
         iso.memory_system = ReadOnlyVectorMemory(context.memory_system)
-        iso.skill_memory = ReadOnlySkillMemory(context.skill_memory)
         iso.graph_memory = ReadOnlyGraphMemory(getattr(context, "graph_memory", None))
     except Exception as e:  # noqa: BLE001
         logger.debug("leaf read-only memory wrap skipped: %s", e)

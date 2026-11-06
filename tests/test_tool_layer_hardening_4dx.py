@@ -144,22 +144,23 @@ def test_tools_do_not_crash_on_a_non_string_action(bad):
     those raises AttributeError, which the loop renders to the model as
     "did you forget a required argument?": advice that cannot work, so it
     repeats the call and burns strikes on a type error nobody named."""
-    from ghost_agent.tools.self_state import tool_self_state
+    from ghost_agent.tools.introspect import tool_introspect   # §4TB: was `self_state` (removed)
 
-    for fn in (tool_self_state,):
+    for fn in (tool_introspect,):
         result = fn(action=bad)
         if asyncio.iscoroutine(result):
             result = asyncio.run(result)
         assert isinstance(str(result), str)
+        assert "must be one of" in str(result)                 # named, not an invocation error
 
 
 def test_a_valid_action_still_works():
     """The counterweight: coercing to str must not swallow real actions."""
-    from ghost_agent.tools.self_state import tool_self_state
-    result = tool_self_state(action="list")
+    from ghost_agent.tools.introspect import tool_introspect   # §4TB: was `self_state` (removed)
+    result = tool_introspect(action="stats")
     if asyncio.iscoroutine(result):
         result = asyncio.run(result)
-    assert "mandatory" not in str(result).lower()
+    assert "must be one of" not in str(result)
 
 
 # ══ 6. CALL-SITE pins — the helper being correct is not the property ═════

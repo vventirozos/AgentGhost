@@ -84,7 +84,6 @@ async def test_agent_rambling_exit_markers():
     mock_context.scratchpad.list_all.return_value = ""
     mock_context.memory_system = None
     mock_context.profile_memory = None
-    mock_context.skill_memory = None
     mock_context.sandbox_dir = "/tmp"
     mock_context.cached_sandbox_state = "Files: None"
     

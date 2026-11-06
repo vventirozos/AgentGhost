@@ -126,13 +126,25 @@ def fetched_urls(tools_run) -> List[str]:
             if m and m.group(1) not in out:
                 out.append(m.group(1))
             continue
-        if t.get("name") not in ("browser", "deep_research", "darkweb_research"):
+        if t.get("name") not in ("browser", "deep_research", "darkweb_research", "fact_check"):
             continue
         content = t.get("content")
         _dv = str(getattr(getattr(content, "status", None), "value", getattr(content, "status", "") or "")).lower()
         if _dv in ("failed", "rejected") or _failed_browser_result(content):
             continue                      # a declared failure read nothing (review 2)
         text = content if isinstance(content, str) else str(content or "")
+        if t.get("name") == "fact_check":
+            # §4TB (review): the sources a completed check LISTS are pages its
+            # research fetched — a report citing one drew "NOT fetched". Only
+            # the URL of each row counts (`factcheck_listed_urls`): a title or
+            # an evidence line is page text and holds no link.
+            try:
+                from ..tools.search import factcheck_listed_urls
+                listed = factcheck_listed_urls(text)
+            except Exception:  # noqa: BLE001
+                listed = []
+            out.extend(u for u in listed if u not in out)
+            continue
         if t.get("name") in ("deep_research", "darkweb_research"):
             # per-source blocks: a block the fetcher wrote as a failure is not a page read
             try:
@@ -279,6 +291,31 @@ def unfetched_links(text: str, fetched: Iterable[str], *, markup: bool = False) 
     return out
 
 
+def _fact_check_seen(content) -> str:
+    """What a `fact_check` result adds to the haystack. A COMPLETED check: the
+    URLs of its source rows (`factcheck_listed_urls`, the same reading
+    `fetched_urls` uses) and nothing else — its verdict is the model's prose,
+    its titles and evidence are page text, and none of them may vouch for a
+    link (§4TB review r2). Any other result — a failed or partial check hands
+    back the research report itself — is read like the research tool's."""
+    text = str(content or "")
+    if not text.startswith("FACT CHECK COMPLETE"):
+        return text
+    try:
+        from ..tools.search import factcheck_listed_urls
+        return "\n".join(factcheck_listed_urls(text))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def tool_row_text(row: dict) -> str:
+    """One executed tool row as haystack text: what its result showed, and
+    the arguments it was called with."""
+    content = row.get("content")
+    seen = _fact_check_seen(content) if row.get("name") == "fact_check" else str(content or "")
+    return f"{seen}\n{getattr(content, 'call_args', '') or ''}"
+
+
 def haystack_from(messages: Iterable, tool_texts: Iterable[str] = (), snippet_ids=()) -> str:
     """Everything the conversation SAW: every non-assistant message's text,
     every tool call's arguments, and the assistant's answers to EARLIER
@@ -289,7 +326,8 @@ def haystack_from(messages: Iterable, tool_texts: Iterable[str] = (), snippet_id
     arguments stay), so an invented link cannot vouch for itself (§4RZ step
     3: an earlier answer carried only by such a summary is left out with
     it). Tool rows count wherever they sit, except a failed browser result
-    and a search snippet named in ``snippet_ids``."""
+    and a search snippet named in ``snippet_ids``; a completed `fact_check`
+    row counts for its listed source URLs only (`_fact_check_seen`)."""
     msgs = [m for m in (messages or []) if isinstance(m, dict)]
     # §4RZ step 3: the reply being checked starts after the REQUEST — this
     # turn's narration before a message the user sent mid-turn (or before a
@@ -321,6 +359,8 @@ def haystack_from(messages: Iterable, tool_texts: Iterable[str] = (), snippet_id
         c = m.get("content")
         if isinstance(c, list):
             c = " ".join(str(it.get("text", "")) for it in c if isinstance(it, dict))
+        if m.get("role") == "tool" and m.get("name") == "fact_check":
+            c = _fact_check_seen(c)
         parts.append(str(c or ""))
     return _norm("\n".join(parts))
 

@@ -91,7 +91,6 @@ def test_every_durable_write_precedes_the_sentinel():
         ("trajectory", "self._record_turn_trajectory("),
         ("project work_log", "self._write_project_work_log_safe("),
         ("episode", "self._record_episode_safe("),
-        ("lesson outcomes", "self._record_lesson_outcomes("),
     ):
         hits = _lines_containing(src, needle, lo, hi)
         assert hits, f"{label} write vanished from stream_wrapper"

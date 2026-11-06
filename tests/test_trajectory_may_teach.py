@@ -7,7 +7,7 @@ WITHOUT it, so nine hours after the request-time gate blocked a channel
 member's turn, the reflection cycle acquired a playbook skill from that same
 trajectory. Every trajectory now carries the requester's role in
 `extra["requester_role"]`, and one predicate
-(`memory.skills.trajectory_may_teach` / `iter_teachable`) sits in every
+(`memory.population.trajectory_may_teach` / `iter_teachable`) sits in every
 trajectory-reading lesson producer. No request-id prefix is consulted.
 §4NM: reflection, the dream seeds, macro mining, the post-mortem and the PRM
 retrains were removed; the live readers are the owner-failure seed pickers.
@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from ghost_agent.distill.schema import Trajectory, Outcome
-from ghost_agent.memory.skills import trajectory_may_teach
+from ghost_agent.memory.population import trajectory_may_teach
 
 REPO = Path(__file__).resolve().parents[1]
 SRC = REPO / "src" / "ghost_agent"
@@ -47,11 +47,8 @@ def test_never_raises():
 # rather than mint lessons (a separate decision, noted in §4KJ).
 TEACHING_SITES = {
     # §4MT: the reaction judge labels seeds; withdrawal retires lessons on owner failures
-    ("core/owner_seeds.py", "judge_reactions"),
     # §4MW: the failure-replay loop picks owner failures (iter_teachable)
-    ("core/failure_replay.py", "pick_case"),
     # §4NE: regression-test candidates are owner failures (iter_teachable)
-    ("core/regression.py", "candidates"),
     # §4QL: the human-graded experience index is built from owner turns (iter_teachable)
     ("memory/experience.py", "sync_experience_index"),
 }
@@ -65,9 +62,7 @@ NON_TEACHING_ALLOWLIST = {
     ("distill/collector.py", "corpus_fingerprint"), ("distill/collector.py", "iter_trajectories"),
     ("distill/collector.py", "<module>"),                                   # a docstring example
     # §4MW: looks up its OWN probe replays by request id; teaches nothing
-    ("core/failure_replay.py", "_resolve_trajectories"),
     # §4NE: reads its OWN test run (probe-rt-…) back by request id; teaches nothing
-    ("core/regression.py", "_tools_for"),
     # §4PL: the failure census — a REPORT over owner turns (its own owner
     # filter, members excluded); it writes no lesson, label or prompt
     ("core/failure_census.py", "_owner_turns"),     # §4PL/§4PM: the census report and the gold draw
@@ -141,7 +136,7 @@ READS = {}
 
 
 def test_iter_teachable_filters_and_tolerates_none():
-    from ghost_agent.memory.skills import iter_teachable
+    from ghost_agent.memory.population import iter_teachable
     trajs = [Trajectory(session_id="m1", extra={"requester_role": "member"}), Trajectory(session_id="own"),
              Trajectory(session_id="m2", extra={"requester_role": "member"})]
     assert [t.session_id for t in iter_teachable(trajs)] == ["own"]
@@ -197,8 +192,6 @@ def test_an_allowlisted_reader_does_not_grow_new_reads():
 
 EXPECTED_ALLOWLISTED_READS = {   # one read each, as of 2026-09-24 — a new read must be classified
     ("core/feedback.py", "find_trajectory_for_request"): 1,
-    ("core/failure_replay.py", "_resolve_trajectories"): 1,          # §4MW: its own replays
-    ("core/regression.py", "_tools_for"): 1,                         # §4NE: its own test runs
     ("core/learning_health.py", "_framing_leak_health"): 1,
     ("core/failure_census.py", "_owner_turns"): 1,                   # §4PL/§4PM: a report, one read per day
 }

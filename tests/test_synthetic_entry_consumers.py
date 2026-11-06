@@ -66,7 +66,6 @@ def agent_for_chat():
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string.return_value = ""
     context.memory_system = None
-    context.skill_memory = None
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""
     return GhostAgent(context)

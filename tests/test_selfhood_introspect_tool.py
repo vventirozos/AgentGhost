@@ -1,4 +1,5 @@
-"""Tests for the introspect tool (read-only selfhood snapshot).
+"""Tests for the introspect tool's read actions (the selfhood snapshot; its
+one write, `set_mood`, is pinned in tests/test_4tb_set_mood.py).
 
 The tool's job is to render a deterministic, first-person view of the
 agent's selfhood — stats, narrative, recent experiences, and an
@@ -49,8 +50,8 @@ async def _populate(sm: SelfModel) -> None:
         final_response="ran out of ideas",
         failure_reason="off-by-one in lookahead",
     )
-    sm.state.set_mood("curious", "a hard problem is bugging me")
-    sm.state.note_open_question("Why do trapdoor functions feel asymmetric?")
+    from ghost_agent.selfhood.mood import ANCHOR_DIRECTION
+    sm.state.set_owner_mood("curious", ANCHOR_DIRECTION["curious"], 2, note="a hard problem is bugging me")
 
 
 async def test_default_action_renders_summary(tmp_path: Path):
@@ -77,7 +78,7 @@ async def test_stats_action_reports_counts(tmp_path: Path):
     await _populate(sm)
     out = await tool_introspect(action="stats", self_model=sm)
     assert "Experiences on file: 3" in out
-    assert "Open questions: 1" in out
+    assert "Open questions" not in out and "Unfinished threads" not in out   # §4TB: gone with their writer
     assert "curious" in out
     # Topic clusters should mention at least one bucket the seed turns hit.
     assert "Topic clusters:" in out
@@ -211,12 +212,14 @@ def test_introspect_appears_in_tool_definitions():
     from ghost_agent.tools.registry import TOOL_DEFINITIONS
     names = [t["function"]["name"] for t in TOOL_DEFINITIONS]
     assert "introspect" in names
-    # The definition must describe the read-only intent and list the
-    # supported actions — these are the load-bearing fields the model
-    # reads at tool-selection time.
+    # The definition must say which actions read and which one writes, and
+    # list the supported actions — these are the load-bearing fields the
+    # model reads at tool-selection time. (§4TB: it said READ-ONLY until
+    # `set_mood` moved here from the removed `self_state` tool.)
     spec = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "introspect")
     desc = spec["function"]["description"]
-    assert "READ-ONLY" in desc
+    assert "READ-ONLY" not in desc and "Nothing here writes" not in desc
+    assert "Every action READS, except 'set_mood'" in desc
     enum = spec["function"]["parameters"]["properties"]["action"]["enum"]
     assert set(enum) >= {"summary", "stats", "narrative", "recent", "recall"}
 
@@ -242,7 +245,6 @@ def test_introspect_dispatch_lambda_passes_self_model(tmp_path: Path):
         memory_dir=str(tmp_path),
         memory_system=MagicMock(),
         graph_memory=None,
-        skill_memory=MagicMock(),
         llm_client=MagicMock(image_gen_clients=None),
         scratchpad=MagicMock(),
         scheduler=MagicMock(),
@@ -435,27 +437,8 @@ async def test_learning_render_failure_degrades(tmp_path: Path, monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# principles + experience ages in the selfhood renders (2026-07-27)
+# experience ages in the selfhood renders (2026-07-27; the principle renders went with principles, §4TB)
 # ──────────────────────────────────────────────────────────────────────
-
-
-async def test_stats_reports_principle_count(tmp_path: Path):
-    sm = SelfModel(root=tmp_path)
-    await _populate(sm)
-    sm.note_principle("Prefer reversible actions over clever ones.")
-    out = await tool_introspect(action="stats", self_model=sm)
-    assert "Operating principles: 1" in out
-
-
-async def test_summary_surfaces_principles(tmp_path: Path):
-    """The values layer is behaviour-shaping by design — 'tell me about
-    yourself' must render it, not hide it."""
-    sm = SelfModel(root=tmp_path)
-    await _populate(sm)
-    sm.note_principle("Prefer reversible actions over clever ones.")
-    out = await tool_introspect(self_model=sm)
-    assert "My operating principles:" in out
-    assert "reversible actions" in out
 
 
 async def test_recent_lines_carry_an_age(tmp_path: Path):

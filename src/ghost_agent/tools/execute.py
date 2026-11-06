@@ -2048,7 +2048,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # The LLM frequently hallucinates that native JSON tools are importable Python modules.
     # The list holds distinctive tool names that are never plausible local
     # module names. The generic ones that collided with legitimate code —
-    # `file_system` (very common module name), `scratchpad`, `recall`, `replan`
+    # `file_system` (very common module name), `scratchpad`, `recall`
     # — were REMOVED: a strong model importing a local `file_system.py` helper
     # was getting its valid code hard-blocked. `browser` is KEPT: it's a
     # prominent native tool the model does hallucinate importing, and a dedicated
@@ -2059,7 +2059,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             "knowledge_base", "system_utility", "manage_tasks",
             "web_search", "fact_check", "deep_research",
             "vision_analysis",
-            "learn_skill", "update_profile", "browser",
+            "update_profile", "browser",
         ]
         
         # Check for direct imports or pip installs

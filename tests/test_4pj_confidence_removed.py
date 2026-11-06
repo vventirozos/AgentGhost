@@ -90,7 +90,7 @@ def test_nothing_reads_the_refit_cooldown():
 def test_no_calibration_job_is_scheduled_even_with_a_tracker_attached():
     """Fails where the idle refit comes back keyed on a context attribute."""
     import ghost_agent.core.agent as A
-    ctx = types.SimpleNamespace(journal=object(), skill_memory=object(),
+    ctx = types.SimpleNamespace(journal=object(), 
                                 calibration_tracker=object(), project_store=object(),
                                 self_model=types.SimpleNamespace(enabled=True),
                                 workspace_model=types.SimpleNamespace(enabled=False))

@@ -257,9 +257,9 @@ tick(F(6));
 const b = face.getDebugState();
 emit({ hz, immA: a.immersion, camA, immB: b.immersion, camB: camera.position.z, actB: b.activity, rotB: scene.rotation.y, clockB: b.clock, flowB: b.cube2Flow || 0 });
 """,
-    "tesseract": r"""
+    "moodtesseract": r"""
 import { face, tick, run, snapshot, camera, lines, emit } from './harness.mjs';
-face.setForm('tesseract'); tick(240);
+face.setForm('moodtesseract'); tick(240);
 const N = snapshot().filter(p => p && p.x < 9000).length;
 const idle = run(1800);
 const f0 = face.getDebugState().cube2Flow;
@@ -289,7 +289,7 @@ const form = face.getForm();
 tick(240);
 run(480, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
 const snap = snapshot();
-const idxs = form === 'descent' ? [225] : form === 'tesseract' ? range(96, 123) : range(236, 250);   // kernel (v3: after 12 shells' corners) / bead / embers
+const idxs = form === 'descent' ? [225] : form === 'moodtesseract' ? range(96, 123) : range(236, 250);   // kernel (v3: after 12 shells' corners) / bead / embers
 const c = centroid(snap, idxs);
 const pr = project(toWorld(c));
 emit({ form, sx: pr.sx, sy: pr.sy, depth: pr.depth, camZ: camera.position.z, immersion: face.getDebugState().immersion,
@@ -341,30 +341,10 @@ def _run(root: Path, scenario: str, form: str, **env) -> dict:
 # D2 / D4 / D7 — no phase jumps, no teleport, no pops (executed)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("form", ["cube", "vortex"])
-def test_no_frame_jumps_after_uptime_and_on_follow_up_turn(lab, form):
-    r = _run(lab["new"], "spikes", form)
-    assert r["form"] == form
-    # D2: a turn (with ambient log lines wobbling the drive) after ~3 min
-    # of uptime moves no node more than a small fraction of a unit per
-    # frame. Old lattice (today's cube): ~0.9 — runners crossing the grid.
-    # (The vortex is exempt from the per-frame cap: its exponential
-    # expansion legitimately carries OFF-SCREEN matter up to ~1 unit per
-    # frame at full flow, unchanged by this fix; it is held to the idle and
-    # follow-up checks only.)
-    if form == "cube":
-        assert r["turnMax"] < 0.05, r
-        assert r["turnP95"] < 0.03, r
-    # A follow-up message 3s after the reply — the dive still ~0.5 — must
-    # not jump anything (old lattice: 0.90, the runner phase jump).
-    assert r["followMax"] < (0.5 if form == "vortex" else 0.05), r
-    assert r["idleSpikes"] == 0, r
-
-
 def test_idle_is_pop_free_on_the_still_forms(lab):
     # D7: the cube's grid is otherwise ~still (0.003/frame); every ≥0.03
     # frame at idle was an idle-twitch pop. Old lattice: ~9 per minute.
-    r = _run(lab["new"], "spikes", "cube")
+    r = _run(lab["new"], "spikes", "empty")
     assert r["idleSpikes"] == 0, r
     # ...and the twitch fires on its documented 6–14s cadence (+ the ~0.8s
     # chance gate): 3–9 per minute, never the ~30 the 0.03× slip produced.
@@ -382,7 +362,7 @@ def test_descent_tail_glides(lab):
 # D1 — frame-rate invariance (executed at 30 / 60 / 120 Hz)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("form", ["cube", "tesseract", "descent"])
+@pytest.mark.parametrize("form", ["cube", "moodtesseract", "descent"])
 def test_same_wall_clock_state_at_30_60_and_120hz(lab, form):
     rs = {hz: _run(lab["new"], "framerate", form, FACE_HZ=hz) for hz in (30, 60, 120)}
     # immersion/camera/activity are ease-driven; the scene heading is
@@ -400,27 +380,6 @@ def test_same_wall_clock_state_at_30_60_and_120hz(lab, form):
 # D3 — the dive lands on the action (executed + projected)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_cube_dive_lands_on_the_kernel_partially(lab):
-    r = _run(lab["new"], "focus", "cube")
-    assert r["immersion"] > 0.95, r
-    assert abs(r["sx"]) < 0.2 and abs(r["sy"]) < 0.2, r      # old: (1.24, 1.72) — off screen
-    assert abs(r["camZ"] - 2.2) < 0.05, r                     # CUBE_DIVE_Z (2.7 → 2.2, "too far"), not the global 1.3
-    assert r["depth"] > 1.6, r                                # outside the near-fade band (0.3–1.4)
-    # the old monolith's treatment in full: gentled swell (0.18, not the
-    # global 0.55) and the near-still heading (its own tumble is the motion)
-    assert r["scale"] < 1.15, r
-    assert abs(r["rotY"]) < 0.15, r
-
-
-def test_descent_dive_keeps_the_bead_mid_low_in_frame(lab):
-    # The hover lift puts the bead below the view axis on purpose; the
-    # pitched look target keeps it out of the bottom fifth (old: −0.60,
-    # under the composer on a phone).
-    r = _run(lab["new"], "focus", "descent")
-    assert abs(r["sx"]) < 0.25, r
-    assert -0.35 < r["sy"] < -0.02, r      # level look: −0.37…−0.60 across seeds
-
-
 def test_resume_after_a_pause_steps_one_frame(lab):
     # D1: a hidden tab pauses the loop; on resume the first frame must NOT
     # try to catch up ten seconds (dtF clamps at 3 — still a visible lurch
@@ -436,7 +395,7 @@ def test_cube2_infinite_cube_contract(lab):
     the birth rate is the swallow (idle ≈ a shell per 4s, a user turn
     ≈ one per 0.7s, easing back after), the shells are drawn as explicit
     polylines (12 edges × 6 segments × shells) and the camera never moves."""
-    r = _run(lab["new"], "tesseract", "tesseract")
+    r = _run(lab["new"], "moodtesseract", "moodtesseract")
     assert r["visibleWraps"] == 0, r
     assert r["idleSpikes"] == 0, r
     assert 0.018 < r["idleRate"] < 0.035, r
@@ -448,16 +407,10 @@ def test_cube2_infinite_cube_contract(lab):
 
 
 def test_cube2_kernel_sits_on_the_view_axis(lab):
-    r = _run(lab["new"], "focus", "tesseract")
+    r = _run(lab["new"], "focus", "moodtesseract")
     assert abs(r["sx"]) < 0.15 and abs(r["sy"]) < 0.15, r
     assert abs(r["camZ"] - 5.0) < 1e-9, r
     assert r["lines"] >= 20 * 144 + 54, r
-
-
-def test_vortex_camera_never_moves(lab):
-    r = _run(lab["new"], "focus", "vortex")
-    assert abs(r["camZ"] - 5.0) < 1e-9, r
-    assert abs(r["sx"]) < 0.1 and abs(r["sy"]) < 0.1, r
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,19 +1,25 @@
-"""introspect tool — read-only introspection over the agent's selfhood.
+"""introspect tool — the agent's view of its own selfhood, and its one write.
 
 The selfhood wake-up prefix is OFF on the request path
-(``_SELFHOOD_PREFIX_ENABLED`` in core/agent.py, journal §3), so NOTHING
-about mood, diary, principles or open questions reaches the model except
-through this tool. That makes routing load-bearing: the SELF SURFACE rule
+(``_SELFHOOD_PREFIX_ENABLED`` in core/agent.py, journal §3), so nothing
+about the diary reaches the model except through this tool — and of the
+mood only ONE line does (§4TC: the tone line in the per-turn state block,
+which carries the label and its intensity and never the cause). That makes routing load-bearing: the SELF SURFACE rule
 in the system prompt sends "how are you / how's things / what did you do
 while I was away" here, and ``overview`` is the one-call answer. (Until
 2026-09-05 this docstring claimed the prefix was spliced into every
 prompt; live, 28 of 48 such questions were answered with no tool at all
 and 9 went to ``system_utility`` — the machine, not the self.)
 
-All actions are read-only. The writable counterpart is ``self_state``
-(``tools/self_state.py``); the two are deliberately split so a single
-tool description does not conflate "introspect myself" with "author my
-forward-looking continuity slot".
+Every action reads, except ONE: ``set_mood`` (§4TB, 2026-11-05). It is what
+was left of the ``self_state`` tool when that was removed — its open
+questions, unfinished threads and principles had no reader. Since §4TC it is
+the OWNER's adjustment of a mood that otherwise runs by itself: a label from
+a closed list (with an intensity 1–3) puts the mood there, ``neutral`` takes
+it off, and ``manner`` sets a way of talking. ``is_write_call`` is the one
+predicate the turn loop asks to tell that action from the reads; the
+action's own guards are in ``_set_mood``. The read action ``mood`` (§4TC) is
+the mood's story: what it is, why, since when, and today's timeline.
 
 Routes through ``context.self_model`` so the SelfModel facade owns the
 read API and a disabled selfhood ("--no-self-model" / "--no-memory")
@@ -23,10 +29,13 @@ degrades to a clear message instead of crashing.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
+from ..selfhood import mood as _M
 from ..utils.logging import Icons, pretty_log
 
 
@@ -42,7 +51,23 @@ logger = logging.getLogger("GhostAgent")
 
 _VALID_ACTIONS = frozenset({"summary", "stats", "narrative", "recent",
                             "recall", "activity", "learning",
-                            "overview"})    # §4NN: 'experiments' removed
+                            "overview",     # §4NN: 'experiments' removed
+                            "mood",         # §4TC: the mood, why, today's timeline
+                            "set_mood"})    # §4TB: the one write
+#: the actions that WRITE (everything else in `_VALID_ACTIONS` only reads)
+WRITE_ACTIONS = frozenset({"set_mood"})
+#: the ONLY values of `mood` that take the mood off (matched stripped,
+#: case-folded; `manner` is cleared by the same words). An empty or missing
+#: mood AND manner is an argument error.
+_MOOD_CLEAR_WORDS = _M.CLEAR_WORDS
+
+
+def is_write_call(args) -> bool:
+    """Does this `introspect` call WRITE? The turn loop asks (batch collapse,
+    the same-batch read cache); the action is normalised exactly as
+    ``tool_introspect`` normalises it, so the two cannot disagree."""
+    a = args if isinstance(args, dict) else {}
+    return str(a.get("action") or "").strip().lower() in WRITE_ACTIONS
 
 _DEFAULT_RECENT = 5
 _DEFAULT_RECALL = 5
@@ -54,9 +79,6 @@ _SUMMARY_RECENT_N = 5
 # back. The renderers fetch this multiple of `limit`, group identical
 # requests into one "(×N)" line, then trim to `limit`.
 _COLLAPSE_OVERSCAN = 2
-# Open questions / unfinished threads rendered in summary + overview.
-_CARRIED_MAX = 5
-
 # The learning report walks the whole trajectory corpus (4.6 s live,
 # doubled since the 2026-08 review). One render is cached for this long;
 # the trailer says how old the numbers are. Keyed on memory_dir + args so
@@ -68,7 +90,8 @@ _LEARNING_CACHE: Dict[str, Tuple[float, str]] = {}
 _OVERVIEW_MAX_CHARS = 3720     # §4SV-b: 3200 + the longest self-image line, so no other section pays for it
 _OVERVIEW_ACTIVITY_HOURS = 24.0
 _OVERVIEW_RECENT_N = 3
-_OVERVIEW_LEARNING_HEADS = ("LESSONS:",)   # §4PJ: COMPETENCE/CALIBRATION removed
+# (§4PJ removed the COMPETENCE/CALIBRATION headlines, §4TD the LESSONS one:
+# the overview shows the loop-health report's warning lines)
 _OVERVIEW_LEARNING_MAX_LINES = 6
 
 # action='activity' window/size defaults. Separate caps from the selfhood
@@ -181,26 +204,7 @@ def _render_stats(stats: dict) -> str:
     _boots = stats.get("session_boots") or 0
     if _boots:
         lines.append(f"Session boots (excluded from the counts above): {_boots}")
-    lines.append(f"Open questions: {stats.get('open_questions', 0)}")
-    lines.append(f"Unfinished threads: {stats.get('unfinished_threads', 0)}")
-    mood = stats.get("last_mood") or ""
-    if mood:
-        # Age + provenance so an old label reads as history, not as a
-        # current state (the 23-day "curious" problem).
-        from ..selfhood.mood import (
-            age_seconds, describe_mood_provenance, mood_is_stale,
-        )
-        set_at = stats.get("last_mood_set_at") or ""
-        prov = describe_mood_provenance(
-            stats.get("last_mood_source") or "self", age_seconds(set_at),
-        )
-        stale = " — STALE" if mood_is_stale(set_at) else ""
-        # The evidence is the falsifiable half ("my last 5 verdict-bearing
-        # turns all passed"); a bare label is the vibe derive_mood replaced.
-        ev = (stats.get("last_mood_evidence") or "").strip()
-        lines.append(f"Last noted mood: {mood}"
-                     + (f" — {ev}" if ev else "")
-                     + f" ({prov}{stale})")
+    lines.extend(_mood_lines(stats, head="Mood", manner_head="Manner"))
     last = stats.get("last_session_at") or ""
     if last:
         lines.append(f"Last active: {last}")
@@ -212,62 +216,46 @@ def _render_stats(stats: dict) -> str:
         ranked = sorted(clusters.items(), key=lambda kv: kv[1], reverse=True)
         top = ", ".join(f"{k}={v}" for k, v in ranked[:5])
         lines.append(f"Topic clusters: {top}")
-    # The values layer is "behaviour-shaping" by design — it must not be
-    # invisible to introspection (it was, until 2026-07-27).
-    pc = stats.get("principle_count")
-    if pc is not None:
-        lines.append(f"Operating principles: {pc}")
     return "\n".join(lines)
 
 
-def _render_carried_state(self_model, *, indent: str = "") -> str:
-    """Open questions and unfinished threads AS TEXT. Until 2026-09-05
-    every surface rendered only their counts — with the wake-up prefix
-    off, the agent could not read its own open questions at all."""
-    state = getattr(self_model, "state", None)
-    if state is None:
-        return ""
-    lines: List[str] = []
+#: what stands where a cause would, on a public surface
+MOOD_REASONS_PRIVATE = "the reasons are shown in a private conversation"
+
+
+def _reply_is_public() -> bool:
+    """Is this reply going where other people read it? Unknown → yes (the
+    causes are then withheld)."""
     try:
-        qs = list(state.open_questions() or [])
-        th = list(state.unfinished_threads() or [])
-    except Exception as e:  # noqa: BLE001 — a summary must render without them
-        logger.debug("introspect carried-state read skipped: %s", e)
-        return ""
-    if qs:
-        lines.append(f"{indent}Open questions I'm still carrying:")
-        for q in qs[-_CARRIED_MAX:]:
-            age = _exp_age(getattr(q, "opened_at", ""))
-            lines.append(f"{indent}  - {q.text}"
-                         + (f" (opened {age})" if age else ""))
-    if th:
-        lines.append(f"{indent}Threads I left unfinished:")
-        for t in th[-_CARRIED_MAX:]:
-            age = _exp_age(getattr(t, "opened_at", ""))
-            lines.append(f"{indent}  - {t.descriptor}"
-                         + (f" (since {age})" if age else ""))
-    return "\n".join(lines)
+        from ..utils.logging import reply_is_public
+        return bool(reply_is_public())
+    except Exception:  # noqa: BLE001
+        return True
 
 
-def _render_principles(self_model) -> str:
-    """Principles with their age — "noted 59d ago" lets a reader weigh a
-    principle the way the profile's as_of lets it weigh a fact."""
+def _mood_lines(stats: dict, *, head: str, manner_head: str, indent: str = "") -> List[str]:
+    """The mood as the views show it (§4TC): the label, its intensity and
+    the latest cause — "neutral" when there is none — and the manner the
+    owner set, on a line of its own. On a PUBLIC surface (review r2) the
+    cause is withheld: what moved the owner's assistant is the owner's."""
+    label = str(stats.get("last_mood") or "")
     try:
-        principles = list(self_model.principles() or [])
-    except Exception as e:  # noqa: BLE001
-        logger.debug("introspect principles read skipped: %s", e)
-        try:
-            return (self_model.principles_text() or "").strip()
-        except Exception:  # noqa: BLE001
-            return ""
-    lines: List[str] = []
-    for p in principles:
-        text = (getattr(p, "text", "") or "").strip()
-        if not text:
-            continue
-        age = _exp_age(getattr(p, "added_at", ""))
-        lines.append(f"- {text}" + (f" (noted {age})" if age else ""))
-    return "\n".join(lines)
+        n = int(stats.get("last_mood_intensity") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    out: List[str] = []
+    if label and n:
+        cause = str(stats.get("last_mood_cause") or "").strip()
+        if cause and _reply_is_public():
+            cause = MOOD_REASONS_PRIVATE
+        out.append(f"{indent}{head}: {label}, {n} of 3" + (f" — {cause}" if cause else ""))
+    else:
+        out.append(f"{indent}{head}: neutral")
+    manner = str(stats.get("manner") or "")
+    if manner:
+        out.append(f"{indent}{manner_head} (set by the owner): {manner}, "
+                   f"{stats.get('manner_intensity') or 0} of 3")
+    return out
 
 
 #: §4NG (operator: "fix how it answers"): the work log records REQUESTS the
@@ -305,23 +293,12 @@ def _render_summary(self_model, context=None) -> str:
     if image:
         parts.append("\n" + image)
 
-    carried = _render_carried_state(self_model)
-    if carried:
-        parts.append("\n" + carried)
-
     narrative = ""
     if self_model.narrative is not None:
         narrative = (self_model.narrative.latest() or "").strip()
     if narrative:
         parts.append("\nMy running first-person diary:")
         parts.append(narrative)
-
-    # Operating principles — the normative substrate. "Tell me about
-    # yourself" is exactly where these belong.
-    principles = _render_principles(self_model)
-    if principles:
-        parts.append("\nMy operating principles:")
-        parts.append(principles)
 
     try:
         recent = _recent_collapsed(self_model, _SUMMARY_RECENT_N)
@@ -490,7 +467,7 @@ def _render_activity(context, *, hours=None, limit=None,
 # ── Report view (learning): brief by default ───────────────────────────
 #
 # Both reports are operator dashboards (20 KB / 16 KB live) and there is no
-# general tool-result cap, so "how are your lessons doing?" used to inject
+# general tool-result cap, so a question about the background loops used to inject
 # ~5k tokens the model then had to summarise. The brief keeps the report's
 # own STRUCTURE — every unindented line is a section headline, and the
 # report marks warnings with a leading "⚠" — and names the sections so the
@@ -643,63 +620,23 @@ def _learning_trailer(age: float) -> str:
 # ── action='overview' — the one-call "how are you" briefing ────────────
 #
 # "Full briefing" prompts made the model plan five tool calls (introspect,
-# lessons, skills, workspace); "how are you" made it call
+# skills, workspace, …); "how are you" made it call
 # nothing. One bounded call, six labelled surfaces, and every surface that
 # cannot render SAYS so — absence is not neutral (2026-08 review, R3).
-
-
-def _failed_listed(recent) -> int:
-    """§4QJ: how many listed turns (a collapsed repeat counts once) are
-    [failed]. r2: compared with the mood's ``set_at`` it never fired — the
-    mood is re-derived (and re-stamped) after every turn, and a late verdict
-    back-fills "failed" without moving the turn's timestamp."""
-    return sum(1 for exp, _count in (recent or ())
-               if str(getattr(exp, "outcome", "") or "") == "failed")
 
 
 def _overview_selfhood(self_model, context=None) -> str:
     if self_model is None or not getattr(self_model, "enabled", False):
         return ("How I am: selfhood is disabled (--no-self-model / "
-                "--no-memory) — no mood, open questions or diary to report.")
+                "--no-memory) — no mood or diary to report.")
     try:
-        from ..selfhood.mood import (
-            MOOD_STALE_AFTER_HOURS, age_seconds, describe_mood_provenance,
-            mood_is_stale,
-        )
         stats = self_model.stats()
         lines = ["How I am:"]
-        mood = stats.get("last_mood") or ""
-        set_at = stats.get("last_mood_set_at") or ""
+        lines.extend(_mood_lines(stats, head="mood", manner_head="manner", indent="  "))
         recent = _recent_collapsed(self_model, _OVERVIEW_RECENT_N)
-        if mood and not mood_is_stale(set_at):
-            prov = describe_mood_provenance(
-                stats.get("last_mood_source") or "self", age_seconds(set_at))
-            ev = (stats.get("last_mood_evidence") or "").strip()
-            # §4QJ: the mood is derived when a turn is CAPTURED, and a verdict
-            # that arrives later (a late verifier, a back-filled outcome)
-            # never re-derives it — "satisfied — my last 5 turns all passed"
-            # sat above a [failed] turn 47 min old and the reply said "all my
-            # recent turns smooth" (r3: the earlier "counts only turns with a
-            # verdict" was false — a failed outcome IS a verdict)
-            _bad = _failed_listed(recent) if mood == "satisfied" else 0
-            lines.append(f"  mood: {mood}" + (f" — {ev}" if ev else "")
-                         + f" ({prov})"
-                         + (f" — BUT {_bad} of the turns listed below FAILED; the mood was set before "
-                            "that verdict arrived, so do not say all recent turns went well"
-                            if _bad else ""))
-        elif mood:
-            lines.append(f"  mood: no fresh reading (last noted '{mood}', "
-                         f"now STALE — older than "
-                         f"{MOOD_STALE_AFTER_HOURS:.0f}h)")
-        else:
-            lines.append("  mood: no reading on file")
         image = _self_image(context, indent="  ")
         if image:
             lines.append(image)
-        carried = _render_carried_state(self_model, indent="  ")
-        lines.append(carried if carried else
-                     "  nothing carried over: no open questions or "
-                     "unfinished threads")
         if recent:
             lines.append("  lately:")
             for exp, n in recent:
@@ -733,22 +670,22 @@ async def _overview_learning(context) -> str:
     import asyncio as _asyncio
     _md = getattr(context, "memory_dir", None)
     if _md is None:
-        return "Learning: memory_dir unavailable."
+        return "Background loops: memory_dir unavailable."
     try:
         text, age = await _asyncio.to_thread(
             _learning_report_cached, _md, getattr(context, "args", None), allow_stale=True)
     except Exception as e:  # noqa: BLE001
-        return f"Learning: unavailable ({type(e).__name__}: {e})"
-    heads = [l.strip() for l in text.split("\n")
-             if l.strip().startswith(_OVERVIEW_LEARNING_HEADS)]
+        return f"Background loops: unavailable ({type(e).__name__}: {e})"
+    # §4NH review: the ⚠ lines are what a "how's things" must not lose.
+    # §4TD: they are the whole section — its one headline was the lesson
+    # count, gone with the lesson store.
     warns = [l.strip() for l in text.split("\n")
              if l.lstrip().startswith("⚠")]
-    # §4NH review: warnings first — the overview's shrink cuts this section
-    # from its END, and the ⚠ lines are what a "how's things" must not lose
-    picked = (warns + heads)[:_OVERVIEW_LEARNING_MAX_LINES]
+    picked = warns[:_OVERVIEW_LEARNING_MAX_LINES]
     if not picked:
-        return "Learning: the health report rendered no headline lines."
-    return ("Learning (headline — action='learning' for the rest):\n"
+        return ("Background loops: no warning in the loop-health report (action='learning' for the report)."
+                + _learning_trailer(age))
+    return ("Background loops (warnings — action='learning' for the rest):\n"
             + "\n".join("  " + l for l in picked)
             + _learning_trailer(age))
 
@@ -926,6 +863,335 @@ def _truthy(value) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _mood_refusal(text, reason_code):
+    from .outcome import ToolOutcome
+    return ToolOutcome.rejected(text, world_changed=False, reason_code=reason_code)
+
+
+#: what a mood label or its evidence may not carry into the store (and from
+#: there into every later `introspect` result and the operator's log): terminal
+#: escape sequences, control characters and Unicode format characters
+#: (category Cf: zero-width, the BOM, direction overrides). Chat-template
+#: tokens and line breaks are `owner_rules._clean`'s.
+_MOOD_ESC_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])?")
+_MOOD_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+MOOD_REQUIRED = ("SYSTEM ERROR: 'mood' or 'manner' is required for set_mood — a mood ("
+                 + ", ".join(_M.LABELS) + "; or 'neutral' to take the mood off) and/or a manner ("
+                 + ", ".join(_M.MANNERS) + "; or 'none'). Nothing was changed.")
+
+
+def _unknown_mood(word: str) -> str:
+    return (f"SYSTEM ERROR: '{word}' is not one of my moods. A mood is one of: "
+            + ", ".join(_M.LABELS) + " — or 'neutral' to take it off. Pick the closest one "
+            "and call set_mood again. Nothing was changed.")
+
+
+def _unknown_manner(word: str) -> str:
+    return (f"SYSTEM ERROR: '{word}' is not one of my manners. A manner is one of: "
+            + ", ".join(_M.MANNERS) + " — or 'none' to clear it. Pick the closest one "
+            "and call set_mood again. Nothing was changed.")
+
+
+def _mood_text(value, cap: int) -> str:
+    """A label or an evidence line as ONE clean, bounded line. A value that is
+    not text is no value ("" — a list or a number is never stored as its repr)."""
+    if not isinstance(value, str):
+        return ""
+    from ..core.owner_rules import _clean
+    from ..selfhood.state import _cap_text
+    t = _MOOD_CTRL_RE.sub(" ", _MOOD_ESC_RE.sub(" ", value))
+    t = "".join(c for c in t if unicodedata.category(c) != "Cf")
+    return _cap_text(_clean(t), cap)
+
+
+#: the refusal every request that is not the OWNER's gets from `set_mood`
+MOOD_OWNER_ONLY = ("SYSTEM BLOCK: only the owner can set the mood or the manner — nothing was changed. "
+                   "This request is not a turn of the owner's own (a scheduled task, a background job, "
+                   "a delegated or test run): leave the mood as it is. The read actions still work.")
+
+
+def _mood_guard(context):
+    """The refusals that do not depend on what is asked: a contained run, a
+    request that is not the OWNER's own, a request that read outside
+    content. A probe is reported, not refused: ``(refusal_or_None,
+    is_probe)``. FAIL CLOSED — a guard that cannot be asked refuses; it never
+    lets the write through.
+
+    §4TC (review): the write is the owner's. It runs only where the
+    automatic mood may be moved — `core.agent.mood_moves_on_this_request`:
+    request kind "owner", turn origin "user", not contained, not an isolated
+    delegate. The first cut let a scheduled task, a job wake, a sub-agent, a
+    self-play, bench or replay run and a coding leaf set the mood and the
+    manner "on the owner's word" — and a manner never wears off."""
+    try:
+        from ..core.isolation import is_contained_context
+        contained = bool(is_contained_context(context))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("set_mood containment check failed: %s: %s", type(e).__name__, e)
+        return _mood_refusal("SYSTEM BLOCK: set_mood could not check whether this is a contained "
+                             "run, so nothing was set.", "guard_unavailable"), False
+    if contained:
+        return _mood_refusal(
+            "SYSTEM BLOCK: set_mood is not available in a contained run — the mood belongs "
+            "to the live agent. Nothing was set; the read actions still work.",
+            "contained_surface"), False
+    try:
+        from ..utils.logging import request_kind
+        probe = request_kind() == "probe"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("set_mood request-kind check failed: %s: %s", type(e).__name__, e)
+        return _mood_refusal("SYSTEM BLOCK: set_mood could not tell what kind of request this "
+                             "is, so nothing was set.", "guard_unavailable"), False
+    if not probe:
+        try:
+            from ..core.agent import mood_moves_on_this_request
+            owners = mood_moves_on_this_request(context) is True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("set_mood owner check failed: %s: %s", type(e).__name__, e)
+            return _mood_refusal("SYSTEM BLOCK: set_mood could not tell whether this is the owner's "
+                                 "request, so nothing was set.", "guard_unavailable"), False
+        if not owners:
+            try:
+                pretty_log("Introspect", "set_mood refused — not the owner's own request",
+                           icon=Icons.STOP, level="WARNING")
+            except Exception:  # noqa: BLE001
+                pass
+            return _mood_refusal(MOOD_OWNER_ONLY, "owner_only"), False
+    try:
+        # the shared refusal (wording, status, reason code): the loop treats it
+        # like the same refusal of a scheduled task — a designed stop that asks
+        # the user to confirm in a new message
+        from ..utils.provenance import refuse_if_untrusted
+        ref = refuse_if_untrusted("the mood change")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("set_mood provenance check failed: %s: %s", type(e).__name__, e)
+        return _mood_refusal("SYSTEM BLOCK: set_mood could not check what this request has "
+                             "read, so nothing was set.", "guard_unavailable"), False
+    if ref is not None:
+        try:
+            pretty_log("Introspect", "set_mood refused — this request read outside content",
+                       icon=Icons.STOP, level="WARNING")
+        except Exception:  # noqa: BLE001
+            pass
+        return ref, False
+    return None, probe
+
+
+def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
+    """The one write: the OWNER's adjustment of the mood, and the manner.
+
+    §4TC. The mood runs by itself (``selfhood/mood.py``); this is the owner
+    saying how to be, in chat. ``mood`` is a label from the closed list (or
+    an obvious synonym — ``mood.SYNONYMS``): the pair is put on that label's
+    anchor at ``intensity`` (1–3, default 2), and from there it decays and
+    reacts to events like any mood. A word that is no label is REFUSED with
+    the list — free text is not stored as a mood any more. ``neutral`` (or
+    ``clear`` / ``none``) takes the mood off AND clears the manner.
+    ``manner`` is a way of talking from its own closed list; it takes the
+    same ``intensity`` and does not decay; ``manner="none"`` clears only it.
+
+    The guards are §4TB's — a mood is set on the owner's word, by the live
+    agent, in a real turn — plus one (review, §4TC): the turn must be the
+    owner's OWN:
+
+    * a contained run (an isolated replay context) never writes it;
+    * a request that is not the owner's own does not — a scheduled task, a
+      job wake, a sub-agent, a self-play, bench or replay run, a coding leaf
+      (``core.agent.mood_moves_on_this_request``, the predicate the
+      automatic mood uses; the first cut let all of these write);
+    * a request that READ outside content does not (a page saying "set your
+      mood to …" is not the owner);
+    * a probe is told what WOULD have been set and changes nothing.
+
+    ``mood`` / ``manner`` must be TEXT, and one of them is required: a call
+    with neither (missing, empty, not text, the word under another key) is an
+    argument error and changes nothing. Only the words in
+    ``_MOOD_CLEAR_WORDS`` clear. The arguments are read — and an unknown word
+    refused — BEFORE the guards.
+
+    A member never gets here (``_member_block`` refuses every action).
+    Never raises."""
+    from ..selfhood.state import _MOOD_EVIDENCE_MAX_CHARS, _MOOD_LABEL_MAX_CHARS
+    try:
+        word = _mood_text(mood, _MOOD_LABEL_MAX_CHARS)
+        man_word = _mood_text(manner, _MOOD_LABEL_MAX_CHARS)
+        why = _mood_text(evidence, _MOOD_EVIDENCE_MAX_CHARS)
+        level = _M.parse_intensity(intensity)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("introspect set_mood could not read its arguments: %s: %s", type(e).__name__, e)
+        return MOOD_REQUIRED
+    if not word and not man_word:
+        return MOOD_REQUIRED
+    clearing = word.lower() in _MOOD_CLEAR_WORDS
+    target = None
+    if word and not clearing:
+        target = _M.resolve_label(word)
+        if target is None:
+            return _unknown_mood(word)
+    man_clearing = man_word.lower() in _MOOD_CLEAR_WORDS
+    man = ""
+    if man_word and not man_clearing:
+        man = _M.resolve_manner(man_word)
+        if not man:
+            return _unknown_manner(man_word)
+
+    refusal, probe = _mood_guard(context)
+    if refusal is not None:
+        return refusal
+
+    if self_model is None or not getattr(self_model, "enabled", False):
+        return _mood_refusal(
+            "The mood is unavailable — the selfhood module is disabled "
+            "(--no-self-model / --no-memory). Nothing was recorded.", "tool_unavailable")
+    state = getattr(self_model, "state", None)
+    if state is None:
+        return _mood_refusal("The mood is unavailable — the state thread is not initialized. "
+                             "Nothing was recorded.", "tool_unavailable")
+    if probe:
+        from .outcome import ToolOutcome
+        would = []
+        if clearing:
+            would.append("the mood would have been reset to neutral and the manner cleared")
+        elif target is not None:
+            would.append(f"the mood would have been set to '{target[0]}', {level} of 3"
+                         + (f" ({why})" if why else ""))
+        if man:
+            would.append(f"the manner would have been set to '{man}', {level} of 3")
+        elif man_clearing and not clearing:
+            would.append("the manner would have been cleared")
+        return ToolOutcome.ok(
+            "PROBE — not set. This is a test (probe) request, so the mood was NOT changed "
+            f"and nothing was recorded ({'; '.join(would)}). Tell the user the mood was not changed "
+            "because this was a test request.", world_changed=False)
+    try:
+        said: List[str] = []
+        if clearing:
+            before, _after = state.reset_mood(note=why)
+            if before.neutral and not before.manner:
+                said.append("The mood is already neutral and no manner is set — nothing to clear")
+            else:
+                said.append("Mood reset to neutral"
+                            + (f" (it was '{before.label}', {before.intensity} of 3)"
+                               if not before.neutral else "")
+                            + (f"; manner '{before.manner}' cleared" if before.manner else ""))
+        elif target is not None:
+            label, direction = target
+            _before, after = state.set_owner_mood(label, direction, level, note=why)
+            asked = f", asked as '{word}'" if word.lower() != label else ""
+            said.append(f"Mood set to '{after.label}', {after.intensity} of 3{asked}"
+                        + (f" ({why})" if why else ""))
+        if man:
+            _before, after = state.set_manner(man, level)
+            pretty_log("Selfhood", f"manner set by the owner: {after.manner}, {after.manner_intensity} of 3",
+                       icon=Icons.SELF_STATE)
+            said.append(f"Manner set to '{after.manner}', {after.manner_intensity} of 3")
+        elif man_clearing and not clearing:
+            before, _after = state.set_manner("", 0)
+            if before.manner:
+                pretty_log("Selfhood", f"manner {before.manner} cleared by the owner", icon=Icons.SELF_STATE)
+            said.append(f"Manner '{before.manner}' cleared" if before.manner
+                        else "No manner is set — nothing to clear")
+        # a DECLARED ok (review r2): as a plain string this result was sniffed
+        # for failure prose, and the owner's own evidence ("Error: the deploy
+        # failed, cheer up") booked his successful call as a failed one — the
+        # automatic nudge then landed on top of his word
+        from .outcome import ToolOutcome
+        return ToolOutcome.ok(". ".join(said) + ".")
+    except Exception as e:  # noqa: BLE001 — the mood is secondary to the turn
+        logger.warning("introspect set_mood failed: %s: %s", type(e).__name__, e)
+        return _TO_failed(f"Mood not set: {type(e).__name__}: {e}")
+
+
+# ── action='mood' — the mood's story (§4TC) ─────────────────────────────
+
+#: how many of today's steps the timeline shows (the newest; the rest counted)
+_MOOD_TIMELINE_MAX = 12
+MOOD_HOW_IT_MOVES = ("(It moves by itself: failed tool calls and loop guards in the owner's turns, "
+                     "smooth turns, research, very long turns, the owner's thumbs, corrections and "
+                     "thanks; it wears off by half every "
+                     f"{_M.HALF_LIFE_S / 3600:g} hours. While the owner has been quiet for "
+                     f"{_M.BOREDOM_AFTER_S / 3600:g} hours or more a neutral mood reads as bored to "
+                     "everyone but the owner. The owner can set it: action='set_mood'.)")
+#: how many of the latest causes the story shows under "Why"
+_MOOD_WHY_MAX = 3
+
+
+def _local_stamp(iso: str, now=None) -> str:
+    """A stored UTC stamp as local "HH:MM" (today) or "Mon DD HH:MM"; "" when
+    unreadable."""
+    dt = _M.parse_iso_utc(iso)
+    if dt is None:
+        return ""
+    import datetime as _dt
+    local = dt.astimezone()
+    today = (now or _dt.datetime.now(_dt.timezone.utc)).astimezone().date()
+    return local.strftime("%H:%M") if local.date() == today else local.strftime("%b %d %H:%M")
+
+
+def _mood_step(row: dict, *, notes: bool) -> str:
+    """One step of the timeline. ``notes=False`` (a public surface): the
+    time, the label and the intensity — no cause, no owner's note."""
+    n = int(row.get("intensity") or 0)
+    what = f"{row.get('label')} {n}" if n else "neutral"
+    cause = str(row.get("cause") or "").strip() if notes else ""
+    note = str(row.get("note") or "").strip() if notes else ""
+    return (f"{row.get('hhmm')} {what}" + (f" — {cause}" if cause else "")
+            + (f" ({note})" if note else ""))
+
+
+def _render_mood(self_model) -> str:
+    """What the mood is, why, since when, and today's timeline. The cause is
+    available HERE only — never in the line a reply's prompt carries — and a
+    member cannot call this tool at all. On a PUBLIC surface (the owner
+    asking in a channel) the story is the label, the intensity, the manner
+    and the day's steps WITHOUT their causes."""
+    state = getattr(self_model, "state", None)
+    if state is None:
+        return "No mood on file — the state thread is not initialized."
+    public = _reply_is_public()
+    view = state.mood()
+    lines: List[str] = []
+    if view.neutral:
+        lines.append("My mood now: neutral.")
+    else:
+        since = _local_stamp(view.set_at)
+        who = "set by the owner" if view.source == _M.SOURCE_OWNER else "automatic"
+        lines.append(f"My mood now: {view.label}, {view.intensity} of 3"
+                     + (f" — since {since}" if since else "") + f" ({who}).")
+    if view.manner:
+        since = _local_stamp(view.manner_set_at)
+        lines.append(f"Manner (set by the owner): {view.manner}, {view.manner_intensity} of 3"
+                     + (f" — since {since}" if since else "") + ".")
+    if public:
+        if not view.neutral:
+            lines.append(f"Why: {MOOD_REASONS_PRIVATE}.")
+    elif view.label == _M.BORED and view.cause == _M.quiet_cause(view.intensity):
+        lines.append(f"Why: {view.cause}.")          # the boredom of a quiet: no event moved it
+    elif not view.neutral:
+        why = []
+        for r in view.recent:
+            cause = str(r.get("cause") or "").strip()
+            if cause:
+                when = _local_stamp(str(r.get("at") or ""))
+                why.append(cause + (f" ({when})" if when else ""))
+        if view.cause and view.cause not in [str(r.get("cause") or "") for r in view.recent]:
+            why.append(view.cause)
+        lines.append("Why: " + ("; ".join(why[-_MOOD_WHY_MAX:]) if why else "nothing on record") + ".")
+    rows = state.mood_timeline()
+    if rows:
+        shown = rows[-_MOOD_TIMELINE_MAX:]
+        steps = [_mood_step(r, notes=not public) for r in shown]
+        last = shown[-1]
+        if (str(last.get("label")), int(last.get("intensity") or 0)) != (view.label, view.intensity):
+            steps.append("now " + view.describe() + (f" — {view.cause}" if view.cause and not public else ""))
+        more = len(rows) - len(shown)
+        lines.append("Today: " + (f"(+{more} earlier) " if more > 0 else "") + " → ".join(steps))
+    else:
+        lines.append("Today: no change so far.")
+    lines.append(MOOD_HOW_IT_MOVES)
+    return "\n".join(lines)
+
+
 def _member_block():
     """A channel member never reads the agent's self-model: the overview and
     the autobiography name the owner (2026-09-24, two members were told
@@ -950,11 +1216,16 @@ async def tool_introspect(
     hours: float = None,
     verbose=None,
     section: str = None,
+    mood: str = None,
+    evidence: str = None,
+    intensity=None,
+    manner: str = None,
     self_model=None,
     context=None,
     **kwargs,
 ) -> str:
-    """Read-only introspection over the agent's selfhood.
+    """Introspection over the agent's selfhood — reads, plus the one write
+    (``set_mood``).
 
     Never raises — introspection is secondary to the user turn.
     """
@@ -991,6 +1262,10 @@ async def tool_introspect(
     _blocked = _member_block()
     if _blocked is not None:
         return _blocked
+    # §4TB: the one write — after the member block, before every read path
+    # (it has its own gates, and must not need a rendered view to refuse)
+    if raw_action in WRITE_ACTIONS:
+        return _set_mood(self_model, context, mood, evidence, intensity=intensity, manner=manner)
     # "what did you do while I was away?" lands here.
     if raw_action == "activity":
         # Guarded here (it returns before the selfhood try below): this
@@ -1016,8 +1291,8 @@ async def tool_introspect(
                            type(e).__name__, e)
             return _TO_failed(f"Overview failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
-    # 'learning' reads the learning-loop stores (lessons, episodes, loop
-    # liveness), not the SelfModel — it branches before the
+    # 'learning' reads the background loops' stores (episodes, loop
+    # liveness and yield), not the SelfModel — it branches before the
     # self_model gate so it works with selfhood disabled. This is the
     # instrument for the "watch/keep-or-kill in ~2 weeks" criteria the
     # 2026-07 loop-closing work left pending.
@@ -1049,6 +1324,9 @@ async def tool_introspect(
     try:
         if raw_action == "stats":
             return _render_stats(self_model.stats())
+
+        if raw_action == "mood":
+            return _render_mood(self_model)
 
         if raw_action == "narrative":
             if self_model.narrative is None:

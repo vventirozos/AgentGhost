@@ -31,7 +31,7 @@ MUT = [
     ("M11 sidecar forgets the stop", YI, '            "gaps": gaps, "stopped": stopped,', '            "gaps": gaps, "stopped": "",'),
     ("M34 per-attempt timeout ignores the budget", YI, '    return max(5.0, min(timeout, rem)) if rem > 0 else timeout', '    return timeout'),
     ("M35 title not cleaned", YI, '    t = re.sub(r"[\\r\\n\\t]+", " ", str(title or "")).strip()[:200]', '    t = str(title or "")'),
-    ("M12 url alias dropped", TM, '    "url", "link",       # §4PI (R1-m6): the macro teaches `url`', '    "link",'),
+    ("M12 url alias dropped", TM, '    "url", "link",       # §4PI (R1-m6): `youtube_transcribe` teaches `url`', '    "link",'),
     ("M13 claim keyed on the spelling", TM, '            if _vid:\n                _claim = f"yt:{_vid}"', '            if False:\n                _claim = f"yt:{_vid}"'),
     ("M20 pages cut mid-line", TM, '    if _end < total:\n        _nl = text.rfind("\\n", offset, _end)', '    if False:\n        _nl = text.rfind("\\n", offset, _end)'),
     ("M21 mid-line offset kept", TM, '    if offset and text[offset - 1] != "\\n":', '    if False:'),

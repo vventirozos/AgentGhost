@@ -143,7 +143,6 @@ MUT = [
      '"_Recorded by `probe_model`. Each response is the model\'s "'),
     ("M97 temperature ignored", PM, '"messages": convo, "temperature": temperature,', '"messages": convo, "temperature": 0.7,'),
     ("M98 replays may probe", IS, '    # §4QA: main-slot model calls + a project write — never inside a replay\n    "probe_model",\n', ""),
-    ("M99 macros may probe", CS, '    "probe_model",   # §4QA', "    # x"),
     ("M100 probe not dispatched", RG, '        "probe_model": lambda **kwargs: tool_probe_model(context=context, **kwargs),\n', ""),
     ("M101 probe not advertised", RG, "    PROBE_MODEL_TOOL_DEFINITION,\n    {", "    {"),
 ]

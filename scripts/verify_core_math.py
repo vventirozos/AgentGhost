@@ -307,11 +307,7 @@ def verify_live_numbers():
     check("chroma type census: SQL GROUP BY == manual tally", sql == raw,
           f"total {sum(sql.values())}", "D")
 
-    # PROPERTY: the playbook must never exceed its documented cap.
-    from ghost_agent.memory.skills import PLAYBOOK_MAX
-    pb = json.loads((mem / "skills_playbook.json").read_text())
-    check("playbook size <= PLAYBOOK_MAX", len(pb) <= PLAYBOOK_MAX,
-          f"{len(pb)} / {PLAYBOOK_MAX}", "P")
+    # (§4TD: the lesson-playbook cap property went with the lesson store.)
 
     # PROPERTY: F8 invariant — every episode row must carry a seeded
     # last_accessed (0 would sort it evict-first, the bug the backfill fixed).

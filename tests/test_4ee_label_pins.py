@@ -412,28 +412,6 @@ def test_late_pass_on_an_already_passed_row_writes_nothing():
     assert writes == []
 
 
-def test_stashed_lesson_outcome_flushes_once_and_rebooks_on_a_sign_flip():
-    import types
-    calls = []
-    sm = types.SimpleNamespace(record_surfaced_outcomes=lambda trig, ok: calls.append((tuple(trig), ok)))
-    agent = GhostAgent.__new__(GhostAgent)
-    agent.context = types.SimpleNamespace(_surfaced_triggers_by_traj={"t": ["L1", "L2"]},
-                                          skill_memory=sm)
-    import asyncio
-    async def go():
-        agent._flush_stashed_lesson_outcome("t", True)
-        await asyncio.sleep(0.2)
-        agent._flush_stashed_lesson_outcome("t", True)      # same sign: no-op
-        await asyncio.sleep(0.2)
-        agent._flush_stashed_lesson_outcome("t", False)     # flip: re-booked
-        await asyncio.sleep(0.2)
-        agent._flush_stashed_lesson_outcome("nope", True)   # nothing stashed
-        await asyncio.sleep(0.2)
-    asyncio.run(go())
-    assert calls == [(("L1", "L2"), True), (("L1", "L2"), False)], calls
-    assert "t" not in agent.context._surfaced_triggers_by_traj
-
-
 def test_verifier_evidence_scan_skips_a_None_entry():
     from ghost_agent.core.agent import _find_substantive_tool_for_verifier
     real = {"name": "execute", "content": "SUCCESS: 42 lines"}
@@ -507,26 +485,6 @@ def test_human_label_locked_stops_at_the_first_id_match():
     agent.context._recent_trajectories_for_correction = {"fp": stamped}
     assert agent._human_label_locked("t") is True
     assert agent._human_label_locked("nobody") is False
-
-
-def test_flush_on_a_wrong_traj_stash_does_not_drop_a_pending_rebook():
-    """stash is non-empty but for ANOTHER trajectory, and THIS one has a
-    retained set of the opposite sign — the re-book must still fire, not be
-    lost to a KeyError (the `and` guard, not `or`)."""
-    import types, asyncio
-    calls = []
-    sm = types.SimpleNamespace(record_surfaced_outcomes=lambda trig, ok: calls.append((tuple(trig), ok)))
-    from collections import OrderedDict
-    agent = GhostAgent.__new__(GhostAgent)
-    agent.context = types.SimpleNamespace(
-        _surfaced_triggers_by_traj={"other": ["Z"]},        # non-empty, different id
-        _flushed_triggers_by_traj=OrderedDict([("t", (["L1"], True))]),  # prior, sign True
-        skill_memory=sm)
-    async def go():
-        agent._flush_stashed_lesson_outcome("t", False)     # sign flip → re-book
-        await asyncio.sleep(0.2)
-    asyncio.run(go())
-    assert calls == [(("L1",), False)], calls
 
 
 # ── retro tiers must scan PAST a foreign sample, not break on it ────────── #

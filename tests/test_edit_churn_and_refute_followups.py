@@ -45,8 +45,6 @@ def agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None
@@ -295,7 +293,6 @@ def test_kill_switch_disables_filing(agent, monkeypatch):
 
 
 async def test_record_late_verdict_wires_filing_with_project_id(agent):
-    agent.context.skill_memory = None
     agent.context.project_store = _store()
     agent._backfill_trajectory_outcome = MagicMock()
     with patch("ghost_agent.core.agent.pretty_log"):
@@ -307,7 +304,6 @@ async def test_record_late_verdict_wires_filing_with_project_id(agent):
 
 
 async def test_low_confidence_refute_files_nothing(agent):
-    agent.context.skill_memory = None
     agent.context.project_store = _store()
     agent._backfill_trajectory_outcome = MagicMock()
     with patch("ghost_agent.core.agent.pretty_log"):

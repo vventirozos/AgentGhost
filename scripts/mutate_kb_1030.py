@@ -84,8 +84,8 @@ m.MUT = [
      '        if _graph_section:\n            _head += " The owner\'s stored facts below are not graded by that match."',
      '        if False:\n            _head += " The owner\'s stored facts below are not graded by that match."'),
     # ── project fallback
-    ("P1 fallback in a public channel", PR, "        if reply_is_public() or requester_is_member() or _mostly_non_latin(str(term)):",
-     "        if requester_is_member() or _mostly_non_latin(str(term)):"),
+    ("P1 fallback in a public channel", PR, "        if reply_is_public() or requester_is_member() or mostly_non_latin(str(term)):",
+     "        if requester_is_member() or mostly_non_latin(str(term)):"),
     ("P2 fallback offers profile rows", PR, '{"type": {"$nin": list(_EXCL) + ["identity"]}}', '{"type": {"$nin": list(_EXCL)}}'),
     ("P3 fallback MEDIUM gate", PR, "                if score < RECALL_HIGH_D:", "                if score < 0.36:"),
     # ── the owner gate

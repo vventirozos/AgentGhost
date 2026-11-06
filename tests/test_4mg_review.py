@@ -263,7 +263,7 @@ def test_owner_identifiers_in_subjects_are_refused_after_outside_content(monkeyp
     assert EG.content_egress_refusal("image_generation", {"prompt": "Vasilis Example as a cat"}, ctx) is None
 
 
-def test_the_registered_tool_is_wrapped_for_macros_and_delegates():
+def test_the_registered_tool_is_wrapped_for_callers_that_skip_the_dispatch():
     from ghost_agent.tools.registry import get_available_tools
     ctx = MagicMock()
     ctx.llm_client.image_gen_clients = [{"model": "Ghost"}]

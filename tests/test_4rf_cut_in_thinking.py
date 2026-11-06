@@ -31,7 +31,6 @@ def agent():
     context.memory_system = None
     context.profile_memory = None
     context.semantic_memory = None
-    context.skill_memory = None
     context.journal = None
     context.scratchpad = MagicMock()
     context.scratchpad.list_all.return_value = ""

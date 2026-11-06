@@ -12,7 +12,7 @@ Findings pinned:
   * MAJOR (lens A) — usable-native gate: a degenerate native call (empty args,
     or a name the agent doesn't expose) must NOT shadow a rich XML call.
   * CRITICAL (lens B) — batch-collapse allowlist: runtime-registered
-    macro/skill names (unknowable to a denylist) must NOT collapse.
+    skill names (unknowable to a denylist) must NOT collapse.
   * MAJOR (lens C-2) — three previously-unpinned live guards: mid-loop strike
     cap, arg unescaping, truncation-error dedupe.
   * MINOR (lens C-4) — the pre-flight guard's enable flag actually gates it.
@@ -170,7 +170,7 @@ def _ts(**over):
         msg={"role": "assistant", "content": ""}, ui_content="",
         parse_failure_reason="", model="test-model",
         last_user_content="do the thing", char_budget=4000,
-        strikes=StrikeLedger(), task_tree=MagicMock(), _user_batch_intent=None,
+        strikes=StrikeLedger(), _user_batch_intent=None,
         _request_constraints=[], repeated_action_steered=set(), messages=[],
         seen_tools=set(), executed_idempotent=set(), raw_tools_called=set(),
         tool_usage={}, tools_run_this_turn=[], request_state=MagicMock(),
@@ -185,24 +185,24 @@ def _call(name, args, cid):
 
 
 class TestCollapseAllowlistDynamicTools:
-    """CRITICAL (lens B): runtime-registered side-effecting tools (macros,
-    acquired skills) are unknown to any static set — the allowlist makes them
-    collapse-unsafe by default."""
+    """CRITICAL (lens B): runtime-registered side-effecting tools (acquired
+    skills; composed macros too until §4TA removed them) are unknown to any
+    static set — the allowlist makes them collapse-unsafe by default."""
 
     @pytest.mark.asyncio
-    async def test_dynamic_macro_duplicates_not_collapsed(self):
+    async def test_dynamic_skill_duplicates_not_collapsed(self):
         agent = _dispatch_agent()
         calls = {"n": 0}
 
-        async def macro(**kwargs):
+        async def skill(**kwargs):
             calls["n"] += 1
             return "ran"
 
         # a name no static denylist could ever contain
-        agent.available_tools = {"deploy_prod_macro": macro}
+        agent.available_tools = {"deploy_prod_skill": skill}
         args = {"env": "prod"}
-        ts = _ts(tool_calls=[_call("deploy_prod_macro", args, "d0"),
-                             _call("deploy_prod_macro", args, "d1")])
+        ts = _ts(tool_calls=[_call("deploy_prod_skill", args, "d0"),
+                             _call("deploy_prod_skill", args, "d1")])
         await agent._dispatch_and_process_tool_batch(ts)
         assert calls["n"] == 2
 

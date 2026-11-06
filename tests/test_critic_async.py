@@ -46,8 +46,6 @@ def agent():
     ctx.llm_client = MagicMock()
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
-    ctx.skill_memory = MagicMock()
-    ctx.skill_memory.get_context_string.return_value = ""
     ctx.memory_system = MagicMock()
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.cached_sandbox_state = None
@@ -114,7 +112,6 @@ def test_async_forces_pure_async_gate(agent, monkeypatch):
 
 def test_late_refuted_queues_correction_in_async(member_turn, agent, monkeypatch):
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     # _record_late_verdict spawns the lesson-retraction task; in production it
     # runs inside a task's done-callback (live loop), so stub the spawn here.
@@ -130,7 +127,6 @@ def test_late_refuted_queues_correction_in_async(member_turn, agent, monkeypatch
 
 def test_late_refuted_does_not_queue_when_not_async(agent, monkeypatch):
     monkeypatch.delenv("GHOST_CRITIC_ASYNC", raising=False)
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task") as _spawn:
@@ -138,9 +134,9 @@ def test_late_refuted_does_not_queue_when_not_async(agent, monkeypatch):
             _verdict(VerifyVerdict.REFUTED, conf=0.9, issues=["wrong"]),
             trajectory_id="traj-1",
         )
-    # Sync mode: retraction still scheduled, but no next-turn correction queued.
+    # Sync mode: no next-turn correction queued. (§4TD: the lesson retraction
+    # that was scheduled here is removed with the lesson store.)
     assert agent._pending_corrections == []
-    _spawn.assert_called()  # retraction (lesson scrub) still happens in sync mode
 
 
 def test_late_confirmed_queues_nothing(agent, monkeypatch):
@@ -335,7 +331,6 @@ async def test_async_mode_repairs_refuted_in_loop(agent, monkeypatch):
         _verdict(VerifyVerdict.CONFIRMED),  # the repaired answer verifies
     ])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
 
     # THREE turns now: tool call, refuted final, repaired final.
     result = await _run(agent, "compute the answer and report it", [
@@ -361,7 +356,6 @@ async def test_async_repair_disabled_defers_correction(agent, monkeypatch):
     agent.available_tools["execute"] = AsyncMock(return_value="OUTPUT: 7")
     verifier, vmock = _make_verifier([_verdict(VerifyVerdict.REFUTED, issues=["wrong number"])])
     agent.context.verifier = verifier
-    agent.context.skill_memory = MagicMock()
 
     # Only two turns — no repair should be demanded.
     result = await _run(agent, "compute the answer and report it", [
@@ -461,7 +455,6 @@ def _msgs(first_user):
 def test_record_late_verdict_tags_conversation(member_turn, agent, monkeypatch):
     """A late REFUTED verdict stores a conversation-tagged, timestamped dict."""
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
@@ -512,7 +505,6 @@ def test_correction_queue_is_capped(member_turn, agent, monkeypatch):
     """Queueing more than _CORRECTION_MAX corrections keeps only the newest."""
     from ghost_agent.core.agent import _CORRECTION_MAX
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
-    agent.context.skill_memory = MagicMock()
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"), \
          patch("ghost_agent.core.agent._glog.spawn_task"):
