@@ -27,13 +27,13 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>interface / voice.py</h1>
-  <p class="subtitle">The local voice loop: speech-to-text on nova's <code>whisper-server</code> (Whisper large-v3, since §4SL; the Gemma 4 audio node when <code>GHOST_STT_URL</code> is unset), text-to-speech on the macOS synthesiser in <code>Ava (Premium)</code>. No extra hardware, no API key, no egress.</p>
+  <p class="subtitle">The local voice loop: speech-to-text on nova's <code>whisper-server</code> (Whisper large-v3, since §4SL; the Gemma 4 audio node when <code>GHOST_STT_URL</code> is unset), text-to-speech on nova's <code>tts-service</code> (Phonon, voice Lottie, since §4TK) for English and the macOS synthesiser for Greek or when the service fails. No extra hardware, no API key, no egress.</p>
 
-  <div class="note"><strong>There is no voice <em>server</em> any more.</strong> This page keeps its
-  filename for stable links, but nothing here is a separate service: STT is an HTTP call to a
-  worker node the agent already runs, and TTS is a subprocess on the interface host. The only
-  moving parts are <code>interface/voice.py</code> and the two proxy routes in
-  <code>interface/server.py</code>.</div>
+  <div class="note"><strong>The old Pi voice server is gone.</strong> This page keeps its filename for
+  stable links. STT is an HTTP call to <code>whisper-server</code> on the worker node. English TTS is an
+  HTTP call to <code>tts-service</code> on the same node (<code>interface/tts-service</code>), and all
+  other TTS is a <code>say</code> subprocess on the interface host. On this side the moving parts are
+  <code>interface/voice.py</code> and the two proxy routes in <code>interface/server.py</code>.</div>
 
   <h2>What changed (2026-08-02)</h2>
   <p>
@@ -115,7 +115,8 @@
       <tr><td>Capture</td><td>Browser (PWA)</td><td><code>MediaRecorder</code> → WebM/Opus, or MP4/AAC on Safari. Needs a secure context; the tailscale cert on :8443 provides it.</td></tr>
       <tr><td>Transcode</td><td>Interface host</td><td><code>ffmpeg</code> → 16 kHz mono PCM WAV. Temp <em>files</em>, not pipes: a WAV written to a non-seekable pipe carries a placeholder length some decoders reject.</td></tr>
       <tr><td>Transcribe</td><td>nova (Whisper large-v3 q5_0, <code>:8090</code>)</td><td>whisper.cpp <code>whisper-server</code>, multipart <code>POST /inference</code> (<code>file</code>, <code>language</code>, <code>response_format=json</code>, <code>temperature=0.0</code>), Silero VAD on. With <code>GHOST_STT_URL</code> unset: the Gemma 4 E4B llama-server (<code>:8088</code>) with an OpenAI <code>input_audio</code> content part.</td></tr>
-      <tr><td>Speak</td><td>Interface host</td><td>macOS <code>say</code> in <code>Ava (Premium)</code> → 22.05 kHz LEI16 WAV, returned as one buffered body. Text is passed by <em>file</em> (<code>-f</code>), never argv.</td></tr>
+      <tr><td>Speak (English)</td><td>Nova</td><td><code>tts-service</code>: Phonon, voice Maeve → 24 kHz 16-bit WAV. See <a href="#4tk">§4TK</a>.</td></tr>
+      <tr><td>Speak (Greek, or the service failed)</td><td>Interface host</td><td>macOS <code>say</code> in <code>Melina</code> or <code>Ava (Premium)</code> → 22.05 kHz LEI16 WAV, returned as one buffered body. Text is passed by <em>file</em> (<code>-f</code>), never argv.</td></tr>
     </tbody>
   </table></div>
 
@@ -162,6 +163,33 @@
   message. A <code>200</code> carrying <code>{"error": …}</code> is a failure, never silence. Tests:
   <code>tests/test_4sl_whisper_stt.py</code>.</p>
 
+  <h2 id="4tk">§4TK — Phonon speaks English (2026-11-07)</h2>
+  <p>The operator chose Phonon 31M's voice Lottie by ear over Ava, Qwen3-TTS 0.6B and Audio8 Realistic Air. Later the same day the operator moved to the voice Maeve.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Text</th><th>Spoken by</th></tr></thead>
+    <tbody>
+      <tr><td>English</td><td><code>tts-service</code>: Maeve, 24&nbsp;kHz, about 0.03&nbsp;s of work per second of audio on nova's CPU</td></tr>
+      <tr><td>Greek (the rule in <code>tts_voice_for</code>)</td><td><code>say</code> with <code>GHOST_TTS_VOICE_EL</code>: Phonon is English only</td></tr>
+      <tr><td>A sentence the service can't speak (HTTP 400, 413 or 422, such as <code>✅</code> alone)</td><td><code>say</code> with <code>GHOST_TTS_VOICE</code>; the next sentence goes back to the service</td></tr>
+      <tr><td>Any other service failure (down, bad key, 5xx, not a WAV)</td><td><code>say</code> with <code>GHOST_TTS_VOICE</code>, and the service is skipped for <code>GHOST_TTS_RETRY_S</code>. The client log says <code>tts-service failed</code> with the reason, never the text.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Because <code>/api/tts</code> makes this choice, the web client and the handheld behave the same. A reply mixing the two languages changes voice between sentences. Measured with a Gemma job running on nova: Gemma 53.4 to 52.4 tok/s, a sentence 0.26 to 0.31&nbsp;s.</p>
+  <p>Setup and the voice list are in <code>interface/tts-service/README.md</code>.</p>
+
+  <h2 id="bargein">Talking over a reply (2026-11-07)</h2>
+  <p>The web client only. <code>interface/static/bargein.js</code> holds the decisions and has no browser code; <code>app.js</code> supplies the microphone and acts on the results.</p>
+  <ul>
+    <li><strong>When the microphone is open:</strong> while a reply to a voice message plays, and for 3 s after. Never for a typed turn. The mic button shows a ring (<code>.barge-listening</code>). Off with <em>Toggle voice interrupt</em> in the palette (<code>localStorage</code> <code>ghost-barge-in</code>, per browser).</li>
+    <li><strong>Detecting speech:</strong> a level above the room, not a speech model. It measures the room for 300 ms, needs 220 ms above 3.5 times that level to start and 900 ms below half that bar to end. Echo cancellation is on for this microphone; push-to-talk keeps it off.</li>
+    <li><strong>What happens:</strong> hearing speech pauses the audio. Under 280 ms voiced (a bare trigger), an empty transcript or a failed transcription resumes it. Three empty results in one reply stop the listening until the next reply, with a note, because the microphone is probably hearing the speakers. Words go out as a 16-bit WAV to <code>/api/stt</code>, with 500 ms of lead-in so the first word survives, and the reply stops.</li>
+    <li><strong>What stays cut (<code>_speechCut</code>):</strong> only reply text already on the stream, checked in <code>queueTTS</code>. A retract removes that text and ends the cut, and so does a new turn. A resume replays the stream from the start, so content and retracts at or behind the furthest point already reached count as history (<code>_streamChars</code>, <code>_replayUpTo</code>): they are not said again and don't touch what is playing. Pressing or speaking before any reply text cuts nothing, so the answer is still heard. Reasoning is never read out, and nothing plays while the mic button is held.</li>
+    <li><strong>Where the words go (<code>_voiceWords</code>, for the button and for voice):</strong> to the running turn's inbox if a turn runs, as Enter does, else a new turn with a spoken reply. A message waiting for after the turn, or one the turn never read, still gets a spoken reply unless the speaker button was turned off since. A bare stop word with no turn running only ends the speech (<code>isStopWord</code>, twin of <code>core/queued_messages.py</code>, one test table for both).</li>
+    <li><strong>Words are kept:</strong> a mic press sends what was already said. Stop, a typed message, the speaker button, a new chat or another session end the listening; words already being transcribed then go to the tray, and so do words from another conversation. So do words being said at that moment, unless too short to be words.</li>
+  </ul>
+  <p><strong>The handheld:</strong> no voice interruption, by decision: its microphone hears the speaker about 13 times above the room, and audio through PipeWire's echo canceller sounded distorted. Shift+Esc interrupts, and the rest of a streaming reply then stays unsaid, by the same rule as above.</p>
+  <p><strong>Not covered:</strong> real speakers and microphones. The tests use Chromium's fake microphone, which has no echo, so the thresholds are untuned against a real room, and iOS is untried. The agent's history keeps the whole reply, so it doesn't know how much was heard. Speech that continues after a 0.9 s pause is treated as a new utterance and lost while the first is transcribed. Pinned by <code>tests/test_interface_bargein.py</code> and <code>tests/test_interface_bargein_page.py</code>.</p>
+
   <h2>Configuration</h2>
   <div class="scroll"><table>
     <thead><tr><th>Env var</th><th>Default</th><th>Meaning</th></tr></thead>
@@ -175,7 +203,11 @@
       <tr><td><code>GHOST_STT_MAX_TOKENS</code></td><td><code>2048</code></td><td>Gemma path only (Whisper has no token budget). Must clear the thinking-token budget — see the trap below.</td></tr>
       <tr><td><code>GHOST_TTS_VOICE</code></td><td><code>Ava (Premium)</code> (en_US, female)</td><td>Any installed <code>say</code> voice — list with <code>say -v '?'</code> (187 on this box). Ava is a <strong>neural</strong> voice, audibly more natural than the compact synthesiser behind every other name here. <strong>It is not stock macOS</strong>: it is a ~1&nbsp;GB download via System&nbsp;Settings → Accessibility → Spoken&nbsp;Content → System&nbsp;Voice → <em>Manage Voices…</em> (the entry sits at the bottom of the voice dropdown itself, not beside it). The <code>(Premium)</code> suffix is part of the name and must be exact — bare <code>Ava</code> is a separate compact voice installed alongside it, so a dropped suffix downgrades quality without erroring. Measured 2026-08-03: 0.58s for a two-sentence chunk vs 0.48s for Samantha, i.e. no meaningful latency cost. Other verified options: <code>Samantha</code> (en_US, present on every macOS), <code>Sandy (English (UK))</code>, <code>Karen</code> (en_AU), <code>Moira</code> (en_IE). An unavailable name never kills speech: if <code>say</code> exits non-zero, synthesis retries with no <code>-v</code> at all, landing on the system default, and logs a warning naming the cause. ⚠ On macOS&nbsp;27 an unknown name does <em>not</em> exit non-zero, so <code>say</code> itself silently uses a default voice (see <code>GHOST_TTS_VOICE_EL</code>).</td></tr>
       <tr><td><code>GHOST_TTS_VOICE_EL</code></td><td><code>Melina</code> (el_GR, stock macOS)</td><td>The voice for <strong>Greek</strong> text (2026-11-02). Ava cannot read Greek script, so Greek replies used to be spoken by an English voice. <code>tts_voice_for()</code> picks a voice per <code>/api/tts</code> chunk. A chunk is usually one sentence, but the end of a streamed reply can arrive as one larger chunk, which then gets one voice. The rule counts <em>words</em> (tokens with at least 2 letters) after dropping URLs, which app.js leaves in the text. A Greek word has at least 2 Greek letters. The rule picks this voice when a chunk has at least 2 Greek words, or when Greek words are at least 30&nbsp;% of its words. It leans Greek on purpose: Melina reading an English name only sounds accented, while Ava reading Greek can't be understood. So "In Greek, good morning is καλή μέρα." is spoken by Melina, while symbols like μ, σ², Ω and ΔG in English maths don't count. A chunk with no words (<code>2.</code>, <code>19°C</code>) uses <code>GHOST_TTS_VOICE</code>. The choice depends on nothing else, so clients never affect each other. Empty turns the switch off. ⚠ On macOS&nbsp;27, <code>say -v &lt;unknown name&gt;</code> exits 0 and quietly uses a default voice, so a typo in either voice variable produces the wrong voice and no warning. The fallback below only fires when <code>say</code> exits non-zero. Check names with <code>say -v '?'</code>. Pins: <code>tests/test_interface_voice.py</code> (Greek voice block).</td></tr>
-      <tr><td><code>GHOST_TTS_RATE</code></td><td>voice default</td><td>Words per minute.</td></tr>
+      <tr><td><code>GHOST_TTS_RATE</code></td><td>voice default</td><td>Words per minute, <code>say</code> only.</td></tr>
+      <tr><td><code>GHOST_TTS_URL</code></td><td>empty (<code>say</code> for everything)</td><td>§4TK: base URL of <code>tts-service</code>. Production: <code>http://100.64.0.11:8096</code>, exported by the client launcher. With it set, <code>GHOST_TTS_VOICE</code> speaks only when the service fails.</td></tr>
+      <tr><td><code>GHOST_TTS_KEY_FILE</code></td><td><code>~/Data/AI/.tts_service_key</code></td><td>The key shared with the service.</td></tr>
+      <tr><td><code>GHOST_TTS_REMOTE_TIMEOUT_S</code> / <code>GHOST_TTS_CONNECT_TIMEOUT_S</code></td><td><code>15</code> / <code>2</code></td><td>Per-phase limits on the service call. The connect limit is what a powered-off nova costs before <code>say</code> takes over.</td></tr>
+      <tr><td><code>GHOST_TTS_RETRY_S</code></td><td><code>30</code></td><td>How long a service failure sends speech straight to <code>say</code>.</td></tr>
       <tr><td><code>GHOST_TTS_MAX_CHARS</code></td><td><code>2000</code></td><td>Per-request text cap; <code>app.js</code> already chunks replies.</td></tr>
       <tr><td><code>GHOST_FFMPEG_BIN</code> / <code>GHOST_FFPROBE_BIN</code> / <code>GHOST_SAY_BIN</code></td><td>auto-resolved</td><td>Absolute-path overrides. Normally unnecessary — see the launchd PATH trap below.</td></tr>
     </tbody>
@@ -249,6 +281,7 @@
   silence vs failure, duration cap, argv-injection resistance, dead-host regression guard.
   The TTS content-type test in <code>tests/test_interface_review_fixes.py</code> was replaced:
   the Pi passthrough it guarded is gone by design.</p>
+  <p><code>tests/test_tts_service.py</code> — §4TK: the service's HTTP layer and key, its log and answers staying free of reply text, the fallback table above, the skip window, and the route passing its client.</p>
   <p>Four guards added 2026-08-03, all aimed at the same failure mode — <strong>speech that keeps
   working while quietly using the wrong voice</strong>, which no ordinary assertion catches because
   the endpoint still returns <code>200</code> and valid audio:</p>

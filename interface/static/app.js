@@ -1,10 +1,15 @@
-import * as matrixGraphFace from './matrix_graph.js?v=18.8';
+import * as matrixGraphFace from './matrix_graph.js?v=19.12';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
+import { createBargeIn, isStopWord } from './bargein.js?v=1.5';   // talk over a spoken reply
 
 // --- Voice Globals ---
 let isTTSActive = false;
+// The speaker button's setting, kept per browser. isTTSActive is what the current reply does,
+// decided when a turn is sent: the setting, or on for a turn sent from the mic. A page load or
+// a press during a reply leaves it alone, so speech never starts part-way through a reply.
+let speakReplies = false;
 let ttsTextQueue = [];
 let ttsAudioQueue = [];
 let isFetchingTTS = false;
@@ -12,6 +17,29 @@ let isPlayingTTS = false;
 let audioCtx = null;
 let currentAudioSource = null;
 let ttsBuffer = "";
+// Talking over a reply (bargein.js). _speechCut: the operator interrupted the reply text
+// now on the stream, so the rest of it is not spoken. A retract removes that text, and
+// with it the cut: what follows is new. _voiceSession: the last
+// message was spoken, the only time the microphone opens by itself. _bargeHold: the
+// reply is paused while we find out whether that was words.
+let _speechCut = false;
+// A resume replays the stream from the start, retracts included. _streamChars counts the
+// content received on this pass and _replayUpTo the most any earlier pass got to: at or
+// behind that, nothing is new. _replayHadText: reply text was on the stream when it broke.
+let _streamChars = 0, _replayUpTo = 0, _replayHadText = false;
+let _speechOffSeq = 0;   // the speaker button was turned off: spoken messages waiting lose that
+let _voiceSession = false;
+let _bargeHold = false;
+let _bargeToken = 0;
+let _bargePrefUnsaved = null;   // the switch, when storage refuses to hold it
+let _bargeFalseStarts = 0;
+let _bargeOffThisReply = false;
+let _bargeOffThisPage = false;
+let _bargeGraceTimer = null;
+let _bargeIn = null;   // made below, where the mic button is known
+let _bargeWatchdog = null;
+let _micSpokenIn = null;     // the same, for the mic button
+let _bargeSpokenIn = null;   // {sid, epoch} of the conversation the words were spoken in
 let mediaRecorder;
 let audioChunks = [];
 
@@ -378,7 +406,6 @@ let currentSpeechHold = false;
 // available when durable sessions are off. See `_resolveOwnTurnId`.
 let _lastSentUserText = '';
 let currentThinkingInterval = null;
-let currentTTSMutedLength = 0;
 // When this turn was SENT (ms). The clock under the bubble counts from it, and
 // the in-flight handle carries it, so a reattach after the phone suspended the
 // page (or iOS reloaded it) keeps counting instead of restarting at 0:00.
@@ -1266,7 +1293,7 @@ function renderEmptyStateHero() {
     sub.className = 'empty-hero-sub';
     sub.textContent = window.matchMedia('(pointer: coarse)').matches
         ? 'Ask anything'
-        : 'Ask anything · ⌘K for commands';
+        : 'Ask anything';
 
     hero.appendChild(title);
     hero.appendChild(rule);
@@ -2021,11 +2048,15 @@ function _revealAgentBubble(div) {
 // Returns whether anything was dropped.
 function _applyStreamRetract() {
     if (currentAccumulatedContent === "") return false;
-    stopTTS();
+    // An old retract on the replay already happened: what is playing now came after it.
+    if (_streamChars >= _replayUpTo) {
+        stopTTS();
+        ttsBuffer = "";          // reasoning open in the retracted text went with it
+        _speechCut = false;
+    }
     currentAccumulatedContent = "";
     currentStreamPrefixLen = 0;
     currentSpeechHold = false;
-    currentTTSMutedLength = 0;
     _cancelScheduledStreamRender();
     if (currentAgentMessageDiv) currentAgentMessageDiv.innerHTML = "";
     return true;
@@ -2691,9 +2722,12 @@ async function resumeOrReconcileInflightTurn() {
             // B, reproduced). Dropping the orphan and re-saving under THIS
             // tab makes the heartbeat and all four terminal paths work.
             clearInflightHandle(h);
+            // Another tab's turn: what this page said and cut belongs to its own last one.
+            if (currentTaskId !== h.taskId) _forgetTurnSpeech();
             currentTaskId = h.taskId;
             currentTurnStartedAt = _turnStartFromHandle(h);
             currentChunkIndex = 0;
+            _noteStreamReplay();
             currentAccumulatedContent = "";
             currentStreamPrefixLen = 0;
             currentSpeechHold = false;
@@ -3745,14 +3779,22 @@ function _holdForAfterTurn(it) {
     _drainSendAfterTurn();
 }
 
-async function _sendWhileBusy() {
+async function _sendWhileBusy(spoken = false) {
     const text = chatInput.value.trim();
     if (!text || text === '/clear') return;     // /clear needs an idle composer
     chatInput.value = '';
     chatInput.style.height = '';
     const seq = ++_queuedSeq, gen = _turnGen, sid = _queuedSid(), epoch = _convEpoch;
     const div = _queuedBubble(text, 'sending…');
-    const item = { text, div, seq, gen, sid, epoch };
+    const item = { text, div, seq, gen, sid, epoch, spoken, offSeq: _speechOffSeq };
+    if (spoken) {
+        // An inbox message the turn never read comes back as text alone.
+        const turn = _turnInfo.get(gen);
+        if (turn) {
+            (turn.spokenTexts = turn.spokenTexts || new Set()).add(text);
+            turn.spokenOffSeq = _speechOffSeq;
+        }
+    }
     if (!sid) { _holdForAfterTurn(item); return; }   // no inbox without a session id
     let data = null;
     try {
@@ -3788,6 +3830,7 @@ async function _sendWhileBusy() {
     }
     if (path === 'cancel') {
         div.remove();
+        if (gen === _turnGen) _endVoiceSession();   // a late answer is another turn's
         const undelivered = Array.isArray(data.undelivered) ? data.undelivered : [];
         if (gen === _turnGen && info && !info.ended && isProcessingRequest && currentChatController) {
             _inboxStopUndelivered = undelivered;      // read by the Stop path
@@ -3958,7 +4001,9 @@ async function _settleQueuedTurnNow(info, gen, undeliveredP, mode) {
                 : `'${word}' was typed during the turn, so nothing of it is sent on its own.`, sid);
         } else {
             const seqs = _leftoverSeqs(info, leftovers);
-            const resend = leftovers.map((text, i) => ({ text, div: null, seq: seqs[i], gen, sid, epoch: info ? info.epoch : _convEpoch }));
+            const resend = leftovers.map((text, i) => ({ text, div: null, seq: seqs[i], gen, sid, epoch: info ? info.epoch : _convEpoch,
+                spoken: !!(info && info.spokenTexts && info.spokenTexts.has(text)),
+                offSeq: info ? info.spokenOffSeq : undefined }));
             const at = _sendAfterTurn.findIndex(q => q.gen === gen);
             const mine = [..._sendAfterTurn.filter(q => q.gen === gen), ...resend].sort((a, b) => a.seq - b.seq);
             _sendAfterTurn = _sendAfterTurn.filter(q => q.gen !== gen);
@@ -4018,6 +4063,8 @@ function _drainSendAfterTurn() {
         // late inbox answer can land between this settle and the next turn's
         // record — an `await` added before it would reopen that window (the
         // late branch then finds no turn of the session and trays the chain).
+        if (it.spoken && it.offSeq === _speechOffSeq) spokenTurnSpeech();
+        else typedTurnSpeech(false);
         sendMessage(false, it.text);
         return;
     }
@@ -4075,6 +4122,13 @@ async function sendMessage(isResume = false, queuedText = null) {
     // both fire on the same visibilitychange — the second replay wiped
     // the first's accumulator and double-pushed the assistant message.
     if (resuming && isProcessingRequest) return;
+    if (!resuming) {
+        // A new reply: it may speak, and the microphone gets a fresh start.
+        _speechCut = false;
+        ttsBuffer = "";
+        _bargeFalseStarts = 0;
+        _bargeOffThisReply = false;
+    }
 
     if (text === '/clear' && !resuming) {
         _convEpoch += 1;                 // §4RZ: nothing held is sent into the new conversation
@@ -4127,13 +4181,16 @@ async function sendMessage(isResume = false, queuedText = null) {
             chatInput.style.height = ''; // Clear inline height → rows="1" takes over
         }
         const _userDiv = addMessage('user', text);
-        
+
         currentTaskId = null;
         currentTurnStartedAt = Date.now();
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
         currentStreamPrefixLen = 0;
         currentSpeechHold = false;
+        _streamChars = 0;                // a resume's count belongs to the turn it resumed
+        _replayUpTo = 0;
+        _replayHadText = false;
         currentReqId = null;
         currentTurnUnlabelable = false;
         tokenCounter.startTurn();        // the last turn's numbers are not this one's
@@ -4150,7 +4207,7 @@ async function sendMessage(isResume = false, queuedText = null) {
         _lastSentUserText = text;
         if (typeof saveChatState === 'function') saveChatState();
         if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
-        
+
         // Render a CSS-driven typing indicator (three staggered dots) so
         // the waiting state reads as deliberate UX rather than text poke.
         // The setInterval-based "Thinking.".repeat() version flickered on
@@ -4244,7 +4301,7 @@ async function sendMessage(isResume = false, queuedText = null) {
 
         let response;
         if (resuming && currentTaskId) {
-            currentTTSMutedLength = currentAccumulatedContent.length;
+            _noteStreamReplay();
             currentAccumulatedContent = "";
             currentStreamPrefixLen = 0;
             currentSpeechHold = false;
@@ -4395,33 +4452,34 @@ async function sendMessage(isResume = false, queuedText = null) {
                             // the first VISIBLE character instead.
                         }
 
+                        _streamChars += chunkContent.length;
                         currentAccumulatedContent += chunkContent;
                         if (data.ghost && data.ghost.stream_prefix === true) {
                             currentStreamPrefixLen = currentAccumulatedContent.length;
                         }
 
                         // --- Voice Intercept Logic ---
-                        if (isTTSActive && !currentSpeechHold && currentAccumulatedContent.length > currentTTSMutedLength) {
+                        if (isTTSActive && !currentSpeechHold && _streamChars > _replayUpTo) {
                             ttsBuffer += chunkContent;
-                            
+
                             let openThink = ttsBuffer.lastIndexOf('<think>') > ttsBuffer.lastIndexOf('</think>');
                             let openTool = ttsBuffer.lastIndexOf('<tool_call') > ttsBuffer.lastIndexOf('</tool_call>');
-                            
+
                             if (!openThink && !openTool) {
                                 // Strip markdown, XML tags, and reasoning blocks
                                 let cleanBuffer = ttsBuffer.replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
-                                
+
                                 // Find natural sentence boundaries
                                 let boundaryMatch = cleanBuffer.match(/([.?!;]+[\s]+)/);
                                 if (boundaryMatch) {
                                     let splitIndex = boundaryMatch.index + boundaryMatch[0].length;
                                     let sentence = cleanBuffer.substring(0, splitIndex).trim();
-                                    
+
                                     // Only queue if it contains actual words or numbers
                                     if (/[\p{L}\p{N}]/u.test(sentence)) {
                                         queueTTS(sentence);
                                     }
-                                    
+
                                     ttsBuffer = cleanBuffer.substring(splitIndex); // Keep remainder
                                 }
                             }
@@ -4577,7 +4635,7 @@ async function sendMessage(isResume = false, queuedText = null) {
         } else {
             _turnOutcome = 'unknown';    // §4RZ: a failed request — the page cannot tell how the turn ended
             if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
-            
+
             const errMsg = e.message.toLowerCase();
             // §4PR: only a turn that EXISTS can be resumed. A POST that never
             // reached the server (proxy down, Wi-Fi off) has no task id, and
@@ -4709,8 +4767,9 @@ async function sendMessage(isResume = false, queuedText = null) {
             }
         }
 
-        if (isTTSActive && ttsBuffer.trim().length > 0) {
-            let finalClean = ttsBuffer.replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "").trim();
+        // A resume is coming: it continues this half sentence, so it isn't said in halves.
+        if (isTTSActive && ttsBuffer.trim().length > 0 && !_turnStillLive) {
+            let finalClean = ttsBuffer.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "").trim();
             if (/[\p{L}\p{N}]/u.test(finalClean)) queueTTS(finalClean);
             ttsBuffer = "";
         }
@@ -4759,11 +4818,30 @@ async function sendMessage(isResume = false, queuedText = null) {
     }
 }
 
-// A TYPED message leaves voice mode: if you're at a keyboard you're reading,
-// not listening. The mic path (which sets isTTSActive) deliberately calls
-// sendMessage() directly so a spoken turn still gets a spoken reply.
+// A TYPED message goes back to the speaker button's setting: a mic turn's speech
+// ends here unless the button is on. After a reload this send may be the first
+// gesture the page has seen, which is what audio needs to play.
+function typedTurnSpeech(byOperator = true) {
+    _voiceSession = false;
+    // The operator typed: that takes over. A held message going out on its own is no
+    // reason to drop what the operator is saying.
+    if (byOperator) _bargeCancel();
+    if (isTTSActive && !speakReplies) stopTTS();
+    isTTSActive = speakReplies;
+    showSpeechState();
+    if (speakReplies) unlockAudio();
+}
+
+// A message from the microphone gets a spoken reply, whatever the button says.
+function spokenTurnSpeech() {
+    _voiceSession = true;
+    isTTSActive = true;
+    showSpeechState();
+}
+
 function sendTypedMessage() {
-    isTTSActive = false;
+    if (!chatInput.value.trim()) return;   // nothing sent: speech and the microphone carry on
+    typedTurnSpeech();
     sendMessage();
 }
 
@@ -4771,6 +4849,7 @@ if (interruptBtn) interruptBtn.addEventListener('click', () => { interruptRunnin
 
 sendBtn.addEventListener('click', () => {
     if (isProcessingRequest && currentChatController) {
+        _endVoiceSession();
         currentChatController.abort();
         toggleSendButtonUI(false);
     } else if (!isProcessingRequest) {
@@ -4932,26 +5011,26 @@ if (workspaceSaveBtn) {
                 // trajectory scan — guaranteed 404s.
                 body: JSON.stringify({ chat_history: chatHistory.map(toWireMessage) })
             });
-            
+
             if (!response.ok) throw await _httpError(response, 'Save failed');
-            
+
             const blob = await response.blob();
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            
+
             let filename = `workspace_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`;
             const disposition = response.headers.get('content-disposition');
             if (disposition && disposition.indexOf('filename=') !== -1) {
                 filename = disposition.split('filename=')[1].replace(/["']/g, '');
             }
-            
+
             a.download = filename;
             document.body.appendChild(a);
             a.click();
             a.remove();
             window.URL.revokeObjectURL(url);
-            
+
             // An INCOMPLETE archive must not read as a clean save (§4GK
             // round 5). The agent sets X-Ghost-Archive-Omitted: N when N
             // files could not be read and are therefore NOT in the zip;
@@ -4981,7 +5060,7 @@ if (workspaceUploadInput) {
         const file = e.target.files[0];
         if (!file) return;
         workspaceUploadInput.value = '';
-        
+
         isProcessingRequest = true;
         activeFace.setWorkingState(true);
         // The composer must SHOW the busy state: without this the
@@ -4990,21 +5069,21 @@ if (workspaceUploadInput) {
         // is silently ignored (R2 lens B).
         toggleSendButtonUI(true, false);   // no AbortController here
         addMessage('system', `Loading workspace from ${file.name}...`);
-        
+
         const formData = new FormData();
         formData.append('file', file);
-        
+
         try {
             const response = await fetch('/api/workspace/load', {
                 method: 'POST',
                 body: formData
             });
-            
+
             if (!response.ok) throw await _httpError(response, 'Load failed');
-            
+
             const result = await response.json();
             if (result.error) throw new Error(result.error);
-            
+
             // Shape-validate like the bridge setter does: a non-array here
             // makes the next `chatHistory.push` throw BEFORE sendMessage's
             // try block, killing the composer with a console-only error.
@@ -5292,8 +5371,25 @@ function _sendComposed(text) {
     return p;
 }
 
+// Words from the microphone. While a turn runs they go to that turn, as Enter does;
+// the old path left them in the composer, which is no use to someone talking.
+function _sendVoice(text) {
+    if (isProcessingRequest && currentChatController) {
+        const draft = chatInput.value;
+        chatInput.value = text;
+        const sent = _sendWhileBusy(true);   // takes the text before its first await
+        chatInput.value = draft;
+        if (draft.trim()) {
+            try { chatInput.dispatchEvent(new Event('input')); } catch (e) { /* stub */ }
+        }
+        return sent;
+    }
+    return _sendComposed(text);
+}
+
 async function confirmUploadAsk() {
     if (!pendingUpload || isProcessingRequest) return;
+    typedTurnSpeech();     // here, while the click still counts as a gesture
     const { file, storedName } = pendingUpload;
     const question = uploadAskInput ? uploadAskInput.value : '';
     closeUploadAsk();
@@ -5732,7 +5828,7 @@ if (renderDownloadBtn) {
             if (ext === 'html') mimeType = 'text/html;charset=utf-8';
             else if (ext === 'css') mimeType = 'text/css;charset=utf-8';
             else if (ext === 'javascript' || ext === 'js') mimeType = 'application/javascript;charset=utf-8';
-            
+
             const blob = new Blob([currentRenderState.content], { type: mimeType });
             const url = URL.createObjectURL(blob);
             triggerDownload(url, filename);
@@ -5777,7 +5873,7 @@ renderZoomOut.addEventListener('click', () => {
         // Ignore clicks on buttons inside the header
         if (e.target.closest('.render-btn')) return;
         isDragging = true;
-        
+
         const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
         const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
 
@@ -5852,7 +5948,7 @@ renderZoomOut.addEventListener('click', () => {
 
     function onResizeStart(e) {
         isResizing = true;
-        
+
         const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
         const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
 
@@ -6485,28 +6581,54 @@ window.addEventListener('pagehide', (e) => {
 
 // --- TTS Engine ---
 const ttsToggleBtn = document.getElementById('tts-toggle-btn');
-if (ttsToggleBtn) {
-    ttsToggleBtn.addEventListener('click', () => {
-        isTTSActive = !isTTSActive;
-        ttsToggleBtn.classList.toggle('active', isTTSActive);
-        
-        if (isTTSActive) {
-            // UNLOCK BROWSER AUTOPLAY via Web Audio API
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            if (audioCtx.state === 'suspended') {
-                audioCtx.resume();
-            }
-            // Play a silent buffer to explicitly register user interaction with Apple WebKit
-            const silentBuffer = audioCtx.createBuffer(1, 1, 22050);
-            const silentSource = audioCtx.createBufferSource();
-            silentSource.buffer = silentBuffer;
-            silentSource.connect(audioCtx.destination);
-            silentSource.start(0);
-        } else {
-            stopTTS();
+const SPEAK_REPLIES_KEY = 'ghost-speak-replies';
+
+// Lit for the setting, and from a mic turn until the next typed message.
+function showSpeechState() {
+    if (!ttsToggleBtn) return;
+    const on = isTTSActive || speakReplies;
+    const text = on ? 'Spoken replies on' : 'Spoken replies off';
+    ttsToggleBtn.classList.toggle('active', on);
+    ttsToggleBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    ttsToggleBtn.setAttribute('aria-label', text);
+    ttsToggleBtn.title = text;
+}
+
+// Best effort: a browser that refuses audio must not stop the message being sent.
+function unlockAudio() {
+    try {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
+        if (audioCtx.state !== 'running') {     // iOS also has 'interrupted'
+            audioCtx.resume();
+        }
+        // Play a silent buffer to explicitly register user interaction with Apple WebKit
+        const silentBuffer = audioCtx.createBuffer(1, 1, 22050);
+        const silentSource = audioCtx.createBufferSource();
+        silentSource.buffer = silentBuffer;
+        silentSource.connect(audioCtx.destination);
+        silentSource.start(0);
+    } catch (_) { /* the next gesture tries again */ }
+}
+
+if (ttsToggleBtn) {
+    try { speakReplies = localStorage.getItem(SPEAK_REPLIES_KEY) === '1'; } catch (_) { /* stays off */ }
+    showSpeechState();
+    ttsToggleBtn.addEventListener('click', () => {
+        // From what the button shows: lit by a mic turn, a press means stop.
+        speakReplies = !(isTTSActive || speakReplies);
+        try { localStorage.setItem(SPEAK_REPLIES_KEY, speakReplies ? '1' : '0'); } catch (_) { /* this page only */ }
+        if (speakReplies) {
+            if (!isProcessingRequest) isTTSActive = true;   // otherwise from the next reply
+            unlockAudio();
+        } else {
+            isTTSActive = false;
+            stopTTS();
+            _bargeCancel();
+            _speechOffSeq += 1;
+        }
+        showSpeechState();
     });
 }
 
@@ -6523,7 +6645,8 @@ function stopTTS() {
     }
     ttsTextQueue = [];
     ttsAudioQueue = [];
-    ttsBuffer = "";
+    // Reasoning may still be open, and a resume needs to know it for what comes next.
+    ttsBuffer = _openMarkupTail(ttsBuffer);
     if (currentAudioSource) {
         try { currentAudioSource.stop(); } catch(e) {}
         try { currentAudioSource.disconnect(); } catch(e) {}
@@ -6535,13 +6658,17 @@ function stopTTS() {
     // Kill the analyser rAF loop and reset the sphere's audio level so
     // it decays immediately instead of drifting after a stop.
     if (typeof _stopTTSAudioPump === 'function') _stopTTSAudioPump();
+    _bargeArmGrace();
 }
 
 // Bumped by stopTTS. Every await inside the TTS pipeline re-checks it, so
 // an interrupted clip cannot resurrect itself after the queue was cleared.
 let _ttsGeneration = 0;
+let _ttsRefusalShown = false;
+let _ttsPlayViaContext = false;
 
 function queueTTS(text) {
+    if (_speechCut) return;   // every sentence of a reply comes through here
     ttsTextQueue.push(text);
     processTTSFetch();
 }
@@ -6561,13 +6688,13 @@ async function processTTSFetch() {
         });
         if (gen !== _ttsGeneration) {
             // stopTTS ran while this was in flight. Anything we do now
-            // speaks over whatever replaced it.
-            isFetchingTTS = false;
+            // speaks over whatever replaced it. stopTTS already cleared
+            // isFetchingTTS, and it may be the newer fetch's flag by now.
             return;
         }
         if (res.ok) {
             let blob = await res.blob();
-            if (gen !== _ttsGeneration) { isFetchingTTS = false; return; }
+            if (gen !== _ttsGeneration) return;
             let audioUrl = URL.createObjectURL(blob);
             ttsAudioQueue.push(audioUrl);
             if (!isPlayingTTS) playNextAudio();
@@ -6582,10 +6709,11 @@ async function processTTSFetch() {
     } catch (e) {
         console.error("TTS Fetch Error:", e);
     }
-    
+
+    if (gen !== _ttsGeneration) return;
     isFetchingTTS = false;
     // Recursively fetch the next chunk while audio is playing
-    if (gen === _ttsGeneration && ttsTextQueue.length > 0) {
+    if (ttsTextQueue.length > 0) {
         processTTSFetch();
     }
 }
@@ -6684,22 +6812,37 @@ function _stopMicAudioPump() {
 }
 
 function playNextAudio() {
-    if (isPlayingTTS || ttsAudioQueue.length === 0) return;
+    // Not while the mic button is held: that recording has no echo cancellation, so the
+    // reply would land in the transcript. The release plays what waited.
+    if (_bargeHold || isRecording || _micPressHeld || isPlayingTTS || ttsAudioQueue.length === 0) return;
     isPlayingTTS = true;
+    _bargeListen();
 
     let audioUrl = ttsAudioQueue.shift();
+    const gen = _ttsGeneration;
 
-    currentAudioSource = new Audio(audioUrl);
-
+    // A clip that cannot load reports it twice, and the second call would start another clip.
+    let clipOver = false;
     const cleanupAndNext = () => {
+        if (clipOver) return;
+        clipOver = true;
         URL.revokeObjectURL(audioUrl);
         isPlayingTTS = false;
         // Only halt the pump when the queue is fully drained — back-to-back
         // clips should keep the visualizer hot without resetting to 0.
         if (ttsAudioQueue.length === 0) _stopTTSAudioPump();
         playNextAudio();
+        if (!isPlayingTTS) _bargeArmGrace();
     };
 
+    if (_ttsPlayViaContext) {
+        currentAudioSource = _bufferClip(audioUrl, cleanupAndNext);
+        currentAudioSource.play();
+        _startTTSAudioPump();
+        return;
+    }
+
+    currentAudioSource = new Audio(audioUrl);
     currentAudioSource.onended = cleanupAndNext;
     currentAudioSource.onerror = cleanupAndNext;
 
@@ -6723,9 +6866,372 @@ function playNextAudio() {
     }
 
     currentAudioSource.play().catch(e => {
+        // Paused for the operator before it began: the resume plays it.
+        if (e && e.name === 'AbortError' && _bargeHold) return;
         console.error("Audio playback rejected:", e);
+        if (gen !== _ttsGeneration) {     // stopped meanwhile: this clip is over
+            URL.revokeObjectURL(audioUrl);
+            return;
+        }
+        if (e && e.name === 'NotAllowedError' && audioCtx) {
+            // iOS can refuse a new element started seconds after the tap. The context
+            // the tap unlocked can still play, so this clip and the rest go through it.
+            _ttsPlayViaContext = true;
+            currentAudioSource.onended = currentAudioSource.onerror = null;
+            currentAudioSource = _bufferClip(audioUrl, cleanupAndNext);
+            currentAudioSource.play();
+            return;
+        }
+        if (e && e.name === 'NotAllowedError') _showAudioRefused();
         cleanupAndNext();
     });
+}
+
+function _showAudioRefused() {
+    if (_ttsRefusalShown) return;
+    _ttsRefusalShown = true;   // a lit button and silence would explain nothing
+    addMessage('system', "🔊 The reply's voice could not play. Press the speaker button off and on to try again.");
+}
+
+// One clip played by the AudioContext, with the calls the speech code makes on an
+// <audio> element: play, pause (keeps the place, for talking over a reply), and the
+// stop and disconnect stopTTS makes. stop never calls onended, as a paused element doesn't.
+function _bufferClip(audioUrl, onDone) {
+    let buffer = null, source = null, timer = null;
+    let wanted = false, over = false, offset = 0, startedAt = 0;
+    const halt = () => {
+        clearTimeout(timer);
+        const s = source;
+        source = null;
+        if (!s) return;
+        try { s.stop(); } catch (_) { /* already ended */ }
+        try { s.disconnect(); } catch (_) { /* already gone */ }
+    };
+    const finish = () => {
+        if (over) return;
+        over = true;
+        halt();
+        clip.onended();
+    };
+    const fail = () => {
+        if (over) return;
+        _showAudioRefused();
+        finish();
+    };
+    // True once the context runs. A suspended one never ends a clip, and iOS suspends it for a call.
+    const running = async () => {
+        if (audioCtx.state === 'running') return true;
+        await Promise.race([audioCtx.resume(), new Promise(r => setTimeout(r, 1000))]);
+        return audioCtx.state === 'running';
+    };
+    // Nothing else notices an end that never arrives: the queue would wait on this clip for good.
+    const watch = (s) => {
+        const left = buffer.duration - offset - (audioCtx.currentTime - startedAt);
+        timer = setTimeout(async () => {
+            if (s !== source) return;
+            if (!await running()) { fail(); return; }
+            if (s !== source) return;
+            if (audioCtx.currentTime - startedAt + offset >= buffer.duration) finish();
+            else watch(s);     // it was suspended and carried on: the clock lost that time
+        }, Math.max(left, 0) * 1000 + 1500);
+    };
+    const begin = async () => {
+        if (over || !wanted || !buffer || source) return;
+        // Paused in the last moment of a clip: a source started past its end never ends.
+        if (offset >= buffer.duration) { finish(); return; }
+        if (!await running()) { fail(); return; }
+        if (over || !wanted || source) return;
+        const s = audioCtx.createBufferSource();
+        s.buffer = buffer;
+        s.connect(_ensureTTSAnalyser() || audioCtx.destination);
+        s.onended = () => { if (s === source) finish(); };     // pause and stop replaced it first
+        source = s;
+        startedAt = audioCtx.currentTime;
+        s.start(0, offset);
+        _ttsRefusalShown = false;
+        watch(s);
+    };
+    const clip = {
+        onended: onDone,
+        play() { wanted = true; begin(); return Promise.resolve(); },
+        pause() {
+            wanted = false;
+            if (source) offset += audioCtx.currentTime - startedAt;
+            halt();
+        },
+        stop() { over = true; halt(); },
+        disconnect() {},
+    };
+    fetch(audioUrl)
+        .then(res => res.arrayBuffer())
+        .then(bytes => audioCtx.decodeAudioData(bytes))
+        .then((decoded) => { buffer = decoded; return begin(); })
+        .catch((e) => {
+            console.error('Audio playback through the context failed:', e);
+            fail();
+        });
+    return clip;
+}
+
+// ── Talking over a reply ───────────────────────────────────────────────
+const BARGE_PREF_KEY = 'ghost-barge-in';
+// Silence after the reply before the microphone closes: a sentence gap must not
+// close it, and it lets the operator answer without pressing anything.
+const BARGE_GRACE_MS = 3000;
+// False starts in one reply before we stop listening: the microphone is hearing
+// the speakers, and a reply that keeps pausing is worse than one that can't be
+// interrupted by voice.
+const BARGE_MAX_FALSE_STARTS = 3;
+// The reply stays paused while this runs, so it is much shorter than STT's own limit.
+const BARGE_STT_TIMEOUT_MS = 30000;
+
+// Stop what is being said. Only reply text already on the stream stays cut: with none
+// yet, the operator interrupted nothing and the answer should still be heard.
+function _interruptSpeech() {
+    // While a resume catches up, the text it will replay is still on the stream.
+    if (_stripInternalTags(currentAccumulatedContent) || (_replayHadText && _streamChars < _replayUpTo)) _speechCut = true;
+    stopTTS();
+}
+
+function _forgetTurnSpeech() {
+    _streamChars = 0;
+    _replayUpTo = 0;
+    _replayHadText = false;
+    _speechCut = false;
+    ttsBuffer = "";
+}
+
+// The stream is about to replay from the start. Twice for one resume changes nothing.
+function _noteStreamReplay() {
+    _replayHadText = !!_stripInternalTags(currentAccumulatedContent) || (_replayHadText && _streamChars < _replayUpTo);
+    _replayUpTo = Math.max(_replayUpTo, _streamChars);
+    _streamChars = 0;
+}
+
+// The <think> or <tool_call this text ends inside, or nothing.
+function _openMarkupTail(text) {
+    const think = text.lastIndexOf('<think>');
+    if (think > text.lastIndexOf('</think>')) return text.slice(think);
+    const tool = text.lastIndexOf('<tool_call');
+    if (tool > text.lastIndexOf('</tool_call>')) return text.slice(tool);
+    return "";
+}
+
+// Words from the microphone, by either route. They are always kept: taken over or in
+// another conversation by now, they go to the tray.
+function _voiceWords(text, spokenIn, token) {
+    if (token !== _bargeToken) {
+        if (!isStopWord(text)) _restoreToComposer([text], 'You moved on while that was transcribed, so it was not sent.', spokenIn.sid);
+        return;
+    }
+    if (!_bargeIn.isCapturing()) _bargeHold = false;
+    _interruptSpeech();
+    if (_queuedSid() !== spokenIn.sid || _convEpoch !== spokenIn.epoch) {
+        _restoreToComposer([text], 'The conversation changed while you were talking, so it was not sent.', spokenIn.sid);
+        return;
+    }
+    // "stop" with nothing running ends the speech and is not a new message. With a
+    // turn running it goes to the turn, which stops.
+    if (isStopWord(text) && !isProcessingRequest) return;
+    // During a running turn, speech keeps to what the reply was already doing.
+    if (isProcessingRequest) _voiceSession = true;
+    else spokenTurnSpeech();
+    _sendVoice(text);
+}
+
+function _bargePrefOn() {
+    if (_bargePrefUnsaved !== null) return _bargePrefUnsaved;
+    try { return localStorage.getItem(BARGE_PREF_KEY) !== '0'; } catch (_) { return true; }
+}
+
+async function _openBargeMic(onFrame) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('no microphone access on this page');
+    }
+    // Unlike push-to-talk, echo cancellation is ON: this microphone is open while
+    // the speakers talk.
+    const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 },
+    });
+    let source = null, tap = null, mute = null;
+    try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // Not only 'suspended': iOS also reports 'interrupted', and either means no frames.
+        if (audioCtx.state !== 'running') audioCtx.resume();
+        const ctx = audioCtx;
+        source = ctx.createMediaStreamSource(stream);
+        tap = ctx.createScriptProcessor(2048, 1, 1);
+        // A processor only runs when connected to the output: through silence, so
+        // the microphone never reaches the speakers.
+        mute = ctx.createGain();
+        mute.gain.value = 0;
+        // Copied: the browser reuses this buffer for the next frame.
+        tap.onaudioprocess = (e) => onFrame(new Float32Array(e.inputBuffer.getChannelData(0)), ctx.sampleRate);
+        source.connect(tap);
+        tap.connect(mute);
+        mute.connect(ctx.destination);
+    } catch (error) {
+        stream.getTracks().forEach(track => track.stop());
+        throw error;
+    }
+    return {
+        close() {
+            tap.onaudioprocess = null;
+            try { source.disconnect(); tap.disconnect(); mute.disconnect(); } catch (_) { /* already gone */ }
+            stream.getTracks().forEach(track => track.stop());
+        },
+    };
+}
+
+function _bargeResume() {
+    _bargeHold = false;
+    if (micBtn && !isRecording) micBtn.classList.remove('recording');
+    if (isPlayingTTS && currentAudioSource) {
+        _bargeListen();
+        currentAudioSource.play().catch((e) => {
+            // Paused again before it started: that pause's resume plays it.
+            if (e && e.name === 'AbortError' && _bargeHold) return;
+            if (currentAudioSource && currentAudioSource.onended) currentAudioSource.onended();
+        });
+    } else {
+        playNextAudio();
+    }
+}
+
+function _bargeFalseStart() {
+    _bargeFalseStarts += 1;
+    if (_bargeFalseStarts >= BARGE_MAX_FALSE_STARTS && !_bargeOffThisReply) {
+        _bargeOffThisReply = true;
+        addMessage('system', '🎙️ The microphone seems to be hearing the speakers, so talking '
+            + 'over this reply is off until the next one. A wired headset avoids this; the mic button still works.');
+    }
+    _bargeResume();
+}
+
+async function _bargeTranscribe(wav, spokenIn) {
+    const token = _bargeToken;
+    let text = '', failed = true;
+    if (!isProcessingRequest) activeFace.setWorkingState(true);
+    try {
+        const form = new FormData();
+        form.append('file', new Blob([wav], { type: 'audio/wav' }), 'voice_record.wav');
+        const res = await fetch('/api/stt', { method: 'POST', body: form, signal: AbortSignal.timeout(BARGE_STT_TIMEOUT_MS) });
+        if (res.ok) {
+            const data = await res.json();
+            text = String(data.text || '').trim();
+            failed = false;
+        } else {
+            addMessage('system', (await _httpError(res, '🎙️ STT Error')).message);
+        }
+    } catch (err) {
+        addMessage('system', '🎙️ STT Upload Failed: ' + err.message);
+    }
+    if (!isProcessingRequest) activeFace.setWorkingState(false);
+    if (token !== _bargeToken) {
+        if (text) _voiceWords(text, spokenIn, token);
+        return;
+    }
+    if (failed) {      // says nothing about the room, so it is not a false start
+        _bargeResume();
+        return;
+    }
+    if (!text) {
+        // With the button held the operator is talking, so this says nothing about the room.
+        if (isRecording || _micPressHeld) _bargeResume();
+        else _bargeFalseStart();
+        return;
+    }
+    _voiceWords(text, spokenIn, token);
+}
+
+_bargeIn = createBargeIn({
+    openMic: _openBargeMic,
+    onListening: (on) => {
+        if (micBtn) micBtn.classList.toggle('barge-listening', on);
+        if (!on && _bargeWatchdog !== null) { clearInterval(_bargeWatchdog); _bargeWatchdog = null; }
+    },
+    onSpeechStart: () => {
+        _bargeHold = true;
+        _bargeSpokenIn = { sid: _queuedSid(), epoch: _convEpoch };
+        // Frames stop if the browser suspends audio, and only frames end an utterance.
+        _bargeWatchdog = setInterval(() => _bargeIn.finishIfStalled(), 500);
+        if (_bargeGraceTimer !== null) { clearTimeout(_bargeGraceTimer); _bargeGraceTimer = null; }
+        if (micBtn) micBtn.classList.add('recording');
+        if (isPlayingTTS && currentAudioSource) {
+            try { currentAudioSource.pause(); } catch (_) { /* carries on */ }
+        }
+    },
+    onShort: _bargeFalseStart,
+    onUtterance: (wav, reachedLimit) => {
+        if (micBtn) micBtn.classList.remove('recording');
+        if (reachedLimit) addMessage('system', '🎙️ That went on past the one-minute limit, so only the first minute was heard.');
+        _bargeTranscribe(wav, _bargeSpokenIn);
+    },
+    onMicError: (error) => {
+        _bargeOffThisPage = true;
+        console.warn('talking over a reply is off for this page:', error);
+        addMessage('system', '🎙️ No microphone to listen with while speaking, so a reply can only be '
+            + 'interrupted with the mic button on this page.');
+    },
+});
+
+function _bargeListen() {
+    if (_bargeGraceTimer !== null) { clearTimeout(_bargeGraceTimer); _bargeGraceTimer = null; }
+    if (_voiceSession && !_bargeOffThisReply && !_bargeOffThisPage && !isRecording && !_micPressHeld && _bargePrefOn()) {
+        _bargeIn.open();
+    } else if (!_bargeIn.isCapturing() && !_bargeHold) {
+        _bargeIn.close();
+    }
+}
+
+function _bargeArmGrace() {
+    if (!_bargeIn || _bargeGraceTimer !== null || _bargeIn.state() === 'closed') return;
+    _bargeGraceTimer = setTimeout(() => {
+        _bargeGraceTimer = null;
+        if (!isPlayingTTS && !_bargeHold && !_bargeIn.isCapturing()) _bargeIn.close();
+    }, BARGE_GRACE_MS);
+}
+
+// The operator took over some other way: nothing being listened to or transcribed
+// may act on the speech now. Whoever calls this decides what happens to the reply.
+function _bargeCancel(resume = true) {
+    if (!_bargeIn) return;
+    // Words already said go to the tray, as words still transcribing do: the token moves next.
+    _bargeIn.finishNow({ dropShort: true });
+    _bargeToken += 1;
+    if (_bargeGraceTimer !== null) { clearTimeout(_bargeGraceTimer); _bargeGraceTimer = null; }
+    _bargeIn.close();
+    if (_bargeHold) {
+        if (resume) {
+            _bargeResume();
+        } else {
+            _bargeHold = false;
+            if (micBtn) micBtn.classList.remove('recording');
+        }
+    }
+}
+
+// Stop, a new chat, another session: the conversation that asked for listening is over.
+function _endVoiceSession() {
+    _voiceSession = false;
+    _bargeCancel(false);
+    stopTTS();
+}
+
+function _toggleBargeIn() {
+    const on = !_bargePrefOn();
+    try {
+        localStorage.setItem(BARGE_PREF_KEY, on ? '1' : '0');
+        _bargePrefUnsaved = null;
+    } catch (_) {
+        _bargePrefUnsaved = on;      // storage refused: it holds for this page
+    }
+    if (on) _bargeOffThisPage = false;
+    else _bargeCancel();
+    addMessage('system', on
+        ? '🎙️ Talking over spoken replies is on. The microphone opens only while a reply to a voice message plays.'
+        : '🎙️ Talking over spoken replies is off. The mic button still interrupts.');
+    return on;
 }
 
 // --- Push-To-Talk Audio Engine (Mic) ---
@@ -6748,14 +7254,21 @@ if (micBtn) {
     };
     const _startRecordingHeld = async (e) => {
 
-        stopTTS(); // Full Duplex Interruption
+        // The press interrupts: nothing more of this reply is spoken, even if it is
+        // still streaming, or it would talk into the microphone that just opened.
+        // Words already said still count, so this is not _bargeCancel.
+        _bargeIn.finishNow();
+        _bargeIn.close();
+        _bargeHold = false;
+        if (micBtn) micBtn.classList.remove('recording');
+        _micSpokenIn = { sid: _queuedSid(), epoch: _convEpoch };
+        _interruptSpeech();
 
         // Voice in → voice out. Holding the mic is both the intent signal
         // ("I'm hands-free") and the user gesture browsers require before
-        // they will play audio, so we unlock autoplay HERE rather than
-        // behind a separate TTS button (the header has no room for one —
-        // see index.html). Typing a message switches speech back off.
-        isTTSActive = true;
+        // they will play audio, so we unlock autoplay HERE. Speech itself is
+        // switched on when the transcript is sent: a denied mic, a quick tap
+        // or an empty transcript is not a spoken turn.
         try {
             if (!audioCtx) {
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -6776,7 +7289,7 @@ if (micBtn) {
         }
 
         // iOS Safari can silently hang on getUserMedia — give it a 5s ceiling.
-        let permTimeout;
+        let permTimeout, micStream = null;
         try {
             const permPromise = navigator.mediaDevices.getUserMedia({
                 audio: {
@@ -6788,9 +7301,13 @@ if (micBtn) {
                 }
             });
             const timeoutPromise = new Promise((_, reject) => {
-                permTimeout = setTimeout(() => reject(new Error('Permission timeout')), 5000);
+                permTimeout = setTimeout(() => {
+                    // Granted later, this stream must not stay live with nobody using it.
+                    permPromise.then(s => s.getTracks().forEach(t => t.stop())).catch(() => {});
+                    reject(new Error('Permission timeout'));
+                }, 5000);
             });
-            const stream = await Promise.race([permPromise, timeoutPromise]);
+            const stream = micStream = await Promise.race([permPromise, timeoutPromise]);
             clearTimeout(permTimeout);
             if (!_micPressHeld) {
                 // released while the permission/stream was pending: no
@@ -6824,6 +7341,9 @@ if (micBtn) {
 
             mediaRecorder.onstop = async () => {
                 _stopMicAudioPump();
+                // Off now: the transcription below can take as long as the connection does.
+                stream.getTracks().forEach(track => track.stop());
+                const voiceToken = _bargeToken, spokenIn = _micSpokenIn;
                 const blobType = mediaRecorder.mimeType || chosenMime || 'audio/webm';
                 const audioBlob = new Blob(audioChunks, { type: blobType });
                 const ext = blobType.includes('mp4') || blobType.includes('aac') ? 'm4a'
@@ -6831,7 +7351,7 @@ if (micBtn) {
                 addMessage('system', '🎙️ Uploading audio for STT...');
                 const formData = new FormData();
                 formData.append('file', audioBlob, `voice_record.${ext}`);
-                
+
                 try {
                     // (Second orphaned updateActivityIcon call removed
                     // 2026-08-02 — see the upload path. This one was invisible
@@ -6843,11 +7363,11 @@ if (micBtn) {
                         method: 'POST',
                         body: formData
                     });
-                    
+
                     if (res.ok) {
                         const data = await res.json();
                         if (data.text) {
-                            _sendComposed(data.text);
+                            _voiceWords(data.text, spokenIn, voiceToken);
                         } else {
                             addMessage('system', '🎙️ STT transcribed nothing.');
                         }
@@ -6866,18 +7386,19 @@ if (micBtn) {
                 } catch (err) {
                     addMessage('system', '🎙️ STT Upload Failed: ' + err.message);
                 } finally {
-                    activeFace.setWorkingState(false);
+                    if (!isProcessingRequest) activeFace.setWorkingState(false);
                 }
-                
-                stream.getTracks().forEach(track => track.stop());
             };
-            
+
             mediaRecorder.start();
             isRecording = true;
             micBtn.classList.add('recording');
             addMessage('system', '🎙️ Recording started...');
         } catch (err) {
             clearTimeout(permTimeout);
+            // The recorder failed after the microphone opened.
+            if (micStream) micStream.getTracks().forEach(track => track.stop());
+            _stopMicAudioPump();
             let msg = err.message || String(err);
             if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
                 msg = 'Microphone access denied. On iOS check Settings > Safari > Microphone.';
@@ -6893,16 +7414,20 @@ if (micBtn) {
     const stopRecording = (e) => {
         if (e && e.cancelable) e.preventDefault();
         _micPressHeld = false;
-        if (!isRecording || !mediaRecorder) return;
-        
-        mediaRecorder.stop();
-        isRecording = false;
-        micBtn.classList.remove('recording');
+        if (isRecording && mediaRecorder) {
+            mediaRecorder.stop();
+            isRecording = false;
+            micBtn.classList.remove('recording');
+        }
+        playNextAudio();
     };
 
     micBtn.addEventListener('mousedown', startRecording);
-    micBtn.addEventListener('mouseup', stopRecording);
-    micBtn.addEventListener('mouseleave', stopRecording);
+    // Released anywhere, not on the button: other controls come and go beside it while
+    // a turn runs, and the button moving out from under the pointer ended the recording.
+    const releaseMouse = (e) => { if (_micPressHeld || isRecording) stopRecording(e); };
+    window.addEventListener('mouseup', releaseMouse);
+    window.addEventListener('blur', releaseMouse);
 
     // For mobile
     micBtn.addEventListener('touchstart', startRecording, {passive: false});
@@ -6937,11 +7462,14 @@ window.GhostCore = {
     dismissEmptyStateHero,
     activeFace,
     stopTTS,
+    toggleBargeIn: _toggleBargeIn,
+    endVoiceSession: _endVoiceSession,
     sendMessage,
     // Cancel THIS TAB's turn (resolving its request id first). Exposed so
     // the palette can stop a turn without the blind "whatever holds the
     // semaphore" cancel it used to issue (R3 lens B).
     cancelOwnTurn: (hard) => {
+        _endVoiceSession();
         if (currentChatController) { try { currentChatController.abort(); } catch (e) {} }
         return _cancelAgentTurn(currentReqId, _lastSentUserText, hard);
     },
@@ -6957,6 +7485,7 @@ window.GhostCore = {
     // Reset the visible conversation WITHOUT touching the session store —
     // the sessions module decides what happens next (new id, load, …).
     clearConversation: () => {
+        _endVoiceSession();
         chatLog.innerHTML = '';
         chatHistory = [];
         safeStorage.remove(_historyKey());
@@ -6991,7 +7520,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.3').catch(e => {
+import('./workspace.js?v=9.5').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

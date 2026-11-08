@@ -790,6 +790,7 @@ async def test_a_members_vision_arguments_are_allowlisted(monkeypatch, tmp_path,
     ({"prompt": "x", "reference_images": ["https://x/../../owner.jpg"]}, False),
     ({"prompt": "x", "reference_images": [{"path": "owner.jpg"}]}, False),
     ({"prompt": "x", "reference_images": ["gen_member1.png"]}, True),
+    ({"prompt": "x", "reference_images": ["gen_member1.png"], "keep_first": True}, True),
     ({"prompt": "a cat", "width": 512, "height": 512, "seed": 3}, True),
 ])
 async def test_a_members_image_arguments_are_allowlisted(monkeypatch, tmp_path, args, allowed):

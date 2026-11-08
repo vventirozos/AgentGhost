@@ -649,6 +649,9 @@ class MainWindow(QWidget):
 
         self.confirmer = commands.Confirmer()
         self.speech = SpeechChunker()
+        # The operator's key cut reply text already on the stream. A retract or a new turn ends it.
+        self._speech_cut = False
+        self._speech_waiting = []      # reply sentences that arrived during a recording
         self._voice_fault_shown = False
         self._agent_ok = None          # None until the first poll answers
         self._last_input_at = time.monotonic()
@@ -1061,6 +1064,8 @@ class MainWindow(QWidget):
         self._note_activity()
         # Barge-in: the agent stops talking when the operator starts. It used
         # to keep speaking, straight into the microphone it was recording.
+        if self.current_response_text and self._busy():
+            self._speech_cut = True
         self._silence()
         self.is_recording = True
         self._rec_started = time.monotonic()
@@ -1114,6 +1119,7 @@ class MainWindow(QWidget):
         self._discard_recording(path)
         self.set_face_mood("idle")
         self._note("recording discarded")
+        self._say_what_waited()
 
     def stop_recording(self):
         """Triggered when the PTT button is released."""
@@ -1125,6 +1131,7 @@ class MainWindow(QWidget):
         self.ptt_btn.setStyleSheet(chip_style())
         set_chip(self.ptt_btn, "mic", "Talk")
         self._stop_arecord()
+        self._say_what_waited()
         path, self._rec_path = self._rec_path, None
         if time.monotonic() - self._rec_started < PTT_MIN_S:
             # A slip of the key, not speech: nothing worth a transcription.
@@ -1686,9 +1693,17 @@ class MainWindow(QWidget):
         # still streaming must not start talking again into the open
         # microphone (it would be transcribed and sent back as the operator's
         # words).
-        if self.tts_enabled and not self.is_recording:
-            for sentence in sentences:
-                audio_queue.put_nowait(sentence)
+        if not self.tts_enabled or self._speech_cut:
+            return
+        if self.is_recording:       # said after the release, like the web client
+            self._speech_waiting.extend(sentences)
+            return
+        for sentence in sentences:
+            audio_queue.put_nowait(sentence)
+
+    def _say_what_waited(self):
+        waiting, self._speech_waiting = self._speech_waiting, []
+        self._say(waiting)
 
     async def send_chat_request(self):
         url = f"{AGENT_BASE}/api/chat"
@@ -1712,6 +1727,8 @@ class MainWindow(QWidget):
         self.update_chat_signal.emit("start_response", "")
         self.set_face_mood("think")
         self.speech = SpeechChunker()
+        self._speech_cut = False
+        self._speech_waiting = []
         started = time.monotonic()
         frame_rid = None          # the id the agent filed this turn under
         unlabelable = False
@@ -1777,6 +1794,7 @@ class MainWindow(QWidget):
                                         held.clear()
                                     elif self.current_response_text:
                                         self._silence()
+                                        self._speech_cut = False
                                         self.speech = SpeechChunker()
                                         self.update_chat_signal.emit("retract_response", "")
                                     continue

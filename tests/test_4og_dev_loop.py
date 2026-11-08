@@ -150,10 +150,12 @@ def test_chunked_pages_add_up_and_a_sample_read_is_not_a_receipt(tmp_path):
 def test_overlapping_ranged_reads_do_not_double_count(tmp_path):
     """Mutant G24: counting an overlap twice would let 1-150 + 100-200 of a
     300-line file (67 % seen) pass the 80 % floor as 84 %."""
-    (tmp_path / "o.py").write_text("".join(f"x{i} = {i}\n" for i in range(300)))
+    lines = [f"x{i} = {i}\n" for i in range(300)]
+    (tmp_path / "o.py").write_text("".join(lines))
     fs(tmp_path, operation="read", path="o.py", start_line=1, end_line=150)
     fs(tmp_path, operation="read", path="o.py", start_line=100, end_line=200)
-    assert abs(FS.read_coverage(tmp_path / "o.py") - 200 / 300) < 0.01
+    want = sum(map(len, lines[:200])) / sum(map(len, lines))    # §4TJ: coverage is by size
+    assert abs(FS.read_coverage(tmp_path / "o.py") - want) < 0.001
     assert getattr(fs(tmp_path, operation="write", path="o.py", content="x = 1\n"), "reason_code", None) == "unread_rewrite"
     fs(tmp_path, operation="read", path="o.py", start_line=200, end_line=260)
     assert FS.read_coverage(tmp_path / "o.py") >= 0.8

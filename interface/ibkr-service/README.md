@@ -60,13 +60,13 @@ To deploy, copy the four `.py` files to `app/` and run the `kickstart` line. If 
 
 | Data | Refreshed | Failure |
 |---|---|---|
-| Flex statement | Every 12 hours | Retried hourly; the last statement stays, marked |
+| Flex statement | Every 12 hours, and hourly while the statement is 1 to 4 days older than the last weekday (UTC, holidays not known) | Retried hourly; the last statement stays, marked |
 | Prices and FX | Every 15 minutes | Falls back to IBKR's close and statement rate after 4 days, or when the statement is newer |
 | 5-year history | Every 20 hours | Retried hourly, paused an hour after a 429; the last history stays, with its end date |
 
 ## Limits
 
-- Holdings update only from the statement, so a trade made today shows after the next one.
+- Holdings update only from the statement, which covers days already closed. A trade shows within an hour of IBKR publishing that day's statement. The one time this was observed, Friday's statement appeared between 04:23 and 07:04 UTC on Saturday.
 - Public prices are delayed and unofficial. A quote in the wrong currency or over 25% from IBKR's last price is rejected, and that holding's history goes unused too. This also rejects real moves that large until the next statement.
 - Yahoo sees the ticker symbols and this machine's IP address. It never sees quantities or cost.
 - `base_currency` only fills in when the statement has no base. It can't convert an account's figures.

@@ -55,6 +55,7 @@ _CARRIER = {
     "temperament.js": "matrix_graph.js",   # the face's inner state (2026-10-30)
     "effort.js": "app.js",          # §4RB
     "tokens.js": "app.js",          # token counter (2026-10-27)
+    "bargein.js": "app.js",         # talking over a spoken reply (2026-11-07)
     "turn_caption.js": "app.js",    # turn status line allowlist (2026-10-27)
     "workspace.js": "app.js",
     "sessions.js": "workspace.js",
@@ -71,6 +72,7 @@ _ANCESTORS = {
     "temperament.js": ["matrix_graph.js", "app.js"],
     "effort.js": ["app.js"],
     "tokens.js": ["app.js"],
+    "bargein.js": ["app.js"],
     "turn_caption.js": ["app.js"],
     "workspace.js": ["app.js"],
     "sessions.js": ["workspace.js", "app.js"],

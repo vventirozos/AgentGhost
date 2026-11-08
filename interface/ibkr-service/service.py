@@ -16,7 +16,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -271,12 +271,26 @@ class Service:
                 self.state.update(credentials_seen=seen, flex_due_now=True)
                 self._save()
 
+    def _statement_behind(self, now: float) -> bool:
+        """IBKR publishes a day's statement some time after that day ends, so a fetch can land just before it.
+        Older than the last weekday means a newer one is due. A market holiday only costs some hourly fetches.
+        Further behind than FLEX_STALE_DAYS, the date is not advancing (a fixed query period, a closed account),
+        so this stops and the 12-hour interval and the STALE label take over."""
+        report_date = (self.state.get("flex") or {}).get("report_date")
+        if not report_date or not isinstance(report_date, str):  # undated: a newer one could not be recognised either
+            return False
+        day = datetime.fromtimestamp(now, timezone.utc).date() - timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        return (day - timedelta(days=FLEX_STALE_DAYS)).isoformat() <= report_date < day.isoformat()
+
     def tick(self) -> None:
         cfg = self.config()
         self._note_new_credentials(cfg)
         now = self.clock()
         if self.token() and cfg.get("flex_query_id"):
-            due = now - self.state["flex_ok_at"] >= FLEX_EVERY and now - self.state["flex_try_at"] >= FLEX_RETRY
+            wanted = now - self.state["flex_ok_at"] >= FLEX_EVERY or self._statement_behind(now)
+            due = wanted and now - self.state["flex_try_at"] >= FLEX_RETRY
             if due or self.state["flex_due_now"]:
                 self.refresh_flex(cfg)
         if self.state.get("flex"):

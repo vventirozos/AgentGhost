@@ -186,8 +186,10 @@ def _mic_env():
 const handlers = {}; const msgs = []; let tracksStopped = 0; let started = 0;
 let resolveMedia;
 const micBtn = { addEventListener: (k, f) => { handlers[k] = f; }, classList: { add() {}, remove() {} } };
-const window = {}; let audioCtx = null; let isTTSActive = false; let mediaRecorder = null; let audioChunks = [];
+const window = { addEventListener() {} }; let audioCtx = null; let isTTSActive = false; let mediaRecorder = null; let audioChunks = [];
 function stopTTS() {} function addMessage(r, t) { msgs.push(t); }
+const _bargeIn = { finishNow() {}, close() {} }; let _bargeHold = false, _micSpokenIn = null, _bargeToken = 0, _convEpoch = 0;
+function _queuedSid() { return null; } function _interruptSpeech() {} function playNextAudio() {} function _voiceWords() {}
 function _startMicAudioPump() {} function _stopMicAudioPump() {}
 const activeFace = { setWorkingState() {} };
 const navigator = { mediaDevices: { getUserMedia: () => new Promise(r => { resolveMedia = r; }) } };

@@ -667,12 +667,12 @@ class TestToolEditing:
         assert out.startswith("ERROR") and "not found" in out and not cap
 
     def test_more_than_the_cap_is_refused(self, tmp_path):
-        for n in ("a.png", "b.png"):
+        for n in ("a.png", "b.png", "c.png", "d.png"):
             (tmp_path / n).write_bytes(_PNG_1x1)
         llm, cap = self._client()
         out = asyncio.run(self._tool()(prompt="x", llm_client=llm, sandbox_dir=tmp_path,
-                                       reference_images=["a.png", "b.png"]))
-        assert out.startswith("ERROR") and "at most 1" in out and not cap
+                                       reference_images=["a.png", "b.png", "c.png", "d.png"]))
+        assert out.startswith("ERROR") and "at most 3" in out and not cap
 
     def test_an_explicit_size_on_an_edit_reaches_the_node_verbatim(self, tmp_path):
         """It used to be snapped client-side to one of five shapes; now the
@@ -694,7 +694,7 @@ class TestToolEditing:
         tool = next(t for t in get_active_tool_definitions(ctx)
                     if t.get("function", {}).get("name") == "image_generation")
         props = tool["function"]["parameters"]["properties"]
-        assert props["reference_images"]["type"] == "array" and props["reference_images"]["maxItems"] == 1
+        assert props["reference_images"]["type"] == "array" and props["reference_images"]["maxItems"] == 3
         assert "EDITING" in tool["function"]["description"]
         # §4MH: the a1ded76 node decodes the alpha channel → advertised (it was
         # withheld while the old build returned noise around opaque)
@@ -1285,18 +1285,19 @@ def test_the_reference_cap_is_one_and_says_why(monkeypatch):
     from ghost_agent.tools import image_gen as tool
     mod = _load_server(monkeypatch)
     assert mod.MAX_REFERENCES == tool.MAX_REFERENCES == 1
-    # A second reference is refused BEFORE the node is called at all.
+    # One reference is SENT; more files than can be joined are refused BEFORE
+    # the node is called at all.
     from unittest.mock import MagicMock
     import tempfile
     from pathlib import Path as _P
     d = _P(tempfile.mkdtemp())
-    for n in ("a.png", "b.png"):
+    for n in ("a.png", "b.png", "c.png", "d.png"):
         (d / n).write_bytes(_PNG_1x1)
     llm = MagicMock()
     llm.image_gen_clients = [{"x": 1}]
     llm.generate_image = MagicMock()
     out = asyncio.run(tool.tool_generate_image(prompt="x", llm_client=llm, sandbox_dir=d,
-                                               reference_images=["a.png", "b.png"]))
+                                               reference_images=["a.png", "b.png", "c.png", "d.png"]))
     assert out.startswith("ERROR") and not llm.generate_image.called
 
 

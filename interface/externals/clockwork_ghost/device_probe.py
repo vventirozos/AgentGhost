@@ -430,6 +430,25 @@ async def main(app):
     w._say(["spoken into the open microphone"])
     check("nothing is queued to be spoken while the operator is recording",
           client.audio_queue.empty())
+    # The key cuts reply text already on the stream: released, the rest stays unsaid.
+    w.is_recording = False
+    shown = w.current_response_text
+    w.current_response_text = "some of the reply"
+    check("the check below runs during a turn", w._busy())
+    w.start_recording()
+    w.discard_recording()
+    w._say(["the rest of the reply"])
+    check("after the key, the rest of a streaming reply is not spoken", client.audio_queue.empty())
+    w.current_response_text = ""
+    w._speech_cut = False
+    w.start_recording()
+    w._say(["an answer nobody has heard yet"])
+    check("with no reply text yet, nothing plays into the recording", client.audio_queue.empty())
+    w.discard_recording()
+    check("…and it is said after the release", not client.audio_queue.empty())
+    w._silence()
+    recorded.clear()            # these two are not the recordings the checks below count
+    w.current_response_text = shown
     w.tts_enabled, w.is_recording = False, False
     slow_rid = STATE["chats"][-1]["rid"]
     w.cancel_key()                                 # Esc, with no recording or countdown → stop
@@ -453,7 +472,9 @@ async def main(app):
     step("5b. a forced stop")
     STATE["hold"], STATE["ignore_cancel"] = True, True
     before = len(w.conversation_history)
+    w._speech_cut = True
     send(w, "one that will not stop")
+    check("a new turn ends the cut", await until(lambda: not w._speech_cut))
     await until(lambda: bool(w.current_response_text))
     w.request_stop()
     await asyncio.sleep(0.4)

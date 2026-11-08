@@ -88,7 +88,7 @@ def _read_line_range(path: Path, filename: str,
                     # r2: one 5 MB line — show its head, say how long it really is
                     _cut = line.encode("utf-8", "replace")[:_LINE_RANGE_MAX_BYTES].decode("utf-8", "ignore")
                     picked.append(f"{lineno}\t{_cut.rstrip(chr(10))} [... line truncated: {_lb:,} bytes; "
-                                  f"use operation='search' or an 'execute' script for the rest]")
+                                  f"use operation='read_chunked', 'search' or an 'execute' script for the rest]")
                     byte_capped = True
                     hard_end = lineno
                     break
@@ -5637,7 +5637,7 @@ _WRITTEN: "dict[tuple, int]" = {}
 _READ: "dict[tuple, dict]" = {}
 #: §4TJ: files this request changed but did not write whole
 _MUTATED: "dict[tuple, bool]" = {}
-#: the share of a file's lines a request must have seen before it may discard the rest
+#: the share of a file (lines and size, chunks or PDF pages) a request must have seen before it may discard the rest
 READ_COVERAGE_FLOOR = 0.80
 #: a file this big is never line-counted for coverage (a whole read is capped long before)
 _COVERAGE_MAX_BYTES = 8 * 1024 * 1024
@@ -5651,18 +5651,30 @@ def _file_stamp(path: Path):
         return None
 
 
-def _count_lines(path: Path):
-    """Line count for coverage, or None when the file is too big to bother."""
+def _line_ranges_coverage(path: Path, ranges) -> float:
+    """§4TJ: the share of the file inside these line ranges, 0.0 when the file is too
+    big to bother. Lines are split as the ranged read splits them (a CR-only file is
+    many lines to it). The lower of two shares, lines and size: nine short lines
+    are not 90% of a file whose tenth holds the rest, and one 90 KB comment is not
+    87% of a file with 800 more lines."""
+    spans = sorted((int(s), int(e)) for s, e in ranges)     # by start: the first still open starts earliest
+    seen, total, seen_lines, lines = 0, 0, 0, 0
     try:
         if path.stat().st_size > _COVERAGE_MAX_BYTES:
-            return None
-        n = 0
-        with open(path, "rb") as fh:
-            for _ in fh:
-                n += 1
-        return n
+            return 0.0
+        i = 0
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, line in enumerate(fh, start=1):
+                total += len(line)
+                lines += 1
+                while i < len(spans) and spans[i][1] < lineno:
+                    i += 1
+                if i < len(spans) and spans[i][0] <= lineno:
+                    seen += len(line)
+                    seen_lines += 1
     except OSError:
-        return None
+        return 0.0
+    return min(seen / float(total), seen_lines / float(lines)) if total else 0.0
 
 
 def _union_len(ranges, lo: int, hi: int) -> int:
@@ -5688,9 +5700,9 @@ def _coverage(rec: dict, path: Path) -> float:
         return 1.0
     best = 0.0
     if rec.get("ranges"):
-        n = _count_lines(path)
-        if n:
-            best = max(best, _union_len(rec["ranges"], 1, n) / float(n))
+        best = max(best, _line_ranges_coverage(path, rec["ranges"]))
+    if rec.get("pages") and rec.get("pages_total"):
+        best = max(best, _union_len(rec["pages"], 1, rec["pages_total"]) / float(rec["pages_total"]))
     if rec.get("bytes"):
         st = _file_stamp(path)
         if st and st[1] > 0:
@@ -5698,18 +5710,27 @@ def _coverage(rec: dict, path: Path) -> float:
     return min(1.0, best)
 
 
-def _mark_read(path: Path, *, start=None, end=None, byte_from=None, byte_to=None, whole=None) -> None:
+def _mark_read(path: Path, *, start=None, end=None, byte_from=None, byte_to=None, whole=None,
+               page=None, pages_total=None) -> None:
     """Record what this request SAW of `path`: a whole read (the default when
     no range is given — the bare call means "read whole"), a line range (as
-    the tool actually showed it), or a byte range (a chunked page). The stamp
+    the tool actually showed it), a byte range (a chunked page) or a page of a
+    PDF, whose text says nothing of its bytes (§4TJ). The stamp
     is the file as it is now — a change by anything but this request's own
     tool calls invalidates it."""
     k = _progress_key(path)
-    rec = _READ.get(k) or {"ranges": [], "bytes": [], "cov": 0.0, "stamp": None, "whole": False}
+    rec = _READ.get(k)
+    # §4TJ: what was seen of another version covers nothing of this one. Kept, one
+    # line of a file swapped under the name inherited the old whole read
+    if not isinstance(rec, dict) or rec.get("stamp") != _file_stamp(path):
+        rec = {"ranges": [], "bytes": [], "cov": 0.0, "stamp": None, "whole": False}
     if whole is None:
-        whole = start is None and end is None and byte_from is None and byte_to is None
+        whole = start is None and end is None and byte_from is None and byte_to is None and page is None
     if whole:
         rec["whole"] = True
+    elif page is not None:
+        rec.setdefault("pages", []).append((int(page), int(page)))
+        rec["pages_total"] = int(pages_total)
     elif start is not None and end is not None:
         rec["ranges"].append((int(start), int(end)))
     elif byte_from is not None and byte_to is not None:
@@ -5737,8 +5758,11 @@ def _forget_parts_under(path: Path) -> None:
         rp = str(Path(path).resolve())
     except Exception:  # noqa: BLE001
         rp = str(path)
-    for k in [k for k in _IN_PROGRESS if k and (k[1] == rp or str(k[1]).startswith(rp + os.sep))]:
-        _IN_PROGRESS.pop(k, None)
+    # §4TJ: what the request knew of that path ends with it: a file moved there
+    # later is not the one it wrote
+    for table in (_IN_PROGRESS, _WRITTEN, _MUTATED, _READ):
+        for k in [k for k in list(table) if k and (k[1] == rp or str(k[1]).startswith(rp + os.sep))]:
+            table.pop(k, None)
 
 
 def _move_parts(old_rp: str, new_path: Path) -> None:
@@ -5746,9 +5770,15 @@ def _move_parts(old_rp: str, new_path: Path) -> None:
         new_rp = str(Path(new_path).resolve())
     except Exception:  # noqa: BLE001
         new_rp = str(new_path)
-    for k in [k for k in _IN_PROGRESS if k and (k[1] == old_rp or str(k[1]).startswith(old_rp + os.sep))]:
-        v = _IN_PROGRESS.pop(k)
-        _IN_PROGRESS[(k[0], new_rp + str(k[1])[len(old_rp):])] = v
+    # §4TJ: all of it follows the file. Parts alone made a renamed draft read as
+    # someone else's (the gate counts parts only on a written file), and an
+    # append + rename dropped the mark that keeps an unread file from reading new
+    if new_rp != old_rp:
+        _forget_parts_under(Path(new_rp))      # a rename lands on a free name: what is recorded there is stale
+    for table in (_IN_PROGRESS, _WRITTEN, _MUTATED, _READ):
+        for k in [k for k in list(table) if k and (k[1] == old_rp or str(k[1]).startswith(old_rp + os.sep))]:
+            v = table.pop(k)
+            table[(k[0], new_rp + str(k[1])[len(old_rp):])] = v
 
 
 def files_left_in_progress(req_id) -> list:
@@ -6116,19 +6146,22 @@ def _note_mutation(path: Path) -> None:
         rrec["stamp"] = None
 
 
-def unread_rewrite_refusal(path: Path, filename: str, *, count_in_progress: bool = True, **_ignored) -> str:
+def unread_rewrite_refusal(path: Path, filename: str, **_ignored) -> str:
     """"" when a write over `path` is allowed, else the refusal TEXT (the
     caller wraps it in `ToolOutcome.rejected("REJECTED: …")`). A first PART
     over an existing unread file is as destructive as a plain write (the
     later parts pass: the file is then in progress / written this request).
     §4OG-1 (h): allowed when this request read ≥ READ_COVERAGE_FLOOR of the
-    file (or wrote it whole) AND the file has not changed since."""
+    file (or wrote it whole) AND the file has not changed since.
+    §4TJ: parts in progress count only on a file this request wrote: an append
+    to an unread file opened this gate for any later write, promoted `replace`
+    or download, and the delete."""
     if not isinstance(path, Path):
         return ""                                   # only a real path is judged (a mocked sandbox is not a file system)
     if not path.exists() or not path.is_file():
         return ""
     k = _progress_key(path)
-    if count_in_progress and k in _IN_PROGRESS:
+    if k in _IN_PROGRESS and k in _WRITTEN:
         return ""
     now = _file_stamp(path)
     size = now[1] if now else 0
@@ -6177,15 +6210,14 @@ def _delete_loses(path: Path) -> bool:
     """§4TJ: deleting this regular file loses content the request never saw.
     Empty, read or written whole (`unread_rewrite_refusal`, the one rule) or
     created during this request (`execute` output: a tar, a screenshot) lose
-    nothing. An append in progress grants nothing here: 5 characters appended to
-    an unread file would otherwise unlock its delete (review r2), and a tool's
-    append or edit voids the birth exit (`_MUTATED`). Birth time, not mtime: an
+    nothing. A tool's append or edit voids the birth exit (`_MUTATED`): the atomic
+    append replaces the inode, so an unread file would read as just born. Birth time, not mtime: an
     in-place edit does not make a file the request's (a rename-based one in
     `execute`, `sed -i`, does: accepted, as `rm` in `execute` is)."""
     if path.name in _SYSTEM_SCRATCH:
         return False
     st = path.stat()
-    if st.st_size == 0 or not unread_rewrite_refusal(path, path.name, count_in_progress=False):
+    if st.st_size == 0 or not unread_rewrite_refusal(path, path.name):
         return False
     if _progress_key(path) in _MUTATED:
         return True
@@ -6250,8 +6282,8 @@ def unread_delete_refusal(path: Path, filename: str) -> str:
                 f"Read those files whole first (operation='read' on each), then delete the folder. If they "
                 f"cannot be read (binary, too big), {ask}. Nothing was deleted.")
     return (f"'{filename}' ({lost[0].stat().st_size:,} bytes) is a file this request has not read — "
-            f"deleting would lose content you have not seen. Read it whole first (operation='read'), then "
-            f"delete it. If it cannot be read (binary, too big), {ask}. Nothing was deleted.")
+            f"deleting would lose content you have not seen. Read it whole first (operation='read', or "
+            f"read_chunked pages when that is only a sample), then delete it. If it cannot be read (binary, too big), {ask}. Nothing was deleted.")
 
 
 def _mark_written(path: Path) -> None:
@@ -8054,8 +8086,11 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             try:                                                            # §4OE-2 receipt; §4OG-1 (h): coverage + stamp
                 _shown = re.search(r"(?m)^--- .*? \(lines (\d+)-(\d+)\) ---", str(_rd)[:600])
                 if _shown:
-                    _mark_read(_get_safe_path(sandbox_dir, target_path),
-                               start=int(_shown.group(1)), end=int(_shown.group(2)))
+                    # §4TJ: a line cut at the cap was not seen. Counted, one read of a
+                    # 500 KB minified file made 81% of it "read"
+                    if not (_shown.group(1) == _shown.group(2) and "[... line truncated: " in str(_rd)[-400:]):
+                        _mark_read(_get_safe_path(sandbox_dir, target_path),
+                                   start=int(_shown.group(1)), end=int(_shown.group(2)))
                 elif _start is None and _end is None:
                     _mark_read(_get_safe_path(sandbox_dir, target_path), whole=True)
             except Exception:  # noqa: BLE001
@@ -8093,8 +8128,20 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
                     _cs = 32000
                 _cs = min(max(1000, _cs), max(80000, int(max_context * 3.5 * 0.2)))   # the reader's clamp (reader M2)
                 _eff = _cs - min(200, _cs // 4)                                          # …and its stride
-                _mark_read(_get_safe_path(sandbox_dir, target_path),
-                           byte_from=(_pg - 1) * _eff, byte_to=(_pg - 1) * _eff + _cs - 1)
+                if str(target_path).lower().endswith(".pdf"):
+                    # §4TJ: pages, not bytes (one page of a 35 KB PDF counted as 90%, every
+                    # page of a 10 MB one as 2%). A page cut at the chunk size, one past
+                    # the end or one with no text (a scan: nothing was seen) earns nothing
+                    _pdf = re.match(r"\[PDF Data - Page (\d+) of (\d+)\]", str(_ck))
+                    _body = str(_ck).split("\n", 1)[-1].rsplit("\n", 1)[0]
+                    if _pdf and _body.strip() and not re.search(
+                            r"\n\[… page \d+ has [\d,]+ chars; the first [\d,]+ are shown", str(_ck)[-400:]):
+                        _mark_read(_get_safe_path(sandbox_dir, target_path),
+                                   page=int(_pdf.group(1)), pages_total=int(_pdf.group(2)))
+                elif not _looks_like_binary(_read_head(_get_safe_path(sandbox_dir, target_path), 8192)):
+                    # §4TJ: a binary's page is its bytes with half of them dropped: nothing seen
+                    _mark_read(_get_safe_path(sandbox_dir, target_path),
+                               byte_from=(_pg - 1) * _eff, byte_to=(_pg - 1) * _eff + _cs - 1)
             except Exception:  # noqa: BLE001
                 pass
         return _ck

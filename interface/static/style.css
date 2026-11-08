@@ -37,7 +37,7 @@ body {
     text-size-adjust: 100%;
 }
 
-button, [role="button"], .icon-btn, #send-btn, #mic-btn, .render-btn {
+button, [role="button"], .icon-btn, #send-btn, #mic-btn, #tts-toggle-btn, .render-btn {
     touch-action: manipulation;
 }
 
@@ -227,7 +227,9 @@ main#chat-container {
 
 .message {
     max-width: 85%;
-    padding: 18px 24px;
+    --bubble-pad: 24px;     /* the first-line reservation subtracts it */
+    --overlay-w: 103px;     /* time + ⋯ from the bubble's right edge, and a small gap */
+    padding: 18px var(--bubble-pad);
     border-radius: 12px;
     font-size: 0.95rem;
     line-height: 1.7;
@@ -336,7 +338,10 @@ footer#input-area-wrapper {
     flex-shrink: 0;
     width: 28px;
     height: 28px;
-    align-self: center;
+    /* On the mic and send buttons' centre line. Centred on the row instead, it
+       floated above them as soon as the text field grew (operator 11-07). */
+    align-self: flex-end;
+    margin-bottom: calc((var(--composer-btn) - 28px) / 2);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -439,6 +444,7 @@ footer#input-area-wrapper {
 }
 
 #input-area {
+    --composer-btn: 52px;   /* mic and send; smaller controls centre on them */
     display: flex;
     align-items: flex-end;
     gap: 16px;
@@ -568,7 +574,8 @@ footer#input-area-wrapper {
     border-radius: 50%;
     width: 40px;
     height: 40px;
-    align-self: center;
+    align-self: flex-end;
+    margin-bottom: calc((var(--composer-btn) - 40px) / 2);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -714,11 +721,12 @@ body.zen-mode .icon-btn:hover {
        on its own axis and a 44px send at flex-end — three sizes on three
        baselines. Now two rows inside the pill: the text field takes the
        whole first row; the controls sit under it on one row, same 40px
-       targets as the phone header — mic and effort on the left, send on
+       targets as the phone header — mic, speaker and effort on the left, send on
        the right (margin-left: auto, so the row keeps its shape when the
        effort switch is off and #effort-wrap is display:none).
        Pinned (rendered, WebKit) in tests/test_interface_composer_mobile.py. */
     #input-area {
+        --composer-btn: 40px;
         flex-wrap: wrap;
         align-items: center;
         border-radius: 24px;
@@ -735,6 +743,7 @@ body.zen-mode .icon-btn:hover {
     /* #input-area prefix: the base #mic-btn rule sits LATER in this file at
        the same specificity and kept the mic at 52px (caught by the rendered pin). */
     #input-area #mic-btn,
+    #input-area #tts-toggle-btn,
     #input-area #send-btn,
     #input-area #effort-wrap {
         width: 40px;
@@ -744,6 +753,7 @@ body.zen-mode .icon-btn:hover {
 
     #input-area #effort-wrap {
         border-radius: 50%;
+        margin-bottom: 0;   /* the full 40px here, so nothing to centre on */
     }
 
     #input-area #send-btn {
@@ -1245,6 +1255,8 @@ pre:hover .render-code-btn {
 
 #mic-btn:hover { background: var(--accent-color); color: #fff; transform: scale(1.05); }
 #mic-btn:active { transform: scale(0.95); }
+/* the microphone is listening while a reply plays: it must show (bargein.js) */
+#mic-btn.barge-listening { box-shadow: 0 0 0 2px var(--accent-color); }
 
 #mic-btn.recording {
     background: var(--error-color);
@@ -1258,12 +1270,35 @@ pre:hover .render-code-btn {
     to { box-shadow: 0 0 30px var(--error-color); transform: scale(1.1); }
 }
 
+/* The mic's other half: same circle, dimmed with a slash while off. */
+#tts-toggle-btn {
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.5);
+    border: 1px solid var(--surface-border);
+    border-radius: 50%;
+    width: 52px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    -webkit-tap-highlight-color: transparent;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+#tts-toggle-btn .tts-waves { display: none; }
+#tts-toggle-btn.active .tts-waves { display: inline; }
+#tts-toggle-btn.active .tts-slash { display: none; }
 #tts-toggle-btn.active {
     background: rgba(46, 125, 84, 0.2);
     color: var(--success-color);
     border-color: var(--success-color);
-    box-shadow: 0 0 15px rgba(46, 125, 84, 0.4);
 }
+@media (hover: hover) {
+    #tts-toggle-btn:hover { color: #fff; transform: scale(1.05); }
+    #tts-toggle-btn.active:hover { color: var(--success-color); }
+}
+#tts-toggle-btn:active { transform: scale(0.95); }
 
 /* ═══════════════════════════════════════════════════════════════
    Typing indicator (three staggered dots)
@@ -1506,7 +1541,8 @@ pre:hover .render-code-btn {
         padding: 15px;
     }
     .message {
-        padding: 10px 14px;
+        --bubble-pad: 14px;
+        padding: 10px var(--bubble-pad);
         max-width: 90%;
     }
     #input-area-wrapper {
@@ -1539,10 +1575,11 @@ pre:hover .render-code-btn {
    screen gets it; phones keep the base 44px .icon-btn/#send-btn/#mic-btn.
    Largest phones top out ~932px wide in landscape, well under 1000px. */
 @media (min-width: 1000px) and (max-height: 720px) {
-    .icon-btn, #mic-btn, #send-btn {
+    .icon-btn, #mic-btn, #tts-toggle-btn, #send-btn {
         width: 36px;
         height: 36px;
     }
+    #input-area { --composer-btn: 36px; }
     /* uConsole-only: safe here because it's not a touch phone, so iOS
        focus-zoom doesn't apply. */
     #chat-input {
@@ -2397,14 +2434,24 @@ body.zen-mode #rail-scrim {
    bubble's own right padding; touch buttons are bigger, so is the
    reservation. Only bubbles that HAVE the overlay pay for it:
    streaming / thinking bubbles keep their full first line. */
-.message:has(> .msg-actions)::before {
+.message:has(> .msg-actions)::before,
+.message:has(> .msg-actions) > :is(p, h1, h2, h3, h4, h5, h6):first-child::before {
     content: '';
     float: right;
-    width: 72px;
+    width: calc(var(--overlay-w) - var(--bubble-pad));
     height: 1.6em;
+    height: calc(1lh - 1px);     /* one line exactly: taller narrows the second line too */
+}
+/* Inside the first paragraph, not beside it (2026-11-07, operator screenshot:
+   "hel / lo ghost."). Beside a block, a float doesn't add to the bubble's
+   fitted width, so a short message was sized for its text alone and then lost
+   72px of it to the float. Inside, the float and the text share a line, and
+   the fitted width counts both. */
+.message:has(> .msg-actions):has(> :is(p, h1, h2, h3, h4, h5, h6):first-child)::before {
+    content: none;
 }
 @media (pointer: coarse) {
-    .message:has(> .msg-actions)::before { width: 86px; }
+    .message { --overlay-w: 111px; }
 }
 /* Phone bubbles (2026-10-25, operator: "the way it wraps text around the
    timer, the word placement and line wrapping etc"). In a ~240px text
@@ -2417,7 +2464,8 @@ body.zen-mode #rail-scrim {
    row, not two. Desktop keeps the hover overlay. Rendered pins:
    tests/test_interface_composer_mobile.py. */
 @media (max-width: 480px) {
-    .message:has(> .msg-actions)::before { content: none; }
+    .message:has(> .msg-actions)::before,
+    .message:has(> .msg-actions) > :is(p, h1, h2, h3, h4, h5, h6):first-child::before { content: none; }
     .msg-actions {
         position: static;
         justify-content: flex-end;
@@ -2780,7 +2828,8 @@ body.zen-mode #rail-scrim {
 
 /* ── Density modes ─────────────────────────────────────────────── */
 body.compact .message {
-    padding: 10px 16px;
+    --bubble-pad: 16px;
+    padding: 10px var(--bubble-pad);
     font-size: 0.88rem;
     line-height: 1.55;
 }

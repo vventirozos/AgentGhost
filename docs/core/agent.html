@@ -2084,6 +2084,59 @@
   between them).</li>
   <li><strong>Review round 4.</strong> HTML comments close as the spec says: <code>&lt;!--&gt;</code> and <code>&lt;!---&gt;</code> are empty, <code>--!&gt;</code> closes one.</li>
 </ul>
+<h2 id="4tp">After each tool result: local pages, held notifications, request data <span class="tag">2026-11-07 &sect;4TP</span></h2>
+<p>One call per tool result, right after provenance: <code>core/request_effects.after_tool_result</code>. Request
+298833ef showed three gaps in one request:</p>
+<ul>
+  <li><strong>A local page is rendered again after a change.</strong> The fetch memo (&sect;4OE-4) answered a re-render of the
+  agent's own <code>file:///workspace/…/index.html</code> after an edit of <code>app.js</code> with the render from before
+  the edit ("nothing has changed"). Now any call that ran and may have changed the workspace drops every remembered
+  local page and local failure (<code>fetch_memo.forget_local</code>; local = <code>file:</code>, a workspace path
+  (<code>/…</code> but not <code>//host</code>), <code>localhost</code>, <code>*.localhost</code>,
+  <code>host.docker.internal</code>, and a loopback or unspecified IP in any spelling — <code>127.0.0.5</code>,
+  <code>[0:0:0:0:0:0:0:1]</code>, <code>0</code>, <code>2130706433</code>, and the short and hex forms a browser
+  reads, <code>127.1</code>, <code>0x7f000001</code>, <code>0177.0.0.1</code>; <code>127.attacker.com</code> is not
+  local). LAN and <code>.local</code> addresses are not local here, though the browser's own-host check counts them.
+  <code>may_change_workspace</code> is wide on purpose: any file_system operation that is not a known read
+  (<code>_FS_READS</code>; review r3: a write set missed the <code>write_append</code>/<code>append_file</code> aliases
+  and <code>quarantine_delete</code>), any <code>execute</code> (a failed script may
+  have written too), project work (any <code>manage_projects</code> action but the reads), an image, a
+  <code>run</code>/<code>lab</code>/<code>manage_services</code> action that is not a read (a started service brings a
+  local page up, and a remembered "connection refused" must not survive it), and a browser call that is not a plain
+  read (a click can change a local app's localStorage), and any acquired skill (named "a custom tool (…)" under a held
+  notification). A refused call forgets nothing. Web pages stay remembered.
+  Logged as <code>Repeat Fetch — … forgot N remembered local page(s)</code>.</li>
+  <li><strong>A write and a render in one batch (review r1).</strong> The memo is consulted at dispatch, before any call
+  of the batch has run, and calls of a batch run together. So when a batch holds a call that may change the workspace
+  (<code>request_effects.batch_may_change_workspace</code>, from names and arguments; each name is first resolved to the
+  tool it runs, review r2: the model writes <code>fs</code> / <code>filesystem</code>; an acquired skill counts, being
+  unvetted code that may write anything — the tool map is rebuilt first when a name in the batch is not in it, review
+  r3: a skill saved earlier in the request was unknown to the check; unparseable arguments, or a resolver that fails,
+  count),
+  a local page in it is neither answered from the memo nor remembered afterwards (its render may predate the
+  write).</li>
+  <li><strong>Tool names are resolved once per batch (review r4).</strong> Before the per-call loop, the tool map is
+  rebuilt when any name of the batch is missing from it, then every name is resolved once
+  (<code>_batch_canon</code>, through <code>_canonicalise_tool_name</code>). The per-call dispatch reuses that answer
+  (<code>_cname</code>) and so does the batch's workspace check, so the two can never disagree. The per-call rebuild is
+  gone. Pinned by <code>tests/test_turn_loop_name_resolution.py</code> (one resolution, one call) and a mixed-batch test in
+  <code>tests/test_4ec_dispatch_pins.py</code>: with a stale map <code>{recall, update_profile}</code>, a batch
+  <code>[recall, update_prices]</code> runs <code>update_prices</code> itself, never a guess of
+  <code>update_profile</code>.</li>
+  <li><strong>Changes are named under a held notification</strong> (<a href="autonomous_activity.html#4tp">autonomous
+  activity &sect;4TP</a>). <code>handle_chat</code> opens the request for notifications before its main <code>try</code> and
+  sends the held message in the <code>finally</code>, saying how the request ended when it did not end normally.</li>
+  <li><strong>Trusted data is kept for a build</strong> the request starts (<a href="coding_executor.html#4tp">coding
+  executor &sect;4TP</a>), and forgotten in the same <code>finally</code>.</li>
+</ul>
+<p>Residue: work an <code>execute</code> detaches as a background job keeps writing after the forget, so a render made
+while it runs can be remembered and go stale when it finishes. Every <code>execute</code> (even <code>cat</code>) clears
+the local entries, so the memo is no brake on alternating a command and a local render; the no-progress breaker still
+is.</p>
+<p>Pins: <code>tests/test_4tp_notify_hold_request_data.py</code> (unit tables and <code>handle_chat</code> runs: edit then
+re-render, the read-only control, an edit and a render in one batch, a web page in a writing batch (control), notify then
+edit, a cancel and a crash mid-request, a caller inside its own <code>except</code>, portfolio data reaching
+<code>manage_projects</code>).</p>
 </main>
 
 <h2 id="4mm">§4MM (2026-10-08): image provenance, the disclaimer guard, the promotion footer</h2>

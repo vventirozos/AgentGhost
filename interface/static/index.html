@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=8.0">
+    <link rel="stylesheet" href="/static/style.css?v=8.6">
 </head>
 
 <body>
@@ -182,10 +182,6 @@
                         <line x1="12" y1="15" x2="12" y2="3"></line>
                     </svg>
                 </button>
-                <!-- TTS voice toggle removed 2026-07-28 (voice unused; frees
-                     the mobile header to a single row). The TTS engine in
-                     app.js is guarded by `if (ttsToggleBtn)` and stays
-                     dormant; restore by re-adding #tts-toggle-btn here. -->
                 <button id="animations-btn" class="icon-btn" title="Animations enabled"
                         aria-label="Animations enabled" aria-pressed="true">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -243,11 +239,9 @@
                      nothing), so the button was a no-op against a dead host.
                      STT now runs locally on nova's Gemma 4 audio node and TTS
                      on the macOS synthesiser — see interface/voice.py.
-                     Holding the mic also enables spoken replies for that turn
-                     (the press is the user gesture that unlocks autoplay);
-                     typing a message turns speech back off. That keeps the
-                     header at six controls, preserving the single-row mobile
-                     layout the TTS toggle was removed to protect. -->
+                     A transcript sent from the mic is spoken even with the speaker
+                     button off (the press is the user gesture that unlocks autoplay);
+                     a typed message goes back to the speaker button's setting. -->
                 <button id="mic-btn" title="Hold to talk" aria-label="Hold to talk">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -255,6 +249,19 @@
                         <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
                         <line x1="12" y1="19" x2="12" y2="23"></line>
                         <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
+                <!-- §4TL (operator, 2026-11-07): spoken replies on or off, beside the mic because
+                     the phone header has no room for it (35px spare at 375px, a button takes 46).
+                     app.js keeps the state; the waves and the slash follow it by CSS. -->
+                <button id="tts-toggle-btn" type="button" title="Spoken replies off"
+                        aria-label="Spoken replies off" aria-pressed="false">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <path class="tts-waves" d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                        <path class="tts-waves" d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                        <line class="tts-slash" x1="3" y1="3" x2="21" y2="21"></line>
                     </svg>
                 </button>
                 <!-- §4RB: reasoning effort for the messages you send (Default = nothing is
@@ -379,7 +386,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=18.8"></script>
+    <script type="module" src="/static/app.js?v=19.12"></script>
 </body>
 
 </html>

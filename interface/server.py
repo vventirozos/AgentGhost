@@ -2248,11 +2248,12 @@ async def stt_proxy(request: Request):
 
 @app.post("/api/tts", dependencies=[Depends(verify_interface_key)])
 async def tts_proxy(request: Request):
-    """Speak text with the local macOS synthesiser and return WAV bytes.
+    """Speak text (nova's tts-service for English, else the local macOS
+    synthesiser, see voice.py) and return WAV bytes.
 
-    Formerly a streaming proxy to the (now nonexistent) Pi voice server. The
-    synthesiser is local and fast, so the response is a single buffered body
-    rather than a stream — app.js calls ``res.blob()`` and hands the result to
+    Formerly a streaming proxy to the (now nonexistent) Pi voice server. Both
+    synthesisers are fast, so the response is a single buffered body rather
+    than a stream — app.js calls ``res.blob()`` and hands the result to
     ``new Audio()``, which needs the complete object anyway.
     """
     try:
@@ -2261,7 +2262,7 @@ async def tts_proxy(request: Request):
             return _err_json(400, "Request body must be a JSON object.")
         if not isinstance(body.get("text", ""), str):   # §4PR: was a 502
             return _err_json(400, "'text' must be a string.")
-        audio = await voice.synthesize(body.get("text", ""))
+        audio = await voice.synthesize(body.get("text", ""), client=_get_http_client())
         return Response(content=audio, media_type="audio/wav")
     except voice.VoiceError as e:
         logger.error(f"TTS failed: {type(e).__name__}: {e}")

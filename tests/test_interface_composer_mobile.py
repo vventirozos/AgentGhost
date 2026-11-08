@@ -104,6 +104,27 @@ def test_the_desktop_composer_is_still_one_row_at_its_designed_width(browser):
         ctx.close()
 
 
+@pytest.mark.parametrize("width,height", [(1440, 900), (1280, 720), (820, 1180), (375, 667)])
+@pytest.mark.parametrize("field_height", [None, 120])
+def test_every_composer_control_shares_one_centre_line(browser, width, height, field_height):
+    """Operator 2026-11-07, desktop screenshot: the effort icon floated above the
+    mic and send. It was centred on the row while they sat at its bottom, so a
+    grown text field moved it alone. Also 1280x720, where mic and send are 36px."""
+    ctx, page = _open(browser, width, height)
+    try:
+        page.evaluate("document.getElementById('interrupt-btn').classList.remove('hidden')")
+        if field_height:
+            page.evaluate("(h) => { document.getElementById('chat-input').style.height = h + 'px'; }", field_height)
+        _show_counter(page)
+        boxes = [_box(page, i) for i in ("mic-btn", "tts-toggle-btn", "effort-wrap", "interrupt-btn", "send-btn")]
+        centres = [(b["top"] + b["bottom"]) / 2 for b in boxes]
+        assert max(centres) - min(centres) < 1, boxes
+        pill = _box(page, "input-area")
+        assert all(b["bottom"] <= pill["bottom"] and b["top"] >= pill["top"] for b in boxes), (pill, boxes)
+    finally:
+        ctx.close()
+
+
 # ── Phone bubbles: the time/menu overlay leaves the text (2026-10-25,
 #    operator: "the way it wraps text around the timer, the word placement
 #    and line wrapping etc"). Before: an 86px first-line reservation in a

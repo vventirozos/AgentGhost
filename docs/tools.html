@@ -172,7 +172,7 @@
       <tr><td><code>manage_projects</code></td><td>Durable projects with tasks, dependencies and status.</td></tr>
       <tr><td><code>manage_tasks</code></td><td>Scheduled tasks (a clock) and reactive watchers (a condition).</td></tr>
       <tr><td><code>workspace</code> / <code>workspace_track</code></td><td>Watches files for changes and records what happened in your world while Ghost was away.</td></tr>
-      <tr><td><code>notify_operator</code></td><td>Queues a notification for you on your own channels (Slack DM, the web console; phone push only when configured). Its reply says which of them are connected right now.</td></tr>
+      <tr><td><code>notify_operator</code></td><td>Queues a notification for you on your own channels (Slack DM, the web console; phone push only when configured). Its reply says which of them are connected right now. Inside a request it is held and sent when the request ends, so it reports the finished work. A later call replaces an earlier one, and files changed after it are named under it (&sect;4TP).</td></tr>
     </tbody>
   </table>
   </div>

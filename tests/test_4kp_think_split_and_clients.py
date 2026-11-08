@@ -346,7 +346,7 @@ def test_the_ui_holds_speech_on_the_hint_and_speaks_the_display_at_the_end(app_j
     accumulator reset clears it, and the end speaks the stripped display."""
     import re
     assert "if (data.ghost && data.ghost.reasoning_unparsed === true) currentSpeechHold = true;" in app_js
-    assert "if (isTTSActive && !currentSpeechHold && currentAccumulatedContent.length > currentTTSMutedLength)" in app_js
+    assert "if (isTTSActive && !currentSpeechHold && _streamChars > _replayUpTo)" in app_js
     resets = [m.end() for m in re.finditer(r'\n[ \t]+currentStreamPrefixLen = 0;', app_js)]
     assert len(resets) >= 3 and all(re.match(r'\s*currentSpeechHold = false;', app_js[i:]) for i in resets)
     end = app_js.index("if (isTTSActive && currentSpeechHold && streamSawDone && !streamHadError) {")

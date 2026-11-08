@@ -13,6 +13,13 @@ taught navigate → extract_text path got the truncated preview back with
 max_chars; a TRUNCATED result is never memoised (the next, fuller read runs);
 a DECLARED FAILURE is remembered with its status, so a dead URL is not
 re-fetched (4 of 4 probes re-fetched one).
+
+Local pages (2026-11-07, req 298833ef): a ``file://`` or loopback page is the
+agent's OWN work. The memo answered a re-render of ``index.html`` after an
+edit of ``app.js`` with the render from BEFORE the edit ("nothing has
+changed"). :func:`forget_local` drops every local entry; the dispatcher calls
+it after any call that may have written the workspace or changed a page's
+state (`core/request_effects.py`).
 """
 from __future__ import annotations
 
@@ -112,6 +119,56 @@ def remember_failure(memo: Dict[Key, str], key: Optional[Key], text: Any) -> boo
     status = (m.group(1).strip() if m else flat[:160]) or "failed"
     _put(memo, fk, status[:200])
     return True
+
+
+#: hosts whose pages are served from this machine or its sandbox
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]", "host.docker.internal"})
+_URL_HOST_RE = re.compile(r"^[a-z][a-z0-9+.-]*://(?:[^@/?#]*@)?(\[[^\]]*\]|[^:/?#]*)")
+
+
+def is_local_url(url: Any) -> bool:
+    """A page the workspace itself serves: ``file:`` URLs, loopback hosts, a
+    bare workspace path. Case and a trailing dot on the host do not matter.
+    A host is local when it is named so (localhost, *.localhost) or is a
+    loopback / unspecified IP in any spelling (review r1 m3: ``[0:…:1]``,
+    ``0``; ``127.attacker.com`` is NOT local)."""
+    u = _norm(url)
+    if not u:
+        return False
+    if u.startswith("file:") or u.startswith("./") or (u.startswith("/") and not u.startswith("//")):
+        return True
+    m = _URL_HOST_RE.match(u)
+    if not m:
+        return False
+    host = m.group(1).rstrip(".").strip("[]")
+    if host in _LOCAL_HOSTS or host.endswith(".localhost"):
+        return True
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(int(host) if host.isdigit() else host)
+    except ValueError:
+        # review r2 m3: a browser also reads the short and hex IPv4 forms
+        # (127.1, 0x7f000001, 0177.0.0.1) — inet_aton parses them the same way
+        if not re.fullmatch(r"[0-9a-fx.]+", host):
+            return False
+        import socket
+        try:
+            ip = ipaddress.ip_address(socket.inet_aton(host))
+        except (OSError, ValueError):
+            return False
+    return ip.is_loopback or ip.is_unspecified
+
+
+def forget_local(memo: Optional[Dict[Key, str]]) -> int:
+    """Drop every remembered result (and remembered failure) of a local page.
+    Returns how many entries went."""
+    if not isinstance(memo, dict):
+        return 0
+    gone = [k for k in list(memo) if isinstance(k, tuple) and len(k) >= 2
+            and k[0] == "browser" and is_local_url(k[1])]
+    for k in gone:
+        memo.pop(k, None)
+    return len(gone)
 
 
 def _put(memo: Dict[Key, str], key: Key, value: str) -> None:

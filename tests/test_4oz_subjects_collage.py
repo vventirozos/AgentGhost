@@ -287,13 +287,13 @@ async def test_the_upload_counts_toward_the_three_panel_limit(tmp_path, web):
     llm.generate_image.assert_not_called()
 
 
-async def test_two_uploads_with_subjects_are_still_refused(tmp_path, web):
-    for n in ("a.jpg", "b.jpg"):
+async def test_too_many_uploads_with_subjects_are_refused(tmp_path, web):
+    for n in ("a.jpg", "b.jpg", "c.jpg"):
         (tmp_path / n).write_bytes(_jpeg())
     llm = _llm()
-    out = await tool_generate_image(prompt="k", subjects=["Alexis Tsipras"], reference_images=["a.jpg", "b.jpg"],
+    out = await tool_generate_image(prompt="k", subjects=["Alexis Tsipras"], reference_images=["a.jpg", "b.jpg", "c.jpg"],
                                     llm_client=llm, sandbox_dir=tmp_path)
-    assert out.startswith("ERROR: at most 1 reference image")
+    assert out.startswith("ERROR: at most 3 subjects") and "got 4" in out and "a.jpg, b.jpg, c.jpg" in out
     llm.generate_image.assert_not_called()
 
 

@@ -157,7 +157,7 @@
   <p>The first screen of an empty chat is a hairline <strong>GHOST</strong> wordmark
   (200-weight, wide tracking, letters fading up in a short cascade), a hairline rule that
   draws itself outward, and one line of orientation
-  (<code>Ask anything · ⌘K for commands</code>; the shortcut half is dropped on coarse
+  (<code>Ask anything</code>; the shortcut half is dropped on coarse
   pointers). <strong>There are no suggestion chips.</strong></p>
   <p>The previous version carried a 2.2&nbsp;rem/700-weight wordmark with 10&nbsp;px
   tracking, two stacked text-shadows, an infinitely sweeping gradient, and three starter
@@ -639,6 +639,14 @@
     new text input is ≥16px (no focus auto-zoom); touch affordances stay visible without hover
     (<code>pointer: coarse</code>); landscape phones (&lt;500px tall) get drawer mode even though
     they're &gt;900px wide.</li>
+    <li><strong>Update 2026-11-07 — the speaker button is back, in the composer.</strong>
+    <code>#tts-toggle-btn</code> now sits beside the mic, because the phone header has 35px spare at
+    375px and a button takes 46px. Its setting is per browser (<code>localStorage</code>
+    <code>ghost-speak-replies</code>), so a phone can stay silent while a desktop speaks. A transcript
+    sent from the mic speaks with the button off and lights it; a typed message, a held message or an
+    upload returns to the setting; a press while lit stops speech at once. <code>isTTSActive</code> is
+    decided when a turn is sent, so a page load or a press during a reply never starts speech mid-reply. If the browser refuses a clip's <code>Audio</code> element, as iOS may when it starts seconds after the tap, that clip and the later ones play through the unlocked <code>AudioContext</code>; this path has not been run on a real iPhone. Pinned by <code>tests/test_interface_tts_button.py</code>. The
+    two paragraphs below are the history of how it left.</li>
     <li><strong>TTS voice toggle removed</strong> (same day, operator request — voice unused):
     <code>#tts-toggle-btn</code> deleted from the header so the six remaining controls fit a
     single row on phones (verified 390px and 375px viewports). The TTS engine in app.js stays

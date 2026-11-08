@@ -33,6 +33,10 @@ import re
 # reference at 768×512 OOMs the DiT after 921 s of sampling — the cap is what
 # stops the model spending a quarter-hour of GPU on a guaranteed failure.
 MAX_REFERENCES = 1
+#: Files one call may pass: several are JOINED into the one reference sent
+#: (subject_photos.MAX_SUBJECTS panels at most). Req 8473053b: two uploads had
+#: no route, so the model wrote its own montage.
+MAX_JOINED_REFERENCES = 3
 MAX_REFERENCE_BYTES = 12 * 1024 * 1024   # mirrors the node's own cap
 #: After a multi-subject render, ask the vision node whether the picture came
 #: out as separate side-by-side panels and, if so, render again: attempt 2
@@ -537,7 +541,16 @@ def _resolve_reference(name, sandbox_dir) -> Path:
     raise ValueError(f"reference image {name!r} not found in the sandbox")
 
 
-async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, subjects=None, tor_proxy=None, **kwargs):
+def _join_label(path, i: int) -> str:
+    """What the image model is told a joined file is."""
+    return f"{'generated' if Path(path.name).name.startswith('gen_') else 'uploaded'} picture {i}"
+
+
+def _truthy(v) -> bool:
+    return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes")
+
+
+async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, subjects=None, tor_proxy=None, keep_first=False, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     _raw_prompt_arg = prompt          # §4QG-b: what subjects_arg compares `subject` against
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
@@ -552,7 +565,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         # Extreme fallback: If they hallucinated `<parameter name="imagination_prompt">`, grab the longest string passed
         longest_str = ""
         _skip = {"steps", "mode", "size", "dimensions", "width", "height",
-                 "seed", "negative_prompt", "transparent", "subjects", *_REF_KEYS}
+                 "seed", "negative_prompt", "transparent", "subjects", "keep_first", *_REF_KEYS}
         for k, v in kwargs.items():
             if k not in _skip and isinstance(v, str) and len(v) > len(longest_str):
                 longest_str = v
@@ -637,12 +650,14 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         refs_in = [refs_in]
     ref_b64: list = []
     ref_bytes: list = []
+    ref_paths: list = []
     if refs_in:
         if not isinstance(refs_in, (list, tuple)):
             return "ERROR: reference_images must be a list of sandbox image filenames."
-        if len(refs_in) > MAX_REFERENCES:
-            return (f"ERROR: at most {MAX_REFERENCES} reference image per edit on this node "
-                    f"(got {len(refs_in)}). Pick the one that matters most.")
+        _distinct = len(dict.fromkeys(str(r) for r in refs_in))    # the same file twice is one picture
+        if _distinct > MAX_JOINED_REFERENCES:
+            return (f"ERROR: at most {MAX_JOINED_REFERENCES} reference images in one call "
+                    f"(got {_distinct}). Pick the ones that matter most. Nothing was rendered.")
         for name in refs_in:
             try:
                 _ref_path = _resolve_reference(name, sandbox_dir)
@@ -670,6 +685,9 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 # return it); MemoryError covers a file that fits the cap but
                 # not this process.
                 return f"ERROR: cannot read reference image {name!r}: {e.__class__.__name__}."
+            if _ref_path in ref_paths:      # the same file twice is one picture, not a join
+                continue
+            ref_paths.append(_ref_path)
             ref_bytes.append(data)
             ref_b64.append(base64.b64encode(data).decode("ascii"))
 
@@ -679,8 +697,8 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
     # from the names). See tools/subject_photos.py.
     from .subject_photos import (MAX_SUBJECTS, DEFAULT_ASPECT, PHOTO_DIR, SearchUnavailable,
                                  PhotoUnavailable, normalise_subjects, fetch_subject_photo,
-                                 combine_side_by_side, pad_photo, photo_title, _fold,
-                                 photo_needs_flatten, subjects_arg)
+                                 combine_side_by_side, combine_keep_first, crop_first_panel,
+                                 pad_photo, photo_title, _fold, photo_needs_flatten, subjects_arg)
     if subjects is None:
         # §4PB: `subject` beside a prompt is the subjects list. §4QG-b: decided
         # by subject_photos.subjects_arg itself — the egress guards' rule — on
@@ -695,26 +713,32 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
     subj = normalise_subjects(subjects)
     subject_note = ""
     _size_by_tool = False      # the tool, not the caller, chose 768x512 for a joined strip
-    _upload = None             # §4PA: a user-supplied photo joined beside the subjects' photos
+    _uploads: list = []        # §4PA: files passed by the caller, joined beside the subjects' photos
+    _scene_pic = None          # a generated picture among them: the scene to keep
     _upload_bytes = b""
+    _crop_box = None           # `keep_first`: where the first picture sits in the joined reference
+    _keep_ref_note = ""
+    _strip_bytes = b""
     _panels = 0                # photos in the joined reference (the collage check needs > 1)
     _scene = False
-    if subj:
-        if ref_b64:
-            # §4PA (operator 2026-10-14): `subjects` + ONE `reference_images` =
-            # the user's photo becomes the LAST panel of the joined reference
-            # (live slack-c7: an uploaded photo of one person + a named other
-            # was refused; the join already exists, so use it).
-            _upload = _ref_path
-            _upload_bytes = ref_bytes[0] if ref_bytes else b""
-            ref_b64, ref_bytes = [], []
-        _n_all = len(subj) + (1 if _upload is not None else 0)
+    if subj or len(ref_paths) > 1:
+        # §4PA (operator 2026-10-14): `subjects` + `reference_images` = the
+        # files become panels of the joined reference (live slack-c7: an
+        # uploaded photo of one person + a named other was refused). Req
+        # 8473053b: several files with no subjects join the same way.
+        _uploads = list(ref_paths)
+        _ref_data = dict(zip(ref_paths, ref_bytes))
+        _keep = _truthy(keep_first) and bool(_uploads)
+        ref_b64, ref_bytes = [], []
+        _n_all = len(subj) + len(_uploads)
         if _n_all > MAX_SUBJECTS:
-            _is_gen = _upload is not None and Path(_upload.name).name.startswith("gen_")
+            _one = _uploads[0] if len(_uploads) == 1 else None
+            _is_gen = _one is not None and Path(_one.name).name.startswith("gen_")
             return (f"ERROR: at most {MAX_SUBJECTS} subjects fit in one picture on this node "
                     f"(got {_n_all}: {', '.join(subj[:5])}{', …' if len(subj) > 5 else ''}"
-                    + (f" + the existing picture {_upload.name}" if _is_gen else
-                       f" + the uploaded photo {_upload.name}" if _upload is not None else "")
+                    + (f" + the existing picture {_one.name}" if _is_gen else
+                       f" + the uploaded photo {_one.name}" if _one is not None else
+                       " + the uploaded photos " + ", ".join(u.name for u in _uploads))
                     + ") — their faces would be too small to keep a likeness. "
                     + ("The people ALREADY in the existing picture are kept by the picture itself: "
                        "list only the NEW person in `subjects` and keep the picture in "
@@ -793,16 +817,26 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                                 world_changed=False, reason_code="subject_photo_missing")
         photos = [r[0] for r in results]
         names = list(subj)
-        # §4PA: a previously GENERATED picture (gen_*) is the SCENE to keep —
-        # it goes first ("turn one: X and Y hug; turn two: add Z"); a user's
-        # photo is one more person and goes last.
-        _scene = _upload is not None and Path(_upload.name).name.startswith("gen_")
-        if _scene:
-            photos.insert(0, _upload)
-            names.insert(0, "the existing picture")
-        elif _upload is not None:
-            photos.append(_upload)
-            names.append("the person in the uploaded photo")
+        if _keep:
+            # the first file is the picture being changed and stays first
+            photos = _uploads + photos
+            names = ["the picture to edit"] + [_join_label(u, i) for i, u in enumerate(_uploads[1:], 2)] + names
+        else:
+            # §4PA: a previously GENERATED picture (gen_*) is the SCENE to keep —
+            # it goes first ("turn one: X and Y hug; turn two: add Z"); a user's
+            # photo is one more person and goes last.
+            _scene_pic = next((u for u in _uploads if Path(u.name).name.startswith("gen_")), None)
+            _scene = _scene_pic is not None
+            _rest = [u for u in _uploads if u is not _scene_pic]
+            photos.extend(_rest)
+            _rest_gen = len(_rest) == 1 and Path(_rest[0].name).name.startswith("gen_")
+            names.extend(["the other generated picture"] if _rest_gen else
+                         ["the person in the uploaded photo"] if len(_rest) == 1 else
+                         [_join_label(u, i) for i, u in enumerate(_rest, 1)])
+            if _scene:
+                photos.insert(0, _scene_pic)
+                names.insert(0, "the existing picture")
+                _upload_bytes = _ref_data.get(_scene_pic, b"")
         _panels = len(photos)
         # The node LETTERBOXES a reference to the render size (§4PB; it used
         # to stretch — §4QG: a <2% aspect error is centre-cropped instead of
@@ -810,6 +844,10 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         # shape: a strip of three portraits became a 2.3:1 panorama or
         # squeezed faces (review). Pad to the render's shape and, for a
         # joined strip with no size asked, ask for the node's default.
+        if _keep and raw_w and raw_h:
+            _size_drop_note = "NOTE: the requested size was ignored: this edit comes back at the first picture's shape. "
+        if _keep:
+            raw_w = raw_h = 0        # the node takes the strip's shape; the crop gives the picture's
         size_asked = bool(raw_w and raw_h)
         if not size_asked and _scene:
             # §4PB: "the scene to keep" keeps its own shape (a portrait came
@@ -819,7 +857,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 raw_w, raw_h = _scene_wh
                 size_asked, _size_by_tool = True, True
         aspect = (raw_w / raw_h) if size_asked else (DEFAULT_ASPECT if len(photos) > 1 else None)
-        if len(photos) > 1 and not size_asked:
+        if len(photos) > 1 and not size_asked and not _keep:
             raw_w, raw_h = 768, 512
             _size_by_tool = True
         if aspect is not None and not (0.25 <= aspect <= 4.0):
@@ -828,7 +866,12 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         try:
             # §4QG: a transparent / 16-bit photo is flattened onto white even
             # with no shape asked — its own bytes turned black on the node
-            if len(photos) == 1 and aspect is None \
+            if _keep:
+                # never written to disk: nothing reads it later, and it would
+                # outlive the user's private uploads it is made of
+                data, _crop_box = await asyncio.to_thread(combine_keep_first, photos)
+                _strip_bytes = data
+            elif len(photos) == 1 and aspect is None \
                     and not await asyncio.to_thread(photo_needs_flatten, photos[0]):
                 data = await asyncio.to_thread(photos[0].read_bytes)
                 ref_name = f"{PHOTO_DIR}/{photos[0].name}"
@@ -837,22 +880,35 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                     (lambda: combine_side_by_side(photos, aspect)) if len(photos) > 1
                     else (lambda: pad_photo(photos[0], aspect)))
                 ref_name = f"{PHOTO_DIR}/ref_combined_{uuid.uuid4().hex[:8]}.jpg"
+                await asyncio.to_thread(lambda: (Path(sandbox_dir) / PHOTO_DIR).mkdir(parents=True, exist_ok=True))
                 await asyncio.to_thread((Path(sandbox_dir) / ref_name).write_bytes, data)
         except Exception as e:  # noqa: BLE001 — a corrupt photo must be a result, not a crash
-            return f"ERROR: could not prepare the subjects' photos ({e.__class__.__name__}). Nothing was rendered."
+            return f"ERROR: could not prepare the reference pictures ({e.__class__.__name__}). Nothing was rendered."
         if len(data) > MAX_REFERENCE_BYTES:
-            return ("ERROR: the subjects' photo is larger than the node accepts "
+            return ("ERROR: the joined reference is larger than the node accepts "
                     f"({len(data) // (1024*1024)} MB). Nothing was rendered.")
         ref_bytes.append(data)
         ref_b64.append(base64.b64encode(data).decode("ascii"))
-        if len(names) == 1:
+        if _keep:
+            # Req 8473053b, measured on the node: "create ONE single picture"
+            # came back as two panels with the change not made, 6 of 6; this
+            # wording made the change, 5 of 5. The panels are the method here
+            # and the tool cuts the first one out afterwards.
+            _others = "RIGHT picture" if _panels == 2 else "other pictures"
+            lead = (f"This image is {_panels} pictures side by side with a gap between them. Edit ONLY the "
+                    f"LEFT picture. Keep the {_others} exactly as {'it is' if _panels == 2 else 'they are'}: "
+                    f"{'it only shows' if _panels == 2 else 'they only show'} what to use. Keep the pictures "
+                    "side by side in the same places. "
+                    + (("Left to right: " + ", ".join(names) + ". ") if subj or _panels > 2 else "")
+                    + "The change to the left picture: ")
+        elif len(names) == 1:
             lead = (f"The reference photo shows {names[0]}. Keep {names[0]} looking exactly as in the "
                     "photo (same face, identity and appearance) and place them in this new scene: ")
         elif _scene:
             lead = (f"The reference image is {len(names)} separate pictures side by side; left to right: "
                     + ", ".join(names) + ". The existing picture is the scene to keep: keep its setting "
                     "and the people already in it exactly as they are (same faces, poses and "
-                    "appearance). Keep " + ", ".join(subj) + " looking exactly as in their photo (same "
+                    "appearance). Keep " + ", ".join(names[1:]) + " looking exactly as in their photo (same "
                     "face, identity and appearance). Create ONE single photograph of ONE continuous "
                     "scene: the existing picture with them added into it, in the same frame — not a "
                     "collage, not split panels, not side-by-side pictures. The change: ")
@@ -865,7 +921,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                     "faces, identities and appearance). Create ONE single photograph of ONE continuous "
                     "scene with all of them together in the same frame — not a collage, not split "
                     "panels, not side-by-side pictures. The scene: ")
-        if len(names) > 1:
+        if len(names) > 1 and not _keep:
             _no_panels = "collage, split screen, diptych, two panels, side-by-side photos, border, frame divider"
             if isinstance(negative_prompt, (list, tuple)):
                 negative_prompt = ", ".join(str(x) for x in negative_prompt if x)
@@ -878,29 +934,37 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         prompt = lead + prompt
         # §4PB: say WHICH article each photo came from — a surname alone can
         # match a relative's or a cabinet's article and nothing showed it
-        _arts = [(s, p, photo_title(p)) for s, p in zip(names, photos) if p is not _upload]
+        _arts = [(s, p, photo_title(p)) for s, p in zip(names, photos) if p not in _uploads]
         _articles_note = ("Photos from Wikipedia: " + "; ".join(f"{s} → {t or '?'}" for s, p, t in _arts) + "."
                           if _arts else "")
         _mismatch = [(s, t) for s, p, t in _arts if t and _fold(t) != _fold(s)]
         if _mismatch:
             _articles_note += (" NOTE: " + "; ".join(f"'{s}' matched the article '{t}'" for s, t in _mismatch)
                                + " — if the user meant someone else, retry with the full name.")
-        subject_note = (
-            f"REFERENCE PHOTO: {ref_name} — "
-            + ("left to right: " if len(names) > 1 else "")
-            + ", ".join(((f"existing picture ({_plain(p.name)})" if _scene else f"uploaded photo ({_plain(p.name)})")
-                         if p is _upload else f"{s} ({_plain(p.name)})")
-                        for s, p in zip(names, photos))
-            + ". THIS WAS A NEW SCENE built from those "
-            + ("pictures (the existing picture plus the subjects' photos; not a plain edit)" if _scene
-               else "photos (not an edit)")
-            + ". If a likeness came out "
-              "wrong, tell the user plainly which subject does not look right — do NOT edit the "
-              "picture with one subject's portrait as the reference (the model would see only that "
-              "portrait, not this scene). If the photo found was of the wrong person or thing, a "
-              "retry needs a MORE SPECIFIC name (the same name finds the same photo); each render "
-              "from photos takes about 3 minutes (up to ~12 when the layout check re-renders).\n"
-            + _articles_note + "\n")
+        if _keep:
+            _keep_ref_note = ("REFERENCE: the model saw these pictures joined left to right: "
+                              + ", ".join(_plain(p.name) for p in photos) + ". " + _articles_note + "\n\n")
+        else:
+            subject_note = (
+                f"REFERENCE PHOTO: {ref_name} — "
+                + ("left to right: " if len(names) > 1 else "")
+                + ", ".join(((f"existing picture ({_plain(p.name)})" if p is _scene_pic else
+                              f"generated picture ({_plain(p.name)})" if Path(p.name).name.startswith("gen_") else
+                              f"uploaded photo ({_plain(p.name)})")
+                             if p in _uploads else f"{s} ({_plain(p.name)})")
+                            for s, p in zip(names, photos))
+                + ". THIS WAS A NEW SCENE built from those "
+                + ("pictures (the existing picture plus the subjects' photos; not a plain edit)" if _scene and subj else
+                   "pictures (not a plain edit)" if _scene
+                   else "photos (not an edit)")
+                + ". If a likeness came out "
+                  "wrong, tell the user plainly which subject does not look right — do NOT edit the "
+                  "picture with one subject's portrait as the reference (the model would see only that "
+                  "portrait, not this scene). "
+                + ("If the photo found was of the wrong person or thing, a retry needs a MORE SPECIFIC "
+                   "name (the same name finds the same photo); " if subj else "")
+                + "Each render from photos takes about 3 minutes (up to ~12 when the layout check re-renders).\n"
+                + _articles_note + "\n")
     transparent =str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
 
     # No size given → send none and let the node apply its default (or, for an
@@ -961,6 +1025,24 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         # prefix chars) → corrupt image. Strip a data-URI prefix and reject
         # empty output.
         image_bytes = _image_bytes_of(resp_data)
+        _crop_note = ""
+        _whole_name, _whole_bytes = "", b""
+        if _crop_box and image_bytes:
+            _whole_render = image_bytes
+            _cut = await asyncio.to_thread(crop_first_panel, image_bytes, _crop_box, _strip_bytes)
+            if _cut:
+                image_bytes = _cut
+                if isinstance(resp_data, dict):      # what is reported is the size of what is saved
+                    resp_data = {k: v for k, v in resp_data.items() if k not in ("width", "height")}
+                # a fuzzy check made the cut: the whole render stays recoverable
+                _whole_name = f"joined_{uuid.uuid4().hex[:8]}.png"
+                _whole_bytes = _whole_render
+                _crop_note = f"The result was cut back to the first picture; the whole render is {_whole_name}. "
+            else:
+                pretty_log("Image Generation", "could not confirm the side-by-side layout — saved uncut",
+                           level="WARNING", icon=Icons.WARN)
+                _crop_note = ("NOTE: the tool could not confirm the render kept the pictures side by side, so it "
+                              "was saved whole and not cut. It may show panels. Tell the user if it does. ")
         _collage_note = ""
         _seen = ""          # §4QJ: the kept picture's scene, from the collage check's look
         if image_bytes and subject_note and _panels > 1 and COLLAGE_RETRIES > 0:
@@ -1059,6 +1141,8 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         await asyncio.to_thread(
             lambda: Path(sandbox_dir).mkdir(parents=True, exist_ok=True))
         await asyncio.to_thread(file_path.write_bytes, image_bytes)
+        if _whole_name:
+            await asyncio.to_thread((Path(sandbox_dir) / _whole_name).write_bytes, _whole_bytes)
         # §4QP: a render with no scene yet gets ONE look, time permitting —
         # AFTER the save (r1 M1: a cancel during the look — the hard stop, the
         # idle supervisor — must not lose a picture the node already paid for)
@@ -1113,8 +1197,10 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
             + (f"Rendered at {_rw}x{_rh}" if _rw and _rh else "Rendered")
             + (f" in {int(_steps_used)} steps" if isinstance(_steps_used, (int, float)) and _steps_used else "")
             + _asked
-            + ("; built from the existing picture and the subjects' photos" if subject_note and _scene else
-               "; built from the subjects' photos" if subject_note else
+            + ("; built from the existing picture and the subjects' photos" if subject_note and _scene and subj else
+               "; built from the subjects' photos" if subject_note and subj else
+               "; built from the joined reference pictures" if subject_note else
+               "; edited from the first picture, using the others joined beside it" if _crop_box else
                "; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
             + ("; transparent background: the PNG has an alpha channel (the background is really transparent — it shows as a checkerboard or the page colour)"
@@ -1154,7 +1240,9 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         # with "keep everything else the same" — the scene was never sent, and
         # the result was four podium portraits. Say what the model saw.
         _ref_names = [n for n in (refs_in or []) if isinstance(n, str)]
-        if ref_b64 and not subject_note and _ref_names \
+        if _crop_box:
+            _edit_note += _keep_ref_note + _crop_note + "\n\n"
+        elif ref_b64 and not subject_note and _ref_names \
                 and not Path(_ref_names[0].strip()).name.startswith("gen_"):
             _edit_note += (
                 f"The model saw ONLY {_plain(Path(_ref_names[0].strip()).name)}: nothing from any earlier "
@@ -1244,6 +1332,15 @@ def _subjects_in(a: dict) -> list:
         return []
 
 
+def _ref_count(a: dict) -> int:
+    """How many different files a call's reference argument carries, under any synonym."""
+    for k in _REF_KEYS:
+        v = a.get(k)
+        if v:
+            return len(dict.fromkeys(str(r) for r in v)) if isinstance(v, (list, tuple)) else 1
+    return 0
+
+
 def render_kind(t_args) -> str:
     a = t_args if isinstance(t_args, dict) else {}
     # every reference synonym the tool accepts (r2: `input_image` timed as a
@@ -1263,7 +1360,7 @@ def _verdict_seconds() -> float:
 def expected_render_seconds(t_args) -> float:
     """The longest of this node's last three renders of the call's kind — and,
     for a call whose joined reference will have ≥2 photo panels (≥2
-    subjects, or subjects + an uploaded/existing picture), the TYPICAL
+    subjects, subjects + an uploaded/existing picture, or several files), the TYPICAL
     collage ladder (§4QG-b): two renders plus one vision verdict. §4QG
     budgeted the worst ladder (1 + reseed + COLLAGE_CFG_COST + a verdict per
     render) and, with an empty history, refused every 2-subject call against
@@ -1274,7 +1371,9 @@ def expected_render_seconds(t_args) -> float:
     kind = render_kind(a)
     single = _single_render_seconds(kind)
     n_subj = len(_subjects_in(a))
-    panels = n_subj + (1 if n_subj and any(a.get(k) for k in _REF_KEYS) else 0)
+    n_refs = _ref_count(a)
+    # `keep_first`: panels are the method, so no collage ladder runs
+    panels = 0 if _truthy(a.get("keep_first")) and n_refs else (n_subj + n_refs if n_subj or n_refs > 1 else 0)
     # §4QP: the look is one more vision call after the render; a subjects
     # call's collage verdict usually carries the scene, so its ladder estimate
     # already holds one verdict and gets no second

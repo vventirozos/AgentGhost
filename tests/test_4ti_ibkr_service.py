@@ -756,13 +756,109 @@ def test_stale_statement_is_labelled(world):
     assert "STALE" in service.answer("summary")[1]
 
 
+def _sends(web):
+    return sum(u.endswith("/SendRequest") for u, _ in web.calls)
+
+
+def _utc(day, hour=4, minute=23):
+    return datetime(2026, 11, day, hour, minute, tzinfo=timezone.utc).timestamp()
+
+
 def test_flex_is_not_fetched_again_inside_its_interval(world):
     service, web, clock, _home = world
+    clock["now"] = _utc(6, 2)  # stays on Friday, so Thursday's statement is still the newest one due
     service.tick()
-    sends = sum(u.endswith("/SendRequest") for u, _ in web.calls)
     clock["now"] += svc.FLEX_EVERY - 5
     service.tick()
-    assert sum(u.endswith("/SendRequest") for u, _ in web.calls) == sends == 1
+    assert _sends(web) == 1
+
+
+def test_a_fetch_just_before_the_new_statement_is_retried_within_the_hour(world):
+    """Req 2026-11-07: fetched at 04:23 UTC Saturday, IBKR still served Thursday, and Friday's trades waited 12 h."""
+    service, web, clock, _home = world
+    clock["now"] = _utc(7)
+    service.tick()
+    assert service.state["flex"]["report_date"] == "2026-11-05" and _sends(web) == 1
+    web.statement = STATEMENT.replace("20261105", "20261106")
+    clock["now"] += svc.FLEX_RETRY - 5
+    service.tick()
+    assert _sends(web) == 1  # not every minute
+    clock["now"] += 10
+    service.tick()
+    assert service.state["flex"]["report_date"] == "2026-11-06" and _sends(web) == 2
+    clock["now"] += svc.FLEX_RETRY + 5  # caught up: back to the long interval
+    service.tick()
+    assert _sends(web) == 2
+
+
+@pytest.mark.parametrize("day", [7, 8, 9])  # Saturday, Sunday, Monday
+def test_friday_is_the_newest_statement_due_over_the_weekend(world, day):
+    service, web, clock, _home = world
+    web.statement = STATEMENT.replace("20261105", "20261106")
+    clock["now"] = _utc(day)
+    service.tick()
+    clock["now"] += svc.FLEX_RETRY + 5
+    service.tick()
+    assert _sends(web) == 1
+
+
+def test_mondays_statement_is_due_on_tuesday(world):
+    service, web, clock, _home = world
+    web.statement = STATEMENT.replace("20261105", "20261106")
+    clock["now"] = _utc(10)
+    service.tick()
+    clock["now"] += svc.FLEX_RETRY + 5
+    service.tick()
+    assert _sends(web) == 2
+
+
+@pytest.mark.parametrize("day, hourly", [(10, True), (12, False)])  # 4 days behind Monday; 6 behind Wednesday
+def test_a_statement_that_stops_advancing_ends_the_hourly_fetches(world, day, hourly):
+    service, web, clock, _home = world
+    clock["now"] = _utc(day)
+    service.tick()
+    clock["now"] += svc.FLEX_RETRY + 5
+    service.tick()
+    assert _sends(web) == (2 if hourly else 1)
+
+
+def test_the_last_weekday_is_counted_in_utc(world):
+    service, _web, _clock, _home = world
+    service.state["flex"] = {"report_date": "2026-11-06"}
+    assert not service._statement_behind(_utc(9, 23, 30))  # Monday in UTC, Tuesday east of it: Friday is still newest
+    assert service._statement_behind(_utc(10, 0, 30))
+
+
+@pytest.mark.parametrize("stored", [20261105, ["2026-11-05"], True, None, ""])
+def test_a_corrupt_stored_date_does_not_stop_the_refresh_cycle(world, stored):
+    service, _web, _clock, _home = world
+    service.state["flex"] = {"report_date": stored}
+    assert service._statement_behind(_utc(7)) is False
+
+
+def test_a_failure_while_catching_up_keeps_the_statement_and_the_hourly_gate(world):
+    service, _web, clock, _home = world
+    clock["now"] = _utc(7)
+    service.tick()
+    service.get = lambda u, p: (_ for _ in ()).throw(OSError("HTTP 500"))
+    tried = service.state["flex_try_at"]
+    clock["now"] += svc.FLEX_RETRY - 5
+    service.tick()
+    assert service.state["flex_try_at"] == tried and not service.state["flex_error"]
+    clock["now"] += 10
+    service.tick()
+    assert service.state["flex_error"] and service.state["flex"]["report_date"] == "2026-11-05"
+
+
+def test_an_undated_statement_keeps_the_long_interval(world):
+    service, web, clock, _home = world
+    web.statement = STATEMENT.replace('toDate="20261105"', 'toDate="soon"')
+    clock["now"] = _utc(7)
+    service.tick()
+    assert service.state["flex"]["report_date"] == ""
+    clock["now"] += svc.FLEX_RETRY + 5
+    service.tick()
+    assert _sends(web) == 1
 
 
 def test_failed_flex_waits_before_trying_again(world):

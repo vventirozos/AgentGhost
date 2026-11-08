@@ -11147,6 +11147,7 @@ _SUBJECT_REFERENCE_RE = re.compile(r"^REFERENCE PHOTO: (\S+) — (?:left to righ
                                    re.MULTILINE)
 #: §4PB: a plain edit's record of the picture it started from — "EDITED FROM: <file>"
 _EDIT_REFERENCE_RE = re.compile(r"^EDITED FROM: (\S+)\s*$", re.MULTILINE)
+_JOINED_EDIT_RE = re.compile(r"^REFERENCE: the model saw these pictures joined left to right: ", re.MULTILINE)
 
 
 def pivot_steer_message(pivot_num: int, failures: int, last_error, tool_names, recovery_hint: str = "",
@@ -11277,6 +11278,23 @@ def _turn_edit_reference(tools_run_this_turn):
                 continue
             m = _EDIT_REFERENCE_RE.search(body)
             last = m.group(1).strip() if m else None
+        except Exception:  # noqa: BLE001
+            continue
+    return last
+
+
+def _turn_edit_was_joined(tools_run_this_turn) -> bool:
+    """The LAST image generated this request was a `keep_first` edit. The user
+    names several pictures then, so the first one named may be the face and
+    not the picture that was changed: its own record says which it was."""
+    last = False
+    for t in (tools_run_this_turn or []):
+        try:
+            if not isinstance(t, dict) or t.get("_synthetic"):
+                continue
+            body = str(t.get("content") or "")
+            if body.lstrip().startswith("SUCCESS: Image generated"):
+                last = bool(_JOINED_EDIT_RE.search(body))
         except Exception:  # noqa: BLE001
             continue
     return last
@@ -22894,6 +22912,30 @@ class GhostAgent:
                     )
 
             _batch_image_calls = 0          # image_generation calls seen earlier in THIS batch (canonical names)
+            # ONE resolution of every tool name of the batch, reused by the
+            # per-call dispatch below (`_cname`) AND the batch's workspace check
+            # (§4TP review r4: resolving twice drifts by construction — the
+            # name-resolution pins). The map is refreshed first when a name is
+            # missing from it (a skill created mid-session; review r3 m2: the
+            # check ran before the per-call refresh).
+            if any(str(((_t or {}).get("function") or {}).get("name") or "")
+                   not in (self.available_tools or {}) for _t in tool_calls or []):
+                self._rebuild_available_tools()
+            _bc_avail = list((self.available_tools or {}).keys())
+            _batch_canon = {_n: self._canonicalise_tool_name(_n, _bc_avail)
+                            for _n in {((_t or {}).get("function") or {}).get("name")
+                                       for _t in tool_calls or []} if isinstance(_n, str)}
+            # §4TP review r1 M1: a write and a render of a local page in ONE
+            # batch — the memo must neither answer that render (it would be the
+            # page from before the write) nor keep it (it may have run first)
+            try:
+                from .request_effects import batch_may_change_workspace as _bmcw
+                _batch_writes_ws = _bmcw(
+                    tool_calls,
+                    canon=_batch_canon.get,
+                    opaque=lambda _n: getattr((self.available_tools or {}).get(_n), "_ghost_opaque", False) is True)
+            except Exception:  # noqa: BLE001
+                _batch_writes_ws = True
             for _tc_idx, tool in enumerate(tool_calls):
                 # Strike cap inside the per-tool loop. The outer cap
                 # at the top of the turn loop only runs at turn
@@ -22929,19 +22971,14 @@ class GhostAgent:
                 # `_cname` is the name the dispatch WILL use. Use it for
                 # every classification; `fname` remains the raw string for
                 # anything the model should see quoted back at it.
-                # Refresh the map on a MISS before resolving — the same
-                # condition the dispatch uses, hoisted so both see the same
-                # tool list. `available_tools` is a cached dict on a
-                # lifespan singleton, so a skill created mid-session is
-                # absent until a rebuild; resolving against the stale map
-                # turned a brand-new `update_prices` into a difflib guess of
-                # `update_profile`, and every guard below would then have
-                # classified it as that tool. Conditional, so the common
-                # case costs nothing.
-                if fname not in self.available_tools:
-                    self._rebuild_available_tools()
-                _cname = self._canonicalise_tool_name(
-                    fname, list(self.available_tools.keys())) or fname
+                # Resolved ONCE for the batch, before this loop, against a map
+                # refreshed on a MISS (`_batch_canon`; §4TP r4). `available_tools`
+                # is a cached dict on a lifespan singleton, so a skill created
+                # mid-session is absent until a rebuild; resolving against the
+                # stale map turned a brand-new `update_prices` into a difflib
+                # guess of `update_profile`, and every guard below would then
+                # have classified it as that tool.
+                _cname = _batch_canon.get(fname) or fname
 
                 if call_runs_a_memory_wipe(
                         fname, tool["function"]["arguments"],
@@ -23386,6 +23423,10 @@ class GhostAgent:
                     from .fetch_memo import fetch_key as _fkey, repeat_result as _frepeat
                     _memo = getattr(self.context, "_fetch_memo", None)
                     _fk = _fkey(_cname, t_args)
+                    if _fk and _batch_writes_ws:
+                        from .fetch_memo import is_local_url as _is_loc
+                        if _is_loc(_fk[1]):
+                            _fk = None                     # §4TP r1 M1: render it again
                     _rep = _frepeat(_memo, _fk) if isinstance(_memo, dict) else None
                 except Exception:  # noqa: BLE001
                     _fk, _rep = None, None
@@ -24216,6 +24257,10 @@ class GhostAgent:
                             from .fetch_memo import (fetch_key as _fkey2, remember as _fremember,
                                                      remember_failure as _fremember_failure)
                             _fk2 = _fkey2(fname, _recorded_args if isinstance(_recorded_args, dict) else {})
+                            if _fk2 and locals().get("_batch_writes_ws", True):
+                                from .fetch_memo import is_local_url as _is_loc2
+                                if _is_loc2(_fk2[1]):
+                                    _fk2 = None            # §4TP r1 M1: may predate the batch's write
                             if not _res_is_error and not _res_unresolved:
                                 _fremember(getattr(self.context, "_fetch_memo", None), _fk2, str_res)
                             elif _res_is_error:
@@ -24838,6 +24883,23 @@ class GhostAgent:
                                    extra_tools=((fname,) if getattr(
                                        (self.available_tools or {}).get(fname), "_ghost_opaque", False)
                                        else ()))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # 298833ef: local pages forgotten after a write, changes named
+                    # under a held notification, trusted data kept for a build
+                    try:
+                        from .request_effects import after_tool_result as _after_effects
+                        _eff = _after_effects(
+                            fname=fname, args=_recorded_args if isinstance(_recorded_args, dict) else {},
+                            text=str_res, ok=not _res_is_error and not _res_unresolved and not _intr,
+                            ran=not _outcome.is_rejection, changed_world=bool(_outcome.changed_the_world),
+                            is_mutating=bool(is_mutating), memo=getattr(self.context, "_fetch_memo", None),
+                            stopped=bool(_intr),
+                            opaque=getattr((self.available_tools or {}).get(fname), "_ghost_opaque", False) is True)
+                        if _eff.get("memo_forgot"):
+                            pretty_log("Repeat Fetch", f"{fname} may have changed the workspace — "
+                                       f"forgot {_eff['memo_forgot']} remembered local page(s); the next "
+                                       f"render of them runs again", icon=Icons.RETRY)
                     except Exception:  # noqa: BLE001
                         pass
 
@@ -30406,6 +30468,17 @@ class GhostAgent:
                     _scope_token = _scope_install(_RS(context=self.context))
                 except Exception:  # noqa: BLE001
                     _scope_token = None
+        # 298833ef: a notify_operator call from here on is held and sent by
+        # the finally below, when the request has really ended
+        try:
+            from ..tools.notify_tool import open_request as _notify_open
+            _notify_open(request_id_context.get())
+        except Exception:  # noqa: BLE001
+            pass
+        # review r1: a caller awaiting this inside its own `except` shows ITS
+        # exception in sys.exc_info() here — not this request's end
+        import sys as _sys_req
+        _exc_before_request = _sys_req.exc_info()[1]
         try:
             if self.agent_semaphore.locked():
                 # §4MU: a wait on the turn lock was invisible — "request
@@ -32770,6 +32843,27 @@ class GhostAgent:
             _hw = locals().get("_hard_watch")
             if _hw is not None and not _hw.done():
                 _hw.cancel()                     # §4SD: the turn is over — no limit to watch
+            # 298833ef: the held notification goes out now, naming how the
+            # request ended when it did not finish normally; the request's
+            # kept data dies with it
+            try:
+                import sys as _sys
+                from ..tools.notify_tool import flush_held as _notify_flush
+                from .request_data import forget as _rd_forget
+                _exc_now = _sys.exc_info()[1]
+                if _exc_now is locals().get("_exc_before_request"):
+                    _exc_now = None
+                _why_early = (f"it was cancelled: {str(locals().get('_turn_cancelled_reason'))[:80]}"
+                              if locals().get("_turn_cancelled_reason")
+                              else "it was stopped or the agent shut down"
+                              if isinstance(_exc_now, asyncio.CancelledError)
+                              else f"it ended with an error ({type(_exc_now).__name__})"
+                              if _exc_now is not None else "")
+                for _nrid in dict.fromkeys((request_id_context.get(), req_id)):
+                    _notify_flush(_nrid, ended_early=_why_early)
+                    _rd_forget(_nrid)
+            except Exception:  # noqa: BLE001
+                pass
             # Queued messages: the loop is over — nothing more is read, even
             # while a streamed final still drains. Pending ones → leftovers.
             # §4SB: and the ones drained for a model call that never completed
@@ -33278,7 +33372,7 @@ class GhostAgent:
     # stranger). It fetches only the encyclopedia's own image for a name, over
     # Tor, like the search tools a member already has.
     _MEMBER_IMAGE_KEYS = frozenset({"prompt", "negative_prompt", "width", "height", "steps",
-                                    "seed", "transparent", "size", "reference_images", "subjects"})
+                                    "seed", "transparent", "size", "reference_images", "subjects", "keep_first"})
     _MEMBER_URL_RE = re.compile(r"https?://[^\s/]+(?:/[^\s]*)?", re.IGNORECASE)
 
     def _member_file_value_ok(self, value, ok) -> bool:
@@ -33378,8 +33472,9 @@ class GhostAgent:
             if ref_path:
                 return ref_path, ref[1]
         # §4PB: a plain edit is judged before/after against the picture it
-        # started from (a user's screenshot still wins when one was given)
-        if not before:
+        # started from (a user's screenshot still wins when one was given,
+        # except over a joined edit: see _turn_edit_was_joined)
+        if not before or _turn_edit_was_joined(tools_run):
             edited_from = _turn_edit_reference(tools_run)
             if edited_from:
                 ref_path = _resolve_image_path(edited_from, sbx)

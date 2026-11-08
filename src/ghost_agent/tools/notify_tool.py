@@ -23,13 +23,29 @@ is polling (within `CONSUMER_POLLING_WINDOW_S`); one that is not is named as
 not polling, with how long ago it last did; the digest is named only when the
 digest's own filter would show the record; and the text says "queued" — the
 tool cannot know a message was read.
+
+HELD UNTIL THE REQUEST ENDS (2026-11-07, req 298833ef). "Notify me in Slack
+when it's done": the model called this after one render, the message went out
+at once, and in the next turn the model found the dashboard showed made-up
+prices and spent five more minutes fixing them. The owner had a "done ✅" for
+work that was not done. Now a call inside an open request is HELD: the
+message is written to the ledger when the request ends (`flush_held`, called
+from handle_chat's finally), so it reports the finished work. A later call in
+the same request REPLACES the held message. Files the request changes after
+the message was written are named under it; a request that ends early (Stop,
+an error, a shutdown) says so. A call outside a request (an idle job, a
+background runner) is sent at once, as before. A held message is lost only if
+the process dies without unwinding (SIGKILL, power loss).
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
+from typing import Optional
 
 from ..core.autonomous_activity import (
     ActivityRecord, CONSUMER_POLLING_WINDOW_S, SEVERITY_NOTIFY, _age_str,
@@ -62,6 +78,111 @@ def _rate_limited() -> bool:
 def _note_sent() -> None:
     """Commit one slot against the hourly budget — only after a successful send."""
     _sent_timestamps.append(time.time())
+
+
+# --- held notifications (one per open request) ------------------------------
+_HOLD_LOCK = threading.Lock()
+#: request id -> None while the request is open and nothing is held, or the
+#: held entry {"message", "context", "changed": [labels]}
+_OPEN: "OrderedDict[str, Optional[dict]]" = OrderedDict()
+_OPEN_CAP = 256
+#: how many changed things the note under a sent message names
+_CHANGED_NAMES_MAX = 6
+
+
+def _rid(req_id=None) -> str:
+    if req_id is not None:
+        return str(req_id or "")
+    try:
+        from ..utils.logging import request_id_context
+        return str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def open_request(req_id) -> None:
+    """handle_chat: a notification called from now on is held until
+    `flush_held(req_id)`. Call it only where the matching flush is certain
+    (right before the try whose finally flushes)."""
+    rid = _rid(req_id)
+    if not rid or rid == "SYSTEM":
+        return
+    with _HOLD_LOCK:
+        _OPEN[rid] = _OPEN.get(rid)
+        _OPEN.move_to_end(rid)
+        while len(_OPEN) > _OPEN_CAP:
+            # an open request with nothing held goes first; a held message
+            # is dropped only when every entry holds one
+            empty = next((k for k, v in _OPEN.items() if v is None and k != rid), None)
+            if empty is not None:
+                _OPEN.pop(empty)
+            else:
+                _OPEN.popitem(last=False)
+
+
+def note_change(label: str, req_id=None) -> None:
+    """The request changed something (a file, the project) — named under a
+    message held BEFORE it. No-op when nothing is held."""
+    rid = _rid(req_id)
+    label = " ".join(str(label or "").split())[:120]
+    if not rid or not label:
+        return
+    with _HOLD_LOCK:
+        held = _OPEN.get(rid)
+        if held is not None and label not in held["changed"]:
+            held["changed"].append(label)
+
+
+def _changed_note(changed) -> str:
+    if not changed:
+        return ""
+    shown = ", ".join(changed[:_CHANGED_NAMES_MAX])
+    more = len(changed) - _CHANGED_NAMES_MAX
+    return (f" (Changed after this message was written: {shown}"
+            + (f", +{more} more" if more > 0 else "") + ".)")
+
+
+def flush_held(req_id=None, *, ended_early: str = "") -> Optional[str]:
+    """handle_chat's finally: close the request and write its held message,
+    if any, to the ledger. ``ended_early`` names why the request did not
+    finish normally ("it was stopped", "it ended with an error"). Returns the
+    text written, or None. Never raises."""
+    rid = _rid(req_id)
+    if not rid:
+        return None
+    with _HOLD_LOCK:
+        held = _OPEN.pop(rid, None)
+    if not held:
+        return None
+    text = held["message"] + _changed_note(held["changed"])
+    if ended_early:
+        text += (f" (The request ended early — {ended_early} — so this may not be "
+                 f"the final state.)")
+    try:
+        log = get_activity_log(held["context"])
+        if log is None or not log.record(PHASE, text, severity=SEVERITY_NOTIFY,
+                                         **({"req_id": rid} if rid != "SYSTEM" else {})):
+            logger.warning("held notification for request %s could not be written: %s", rid[:8], text[:120])
+            return None
+    except Exception:  # noqa: BLE001
+        logger.warning("held notification for request %s failed", rid[:8], exc_info=True)
+        return None
+    _note_sent()
+    try:
+        from ..utils.logging import pretty_log, Icons
+        pretty_log("Notify Operator",
+                   "held message sent now the request ended"
+                   + (f" — {len(held['changed'])} change(s) named under it" if held["changed"] else "")
+                   + (f" — ended early: {ended_early}" if ended_early else ""),
+                   icon=Icons.NOTIFY_OUT)
+    except Exception:  # noqa: BLE001
+        pass
+    return text
+
+
+def _reset_holds_for_tests() -> None:
+    with _HOLD_LOCK:
+        _OPEN.clear()
 
 
 #: how many clients the "Not reachable now" line names before it counts the rest
@@ -226,6 +347,36 @@ async def tool_notify_operator(message: str = None, context=None, **kwargs):
     except Exception:  # noqa: BLE001
         pass
 
+    # Held until the request ends (see the module docstring): the ledger
+    # gets it from `flush_held`, with what changed after it.
+    _hold_rid = _rid()
+    with _HOLD_LOCK:
+        _holding = bool(_hold_rid) and _hold_rid in _OPEN
+        _replaced = _holding and _OPEN.get(_hold_rid) is not None
+        if _holding:
+            _OPEN[_hold_rid] = {"message": message, "context": context, "changed": []}
+    if _holding:
+        try:
+            _ch, _q, _reg, _readable = _delivery_channels(context)
+        except Exception:  # noqa: BLE001
+            _ch, _reg, _readable = [], False, False
+        _now = (f"Clients polling now: {', '.join(_ch)}." if _ch
+                else "Which client will show it is not known." if not _readable
+                else "No client is polling right now — it is delivered when one reconnects."
+                if _reg else "No client is registered for notifications yet — it stays readable "
+                             "in the activity ledger.")
+        return (("Notification HELD (it replaces the one held earlier in this request). "
+                 if _replaced else "Notification HELD. ")
+                + "It is sent to the operator when this request ends, so it reports the "
+                f"finished work. {_now}\nMessage: {message}\n"
+                "Only the LAST notify_operator call of this request is sent: if you change, fix "
+                "or find anything after this, call notify_operator again with the corrected line. "
+                "File writes, project work and changing commands after this call are named "
+                "under the message when it is sent. "
+                "It goes ONLY to the operator (their own notification channels). No channel and "
+                "no other person receives it — if a channel post or a message to someone else "
+                "was asked for, tell the user that was NOT done.")
+
     # Stamp the writing turn's request id so the finalize digest can skip
     # records THIS turn authored — without it, the "while you were away"
     # banner echoes the notification the same reply just sent (observed on
@@ -289,11 +440,11 @@ NOTIFY_OPERATOR_TOOL_DEFINITION = {
         "description": (
             "Queue a short NOTIFICATION for the operator on their own "
             "notification channels (Slack DM, the web console; phone push "
-            "only when configured) — for when they are NOT watching this "
-            "conversation. Use when asked to 'report back', 'notify me', "
-            "'ping me on Slack', or when long background work finishes with "
-            "something the operator should hear about now. NOT for normal "
-            "replies, and NOT a substitute for your final response — send "
+            "only when configured), for when they are NOT watching. It is "
+            "sent when this request ENDS; a later call replaces an earlier "
+            "one. Use when asked to 'report back', 'notify me', 'ping me on "
+            "Slack', or when long work finishes with news for now. NOT for "
+            "normal replies, NOT a substitute for your final response — send "
             "the one-line headline, keep the detail in your reply. It "
             "reaches ONLY the operator: it cannot post to a Slack channel "
             "or message anyone else — if asked to, say plainly that it was "

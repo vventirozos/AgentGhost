@@ -1,6 +1,7 @@
 """Local voice loop for the web interface — STT on nova (whisper.cpp's
 ``whisper-server`` when ``GHOST_STT_URL`` is set, else the Gemma 4 audio
-node), TTS via the local macOS speech synthesiser.
+node), TTS via nova's tts-service for English when ``GHOST_TTS_URL`` is set
+(Phonon, interface/tts-service) and the local macOS speech synthesiser otherwise.
 
 **§4SL (2026-10-31): Whisper replaces Gemma for speech.** Measured on nova
 with this module's exact Gemma request (FLEURS read speech, 16-bit WAV):
@@ -55,8 +56,11 @@ import os
 import shutil
 import re
 import tempfile
+import time
 import wave
 from pathlib import Path
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +225,22 @@ def tts_voice_for(text: str) -> str:
     return TTS_VOICE
 
 
-TTS_RATE = os.environ.get("GHOST_TTS_RATE", "")  # words/min; "" = voice default
+TTS_RATE = os.environ.get("GHOST_TTS_RATE", "")  # words/min; "" = voice default; `say` only
+# 2026-11-07 (operator chose Phonon's Maeve by ear): English goes to nova's
+# tts-service when this is set. Greek stays on `say`: Phonon is English only.
+# GHOST_TTS_VOICE is then what speaks when the service fails, so a reply is
+# never silent because nova is down. Empty = `say` for everything.
+TTS_URL = os.environ.get("GHOST_TTS_URL", "").strip().rstrip("/")
+TTS_KEY_FILE = os.environ.get("GHOST_TTS_KEY_FILE", "~/Data/AI/.tts_service_key")
+# A sentence takes about 0.2 s, so this is only reached by a sick service. The
+# connect limit is short because a powered-off nova would otherwise hold the
+# first sentence of a reply for the whole timeout. Both limits are per phase.
+TTS_REMOTE_TIMEOUT_S = _env_num("GHOST_TTS_REMOTE_TIMEOUT_S", 15.0)
+TTS_CONNECT_TIMEOUT_S = _env_num("GHOST_TTS_CONNECT_TIMEOUT_S", 2.0)
+# After a failure, skip the service for this long: a reply is many sentences,
+# and each would otherwise wait out the failure before falling back.
+TTS_RETRY_S = _env_num("GHOST_TTS_RETRY_S", 30.0)
+_tts_remote_skip_until = 0.0
 # app.js already splits replies into chunks and queues them, so a single
 # request is a sentence or two. The cap stops a pathological chunk from
 # turning into a multi-minute synthesis job.
@@ -484,10 +503,12 @@ async def _transcribe_whisper(wav: bytes, duration: float, *, client) -> str:
     return text
 
 
-async def synthesize(text: str) -> bytes:
-    """Render text to WAV bytes with the local macOS speech synthesiser.
+async def synthesize(text: str, *, client=None) -> bytes:
+    """Render text to WAV bytes: English on nova's tts-service when ``client``
+    is given and ``GHOST_TTS_URL`` is set, everything else with the local
+    macOS speech synthesiser.
 
-    Text is passed via a FILE (``say -f``), never argv or a shell string:
+    ``say`` gets its text via a FILE (``say -f``), never argv or a shell string:
     agent replies routinely contain quotes, backticks and newlines, and this
     keeps all of it inert.
     """
@@ -495,12 +516,46 @@ async def synthesize(text: str) -> bytes:
     if not text:
         raise VoiceError("No text to speak.", 400)
     async with _voice_slot("tts"):
-        return await _synthesize(text)
+        return await _synthesize(text, client=client)
 
 
-async def _synthesize(text: str) -> bytes:
+async def _speak_on_service(text: str, client) -> bytes | None:
+    """The WAV from nova's tts-service, or None to fall back to `say`. The log
+    names the failure and never the text."""
+    global _tts_remote_skip_until
+    if time.monotonic() < _tts_remote_skip_until:
+        return None
+    try:
+        key = Path(TTS_KEY_FILE).expanduser().read_text().strip()
+        resp = await client.post(f"{TTS_URL}/speak", json={"text": text},
+                                 headers={"X-Tts-Service-Key": key},
+                                 timeout=httpx.Timeout(TTS_REMOTE_TIMEOUT_S,
+                                                       connect=TTS_CONNECT_TIMEOUT_S))
+        if resp.status_code in (400, 413, 422):
+            # this sentence's problem ("✅" has nothing to speak): the service
+            # is fine, so the next sentence still goes to it
+            return None
+        if resp.status_code != 200:
+            reason = f"HTTP {resp.status_code}"
+        elif not resp.content.startswith(b"RIFF"):
+            reason = "the answer is not a WAV"
+        else:
+            return resp.content
+    except Exception as exc:  # noqa: BLE001 - degraded speech beats silence
+        reason = type(exc).__name__
+    _tts_remote_skip_until = time.monotonic() + TTS_RETRY_S
+    logger.warning("tts-service failed (%s): `say` speaks for the next %.0f s",
+                   reason, TTS_RETRY_S)
+    return None
+
+
+async def _synthesize(text: str, *, client=None) -> bytes:
     if len(text) > TTS_MAX_CHARS:
         text = text[:TTS_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+    if TTS_URL and client is not None and tts_voice_for(text) == TTS_VOICE:
+        audio = await _speak_on_service(text, client)
+        if audio is not None:
+            return audio
     with tempfile.TemporaryDirectory(prefix="ghost-tts-") as td:
         txt = Path(td) / "say.txt"
         out = Path(td) / "say.wav"

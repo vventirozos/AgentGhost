@@ -427,11 +427,384 @@ def test_the_mutation_record_is_bounded(req, tmp_path, monkeypatch):
     assert len(FS._MUTATED) <= 8
 
 
-async def test_the_guard_for_writes_still_counts_a_part_in_progress(req, tmp_path):
-    p = _old(tmp_path / "a.txt")
-    FS._mark_in_progress(p, True)
-    assert FS.unread_rewrite_refusal(p, "a.txt") == ""
-    assert FS.unread_rewrite_refusal(p, "a.txt", count_in_progress=False) != ""
+# ── what the request knows follows a rename and ends with a delete ──
+async def test_a_renamed_draft_stays_the_requests_own(req, tmp_path):
+    head = "<!doctype html>\n<html>\n<head><title>Mine</title></head>\n"
+    await FS.tool_file_system(operation="write", path="draft.html", content=head, more_parts=True, sandbox_dir=tmp_path)
+    assert str(await FS.tool_file_system(operation="rename", path="draft.html", destination="index.html",
+                                         sandbox_dir=tmp_path)).startswith("SUCCESS")
+    out = await FS.tool_file_system(operation="write", path="index.html", content=head + "body\n" * 50, sandbox_dir=tmp_path)
+    assert str(out).startswith("SUCCESS")
+
+
+async def test_a_file_in_a_renamed_folder_stays_the_requests_own(req, tmp_path):
+    await FS.tool_file_system(operation="write", path="d/a.txt", content="mine\n", sandbox_dir=tmp_path)
+    await FS.tool_file_system(operation="rename", path="d", destination="e", sandbox_dir=tmp_path)
+    assert FS.unread_rewrite_refusal(tmp_path / "e" / "a.txt", "e/a.txt") == ""
+
+
+async def test_append_then_rename_does_not_make_an_unread_file_new(req, tmp_path):
+    p = _old(tmp_path / "old.txt", "owner\n")
+    await FS.tool_file_system(operation="write", path="old.txt", content="x\n", append=True, sandbox_dir=tmp_path)
+    await FS.tool_file_system(operation="rename", path="old.txt", destination="n.txt", sandbox_dir=tmp_path)
+    assert _refused(await FS.tool_delete_file("n.txt", tmp_path)) and (tmp_path / "n.txt").exists() and not p.exists()
+
+
+async def test_append_then_folder_rename_does_not_either(req, tmp_path):
+    _old(tmp_path / "d" / "old.txt", "owner\n")
+    await FS.tool_file_system(operation="write", path="d/old.txt", content="x\n", append=True, sandbox_dir=tmp_path)
+    await FS.tool_file_system(operation="rename", path="d", destination="e", sandbox_dir=tmp_path)
+    assert _refused(await FS.tool_delete_file("e", tmp_path)) and (tmp_path / "e" / "old.txt").exists()
+
+
+async def test_a_deleted_name_forgets_who_wrote_it(req, tmp_path):
+    """write t → delete t → rename the owner's file onto t → edit: not the request's."""
+    await FS.tool_file_system(operation="write", path="t.txt", content="mine\n", sandbox_dir=tmp_path)
+    assert (await FS.tool_delete_file("t.txt", tmp_path)).startswith("SUCCESS")
+    old = _old(tmp_path / "old.txt", "owner\nkeep\n")
+    await FS.tool_file_system(operation="rename", path="old.txt", destination="t.txt", sandbox_dir=tmp_path)
+    t = tmp_path / "t.txt"
+    FS._note_mutation(t)
+    assert _refused(await FS.tool_delete_file("t.txt", tmp_path)) and t.exists() and not old.exists()
+
+
+async def test_a_deleted_folder_forgets_too(req, tmp_path):
+    await FS.tool_file_system(operation="write", path="d/a.txt", content="mine\n", sandbox_dir=tmp_path)
+    assert (await FS.tool_delete_file("d", tmp_path)).startswith("SUCCESS")
+    assert FS._progress_key(tmp_path / "d" / "a.txt") not in FS._WRITTEN
+
+
+# ── a read counts for the version it saw ──
+OWNER = "".join(f"owner line {i}\n" for i in range(20))
+
+
+async def _fs(d, op, path, **k):
+    return str(await FS.tool_file_system(operation=op, path=path, sandbox_dir=d, **k))
+
+
+async def test_one_line_of_a_swapped_file_does_not_inherit_the_whole_read(req, tmp_path):
+    _old(tmp_path / "a.txt", "first\n")
+    o = _old(tmp_path / "o.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt")
+    await _fs(tmp_path, "delete", "a.txt")
+    await _fs(tmp_path, "rename", "o.txt", destination="a.txt")
+    await _fs(tmp_path, "read", "a.txt", start_line=1, end_line=1)
+    assert FS.read_coverage(tmp_path / "a.txt") < 0.5
+    assert "REJECTED" in await _fs(tmp_path, "write", "a.txt", content="NEW\n")
+    assert (tmp_path / "a.txt").read_text() == OWNER and not o.exists()
+
+
+async def test_swap_by_rotation_cannot_delete_on_one_line(req, tmp_path):
+    _old(tmp_path / "a.txt", "first\n")
+    _old(tmp_path / "new.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt")
+    await _fs(tmp_path, "rename", "a.txt", destination="a.bak")
+    await _fs(tmp_path, "rename", "new.txt", destination="a.txt")
+    await _fs(tmp_path, "read", "a.txt", start_line=1, end_line=1)
+    assert _refused(await FS.tool_delete_file("a.txt", tmp_path))
+    assert (tmp_path / "a.txt").read_text() == OWNER
+
+
+async def test_a_file_changed_from_outside_needs_a_new_read(req, tmp_path):
+    p = _old(tmp_path / "a.txt", "first\n")
+    await _fs(tmp_path, "read", "a.txt")
+    p.write_text(OWNER)
+    await _fs(tmp_path, "read", "a.txt", start_line=1, end_line=1)
+    assert "REJECTED" in await _fs(tmp_path, "write", "a.txt", content="NEW\n")
+    assert p.read_text() == OWNER
+
+
+async def test_own_edit_then_one_line_is_not_a_fresh_whole_read(req, tmp_path):
+    p = _old(tmp_path / "a.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt")
+    FS._note_mutation(p)
+    await _fs(tmp_path, "read", "a.txt", start_line=1, end_line=1)
+    assert "REJECTED" in await _fs(tmp_path, "write", "a.txt", content="NEW\n")
+    await _fs(tmp_path, "read", "a.txt")
+    assert (await _fs(tmp_path, "write", "a.txt", content="NEW\n")).startswith("SUCCESS")
+
+
+async def test_pages_of_one_unchanged_file_still_add_up(req, tmp_path):
+    _old(tmp_path / "a.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt", start_line=1, end_line=10)
+    await _fs(tmp_path, "read", "a.txt", start_line=11, end_line=20)
+    assert FS.read_coverage(tmp_path / "a.txt") == 1.0
+    assert (await _fs(tmp_path, "write", "a.txt", content="NEW\n")).startswith("SUCCESS")
+
+
+async def test_a_read_follows_the_rename(req, tmp_path):
+    _old(tmp_path / "a.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt")
+    await _fs(tmp_path, "rename", "a.txt", destination="b.txt")
+    assert (await _fs(tmp_path, "write", "b.txt", content="NEW\n")).startswith("SUCCESS")
+
+
+async def test_a_read_ends_with_the_delete(req, tmp_path):
+    _old(tmp_path / "a.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt")
+    await _fs(tmp_path, "delete", "a.txt")
+    assert FS._progress_key(tmp_path / "a.txt") not in FS._READ
+
+
+async def test_a_rename_clears_what_is_recorded_at_its_destination(req, tmp_path):
+    """The name was freed behind the tools' back (`rm` in execute): its records are stale."""
+    await _fs(tmp_path, "write", "d.txt", content="mine\n", more_parts=True)
+    os.remove(tmp_path / "d.txt")
+    _old(tmp_path / "o.txt", OWNER)
+    await _fs(tmp_path, "rename", "o.txt", destination="d.txt")
+    assert FS.unread_rewrite_refusal(tmp_path / "d.txt", "d.txt") != ""
+    assert _refused(await FS.tool_delete_file("d.txt", tmp_path))
+    assert (tmp_path / "d.txt").read_text() == OWNER
+
+
+async def test_a_rename_onto_itself_keeps_what_the_request_knows(req, tmp_path):
+    _old(tmp_path / "a.txt", OWNER)
+    await _fs(tmp_path, "read", "a.txt")
+    FS._move_parts(str((tmp_path / "a.txt").resolve()), tmp_path / "a.txt")
+    assert FS.read_coverage(tmp_path / "a.txt") == 1.0
+
+
+# ── coverage measures what was shown ──
+async def test_a_line_cut_at_the_cap_counts_for_nothing(req, tmp_path):
+    p = _old(tmp_path / "app.min.js", "x" * 520_000)
+    out = await _fs(tmp_path, "read", "app.min.js", start_line=1, end_line=1)
+    assert "line truncated" in out and "read_chunked" in out[-400:]
+    assert FS.read_coverage(p) == 0.0
+    assert "REJECTED" in await _fs(tmp_path, "write", "app.min.js", content="NEW\n")
+    assert _refused(await FS.tool_delete_file("app.min.js", tmp_path)) and p.stat().st_size == 520_000
+
+
+async def test_the_refusals_way_out_finishes_a_one_line_file(req, tmp_path):
+    p = _old(tmp_path / "app.min.js", "x" * 100_000)
+    for page in (1, 2, 3, 4):
+        await _fs(tmp_path, "read_chunked", "app.min.js", page=page)
+    assert FS.read_coverage(p) == 1.0
+    assert (await _fs(tmp_path, "write", "app.min.js", content="NEW\n")).startswith("SUCCESS")
+
+
+async def test_short_lines_of_a_file_with_one_huge_line_are_not_most_of_it(req, tmp_path):
+    p = _old(tmp_path / "bundle.js", "y" * 50_000 + "\n" + "short\n" * 9)
+    await _fs(tmp_path, "read", "bundle.js", start_line=2, end_line=10)
+    assert FS.read_coverage(p) < 0.01
+    assert "REJECTED" in await _fs(tmp_path, "write", "bundle.js", content="NEW\n")
+
+
+async def test_one_long_line_is_not_most_of_a_file(req, tmp_path):
+    p = _old(tmp_path / "code.py", "#" + "y" * 90_000 + "\n" + "def f(): pass\n" * 800)
+    await _fs(tmp_path, "read", "code.py", start_line=1, end_line=1)
+    assert FS.read_coverage(p) == 1 / 801
+    assert "REJECTED" in await _fs(tmp_path, "write", "code.py", content="NEW\n")
+
+
+async def test_long_rows_are_not_most_of_a_csv(req, tmp_path):
+    p = _old(tmp_path / "t.csv", ("l" * 600 + "\n") * 150 + "s\n" * 850)
+    await _fs(tmp_path, "read", "t.csv", start_line=1, end_line=150)
+    assert FS.read_coverage(p) == 0.15
+    assert "REJECTED" in await _fs(tmp_path, "write", "t.csv", content="NEW\n")
+
+
+async def test_most_lines_and_most_of_the_size_pass(req, tmp_path):
+    p = _old(tmp_path / "t.csv", "row\n" * 100)
+    await _fs(tmp_path, "read", "t.csv", start_line=1, end_line=80)
+    assert FS.read_coverage(p) == 0.8
+    assert (await _fs(tmp_path, "write", "t.csv", content="NEW\n")).startswith("SUCCESS")
+
+
+async def test_a_cr_only_file_is_counted_as_the_reader_splits_it(req, tmp_path):
+    p = _old(tmp_path / "progress.log", "".join(f"step {i}\r" for i in range(1000)))
+    await _fs(tmp_path, "read", "progress.log", start_line=1, end_line=1)
+    assert FS.read_coverage(p) < 0.01
+    assert "REJECTED" in await _fs(tmp_path, "write", "progress.log", content="NEW\n")
+
+
+@pytest.mark.parametrize("ranges,want", [
+    ([(1, 2), (3, 4)], 1.0),            # touching ranges join
+    ([(1, 4), (2, 3)], 1.0),            # one inside the other
+    ([(3, 4), (1, 1)], 0.75),           # out of order, with a gap
+    ([(1, 1), (1, 1)], 0.25),           # the same line twice counts once
+    ([(9, 12)], 0.0),                   # past the end
+    ([(1, 4), (2, 2), (3, 3)], 1.0),    # a short range after a long one does not end it
+])
+def test_overlapping_line_ranges_count_once(tmp_path, ranges, want):
+    p = tmp_path / "f.txt"
+    p.write_text("aaa\nbbb\nccc\nddd\n")
+    assert FS._line_ranges_coverage(p, ranges) == want
+
+
+def test_an_empty_or_oversized_file_has_no_line_coverage(tmp_path, monkeypatch):
+    p = tmp_path / "f.txt"
+    p.write_text("")
+    assert FS._line_ranges_coverage(p, [(1, 1)]) == 0.0
+    p.write_text("abc\n")
+    assert FS._line_ranges_coverage(p, [(1, 1)]) == 1.0
+    monkeypatch.setattr(FS, "_COVERAGE_MAX_BYTES", 2)
+    assert FS._line_ranges_coverage(p, [(1, 1)]) == 0.0
+
+
+async def test_a_chunked_page_of_a_binary_earns_nothing(req, tmp_path):
+    p = tmp_path / "b.bin"
+    p.write_bytes(bytes(range(256)) * 80)
+    os.utime(p, (OLD, OLD))
+    await _fs(tmp_path, "read_chunked", "b.bin", page=1)
+    assert FS.read_coverage(p) == 0.0
+    assert _refused(await FS.tool_delete_file("b.bin", tmp_path)) and p.exists()
+
+
+def _pdf(path, pages, text="hello", pad=0, lines=1, blank=()):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    for i in range(pages):
+        page = doc.new_page()
+        if i in blank:
+            continue
+        for ln in range(lines):
+            page.insert_text((50, 20 + ln * 12), f"{text} {i}")
+    if pad:
+        doc.embfile_add("pad.bin", os.urandom(pad))
+    doc.save(str(path))
+    doc.close()
+    os.utime(path, (OLD, OLD))
+    return path
+
+
+async def test_one_page_of_a_small_pdf_is_one_page(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 100)
+    await _fs(tmp_path, "read_chunked", "doc.pdf", page=1)
+    assert FS.read_coverage(p) == 0.01
+    assert _refused(await FS.tool_delete_file("doc.pdf", tmp_path)) and p.exists()
+
+
+async def test_every_page_of_a_heavy_pdf_is_all_of_it(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 5, pad=2_000_000)
+    for page in range(1, 6):
+        await _fs(tmp_path, "read_chunked", "doc.pdf", page=page)
+    assert FS.read_coverage(p) == 1.0
+    assert (await FS.tool_delete_file("doc.pdf", tmp_path)).startswith("SUCCESS")
+
+
+async def test_the_same_pdf_page_twice_counts_once(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 4)
+    for _ in range(3):
+        await _fs(tmp_path, "read_chunked", "doc.pdf", page=2)
+    assert FS.read_coverage(p) == 0.25
+
+
+async def test_a_pdf_page_past_the_end_earns_nothing(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 2)
+    assert "does not exist" in await _fs(tmp_path, "read_chunked", "doc.pdf", page=9)
+    assert FS.read_coverage(p) == 0.0
+
+
+async def test_a_pdf_page_cut_at_the_chunk_size_earns_nothing(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 1, text="z" * 90, lines=40)
+    out = await _fs(tmp_path, "read_chunked", "doc.pdf", page=1, chunk_size=1000)
+    assert "are shown" in out                                       # the real reader's own cut
+    assert FS.read_coverage(p) == 0.0
+    out = await _fs(tmp_path, "read_chunked", "doc.pdf", page=1, chunk_size=20000)
+    assert "are shown" not in out and FS.read_coverage(p) == 1.0
+
+
+async def test_a_scanned_pdf_shows_nothing_and_earns_nothing(req, tmp_path):
+    p = _pdf(tmp_path / "scan.pdf", 10, blank=range(10), pad=1_000_000)
+    for page in range(1, 9):
+        await _fs(tmp_path, "read_chunked", "scan.pdf", page=page)
+    assert FS.read_coverage(p) == 0.0
+    assert _refused(await FS.tool_delete_file("scan.pdf", tmp_path)) and p.exists()
+
+
+async def test_only_the_pages_with_text_count(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 4, blank={1, 3})
+    for page in range(1, 5):
+        await _fs(tmp_path, "read_chunked", "doc.pdf", page=page)
+    assert FS.read_coverage(p) == 0.5
+
+
+async def test_a_changed_pdf_starts_its_pages_again(req, tmp_path):
+    p = _pdf(tmp_path / "doc.pdf", 2)
+    await _fs(tmp_path, "read_chunked", "doc.pdf", page=1)
+    await _fs(tmp_path, "read_chunked", "doc.pdf", page=2)
+    assert FS.read_coverage(p) == 1.0
+    _pdf(p, 4)
+    await _fs(tmp_path, "read_chunked", "doc.pdf", page=1)
+    assert FS.read_coverage(p) == 0.25
+
+
+# ── the write gate: parts count only on the request's own file ──
+async def _append_part(path, tmp_path, text="\n# one more line\n"):
+    out = await FS.tool_file_system(operation="write", path=path, content=text, append=True, more_parts=True,
+                                    sandbox_dir=tmp_path)
+    assert str(out).startswith("SUCCESS")
+
+
+async def test_an_append_does_not_open_a_restart_write_over_the_owners_file(req, tmp_path):
+    body = "<!doctype html>\n<html>\n<head><title>Owner</title></head>\n<body>" + "owner\n" * 2000 + "</body></html>\n"
+    p = _old(tmp_path / "o.html", body)
+    await _append_part("o.html", tmp_path, "<!-- x -->\n")
+    before = p.read_text()
+    out = await FS.tool_file_system(operation="write", path="o.html", sandbox_dir=tmp_path,
+                                    content="<!doctype html>\n<html>\n<head><title>Mine</title></head>\n" + "mine\n" * 2000)
+    assert str(out).startswith("REJECTED") and getattr(out, "reason_code", "") == "unread_rewrite"
+    assert p.read_text() == before
+
+
+async def test_an_append_does_not_open_a_promoted_replace(req, tmp_path):
+    body = "import os\n\n\ndef owner():\n    return 1\n"
+    p = _old(tmp_path / "m.py", body)
+    await _append_part("m.py", tmp_path)
+    before = p.read_text()
+    module = "import sys\n\n\ndef mine():\n    return 2\n\n\ndef other():\n    return 3\n"
+    out = await FS.tool_file_system(operation="replace", path="m.py", content=module, sandbox_dir=tmp_path)
+    assert p.read_text() == before and getattr(out, "reason_code", "") == "unread_rewrite"
+
+
+async def test_an_append_does_not_open_a_download_over_it(req, tmp_path):
+    p = _old(tmp_path / "d.txt")
+    await _append_part("d.txt", tmp_path)
+    before = p.read_text()
+    out = await FS.tool_download_file("http://example.invalid/x", tmp_path, "", filename="d.txt")
+    assert getattr(out, "reason_code", "") == "unread_rewrite" and p.read_text() == before
+
+
+async def test_reading_the_file_after_the_append_opens_the_gate(req, tmp_path):
+    p = _old(tmp_path / "o.txt")
+    await _append_part("o.txt", tmp_path)
+    assert FS.unread_rewrite_refusal(p, "o.txt") != ""
+    FS._mark_read(p, whole=True)
+    assert FS.unread_rewrite_refusal(p, "o.txt") == ""
+
+
+async def test_later_parts_of_the_owners_file_still_append(req, tmp_path):
+    p = _old(tmp_path / "o.txt", "start\n")
+    await _append_part("o.txt", tmp_path, "a\n")
+    await _append_part("o.txt", tmp_path, "b\n")
+    assert p.read_text() == "start\na\nb\n"
+
+
+async def test_a_part_of_the_requests_own_file_keeps_its_exit_after_a_script_changed_it(req, tmp_path):
+    p = tmp_path / "n.txt"
+    await FS.tool_file_system(operation="write", path="n.txt", content="a\n", more_parts=True, sandbox_dir=tmp_path)
+    p.write_text("a script changed it\n")
+    assert FS.unread_rewrite_refusal(p, "n.txt") == ""
+
+
+async def test_a_new_file_cannot_start_with_an_appended_part(req, tmp_path):
+    """So every file in progress and not written existed before the request."""
+    out = await FS.tool_file_system(operation="write", path="n.html", content="x\n", append=True, more_parts=True,
+                                    sandbox_dir=tmp_path)
+    assert "does not exist yet" in str(out) and not (tmp_path / "n.html").exists()
+
+
+async def test_a_restart_of_the_requests_own_parts_still_works(req, tmp_path):
+    head = "<!doctype html>\n<html>\n<head><title>Mine</title></head>\n"
+    await FS.tool_file_system(operation="write", path="n.html", content=head, more_parts=True, sandbox_dir=tmp_path)
+    out = await FS.tool_file_system(operation="write", path="n.html", content=head + "body\n" * 50, sandbox_dir=tmp_path)
+    assert str(out).startswith("SUCCESS")
+
+
+async def test_an_append_to_an_existing_file_is_not_marked_as_written(req, tmp_path):
+    p = _old(tmp_path / "o.txt")
+    await _append_part("o.txt", tmp_path)
+    assert FS._progress_key(p) not in FS._WRITTEN
 
 
 async def test_a_new_file_in_parts_may_go(req, tmp_path):

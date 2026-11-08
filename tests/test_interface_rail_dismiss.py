@@ -77,6 +77,7 @@ const load = async (id) => {{
 const Core = {{
     isProcessing: () => {processing},
     stopTTS: () => calls.push({{fn: 'stopTTS'}}),
+    endVoiceSession: () => calls.push({{fn: 'endVoiceSession'}}),
     clearConversation: () => calls.push({{fn: 'clearConversation'}}),
 }};
 {fns}

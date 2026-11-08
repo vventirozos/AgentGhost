@@ -262,7 +262,7 @@
     <dd>A machine for background and small jobs, so they don't compete with your conversation for the main model.</dd>
 
     <dt>Critic node</dt>
-    <dd>The machine that ran the LLM judge. With the judge off (§4OW) it serves the image look checks (<code>GHOST_VISUAL_CHECK_POOL=critic</code>); in production it is the same helper box as the worker node.</dd>
+    <dd>The machine that ran the LLM judge. With the judge off (§4OW) it has no regular work: the image pixel check runs there only with <code>GHOST_VISUAL_CHECK_POOL=critic</code>, unset in production since 2026-11-07. In production it is the same helper box as the worker node.</dd>
 
     <dt>Swarm</dt>
     <dd>Fanning one task out across several models in parallel.</dd>

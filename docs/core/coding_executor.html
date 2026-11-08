@@ -507,6 +507,33 @@
 </ul>
 <p>Not changed here (open, reported to the operator): an owner-path (foreground) executor stream — the spec call before §4SD, and now each file call — does not take §4SC's side path, so a kept conversation over ~31k tokens is parked by llama rather than saved first.</p>
 <p>Pins: <code>tests/test_4sd_executor_generate.py</code>.</p>
+<h2 id="4tp">The request's own data reaches the build <span class="tag">2026-11-07 &sect;4TP</span></h2>
+<p>Request 298833ef: the main turn fetched the owner's portfolio (real prices, cost basis, P/L) with
+<code>portfolio</code>, then ran <code>manage_projects autoadvance</code>. The executor that wrote <code>app.js</code>
+saw the task, the project files and the ledger, but not the numbers. It made up prices (+15&nbsp;% P/L where the real
+figure was −3&nbsp;%).</p>
+<ul>
+  <li><code>core/request_data.py</code> keeps, by request id, each successful result of a <strong>data tool</strong>
+  in the request (the dispatcher calls <code>note_result</code> through <code>request_effects.after_tool_result</code>).
+  The data tools are an allow-list, <code>DATA_TOOLS</code>: <code>portfolio</code>. Review r1: a
+  deny-list also swept the health check (internal hosts, service state) and the owner's location into every build.
+  Review r2: <code>check_weather</code> with no location names the owner's place, so it is not on the list either. A new
+  data tool is added there. A result from outside
+  content is never kept even then (<code>utils.provenance.is_untrusted_source</code>), so a page's text cannot reach a
+  prompt that writes and runs code. Failures, refusals and stopped calls are not kept.</li>
+  <li>The spec prompt (<code>_generate_build_spec</code>), every file prompt (<code>_generate_prompt</code>) and the
+  agentic leaf's prompt (<code>coding_loop._leaf_prompt</code>, review r1: a task routed agentic had none; it is built
+  in the parent request, since the leaf's own turn runs as <code>sub-leaf-…</code>) carry
+  <code>DATA THIS REQUEST FETCHED</code>, after the research block. It tells the
+  model to use these exact values, never to invent one that should come from there, and to label anything missing as
+  sample data and say so in its summary.</li>
+  <li>Bounds: 3,000 chars per result, 8,000 in all, the newest kept (shown oldest first), 12 per request. A repeat of
+  the same text replaces the earlier row. Forgotten when the request ends (<code>handle_chat</code>'s
+  <code>finally</code>). An unattended step (no request) has none.</li>
+</ul>
+<p>Not covered: values the model read on the web. It must put them in the task text. The one-command project generator
+(<code>project_advancer.default_code_generator</code>) does not get the block.</p>
+<p>Pins: <code>tests/test_4tp_notify_hold_request_data.py</code>.</p>
 </main>
 </body>
 </html>

@@ -1,7 +1,11 @@
 {
   "app.js": {
-    "sha": "415182a1b23e00b9",
-    "version": "18.8"
+    "sha": "6791ca74757c4d0a",
+    "version": "19.12"
+  },
+  "bargein.js": {
+    "sha": "07e236cbbe833426",
+    "version": "1.5"
   },
   "effort.js": {
     "sha": "40ad7b946907c142",
@@ -9,27 +13,27 @@
   },
   "matrix_graph.js": {
     "sha": "24bdebc36609bf9a",
-    "version": "18.8"
+    "version": "19.12"
   },
   "notifications.js": {
     "sha": "487030a97676874f",
     "version": "7.2"
   },
   "palette.js": {
-    "sha": "3cf309026777487f",
-    "version": "7.5"
+    "sha": "9ee142144bae9067",
+    "version": "7.6"
   },
   "sessions.js": {
-    "sha": "4a136e1e4b963177",
-    "version": "7.12"
+    "sha": "266c08c44f96c9fe",
+    "version": "7.13"
   },
   "status.js": {
     "sha": "0651107cdfe81a85",
     "version": "7.7"
   },
   "style.css": {
-    "sha": "3811df698048b197",
-    "version": "8.0"
+    "sha": "f8ef5a5e15e98ac2",
+    "version": "8.6"
   },
   "temperament.js": {
     "sha": "b18b8cde2b43a11c",
@@ -44,7 +48,7 @@
     "version": "1.1"
   },
   "workspace.js": {
-    "sha": "6ab07e577d5e33e9",
-    "version": "9.3"
+    "sha": "dbac1dfafe4ba8f7",
+    "version": "9.5"
   }
 }

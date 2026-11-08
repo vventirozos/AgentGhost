@@ -101,7 +101,7 @@
     "test_interface_review_fixes.py": 4,
     "test_interface_silent_resume.py": 2,
     "test_interface_visualizer.py": 1,
-    "test_interface_voice.py": 17,
+    "test_interface_voice.py": 15,
     "test_introspective_no_websearch.py": 3,
     "test_isolation_replay.py": 2,
     "test_job_landing_report_drain.py": 1,
@@ -214,5 +214,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 862
+  "total_textual": 860
 }

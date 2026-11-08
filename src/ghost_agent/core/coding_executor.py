@@ -803,6 +803,18 @@ def _render_research(research_context: Optional[Dict[str, str]]) -> str:
         "or contradict them; these are NOT files to edit):\n" + body + "\n")
 
 
+def _render_request_data() -> str:
+    """The data the owner's request fetched with its own tools (req 298833ef:
+    a dashboard of the owner's portfolio was seeded with invented prices —
+    the real ones were one call earlier, in the conversation, which this
+    executor never sees). `core/request_data.py`. "" outside a request."""
+    try:
+        from .request_data import render_block
+        return render_block()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _repair_json_string_newlines(text: str) -> str:
     """Escape literal control characters inside JSON string literals.
 
@@ -1708,6 +1720,7 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         user += ("\nPROJECT LEDGER (existing files / APIs / conventions — build "
                  f"CONSISTENTLY with these):\n{ledger}\n")
     user += _render_research(research_context)
+    user += _render_request_data()
     user += _render_existing(existing_files, single_file)
     user += _render_already_built(description, existing_files)
     if feedback:
@@ -1979,6 +1992,7 @@ def _generate_prompt(path: str, brief: str, *, description: str, ledger: str, pl
         user += ("\nPROJECT LEDGER (existing files / APIs / conventions — build "
                  f"CONSISTENTLY with these):\n{ledger}\n")
     user += _render_research(research_context)
+    user += _render_request_data()
     user += _render_reference({p: c for p, c in shown_files.items() if _norm_path(p) != _norm_path(path)})
     if previous:
         # review r10: the leaf's own earlier version was shown as "another

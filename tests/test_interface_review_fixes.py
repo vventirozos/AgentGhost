@@ -680,10 +680,11 @@ async def test_tts_returns_wav_from_local_synthesis():
     req = MagicMock()
     req.json = AsyncMock(return_value={"text": "hello"})
 
-    with patch.object(voice, "synthesize", AsyncMock(return_value=b"RIFF....WAVE")) as synth:
+    with patch.object(voice, "synthesize", AsyncMock(return_value=b"RIFF....WAVE")) as synth, \
+            patch.object(server, "_get_http_client", MagicMock(return_value="shared-client")):
         resp = await server.tts_proxy(req)
 
-    synth.assert_awaited_once_with("hello")
+    synth.assert_awaited_once_with("hello", client="shared-client")
     assert resp.media_type == "audio/wav"
     assert resp.body == b"RIFF....WAVE"
 

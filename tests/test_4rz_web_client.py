@@ -239,6 +239,8 @@ L = "/api/turn/inbox/leftovers"
 
 def _harness(body: str) -> str:
     return (_FAKE_DOM + _state_block()
+            # the speech side of a turn is not what these tests drive
+            + "let _speechOffSeq = 0; function _endVoiceSession() {} function spokenTurnSpeech() {} function typedTurnSpeech() {}\n"
             + "\n".join(extract_js_function(APP, f) for f in _FUNCS) + "\n"
             # a turn in flight (generation 1): [u1] with the reply bubble streaming
             + "chatHistory.push({ role: 'user', content: 'u1' }); _beginQueuedTurn();\n"

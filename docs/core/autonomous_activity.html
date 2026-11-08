@@ -518,6 +518,54 @@ phone" whether or not a phone transport is configured. In four months: 26 calls,
 
 <h2 id="4ms">§4MS: repeats stay</h2>
 <p><em>(Reflection, bench and the counterfactual loop named here were removed on 2026-10-11, §4NM.)</em> About 66% of the ledger repeats the previous record of its phase (241 "stable pass", 227 "τ=0.81", 165 "graduated N"). A write-time dedupe was built and then removed in the same round: the digest's <code>[phase] ×N</code> counts and the counterfactual loop's "recheck still failing" tally read those repeats as information. The jobs that re-ran with nothing new are the cause, and those were gated instead (reflection, self-play, bench).</p>
+<h2 id="4tp">notify_operator is held until the request ends <span class="tag">2026-11-07 &sect;4TP</span></h2>
+<p><strong>What was wrong.</strong> Request 298833ef: "build a dashboard of my portfolio … notify me in Slack when it's
+done". The model called <code>notify_operator</code> ("Portfolio Dashboard project is done ✅") after one render. The
+message went out at once. In the next turn the model saw the dashboard showed invented prices, edited
+<code>app.js</code> and checked it again for five more minutes. The owner had "done" for work that was not done.</p>
+<ul>
+  <li><strong>Held.</strong> <code>handle_chat</code> opens the request for notifications (<code>notify_tool.open_request</code>,
+  right before the <code>try</code> whose <code>finally</code> closes it). A <code>notify_operator</code> call inside it is
+  not written to the ledger. It is kept, and the tool answers <code>Notification HELD. It is sent to the operator when
+  this request ends …</code>, with the clients polling now. The <code>finally</code> calls <code>flush_held</code>, which
+  writes it (same phase, severity and <code>req_id</code> as before) and spends the hourly budget then. The rate limit is
+  checked at the call; a call over it holds nothing.</li>
+  <li><strong>The last call wins.</strong> A later call in the same request replaces the held message (the receipt says
+  so). The tool description says it is sent when the request ends and that a later call replaces an earlier one.</li>
+  <li><strong>What changed after it.</strong> The dispatcher reports each change (<code>core/request_effects.change_label</code>:
+  a file written or edited, project work, a mutating shell command, a script run, an image) to
+  <code>note_change</code>. Changes after the held message are named under it when it is sent:
+  <code>(Changed after this message was written: app.js.)</code>, at most 6 names, then <code>+N more</code>. A
+  replacement starts with no changes. <code>node --check</code> and other read-only commands are not changes.</li>
+  <li><strong>An early end is said.</strong> A cancelled request, a Stop, a shutdown (<code>CancelledError</code>) or an
+  error still sends the held message, with <code>(The request ended early — … — so this may not be the final state.)</code></li>
+  <li><strong>Not held:</strong> a call with no open request (an idle job, a background runner, request id
+  <code>SYSTEM</code>) is sent at once, as before. A probe is never sent.</li>
+  <li><strong>The finish-line backstop is unchanged.</strong> A held receipt is an OK tool row, so
+  <code>_notify_delivered</code> counts it and the backstop and the project promise stand down. The message itself is
+  written by the <code>finally</code>, after finalize.</li>
+</ul>
+<ul>
+  <li><strong>How the request ended</strong> is read in the <code>finally</code> from the exception in flight, compared
+  with the one in flight when the request started (review r1: a caller awaiting <code>handle_chat</code> inside its own
+  <code>except</code> would otherwise make a normal end read "ended with an error").</li>
+  <li>At most 256 requests are open at once; past that an open request with nothing held is dropped first.</li>
+</ul>
+<p>Residue, reported to the operator:</p>
+<ul>
+  <li>A held message is lost if the process dies without unwinding (SIGKILL, power loss).</li>
+  <li>A <strong>streamed</strong> reply streams after the <code>finally</code>: the message goes out as the reply starts,
+  and a Stop during the reply is not noted under it (the work is finished by then; no tool runs in the stream).</li>
+  <li><strong>Progress pings</strong> inside one long request are no longer possible: "ping me when part 1 is done" is sent
+  at the end, and a later call replaces it.</li>
+  <li>A background job launched in the request writes its own "done" when it finishes, so it can arrive before the
+  request's held "started X" message.</li>
+  <li>The rate limit is checked at the call and spent at the send, so a job or backstop notice in between can make it
+  13 in an hour.</li>
+  <li>A change in the same batch as the notify call, processed after it, is named as "after" though the model knew of it.
+  A script the command heuristic does not see as changing (<code>node build.js</code>) is not named.</li>
+</ul>
+<p>Pins: <code>tests/test_4tp_notify_hold_request_data.py</code>.</p>
 </main>
 </body>
 </html>

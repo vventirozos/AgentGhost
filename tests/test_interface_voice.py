@@ -346,17 +346,15 @@ def test_mic_button_is_restored_in_the_input_area():
 
 
 def test_voice_in_gives_voice_out_and_typing_turns_it_off():
-    """Holding the mic enables spoken replies (and unlocks autoplay, which
-    browsers only allow from a user gesture); a typed message disables them."""
+    """Holding the mic unlocks autoplay, which browsers only allow from a user
+    gesture; a transcript it sends is spoken; a typed message goes back to the
+    speaker button's setting, off unless the operator turned it on (§4TL)."""
     js = (_ROOT / "interface" / "static" / "app.js").read_text()
     start = js.find("const startRecording")
     assert start != -1, "push-to-talk engine missing"
     body = js[start:start + 1600]
-    assert "isTTSActive = true" in body, "mic press must enable spoken replies"
     assert "createBuffer" in body, "mic press must unlock autoplay (iOS needs it)"
     assert "function sendTypedMessage" in js
-    typed = js[js.find("function sendTypedMessage"):][:200]
-    assert "isTTSActive = false" in typed, "typing must turn speech back off"
 
 
 def test_binaries_resolve_without_a_usable_path(tmp_path, monkeypatch):

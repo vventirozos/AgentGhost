@@ -450,3 +450,29 @@ async def test_a_read_does_not_reset_the_seen_tools_set():
               seen_tools={"file_system:a.py"})
     await agent._dispatch_and_process_tool_batch(ts2)
     assert "file_system:a.py" in ts2.seen_tools   # a read only ADDS to the set
+
+
+@pytest.mark.asyncio
+async def test_a_tool_new_to_the_map_resolves_to_itself_in_a_mixed_batch():
+    """§4TP r5: the batch resolves every name once, against the map refreshed
+    when ANY name of the batch is missing. Stale map {recall, update_profile};
+    batch [recall, update_prices]: update_prices must run as itself, never as
+    a difflib guess of update_profile (a refresh on the first name only, or a
+    name list read before the refresh, both made that guess)."""
+    agent = _dispatch_agent(); ran = []
+
+    def mk(name):
+        async def f(**kw):
+            ran.append(name); return "ok"
+        return f
+    agent.available_tools = {"recall": mk("recall"), "update_profile": mk("update_profile")}
+    agent._rebuild_available_tools = lambda: agent.available_tools.update({"update_prices": mk("update_prices")})
+    # update_profile is an idempotent SETTER: classified as it, the second
+    # identical update_prices call is refused "already applied" (the guards
+    # key on the batch's resolution; the dispatch re-resolves on its own, so
+    # what RUNS alone cannot show the wrong classification)
+    ts = _ts(tool_calls=[_call("recall", {"query": "q"}), _call("update_prices", {"sku": "a1"}),
+                         _call("update_prices", {"sku": "a1"})])
+    await agent._dispatch_and_process_tool_batch(ts)
+    assert ran == ["recall", "update_prices", "update_prices"]
+    assert not [m for m in ts.tools_run_this_turn if m.get("_synthetic")]

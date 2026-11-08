@@ -32,6 +32,7 @@ export function initPalette(ctx) {
             // status panel with per-turn Stop/Force) were removed
             // 2026-09-05 at the operator's request, along with the panel.
             { label: 'Stop MY turn', hint: 'cooperative cancel of this tab\'s turn', run: () => Core.cancelOwnTurn(false) },
+            { label: 'Toggle voice interrupt', hint: 'talk over spoken replies', run: () => Core.toggleBargeIn() },
             { label: 'Toggle density', hint: 'compact / comfortable', run: toggleDensity },
             {
                 label: 'Copy last reply', hint: '', run: async () => {

@@ -347,6 +347,19 @@ def parse_leaf_reply(text: str) -> Tuple[str, str]:
     return verify, summary
 
 
+def _request_data_block() -> str:
+    """§4TP review r1 M2: the data the owner's request fetched with its own
+    tools (`core/request_data.py`), rendered here — in the PARENT request,
+    where the prompt is built; the leaf's own turn runs under a
+    `sub-leaf-…` id that holds none."""
+    try:
+        from .request_data import render_block
+        b = render_block()
+        return (b.strip() + "\n\n") if b else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _leaf_prompt(description: str, ledger: str, existing_files: Optional[Dict[str, str]],
                  research_context: Optional[Dict[str, str]], single_file: bool,
                  witness: str) -> str:
@@ -367,7 +380,7 @@ def _leaf_prompt(description: str, ledger: str, existing_files: Optional[Dict[st
         f"BUILD TASK (one leaf of a project): {description}\n\n"
         f"PROJECT LEDGER (what was built before):\n{(ledger or '(none)')[:2500]}\n\n"
         f"EXISTING FILES: {files_line}\n\n"
-        f"{research}{single}{wit}"
+        f"{research}{_request_data_block()}{single}{wit}"
         "HOW TO WORK: you have `file_system` (read / write / replace / list_files / search) and "
         "`execute` (a shell in the project directory). Read what exists before editing. Make the "
         "change with targeted edits, then RUN it — run the tests, import the module, start the "

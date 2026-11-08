@@ -353,14 +353,41 @@ def test_the_web_client_drops_the_retracted_text_and_its_speech():
     from tests.helpers import eval_js, extract_js_function
     fn = extract_js_function(APP, "_applyStreamRetract")
     prelude = ("let currentAccumulatedContent = 'Narration before a call.'; let currentStreamPrefixLen = 4;"
-               "let currentTTSMutedLength = 9; let currentAgentMessageDiv = {innerHTML: '<p>x</p>'};"
-               "let currentSpeechHold = true;"
-               "let stopped = 0; let cancelled = 0; function stopTTS() { stopped++; }"
+               "let _streamChars = 9, _replayUpTo = 0; let currentAgentMessageDiv = {innerHTML: '<p>x</p>'};"
+               "let currentSpeechHold = true; let _speechCut = false;"
+               "let ttsBuffer = ''; let stopped = 0; let cancelled = 0; function stopTTS() { stopped++; }"
                "function _cancelScheduledStreamRender() { cancelled++; }\n")
     got = eval_js(prelude + fn, "[_applyStreamRetract(), currentAccumulatedContent, currentStreamPrefixLen,"
-                                " currentTTSMutedLength, currentAgentMessageDiv.innerHTML, stopped, cancelled,"
+                                " currentAgentMessageDiv.innerHTML, stopped, cancelled,"
                                 " _applyStreamRetract(), stopped, currentSpeechHold]")
-    assert got == [True, "", 0, 0, "", 1, 1, False, 1, False]          # a second retract with nothing shown is a no-op
+    assert got == [True, "", 0, "", 1, 1, False, 1, False]          # a second retract with nothing shown is a no-op
+
+
+def test_a_resumed_clip_paused_again_before_it_started_is_not_over():
+    """play() rejects with AbortError when a new pause lands first, and that pause's resume plays it."""
+    from tests.helpers import eval_js, extract_js_function
+    fn = extract_js_function(APP, "_bargeResume")
+    prelude = ("let ended = 0, _bargeHold = false, micBtn = null, isRecording = false, isPlayingTTS = true;"
+               "function _bargeListen() { _bargeHold = true; } function playNextAudio() {}"
+               "const fail = (name) => ({ onended() { ended++; }, play() { return Promise.reject({ name }); } });"
+               "let currentAudioSource = null;\n")
+    got = eval_js(prelude + fn, """await (async () => {
+        currentAudioSource = fail('AbortError'); _bargeResume(); await new Promise(r => setTimeout(r, 0));
+        const abort = ended;
+        currentAudioSource = fail('NotSupportedError'); _bargeResume(); await new Promise(r => setTimeout(r, 0));
+        return [abort, ended]; })()""")
+    assert got == [0, 1]
+
+
+def test_noting_a_replay_twice_keeps_what_the_first_one_saw():
+    """A return to the tab notes it and empties the text, then the resume notes it again."""
+    from tests.helpers import eval_js, extract_js_function
+    fn = extract_js_function(APP, "_noteStreamReplay")
+    prelude = ("let _streamChars = 12, _replayUpTo = 3, _replayHadText = false, currentAccumulatedContent = 'Said so far.';"
+               "const _stripInternalTags = (t) => t;\n")
+    got = eval_js(prelude + fn, """(() => { _noteStreamReplay(); currentAccumulatedContent = ''; _noteStreamReplay();
+        return [_streamChars, _replayUpTo, _replayHadText]; })()""")
+    assert got == [0, 12, True]
 
 
 def test_the_web_stream_loop_calls_the_retract_on_the_frame():

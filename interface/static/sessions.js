@@ -270,7 +270,7 @@ export function initSessions(ctx) {
             return;
         }
         try {
-            Core.stopTTS();
+            Core.endVoiceSession();
             // load() commits the identity itself, atomically with the
             // paint (R6); a superseded load returns null having bound
             // nothing.

@@ -137,7 +137,7 @@
       <ul>
         <li>a call marked main that does not open with the head (it goes through the switch, which keeps the request's own conversation as it is);</li>
         <li>a worker or critic call that falls back to the main slot when its own pool is down (the pool is checked as configured, not as served);</li>
-        <li>cost: the visual verifier's pixel check falls back to the vision pool when the critic fails, and inside a live request it then pays a conversation save (seconds, up to tens under swap) before its verdict.</li>
+        <li>cost: the visual verifier's pixel check runs on the vision pool, which is the main server (production since 2026-11-07), and inside a live request it pays a conversation save (seconds, up to tens under swap) before its verdict.</li>
       </ul></li>
   </ul>
 

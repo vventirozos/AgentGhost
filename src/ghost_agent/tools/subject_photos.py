@@ -725,6 +725,125 @@ def combine_side_by_side(paths: List[Path], aspect: Optional[float] = None) -> b
 
 
 
+#: `keep_first` (req 8473053b): the other panels stay narrow so the picture
+#: being edited gets the most of the node's 768x512 pixel budget.
+_OTHER_PANEL_MAX = round(COMBINED_HEIGHT * 0.75)
+_OTHER_PANEL_MIN = round(COMBINED_HEIGHT * 0.5)
+#: how far from the predicted edge the gap may have moved in a render, as a
+#: share of its width (measured: 1-2 px of 736)
+_GAP_SEARCH = 0.015
+#: the gap, when it survives, is a run of flat columns (gray standard deviation),
+#: at least half its expected width, and gives the exact place to cut. One flat
+#: column could be a keyline inside the picture (review). The model may also paint
+#: the gap over (live, twice, purple with soft edges), so a missing gap does not
+#: mean a lost layout: the panels' correlation decides that.
+_GAP_MAX_STDDEV = 8.0
+#: reference pixels at or above this are empty background, not panel content
+_OTHERS_BLANK_LEVEL = 240
+#: fewer content cells than this (of 32x32) cannot show a layout was kept
+_OTHERS_MIN_CELLS = 8
+#: correlation of the other panels' content, render against reference. Brightness
+#: alone passed a plain wall of similar gray (review). Measured: real renders that
+#: kept the layout 0.85-0.99, lost ones (a scene, walls, another person) -0.31 to 0.13.
+_OTHERS_MIN_CORRELATION = 0.6
+
+
+def combine_keep_first(paths: List[Path]) -> Tuple[bytes, Tuple[float, float, float, float]]:
+    """The first picture whole, then the others beside it, narrowed by scaling
+    and never cropped (review: a crop can remove the face to copy). Returns
+    the JPEG and where the first picture sits in it, as shares of the strip:
+    (right edge, top, bottom, gap width); ``crop_first_panel`` cuts it back out."""
+    from PIL import Image, ImageOps
+    with Image.open(paths[0]) as im:
+        first = _on_white(ImageOps.exif_transpose(im))
+    if not ASPECT_BAND[0] <= first.width / first.height <= ASPECT_BAND[1]:
+        raise ValueError("the first picture's shape is outside what the node renders")
+    w = max(1, round(first.width * COMBINED_HEIGHT / first.height))
+    cap = round(COMBINED_HEIGHT * 1.5)
+    if w <= cap:
+        panel0 = first.resize((w, COMBINED_HEIGHT), Image.Resampling.LANCZOS)
+        top = 0
+        inner_h = COMBINED_HEIGHT
+    else:                                   # never crop what is being edited
+        inner_h = max(1, round(first.height * cap / first.width))
+        top = (COMBINED_HEIGHT - inner_h) // 2
+        panel0 = Image.new("RGB", (cap, COMBINED_HEIGHT), (255, 255, 255))
+        panel0.paste(first.resize((cap, inner_h), Image.Resampling.LANCZOS), (0, top))
+    side = max(_OTHER_PANEL_MIN, min(panel0.width, _OTHER_PANEL_MAX))
+    ims = [panel0]
+    for p in paths[1:]:
+        with Image.open(p) as im:
+            im = _on_white(ImageOps.exif_transpose(im))
+            ow = max(1, round(im.width * COMBINED_HEIGHT / im.height))
+            if ow <= side:
+                ims.append(im.resize((ow, COMBINED_HEIGHT), Image.Resampling.LANCZOS))
+            else:
+                h = max(1, round(im.height * side / im.width))
+                panel = Image.new("RGB", (side, COMBINED_HEIGHT), (255, 255, 255))
+                panel.paste(im.resize((side, h), Image.Resampling.LANCZOS), (0, (COMBINED_HEIGHT - h) // 2))
+                ims.append(panel)
+    width = sum(i.width for i in ims) + COMBINED_GAP * (len(ims) - 1)
+    out = Image.new("RGB", (width, COMBINED_HEIGHT), (255, 255, 255))
+    x = 0
+    for im in ims:
+        out.paste(im, (x, 0))
+        x += im.width + COMBINED_GAP
+    buf = io.BytesIO()
+    out.save(buf, format="JPEG", quality=90)
+    return buf.getvalue(), (panel0.width / width, top / COMBINED_HEIGHT, (top + inner_h) / COMBINED_HEIGHT,
+                            COMBINED_GAP / width)
+
+
+def _others_correlation(render, strip, edge: float) -> Optional[float]:
+    """Pearson correlation of the panels beside the first picture, over the
+    cells that hold content in the reference. None: too little content to tell."""
+    def cells(i):
+        return i.crop((min(i.width - 1, round(edge * i.width) + 1), 0, i.width, i.height)).resize((32, 32)).tobytes()
+    a, b = cells(render), cells(strip)
+    idx = [k for k, v in enumerate(b) if v < _OTHERS_BLANK_LEVEL]
+    if len(idx) < _OTHERS_MIN_CELLS:
+        return None
+    x, y = [a[k] for k in idx], [b[k] for k in idx]
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    sx, sy = sum((v - mx) ** 2 for v in x), sum((v - my) ** 2 for v in y)
+    if not sx or not sy:
+        return 0.0
+    return sum((u - mx) * (v - my) for u, v in zip(x, y)) / (sx * sy) ** 0.5
+
+
+def crop_first_panel(image_bytes: bytes, box: Tuple[float, float, float, float], strip_bytes: bytes) -> Optional[bytes]:
+    """The first picture cut out of a render of the ``strip_bytes`` reference
+    as a PNG, or None when the other panels' content is gone: the render did
+    not keep the layout and cutting it would destroy the picture."""
+    from PIL import Image, ImageStat
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            rgb = im.convert("RGB")
+        with Image.open(io.BytesIO(strip_bytes)) as st:
+            strip = st.convert("L")
+    except Exception:  # noqa: BLE001 — unreadable: the caller keeps it whole
+        return None
+
+    gray = rgb.convert("L")
+    corr = _others_correlation(gray, strip, box[0])
+    if corr is None or corr < _OTHERS_MIN_CORRELATION:
+        return None
+    w, h = rgb.size
+    edge = round(box[0] * w)
+    reach = max(2, round(w * _GAP_SEARCH))
+    need = max(2, round(box[3] * w / 2))
+    run, cut_at = 0, edge
+    for x in range(max(1, edge - reach), min(w - 1, edge + reach + need) + 1):
+        run = run + 1 if ImageStat.Stat(gray.crop((x, 0, x + 1, h))).stddev[0] <= _GAP_MAX_STDDEV else 0
+        if run >= need:
+            cut_at = x - run + 1
+            break
+    buf = io.BytesIO()
+    top = round(box[1] * h)
+    rgb.crop((0, top, cut_at, max(top + 1, round(box[2] * h)))).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def pad_photo(path: Path, aspect: Optional[float]) -> bytes:
     """One photo padded to ``aspect`` (a requested render shape); §4QG:
     ``aspect=None`` = its own shape, only flattened onto white."""
