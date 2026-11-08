@@ -69,7 +69,7 @@ const dT = face.getDebugState();
 const twAbs = dT.tesseract.tw.map(Math.abs);
 const uv = lines.geometry.attributes.aLightPass.array; const bases = new Set();
 for (let e = 0; e < 12; e++) bases.add(Math.round(uv[(e * 6) * 2] * 1000) / 1000);
-face.noteToolCall(); tick(3);
+face.noteToolCall(); tick(8);   // §4TQ: the flash rises over ~0.15 s (peak ~frame 8)
 const dTool = face.getDebugState();
 const cornerSizesTool = snapshot().slice(0, 8).map(p => p.s);
 tick(400);
@@ -90,7 +90,7 @@ emit({ rest, idleP95: p95Of(idle), turnP95: p95Of(turn), turnMax: maxOf(turn),
        flashTool: dTool.gaitFlash, cornerSizesTool, wobPass, twPassDecay: twB / Math.max(1e-9, twA), shudder,
        sweepOn, nan, wraps: turn.reduce((m, s) => m + s.wraps, 0), lines: lines.geometry.drawRange.count / 2, linesNow: { ...face.getDebugState().tesseract.lines },
        kernelBase: d0.tesseract.kernelBase, shells: d0.tesseract.shells, kernelN: d0.tesseract.kernelN,
-       stream: d0.tesseract.stream, rollIdleRate: (face.getDebugState().tesseract.roll - d0.tesseract.roll) / ((1200 + 900 + 3 + 400 + 5 + 60 + 400 + 12 + 400 + 120 + 600) / 60),
+       stream: d0.tesseract.stream, rollIdleRate: (face.getDebugState().tesseract.roll - d0.tesseract.roll) / ((1200 + 900 + 8 + 400 + 5 + 60 + 400 + 12 + 400 + 120 + 600) / 60),
        centerDim: lines.material.uniforms.uCenterDim.value,
        sceneRoll: scene.rotation.z - sceneZ0, rollAcc: face.getDebugState().tesseract.roll - d0.tesseract.roll });
 """,

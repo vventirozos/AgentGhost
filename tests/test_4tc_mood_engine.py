@@ -1067,7 +1067,7 @@ def test_any_other_word_is_no_mood(word):
 
 def test_the_clear_words_and_the_manners_are_closed_lists():
     assert M.CLEAR_WORDS == frozenset({"clear", "none", "neutral"})
-    assert M.MANNERS == ("sarcastic", "playful", "formal", "terse", "gentle", "dramatic")
+    assert M.MANNERS == ("sarcastic", "playful", "formal", "terse", "gentle", "dramatic", "evil")
     assert [M.resolve_manner(w) for w in ("Sarcastic", " terse ", "rude", "", None, "neutral")] == [
         "sarcastic", "terse", "", "", "", ""]
     assert not set(M.MANNERS) & set(M.LABELS) and not set(M.SYNONYMS) & set(M.LABELS)
@@ -1147,18 +1147,24 @@ def test_an_event_leaves_the_manner_where_it_is(tmp_path):
     s.mark_owner_turn(now=T0)
     s.settle(now=_at(hours=9))                                         # … and so do time and a long quiet
     v = s.mood(now=_at(hours=9))
-    assert (v.label, v.manner, v.manner_intensity, v.manner_set_at) == ("bored", "playful", 3, "2026-11-06T09:00:00Z")
-    assert json.loads(s.path.read_text())["mood"]["manner"] == "playful"
+    # §4TS: the manner's level at +9 h depends on where its day ends in THIS
+    # machine's local time — read it off the module's own schedule
+    want = M.manner_level(3, "2026-11-06T09:00:00Z", now=_at(hours=9))
+    assert (v.label, v.manner, v.manner_intensity) == ("bored", "playful" if want else "", want)
+    assert v.manner_set_at == ("2026-11-06T09:00:00Z" if want else "")
+    # a write keeps a live manner and drops one whose day is over (§4TS closing review)
+    assert json.loads(s.path.read_text())["mood"]["manner"] == ("playful" if want else "")
 
 
-def test_a_manner_does_not_decay_and_leaves_the_mood_alone(tmp_path):
+def test_a_manner_leaves_the_mood_alone_and_ends_with_its_day(tmp_path):
+    """§4TS: a manner used to stay for good (a month later still "dramatic, 3")."""
     s = SelfStateThread(tmp_path)
     s.set_owner_mood("content", M.ANCHOR_DIRECTION["content"], 2, now=T0)
     before, after = s.set_manner("dramatic", 3, now=_at(minutes=1))
     assert (after.label, after.intensity, after.p) == (before.label, before.intensity, before.p)
     assert (after.manner, after.manner_intensity, after.manner_set_at) == ("dramatic", 3, "2026-11-06T09:01:00Z")
     month = s.mood(now=_at(hours=24 * 30))
-    assert month.neutral and (month.manner, month.manner_intensity) == ("dramatic", 3)
+    assert month.neutral and (month.manner, month.manner_intensity) == ("", 0)
     assert len(_rows(s)) == 1                                          # a manner is not a mood row
 
 

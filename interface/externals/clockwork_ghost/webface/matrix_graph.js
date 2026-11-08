@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { createTemperament, logRowIcon } from './temperament.js?v=1.6';
+import { createTemperament, logRowIcon } from './temperament.js?v=1.7';
 export { logRowIcon };
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -349,6 +349,15 @@ export const PHASES = ['search', 'read', 'tool', 'verify', 'write'];
 let phase = null;
 const gait = { search: 0, read: 0, tool: 0, verify: 0, write: 0 };
 let toolPulse = 0.0;
+// What the eye sees of a tool call (2026-11-08, §4TQ): toolPulse rises in one
+// frame, and every visual it fed (kernel size, corner sparks, node size and
+// light through pulseT, the line bursts' position, the bloom) jumped with it —
+// a pop at the start of most turns (operator: "jidderish when it transits
+// from idle to busy"). The visuals read this follower instead: it rises over
+// ~0.15 s (frame-rate independent), peaks at about half of toolPulse, and
+// falls with it.
+let toolFlash = 0.0;
+const TOOL_FLASH_RISE = 0.15;
 let sweepAngle = 0.0;
 let recallSpark = 0.0;
 let recallNode = -1;
@@ -1479,7 +1488,7 @@ export function getDebugState() {
         pulse: _fract(pulsePhase),
         bob: _bob,
         anatomy: FORMS[formIndex],
-        phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
+        phase, gait: { ...gait }, toolPulse, toolFlash, recallSpark, verdict, verdictEnv,
         backgroundBusy, moodHue, moodLook: { ..._moodNow }, pulsePhase, gazeY, errorKind, errorKindEnv, body: { ..._bodyPrev },
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
         dtF, clock: time, cube2Flow, cube2Travel, twitchAmp,
@@ -1871,6 +1880,8 @@ function animate(ts) {
     for (const k of PHASES) gait[k] += ((phase === k ? 1 : 0) - gait[k]) * ease(0.04);
     toolPulse *= decay(0.93);
     if (toolPulse < 0.003) toolPulse = 0;
+    toolFlash += (toolPulse - toolFlash) * ease(TOOL_FLASH_RISE);
+    if (toolFlash < 0.003 && toolPulse === 0) toolFlash = 0;
     recallSpark *= decay(0.972);                // ~1.5s comet
     if (recallSpark < 0.01) { recallSpark = 0; recallNode = -1; }
     verdictEnv *= decay(verdict === 'pass' ? TUNE.passHold : 0.975);   // pass holds ~2s, others ~1s
@@ -1891,7 +1902,7 @@ function animate(ts) {
     const DIAL = dialectFor(FORMS[formIndex]);
     gaitFlow = DIAL.write === 'flow' ? gait.write : 0;
     gaitThicken = DIAL.read === 'thicken' ? gait.read : 0;
-    gaitFlash = DIAL.tool === 'flash' ? toolPulse : 0;
+    gaitFlash = DIAL.tool === 'flash' ? toolFlash : 0;
     gaitAlign = DIAL.verify === 'align' ? gait.verify : 0;
     // Stillness: a pass crystallises; a refusal freezes; verify tightens
     // toward stillness; read slows. 0 = full motion, 1 = frozen.
@@ -1955,7 +1966,7 @@ function animate(ts) {
         // v2: a tool call sends a burst of packets down every edge (the
         // line shader's `burst` term rides uPulseT), and a user turn keeps
         // the charge visibly moving.
-        pulseT = Math.min(1.0, pulseT + 0.6 * toolPulse + 0.15 * c2n);
+        pulseT = Math.min(1.0, pulseT + 0.6 * toolFlash + 0.15 * c2n);
     } else {
         cube2Travel = 0.0;
     }
@@ -2203,7 +2214,7 @@ function animate(ts) {
         // z-wave or the form's own flow.
         const axis = DIAL.radialAxis;
         const readRadial = DIAL.read === 'contract' ? TUNE.radialRead * gait.read : 0;
-        const toolRadial = DIAL.tool === 'kick' ? TUNE.toolKick * toolPulse : 0;
+        const toolRadial = DIAL.tool === 'kick' ? TUNE.toolKick * toolFlash : 0;
         const radial = 1.0 + TUNE.radialSearch * gait.search - readRadial
             - TUNE.radialVerify * gait.verify + toolRadial;
         // × CALM like every other CPU-side ripple (§4PR: reduced motion
@@ -2503,7 +2514,7 @@ function animate(ts) {
     // response unchanged, so a busy agent still visibly glows.
     // Background-blend bloom (×0.65, all forms — see formDim above).
     bloomPass.strength = (0.88 + workingState * 0.3 + activity * 0.35
-        + errorState * 0.5 + 0.20 * toolPulse + 0.25 * recallSpark
+        + errorState * 0.5 + 0.20 * toolFlash + 0.25 * recallSpark
         + (verdict === 'pass' ? 0.2 * verdictEnv : 0)
         + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9))
         + 0.35 * TS.glow)

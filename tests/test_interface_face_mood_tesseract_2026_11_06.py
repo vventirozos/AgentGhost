@@ -191,7 +191,19 @@ def before(tmp_path_factory):
     src = f.read_text(encoding="utf-8")
     for old, new in (("const u = Math.random(), v = Math.random();", "const u = 0.5, v = 0.5;"),
                      ("Math.pow(Math.random(), 0.55); // inward bias", "0.5; // inward bias"),
-                     ("moteSeeds[i] = Math.random();", "moteSeeds[i] = 0.5;")):
+                     ("moteSeeds[i] = Math.random();", "moteSeeds[i] = 0.5;"),
+                     # §4TQ (2026-11-08): the tool flash's visuals read an eased
+                     # follower; the same change is applied here so every OTHER
+                     # channel is still compared frame for frame.
+                     ("let toolPulse = 0.0;", "let toolPulse = 0.0; let toolFlash = 0.0;"),
+                     ("    if (toolPulse < 0.003) toolPulse = 0;\n",
+                      "    if (toolPulse < 0.003) toolPulse = 0;\n"
+                      "    toolFlash += (toolPulse - toolFlash) * ease(0.15);\n"
+                      "    if (toolFlash < 0.003 && toolPulse === 0) toolFlash = 0;\n"),
+                     ("gaitFlash = DIAL.tool === 'flash' ? toolPulse : 0;", "gaitFlash = DIAL.tool === 'flash' ? toolFlash : 0;"),
+                     ("pulseT + 0.6 * toolPulse + 0.15 * c2n", "pulseT + 0.6 * toolFlash + 0.15 * c2n"),
+                     ("TUNE.toolKick * toolPulse : 0", "TUNE.toolKick * toolFlash : 0"),
+                     ("+ 0.20 * toolPulse + 0.25 * recallSpark", "+ 0.20 * toolFlash + 0.25 * recallSpark")):
         assert src.count(old) == 1, old
         src = src.replace(old, new)
     f.write_text(src, encoding="utf-8")

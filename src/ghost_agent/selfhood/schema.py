@@ -82,7 +82,8 @@ class Mood:
     holds the last few events that moved the pair (``{"at","cause","kind"}``).
 
     The MANNER is separate: a way of talking the owner set, with its own
-    intensity. It does not decay.
+    intensity. It lasts until the end of the day it was set on, stepping
+    down on the way (§4TS, read-time: ``mood.manner_level``).
 
     Before §4TC a mood was ``{"label", "evidence", "set_at", "source":
     "self"|"derived"}``. Such a record has no pair: ``SelfState.from_dict``

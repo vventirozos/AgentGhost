@@ -27,7 +27,7 @@ PORTFOLIO_TOOL_DEFINITION = {
             "mix, volatility, past falls, comparison with an index), 'forecast' (ranges from past returns, for "
             "one symbol or the whole mix), 'review' (fixed-rule prompts, each with its reason and the case "
             "against acting), 'status' (is the service working). It reads only and cannot trade. Report its "
-            "figures, dates and caveats as they are: never compute your own, and never turn a prompt or a range "
+            "figures, names, dates and caveats as they are: never compute your own or name a holding from memory, and never turn a prompt or a range "
             "into a buy or sell instruction or a price prediction."
         ),
         "parameters": {

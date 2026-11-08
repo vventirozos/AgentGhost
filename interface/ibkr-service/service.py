@@ -37,7 +37,8 @@ FLEX_STALE_DAYS = 4
 TICK = 30
 DEFAULT_CONFIG = {
     "flex_query_id": "", "base_currency": None, "benchmark": "VT", "symbol_overrides": {},
-    "max_position_pct": 20, "loss_review_pct": -30, "gain_review_pct": 100, "gain_review_weight_pct": 10,
+    # max_fund_pct 100: no fund is a size prompt by default; the review's fund line says why instead (§4TI-d)
+    "max_position_pct": 20, "max_fund_pct": 100, "loss_review_pct": -30, "gain_review_pct": 100, "gain_review_weight_pct": 10,
     "drawdown_review_pct": -25, "correlation_review": 0.7,
 }
 NOTE_NOT_ADVICE = ("These are prompts for your own judgement from fixed rules, not financial advice. "
@@ -73,7 +74,7 @@ def scrub(text, *secrets: str) -> str:
 
 
 #: Where a limit must lie, so a mistyped value can't turn a rule upside down or switch it off.
-LIMIT_RANGES = {"max_position_pct": (1, 100), "loss_review_pct": (-100, -1), "gain_review_pct": (1, 10000),
+LIMIT_RANGES = {"max_position_pct": (1, 100), "max_fund_pct": (1, 100), "loss_review_pct": (-100, -1), "gain_review_pct": (1, 10000),
                 "gain_review_weight_pct": (1, 100), "drawdown_review_pct": (-100, -1), "correlation_review": (0.01, 1)}
 
 
@@ -313,7 +314,7 @@ class Service:
                                          self.symbol_map(cfg), self._base(cfg), market.quote_problem, self.clock())
 
     def _limits(self, cfg: dict) -> dict:
-        return {"max_position": cfg["max_position_pct"] / 100, "loss_review": cfg["loss_review_pct"] / 100,
+        return {"max_position": cfg["max_position_pct"] / 100, "max_fund": cfg["max_fund_pct"] / 100, "loss_review": cfg["loss_review_pct"] / 100,
                 "gain_review": cfg["gain_review_pct"] / 100, "gain_review_weight": cfg["gain_review_weight_pct"] / 100,
                 "drawdown_review": cfg["drawdown_review_pct"] / 100, "correlation_review": cfg["correlation_review"]}
 
@@ -357,18 +358,29 @@ class Service:
             return f"{self._price(row['price'])} {row['currency']} (public, delayed, {self._when(row.get('price_at'))})"
         return f"{self._price(row['price'])} {row['currency']} (IBKR close {row.get('price_date')}; {row.get('price_note')})"
 
+    def _names(self, valued: dict, symbols: list) -> str:
+        """A list of tickers as named lines: each with IBKR's name (§4TI-b)."""
+        labels = {r.get("symbol"): r.get("label") or r.get("symbol") for r in valued["positions"]}
+        return ", ".join(labels.get(s) or str(s) for s in symbols)
+
     def _position_line(self, row: dict, base: str | None) -> str:
+        label = row.get("label") or analytics.label(row)
         if row.get("notional"):
-            return f"{row['symbol']}: {self._quantity(row['qty']) if row.get('qty') is not None else 'quantity unknown'} {row['asset']} contract(s), last price {self._price_line(row)}"
-        parts = [f"{row['symbol']}: {self._quantity(row['qty'])} x {self._price_line(row)}" if row.get("qty") is not None
-                 else f"{row['symbol']}: quantity unknown"]
+            return f"{label}: {self._quantity(row['qty']) if row.get('qty') is not None else 'quantity unknown'} {row['asset']} contract(s), last price {self._price_line(row)}"
+        parts = [f"{label}: {self._quantity(row['qty'])} x {self._price_line(row)}" if row.get("qty") is not None
+                 else f"{label}: quantity unknown"]
         if row.get("value_base") is not None:
             parts.append(f"value {self._money(row['value_base'], base)}")
         if row.get("weight") is not None:
             parts.append(f"{row['weight']:.1%} of holdings")
         if row.get("gain_local") is not None:
             pct = f" ({row['gain_pct']:+.1%})" if row.get("gain_pct") is not None else ""
-            parts.append(f"gain {row['gain_local']:+,.2f} {row['currency']}{pct}")
+            if base and row["currency"] != base and row.get("gain_base") is not None:
+                # §4TI-e: in the account's currency first, like every other money figure in the line
+                parts.append(f"gain {row['gain_base']:+,.2f} {base} at today's FX ({row['gain_local']:+,.2f} "
+                             f"{row['currency']}{', ' + pct.strip(' ()') if pct else ''})")
+            else:
+                parts.append(f"gain {row['gain_local']:+,.2f} {row['currency']}{pct}")
         else:
             parts.append("gain unknown")
         if row.get("move_pct") is not None:
@@ -381,13 +393,13 @@ class Service:
         valued, data = self.valued(cfg), self.state["flex"]
         base = valued["base"]
         missing = valued["incomplete"]
-        partial = f" (PARTIAL: leaves out {', '.join(missing)})" if missing else ""
+        partial = f" (PARTIAL: leaves out {self._names(valued, missing)})" if missing else ""
         lines = ["PORTFOLIO (all figures computed by the service; report them as they are)",
                  f"Holdings: {self._money(valued['invested'], base)}{partial}",
                  f"Cash: {self._money(valued['cash'], base)}",
                  f"Total: {self._money(valued['total'], base)}{partial if valued['total'] is not None else ''}"]
         if valued["gain"] is not None:
-            left_out = f"; leaves out {', '.join(valued['gain_unknown'])}" if valued["gain_unknown"] else ""
+            left_out = f"; leaves out {self._names(valued, valued['gain_unknown'])}" if valued["gain_unknown"] else ""
             lines.append(f"Gain against cost: {self._money(valued['gain'], base)} ({valued['gain_pct']:+.1%}), "
                          f"at today's FX, so it leaves out past currency moves{left_out}")
         if valued["day"] is not None:
@@ -403,7 +415,7 @@ class Service:
                          f"{self._money(data['dividends_ytd'], base)}, withholding tax {self._money(data['withholding_ytd'], base)}")
         lines.extend(self._position_line(row, base) for row in valued["positions"])
         if valued["notional"]:
-            lines.append("Not in any total, because a contract's size isn't money held: " + ", ".join(valued["notional"]))
+            lines.append("Not in any total, because a contract's size isn't money held: " + self._names(valued, valued["notional"]))
         return "\n".join(lines + self._freshness(cfg))
 
     def _holding_rows(self, valued: dict, symbol: str) -> list:
@@ -413,7 +425,7 @@ class Service:
         return [r for r in valued["positions"] if wanted and wanted in (fold(r.get("symbol")), fold(r.get("isin")), fold(r.get("yahoo")))]
 
     def _not_held(self, valued: dict, symbol: str, cfg: dict) -> str:
-        held = ", ".join(r["symbol"] for r in valued["positions"]) or "none"
+        held = ", ".join(r.get("label") or r["symbol"] for r in valued["positions"]) or "none"
         return "\n".join([f"PORTFOLIO: no holding matched {symbol.strip().upper()} on this statement. Holdings: {held}."] + self._freshness(cfg))
 
     def _position(self, cfg: dict, symbol: str) -> str:
@@ -423,7 +435,9 @@ class Service:
             return self._not_held(valued, symbol, cfg)
         lines = []
         for row in rows:
-            lines += [self._position_line(row, valued["base"]), f"Name: {row.get('description')}"]
+            lines.append(self._position_line(row, valued["base"]))
+            if row.get("public_name") and row.get("description") and row["public_name"].upper() != row["description"].upper():
+                lines.append(f"IBKR's name for it: {row['description']}")
             if row.get("cost_price") is not None:
                 lines.append(f"Average cost: {self._price(row['cost_price'])} {row['currency']}")
         symbols = {r["symbol"] for r in rows}
@@ -441,10 +455,13 @@ class Service:
         health = self._health_data(cfg, valued)
         lines = [f"PORTFOLIO HEALTH: {health['count']} holdings valued"]
         if valued["incomplete"]:
-            lines.append("Left out of these figures, value unknown: " + ", ".join(valued["incomplete"]))
+            lines.append("Left out of these figures, value unknown: " + self._names(valued, valued["incomplete"]))
         if health["largest"]:
-            lines.append(f"Largest: {health['largest']['symbol']} at {health['largest']['weight']:.1%} "
-                         f"(your limit {cfg['max_position_pct']}%). Top 3 together: {health['top3']:.1%}.")
+            big = health["largest"]
+            limit = (f"a fund; your limit for one fund {cfg['max_fund_pct']}%" if analytics.is_fund(big)
+                     else f"your limit {cfg['max_position_pct']}%")
+            lines.append(f"Largest: {big.get('label') or big['symbol']} at {big['weight']:.1%} "
+                         f"({limit}). Top 3 together: {health['top3']:.1%}.")
             lines.append("Currencies: " + ", ".join(f"{c} {w:.1%}" for c, w in health["currencies"]))
         if "volatility" in health:
             stale = " STALE: the shared history stops well before today." if health["history_stale"] else ""
@@ -471,10 +488,12 @@ class Service:
             rows = self._holding_rows(valued, symbol)
             if not rows:
                 return self._not_held(valued, symbol, cfg)
-            history = next((self.histories[r["history_symbol"]] for r in rows if self.histories.get(r.get("history_symbol"))), [])
+            # name the listing whose closes are used (§4TI-b review r2: rows[0] named one, another's history ran)
+            row = next((r for r in rows if self.histories.get(r.get("history_symbol"))), rows[0])
+            history = self.histories.get(row.get("history_symbol")) or []
             closes = [p for _, p in history]
             last = history[-1][0] if history else None
-            name, basis = wanted, f"{wanted} closes with dividends reinvested"
+            name, basis = row.get("label") or wanted, f"{row['symbol']} closes with dividends reinvested"
         else:
             longs = [r for r in valued["positions"] if r.get("weight") and (r.get("qty") or 0) > 0]
             weights: dict = {}
@@ -486,7 +505,7 @@ class Service:
             last = blend["dates"][-1] if blend else None
             name = "your current mix"
             basis = f"today's weights held constant, {blend['coverage']:.0%} of long holdings covered" if blend else ""
-        tail = (["Left out, value unknown: " + ", ".join(valued["incomplete"])] if valued["incomplete"] and not wanted else []) + self._freshness(cfg)
+        tail = (["Left out, value unknown: " + self._names(valued, valued["incomplete"])] if valued["incomplete"] and not wanted else []) + self._freshness(cfg)
         rows = analytics.bands(closes)
         if not rows:
             return "\n".join([f"PORTFOLIO RANGES: not enough price history for {name} (a horizon needs at least twice its "
@@ -509,10 +528,18 @@ class Service:
                 [f"PORTFOLIO REVIEW: {len(items)} item(s) to look at. None is an instruction to buy or sell."]
         for item in items:
             lines.append(f"- {item['why']} Ask: {item['ask']} On the other hand: {item['against']}")
+        limits = self._limits(cfg)
+        funds = [r for r in valued["positions"] if analytics.is_fund(r) and (r.get("weight") or 0) > limits["max_position"]
+                 and r["weight"] <= limits["max_fund"]]
+        if funds:
+            lines.append(f"A note, not a prompt: funds are held to your limit for one fund ({cfg['max_fund_pct']}%, setting "
+                         f"max_fund_pct), not the {cfg['max_position_pct']}% limit for one company: "
+                         f"{self._names(valued, [r['symbol'] for r in funds])}. The service can't tell a broad index fund "
+                         "from a one-sector or one-country fund; the fund's name says which it is.")
         if valued["incomplete"]:
-            lines.append("Share of holdings not checked, value unknown: " + ", ".join(valued["incomplete"]))
+            lines.append("Share of holdings not checked, value unknown: " + self._names(valued, valued["incomplete"]))
         for rule, symbols in unchecked.items():
-            lines.append(f"Not checked for {rule}, data missing: {', '.join(symbols)}")
+            lines.append(f"Not checked for {rule}, data missing: {self._names(valued, symbols)}")
         if cfg.get("rejected"):
             lines.append("Settings ignored as invalid, so their defaults are used: " + ", ".join(cfg["rejected"]))
         lines.append(NOTE_NOT_ADVICE)

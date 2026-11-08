@@ -305,7 +305,7 @@ async def verify_interface_key_or_page_cookie(request: Request,
     open and holds no API key; it needs the PUBLIC VAPID key to re-subscribe.
     `/api/push/vapid` returns nothing but that public key and an on/off flag
     — data every subscription already carries — so accepting the HttpOnly,
-    SameSite=Strict page cookie there widens nothing. Every state-changing
+    SameSite=Lax page cookie there widens nothing. Every state-changing
     route keeps the header-only rule (the cookie must never authorise a
     write: see the note above _PAGE_COOKIE).
     """
@@ -903,7 +903,8 @@ async def _log_streamer_once():
 # with no way back, and an installed iOS PWA has no address bar to fix it
 # in. The cookie restores that, and is strictly safer than the URL it
 # replaces: HttpOnly (JS cannot read it, unlike `window.GHOST_API_KEY`),
-# SameSite=Strict, never in a Referer, and never in an access log.
+# SameSite=Lax (Strict until 2026-11-08: it broke the macOS Dock web app),
+# never in a Referer, and never in an access log.
 #
 # It gates ONLY this page. Every state-changing endpoint still requires the
 # `X-Ghost-Key` HEADER, so the cookie cannot be used for CSRF; and `/` is a
@@ -1084,7 +1085,16 @@ async def get(request: Request, key: str | None = None):
         max_age=_PAGE_COOKIE_MAX_AGE,
         path="/",
         httponly=True,
-        samesite="strict",
+        # Lax, not Strict (2026-11-08): a macOS Safari web app ("Add to
+        # Dock") opens its start URL — the SCRUBBED `/`, no key — as a
+        # navigation with no initiating site, and WebKit withheld the Strict
+        # cookie on it: the Dock app landed on the 401 page until a reload
+        # (log: `GET /` 401 then 200 on one connection). Lax still keeps it
+        # off every cross-site subresource, POST and frame; a cross-site
+        # top-level GET of `/` returns a page the other site cannot read
+        # (CORS) or frame (X-Frame-Options: DENY), and the cookie authorises
+        # no write.
+        samesite="lax",
         secure=_request_is_https(request),
     )
     return response

@@ -169,7 +169,10 @@ RULE_HINT = ("If the owner means their own standing rules (the ### OWNER RULES b
              "the commands that change them, so NOTHING was changed. Only these exact messages show or change a "
              "rule, and the system runs them itself: “learn this rule: <the rule>” (the rule on one line after "
              "the colon, with no question mark), “show my rules”, “show rule N”, “forget rule N” (it then asks for “confirm forget "
-             "rule N”). You have no tool that changes a rule. There are no proposed or candidate rules any more "
+             "rule N”). To change a rule: “show my rules” gives its number; the owner sends the new rule, on one line "
+             "(a list of steps written as one sentence), with “learn this rule: <the rule>”, then “forget rule N” "
+             "for the old one (with a full list, forget first). You have no tool that changes a rule, and a "
+             "profile entry is not a rule. There are no proposed or candidate rules any more "
              "(the loop that proposed them was removed on 2026-11-05), so “learn rule N” and “dismiss rule N” do "
              "nothing. If the owner asked a question, answer it; if they asked for a change, tell them in one or "
              "two sentences the exact message to send. If the message is about some other kind of rule, ignore "
@@ -528,6 +531,17 @@ def rules_withheld() -> bool:
         return False
 
 
+#: §4TI-c, under every rules block. Req 0f263dac: "edit this rule, add … 1. … 4. …" (27 words, so no
+#: `RULE_HINT`) — the model wrote a guessed profile key and said "Done" while the rule stayed as it was. A matcher
+#: deciding which long message is an edit failed three reviews in a row (it hinted "fix my lint rule…" and
+#: missed "can you edit my rule…"), so the operator chose this fixed line: no guess, any wording, any language.
+RULES_FIXED_LINE = ("These rules change only by the owner's own commands: “learn this rule: <the rule>” adds one; "
+                    "“show my rules” gives the numbers (not the order above); “forget rule N”, then “confirm forget "
+                    "rule N”, removes one (with ten rules, forget first). You have no tool that changes them, and a "
+                    "profile entry is not a rule. Asked to change one, tell the owner which messages to send; never "
+                    "say it is changed.")
+
+
 def rules_block(home) -> str:
     """The ### OWNER RULES block for a turn's state, or "" (no rule). The
     caller decides WHO may see it (never a member, a public reply or an
@@ -539,7 +553,7 @@ def rules_block(home) -> str:
     if not rs or rules_withheld():
         return ""
     return ("### OWNER RULES (set by the owner — follow them whenever they apply)\n"
-            + "\n".join(f"- {_clean(r['rule'])[:RULE_MAX_CHARS]}" for r in rs) + "\n\n")
+            + "\n".join(f"- {_clean(r['rule'])[:RULE_MAX_CHARS]}" for r in rs) + "\n" + RULES_FIXED_LINE + "\n\n")
 
 
 def rules_mentioning(home, target: str) -> List[dict]:

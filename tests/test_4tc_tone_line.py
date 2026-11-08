@@ -595,8 +595,12 @@ def test_the_line_is_built_in_one_place_and_enters_one_block():
         got = _calls(ast.parse(path.read_text(encoding="utf-8")), {"tone_line", "tone", "_mood_tone_block"})
         if got:
             users[str(path.relative_to(SRC))] = sorted(got)
+    # tools/introspect.py (2026-11-08, operator: "add the tone to the mood"):
+    # the `mood` view SHOWS the line verbatim to the owner (a tool result in
+    # the owner's own turn, not a side call's prompt) — `mood_tone_text`.
     assert users == {"core/agent.py": ["_mood_tone_block", "tone"],
-                     "selfhood/state.py": ["tone_line"]}
+                     "selfhood/state.py": ["tone_line"],
+                     "tools/introspect.py": ["tone"]}
     tree = ast.parse((SRC / "core" / "agent.py").read_text(encoding="utf-8"))
     keys = [n.args[0].elts[0].value for n in ast.walk(tree)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "append"

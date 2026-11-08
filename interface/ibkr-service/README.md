@@ -43,7 +43,7 @@ The service tries new credentials within a minute. Tokens expire: when one does,
 
 ## Settings in `config.json`
 
-`base_currency`, `benchmark` (default `VT`), `symbol_overrides` (ISIN or IBKR symbol to Yahoo symbol), `max_position_pct` (20), `loss_review_pct` (-30), `gain_review_pct` (100), `gain_review_weight_pct` (10), `drawdown_review_pct` (-25), `correlation_review` (0.7).
+`base_currency`, `benchmark` (default `VT`), `symbol_overrides` (ISIN or IBKR symbol to Yahoo symbol), `max_position_pct` (20, the limit for one company or a holding of unknown type), `max_fund_pct` (100, the limit for one fund: Yahoo's instrument type ETF or MUTUALFUND; the type can't tell a broad index fund from a one-sector fund, and the review says so in one line when a fund is above `max_position_pct` and at or below `max_fund_pct`; with the default 100 that line replaces the size prompt for funds; funds get no large-gain prompt), `loss_review_pct` (-30), `gain_review_pct` (100), `gain_review_weight_pct` (10), `drawdown_review_pct` (-25), `correlation_review` (0.7).
 
 ## Running it
 

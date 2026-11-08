@@ -467,8 +467,18 @@ SYNONYMS = {
 #: the ONLY words that take the mood off (matched stripped, case-folded)
 CLEAR_WORDS = frozenset({"clear", "none", "neutral"})
 
-#: a manner is a way of talking: set by the owner, never decays
-MANNERS = ("sarcastic", "playful", "formal", "terse", "gentle", "dramatic")
+#: a manner is a way of talking: set by the owner, and it lasts until the end
+#: of that day (``manner_level``)
+MANNERS = ("sarcastic", "playful", "formal", "terse", "gentle", "dramatic", "evil")
+#: words the owner may use for a manner (2026-11-08: "i'd like to have an evil tone")
+MANNER_SYNONYMS = {"villainous": "evil", "sinister": "evil", "wicked": "evil", "menacing": "evil"}
+#: what a manner means, where its name alone could be misread: the tone line
+#: carries it. "evil" is a VOICE — the facts, the help and the refusals stay
+#: exactly as they are (``_LIMITS``).
+MANNER_GLOSS = {"evil": "a theatrical villain's voice: menace, gloating and grand schemes in the "
+                        "wording only, aimed at problems, bugs and imaginary foes - never at a person, "
+                        "no insults or threats toward anyone; you stay fully on the side of whoever you "
+                        "are answering, and it changes no answer and no refusal"}
 DEFAULT_INTENSITY = 2
 
 
@@ -488,6 +498,7 @@ def resolve_label(word) -> Optional[Tuple[str, Tuple[float, float]]]:
 def resolve_manner(word) -> str:
     """The manner for ``word``, or "" when it is not one."""
     w = str(word or "").strip().lower()
+    w = MANNER_SYNONYMS.get(w, w)
     return w if w in MANNERS else ""
 
 
@@ -540,14 +551,15 @@ def tone_line(label: str, intensity: int, manner: str = "", manner_intensity: in
     except (TypeError, ValueError):
         mn = 0
     mn = mn if mn in MANNER_LEVEL_SENTENCE else DEFAULT_INTENSITY
+    gloss = f" ({MANNER_GLOSS[man]}.)" if man in MANNER_GLOSS else ""
     if has_mood:
         return (f"YOUR MOOD RIGHT NOW: {label}, {n} of 3."
-                + (f" MANNER (set by the owner): {man}, {mn} of 3." if man else "")
+                + (f" MANNER (set by the owner): {man}, {mn} of 3.{gloss}" if man else "")
                 + " Speak in that mood: it must be audible in HOW you phrase this reply - "
                   "word choice, rhythm - the way a person in that mood would say the same thing. "
                 + LEVEL_SENTENCE[n] + " " + _LIMITS)
     if man:
-        return (f"MANNER (set by the owner): {man}, {mn} of 3."
+        return (f"MANNER (set by the owner): {man}, {mn} of 3.{gloss}"
                 " Speak in that manner: it must be audible in HOW you phrase this reply - "
                 "word choice, rhythm - the way a person with that manner would say the same thing. "
                 + MANNER_LEVEL_SENTENCE[mn] + " " + _LIMITS)
@@ -591,3 +603,93 @@ def age_seconds(
     elif now.tzinfo is None:
         now = now.replace(tzinfo=datetime.timezone.utc)
     return max(0.0, (now - dt).total_seconds())
+
+
+# ── the manner's day (2026-11-08, §4TS) ─────────────────────────────────────
+#
+# A manner used to stay until the owner cleared it. One "be sarcastic" said
+# once and forgotten coloured every reply for weeks — a Slack member's, a
+# public channel's, a scheduled report's included (everyone hears the tone).
+# It now lasts until the END OF THE DAY it was set on (operator's choice),
+# and on the way there it steps down, 3 → 2 → 1 → off, never in between, so
+# the tone line changes at most once per step. Read-time only, like boredom:
+# nothing is stored when it steps, and saying it again starts a new day.
+
+#: the day ends at this local hour (04:00, not midnight: a manner set in the
+#: evening keeps going into the night instead of vanishing at 00:00)
+MANNER_DAY_END_HOUR = 4
+#: a manner set this close to the day's end (03:15, say) lasts until the NEXT
+#: day's end instead of a few minutes
+MANNER_MIN_LIFE_S = 3600.0
+#: each step down lasts this long: a manner at 3 is 3 until 4 h before the
+#: end, 2 until 2 h before, 1 until the end. A manner set later than that
+#: spreads its steps evenly over the time it has.
+MANNER_STEP_S = 2 * 3600.0
+
+
+def _local_at(day: datetime.date, hour: int, tz) -> datetime.datetime:
+    """``hour``:00 on ``day`` in ``tz`` (None = this machine's local time,
+    daylight saving included), as an aware datetime."""
+    if tz is None:
+        return datetime.datetime.combine(day, datetime.time(hour)).astimezone()
+    return datetime.datetime.combine(day, datetime.time(hour), tzinfo=tz)
+
+
+def manner_ends_at(set_at: str, *, tz=None) -> Optional[datetime.datetime]:
+    """When a manner set at ``set_at`` (the on-disk stamp) is over: the first
+    local ``MANNER_DAY_END_HOUR``:00 at least ``MANNER_MIN_LIFE_S`` after it.
+    None when the stamp does not parse."""
+    start = parse_iso_utc(set_at)
+    if start is None:
+        return None
+    local = start.astimezone(tz) if tz is not None else start.astimezone()
+    day = local.date()
+    for _ in range(3):
+        end = _local_at(day, MANNER_DAY_END_HOUR, tz)
+        if (end - start).total_seconds() >= MANNER_MIN_LIFE_S:
+            return end.astimezone(datetime.timezone.utc)
+        day += datetime.timedelta(days=1)
+    return None                                  # unreachable for a sane clock
+
+
+def manner_schedule(intensity, set_at: str, *, tz=None) -> List[Tuple[datetime.datetime, int]]:
+    """The steps of a manner set at ``intensity`` at ``set_at``: ``(when,
+    level from then on)``, in time order, the last one ``(end, 0)``. Empty
+    when there is no manner to fade (an unreadable stamp, no intensity)."""
+    try:
+        n = max(0, min(3, int(intensity)))
+    except (TypeError, ValueError):
+        n = 0
+    start = parse_iso_utc(set_at)
+    end = manner_ends_at(set_at, tz=tz)
+    if n == 0 or start is None or end is None:
+        return []
+    span = min(n * MANNER_STEP_S, (end - start).total_seconds())
+    fade_from = end - datetime.timedelta(seconds=span)
+    step = span / n
+    out = [(fade_from + datetime.timedelta(seconds=k * step), n - k) for k in range(1, n)]
+    out.append((end, 0))
+    return out
+
+
+def manner_level(intensity, set_at: str, *, now: Optional[datetime.datetime] = None, tz=None) -> int:
+    """The level a manner set at ``intensity`` at ``set_at`` has at ``now``:
+    the set level, then one less at each step, 0 once its day is over — and
+    0 for a stamp that does not parse (a way of talking is never kept on a
+    time nobody can read)."""
+    steps = manner_schedule(intensity, set_at, tz=tz)
+    if not steps:
+        return 0
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    start = parse_iso_utc(set_at)
+    if start is not None and (start - now).total_seconds() > MANNER_MIN_LIFE_S:
+        return 0          # set well in the FUTURE (a hand edit, a clock set back): no day to read
+    level = max(0, min(3, int(intensity)))
+    for at, lvl in steps:
+        if now >= at:
+            level = lvl
+    return level
+

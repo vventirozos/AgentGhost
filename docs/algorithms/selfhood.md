@@ -17,7 +17,8 @@
 > multi-tool turns, research turns, very long turns, the owner's thumbs,
 > corrections and thanks, and the owner saying so in chat
 > (`introspect(action="set_mood", mood=…, intensity=1–3, manner=…)` — the
-> owner's own request only). A long quiet moves nothing: after 6 quiet hours
+> owner's own request only; a manner lasts until 04:00 local, stepping down
+> 3 → 2 → 1 on the way — §4TS). A long quiet moves nothing: after 6 quiet hours
 > a neutral mood READS as bored (1; after 12 hours, 2) to every reader but
 > the owner — never stored, measured from a persisted owner stamp.
 > A label (cheerful, content, calm, restless, bored, irritable, down, tired,

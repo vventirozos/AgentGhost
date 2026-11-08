@@ -78,6 +78,10 @@ def fetch_chart(symbol: str, get: Callable[[str, dict], str], loads, span: str =
     return {
         "symbol": symbol, "price": float(meta["regularMarketPrice"]) * factor, "currency": currency, "at": at,
         "offset": offset, "session": session, "previous_close": earlier[-1] if earlier else None, "closes": closes,
+        # Yahoo's own type: ETF / MUTUALFUND for a fund, EQUITY for one company. IBKR files both under STK.
+        "kind": str(meta.get("instrumentType") or "").upper(),
+        # the listing's full name ("Vanguard S&P 500 UCITS ETF USD Accumulation"): IBKR's is terse ("VANG S&P500 USDA")
+        "name": " ".join(str(meta.get("longName") or meta.get("shortName") or "").split()),
     }
 
 

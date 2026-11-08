@@ -119,6 +119,9 @@ class MoodView:
     cause: str = ""             # why it is what it is
     manner_set_at: str = ""
     recent: Tuple[Dict[str, str], ...] = ()   # the last events that moved it
+    #: the manner's steps still ahead, ``(on-disk stamp, level from then)``,
+    #: the last one the end of its day (§4TS); () with no manner
+    manner_steps: Tuple[Tuple[str, int], ...] = ()
 
     @property
     def neutral(self) -> bool:
@@ -293,13 +296,10 @@ class SelfStateThread:
         the first to see (at most one per level per quiet)."""
         stored = self._state.mood
         p, e, label, n, _nov = self._evolve(stored, now)
-        manner = stored.manner if stored is not None else ""
         base = dict(
             p=round(p, 4), e=round(e, 4),
-            manner=manner,
-            manner_intensity=(stored.manner_intensity if manner else 0),
-            manner_set_at=(stored.manner_set_at if manner else ""),
             recent=tuple(dict(r) for r in (stored.recent if stored is not None else ())),
+            **self._manner_now(stored, now),
         )
         if n == 0:
             # boredom: only over a NEUTRAL mood — a real mood that has not
@@ -471,8 +471,7 @@ class SelfStateThread:
         cur = Mood(
             p=p, e=e, updated_at=_iso(now), label=label, intensity=n, novelty=novelty,
             source=base.source, set_at=base.set_at, cause=base.cause,
-            recent=list(base.recent), manner=base.manner,
-            manner_intensity=base.manner_intensity, manner_set_at=base.manner_set_at,
+            recent=list(base.recent), **self._kept_manner(base, now),
         )
         if (label, n) == (base.label, base.intensity):
             return cur                       # nothing to write: decay is a function of time
@@ -490,7 +489,7 @@ class SelfStateThread:
         """Write down what time did to the mood (a step down, a wearing
         off). Boredom is never settled: it is not in the pair."""
         with self._lock:
-            return self._view_of(self._settle_locked(now))
+            return self._view_of(self._settle_locked(now), now)
 
     def owner_arrived(self, *, now: Optional[datetime.datetime] = None) -> None:
         """An owner's request has arrived: the quiet, if there was one, is
@@ -520,7 +519,7 @@ class SelfStateThread:
         ``(dp, de)``, clamp it, record it. Returns ``(before, after)``."""
         with self._lock:
             base = self._settle_locked(now)
-            before = self._view_of(base)
+            before = self._view_of(base, now)
             try:
                 dp, de = float(dp), float(de)
             except (TypeError, ValueError):
@@ -544,27 +543,54 @@ class SelfStateThread:
                 cause=(cause if changed else base.cause),
                 recent=(list(base.recent) + [{"at": at, "cause": cause, "kind": str(kind or "")}]
                         )[-MOOD_RECENT_CAUSES:],
-                manner=base.manner, manner_intensity=base.manner_intensity,
-                manner_set_at=base.manner_set_at,
+                **self._kept_manner(base, now),
             )
             self._store_locked(new)
             if changed:
                 self._append_history_locked(new, str(kind or ""), prev=before.describe())
-            return before, self._view_of(new)
+            return before, self._view_of(new, now)
 
     @staticmethod
     def _describe(m: Mood) -> str:
         return M.NEUTRAL if not m.intensity else f"{m.label}, {m.intensity} of 3"
 
     @staticmethod
-    def _view_of(m: Mood) -> MoodView:
+    def _kept_manner(m: Optional[Mood], now: Optional[datetime.datetime]) -> Dict[str, object]:
+        """The manner fields a WRITE carries over (review §4TS): the stored
+        ones while the manner's day is on, none once it is over — so an
+        expired manner is dropped at the next write instead of staying on
+        disk, where a clock set back would bring it back."""
+        if m is None or not m.manner:
+            return dict(manner="", manner_intensity=0, manner_set_at="")
+        if M.manner_level(m.manner_intensity, m.manner_set_at, now=_aware(now)) == 0:
+            return dict(manner="", manner_intensity=0, manner_set_at="")
+        return dict(manner=m.manner, manner_intensity=m.manner_intensity, manner_set_at=m.manner_set_at)
+
+    @staticmethod
+    def _manner_now(m: Optional[Mood], now: Optional[datetime.datetime]) -> Dict[str, object]:
+        """The manner fields a reader sees at ``now`` (§4TS): the stored
+        manner at the level its day has come to — none once the day is
+        over — with the steps still ahead. The stored fields are never
+        rewritten by this: the level is a function of when it was set."""
+        if m is None or not m.manner:
+            return dict(manner="", manner_intensity=0, manner_set_at="", manner_steps=())
+        when = _aware(now)
+        level = M.manner_level(m.manner_intensity, m.manner_set_at, now=when)
+        if level == 0:
+            return dict(manner="", manner_intensity=0, manner_set_at="", manner_steps=())
+        ahead = tuple((_iso(at), lvl) for at, lvl in M.manner_schedule(m.manner_intensity, m.manner_set_at)
+                      if at > when)
+        return dict(manner=m.manner, manner_intensity=level, manner_set_at=m.manner_set_at,
+                    manner_steps=ahead)
+
+    @classmethod
+    def _view_of(cls, m: Mood, now: Optional[datetime.datetime] = None) -> MoodView:
         return MoodView(
             label=m.label, intensity=m.intensity, p=round(m.p, 4), e=round(m.e, 4),
-            manner=m.manner, manner_intensity=(m.manner_intensity if m.manner else 0),
             source=(m.source if m.intensity else M.SOURCE_AUTO), set_at=m.set_at,
             cause=(m.cause if m.intensity else ""),
-            manner_set_at=(m.manner_set_at if m.manner else ""),
             recent=tuple(dict(r) for r in m.recent),
+            **cls._manner_now(m, now),
         )
 
     def set_owner_mood(self, label: str, direction: Tuple[float, float], intensity: int, *,
@@ -575,7 +601,7 @@ class SelfStateThread:
         Returns ``(before, after)``."""
         with self._lock:
             base = self._settle_locked(now)
-            before = self._view_of(base)
+            before = self._view_of(base, now)
             n = max(1, min(3, int(intensity)))
             p, e = M.anchor_for(direction, n)
             at = _iso(now)
@@ -586,15 +612,14 @@ class SelfStateThread:
                 set_at=(at if changed else (base.set_at or at)), cause=OWNER_CAUSE,
                 recent=(list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}]
                         )[-MOOD_RECENT_CAUSES:],
-                manner=base.manner, manner_intensity=base.manner_intensity,
-                manner_set_at=base.manner_set_at,
+                **self._kept_manner(base, now),
             )
             self._store_locked(new)
             if changed:
                 self._append_history_locked(new, M.KIND_OWNER,
                                             _cap_text(note, _MOOD_EVIDENCE_MAX_CHARS),
                                             prev=before.describe())
-            return before, self._view_of(new)
+            return before, self._view_of(new, now)
 
     def reset_mood(self, *, note: str = "", now: Optional[datetime.datetime] = None,
                    ) -> Tuple[MoodView, MoodView]:
@@ -602,36 +627,49 @@ class SelfStateThread:
         cleared. Returns ``(before, after)``."""
         with self._lock:
             base = self._settle_locked(now)
-            before = self._view_of(base)
+            before = self._view_of(base, now)
             at = _iso(now)
             was_mood = base.intensity > 0
-            if not was_mood and not base.manner and base.p == 0.0 and base.e == 0.0:
+            # what the owner can SEE (review §4TS): a mood, or a manner whose
+            # day is not over. Only then is "neutral" his word on record — an
+            # expired manner or a pair decayed under the first threshold (it
+            # never reaches exactly 0) is zeroed silently, with no "the owner
+            # said so" event to show up later as a reason
+            visible = was_mood or bool(before.manner)
+            # the STORED record, not ``base`` (round-2 review): ``base`` has
+            # an expired manner already blanked, so testing it left that
+            # manner on disk for a clock set back to revive
+            stored = self._state.mood
+            on_file = bool(stored is not None and stored.manner)
+            if not visible and not on_file and base.p == 0.0 and base.e == 0.0:
                 return before, before            # nothing on file to reset
             new = Mood(
                 p=0.0, e=0.0, updated_at=at, label=M.NEUTRAL, intensity=0, novelty=False,
                 source=M.SOURCE_AUTO, set_at=(at if was_mood else base.set_at),
                 cause=(OWNER_CAUSE if was_mood else base.cause),
-                recent=(list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}]
-                        )[-MOOD_RECENT_CAUSES:],
+                recent=((list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}])
+                        if visible else list(base.recent))[-MOOD_RECENT_CAUSES:],
             )
             self._store_locked(new)
             if was_mood:
                 self._append_history_locked(new, M.KIND_OWNER,
                                             _cap_text(note, _MOOD_EVIDENCE_MAX_CHARS),
                                             prev=before.describe())
-            return before, self._view_of(new)
+            return before, self._view_of(new, now)
 
     def set_manner(self, manner: str, intensity: int, *,
                    now: Optional[datetime.datetime] = None) -> Tuple[MoodView, MoodView]:
-        """The owner set a way of talking ("" clears it). It does not decay
-        and stays until the owner changes or clears it. The mood itself is
-        left as it is. Returns ``(before, after)``."""
+        """The owner set a way of talking ("" clears it). It lasts until the
+        end of the day, stepping down on the way (§4TS, ``mood.manner_level``);
+        setting it again — the same manner included — starts a new day. The
+        mood itself is left as it is. Returns ``(before, after)``."""
         with self._lock:
             base = self._settle_locked(now)
-            before = self._view_of(base)
+            before = self._view_of(base, now)
             man = M.resolve_manner(manner)
-            if not man and not base.manner:
-                return before, before
+            stored = self._state.mood
+            if not man and not before.manner and not (stored is not None and stored.manner):
+                return before, before            # nothing set (an expired one on file is dropped below)
             new = Mood(
                 p=base.p, e=base.e, updated_at=base.updated_at or _iso(now), label=base.label,
                 intensity=base.intensity, novelty=base.novelty, source=base.source,
@@ -640,10 +678,8 @@ class SelfStateThread:
                 manner_intensity=(max(1, min(3, int(intensity))) if man else 0),
                 manner_set_at=(_iso(now) if man else ""),
             )
-            if man and man == base.manner and new.manner_intensity == base.manner_intensity:
-                new.manner_set_at = base.manner_set_at or new.manner_set_at
             self._store_locked(new)
-            return before, self._view_of(new)
+            return before, self._view_of(new, now)
 
     def mood_history(self, *, limit: int = 20) -> List[Dict[str, object]]:
         """The newest ``limit`` rows of the mood journal, oldest first. Rows
@@ -736,8 +772,10 @@ class SelfStateThread:
         if include_mood and not view.neutral:
             lines.append(f"My mood: {view.describe()}.")
         if view.manner:
-            lines.append(f"My manner (set by the owner): {view.manner}, "
-                         f"{view.manner_intensity} of 3.")
+            # the diary (include_mood=False) gets the name only: the level steps
+            # with the clock (§4TS), and its prompt's hash is its skip-guard
+            lines.append(f"My manner (set by the owner): {view.manner}"
+                         + (f", {view.manner_intensity} of 3." if include_mood else "."))
         text = "\n".join(lines)
         if len(text) > max_chars:
             text = text[: max_chars - 1] + "…"

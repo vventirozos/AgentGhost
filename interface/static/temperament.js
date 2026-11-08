@@ -118,8 +118,12 @@ const IMPULSE = {
     'stream:first':    { valence: 0.06 },   // relief: the reply started
     'wake':            { arousal: 0.40, curiosity: 0.20, valence: 0.10 },
 };
-// Kinds whose reaction also produces a visible transient (`startle`).
-const STARTLE = { 'error': 1.0, 'verdict:refute': 0.6, 'outcome:fail': 0.35, 'wake': 0.5 };
+// Kinds whose reaction also produces a visible transient (`startle`: a ~7 Hz
+// shake, a flare and a flinch). NOT 'wake' (2026-11-08, operator: "jidderish
+// when it transits from idle to busy"): the first turn after an hour away
+// shook the whole face for ~2 s — the shake read as jitter, not waking. The
+// wake keeps its arousal nudge and its smooth 3 s lift/brighten (`wakeAt`).
+const STARTLE = { 'error': 1.0, 'verdict:refute': 0.6, 'outcome:fail': 0.35 };
 
 const DRIVES = ['arousal', 'focus', 'strain', 'curiosity', 'fatigue', 'valence'];
 // Decay time constants (s) toward each drive's baseline.

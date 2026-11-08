@@ -130,13 +130,16 @@ def test_a_forged_cookie_is_rejected(iface):
     assert c.get("/").status_code == 401
 
 
-def test_page_cookie_is_httponly_and_samesite_strict(iface):
-    """It carries the master key, so JS must not be able to read it and it
-    must never ride a cross-site request."""
+def test_page_cookie_is_httponly_and_samesite_lax(iface):
+    """It carries the master key, so JS must not be able to read it, and it
+    must not ride a cross-site subresource, POST or frame (Lax). Not Strict:
+    a macOS Safari "Add to Dock" app opens the scrubbed `/` as a navigation
+    with no initiating site, and the Strict cookie was withheld — the app
+    opened on the 401 page (2026-11-08)."""
     r = TestClient(iface.app).get(f"/?key={iface.GHOST_API_KEY}")
     sc = r.headers.get("set-cookie", "").lower()
     assert "httponly" in sc
-    assert "samesite=strict" in sc
+    assert "samesite=lax" in sc and "samesite=strict" not in sc
 
 
 def test_page_cookie_is_secure_only_over_https(iface):

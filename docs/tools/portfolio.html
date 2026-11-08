@@ -41,11 +41,11 @@
   <table>
     <thead><tr><th>action</th><th>Arguments</th><th>What it returns</th></tr></thead>
     <tbody>
-      <tr><td><code>summary</code></td><td>&mdash;</td><td>Value, cash, total, gain against cost, today's change, dividends, and one line per holding.</td></tr>
-      <tr><td><code>position</code></td><td><code>symbol</code></td><td>One holding with its average cost and recent trades.</td></tr>
+      <tr><td><code>summary</code></td><td>&mdash;</td><td>Value, cash, total, gain against cost, today's change, dividends, and one line per holding, headed by its ticker and its full public name (the price source's, once a quote has confirmed the listing; IBKR's terse name until then). A gain in another currency is shown in the account's currency at today's FX first, then in its own currency.</td></tr>
+      <tr><td><code>position</code></td><td><code>symbol</code></td><td>One holding with its average cost and recent trades. When the full public name is shown, a line also gives IBKR's own name for the holding.</td></tr>
       <tr><td><code>health</code></td><td>&mdash;</td><td>Concentration, currency mix, and how today's mix would have behaved: volatility, worst fall, correlation, comparison with the benchmark.</td></tr>
       <tr><td><code>forecast</code></td><td><code>symbol</code> (optional)</td><td>The range of past returns over 1 month, 3 months and 1 year. A horizon needs twice its length in history, or it's left out.</td></tr>
-      <tr><td><code>review</code></td><td>&mdash;</td><td>Prompts from fixed rules, each with its reason and the case against acting. Never a buy or sell instruction.</td></tr>
+      <tr><td><code>review</code></td><td>&mdash;</td><td>Prompts from fixed rules, each with its reason and the case against acting. Never a buy or sell instruction. Size is checked per kind: one company (or a holding of unknown type) against <code>max_position_pct</code> (20%), a fund (Yahoo type ETF or mutual fund) against <code>max_fund_pct</code> (100%); a fund above <code>max_position_pct</code> and at or below <code>max_fund_pct</code> gets one line, marked as a note and not a prompt, saying a broad fund can't be told from a one-sector fund (with the default 100%, that line replaces the size prompt for funds). Funds get no large-gain prompt, and their fall prompt has its own case against.</td></tr>
       <tr><td><code>status</code></td><td>&mdash;</td><td>Whether the token and query are present, and when data last arrived. No holdings.</td></tr>
     </tbody>
   </table>

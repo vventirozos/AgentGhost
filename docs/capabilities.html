@@ -140,7 +140,7 @@
   <p>The agent has a mood, and it shows in <em>how</em> it phrases its replies &mdash; never in <em>what</em> they say: the facts, the numbers, the tool use and the completeness stay the same, serious replies included. The mood is two numbers, pleasantness and energy, that move by themselves: failed tool calls and loop guards in your turns make it irritable, a smooth multi-tool turn or your thumbs-up lifts it, a research turn that read several pages makes it curious, a very long turn tires it, and a thumbs-down lowers it. A short "thanks" or "well done" lifts it a little. It wears off by half every two hours. A long quiet changes nothing in it: after six hours without you a neutral mood only <em>reads</em> as bored to whoever else is answered meanwhile (a scheduled report, a channel member), and never to you. A label and an intensity from 1 to 3 are read off the two numbers: at 1 the mood is a faint tint, at 2 it is clearly noticeable, at 3 it is strong and the agent may say outright that it is in a mood.</p>
   <pre><code>&gt; "cheer up"                      → mood cheerful, 2 of 3
 &gt; "don't be so grumpy"            → mood calm, 1 of 3
-&gt; "be more sarcastic"             → manner sarcastic (stays until you change it)
+&gt; "be more sarcastic"             → manner sarcastic (until the end of the day, 04:00)
 &gt; "be neutral"                    → mood off, manner cleared
 &gt; "why are you in this mood?"     → the cause, since when, today's timeline</code></pre>
   <p>Everyone who is answered hears it &mdash; you, channel members, scheduled tasks &mdash; but only your own turns, thumbs and words move it, and only you, in a message of your own, can set it or ask why (a scheduled task or a background job that tries is refused).</p>

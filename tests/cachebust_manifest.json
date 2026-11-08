@@ -1,7 +1,7 @@
 {
   "app.js": {
-    "sha": "6791ca74757c4d0a",
-    "version": "19.12"
+    "sha": "3c49599a4df1067e",
+    "version": "19.13"
   },
   "bargein.js": {
     "sha": "07e236cbbe833426",
@@ -12,8 +12,8 @@
     "version": "1.2"
   },
   "matrix_graph.js": {
-    "sha": "24bdebc36609bf9a",
-    "version": "19.12"
+    "sha": "6fb37eacc339f0b5",
+    "version": "19.13"
   },
   "notifications.js": {
     "sha": "487030a97676874f",
@@ -36,8 +36,8 @@
     "version": "8.6"
   },
   "temperament.js": {
-    "sha": "b18b8cde2b43a11c",
-    "version": "1.6"
+    "sha": "55dde04d0d32242a",
+    "version": "1.7"
   },
   "tokens.js": {
     "sha": "0aa668ae8d23cb93",

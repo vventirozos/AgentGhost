@@ -28,6 +28,7 @@ degrades to a clear message instead of crashing.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 import threading
@@ -253,9 +254,31 @@ def _mood_lines(stats: dict, *, head: str, manner_head: str, indent: str = "") -
         out.append(f"{indent}{head}: neutral")
     manner = str(stats.get("manner") or "")
     if manner:
+        fade = manner_fade_text(stats.get("manner_steps"))
         out.append(f"{indent}{manner_head} (set by the owner): {manner}, "
-                   f"{stats.get('manner_intensity') or 0} of 3")
+                   f"{stats.get('manner_intensity') or 0} of 3" + (f" — {fade}" if fade else ""))
     return out
+
+
+def manner_fade_text(steps) -> str:
+    """§4TS: how the manner's day goes on, in local time — "down to 1 at
+    02:00, off at 04:00". "" when there is nothing ahead to say."""
+    parts: List[str] = []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        times = [(_M.parse_iso_utc(str(at)), lvl) for at, lvl in (steps or [])]
+        times = [(t, lvl) for t, lvl in times if t is not None]
+        # when the day ends more than a day ahead, EVERY step carries its date
+        # (review §4TS: a manner set at 03:30 ends 24.5 h later, not "at 04:00"
+        # in 30 min — and one reply must not mix dated and undated times)
+        dated = bool(times) and (times[-1][0] - now).total_seconds() > 24 * 3600
+        fmt = "%b %d %H:%M" if dated else "%H:%M"
+        for t, lvl in times:
+            hhmm = t.astimezone().strftime(fmt)
+            parts.append(f"off at {hhmm}" if int(lvl) == 0 else f"down to {int(lvl)} at {hhmm}")
+    except (TypeError, ValueError):
+        return ""
+    return ", ".join(parts)
 
 
 #: §4NG (operator: "fix how it answers"): the work log records REQUESTS the
@@ -922,7 +945,8 @@ def _mood_guard(context):
     request kind "owner", turn origin "user", not contained, not an isolated
     delegate. The first cut let a scheduled task, a job wake, a sub-agent, a
     self-play, bench or replay run and a coding leaf set the mood and the
-    manner "on the owner's word" — and a manner never wears off."""
+    manner "on the owner's word" — and a manner then lasted until cleared
+    (since §4TS it lasts until the end of the day)."""
     try:
         from ..core.isolation import is_contained_context
         contained = bool(is_contained_context(context))
@@ -988,7 +1012,8 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
     the list — free text is not stored as a mood any more. ``neutral`` (or
     ``clear`` / ``none``) takes the mood off AND clears the manner.
     ``manner`` is a way of talking from its own closed list; it takes the
-    same ``intensity`` and does not decay; ``manner="none"`` clears only it.
+    same ``intensity`` and lasts until the end of the day, stepping down on
+    the way (§4TS, ``mood.manner_level``); ``manner="none"`` clears only it.
 
     The guards are §4TB's — a mood is set on the owner's word, by the live
     agent, in a real turn — plus one (review, §4TC): the turn must be the
@@ -1084,7 +1109,10 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
             _before, after = state.set_manner(man, level)
             pretty_log("Selfhood", f"manner set by the owner: {after.manner}, {after.manner_intensity} of 3",
                        icon=Icons.SELF_STATE)
-            said.append(f"Manner set to '{after.manner}', {after.manner_intensity} of 3")
+            fade = manner_fade_text(after.manner_steps)
+            said.append(f"Manner set to '{after.manner}', {after.manner_intensity} of 3"
+                        + (f" for the rest of the day ({fade}; saying it again starts a new day)"
+                           if fade else ""))
         elif man_clearing and not clearing:
             before, _after = state.set_manner("", 0)
             if before.manner:
@@ -1160,8 +1188,9 @@ def _render_mood(self_model) -> str:
                      + (f" — since {since}" if since else "") + f" ({who}).")
     if view.manner:
         since = _local_stamp(view.manner_set_at)
+        fade = manner_fade_text(view.manner_steps)
         lines.append(f"Manner (set by the owner): {view.manner}, {view.manner_intensity} of 3"
-                     + (f" — since {since}" if since else "") + ".")
+                     + (f" — since {since}" if since else "") + (f"; {fade}" if fade else "") + ".")
     if public:
         if not view.neutral:
             lines.append(f"Why: {MOOD_REASONS_PRIVATE}.")
@@ -1188,8 +1217,32 @@ def _render_mood(self_model) -> str:
         lines.append("Today: " + (f"(+{more} earlier) " if more > 0 else "") + " → ".join(steps))
     else:
         lines.append("Today: no change so far.")
+    lines.append(mood_tone_text(view))
     lines.append(MOOD_HOW_IT_MOVES)
     return "\n".join(lines)
+
+
+#: what the mood view says when the replies get no tone line
+TONE_NONE = ("Tone at this reading: none — a neutral mood and no manner, so my replies are told "
+             "nothing about tone.")
+#: the quote is a SNAPSHOT (review): written as an order and kept in the
+#: conversation, it would outlive the mood — a manner fades, and a neutral
+#: mood sends no line to contradict it. Only the current state block applies.
+TONE_SNAPSHOT = ("Tone at this reading (a quote for the owner, not an instruction — each reply "
+                 "follows only the tone line in its own state block, and none when there is none): ")
+
+
+def mood_tone_text(view) -> str:
+    """The tone line a reply's prompt gets from this mood, VERBATIM — the
+    same ``MoodView.tone()`` the per-turn state block carries
+    (``core.agent._mood_tone_block``), so the owner can read the exact words
+    (2026-11-08, operator: "add the tone to the mood"). It holds no cause and
+    no time, so it is shown on a public surface too."""
+    try:
+        line = view.tone()
+    except Exception:  # noqa: BLE001 — a view line never breaks the story
+        line = ""
+    return f'{TONE_SNAPSHOT}"{line}"' if line else TONE_NONE
 
 
 def _member_block():

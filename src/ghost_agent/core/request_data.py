@@ -38,8 +38,8 @@ from typing import Dict, List
 #: names the owner's place too. Add a data tool here (every action is kept).
 DATA_TOOLS = frozenset({"portfolio"})
 
-RESULT_MAX_CHARS = 3_000
-BLOCK_MAX_CHARS = 8_000
+RESULT_MAX_CHARS = 4_000   # §4TI-b: holding lines carry IBKR's names; an 18-holding summary is ~3.7k
+BLOCK_MAX_CHARS = 9_000    # §4TI-b: two full results (2 x 4k + headers) still fit
 _PER_REQUEST_MAX = 12
 _CAP = 256
 

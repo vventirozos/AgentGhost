@@ -16,6 +16,14 @@ PRICE_STALE = 4 * 86400
 #: A price history whose last close is older than this says so, and its fall-from-high prompt stays quiet.
 HISTORY_STALE_DAYS = 7
 MAX_FX_GAP = 0.25
+#: Yahoo instrument types that hold many companies. A fund is held to `max_fund` instead of the one-company
+#: limit (§4TI-d: an S&P 500 fund at 88% was flagged against the 20% single-stock limit, noise the owner learns
+#: to ignore). A type can't tell a broad index fund from a one-sector one, so the review says so.
+FUND_KINDS = frozenset({"ETF", "MUTUALFUND"})
+
+
+def is_fund(row: dict) -> bool:
+    return row.get("kind") in FUND_KINDS
 
 
 def percentile(values: list, q: float) -> float:
@@ -153,6 +161,15 @@ def _rate(pos: dict, base: str, fx: dict, now: float, use_statement: bool) -> tu
     return (statement, "IBKR's statement rate") if statement else (None, None)
 
 
+def label(row: dict) -> str:
+    """The ticker with IBKR's own name for it, for every line that names a holding (§4TI-b). With a bare ticker
+    a model fills the name in from memory, and on 11-08 gave a fund the wrong index."""
+    symbol = str(row.get("symbol") or "")
+    # no "|" (the line's own separator) and no brackets of its own: "EMIM (… USD (Acc)): " read as two labels
+    name = " ".join(str(row.get("description") or "").replace("|", "/").replace("(", " ").replace(")", " ").split())
+    return f"{symbol} ({name})" if name and name.upper() != symbol.upper() else symbol
+
+
 def value_positions(flex: dict, quotes: dict, fx: dict, symbols: dict, base: str | None, problem, now: float) -> dict:
     """Value each holding and the whole account. A holding that can't be valued is listed, never guessed.
     `symbols` maps a holding's key to its Yahoo symbol."""
@@ -167,6 +184,12 @@ def value_positions(flex: dict, quotes: dict, fx: dict, symbols: dict, base: str
         row_date = pos.get("report_date") or statement_date
         quote, why_not, confirmed = _usable_quote(pos, quotes.get(yahoo) if yahoo else None, row_date, now, problem)
         row["history_symbol"] = yahoo if confirmed else None
+        # a listing a quote has not confirmed as this holding says nothing about what the holding is
+        row["kind"] = ((quotes.get(yahoo) or {}).get("kind") or "") if confirmed else ""
+        # §4TI-e: the full public name when a quote confirmed the listing, else IBKR's own
+        public = ((quotes.get(yahoo) or {}).get("name") or "") if confirmed else ""
+        row["public_name"] = public
+        row["label"] = label({**pos, "description": public or pos.get("description")})
         if quote:
             price, source, previous = quote["price"], "public", quote.get("previous_close")
             row["price_at"] = quote.get("at")
@@ -196,7 +219,7 @@ def value_positions(flex: dict, quotes: dict, fx: dict, symbols: dict, base: str
         value_sum += local * rate
         if pos.get("cost"):  # a zero cost (a spin-off, a gift) has no percentage and would inflate the total's
             gain = local - pos["cost"]
-            row.update(gain_local=gain, gain_pct=gain / abs(pos["cost"]))
+            row.update(gain_local=gain, gain_pct=gain / abs(pos["cost"]), gain_base=gain * rate)
             gain_sum += gain * rate
             gain_cost += abs(pos["cost"]) * rate
         else:
@@ -263,21 +286,37 @@ def review_items(valued: dict, health: dict, histories: dict, limits: dict, now:
     items, no_cost, no_history = [], [], []
     for row in valued["positions"]:
         symbol, weight, gain_pct = row["symbol"], row.get("weight"), row.get("gain_pct")
-        if weight is not None and weight > limits["max_position"]:
-            items.append({"rule": "concentration", "symbol": symbol,
-                          "why": f"{symbol} is {weight:.1%} of your holdings, above your {limits['max_position']:.0%} limit.",
-                          "ask": "Would you be comfortable if this one company or fund fell by half?",
-                          "against": "A broad index fund can reasonably be this large, and selling may trigger tax."})
+        named = row.get("label") or symbol
+        fund = is_fund(row)
+        limit = limits["max_fund"] if fund else limits["max_position"]
+        if weight is not None and weight > limit:
+            if fund:
+                items.append({"rule": "concentration", "symbol": symbol,
+                              "why": f"{named} is a fund at {weight:.1%} of your holdings, above your {limit:.0%} limit for one fund.",
+                              "ask": "Does this fund spread your money over many companies and countries, or one sector or region?",
+                              "against": "A broad index fund can reasonably be most of a portfolio, and selling may trigger tax."})
+            elif row.get("kind") == "EQUITY":
+                items.append({"rule": "concentration", "symbol": symbol,
+                              "why": f"{named} is one company at {weight:.1%} of your holdings, above your {limit:.0%} limit.",
+                              "ask": "Would you be comfortable if this one company fell by half?",
+                              "against": "It may be a company you know well, and selling may trigger tax."})
+            else:  # type unknown: held to the one-company limit, worded for either
+                items.append({"rule": "concentration", "symbol": symbol,
+                              "why": f"{named} is {weight:.1%} of your holdings, above your {limit:.0%} limit.",
+                              "ask": "Would you be comfortable if this one company or fund fell by half?",
+                              "against": "A broad index fund can reasonably be this large, and selling may trigger tax."})
         if gain_pct is None:
             no_cost.append(symbol)
         elif gain_pct <= limits["loss_review"]:
             items.append({"rule": "large_loss", "symbol": symbol,
-                          "why": f"{symbol} is {gain_pct:.1%} against what you paid.",
+                          "why": f"{named} is {gain_pct:.1%} against what you paid.",
                           "ask": "Has your reason for owning it changed, or only the price?",
                           "against": "What you paid says nothing about what happens next, so a loss alone is no reason to sell."})
-        elif gain_pct >= limits["gain_review"] and (weight or 0) >= limits["gain_review_weight"]:
+        elif gain_pct >= limits["gain_review"] and (weight or 0) >= limits["gain_review_weight"] and not fund:
+            # a fund that rose is the market that rose: "does it still deserve this much" is the size rule's
+            # question, asked against the fund limit above (§4TI-d review)
             items.append({"rule": "large_gain", "symbol": symbol,
-                          "why": f"{symbol} is up {gain_pct:.1%} and is now {weight:.1%} of your holdings.",
+                          "why": f"{named} is up {gain_pct:.1%} and is now {weight:.1%} of your holdings.",
                           "ask": "Does it still deserve this much of your money at today's price?",
                           "against": "Strong companies can keep rising, and selling may trigger tax."})
         if (row.get("qty") or 0) <= 0:
@@ -291,9 +330,10 @@ def review_items(valued: dict, health: dict, histories: dict, limits: dict, now:
         fall = year[-1] / max(year) - 1
         if fall <= limits["drawdown_review"]:
             items.append({"rule": "drawdown", "symbol": symbol,
-                          "why": f"{symbol} closed {fall:.1%} below its high of the past year on {history[-1][0]}.",
+                          "why": f"{named} closed {fall:.1%} below its high of the past year on {history[-1][0]}.",
                           "ask": "Is there news that explains the fall, and does it change your view?",
-                          "against": "Large falls are normal for single stocks and often pass."})
+                          "against": ("A fund falling this much usually means its whole market fell, which has happened "
+                                      "many times before." if fund else "Large falls are normal for single stocks and often pass.")})
     correlated = health.get("correlation")
     if correlated is not None and correlated >= limits["correlation_review"] and health.get("count", 0) >= 3:
         items.append({"rule": "correlation", "symbol": None,

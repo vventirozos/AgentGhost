@@ -54,10 +54,15 @@ def _reply(status, **fields):
 NOW = datetime(2026, 11, 6, 15, 0, tzinfo=timezone.utc).timestamp()
 
 
-def _chart(price, currency="USD", closes=(90.0, 100.0), end=NOW, offset=0):
+def _chart(price, currency="USD", closes=(90.0, 100.0), end=NOW, offset=0, kind=None, name=None):
     stamps = [int(end - (len(closes) - 1 - i) * 86400) for i in range(len(closes))]
+    meta = {"regularMarketPrice": price, "currency": currency, "regularMarketTime": int(end), "gmtoffset": offset}
+    if kind:
+        meta["instrumentType"] = kind
+    if name:
+        meta["longName"] = name
     return json.dumps({"chart": {"result": [{
-        "meta": {"regularMarketPrice": price, "currency": currency, "regularMarketTime": int(end), "gmtoffset": offset},
+        "meta": meta,
         "timestamp": stamps,
         "indicators": {"quote": [{"close": list(closes)}], "adjclose": [{"adjclose": list(closes)}]},
     }]}})
@@ -70,6 +75,8 @@ class FakeWeb:
         self.statement, self.calls, self.prices = statement, [], {
             "ACME": (110.0, "USD"), "WRLD.DE": (55.0, "EUR"), "USDEUR=X": (0.8, "EUR"), "VT": (100.0, "USD")}
         self.history = None
+        self.kinds = {}
+        self.names = {}
 
     def __call__(self, url, params):
         self.calls.append((url, dict(params)))
@@ -82,7 +89,7 @@ class FakeWeb:
             raise OSError("HTTP 404")
         price, currency = self.prices[name]
         closes = self.history.get(name) if self.history and params.get("range") == "5y" else None
-        return _chart(price, currency, closes=closes or (price * 0.9, price))
+        return _chart(price, currency, closes=closes or (price * 0.9, price), kind=self.kinds.get(name), name=self.names.get(name))
 
 
 @pytest.fixture
@@ -601,7 +608,7 @@ def test_correlation_sign():
     assert analytics.correlation(up, [1.0, 1.0, 1.0, 1.0]) is None
 
 
-LIMITS = {"max_position": 0.2, "loss_review": -0.3, "gain_review": 1.0, "gain_review_weight": 0.1,
+LIMITS = {"max_position": 0.2, "max_fund": 1.0, "loss_review": -0.3, "gain_review": 1.0, "gain_review_weight": 0.1,
           "drawdown_review": -0.25, "correlation_review": 0.7}
 
 
@@ -1155,3 +1162,214 @@ def test_key_is_redacted_from_stored_text(monkeypatch, tmp_path):
     monkeypatch.setenv("GHOST_PORTFOLIO_KEY_FILE", str(key))
     rule = redact._portfolio_key_rule()
     assert rule and rule[1].sub(rule[2], f"header {secret}") == "header <REDACTED_PORTFOLIO_KEY>"
+
+
+def test_summary_lines_carry_ibkr_names_so_the_model_need_not_supply_one(world):
+    """11-08: the summary had tickers only, and the model named a fund from memory, with the wrong index."""
+    service, web, *_ = world
+    service.tick()
+    ok, text = service.answer("summary")
+    assert ok and "ACME (ACME CORP): " in text and "WRLD (WORLD ETF): " in text
+    position = service.answer("position", "ACME")[1]
+    assert "ACME (ACME CORP): " in position and "Name:" not in position
+    assert analytics.label({"symbol": "ACME", "description": "acme"}) == "ACME"
+    assert analytics.label({"symbol": "ACME", "description": "  "}) == "ACME"
+    assert analytics.label({"symbol": "ACME", "description": None}) == "ACME"
+    assert analytics.label({"symbol": "X", "description": "A | B\nC"}) == "X (A / B C)"  # the line's own " | " stays its own
+    assert analytics.label({"symbol": "E", "description": "Core EM IMI UCITS ETF USD (Acc)"}) == "E (Core EM IMI UCITS ETF USD Acc)"
+
+
+def test_every_answer_that_names_a_holding_carries_its_ibkr_name(world):
+    """§4TI-b review: summary was fixed first; review, health, forecast and not-held still gave bare tickers."""
+    service, web, *_ = world
+    service.tick()
+    health = service.answer("health")[1]
+    assert any(line.startswith("Largest: ") and "(" in line.split(" at ")[0] for line in health.splitlines())
+    review = service.answer("review")[1]
+    assert "- ACME (ACME CORP) is " in review and "- WRLD (WORLD ETF) is " in review
+    assert "data missing: WRLD (WORLD ETF), ACME (ACME CORP), ODD (ODD LISTING)" in review
+    assert "Holdings: WRLD (WORLD ETF), ACME (ACME CORP), ODD (ODD LISTING)." in service.answer("position", "NOPE")[1]
+    assert "ACME (ACME CORP)" in service.answer("forecast", "acme")[1]
+
+
+def test_a_contract_line_carries_its_ibkr_name(world):
+    service, *_ = world
+    row = {"symbol": "ESZ6", "description": "E-MINI S&P 500", "notional": True, "qty": 1.0, "asset": "FUT",
+           "price": 5000.0, "source": "IBKR", "currency": "USD", "price_date": "2026-11-05", "price_note": "no public listing mapped"}
+    assert service._position_line(row, "EUR").startswith("ESZ6 (E-MINI S&P 500): 1 FUT contract(s)")
+
+
+def test_a_missing_value_is_named_with_its_ibkr_name(world):
+    service, web, *_ = world
+    web.statement = STATEMENT.replace('position="1" markPrice="10"', 'position="1"')
+    service.tick()
+    assert "PARTIAL: leaves out ODD (ODD LISTING)" in service.answer("summary")[1]
+
+
+def test_every_list_of_holdings_carries_ibkr_names():
+    """§4TI-b review r2: five of the name lists were unpinned; each reverted to bare tickers passed."""
+    service = svc.Service.__new__(svc.Service)
+    rows = [{"symbol": "ESZ6", "label": "ESZ6 (E-MINI)"}, {"symbol": "SPUN", "label": "SPUN (SPUN CO)"},
+            {"symbol": "ODD", "label": "ODD (ODD LISTING)"}]
+    valued = {"positions": rows}
+    assert service._names(valued, ["ESZ6", "ODD", "GONE"]) == "ESZ6 (E-MINI), ODD (ODD LISTING), GONE"
+
+
+def test_unknown_values_are_named_in_every_answer(world):
+    service, web, *_ = world
+    web.statement = (STATEMENT.replace('position="1" markPrice="10"', 'position="1"')
+                     .replace('costBasisMoney="1500"', 'costBasisMoney="0"'))
+    service.tick()
+    assert "leaves out WRLD (WORLD ETF)" in service.answer("summary")[1]
+    health = service.answer("health")[1]
+    assert "Left out of these figures, value unknown: ODD (ODD LISTING)" in health
+    assert "Largest: WRLD (WORLD ETF) at " in health
+    assert "Left out, value unknown: ODD (ODD LISTING)" in service.answer("forecast")[1]
+    assert "Share of holdings not checked, value unknown: ODD (ODD LISTING)" in service.answer("review")[1]
+
+
+def test_a_contract_is_named_in_the_not_in_any_total_list(world):
+    service, web, *_ = world
+    fut = (f'<OpenPosition accountId="{ACCOUNT}" assetCategory="FUT" symbol="ESZ6" description="E-MINI SP 500 DEC26" conid="7" '
+           'currency="USD" listingExchange="CME" position="1" markPrice="6000" positionValue="300000" fxRateToBase="0.9" '
+           'reportDate="20261105" levelOfDetail="SUMMARY"/>')
+    web.statement = STATEMENT.replace("</OpenPositions>", fut + "</OpenPositions>", 1)
+    assert web.statement != STATEMENT
+    service.tick()
+    assert "isn't money held: ESZ6 (E-MINI SP 500 DEC26)" in service.answer("summary")[1]
+
+
+
+# §4TI-d: a fund is held to its own limit. An S&P 500 fund at 88% was flagged against the 20% one-company limit.
+@pytest.mark.parametrize("kind,weight,fires,word", [
+    ("ETF", 0.88, False, None), ("MUTUALFUND", 0.88, False, None), ("ETF", 1.0, False, None),
+    ("EQUITY", 0.21, True, "one company"), ("EQUITY", 0.20, False, None),
+    ("", 0.21, True, "company or fund"),                      # type unknown: the one-company limit, neutral words
+])
+def test_concentration_holds_a_fund_to_the_fund_limit(kind, weight, fires, word):
+    items, _ = analytics.review_items({"positions": [{"symbol": "X", "kind": kind, "weight": weight}]}, {}, {}, LIMITS, NOW)
+    got = [i for i in items if i["rule"] == "concentration"]
+    assert bool(got) is fires and (not word or word in got[0]["why"] + got[0]["ask"])
+
+
+def test_a_fund_over_its_own_limit_is_flagged_as_a_fund():
+    limits = {**LIMITS, "max_fund": 0.6}
+    items, _ = analytics.review_items({"positions": [{"symbol": "X", "kind": "ETF", "weight": 0.61}]}, {}, {}, limits, NOW)
+    assert [i["rule"] for i in items] == ["concentration"] and "a fund at 61.0%" in items[0]["why"]
+    assert "one sector or region" in items[0]["ask"]
+
+
+def test_the_kind_comes_from_a_confirmed_quote_only():
+    pos = {"key": "1", "symbol": "W", "qty": 1.0, "mark": 50.0, "currency": "EUR", "asset": "STK", "cost": 40.0}
+    quote = {"price": 50.0, "currency": "EUR", "at": NOW, "session": "2026-11-06", "kind": "ETF"}
+    ok = analytics.value_positions({"positions": [pos]}, {"W.DE": quote}, {}, {"1": "W.DE"}, "EUR", lambda p, q: None, NOW)
+    assert ok["positions"][0]["kind"] == "ETF"
+    wrong = analytics.value_positions({"positions": [pos]}, {"W.DE": quote}, {}, {"1": "W.DE"}, "EUR", lambda p, q: "other listing", NOW)
+    assert wrong["positions"][0]["kind"] == ""                # an unconfirmed listing says nothing about the holding
+
+
+def test_fetch_chart_keeps_yahoos_instrument_type():
+    assert market.fetch_chart("W.DE", lambda u, p: _chart(50.0, "EUR", kind="ETF"), json.loads)["kind"] == "ETF"
+    assert market.fetch_chart("W.DE", lambda u, p: _chart(50.0, "EUR"), json.loads)["kind"] == ""
+
+
+def test_review_and_health_say_a_large_fund_is_held_to_the_fund_limit(world):
+    service, web, *_ = world
+    web.kinds = {"WRLD.DE": "ETF", "ACME": "EQUITY"}
+    service.tick()
+    review = service.answer("review")[1]
+    assert "WRLD (WORLD ETF) is" not in review                                        # no item for the fund
+    assert "- ACME (ACME CORP) is one company at " in review                           # the stock still is one
+    assert ("A note, not a prompt: funds are held to your limit for one fund (100%, setting max_fund_pct), not the 20% "
+            "limit for one company: WRLD (WORLD ETF). The service can't tell a broad index fund") in review
+    health = service.answer("health")[1]
+    assert "Largest: WRLD (WORLD ETF) at " in health and "(a fund; your limit for one fund 100%)" in health
+
+
+def test_max_fund_pct_is_a_checked_setting(world):
+    service, web, clock, home = world
+    (home / "config.json").write_text(json.dumps({"flex_query_id": "4242", "max_fund_pct": 50}))
+    assert service.config()["max_fund_pct"] == 50
+    (home / "config.json").write_text(json.dumps({"flex_query_id": "4242", "max_fund_pct": 0}))
+    assert service.config()["max_fund_pct"] == 100 and "max_fund_pct" in service.config()["rejected"]
+
+
+
+def test_a_fund_gets_no_large_gain_prompt_and_its_own_fall_wording():
+    """§4TI-d review: a broad fund that doubled still got "does it still deserve this much", worded for a company."""
+    stock = {"symbol": "S", "kind": "EQUITY", "weight": 0.5, "gain_pct": 1.5}
+    fund = {**stock, "symbol": "F", "kind": "ETF"}
+    rules = lambda row: [i["rule"] for i in analytics.review_items({"positions": [row]}, {}, {}, LIMITS, NOW)[0]]
+    assert "large_gain" in rules(stock) and "large_gain" not in rules(fund)
+    fell = _closes([100.0] * 200 + [70.0])
+    def against(kind):
+        row = {"symbol": "X", "kind": kind, "history_symbol": "X", "qty": 1, "gain_pct": 0.0}
+        return analytics.review_items({"positions": [row]}, {}, {"X": fell}, LIMITS, NOW)[0][0]["against"]
+    assert "whole market fell" in against("ETF") and "single stocks" in against("EQUITY") and "single stocks" in against("")
+
+
+def test_kind_survives_a_stale_but_confirmed_quote_and_an_old_state_quote():
+    pos = {"key": "1", "symbol": "W", "qty": 1.0, "mark": 50.0, "currency": "EUR", "asset": "STK", "cost": 40.0}
+    old = {"price": 50.0, "currency": "EUR", "at": NOW - 10 * 86400, "session": "2026-10-27", "kind": "ETF"}
+    row = analytics.value_positions({"positions": [pos]}, {"W.DE": old}, {}, {"1": "W.DE"}, "EUR", lambda p, q: None, NOW)["positions"][0]
+    assert row["source"] == "IBKR" and row["kind"] == "ETF"   # too old to price, still this listing
+    legacy = {k: v for k, v in old.items() if k != "kind"} | {"at": NOW, "session": "2026-11-06"}
+    row = analytics.value_positions({"positions": [pos]}, {"W.DE": legacy}, {}, {"1": "W.DE"}, "EUR", lambda p, q: None, NOW)["positions"][0]
+    assert row["kind"] == ""                                  # a quote saved before §4TI-d: no KeyError, type unknown
+
+
+@pytest.mark.parametrize("fund_pct,line,item", [(100, True, False), (50, False, True)])
+def test_the_fund_line_only_between_the_two_limits(world, fund_pct, line, item):
+    service, web, clock, home = world
+    (home / "config.json").write_text(json.dumps({"flex_query_id": "4242", "max_fund_pct": fund_pct}))
+    web.kinds = {"WRLD.DE": "ETF", "ACME": "EQUITY"}
+    service.tick()
+    review = service.answer("review")[1]
+    assert ("A note, not a prompt: funds" in review) is line
+    assert ("- WRLD (WORLD ETF) is a fund at " in review) is item
+
+
+def test_a_small_fund_gets_no_fund_line_and_a_stock_largest_names_the_stock_limit(world):
+    service, web, clock, home = world
+    (home / "config.json").write_text(json.dumps({"flex_query_id": "4242", "max_position_pct": 60}))
+    web.kinds = {"WRLD.DE": "ETF", "ACME": "EQUITY"}
+    service.tick()
+    assert "A note, not a prompt" not in service.answer("review")[1]           # the fund is under 60%
+    (home / "config.json").write_text(json.dumps({"flex_query_id": "4242"}))
+    web.kinds = {"WRLD.DE": "EQUITY", "ACME": "EQUITY"}
+    web.prices["WRLD.DE"] = (55.0, "EUR")
+    service.state["prices_at"] = 0
+    service.tick()
+    assert "Largest: WRLD (WORLD ETF) at " in service.answer("health")[1] and "(your limit 20%)" in service.answer("health")[1]
+
+
+
+# §4TI-e: the public full name when the listing is confirmed; gains in the account's currency first.
+def test_the_full_public_name_heads_the_line_when_the_listing_is_confirmed(world):
+    service, web, *_ = world
+    web.names = {"WRLD.DE": "World  Index | UCITS ETF Acc"}
+    service.tick()
+    summary = service.answer("summary")[1]
+    assert "WRLD (World Index / UCITS ETF Acc): " in summary and "ACME (ACME CORP): " in summary   # no name: IBKR's
+    position = service.answer("position", "WRLD")[1]
+    assert "IBKR's name for it: WORLD ETF" in position
+    assert "IBKR's name for it" not in service.answer("position", "ACME")[1]
+
+
+def test_an_unconfirmed_listing_keeps_ibkrs_name():
+    pos = {"key": "1", "symbol": "W", "description": "WORLD ETF", "qty": 1.0, "mark": 50.0, "currency": "EUR", "asset": "STK"}
+    quote = {"price": 50.0, "currency": "EUR", "at": NOW, "session": "2026-11-06", "name": "Some Other Fund"}
+    row = analytics.value_positions({"positions": [pos]}, {"W.DE": quote}, {}, {"1": "W.DE"}, "EUR", lambda p, q: "other listing", NOW)["positions"][0]
+    assert row["label"] == "W (WORLD ETF)" and row["public_name"] == ""
+    assert market.fetch_chart("W.DE", lambda u, p: _chart(50.0, "EUR", name="  A  B "), json.loads)["name"] == "A B"
+
+
+def test_a_foreign_currency_gain_is_shown_in_the_account_currency_first(world):
+    service, *_ = world
+    service.tick()
+    line = next(l for l in service.answer("summary")[1].splitlines() if l.startswith("ACME"))
+    row = next(r for r in service.valued(service.config())["positions"] if r["symbol"] == "ACME")
+    assert row["gain_base"] == pytest.approx(row["gain_local"] * row["fx"])
+    assert f"gain {row['gain_base']:+,.2f} EUR at today's FX ({row['gain_local']:+,.2f} USD, {row['gain_pct']:+.1%})" in line
+    wrld = next(l for l in service.answer("summary")[1].splitlines() if l.startswith("WRLD"))
+    assert "at today's FX" not in wrld and " EUR (" in wrld.split("| gain ")[1]       # same currency: as before

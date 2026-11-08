@@ -100,7 +100,7 @@ class TestDialects:
         body = graph_nc[i:i + 400]
         for line in ("gaitFlow = DIAL.write === 'flow' ? gait.write : 0;",
                      "gaitThicken = DIAL.read === 'thicken' ? gait.read : 0;",
-                     "gaitFlash = DIAL.tool === 'flash' ? toolPulse : 0;",
+                     "gaitFlash = DIAL.tool === 'flash' ? toolFlash : 0;",
                      "gaitAlign = DIAL.verify === 'align' ? gait.verify : 0;"):
             assert line in body, line
 
@@ -118,7 +118,7 @@ class TestDialects:
         i = graph_nc.index("const axis = DIAL.radialAxis;")
         body = graph_nc[i:i + 1400]
         assert "DIAL.read === 'contract' ? TUNE.radialRead * gait.read : 0" in body
-        assert "DIAL.tool === 'kick' ? TUNE.toolKick * toolPulse : 0" in body
+        assert "DIAL.tool === 'kick' ? TUNE.toolKick * toolFlash : 0" in body
         assert "DIAL.write === 'wave' ? gait.write : 0" in body
         assert "else if (axis === 'y') { p.y *= f; }" in body
         assert "let f = axis === 'none' ? 1.0 : radial;" in body

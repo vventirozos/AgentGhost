@@ -357,6 +357,8 @@ class SelfModel:
             "last_mood_cause": _mood.cause,
             "manner": _mood.manner,
             "manner_intensity": _mood.manner_intensity,
+            # §4TS: the manner's steps still ahead, (on-disk stamp, level)
+            "manner_steps": [list(x) for x in _mood.manner_steps],
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),

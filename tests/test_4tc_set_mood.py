@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -43,8 +44,28 @@ def _rows(sm) -> list:
     return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
 
+#: §4TS: a manner's reply names its day ("… for the rest of the day (down to
+#: 1 at 02:00, off at 04:00; saying it again starts a new day)"), which depends
+#: on the time the suite runs. The exact replies below are pinned WITHOUT it;
+#: the day itself is pinned by the tests at the end of this file.
+_FADE_RE = re.compile(r" for the rest of the day \([^()]*; saying it again starts a new day\)")
+
+
+class _NoFade(str):
+    """The reply's text without its day; every other attribute (status,
+    reason_code, …) is the real outcome's."""
+    def __new__(cls, out):
+        obj = super().__new__(cls, _FADE_RE.sub("", out))
+        obj._out = out
+        return obj
+
+    def __getattr__(self, name):
+        return getattr(self._out, name)
+
+
 async def _set(sm, **kw):
-    return await tool_introspect(action="set_mood", self_model=sm, **kw)
+    out = await tool_introspect(action="set_mood", self_model=sm, **kw)
+    return _NoFade(out) if isinstance(out, str) and _FADE_RE.search(out) else out
 
 
 def _now(sm):
@@ -102,7 +123,7 @@ async def test_a_refused_word_refuses_the_whole_call(tmp_path):
     assert "is not one of my moods" in out and _now(sm) == ("neutral", 0, "", 0)
     out = await _set(sm, mood="cheerful", manner="rude")
     assert out == ("SYSTEM ERROR: 'rude' is not one of my manners. A manner is one of: sarcastic, playful, "
-                   "formal, terse, gentle, dramatic — or 'none' to clear it. Pick the closest one and call "
+                   "formal, terse, gentle, dramatic, evil — or 'none' to clear it. Pick the closest one and call "
                    "set_mood again. Nothing was changed.")
     assert _now(sm) == ("neutral", 0, "", 0) and not sm.state.path.exists()
 
@@ -176,11 +197,14 @@ async def test_manner_none_clears_only_the_manner(tmp_path, word):
     assert await _set(sm, manner=word) == "No manner is set — nothing to clear."
 
 
-async def test_a_manner_does_not_wear_off(tmp_path):
+async def test_a_manner_is_over_by_the_next_day(tmp_path):
+    """§4TS: it used to stay for good — a week later still "playful"."""
     sm = SelfModel(root=tmp_path)
     await _set(sm, mood="calm", manner="playful", intensity=1)
     week = sm.state.mood(now=dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=7))
-    assert (week.label, week.manner, week.manner_intensity) == ("neutral", "playful", 1)
+    assert (week.label, week.manner, week.manner_intensity) == ("neutral", "", 0)
+    day = sm.state.mood(now=dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=27))   # past any day's end, clock change included
+    assert day.manner == ""
 
 
 async def test_a_manner_word_is_no_mood_and_a_mood_word_is_no_manner(tmp_path):
@@ -234,14 +258,16 @@ async def test_the_mood_action_says_what_why_since_when_and_today(tmp_path):
     assert lines[2] == ("Today: 00:01 content 1 — a turn of 5 tool calls went through without a failure → "
                         "00:02 irritable 2 — 4 tool calls failed in this turn → "
                         "00:03 cheerful 2 — the owner said so (set_mood) (Elena said Bruno is home)")
-    assert lines[3] == I.MOOD_HOW_IT_MOVES and len(lines) == 4
-    assert "half every 2 hours" in lines[3] and "action='set_mood'" in lines[3]
+    assert lines[3] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2)}"'
+    assert lines[4] == I.MOOD_HOW_IT_MOVES and len(lines) == 5
+    assert "half every 2 hours" in lines[4] and "action='set_mood'" in lines[4]
 
 
 async def test_the_mood_action_for_a_neutral_mood(tmp_path):
     sm = SelfModel(root=tmp_path)
     out = await tool_introspect(action="mood", self_model=sm)
-    assert out.split("\n") == ["My mood now: neutral.", "Today: no change so far.", I.MOOD_HOW_IT_MOVES]
+    assert out.split("\n") == ["My mood now: neutral.", "Today: no change so far.", I.TONE_NONE,
+                                I.MOOD_HOW_IT_MOVES]
 
 
 async def test_the_mood_action_shows_the_manner_and_an_automatic_mood(tmp_path):
@@ -273,7 +299,11 @@ async def test_on_a_public_surface_the_story_has_no_causes_and_no_note(tmp_path)
     calls failed in this turn" — to everyone there. It keeps the label, the
     intensity, the manner and the day's steps, and says where the reasons are."""
     sm = _story(tmp_path)
-    sm.state.set_manner("terse", 2, now=_today(0, 3))
+    # §4TS: a manner set at 00:03 is over by 04:00, and setting one now would
+    # settle (decay) the story's 00:03 mood first — so it is put on file as set now
+    m = sm.state.state.mood
+    m.manner, m.manner_intensity = "terse", 2
+    m.manner_set_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None, microsecond=0).isoformat() + "Z"
     _fresh(sm)
     private = (await tool_introspect(action="mood", self_model=sm)).split("\n")
     tok = reply_surface_context.set("public")
@@ -285,7 +315,8 @@ async def test_on_a_public_surface_the_story_has_no_causes_and_no_note(tmp_path)
     assert public[1] == private[1] and public[1].startswith("Manner (set by the owner): terse, 2 of 3")
     assert public[2] == "Why: the reasons are shown in a private conversation."
     assert public[3] == "Today: 00:01 content 1 → 00:02 irritable 2 → 00:03 cheerful 2"
-    assert public[4] == I.MOOD_HOW_IT_MOVES and len(public) == 5
+    assert public[4] == private[4] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2, "terse", 2)}"'
+    assert public[5] == I.MOOD_HOW_IT_MOVES and len(public) == 6
     for cause in CAUSES:
         assert cause not in "\n".join(public), cause
         assert cause in "\n".join(private), cause
@@ -320,10 +351,10 @@ async def test_on_a_public_surface_overview_summary_and_stats_withhold_the_cause
     finally:
         reply_surface_context.reset(tok)
     assert "  mood: irritable, 2 of 3 — the reasons are shown in a private conversation\n" in over
-    assert "  manner (set by the owner): gentle, 1 of 3\n" in over
+    assert re.search(r"\n  manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", over), over
     for out in (stats, summ):
         assert "Mood: irritable, 2 of 3 — the reasons are shown in a private conversation\n" in out
-        assert "Manner (set by the owner): gentle, 1 of 3\n" in out
+        assert re.search(r"Manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", out)
     assert "tool calls failed" not in over + stats + summ
     private = await tool_introspect(action="stats", self_model=sm, context=ctx)
     assert "Mood: irritable, 2 of 3 — 4 tool calls failed in this turn\n" in private
@@ -427,11 +458,11 @@ async def test_overview_summary_and_stats_show_the_mood_with_its_latest_cause(tm
     sm.state.set_manner("gentle", 1)
     over = await tool_introspect(action="overview", self_model=sm, context=_ctx(tmp_path))
     assert "  mood: irritable, 2 of 3 — 4 tool calls failed in this turn\n" in over
-    assert "  manner (set by the owner): gentle, 1 of 3\n" in over
+    assert re.search(r"\n  manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", over), over
     for action in ("summary", "stats"):
         out = await tool_introspect(action=action, self_model=sm, context=_ctx(tmp_path))
         assert "Mood: irritable, 2 of 3 — 4 tool calls failed in this turn\n" in out, action
-        assert "Manner (set by the owner): gentle, 1 of 3\n" in out, action
+        assert re.search(r"Manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", out), action
     for gone in ("derived", "self-noted", "STALE", "Last noted mood", "no reading on file"):
         assert gone not in over + out, gone
     I._LEARNING_CACHE.clear()
@@ -704,7 +735,7 @@ async def test_a_real_owner_turn_sets_both_and_the_reply_that_confirms_it_alread
     P._reset_for_tests()
     await agent.handle_chat({"messages": [{"role": "user", "content": "be grumpy and sarcastic from now on"}],
                              "stream": False}, [], request_id="web-4tc-owner-turn")
-    assert str(rows[0]) == "Mood set to 'irritable', 3 of 3. Manner set to 'sarcastic', 3 of 3."
+    assert _FADE_RE.sub("", str(rows[0])) == "Mood set to 'irritable', 3 of 3. Manner set to 'sarcastic', 3 of 3."
     assert (sm.mood().label, sm.mood().intensity, sm.mood().manner) == ("irritable", 3, "sarcastic")
     second = agent.sent[1]["messages"][-1]["content"]
     assert M.tone_line("irritable", 3, "sarcastic", 3) in second
@@ -722,12 +753,23 @@ def test_a_stamp_from_another_day_carries_its_date():
     assert I._local_stamp("not a time") == "" and I._local_stamp(None) == ""
 
 
-async def test_a_manner_set_days_ago_says_which_day(tmp_path):
+async def test_a_manner_set_days_ago_is_over(tmp_path):
+    """§4TS: before, this line read "formal, 2 of 3 — since <3 days ago>"."""
     sm = SelfModel(root=tmp_path)
     then = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
     sm.state.set_manner("formal", 2, now=then)
+    out = await tool_introspect(action="mood", self_model=sm)
+    assert "Manner" not in out and sm.state.mood().manner == ""
+
+
+async def test_the_mood_view_shows_the_manners_day(tmp_path):
+    sm = SelfModel(root=tmp_path)
+    sm.state.set_manner("formal", 2)
     line = (await tool_introspect(action="mood", self_model=sm)).split("\n")[1]
-    assert line == f"Manner (set by the owner): formal, 2 of 3 — since {then.astimezone().strftime('%b %d %H:%M')}."
+    steps = sm.state.mood().manner_steps
+    assert steps and steps[-1][1] == 0
+    assert line.startswith("Manner (set by the owner): formal, ") and line.endswith(
+        f"; {I.manner_fade_text(steps)}."), line
 
 
 async def test_why_shows_the_last_three_causes_and_no_more(tmp_path):
@@ -757,3 +799,20 @@ async def test_the_story_of_a_boredom_is_the_quiet_and_the_owner_never_reads_one
     own = (await tool_introspect(action="mood", self_model=sm)).split("\n")          # the fixture's id is the owner's
     assert own[0] == "My mood now: neutral."
     assert sm.state.state.mood.e == 0.0 and sm.state.state.mood.label == "neutral"   # nothing bored was stored
+
+
+async def test_the_mood_view_shows_the_tone_line_the_reply_gets(tmp_path, monkeypatch):
+    """2026-11-08 (operator: "add the tone to the mood"): the exact words the
+    per-turn state block carries — the same function, the same view."""
+    import ghost_agent.core.agent as A
+    sm = SelfModel(root=tmp_path)
+    sm.state.set_owner_mood("irritable", M.ANCHOR_DIRECTION["irritable"], 2)
+    sm.state.set_manner("sarcastic", 3)
+    out = (await tool_introspect(action="mood", self_model=sm)).split("\n")
+    tone = next(x for x in out if x.startswith("Tone at this reading"))
+    ctx = SimpleNamespace(self_model=sm)
+    monkeypatch.setattr(A, "mood_is_heard_on_this_request", lambda c: True)
+    monkeypatch.setattr(A, "_mood_model", lambda c: sm)
+    block = A._mood_tone_block(ctx)
+    assert block.endswith("\n\n") and tone == f'{I.TONE_SNAPSHOT}"{block[:-2]}"'
+    assert "irritable, 2 of 3" in tone and "sarcastic, 3 of 3" in tone
