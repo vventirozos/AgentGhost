@@ -112,9 +112,11 @@ class TestFacePureHelpers:
         assert out == ["network", "network", "timeout", "refusal", "generic"]
 
     def test_verdict_mapping_and_refute_flinch(self, graph_js):
-        out = eval_js("let verdict = null, verdictEnv = 0, flinch = 0; const temper = { event: () => 1 };\n" + _fn(graph_js, "noteVerdict"),
-                      "[noteVerdict('pass'), verdictEnv, flinch, noteVerdict('refute'), flinch, noteVerdict('whatever')]")
-        assert out == ["pass", 1.0, 0, "refute", 0.5, "stop"]
+        out = eval_js("let verdict = null, verdictEnv = 0, flinch = 0, greens = []; const temper = { event: () => 1 };\n"
+                      "const SUCCESS_VERIFIED = 1; function noteSuccess(s) { greens.push(s); }\n" + _fn(graph_js, "noteVerdict"),
+                      "[noteVerdict('pass'), verdictEnv, flinch, noteVerdict('refute'), flinch, noteVerdict('whatever'), greens]")
+        # 2026-11-09: a pass also starts the green front, once; refute and stop do not
+        assert out == ["pass", 1.0, 0, "refute", 0.5, "stop", [1]]
 
     def test_tool_call_is_a_saturating_kick(self, graph_js):
         # the temperament's gain (2026-10-30) is 1 here: this pins the kick itself
@@ -128,7 +130,8 @@ class TestFacePureHelpers:
         for gone in ("setAutoForm", "autoFormFor", "setTaskHint", "setConversation", "describeNodeAt",
                      "_buildConversation", "_buildToolGraph", "_buildStack", "_buildAbyssal", "_buildHorizon",
                      "_buildCortex", "explicitEdges", "nodeLabels", "setTune", "loadTuneOverrides",
-                     "fireIdleTwitch", "ghost_face_auto", "ghost_face_tune"):
+                     "fireIdleTwitch", "ghost_face_auto", "ghost_face_tune",
+                     "idleTwitch", "twitchAmp", "toolKick", "'kick'"):
             assert gone not in graph_nc, f"{gone} is back"
         m = re.search(r"const FORMS = \[(.*?)\];", graph_nc, re.DOTALL)
         assert re.findall(r"'(\w+)'", m.group(1)) == ["moodtesseract", "empty"]
@@ -138,7 +141,7 @@ class TestFaceRenderWiring:
     def test_gaits_and_events_are_applied_after_every_anatomy(self, graph_nc):
         i = graph_nc.index("const radial = 1.0 + TUNE.radialSearch * gait.search")
         body = graph_nc[i:i + 2200]
-        for needle in ("toolRadial", "backgroundBusy", "writeW", "shudder", "idleTwitch"):
+        for needle in ("backgroundBusy", "writeW", "shudder"):   # toolRadial/idleTwitch removed 2026-11-09 (dead)
             assert needle in body, needle
         assert graph_nc.index("const radial = 1.0") < graph_nc.index("if (formBlend < 1.0) {"), (
             "gaits must be applied BEFORE the reorganisation blend or a form switch snaps")
@@ -346,13 +349,27 @@ class TestHealthCarriesMood:
     def test_mood_label_intensity_manner_and_who_set_it(self):
         """§4TC: one shape, always an object."""
         body = self._health(lambda: SimpleNamespace(label="irritable", intensity=2, manner="sarcastic",
-                                                    source="owner", set_at="2026-09-11T10:00:00Z"))
+                                                    source="owner", set_at="2026-09-11T10:00:00Z",
+                                                    cause="the owner said so (set_mood)",
+                                                    held_until="2026-09-12T02:00:00Z"))
         assert body["mood"] == {"label": "irritable", "intensity": 2, "manner": "sarcastic",
-                                "set_at": "2026-09-11T10:00:00Z", "source": "owner"}
+                                "set_at": "2026-09-11T10:00:00Z", "source": "owner",
+                                "cause": "the owner said so (set_mood)", "held_until": "2026-09-12T02:00:00Z"}
         body = self._health(lambda: SimpleNamespace(label="bored", intensity=1, manner="", source="auto", set_at=""))
-        assert body["mood"] == {"label": "bored", "intensity": 1, "manner": "", "set_at": "", "source": "auto"}
+        assert body["mood"] == {"label": "bored", "intensity": 1, "manner": "", "set_at": "", "source": "auto",
+                                "cause": "", "held_until": ""}
 
-    NEUTRAL = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}
+    def test_the_cause_is_capped_and_a_neutral_mood_has_none(self):
+        """§4TX: the chip's tooltip says why — in the system's own words, capped."""
+        body = self._health(lambda: SimpleNamespace(label="down", intensity=1, manner="", source="auto",
+                                                    set_at="", cause="x" * 500))
+        assert body["mood"]["cause"] == "x" * 200
+        body = self._health(lambda: SimpleNamespace(label="neutral", intensity=0, manner="", source="auto",
+                                                    set_at="", cause="it wore off", held_until="2026-09-12T02:00:00Z"))
+        assert (body["mood"]["cause"], body["mood"]["held_until"]) == ("", "")
+
+    NEUTRAL = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
+               "held_until": ""}
 
     def test_a_neutral_mood_keeps_the_manner_and_names_no_owner(self):
         body = self._health(lambda: SimpleNamespace(label="neutral", intensity=0, manner="formal",
@@ -370,7 +387,8 @@ class TestHealthCarriesMood:
 
     def test_an_out_of_range_intensity_is_brought_into_range(self):
         body = self._health(lambda: SimpleNamespace(label="tired", intensity=9, manner=None, source="x", set_at=None))
-        assert body["mood"] == {"label": "tired", "intensity": 3, "manner": "", "set_at": "", "source": "auto"}
+        assert body["mood"] == {"label": "tired", "intensity": 3, "manner": "", "set_at": "", "source": "auto",
+                                "cause": "", "held_until": ""}
 
     def test_the_real_state_thread_feeds_the_endpoint(self, tmp_path):
         from ghost_agent.selfhood import SelfModel
@@ -383,7 +401,8 @@ class TestHealthCarriesMood:
         raw = sm.state.path.read_bytes()
         body = self._health(sm.state.mood)["mood"]
         assert (body["label"], body["intensity"], body["manner"], body["source"]) == ("cheerful", 3, "playful", "owner")
-        assert body["set_at"].endswith("Z")
+        assert body["set_at"].endswith("Z") and body["held_until"].endswith("Z")       # §4TX: held as set
+        assert body["cause"] == "the owner said so (set_mood)"
         assert sm.state.path.read_bytes() == raw and before is False       # the endpoint only reads
 
 
@@ -391,6 +410,19 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=19.13" in index and "style.css?v=8.7" in index
-    assert "matrix_graph.js?v=19.13" in app and "workspace.js?v=9.5" in app
-    assert "status.js?v=7.7" in ws and "palette.js?v=7.6" in ws
+    assert "app.js?v=19.18" in index and "style.css?v=8.7" in index
+    assert "matrix_graph.js?v=19.18" in app and "workspace.js?v=9.6" in app
+    assert "status.js?v=7.8" in ws and "palette.js?v=7.6" in ws
+
+
+def test_the_chip_tooltip_names_the_mood_its_cause_and_the_manner(status_js):
+    """§4TX: the chip's title says the mood in words, its cause, the hold and the manner."""
+    fn = extract_js_function(status_js, "moodNote")
+    out = eval_js(fn, "[moodNote({mood: {label: 'irritable', intensity: 2, cause: '3 tool calls failed', "
+                      "manner: 'terse', held_until: ''}}), "
+                      "moodNote({mood: {label: 'calm', intensity: 1, cause: 'the owner said so (set_mood)', "
+                      "held_until: '2026-11-10T02:00:00Z', manner: ''}}), "
+                      "moodNote({mood: {label: 'neutral', intensity: 0, manner: ''}}), moodNote(null), moodNote({})]")
+    assert out == ["\nmood: irritable, 2 of 3 — 3 tool calls failed\nmanner: terse",
+                   "\nmood: calm, 1 of 3 — the owner said so (set_mood) (held as the owner set it)",
+                   "", "", ""]

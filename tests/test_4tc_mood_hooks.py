@@ -124,14 +124,14 @@ def test_failed_tool_calls_in_the_turn_make_it_irritable(tmp_path, owner):
     v = _mood(agent)
     assert (v.label, v.intensity) == ("irritable", 1)
     assert (v.p, v.e) == (pytest.approx(-0.36), pytest.approx(0.24))
-    assert v.cause == "3 tool calls failed in this turn" and v.source == "auto"
+    assert v.cause == "3 tool calls failed (of 4) in this turn" and v.source == "auto"
     assert [(r["label"], r["kind"]) for r in _rows(agent)] == [("irritable", "turn")]
 
 
 def test_a_clean_turn_of_several_calls_lifts_it_a_little(tmp_path, owner):
     agent = _traj_agent(tmp_path)
     _record(agent, _turn([("execute", OK)] * 3))
-    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.08), 0.0)
+    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.10), 0.0)          # §4TX: 0.04 + 0.02 x 3
     two = _traj_agent(tmp_path / "two")
     _record(two, _turn([("execute", OK)] * 2))
     assert _mood(two).p == 0.0
@@ -142,14 +142,18 @@ def test_a_designed_stop_is_not_a_failure(tmp_path, owner):
     agent = _traj_agent(tmp_path)
     stop = ToolOutcome.rejected("SYSTEM BLOCK: ask the user first.", reason_code="clarify_first")
     _record(agent, _turn([("execute", OK), ("execute", OK), ("manage_projects", stop)]))
-    assert _mood(agent).p == pytest.approx(0.08)                        # three answered calls, none failed
+    assert _mood(agent).p == pytest.approx(0.10)                        # three answered calls, none failed
 
 
-def test_a_refused_call_counts_as_a_failure(tmp_path, owner):
+def test_a_guards_refusal_is_not_counted_against_the_mood(tmp_path, owner):
+    """§4TX (review 11-09): a guard saying no is the system working — the tool did its job. It is still an
+    answered call (it makes no turn "clean" by itself) and is counted as excused."""
     agent = _traj_agent(tmp_path)
     refused = ToolOutcome.rejected("SYSTEM BLOCK: that path is outside the project.", reason_code="path_denied")
+    sig = agent._mood_turn_signals(_turn([("file_system", refused), ("execute", OK)]), ASK, OWNER_RID)
+    assert (sig.tool_calls, sig.failures, sig.excused) == (2, 0, 1)
     _record(agent, _turn([("file_system", refused), ("execute", OK)]))
-    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(-0.12), pytest.approx(0.08))
+    assert _mood(agent).neutral
 
 
 def test_only_this_turns_calls_count(tmp_path, owner):
@@ -158,7 +162,7 @@ def test_only_this_turns_calls_count(tmp_path, owner):
     earlier = _turn([("execute", BAD)] * 4, ask="an earlier request about Bruno's food")
     earlier.append({"role": "assistant", "content": "It failed four times."})
     _record(agent, _turn([("execute", OK)] * 3, history=earlier))
-    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.08), 0.0)
+    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.10), 0.0)
 
 
 def test_a_research_turn_that_read_several_pages_makes_it_curious(tmp_path, owner):
@@ -166,14 +170,14 @@ def test_a_research_turn_that_read_several_pages_makes_it_curious(tmp_path, owne
     _record(agent, _turn([("browser", _page(1)), ("browser", _page(2)), ("browser", _page(3))]))
     v = _mood(agent)
     assert (v.label, v.intensity) == ("curious", 1)
-    assert (v.p, v.e) == (pytest.approx(0.15 + 0.08), pytest.approx(0.20))
+    assert (v.p, v.e) == (pytest.approx(0.15 + 0.10), pytest.approx(0.20))
     assert "read 3 sources in a research turn" in v.cause
 
 
 def test_the_same_page_read_three_times_is_one_source(tmp_path, owner):
     agent = _traj_agent(tmp_path)
     _record(agent, _turn([("browser", _page(1))] * 3))
-    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.08), 0.0)       # a clean turn, no research
+    assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.10), 0.0)       # a clean turn, no research
 
 
 def test_a_failed_page_load_is_not_a_source(tmp_path, owner):
@@ -181,14 +185,15 @@ def test_a_failed_page_load_is_not_a_source(tmp_path, owner):
     dead = ToolOutcome.failed("URL: https://example.org/vet/9\nERROR: timeout")
     sig = agent._mood_turn_signals(_turn([("browser", _page(1)), ("browser", _page(2)), ("browser", dead)]),
                                    ASK, OWNER_RID)
-    assert (sig.tool_calls, sig.failures, sig.sources) == (3, 1, 2)
+    # §4TX: a timeout is transient — excused, not a failure; and still not a source
+    assert (sig.tool_calls, sig.failures, sig.excused, sig.sources) == (3, 0, 1, 2)
 
 
 def test_a_very_long_turn_makes_it_tired(tmp_path, owner):
     agent = _traj_agent(tmp_path)
-    _record(agent, _turn([("execute", OK)] * 2), elapsed_s=1500.0)
+    _record(agent, _turn([]), elapsed_s=1500.0)          # §4TX r2: long, and nothing done in it
     v = _mood(agent)
-    assert (v.label, v.intensity) == ("tired", 1) and v.cause == "a very long turn (25 min, 2 tool calls)"
+    assert (v.label, v.intensity) == ("tired", 1) and v.cause == "a very long turn (25 min, 0 tool calls)"
 
 
 def test_the_signals_are_the_turns_own(tmp_path, owner):
@@ -220,7 +225,7 @@ def test_another_requests_guard_events_do_not_count(tmp_path, owner):
     agent = _traj_agent(tmp_path)
     A.note_guard_event(agent.context, "web-someone-else", "edit_churn")
     _record(agent, _turn([("execute", OK)] * 3))
-    assert _mood(agent).p == pytest.approx(0.08)
+    assert _mood(agent).p == pytest.approx(0.10)
 
 
 def test_a_breaker_that_closes_the_request_is_a_guard_event():
@@ -295,11 +300,11 @@ def test_a_designed_refusal_and_any_introspect_call_are_not_trouble(tmp_path, ow
     assert _mood(agent).neutral
 
 
-def test_a_refusal_of_another_kind_is_still_trouble(tmp_path, owner):
+def test_a_refusal_of_another_kind_is_an_excused_call_and_a_real_failure_still_counts(tmp_path, owner):
     agent = _traj_agent(tmp_path)
     denied = ToolOutcome.rejected("SYSTEM BLOCK: that path is outside the project.", reason_code="path_denied")
     sig = agent._mood_turn_signals(_turn([("file_system", denied), ("execute", BAD)]), ASK, OWNER_RID)
-    assert (sig.tool_calls, sig.failures) == (2, 2)
+    assert (sig.tool_calls, sig.failures, sig.excused) == (2, 1, 1)
     assert A.MOOD_BLIND_REASONS == frozenset({"untrusted_content", "owner_data_blocked", "owner_only"})
 
 
@@ -347,7 +352,12 @@ async def test_cheer_up_with_four_failing_calls_in_the_same_turn_stays_cheerful(
     _record(agent, msgs, ask="cheer up", pressure_lockdown=True)
     v = _mood(agent)
     assert (v.label, v.intensity, v.source) == ("cheerful", 2, "owner") and v.p == pytest.approx(0.60, abs=1e-3)
-    _record(agent, _turn([("execute", BAD)] * 4))                      # the NEXT turn's failures do count
+    # §4TX: and it HOLDS — the next turn's failures are recorded as held, not applied, until the day ends
+    _record(agent, _turn([("execute", BAD)] * 4))
+    assert _mood(agent).p == pytest.approx(0.60, abs=1e-3)
+    assert agent.context.self_model.state.mood_events()[-1]["held"]
+    agent.context.self_model.state.state.mood.held_until = ""          # past the day's end: they count again
+    _record(agent, _turn([("execute", BAD)] * 4))
     assert _mood(agent).p < 0.2
 
 
@@ -590,8 +600,12 @@ def test_the_same_thumb_again_is_not_a_second_thumb(tmp_path):
     for _ in range(3):
         assert F.apply_human_label(agent, "r1", "positive", source="web")["ok"]
     assert sm.mood().p == 0.25
-    F.apply_human_label(agent, "r1", "negative", source="web")           # a changed mind is a new thumb
-    assert sm.mood().p == pytest.approx(-0.05, abs=0.01)
+    F.apply_human_label(agent, "r1", "negative", source="web")           # a changed mind REPLACES the thumb
+    assert sm.mood().p == pytest.approx(-0.30, abs=0.01)                 # §4TX: was -0.05, drifting per toggle
+    for _ in range(3):                                                   # toggling back and forth: no drift
+        F.apply_human_label(agent, "r1", "positive", source="web")
+        F.apply_human_label(agent, "r1", "negative", source="web")
+    assert sm.mood().p == pytest.approx(-0.30, abs=0.01)
 
 
 @pytest.mark.parametrize("source", sorted(F.OWNER_LABEL_SOURCES))
@@ -841,7 +855,9 @@ def test_the_owner_is_never_answered_bored_even_before_his_arrival_is_stamped(tm
     assert A._mood_tone_block(agent.context) == "" and _mood(agent).neutral        # the owner's own request
     assert _rows(agent) == []                                            # and his read wrote no row
     with _as("slack-m-1", role="member"):
-        assert A._mood_tone_block(agent.context) == M.tone_line("bored", 2) + "\n\n"
+        # §4TX: a quiet is not taken out on whoever writes next — no reply hears boredom; the face still shows it
+        assert A._mood_tone_block(agent.context) == ""
+        assert _mood(agent).label == "bored"
 
 
 def test_an_owners_request_that_follows_no_boredom_writes_no_quiet_row(tmp_path, owner):

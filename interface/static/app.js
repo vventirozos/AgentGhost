@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.13';
+import * as matrixGraphFace from './matrix_graph.js?v=19.18';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -234,6 +234,7 @@ const ICON_CLASS = {
     '🔒': 'accent',   // SHIELD
     '📣': 'accent',   // NOTIFY_OUT
     '🪞': 'accent',   // SELF_STATE
+    '💗': 'accent',   // SENTIMENT (§4TW)
     '🎭': 'accent',   // MIRROR (§4SV)
     '🎓': 'accent',   // SKILL_GRADUATE
     '👍': 'accent',   // FEEDBACK_POS — human outcome label (/api/feedback)
@@ -7520,7 +7521,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.5').catch(e => {
+import('./workspace.js?v=9.6').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

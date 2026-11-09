@@ -321,7 +321,8 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     if (not unchanged and is_owner_label_source(source)
                             and turn_is_recent_enough(traj)):
                         from ..selfhood.mood import KIND_THUMB_DOWN, KIND_THUMB_UP
-                        _sm.note_owner_reaction(KIND_THUMB_UP if positive else KIND_THUMB_DOWN)
+                        _sm.note_owner_reaction(KIND_THUMB_UP if positive else KIND_THUMB_DOWN,
+                                                reply_id=str(rid or ""))
             except Exception as _sfe:  # noqa: BLE001 — label already committed
                 logger.debug("selfhood human-label backfill skipped: %s: %s",
                              type(_sfe).__name__, _sfe)

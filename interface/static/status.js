@@ -112,7 +112,21 @@ export function initStatus(_ctx) {
         const reasons = [];
         if (agentDegraded) reasons.push(degradedReason(health, healthOk, healthFailNote));
         if (tlsNote) reasons.push(tlsNote);
-        indicator.title = degraded ? 'DEGRADED — ' + reasons.join(' · ') : baseTitle;
+        indicator.title = (degraded ? 'DEGRADED — ' + reasons.join(' · ') : baseTitle) + moodNote(health);
+    }
+
+    // §4TX: the mood in words on the chip's tooltip — the face shows it as a colour only
+    function moodNote(h) {
+        const m = h && h.mood;
+        if (!m || typeof m !== 'object') return '';
+        const parts = [];
+        if (m.intensity > 0 && m.label) {
+            parts.push('mood: ' + m.label + ', ' + m.intensity + ' of 3'
+                + (m.cause ? ' — ' + m.cause : '')
+                + (m.held_until ? ' (held as the owner set it)' : ''));
+        }
+        if (m.manner) parts.push('manner: ' + m.manner);
+        return parts.length ? '\n' + parts.join('\n') : '';
     }
 
     async function pollInterfaceHealth() {

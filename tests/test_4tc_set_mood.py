@@ -48,7 +48,9 @@ def _rows(sm) -> list:
 #: 1 at 02:00, off at 04:00; saying it again starts a new day)"), which depends
 #: on the time the suite runs. The exact replies below are pinned WITHOUT it;
 #: the day itself is pinned by the tests at the end of this file.
-_FADE_RE = re.compile(r" for the rest of the day \([^()]*; saying it again starts a new day\)")
+_FADE_RE = re.compile(r" for the rest of the day \([^()]*; saying it again starts a new day\)"
+                      # §4TX: a set mood names when its hold ends — pinned by its own test below
+                      r"|; it holds as set until [^()]*\(nothing moves it until then; 'neutral' takes it off\)")
 
 
 class _NoFade(str):
@@ -131,6 +133,9 @@ async def test_a_refused_word_refuses_the_whole_call(tmp_path):
 async def test_the_set_mood_then_decays_and_reacts_like_any_mood(tmp_path):
     sm = SelfModel(root=tmp_path)
     await _set(sm, mood="cheerful", intensity=3)
+    held = sm.state.mood(now=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=50))
+    assert (held.label, held.intensity) == ("cheerful", 3) and held.held_until       # §4TX: held, not faded
+    sm.state.state.mood.held_until = ""                                             # past the day's end
     later = sm.state.mood(now=dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2, minutes=1))
     assert (later.label, later.intensity) == ("cheerful", 2)
     after = sm.note_owner_turn(M.TurnSignals(tool_calls=6, failures=6))
@@ -146,15 +151,18 @@ async def test_neutral_takes_the_mood_off_and_the_manner_with_it(tmp_path):
     out = await _set(sm, mood="neutral")
     assert out == "Mood reset to neutral (it was 'irritable', 3 of 3); manner 'sarcastic' cleared."
     assert _now(sm) == ("neutral", 0, "", 0)
-    assert [(r["label"], r["intensity"], r["kind"]) for r in _rows(sm)] == [("irritable", 3, "owner"),
-                                                                           ("neutral", 0, "owner")]
+    assert [(r["label"], r["intensity"], r["kind"]) for r in _rows(sm)] == [
+        ("irritable", 3, "owner"), ("irritable", 3, "manner"), ("neutral", 0, "owner"), ("neutral", 0, "manner")]
 
 
 async def test_neutral_with_only_a_manner_on_file_clears_the_manner(tmp_path):
     sm = SelfModel(root=tmp_path)
     await _set(sm, manner="formal")
     assert await _set(sm, mood="neutral") == "Mood reset to neutral; manner 'formal' cleared."
-    assert _now(sm) == ("neutral", 0, "", 0) and _rows(sm) == []
+    assert _now(sm) == ("neutral", 0, "", 0)
+    assert [(r["kind"], r["cause"]) for r in _rows(sm)] == [            # §4TX: the manner's rows, no mood row
+        ("manner", "the owner set the manner: formal, 2 of 3"),
+        ("manner", "the owner cleared the manner (formal) with neutral")]
 
 
 async def test_neutral_with_a_manner_in_the_same_call_keeps_that_manner(tmp_path):
@@ -175,7 +183,7 @@ async def test_each_manner_is_set_and_leaves_the_mood_alone(tmp_path, manner):
     await _set(sm, mood="content", intensity=1)
     assert await _set(sm, manner=manner, intensity=3) == f"Manner set to '{manner}', 3 of 3."
     assert _now(sm) == ("content", 1, manner, 3)
-    assert len(_rows(sm)) == 1                                   # the mood's journal has no manner row
+    assert [r["kind"] for r in _rows(sm)] == ["owner", "manner"]     # §4TX: the manner is its own row
 
 
 async def test_the_intensity_goes_to_whatever_the_call_sets(tmp_path):
@@ -210,8 +218,11 @@ async def test_a_manner_is_over_by_the_next_day(tmp_path):
 async def test_a_manner_word_is_no_mood_and_a_mood_word_is_no_manner(tmp_path):
     sm = SelfModel(root=tmp_path)
     assert "is not one of my moods" in await _set(sm, mood="sarcastic")
-    assert "is not one of my manners" in await _set(sm, manner="irritable")
     assert _now(sm) == ("neutral", 0, "", 0)
+    # §4TX (review: "be grumpy" sent as the manner was refused): a MOOD word sent as the manner is the mood
+    assert await _set(sm, manner="irritable") == "Mood set to 'irritable', 2 of 3."
+    assert await _set(sm, manner="grumpy", manner_intensity=3) == "Mood set to 'irritable', 3 of 3, asked as 'grumpy'."
+    assert _now(sm) == ("irritable", 3, "", 0)
 
 
 async def test_the_manner_goes_through_the_same_guards(tmp_path):
@@ -314,8 +325,11 @@ async def test_on_a_public_surface_the_story_has_no_causes_and_no_note(tmp_path)
     assert public[0] == private[0] == "My mood now: cheerful, 2 of 3 — since 00:03 (set by the owner)."
     assert public[1] == private[1] and public[1].startswith("Manner (set by the owner): terse, 2 of 3")
     assert public[2] == "Why: the reasons are shown in a private conversation."
-    assert public[3] == "Today: 00:01 content 1 → 00:02 irritable 2 → 00:03 cheerful 2"
-    assert public[4] == private[4] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2, "terse", 2)}"'
+    # §4TX r4: every journal row holds the owner's pair — the public story has no timeline
+    assert public[3] == f"Today: {I.MOOD_STEPS_PRIVATE}." and private[3].startswith("Today: 00:01 content 1")
+    assert private[4] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2, "terse", 2)}"'
+    # §4TX r3: on a public surface, the line the public reply really gets
+    assert public[4] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2, "terse", 2, audience="public")}"'
     assert public[5] == I.MOOD_HOW_IT_MOVES and len(public) == 6
     for cause in CAUSES:
         assert cause not in "\n".join(public), cause
@@ -330,7 +344,7 @@ async def test_on_a_public_surface_a_mood_that_wore_off_shows_no_cause_either(tm
         out = await tool_introspect(action="mood", self_model=sm)
     finally:
         reply_surface_context.reset(tok)
-    assert "→ now cheerful, 1 of 3" in out and "it wore off" not in out
+    assert "My mood now: cheerful, 1 of 3" in out and "it wore off" not in out
     assert "→ now cheerful, 1 of 3 — it wore off" in await tool_introspect(action="mood", self_model=sm)
 
 
@@ -357,7 +371,7 @@ async def test_on_a_public_surface_overview_summary_and_stats_withhold_the_cause
         assert re.search(r"Manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", out)
     assert "tool calls failed" not in over + stats + summ
     private = await tool_introspect(action="stats", self_model=sm, context=ctx)
-    assert "Mood: irritable, 2 of 3 — 4 tool calls failed in this turn\n" in private
+    assert "Mood: irritable, 2 of 3 — 4 tool calls failed (of 6) in this turn\n" in private
     I._LEARNING_CACHE.clear()
 
 
@@ -374,7 +388,8 @@ async def test_a_surface_that_cannot_be_read_is_treated_as_public(tmp_path, monk
     assert I._mood_lines({"last_mood": "down", "last_mood_intensity": 1, "last_mood_cause": "x"}, head="M",
                          manner_head="N") == ["M: down, 1 of 3 — the reasons are shown in a private conversation"]
     assert I._mood_lines({"last_mood": "down", "last_mood_intensity": 1, "last_mood_cause": ""}, head="M",
-                         manner_head="N") == ["M: down, 1 of 3"]          # no cause: nothing to withhold
+                         manner_head="N") == ["M: down, 1 of 3 — the reasons are shown in a private conversation"]
+    # §4TX r3: the public view carries no cause at all, so a public line always says where the reasons are
 
 
 async def test_a_successful_set_mood_is_a_declared_ok(tmp_path):
@@ -457,11 +472,11 @@ async def test_overview_summary_and_stats_show_the_mood_with_its_latest_cause(tm
     sm.note_owner_turn(M.TurnSignals(tool_calls=6, failures=4))
     sm.state.set_manner("gentle", 1)
     over = await tool_introspect(action="overview", self_model=sm, context=_ctx(tmp_path))
-    assert "  mood: irritable, 2 of 3 — 4 tool calls failed in this turn\n" in over
+    assert "  mood: irritable, 2 of 3 — 4 tool calls failed (of 6) in this turn\n" in over
     assert re.search(r"\n  manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", over), over
     for action in ("summary", "stats"):
         out = await tool_introspect(action=action, self_model=sm, context=_ctx(tmp_path))
-        assert "Mood: irritable, 2 of 3 — 4 tool calls failed in this turn\n" in out, action
+        assert "Mood: irritable, 2 of 3 — 4 tool calls failed (of 6) in this turn\n" in out, action
         assert re.search(r"Manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", out), action
     for gone in ("derived", "self-noted", "STALE", "Last noted mood", "no reading on file"):
         assert gone not in over + out, gone
@@ -582,7 +597,7 @@ async def test_the_owners_own_request_still_sets_it(tmp_path):
             out = await tool_introspect(action="set_mood", mood="cheerful", self_model=sm, context=_live_ctx())
         finally:
             request_id_context.reset(tok)
-        assert out == "Mood set to 'cheerful', 2 of 3."
+        assert _NoFade(out) == "Mood set to 'cheerful', 2 of 3."
     tok = reply_surface_context.set("public")                           # the owner in a channel: still his word
     try:
         assert (await _set(sm, manner="terse")) == "Manner set to 'terse', 2 of 3."
@@ -795,7 +810,7 @@ async def test_the_story_of_a_boredom_is_the_quiet_and_the_owner_never_reads_one
     assert lines[0].startswith("My mood now: bored, 1 of 3 — since ") and lines[0].endswith(" (automatic).")
     assert lines[1] == "Why: quiet for 6 hours."                         # not the thumb of yesterday
     assert "bored 1 — quiet for 6 hours" in lines[2] and "Mood: bored, 1 of 3 — quiet for 6 hours" in stats
-    assert "quiet for 6 hours or more a neutral mood reads as bored to everyone but the owner" in lines[-1]
+    assert "quiet for 6 hours or more a neutral mood reads as bored (here and on the face, not in replies)" in lines[-1]
     own = (await tool_introspect(action="mood", self_model=sm)).split("\n")          # the fixture's id is the owner's
     assert own[0] == "My mood now: neutral."
     assert sm.state.state.mood.e == 0.0 and sm.state.state.mood.label == "neutral"   # nothing bored was stored

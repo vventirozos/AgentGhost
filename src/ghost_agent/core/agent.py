@@ -13,6 +13,8 @@ import random
 import time
 import uuid
 import contextlib
+import collections
+import threading
 import re
 
 #: §4SH r6: the tail of a malformed file_system call searched for its trailing keys
@@ -10179,6 +10181,99 @@ def _ends_with_action_promise(text) -> str:
     return ""
 
 
+#: Intent markers for the filler guard ("I'll", "let me", "running" …) —
+#: kept narrow on purpose: "will" / "can" alone would fire on prose.
+_FILLER_INTENT_RE = re.compile(
+    r"\b(?:i['’]ll|i\s+will|i(?:['’]m|\s+am)\s+(?:going|about)\s+to|"
+    r"let\s+me|let['’]s|gonna|"
+    r"now\s+(?:i['’]?m\s+)?(?:running|calling|using|executing|"
+    r"invoking|firing)|"
+    r"running|calling|invoking|firing\s+off|executing\s+(?:the|a))\b",
+    re.IGNORECASE,
+)
+
+#: A last sentence that hands the choice to the user — an offer, not a
+#: promise ("Want me to run …?", "whenever you're ready").
+_FILLER_OFFER_RE = re.compile(
+    r"\b(?:want\s+me\s+to|would\s+you\s+like|shall\s+i|should\s+i|"
+    r"do\s+you\s+want|if\s+you['’]?d\s+like|if\s+you\s+would\s+like|"
+    r"whenever\s+you['’]?re\s+ready|whenever\s+you\s+are\s+ready)\b",
+    re.IGNORECASE,
+)
+
+#: Head of the filler alert — also how the guard sees it already fired.
+_FILLER_ALERT_HEAD = ("SYSTEM ALERT: You provided conversational text "
+                      "mentioning the tool")
+
+#: "I'll not / never …" is not a promise.
+_FILLER_NEGATION_RE = re.compile(r"^\s*(?:not(?!\s+only\b)|never|n['’]t)\b", re.IGNORECASE)
+
+#: How many words after the intent marker the tool name may sit.
+_FILLER_WINDOW_WORDS = 4
+
+
+def _filler_promised_tool(text, tool_names) -> str:
+    """Return the tool a reply PROMISES to run without calling it, else "".
+
+    req 8ecb1424 (11-09): a casual "you've got time — news, a little
+    portfolio curiosity, or just a chat?" was rejected twice (``run``, then
+    ``portfolio``): any intent word ANYWHERE plus any tool name ANYWHERE
+    fired, a 10 s reply took 51 s, the user watched it retracted twice and
+    two strikes were booked. 10-10 probe-mz: "I don't have web_search on
+    this channel" was steered into a pointless vision call. Now:
+
+    * the tool name must sit within ``_FILLER_WINDOW_WORDS`` words AFTER an
+      intent marker, inside the same sentence ("let me run `web_search`");
+    * a one-word tool name (``run``, ``portfolio``, ``jobs``, ``browser`` …
+      — ordinary English) counts only when written AS a tool: in backticks
+      or followed by "tool" ("use the execute tool");
+    * a reply whose last sentence is a question or an offer is exempt —
+      it hands the choice to the user, it promises nothing.
+    """
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    last = re.split(r"(?<=[.!?])\s+|\n+", t)[-1].strip()
+    # "Want me to? 😊" — the emoji is not the last sentence
+    if not re.search(r"\w", last):
+        parts = [x for x in re.split(r"(?<=[.!?])\s+|\n+", t) if re.search(r"\w", x)]
+        last = parts[-1].strip() if parts else ""
+    last = re.sub(r"[^\w?]+$", "", last)
+    if last.endswith("?") or _FILLER_OFFER_RE.search(last):
+        return ""
+    low = t.lower()
+    for m in _FILLER_INTENT_RE.finditer(low):
+        tail = low[m.end():]
+        if _FILLER_NEGATION_RE.search(tail):
+            continue
+        # a colon / semicolon / dash ends the promise's clause: "let me be
+        # straightforward: web_search is not on this channel"
+        stop = re.search(r"[.!?:;](?:\s|$)|\s[—–-]\s|\n", tail)
+        if stop:
+            tail = tail[:stop.start()]
+        words = list(re.finditer(r"\S+", tail))
+        if not words:
+            continue
+        window = tail[:words[min(len(words), _FILLER_WINDOW_WORDS + 2) - 1].end()]
+        for name in tool_names:
+            n = str(name).lower()
+            if "_" in n:
+                pats = (re.escape(n), re.escape(n.replace("_", " ")))
+            else:
+                pats = (rf"`{re.escape(n)}`", rf"{re.escape(n)}\s+tool")
+            for pat in pats:
+                hit = re.search(pat if pat.startswith("`")
+                                else rf"(?<!\w){pat}(?!\w)", window)
+                if not hit:
+                    continue
+                # the name must START within the first N words of the tail
+                # (a word that merely opens it — "`" / "**" — is not one)
+                before = sum(1 for w in words if w.end() <= hit.start())
+                if before < _FILLER_WINDOW_WORDS:
+                    return str(name)
+    return ""
+
+
 #: Tools whose dropped-at-the-finish-line call means user-visible work was
 #: silently skipped (vs. terminal-tool re-calls, which are dropped by
 #: design). Used for the honesty note when force_final_response eats a call.
@@ -12435,20 +12530,147 @@ def _mood_blind_row(m) -> bool:
     return str(getattr(m.get("content"), "reason_code", "") or "") in MOOD_BLIND_REASONS
 
 
+def mood_excuses_failure(text) -> bool:
+    """§4TX (review 11-09): a failed call the mood does not count against
+    itself — the tool worked and the world said no, or it will say yes on
+    the next try: a transient failure (Tor, a timeout, the sandbox briefly
+    away — `classify_tool_failure` RETRYABLE), a guard's refusal (REJECTED,
+    SYSTEM BLOCK, a containment refusal — `result_is_rejection`), a test run
+    whose tests failed (finding them is the work), and a result that reads
+    "SUCCESS…" though the row was booked a failure (one live row: a file
+    write)."""
+    t = str(text or "")
+    if not t.strip():
+        return False
+    try:
+        from ..tools.tool_failure import (FailureClass, _TEST_RUNNER_RE, classify_tool_failure,
+                                          is_program_output, result_is_rejection)
+        if t.lstrip().upper().startswith("SUCCESS"):
+            return True
+        if result_is_rejection(t):
+            return True
+        if is_program_output(t) and _TEST_RUNNER_RE.search(t):
+            # review r2: a test RUN's output (the runner's own summary), not any text saying "2 failed"
+            return True
+        return classify_tool_failure(t)[0] == FailureClass.RETRYABLE
+    except Exception:  # noqa: BLE001 — a mood reading never breaks a turn
+        return False
+
+
+def mood_tasks_done(call) -> int:
+    """§4TX: how many project tasks one ``manage_projects`` call closed DONE
+    — its ``closed`` list (a refused close and a re-close of a task already
+    DONE are not in it). Read from the call's FULL result when there is one
+    (review r2: the row's result is cut at 4,000 characters, and a cut JSON
+    counted no task)."""
+    if getattr(call, "name", "") != "manage_projects" or getattr(call, "error", None):
+        return 0
+    args = getattr(call, "arguments", None) or {}
+    if not isinstance(args, dict) or str(args.get("action") or "").strip().lower() != "task_update":
+        return 0
+    try:
+        payload = json.loads(str(getattr(call, "full_result", "") or getattr(call, "result", "") or ""))
+    except (TypeError, ValueError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    closed = payload.get("closed") or []
+    return len({str(t) for t in closed}) if isinstance(closed, list) else 0
+
+
+#: §4TX: per conversation, the mood last heard in it and the request that first heard it — a remark about the
+#: mood is made once per conversation, not every reply. Bounded; in memory (a restart forgets: one more remark).
+_MOOD_HEARD_BY_CONV: "collections.OrderedDict[str, Tuple[str, str]]" = collections.OrderedDict()
+#: §4TX: per request, what the tone line said — the turn record carries it (how the mood sounded is measurable)
+_MOOD_TONE_BY_REQ: "collections.OrderedDict[str, Dict[str, Any]]" = collections.OrderedDict()
+_MOOD_MEMO_MAX = 256
+_MOOD_MEMO_LOCK = threading.Lock()
+
+
+def _mood_audience() -> str:
+    """"others" for a member's reply, "public" for the owner's reply on a public channel (others read it),
+    else "owner". Both hear the mood without the owner's own sentiment and without its cause."""
+    try:
+        if requester_is_member():
+            return "others"
+        return "public" if reply_is_public() else "owner"
+    except Exception:  # noqa: BLE001
+        return "others"
+
+
+def _mood_conversation() -> str:
+    """§4TX (review r2): the conversation a request belongs to, for the mood's memos — the slot session
+    (web session id, ``slack:<thread>:<user>``, else the first-message fingerprint), the conversation
+    key when there is no session; a member's request is keyed by the member too ("" when unknown)."""
+    try:
+        from ..utils.logging import conversation_key_context as _ckc, slot_session_context as _ssc
+        conv = str(_ssc.get() or "") or str(_ckc.get() or "")
+        if requester_is_member():
+            member = requester_member_id()
+            return f"member:{member}:{conv}" if member else ""
+        return conv
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _mood_remarked(conv_key: str, signature: str, req_id: str) -> bool:
+    """Was this same mood already heard by an EARLIER request of this conversation? Records this one."""
+    if not conv_key or not req_id:
+        return False
+    with _MOOD_MEMO_LOCK:
+        was = _MOOD_HEARD_BY_CONV.get(conv_key)
+        if was is not None and was[0] == signature:
+            _MOOD_HEARD_BY_CONV.move_to_end(conv_key)
+            return was[1] != req_id
+        _MOOD_HEARD_BY_CONV[conv_key] = (signature, req_id)
+        while len(_MOOD_HEARD_BY_CONV) > _MOOD_MEMO_MAX:
+            _MOOD_HEARD_BY_CONV.popitem(last=False)
+        return False
+
+
+def mood_tone_heard(req_id: str) -> Optional[Dict[str, Any]]:
+    """What the tone line of request ``req_id`` said (None = none was heard)."""
+    with _MOOD_MEMO_LOCK:
+        d = _MOOD_TONE_BY_REQ.get(str(req_id or ""))
+        return dict(d) if d else None
+
+
 def _mood_tone_block(context) -> str:
     """§4TC: the ONE line that makes the mood audible — a section of the
     per-turn state block, after the cached head; never the system slot, never
     a tool description. "" (zero bytes) for a neutral mood with no manner,
     and for a run that does not hear it. The text depends on the label, the
     intensity and the manner only (`selfhood.mood.tone_line`): no time, no
-    number of the pair, no cause."""
+    number of the pair, no cause.
+
+    §4TX: the mood a REPLY hears — no boredom (`for_reply`); a member or a
+    public channel hears it without the owner's own sentiment and is told it
+    is not about them (`audience`); a mood already heard by an earlier
+    request of the same conversation keeps its tint without a new remark
+    (`remarked`). What was heard is kept for the turn record."""
     try:
         if not mood_is_heard_on_this_request(context):
             return ""
         sm = _mood_model(context)
         if sm is None:
             return ""
-        line = sm.mood().tone()
+        audience = _mood_audience()
+        view = sm.mood(for_reply=True, audience=audience)
+        req_id = str(request_id_context.get() or "")
+        conv = _mood_conversation()
+        if view.neutral and not view.manner:
+            return ""
+        remarked = _mood_remarked(conv, view.signature(), req_id)
+        line = view.tone(remarked=remarked, audience=audience)
+        if isinstance(line, str) and line and req_id:
+            with _MOOD_MEMO_LOCK:
+                _MOOD_TONE_BY_REQ[req_id] = {
+                    "mood": view.describe(), "manner": (f"{view.manner}, {view.manner_intensity} of 3"
+                                                        if view.manner else ""),
+                    "remarked": remarked, "audience": audience}
+                _MOOD_TONE_BY_REQ.move_to_end(req_id)
+                while len(_MOOD_TONE_BY_REQ) > _MOOD_MEMO_MAX:
+                    _MOOD_TONE_BY_REQ.popitem(last=False)
         return (line + "\n\n") if isinstance(line, str) and line else ""
     except Exception:  # noqa: BLE001 — a state block never breaks a turn
         return ""
@@ -29501,55 +29723,47 @@ class GhostAgent:
                 #       (so `executed` / `executive` / `execution`
                 #       don't match `execute`), AND
                 #   (b) an explicit intent marker ("I'll", "let me",
-                #       "running", "calling", "using") sits within
-                #       ~12 words of the tool name — casual mention
-                #       ("execute is a common English verb") does
-                #       not have this pattern, a real tool-promise
-                #       ("Let me execute that now") does.
+                #       "running", "calling") sits at most 4 words
+                #       BEFORE the tool name in the same sentence;
+                #   (c) a one-word tool name (`run`, `portfolio` …)
+                #       is written as a tool (backticks / "… tool");
+                #   (d) the last sentence is not a question / offer.
+                # Details + incidents: `_filler_promised_tool`.
                 if clean_ui and not force_final_response and not is_final_generation:
                     tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
-                    clean_ui_lower = clean_ui.lower()
-                    # Intent markers the model uses when it actually
-                    # means to run a tool. Kept narrow on purpose —
-                    # over-broad markers (e.g. "will", "can") would
-                    # reintroduce false positives on prose.
-                    _intent_pattern = re.compile(
-                        r"\b(?:i['’]?ll|i\s+will|i\s+am\s+going\s+to|"
-                        r"let\s+me|let's|gonna|"
-                        r"now\s+(?:i['’]?m\s+)?(?:running|calling|using|executing|"
-                        r"invoking|firing)|"
-                        r"running|calling|invoking|firing\s+off|executing\s+(?:the|a))\b",
-                        re.IGNORECASE,
-                    )
-                    has_intent = bool(_intent_pattern.search(clean_ui_lower))
-
-                    mentioned_tools = []
-                    if has_intent:
-                        for t in tool_names:
-                            # Word-boundary match on both the raw
-                            # `tool_name` and the space-separated
-                            # form `tool name` so `file_system` is
-                            # caught in either shape without
-                            # matching `file` alone.
-                            pat_underscore = rf"\b{re.escape(t)}\b"
-                            pat_spaced = rf"\b{re.escape(t.replace('_', ' '))}\b"
-                            if re.search(pat_underscore, clean_ui_lower) or (
-                                "_" in t and re.search(pat_spaced, clean_ui_lower)
-                            ):
-                                mentioned_tools.append(t)
-
+                    # 11-09 req 8ecb1424: adjacency + tool-shaped one-word
+                    # names + offers exempt — see `_filler_promised_tool`.
                     # §4KW (review): never order a tool the requester lacks
                     # ("Output the XML <tool_call> immediately" for `browser`
                     # to a member, then the caveat told it to ignore browser)
                     if requester_is_member():
-                        mentioned_tools = [t for t in mentioned_tools if t in _MEMBER_ALLOWED_TOOLS]
-                    if mentioned_tools and not has_run_tools:
+                        tool_names = [t for t in tool_names if t in _MEMBER_ALLOWED_TOOLS]
+                    _promised = _filler_promised_tool(clean_ui, tool_names)
+                    mentioned_tools = [_promised] if _promised else []
+                    # ONCE per request (review): with no strike behind it,
+                    # a model that answers every alert with the same
+                    # promise would loop to the deadline. The marker is the
+                    # alert in this request's own messages — no state to
+                    # carry across the loop.
+                    # Only THIS request's rows (review r2): rows after the
+                    # marked request row (§4RZ `_request`); without the
+                    # mark, the whole list (fails safe: a missed nudge).
+                    _rows = [m for m in messages if isinstance(m, dict)]
+                    _req_i = max((i for i, m in enumerate(_rows)
+                                  if m.get("role") == "user" and m.get("_request")),
+                                 default=-1)
+                    _filler_nudged = any(
+                        str(m.get("content") or "").startswith(_FILLER_ALERT_HEAD)
+                        for m in _rows[_req_i + 1:]
+                        if m.get("role") == "user")
+                    if mentioned_tools and not has_run_tools and not _filler_nudged:
                         is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))
                         if not is_valid_final and len(clean_ui.split()) < 100:
                             pretty_log("Agent Parser", f"Caught conversational filler without XML ({mentioned_tools[0]}).", level="WARNING", icon=Icons.WARN)
                             messages.append(msg)
-                            messages.append({"role": "user", "content": f"SYSTEM ALERT: You provided conversational text mentioning the tool `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately."})
-                            execution_failure_count += 1
+                            messages.append({"role": "user", "content": f"{_FILLER_ALERT_HEAD} `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately."})
+                            # a nudge, not a strike (req 8ecb1424: two false
+                            # alarms booked two strikes on a chat turn)
                             return "continue"
 
                 # TRAILING-PROMISE GUARD (2026-07-14). The filler
@@ -30297,7 +30511,8 @@ class GhostAgent:
                 return
             sm = _mood_model(self.context)
             if sm is not None:
-                sm.owner_arrived()
+                sm.owner_arrived(request_id=str(request_id_context.get() or ""),
+                                 conversation=_mood_conversation())
         except Exception as e:  # noqa: BLE001 — the mood never breaks a request
             logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
 
@@ -30309,7 +30524,7 @@ class GhostAgent:
                 return
             sm = _mood_model(self.context)
             if sm is not None:
-                sm.note_owner_reaction(kind)
+                sm.note_owner_reaction(kind, request_id=str(request_id_context.get() or ""))
         except Exception as e:  # noqa: BLE001
             logger.debug("mood reaction skipped: %s: %s", type(e).__name__, e)
 
@@ -30383,7 +30598,6 @@ class GhostAgent:
         # a job resume (sched-/job-/sub-) every <15 min kept the agent
         # "busy" and silently starved every idle phase
         self._heartbeat()
-        self._mood_owner_arrived()                  # §4TC: an owner's request ends the quiet
         # §4MX r3 (after the role and origin are set): the owner's rule command ("learn this rule: …",
         # "show rule N", "forget rule N" — core/owner_rules.py) is carried out HERE, before the
         # model runs, not left to its choice of tool. Owner turns only (never a member, a channel
@@ -30426,6 +30640,8 @@ class GhostAgent:
         req_id = _active_turn.req_id
         if req_id != request_id_context.get():
             request_id_context.set(req_id)          # §4OG-4 (g): every contextvar reader sees the uniquified id (reader C M2)
+        # §4TX r4: after the id is final (the reaction ledger keys this message by it)
+        self._mood_owner_arrived()                  # §4TC: an owner's request ends the quiet
         # §4RZ: a hold the user sends after THIS moment withdraws this
         # request's yes — noted at REGISTRATION, before the turn lock, so a
         # hold sent while it waits counts (r4) and an old one does not (r5)
@@ -30858,13 +31074,32 @@ class GhostAgent:
                 # §4TC: thanks / praise in the owner's message lifts the mood
                 # a little — once per request (this block runs once), for a
                 # real owner request only (`mood_moves_on_this_request`).
+                _mood_praised = False
                 try:
                     from ..selfhood.mood import (KIND_PRAISE as _MOOD_KIND_PRAISE,
                                                  has_praise as _mood_has_praise)
                     if _mood_has_praise(last_user_content):
+                        _mood_praised = True
                         self._mood_owner_reaction(_MOOD_KIND_PRAISE)
                 except Exception as e:  # noqa: BLE001 — the mood never breaks a turn
                     logger.debug("mood praise skipped: %s: %s", type(e).__name__, e)
+
+                # §4TW: the owner's message is scored by the sentiment service in
+                # the background; a confident score is a small mood event (not
+                # when the praise above already counted it). Same owner-only
+                # predicate as the praise above.
+                try:
+                    from ..selfhood import sentiment as _sentiment
+                    if _sentiment.settings()[0] and mood_moves_on_this_request(self.context):
+                        _sm_sent = _mood_model(self.context)
+                        if _sm_sent is not None:
+                            from ..utils.logging import request_id_context as _rid_ctx, spawn_bg as _spawn_bg
+                            _spawn_bg(_sentiment.score_message(
+                                last_user_content, _sm_sent.root, request_id=str(_rid_ctx.get() or ""),
+                                tor_proxy=getattr(self.context, "tor_proxy", None),
+                                self_model=_sm_sent, praised=_mood_praised), name="sentiment")
+                except Exception as e:  # noqa: BLE001 — never breaks a turn
+                    logger.debug("sentiment scoring not started: %s: %s", type(e).__name__, e)
 
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the
@@ -36065,11 +36300,13 @@ class GhostAgent:
         call). And when the owner SET the mood or the manner in this turn,
         `owner_set` says so: his word holds for the turn."""
         from ..selfhood.mood import TurnSignals
-        from ..tools.introspect import is_write_call as _is_mood_write
+        from ..tools.introspect import NO_CHANGE_NOTES as _no_change, is_write_call as _is_mood_write
         from .link_grounding import fetched_urls
         turn = list(msgs or [])[self._this_turn_boundary(msgs, real_request) + 1:]
         owner_set = any(c.name == "introspect" and _is_mood_write(c.arguments)
                         and c.result and not c.error
+                        # §4TX r4/r6: a call that changed nothing (its notes come last) is not his word
+                        and not str(c.result).startswith(_no_change)
                         for c in self._reconstruct_tool_calls(turn))
         seen = [m for m in turn if not _mood_blind_row(m)]
         calls = [c for c in self._reconstruct_tool_calls(seen) if (c.result or c.error)]
@@ -36078,9 +36315,13 @@ class GhostAgent:
             sources = len(fetched_urls(rows))
         except Exception:  # noqa: BLE001
             sources = 0
+        failed = [c for c in calls if c.error]
+        excused = sum(1 for c in failed if mood_excuses_failure(c.result or c.error))
         return TurnSignals(
             tool_calls=len(calls),
-            failures=sum(1 for c in calls if c.error),
+            failures=len(failed) - excused,
+            excused=excused,
+            tasks_done=sum(mood_tasks_done(c) for c in calls),
             guards=len(guard_events_for(self.context, req_id)),
             sources=sources,
             duration_s=float(duration_s or 0.0),
@@ -36652,6 +36893,10 @@ class GhostAgent:
         _lbr = loop_breaker_for(self.context, req_id)
         if _lbr:
             _extra["loop_breaker"] = _lbr
+        # §4TX: the mood the reply was told to sound like (label, manner, remarked, audience — never the pair)
+        _heard = mood_tone_heard(req_id or "")
+        if _heard:
+            _extra["mood_tone"] = _heard
         # §4OG-2 (b): the DELIVERABLE decides before any shape rule — a green
         # last run, or a file this turn wrote that the reply hands over
         try:
@@ -37033,7 +37278,8 @@ class GhostAgent:
                 if _sm_mood is not None:
                     # the owner was here — the next quiet is measured from
                     # the end of this turn (a turn that was cut included)
-                    _sm_mood.owner_turn_ended()
+                    _sm_mood.owner_turn_ended(request_id=str(req_id or ""),
+                                              conversation=_mood_conversation())
                     if not aborted:
                         # See the docstring: None = in-semaphore caller, read
                         # live; the SSE drain passes its semaphore-time snapshot.

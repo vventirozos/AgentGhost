@@ -2741,6 +2741,16 @@ edit, a cancel and a crash mid-request, a caller inside its own <code>except</co
 </ul>
 <p>Pins: <code>tests/test_4po_trailing_promise.py</code>; battery <code>scripts/mutate_4po.py</code>. The two sites behind the verifier repair and the forced-final fallback are not reachable from the test harness; they were checked by a reviewer reading the code.</p>
 
+<h2 id="4ty">§4TY (2026-11-09): a chat reply that names a tool is not a promise</h2>
+<p>A guard catches replies that say they will use a tool but contain no tool call ("I will use the execute tool."), and sends the model back to make the call. It used to fire when an intent word ("I'll", "let me", "running" &hellip;) appeared anywhere in the reply and any tool name appeared anywhere. Request 8ecb1424 ("it's still early, i got some time till i get to bed") was rejected twice, first for <code>run</code> and then for <code>portfolio</code>, because the reply offered "a news catch-up, a little portfolio curiosity". A 10&nbsp;s reply took 51&nbsp;s, the user saw it pulled back twice, and two strikes were booked. On 10-10 the same guard pushed "I don't have web_search on this channel" into a pointless vision call. It had fired 3 times in a month, all of them wrong.</p>
+<ul>
+  <li><strong>Next to each other:</strong> <code>_filler_promised_tool</code> fires only when the tool name starts within 4 words <em>after</em> an intent marker, in the same sentence ("let me run <code>web_search</code>").</li>
+  <li><strong>Written as a tool:</strong> a one-word tool name that is also an English word (<code>run</code>, <code>portfolio</code>, <code>jobs</code>, <code>browser</code>, <code>execute</code> &hellip;) counts only in backticks or followed by "tool". Underscored names count bare or with spaces (<code>web_search</code> / "web search").</li>
+  <li><strong>Offers are exempt:</strong> a reply whose last sentence is a question or an offer ("want me to &hellip;?", "whenever you're ready", "let me know") hands the choice to the user and promises nothing.</li>
+  <li><strong>A nudge, not a strike, once per request:</strong> a firing no longer adds to <code>execution_failure_count</code>. Because no strike stops it, it fires at most once per request: it is skipped when its own alert already appears after the request row (<code>_request</code>), so a model that repeats the promise ships on the second generation. "Not / never" right after the marker, and a clause ended by <code>:</code> <code>;</code> or a dash, are not promises; "let me know" is a sign-off, not an offer. For members, the check only considers tools the member may use.</li>
+</ul>
+<p>Pins: <code>tests/test_agent_fallback_mechanisms.py</code> (the incident shapes, real promises, the sentence boundary, and an end-to-end chat reply that ships on the first generation).</p>
+
 <h2 id="4pm">§4PM (2026-10-16): the census's other instruments</h2>
 <p>Still a measurement only: nothing here changes a reply. The §4PL census counted detectors. It could not say whether a task got done, it booked guard refusals as tool failures, and it could not see greetings or why a turn never arrived. These additions to <code>core/failure_census.py</code> fill those gaps.</p>
 <ul>

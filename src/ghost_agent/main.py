@@ -345,6 +345,9 @@ def parse_args():
     # §4SX Phase B: the labs host (disposable machines; interface/ghost-labs)
     parser.add_argument("--labs-host", default=os.getenv("GHOST_LABS_HOST", ""), help="host:port of the ghost-labs service (disposable machines for the `lab` tool). Unset = the tool is hidden. Env fallback: GHOST_LABS_HOST.")
     parser.add_argument("--labs-key-file", default=os.getenv("GHOST_LABS_KEY_FILE", "~/Data/AI/.ghost_labs_key"), help="file holding the labs API key (0600; never pass the key itself — args are recorded). Env fallback: GHOST_LABS_KEY_FILE.")
+    # §4TW: the sentiment service (interface/sentiment-service); a confident score is a small mood event
+    parser.add_argument("--sentiment-url", default=os.getenv("GHOST_SENTIMENT_URL", ""), help="http://host:port of the sentiment service, which scores the owner's English messages; a confident score nudges the mood a little. Unset = off. Env fallback: GHOST_SENTIMENT_URL.")
+    parser.add_argument("--sentiment-key-file", default=os.getenv("GHOST_SENTIMENT_KEY_FILE", "~/Data/AI/.sentiment_service_key"), help="file holding the sentiment service key (0600; never pass the key itself — args are recorded). Env fallback: GHOST_SENTIMENT_KEY_FILE.")
     parser.add_argument("--notify-webhook", default=os.getenv("GHOST_NOTIFY_WEBHOOK", ""), help="Outbound push-notification webhook URL — one JSON POST ({title, body, severity, phase, ts}) per notify-severity autonomous event (needs-user project tasks, scheduled-turn conclusions, ...). Loopback/LAN/Tailscale targets connect directly; PUBLIC targets are only ever reached through the Tor SOCKS proxy (fail-closed: skipped when Tor is unavailable). Env fallback: GHOST_NOTIFY_WEBHOOK.")
     parser.add_argument("--notify-ntfy", default=os.getenv("GHOST_NOTIFY_NTFY", ""), help="ntfy topic URL for outbound push (plain-text POST with Title/Priority headers), e.g. http://ghost.lan:8090/ghost-agent. Same egress rules as --notify-webhook. Env fallback: GHOST_NOTIFY_NTFY.")
     parser.add_argument("--no-redact-logs", action="store_true", default=False, help="Disable redaction of the monitored log stream. By default secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.")
@@ -394,6 +397,7 @@ def parse_args():
     if args.upstream_url:
         args.upstream_url = args.upstream_url.replace("http:://", "http://").replace("https:://", "https://")
     _export_labs_key_file(args)
+    _export_sentiment_settings(args)
     return args
 
 
@@ -404,6 +408,16 @@ def _export_labs_key_file(args) -> None:
     kf = getattr(args, "labs_key_file", "")
     if isinstance(kf, str) and kf.strip():
         os.environ["GHOST_LABS_KEY_FILE"] = os.path.expanduser(kf.strip())
+
+def _export_sentiment_settings(args) -> None:
+    """§4TW: `selfhood.sentiment` reads its settings from the environment, so the flags (which default to the
+    same variables) are written back there: a flag given on the command line wins, and every reader agrees."""
+    url = getattr(args, "sentiment_url", "")
+    if isinstance(url, str):
+        os.environ["GHOST_SENTIMENT_URL"] = url.strip()
+    kf = getattr(args, "sentiment_key_file", "")
+    if isinstance(kf, str) and kf.strip():
+        os.environ["GHOST_SENTIMENT_KEY_FILE"] = os.path.expanduser(kf.strip())
 
 #: Env var names whose VALUE is a secret. Matched case-insensitively on the
 #: substring, so a future `GHOST_SLACK_TOKEN` is covered without an edit.

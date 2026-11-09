@@ -550,6 +550,11 @@ async def test_task_update_marks_done(context):
     assert res["count"] == 1
     assert res["updated"][0]["status"] == "DONE"
     assert res["updated"][0]["result_summary"] == "shipped"
+    # §4TX: the tasks THIS call closed (the mood counts them); a re-close is not one
+    assert res["closed"] == [r["task_id"]]
+    again = _parse(await tool_manage_projects(
+        context, action="task_update", task_id=r["task_id"], status="DONE", result="shipped"))
+    assert again["updated"][0]["status"] == "DONE" and "closed" not in again
 
 
 async def test_task_update_rejects_bad_status(context):

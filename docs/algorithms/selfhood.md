@@ -10,6 +10,21 @@
 > had already labelled. See `docs/algorithms/selfhood.html`, section
 > "The diary follows the corpus".
 
+> **2026-11-09 §4TX (review of the whole mood and tone system).** Failures
+> weigh by the share of the turn's calls that failed; transient failures,
+> guards' refusals and failing test runs do not count; the clean reward grows
+> with the work and survives a long turn (calm, not bored); a finished
+> project task lifts it. Reactions to one reply (thumbs, correction, thanks,
+> the message's tone) are ONE verdict (the reaction ledger); a changed thumb
+> replaces the old one. A mood the owner sets is HELD until the next 04:00.
+> The tone line remarks on a mood once per conversation, says code and tool
+> arguments carry no tone, names the precedence and how to answer "why";
+> no reply hears boredom; members and public channels hear the mood without
+> the owner's own sentiment. Every event, applied or held, is a row of
+> `mood.events.jsonl`; manner changes are history rows; each turn record
+> carries the tone it was given. See `selfhood.html#ledger`, `#hold`,
+> `#tone-line`.
+
 > **Current state (2026-11-06, §4TC).** The mood is no longer a label
 > derived from verifier verdicts. It is two numbers — pleasantness and
 > energy, each in [-1, 1] — that halve every two hours and are moved by

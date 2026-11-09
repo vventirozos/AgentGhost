@@ -85,6 +85,13 @@ class Mood:
     intensity. It lasts until the end of the day it was set on, stepping
     down on the way (§4TS, read-time: ``mood.manner_level``).
 
+    §4TX: ``held_until`` — a mood the owner SET does not decay and is not
+    moved by events until then (the next 04:00, like a manner); ``owner_at``
+    — when the owner last set, reset or changed the manner (an event about a
+    message older than that is not applied); ``private_p`` / ``private_e`` —
+    the part of the pair the owner's own sentiment put there, which decays
+    with it and is left out of the mood other people hear.
+
     Before §4TC a mood was ``{"label", "evidence", "set_at", "source":
     "self"|"derived"}``. Such a record has no pair: ``SelfState.from_dict``
     ignores it and the mood starts neutral."""
@@ -102,6 +109,10 @@ class Mood:
     manner: str = ""
     manner_intensity: int = 0
     manner_set_at: str = ""
+    held_until: str = ""
+    owner_at: str = ""
+    private_p: float = 0.0
+    private_e: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Any) -> Optional["Mood"]:
@@ -145,6 +156,9 @@ class Mood:
             manner=manner,
             manner_intensity=(_level("manner_intensity") or 2) if manner else 0,
             manner_set_at=_text("manner_set_at", 40) if manner else "",
+            held_until=_text("held_until", 40) if d.get("source") == SOURCE_OWNER else "",
+            owner_at=_text("owner_at", 40),
+            private_p=clamp(d.get("private_p")), private_e=clamp(d.get("private_e")),
         )
 
 

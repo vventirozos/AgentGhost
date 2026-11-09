@@ -39,6 +39,12 @@ def _rows(s: SelfStateThread) -> list:
     return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
 
 
+def _unhold(s: SelfStateThread) -> SelfStateThread:
+    """§4TX: an owner-set mood is held until the day ends — drop the hold, to test what follows it."""
+    s.state.mood.held_until = ""
+    return s
+
+
 def _put(s: SelfStateThread, p: float, e: float, now=T0, cause="seed", kind=M.KIND_TURN, **kw):
     """Move a neutral mood to (p, e) through the one writer."""
     return s.nudge(p, e, cause, kind, now=now, **kw)
@@ -201,8 +207,9 @@ def test_the_tag_belongs_to_the_move_that_set_it(tmp_path):
               for i in (1, 2, 3)]
     assert "curious" not in labels and s.state.mood.novelty is False
     assert s.mood(now=_at(minutes=4)).label in ("content", "cheerful") and s.mood(now=_at(minutes=4)).intensity == 3
-    again = s.nudge(0.15, 0.20, "read 3 sources in a research turn", M.KIND_TURN, novelty=True, now=_at(minutes=5))[1]
-    assert again.label == "curious"                                   # a new research event tags again
+    # a new research event tags again — once the pair is back on the cheerful diagonal (§4TX)
+    again = s.nudge(0.15, 0.60, "read 3 sources in a research turn", M.KIND_TURN, novelty=True, now=_at(minutes=5))[1]
+    assert again.label == "curious"
     for kind, move in ((M.KIND_PRAISE, (0.10, 0.0)), (M.KIND_TURN, (0.08, 0.0))):
         t = SelfStateThread(tmp_path / kind)
         t.nudge(0.3, 0.3, "research", M.KIND_TURN, novelty=True, now=T0)
@@ -218,6 +225,7 @@ def test_the_owners_word_clears_an_old_tag_and_a_research_turn_after_it_may_tag(
     assert after.label == "cheerful" and s.state.mood.novelty is False
     assert SelfStateThread(tmp_path).mood(now=T0).label == "cheerful"                 # read off the stored pair
     assert json.loads(s.path.read_text())["mood"]["novelty"] is False
+    _unhold(s)                                                        # §4TX: past its hold
     _b, tagged = s.nudge(0.15, 0.20, "read 4 sources in a research turn", M.KIND_TURN, novelty=True, now=T0)
     assert tagged.label == "curious"                                  # an owner-set mood, then research
     _b, his = s.set_owner_mood("curious", M.ANCHOR_DIRECTION["curious"], 2, now=T0)
@@ -233,8 +241,9 @@ def test_a_novelty_event_that_leaves_the_mood_unpleasant_tags_nothing(tmp_path):
 
 
 @pytest.mark.parametrize("p,e,label", [
-    (0.03, 0.28, "curious"),          # pleasant by a little: the tag holds (untagged it reads "restless")
-    (0.28, 0.03, "curious"),          # … and so on the other side (untagged: "content")
+    (0.03, 0.28, "restless"),         # §4TX: only where the plain region is cheerful (was curious)
+    (0.28, 0.03, "content"),          # … and so on the other side (was curious)
+    (0.12, 0.28, "curious"),          # the diagonal: cheerful, tagged
     (0.30, 0.30, "curious"),
     (-0.03, 0.28, "restless"),        # trouble won the sign of P: no tag
     (0.0, 0.28, "restless"),
@@ -250,14 +259,15 @@ def test_the_tag_needs_both_numbers_positive(p, e, label):
 def test_a_research_turn_with_one_failure_is_still_curious_and_with_two_it_is_not(tmp_path):
     """Review: research plus ONE failed call read "restless" — the tag was
     lost because the pair left the diagonal. The precedence: trouble wins the
-    sign of P; the tag stays only while P ends positive."""
+    sign of P; the tag stays only while the plain region is cheerful (§4TX —
+    the failure weighs by its share, so one of five keeps the diagonal)."""
     one = SelfModel(root=tmp_path / "one")
     after = one.note_owner_turn(M.TurnSignals(tool_calls=5, failures=1, sources=4), now=T0)
-    assert (after.p, after.e) == (pytest.approx(0.03), pytest.approx(0.28))
+    assert (after.p, after.e) == (pytest.approx(0.102), pytest.approx(0.232))
     assert (after.label, after.intensity) == ("curious", 1)
     two = SelfModel(root=tmp_path / "two")
     after = two.note_owner_turn(M.TurnSignals(tool_calls=5, failures=2, sources=4), now=T0)
-    assert after.p == pytest.approx(-0.09) and (after.label, after.intensity) == ("restless", 1)
+    assert after.p == pytest.approx(-0.042) and (after.label, after.intensity) == ("restless", 1)
     assert two.state.state.mood.novelty is False
 
 
@@ -278,19 +288,35 @@ def test_a_plain_chat_turn_changes_nothing(tmp_path):
 
 
 def test_each_failed_call_lowers_pleasantness_and_raises_energy():
-    ev = _one(M.TurnSignals(tool_calls=5, failures=1))
+    ev = _one(M.TurnSignals(tool_calls=1, failures=1))
     assert (ev.dp, ev.de) == M.EV_TROUBLE == (-0.12, 0.08)
-    ev = _one(M.TurnSignals(tool_calls=5, failures=3))
+    assert ev.cause == "1 tool call failed in this turn"
+    ev = _one(M.TurnSignals(tool_calls=3, failures=3))
     assert (ev.dp, ev.de) == (pytest.approx(-0.36), pytest.approx(0.24))
     assert ev.cause == "3 tool calls failed in this turn" and ev.kind == M.KIND_TURN and not ev.novelty
+
+
+def test_failures_weigh_by_the_share_of_the_turns_calls_that_failed():
+    """§4TX (review 11-09): one failure among many calls is a small thing — each failure counts
+    min(1, max(0.25, 2 x share)) of a full one; the cause says of how many."""
+    assert M.TROUBLE_SHARE_FLOOR == 0.25
+    one_of_five = _one(M.TurnSignals(tool_calls=5, failures=1))
+    assert (one_of_five.dp, one_of_five.de) == (pytest.approx(-0.12 * 0.4), pytest.approx(0.08 * 0.4))
+    assert one_of_five.cause == "1 tool call failed (of 5) in this turn"
+    three_of_five = _one(M.TurnSignals(tool_calls=5, failures=3))           # share 0.6 → full weight
+    assert three_of_five.dp == pytest.approx(-0.36)
+    one_of_twenty = M.turn_events(M.TurnSignals(tool_calls=20, failures=1))[0]     # the floor
+    assert one_of_twenty.dp == pytest.approx(-0.12 * 0.25)
+    half = _one(M.TurnSignals(tool_calls=4, failures=2))
+    assert half.dp == pytest.approx(-0.24)
 
 
 def test_a_guard_event_counts_like_a_failure_and_is_named():
     ev = _one(M.TurnSignals(tool_calls=5, guards=1))
     assert (ev.dp, ev.de) == M.EV_TROUBLE and ev.cause == "a loop guard stepped in once in this turn"
-    ev = _one(M.TurnSignals(tool_calls=5, failures=1, guards=2))
+    ev = _one(M.TurnSignals(tool_calls=2, failures=1, guards=2))           # a guard counts in full
     assert (ev.dp, ev.de) == (pytest.approx(-0.36), pytest.approx(0.24))
-    assert ev.cause == "1 tool call failed and a loop guard stepped in 2 times in this turn"
+    assert ev.cause == "1 tool call failed (of 2) and a loop guard stepped in 2 times in this turn"
 
 
 def test_a_turn_that_ended_under_context_pressure_is_named_as_that():
@@ -298,7 +324,7 @@ def test_a_turn_that_ended_under_context_pressure_is_named_as_that():
     ev = _one(M.TurnSignals(tool_calls=2, pressure=True))
     assert (ev.dp, ev.de) == M.EV_TROUBLE
     assert ev.cause == "the context ran out of room (context pressure) in this turn" and "guard" not in ev.cause
-    ev = _one(M.TurnSignals(tool_calls=5, failures=2, guards=1, pressure=True))
+    ev = _one(M.TurnSignals(tool_calls=2, failures=2, guards=1, pressure=True))
     assert (ev.dp, ev.de) == (pytest.approx(-0.48), pytest.approx(0.32))
     assert ev.cause == ("2 tool calls failed and a loop guard stepped in once and the context ran out of room "
                         "(context pressure) in this turn")
@@ -317,20 +343,34 @@ def test_trouble_is_capped_per_turn():
     assert M.TROUBLE_CAP == 4
     capped = _one(M.TurnSignals(tool_calls=20, failures=9, guards=9, duration_s=10.0))
     assert (capped.dp, capped.de) == (pytest.approx(-0.48), pytest.approx(0.32))
-    assert capped.cause.startswith("9 tool calls failed and a loop guard stepped in 9 times")
+    assert capped.cause.startswith("9 tool calls failed (of 20) and a loop guard stepped in 9 times")
     at_cap = M.turn_events(M.TurnSignals(tool_calls=4, failures=4))[0]
     assert (at_cap.dp, at_cap.de) == (pytest.approx(capped.dp), pytest.approx(capped.de))
 
 
 def test_a_clean_multi_tool_turn_lifts_pleasantness_a_little():
     ev = _one(M.TurnSignals(tool_calls=3, duration_s=20.0))
-    assert (ev.dp, ev.de) == M.EV_CLEAN_TURN == (0.08, 0.0)
+    assert (ev.dp, ev.de) == (pytest.approx(0.10), 0.0) and M.EV_CLEAN_TURN[1] == 0.0
     assert ev.cause == "a turn of 3 tool calls went through without a failure"
     assert M.CLEAN_TURN_MIN_CALLS == 3
     assert M.turn_events(M.TurnSignals(tool_calls=2)) == []                         # too few calls
-    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, failures=1))] == [-0.12]      # one failed
+    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, failures=1))] == [pytest.approx(-0.048)]
     assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, guards=1))] == [-0.12]        # a guard
     assert M.turn_events(M.TurnSignals(tool_calls=5, completed=False)) == []        # it was cut off
+
+
+def test_the_clean_reward_grows_with_the_work_and_shrinks_with_the_failed_share():
+    """§4TX: 0.04 + 0.02 per call, at most 0.16, times (1 - failed share); none past 10 % failed."""
+    assert (M.CLEAN_TURN_BASE, M.CLEAN_TURN_PER_CALL, M.CLEAN_TURN_MAX, M.CLEAN_TURN_MAX_SHARE) == (
+        0.04, 0.02, 0.16, 0.10)
+    assert _one(M.TurnSignals(tool_calls=4)).dp == pytest.approx(0.12)
+    assert _one(M.TurnSignals(tool_calls=6)).dp == pytest.approx(0.16)
+    assert _one(M.TurnSignals(tool_calls=20)).dp == pytest.approx(0.16)
+    one_of_twenty = M.turn_events(M.TurnSignals(tool_calls=20, failures=1))
+    assert [e.dp for e in one_of_twenty] == [pytest.approx(-0.03), pytest.approx(0.16 * 0.95)]
+    assert one_of_twenty[1].cause == "a turn of 20 tool calls went through, 1 of them failed"
+    # 1 of 9 failed (11 %): past the share, no reward; the failure weighs the floor
+    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=9, failures=1))] == [pytest.approx(-0.03)]
 
 
 def test_a_research_turn_lifts_both_and_carries_the_novelty_tag():
@@ -341,32 +381,53 @@ def test_a_research_turn_lifts_both_and_carries_the_novelty_tag():
     assert M.turn_events(M.TurnSignals(tool_calls=2, sources=2)) == []
     # it does not need a clean turn
     kinds = [(e.dp, e.novelty) for e in M.turn_events(M.TurnSignals(tool_calls=6, failures=1, sources=5))]
-    assert kinds == [(-0.12, False), (0.15, True)]
+    assert kinds == [(pytest.approx(-0.12 * 2 / 6), False), (0.15, True)]
 
 
 def test_a_very_long_turn_lowers_energy_and_is_tired_not_bored(tmp_path):
     assert (M.LONG_TURN_S, M.LONG_TURN_CALLS) == (900.0, 25)
-    ev = _one(M.TurnSignals(tool_calls=2, duration_s=900.0))
+    # a long turn with nothing done in it (§4TX r2: 2 good calls make it a long CLEAN turn)
+    ev = _one(M.TurnSignals(tool_calls=0, duration_s=900.0))
     assert (ev.dp, ev.de) == M.EV_LONG_TURN == (-0.15, -0.30)
-    assert ev.cause == "a very long turn (15 min, 2 tool calls)"
-    by_calls = _one(M.TurnSignals(tool_calls=25, duration_s=60.0))
-    assert (by_calls.dp, by_calls.de) == M.EV_LONG_TURN
+    assert ev.cause == "a very long turn (15 min, 0 tool calls)"
     assert M.turn_events(M.TurnSignals(tool_calls=2, duration_s=899.0)) == []
-    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=24, duration_s=60.0))] == [0.08]
-    # a long turn is not also a "clean turn": alone it reads tired
+    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=24, duration_s=60.0))] == [pytest.approx(0.16)]
+    # a long turn with failures in it: a slog, tired
+    sm = SelfModel(root=tmp_path / "slog")
+    after = sm.note_owner_turn(M.TurnSignals(tool_calls=30, failures=6, duration_s=1200.0), now=T0)
+    assert (after.p, after.e) == (pytest.approx(-0.12 * 4 * 0.4 - 0.15), pytest.approx(0.08 * 4 * 0.4 - 0.30))
+    assert (after.label, after.intensity) == ("tired", 1)
+
+
+def test_a_long_clean_turn_costs_energy_only_and_keeps_the_full_reward(tmp_path):
+    """§4TX (review: four long successful research turns read "bored"): calm after good long work."""
+    assert M.EV_LONG_CLEAN_TURN == (0.0, -0.30)
+    evs = M.turn_events(M.TurnSignals(tool_calls=25, duration_s=60.0))
+    assert [(e.dp, e.de) for e in evs] == [(0.0, -0.30), (pytest.approx(0.16), 0.0)]
+    by_time = M.turn_events(M.TurnSignals(tool_calls=3, duration_s=1200.0))       # few calls, long: full reward
+    assert [(e.dp, e.de) for e in by_time] == [(0.0, -0.30), (pytest.approx(0.16), 0.0)]
     sm = SelfModel(root=tmp_path)
     after = sm.note_owner_turn(M.TurnSignals(tool_calls=30, duration_s=1200.0), now=T0)
-    assert (after.label, after.intensity) == ("tired", 1)
+    assert (after.label, after.intensity) == ("calm", 1)
 
 
 def test_one_turns_events_are_one_move_with_the_causes_joined(tmp_path):
     sm = SelfModel(root=tmp_path)
-    after = sm.note_owner_turn(M.TurnSignals(tool_calls=6, failures=2, sources=4), now=T0)
+    after = sm.note_owner_turn(M.TurnSignals(tool_calls=4, failures=2, sources=4), now=T0)
     assert (after.p, after.e) == (pytest.approx(-0.24 + 0.15), pytest.approx(0.16 + 0.20))
     rows = _rows(sm.state)
     assert len(rows) == 1 and rows[0]["kind"] == "turn"
-    assert rows[0]["cause"] == "2 tool calls failed in this turn; read 4 sources in a research turn"
+    assert rows[0]["cause"] == "2 tool calls failed (of 4) in this turn; read 4 sources in a research turn"
     assert M.merge_events([]) is None and M.merge_events([None]) is None
+
+
+def test_a_finished_project_task_is_its_own_event():
+    """§4TX: manage_projects closed a task DONE in the owner's turn — once per turn, whatever the count."""
+    assert M.EV_TASK_DONE == (0.15, 0.10)
+    evs = M.turn_events(M.TurnSignals(tool_calls=2, tasks_done=1))
+    assert [(e.dp, e.de, e.cause) for e in evs] == [(0.15, 0.10, "finished 1 project task")]
+    assert M.turn_events(M.TurnSignals(tool_calls=2, tasks_done=3))[0].cause == "finished 3 project tasks"
+    assert M.turn_events(M.TurnSignals(tool_calls=2, tasks_done=1, owner_set=True)) == []
 
 
 @pytest.mark.parametrize("sig", [
@@ -516,6 +577,7 @@ def test_a_real_mood_that_has_not_worn_off_is_not_replaced_by_boredom(tmp_path):
     owner = SelfStateThread(tmp_path / "owner")                        # the same for a mood the owner set
     owner.mark_owner_turn(now=T0)
     owner.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 3, now=_at(hours=5))
+    _unhold(owner)                                                     # §4TX: past its hold
     seen = [(owner.mood(now=_at(hours=h)).label, owner.mood(now=_at(hours=h)).source) for h in (7, 9, 12)]
     assert seen == [("cheerful", "owner"), ("cheerful", "owner"), ("bored", "auto")]
 
@@ -795,6 +857,7 @@ def test_a_settled_step_down_of_an_owner_set_mood_is_still_the_owners(tmp_path):
     """(A mutant the review found alive.) Stored, not only read."""
     s = SelfStateThread(tmp_path)
     s.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 3, now=T0)
+    _unhold(s)
     view = s.settle(now=_at(hours=2))
     assert (view.label, view.intensity, view.source) == ("cheerful", 2, "owner")
     assert json.loads(s.path.read_text())["mood"]["source"] == "owner"
@@ -947,8 +1010,11 @@ def test_todays_timeline_is_the_local_days_rows_with_their_local_time(tmp_path):
     s.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 2,
                      now=dt.datetime(2026, 11, 6, 10, 5, tzinfo=UTC))         # 12:05 local
     today = s.mood_timeline(now=dt.datetime(2026, 11, 6, 12, 0, tzinfo=UTC), tz=tz)
+    # §4TX: the irritable the owner set is held until the day's end (04:00 machine time), then wears off
+    end = M.parse_iso_utc(M.manner_ends_at("2026-11-05T22:10:00Z").strftime("%Y-%m-%dT%H:%M:%SZ"))
+    off = (end + dt.timedelta(seconds=M.decay_step_s(M.ANCHOR_MAGNITUDE[2], 0))).astimezone(tz)
     assert [(r["hhmm"], r["label"], r["intensity"]) for r in today] == [
-        ("00:10", "irritable", 2), ("03:58", "neutral", 0), ("12:05", "cheerful", 2)]
+        ("00:10", "irritable", 2), (off.strftime("%H:%M"), "neutral", 0), ("12:05", "cheerful", 2)]
     assert s.mood_timeline(now=dt.datetime(2026, 11, 8, 12, 0, tzinfo=UTC), tz=tz) == []
 
 
@@ -1094,10 +1160,53 @@ def test_setting_the_same_mood_again_adds_no_row_and_re_anchors_the_pair(tmp_pat
 def test_an_owner_set_mood_decays_and_reacts_like_any_mood(tmp_path):
     s = SelfStateThread(tmp_path)
     s.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 3, now=T0)
+    _unhold(s)
     assert s.mood(now=_at(hours=2)).intensity == 2 and s.mood(now=_at(hours=2)).source == "owner"
     assert s.mood(now=_at(hours=12)).neutral and s.mood(now=_at(hours=12)).source == "auto"
     _b, after = s.nudge(-1.6, 0.0, "4 tool calls failed in this turn", M.KIND_TURN, now=_at(minutes=1))
     assert (after.label, after.source) == ("irritable", "auto")
+
+
+def test_an_owner_set_mood_is_held_until_the_day_ends_then_decays(tmp_path):
+    """§4TX (review: "cheer up" faded in 41 minutes): no decay and no event while held; held until the
+    manner's day end; from there it decays as if it had been written then."""
+    s = SelfStateThread(tmp_path)
+    _b, set_ = s.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 3, now=T0)
+    end = M.manner_ends_at(s.state.mood.set_at)
+    assert set_.held_until and M.parse_iso_utc(set_.held_until) == end.replace(microsecond=0)
+    just_before = end - dt.timedelta(minutes=1)
+    held = s.mood(now=just_before)
+    assert (held.label, held.intensity, held.p, held.held_until) == ("cheerful", 3, 0.9, set_.held_until)
+    before, after = s.nudge(-1.6, 0.0, "4 tool calls failed in this turn", M.KIND_TURN, now=_at(hours=1))
+    assert after == before and s.state.mood.p == 0.9                         # an event is held, not applied
+    ev = s.mood_events()[-1]
+    assert ev["kind"] == M.KIND_TURN and ev["held"] == SelfStateThread.HELD_OWNER_HOLD and ev["dp"] == -1.6
+    after_end = s.mood(now=end + dt.timedelta(hours=2))
+    assert (after_end.label, after_end.intensity, after_end.held_until) == ("cheerful", 2, "")
+    _b, moved = s.nudge(-1.6, 0.0, "4 tool calls failed in this turn", M.KIND_TURN,
+                        now=end + dt.timedelta(minutes=1))
+    assert moved.label == "irritable"
+
+
+def test_neutral_lifts_the_hold_and_the_next_event_moves_the_mood(tmp_path):
+    s = SelfStateThread(tmp_path)
+    s.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 2, now=T0)
+    s.reset_mood(now=_at(minutes=1))
+    assert s.state.mood.held_until == "" and s.hold_reason(now=_at(minutes=2)) == ""
+    assert s.nudge(-0.5, 0.2, "trouble", M.KIND_TURN, now=_at(minutes=2))[1].label == "irritable"
+
+
+def test_an_event_about_a_message_older_than_the_owners_word_is_held(tmp_path):
+    """§4TX: a slow sentiment score of a message sent BEFORE "neutral" must not undo it."""
+    s = SelfStateThread(tmp_path)
+    s.reset_mood(now=_at(minutes=1))
+    _put(s, 0.5, 0.0, now=_at(minutes=2))                     # something to reset
+    s.reset_mood(now=_at(minutes=3))
+    assert s.hold_reason(now=_at(minutes=4), arrived="2026-11-06T09:02:30Z") == SelfStateThread.HELD_OWNER_LATER
+    before, after = s.nudge(0.5, 0.0, "upbeat", M.KIND_SENTIMENT, now=_at(minutes=4),
+                            arrived="2026-11-06T09:02:30Z")
+    assert after == before and after.neutral
+    assert s.hold_reason(now=_at(minutes=4), arrived="2026-11-06T09:03:30Z") == ""
 
 
 def test_the_owners_note_rides_the_row_not_the_cause(tmp_path):
@@ -1119,7 +1228,10 @@ def test_neutral_resets_the_pair_and_clears_the_manner(tmp_path):
     before, after = s.reset_mood(now=_at(minutes=5))
     assert (before.label, before.manner) == ("irritable", "sarcastic")
     assert after.neutral and (after.p, after.e, after.manner, after.manner_intensity) == (0.0, 0.0, "", 0)
-    assert [(r["label"], r["intensity"], r["kind"]) for r in _rows(s)][-1] == ("neutral", 0, "owner")
+    # §4TX: the cleared manner is said too, as its own row after the owner's "neutral"
+    assert [(r["label"], r["intensity"], r["kind"]) for r in _rows(s)][-2:] == [("neutral", 0, "owner"),
+                                                                                ("neutral", 0, "manner")]
+    assert _rows(s)[-1]["cause"] == "the owner cleared the manner (sarcastic) with neutral"
     assert SelfStateThread(tmp_path).mood(now=_at(minutes=6)) == after
 
 
@@ -1165,7 +1277,10 @@ def test_a_manner_leaves_the_mood_alone_and_ends_with_its_day(tmp_path):
     assert (after.manner, after.manner_intensity, after.manner_set_at) == ("dramatic", 3, "2026-11-06T09:01:00Z")
     month = s.mood(now=_at(hours=24 * 30))
     assert month.neutral and (month.manner, month.manner_intensity) == ("", 0)
-    assert len(_rows(s)) == 1                                          # a manner is not a mood row
+    # §4TX: a manner change is its own row (kind "manner"), the pair untouched
+    assert [(r["kind"], r["label"], r["cause"]) for r in _rows(s)] == [
+        ("owner", "content", "the owner said so (set_mood)"),
+        ("manner", "content", "the owner set the manner: dramatic, 3 of 3")]
 
 
 def test_clearing_the_manner_clears_only_the_manner(tmp_path):
@@ -1388,6 +1503,7 @@ def test_the_diarys_block_does_not_move_with_the_clock_or_with_a_boredom_level(t
     now = dt.datetime.now(UTC)
     s.mark_owner_turn(now=now)
     s.set_owner_mood("content", M.ANCHOR_DIRECTION["content"], 2, now=now)
+    _unhold(s)
     s.state.mood.updated_at = (now - dt.timedelta(hours=20)).replace(tzinfo=None).isoformat() + "Z"
     s.state.last_owner_turn_at = s.state.mood.updated_at
     first = n._format_state_block(s)

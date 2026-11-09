@@ -196,6 +196,8 @@
     <dd>The labs host (<code>host:port</code>, env <code>GHOST_LABS_HOST</code>) and the file holding its API key (env <code>GHOST_LABS_KEY_FILE</code>, default <code>~/Data/AI/.ghost_labs_key</code>, mode 0600). With both, the <code>lab</code> tool is available; without them it is hidden. See <a href="tools/labs.html">tools / labs</a>.</dd>
     <dt><code>GHOST_PORTFOLIO_URL</code>, <code>GHOST_PORTFOLIO_KEY_FILE</code></dt>
     <dd>The separate IBKR service (<code>http://host:port</code>) and the file holding its key (default <code>~/Data/AI/.ibkr_service_key</code>). Unset or empty hides the <code>portfolio</code> tool. See <a href="tools/portfolio.html">tools / portfolio.py</a>.</dd>
+    <dt>--sentiment-url<br>--sentiment-key-file</dt>
+    <dd>The separate sentiment service (<code>http://host:port</code>) and the file holding its key (default <code>~/Data/AI/.sentiment_service_key</code>). When both are set, each owner message is scored in the background and journalled, and a confident score nudges the mood a little (&sect;4TW). Env fallbacks <code>GHOST_SENTIMENT_URL</code> and <code>GHOST_SENTIMENT_KEY_FILE</code>; a flag wins. Unset or empty switches it off. See <a href="algorithms/selfhood.html#sentiment">selfhood: sentiment</a>.</dd>
 
     <dt>--notify-webhook<br>--notify-ntfy</dt>
     <dd>Where to push notifications when something needs you. A LAN or tailnet target is reached directly; a public one only over Tor, and skipped if Tor is down.</dd>

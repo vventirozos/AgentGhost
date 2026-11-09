@@ -29,7 +29,7 @@ from typing import Awaitable, Callable, List, Optional
 
 from .autobiographical import AutobiographicalMemory
 from .schema import Experience, _utcnow_iso
-from .mood import KIND_QUIET, KIND_QUIET_END
+from .mood import KIND_MANNER, KIND_QUIET, KIND_QUIET_END
 from .state import SelfStateThread
 
 logger = logging.getLogger("GhostSelfhood")
@@ -210,7 +210,7 @@ class NarrativeSummariser:
             return []
         try:
             return [row for row in (state.mood_timeline() or [])
-                    if row.get("kind") not in (KIND_QUIET, KIND_QUIET_END)]
+                    if row.get("kind") not in (KIND_QUIET, KIND_QUIET_END, KIND_MANNER)]
         except Exception:
             return []
 

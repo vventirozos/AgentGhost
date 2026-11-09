@@ -833,7 +833,8 @@ async def api_health(request: Request):
     # intensity 0–3, the manner the owner set, since when, and who set it
     # ("auto" | "owner"). A read — it never moves the mood. getattr-chained
     # so a mock or a boot without a self-model can never 500 the endpoint.
-    mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}
+    mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
+            "held_until": ""}
     try:
         _st = getattr(getattr(context, "self_model", None), "state", None)
         _read = getattr(_st, "mood", None)
@@ -846,9 +847,13 @@ async def api_health(request: Request):
             mood = {"label": (_label if _n else "neutral") or "neutral", "intensity": _n,
                     "manner": _manner if isinstance(_manner, str) else "",
                     "set_at": str(getattr(_m, "set_at", "") or "") if _n else "",
-                    "source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto"}
+                    "source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto",
+                    # §4TX: why, in the system's own words (never a message), and the owner's hold
+                    "cause": str(getattr(_m, "cause", "") or "")[:200] if _n else "",
+                    "held_until": str(getattr(_m, "held_until", "") or "") if _n else ""}
     except Exception:  # noqa: BLE001 — health must never raise
-        mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}
+        mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
+            "held_until": ""}
 
     # §4RQ: seconds the main slot is still kept for the conversation that last
     # used it (§4RP, GHOST_SLOT_KEEP_S); 0 when nothing owns it. Read by

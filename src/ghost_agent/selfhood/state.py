@@ -52,6 +52,11 @@ MOOD_HISTORY_FILENAME = "mood.history.jsonl"
 #: ``MOOD_HISTORY_KEEP_ROWS``.
 MOOD_HISTORY_MAX_ROWS = 1200
 MOOD_HISTORY_KEEP_ROWS = 1000
+#: §4TX: every event, applied or held, one row — what moved the pair and what was refused, not only the
+#: changes of label the history keeps (review: "why is it irritable" could not be answered from the files)
+MOOD_EVENTS_FILENAME = "mood.events.jsonl"
+MOOD_EVENTS_MAX_ROWS = 3000
+MOOD_EVENTS_KEEP_ROWS = 2500
 
 # Input caps for the texts a mood row carries.
 _MOOD_LABEL_MAX_CHARS = 64
@@ -119,6 +124,8 @@ class MoodView:
     cause: str = ""             # why it is what it is
     manner_set_at: str = ""
     recent: Tuple[Dict[str, str], ...] = ()   # the last events that moved it
+    #: §4TX: an owner-set mood is held (no decay, no event moves it) until this stamp; "" when not held
+    held_until: str = ""
     #: the manner's steps still ahead, ``(on-disk stamp, level from then)``,
     #: the last one the end of its day (§4TS); () with no manner
     manner_steps: Tuple[Tuple[str, int], ...] = ()
@@ -127,14 +134,34 @@ class MoodView:
     def neutral(self) -> bool:
         return self.intensity == 0
 
-    def tone(self) -> str:
+    def tone(self, *, remarked: bool = False, audience: str = "owner") -> str:
         """The one line a reply's prompt carries ("" when there is nothing
         to say)."""
-        return M.tone_line(self.label, self.intensity, self.manner, self.manner_intensity)
+        return M.tone_line(self.label, self.intensity, self.manner, self.manner_intensity,
+                           remarked=remarked, audience=audience)
+
+    @property
+    def held(self) -> bool:
+        return bool(self.held_until)
+
+    def signature(self) -> str:
+        """What a listener hears — the label, the level, the manner: the same
+        signature twice is the same tone line's mood (§4TX, one remark per
+        conversation)."""
+        return f"{self.label}:{self.intensity}:{self.manner}:{self.manner_intensity}"
 
     def describe(self) -> str:
         """"irritable, 2 of 3" / "neutral"."""
         return M.NEUTRAL if self.neutral else f"{self.label}, {self.intensity} of 3"
+
+
+def _toward_zero(v: float, share: float) -> float:
+    """``v`` without the part ``share`` put in it — only toward zero, never past it."""
+    if v > 0 and share > 0:
+        return max(0.0, v - share)
+    if v < 0 and share < 0:
+        return min(0.0, v - share)
+    return v
 
 
 class SelfStateThread:
@@ -148,8 +175,12 @@ class SelfStateThread:
         self.root = Path(root)
         self.path = self.root / STATE_FILENAME
         self.mood_history_path = self.root / MOOD_HISTORY_FILENAME
+        self.mood_events_path = self.root / MOOD_EVENTS_FILENAME
         self.enabled = bool(enabled)
         self._lock = threading.RLock()
+        #: §4TX review r3: moved only when the owner REPLACES the pair (a set mood, a "neutral" that
+        #: cleared one) — the reaction ledger's amounts belong to one pair (in memory, like the ledger)
+        self.pair_epoch = 0
         self._state: SelfState = self._read_or_empty()
         #: how long the owner has been quiet, in seconds (None = unknown) —
         #: attached by the process that owns the clock (``main.py``); this
@@ -260,7 +291,7 @@ class SelfStateThread:
         # an age that cannot be established is not "now": the pair is
         # worth nothing (a mood must never be presented as current on a
         # timestamp nobody can read)
-        age = M.age_seconds(stored.updated_at, now=now)
+        age = SelfStateThread._age(stored, now)
         if age is None:
             p = e = 0.0
         else:
@@ -268,6 +299,37 @@ class SelfStateThread:
         label, n, novelty = M.read_off(p, e, held_label=stored.label, held_intensity=stored.intensity,
                                        novelty=stored.novelty)
         return p, e, label, n, novelty
+
+    @staticmethod
+    def _held_until(stored: Optional[Mood], now: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+        """§4TX: the end of the owner's hold when it is still on at ``now``, else None."""
+        if stored is None or not stored.held_until:
+            return None
+        end = M.parse_iso_utc(stored.held_until)
+        return end if (end is not None and _aware(now) < end) else None
+
+    @staticmethod
+    def _age(stored: Mood, now: Optional[datetime.datetime]) -> Optional[float]:
+        """How long the stored pair has been decaying at ``now`` (None = unknown).
+        §4TX: no time at all while the owner's hold is on; after it, the time
+        since the hold ended (or since the pair was written, if later)."""
+        age = M.age_seconds(stored.updated_at, now=now)
+        if age is None or not stored.held_until:
+            return age
+        end = M.parse_iso_utc(stored.held_until)
+        if end is None:
+            return age
+        return min(age, max(0.0, (_aware(now) - end).total_seconds()))
+
+    @staticmethod
+    def _private_now(stored: Optional[Mood], now: Optional[datetime.datetime]) -> Tuple[float, float]:
+        """§4TX: the owner's-sentiment part of the pair at ``now`` — it decays with the pair."""
+        if stored is None or (not stored.private_p and not stored.private_e):
+            return 0.0, 0.0
+        age = SelfStateThread._age(stored, now)
+        if age is None:
+            return 0.0, 0.0
+        return M.decay(stored.private_p, age), M.decay(stored.private_e, age)
 
     @staticmethod
     def _wore_off_at(stored: Optional[Mood], n: int, now: Optional[datetime.datetime]) -> str:
@@ -279,6 +341,9 @@ class SelfStateThread:
             start = M.parse_iso_utc(stored.updated_at) if stored is not None else None
             if start is None:
                 return _iso(now)
+            held = M.parse_iso_utc(stored.held_until) if stored.held_until else None
+            if held is not None and held > start:
+                start = held                 # §4TX: it began to decay when the owner's hold ended
             end = _aware(now)
             at = start + datetime.timedelta(
                 seconds=M.decay_step_s(max(abs(stored.p), abs(stored.e)), n))
@@ -286,22 +351,53 @@ class SelfStateThread:
         except Exception:  # noqa: BLE001 — a stamp never costs the mood
             return _iso(now)
 
-    def mood(self, *, now: Optional[datetime.datetime] = None, quiet_s=None) -> MoodView:
+    def mood(self, *, now: Optional[datetime.datetime] = None, quiet_s=None,
+             for_reply: bool = False, audience: str = "owner") -> MoodView:
         """The mood NOW. A read never MOVES the mood, whoever asks: no event
         is applied and nothing of a boredom is stored. What a read can do,
         and only while it sees a boredom (``_note_bored``): settle a mood
         that wore off unseen — the stored pair is rewritten to its decayed
         value, the same value any reader computes from it, and the "it wore
         off" row is added — and add the journal row of a boredom level it is
-        the first to see (at most one per level per quiet)."""
+        the first to see (at most one per level per quiet).
+
+        §4TX: ``for_reply`` — the mood a reply's tone line is made of: no
+        boredom (a quiet is not something to take out on whoever writes
+        next; the face and introspect still show it). ``audience="others"``
+        — the mood a member or a public channel hears: the part the owner's
+        own sentiment put in the pair is left out, and so is the cause."""
         stored = self._state.mood
         p, e, label, n, _nov = self._evolve(stored, now)
+        held = self._held_until(stored, now)
         base = dict(
             p=round(p, 4), e=round(e, 4),
             recent=tuple(dict(r) for r in (stored.recent if stored is not None else ())),
+            held_until=(_iso(held) if held is not None else ""),
             **self._manner_now(stored, now),
         )
-        if n == 0:
+        if audience in ("others", "public") and stored is not None:
+            # review r2: the owner's share comes out only TOWARD zero (others never hear a mood the agent
+            # does not have, nor a stronger one), and others never get the cause or the recent events
+            pp, pe = self._private_now(stored, now)
+            q_p, q_e = _toward_zero(p, pp), _toward_zero(e, pe)
+            # review r3: with a share taken out, a fresh read — the owner's level, held by the margin, is
+            # not carried over to others
+            # review r6: ANY share — the owner's held level may exist only because of the owner's share (r4/r5 kept
+            # it for a small share, and others heard it rise while the mood decayed). Others may step down a
+            # little before the owner does; they never hear more than the owner does.
+            shared = bool(pp or pe)
+            o_label, o_n, _ = M.read_off(q_p, q_e, held_label=("" if shared else stored.label),
+                                         held_intensity=(0 if shared else stored.intensity),
+                                         novelty=stored.novelty)
+            base.update(p=round(q_p, 4), e=round(q_e, 4), recent=())
+            if o_n == 0:
+                return MoodView(**base)
+            same = (o_label, o_n) == (label, n) and not shared
+            # review r5: "since" is the owner's own moment when the owner's share was taken out — not shown then
+            return MoodView(label=o_label, intensity=o_n,
+                            source=(stored.source if same and o_label == stored.label else M.SOURCE_AUTO),
+                            set_at=(stored.set_at if same else ""), cause="", **base)
+        if n == 0 and not for_reply:
             # boredom: only over a NEUTRAL mood — a real mood that has not
             # worn off (the owner's included) is not replaced by it
             quiet = self._quiet(quiet_s, now)
@@ -357,7 +453,57 @@ class SelfStateThread:
         except Exception as e:
             logger.warning("mood history append failed: %s", e)
 
+    def _append_event_locked(self, *, kind: str, cause: str, dp: float, de: float, held: str = "",
+                             after: str = "", now: Optional[datetime.datetime] = None) -> None:
+        """§4TX: one row of ``mood.events.jsonl`` — every event, applied or
+        held (``held`` says why it was not applied). Never the words of a
+        message: the cause is the event's own sentence. Best-effort."""
+        if not self.enabled:
+            return
+        try:
+            self.mood_events_path.parent.mkdir(parents=True, exist_ok=True)
+            rec = {"at": _iso(now), "kind": str(kind or "")[:24],
+                   "dp": round(float(dp), 4), "de": round(float(de), 4),
+                   "cause": _cap_text(str(cause or ""), _MOOD_EVIDENCE_MAX_CHARS)}
+            if held:
+                rec["held"] = held
+            if after:
+                rec["after"] = after
+            with open_append(self.mood_events_path) as f:
+                f.write(json.dumps(rec, ensure_ascii=False))
+                f.write("\n")
+            self._compact_locked(self.mood_events_path, MOOD_EVENTS_MAX_ROWS, MOOD_EVENTS_KEEP_ROWS)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mood events append failed: %s", e)
+
+    def note_held(self, kind: str, cause: str, dp: float, de: float, why: str, *,
+                  now: Optional[datetime.datetime] = None) -> None:
+        """§4TX: an event that was not applied, with why — one events-log row."""
+        with self._lock:
+            self._append_event_locked(kind=kind, cause=cause, dp=dp, de=de, held=why, now=now)
+
+    def mood_events(self, *, limit: int = 50) -> List[Dict[str, object]]:
+        """The newest ``limit`` rows of ``mood.events.jsonl``, oldest first."""
+        if limit <= 0 or not self.mood_events_path.exists():
+            return []
+        out: List[Dict[str, object]] = []
+        try:
+            lines = self.mood_events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        for line in lines[-limit:]:
+            try:
+                d = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(d, dict) and "at" in d:
+                out.append(d)
+        return out
+
     def _maybe_compact_mood_history_locked(self) -> None:
+        self._compact_locked(self.mood_history_path, MOOD_HISTORY_MAX_ROWS, MOOD_HISTORY_KEEP_ROWS)
+
+    def _compact_locked(self, path: Path, max_rows: int, keep_rows: int) -> None:
         """Keep the newest ``MOOD_HISTORY_KEEP_ROWS`` rows once the journal
         holds more than ``MOOD_HISTORY_MAX_ROWS``. Caller holds the lock.
         Works on BYTES: a line that is not UTF-8 (a torn write, a hand edit)
@@ -365,18 +511,16 @@ class SelfStateThread:
         the cap off. Best-effort — a failed compaction never fails the mood
         write."""
         try:
-            with self.mood_history_path.open("rb") as f:
+            with path.open("rb") as f:
                 lines = f.readlines()
-            if len(lines) <= MOOD_HISTORY_MAX_ROWS:
+            if len(lines) <= max_rows:
                 return
-            tail = lines[-MOOD_HISTORY_KEEP_ROWS:]
-            tmp = self.mood_history_path.with_suffix(".jsonl.tmp")
+            tail = lines[-keep_rows:]
+            tmp = path.with_suffix(".jsonl.tmp")
             with tmp.open("wb") as f:
                 f.writelines(tail)
-            tmp.replace(self.mood_history_path)
-            logger.info(
-                "mood history compacted to newest %d records", len(tail),
-            )
+            tmp.replace(path)
+            logger.info("%s compacted to newest %d records", path.name, len(tail))
         except Exception as e:
             logger.warning("mood history compaction failed: %s", e)
 
@@ -471,7 +615,7 @@ class SelfStateThread:
         cur = Mood(
             p=p, e=e, updated_at=_iso(now), label=label, intensity=n, novelty=novelty,
             source=base.source, set_at=base.set_at, cause=base.cause,
-            recent=list(base.recent), **self._kept_manner(base, now),
+            recent=list(base.recent), **self._kept_manner(base, now), **self._kept_owner(stored, now),
         )
         if (label, n) == (base.label, base.intensity):
             return cur                       # nothing to write: decay is a function of time
@@ -513,10 +657,35 @@ class SelfStateThread:
             self._bored_seen = None
             self._flush()
 
+    #: why an event was not applied (§4TX)
+    HELD_OWNER_HOLD = "the owner set the mood (held until the day ends)"
+    HELD_OWNER_LATER = "the owner set the mood after the message"
+
+    def hold_reason(self, *, now: Optional[datetime.datetime] = None, arrived: str = "") -> str:
+        """§4TX: why an event would not be applied right now — "" when it
+        would be. The owner's hold is on; or the owner set, reset or changed
+        the manner after ``arrived`` (when the message the event is about came in)."""
+        stored = self._state.mood
+        if self._held_until(stored, now) is not None:
+            return self.HELD_OWNER_HOLD
+        if arrived and stored is not None and stored.owner_at:
+            a, o = M.parse_iso_utc(arrived), M.parse_iso_utc(stored.owner_at)
+            if a is not None and o is not None and o >= a:
+                return self.HELD_OWNER_LATER
+        return ""
+
     def nudge(self, dp: float, de: float, cause: str, kind: str, *, novelty: bool = False,
-              now: Optional[datetime.datetime] = None) -> Tuple[MoodView, MoodView]:
+              now: Optional[datetime.datetime] = None, arrived: str = "",
+              private_adjust: Optional[Tuple[float, float]] = None) -> Tuple[MoodView, MoodView]:
         """THE function every event goes through: move the pair by
-        ``(dp, de)``, clamp it, record it. Returns ``(before, after)``."""
+        ``(dp, de)``, clamp it, record it. Returns ``(before, after)``.
+        §4TX: an event is held — recorded in the events log, not applied —
+        while the owner's hold is on, or when it is about a message that
+        ``arrived`` before the owner last set the mood. ``private_adjust``: a
+        change to the owner's private sentiment share that comes with a
+        non-sentiment event (the reaction ledger: a stronger reaction to the
+        same reply replaced the message's sentiment). Returns the SAME view
+        twice when nothing was applied."""
         with self._lock:
             base = self._settle_locked(now)
             before = self._view_of(base, now)
@@ -526,8 +695,25 @@ class SelfStateThread:
                 return before, before
             if dp == 0.0 and de == 0.0:
                 return before, before
+            why = self.hold_reason(now=now, arrived=arrived)
+            if why:
+                self._append_event_locked(kind=kind, cause=cause, dp=dp, de=de, held=why, now=now)
+                return before, before
             at = _iso(now)
             p, e = M.clamp(base.p + dp), M.clamp(base.e + de)
+            owner = self._kept_owner(self._state.mood, now)
+            if private_adjust is not None:
+                ap_, ae_ = float(private_adjust[0]), float(private_adjust[1])
+                if kind == M.KIND_SENTIMENT:
+                    # review r4: only the part the clamp let through is the owner's share in the pair
+                    ap_ *= max(0.0, min(1.0, (p - base.p) / dp)) if dp else 0.0
+                    ae_ *= max(0.0, min(1.0, (e - base.e) / de)) if de else 0.0
+                owner.update(private_p=M.clamp(owner["private_p"] + ap_),
+                             private_e=M.clamp(owner["private_e"] + ae_))
+            elif kind == M.KIND_SENTIMENT:
+                # §4TX: the share the owner's sentiment put in — what was really added, after the clamp
+                owner.update(private_p=M.clamp(owner["private_p"] + (p - base.p)),
+                             private_e=M.clamp(owner["private_e"] + (e - base.e)))
             # the novelty tag belongs to the move that set it: a later event
             # that is not itself a research event clears it (review r2 —
             # research, then three thumbs, read "curious, 3 of 3: the owner
@@ -543,9 +729,10 @@ class SelfStateThread:
                 cause=(cause if changed else base.cause),
                 recent=(list(base.recent) + [{"at": at, "cause": cause, "kind": str(kind or "")}]
                         )[-MOOD_RECENT_CAUSES:],
-                **self._kept_manner(base, now),
+                **self._kept_manner(base, now), **owner,
             )
             self._store_locked(new)
+            self._append_event_locked(kind=kind, cause=cause, dp=dp, de=de, after=self._describe(new), now=now)
             if changed:
                 self._append_history_locked(new, str(kind or ""), prev=before.describe())
             return before, self._view_of(new, now)
@@ -565,6 +752,18 @@ class SelfStateThread:
         if M.manner_level(m.manner_intensity, m.manner_set_at, now=_aware(now)) == 0:
             return dict(manner="", manner_intensity=0, manner_set_at="")
         return dict(manner=m.manner, manner_intensity=m.manner_intensity, manner_set_at=m.manner_set_at)
+
+    @classmethod
+    def _kept_owner(cls, m: Optional[Mood], now: Optional[datetime.datetime]) -> Dict[str, object]:
+        """§4TX: the owner fields a WRITE carries over — the hold while it is
+        on, when the owner last spoke, and the sentiment share brought to
+        ``now`` (it decays with the pair, so it is stored decayed with it)."""
+        if m is None:
+            return dict(held_until="", owner_at="", private_p=0.0, private_e=0.0)
+        pp, pe = cls._private_now(m, now)
+        held = cls._held_until(m, now)
+        return dict(held_until=(m.held_until if held is not None else ""), owner_at=m.owner_at,
+                    private_p=round(pp, 4), private_e=round(pe, 4))
 
     @staticmethod
     def _manner_now(m: Optional[Mood], now: Optional[datetime.datetime]) -> Dict[str, object]:
@@ -590,14 +789,24 @@ class SelfStateThread:
             source=(m.source if m.intensity else M.SOURCE_AUTO), set_at=m.set_at,
             cause=(m.cause if m.intensity else ""),
             recent=tuple(dict(r) for r in m.recent),
+            held_until=(m.held_until if cls._held_until(m, now) is not None else ""),
             **cls._manner_now(m, now),
         )
 
     def set_owner_mood(self, label: str, direction: Tuple[float, float], intensity: int, *,
-                       note: str = "", now: Optional[datetime.datetime] = None,
-                       ) -> Tuple[MoodView, MoodView]:
+                       note: str = "", now: Optional[datetime.datetime] = None, hold: bool = True,
+                       hold_until: str = "", keep_share: bool = False) -> Tuple[MoodView, MoodView]:
         """The owner said how to be: put the pair on ``label``'s anchor at
-        ``intensity``. From there it decays and reacts like any mood.
+        ``intensity``. §4TX: it is HELD there — no decay, no event moves it —
+        until the end of the day (the next 04:00, ``mood.manner_ends_at``);
+        from then it decays and reacts like any mood. ``hold=False`` (a step
+        DOWN on a mood: "be less irritable"): set, not held — it decays and
+        reacts at once, as the mood it stepped down did. ``keep_share`` (a step
+        down — review r7: zeroing the owner's sentiment share let others hear a
+        mood only the owner's messages had made): the share is carried over in
+        proportion to the step. ``hold_until``: keep
+        this hold end (a step down on a held mood: review r4 — a new hold at
+        03:30 ran to the NEXT day's 04:00).
         Returns ``(before, after)``."""
         with self._lock:
             base = self._settle_locked(now)
@@ -613,18 +822,54 @@ class SelfStateThread:
                 recent=(list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}]
                         )[-MOOD_RECENT_CAUSES:],
                 **self._kept_manner(base, now),
+                held_until=((hold_until or self._hold_end(at)) if hold else ""), owner_at=at,
+                **self._share_after_step(base, p, e, now, keep_share),
             )
             self._store_locked(new)
+            self.pair_epoch += 1
+            self._append_event_locked(kind=M.KIND_OWNER, cause=OWNER_CAUSE, dp=p - base.p, de=e - base.e,
+                                      after=self._describe(new), now=now)
             if changed:
                 self._append_history_locked(new, M.KIND_OWNER,
                                             _cap_text(note, _MOOD_EVIDENCE_MAX_CHARS),
                                             prev=before.describe())
             return before, self._view_of(new, now)
 
+    @classmethod
+    def _share_after_step(cls, base: Mood, p: float, e: float, now, keep: bool) -> Dict[str, float]:
+        """§4TX r7: the owner's sentiment share after the owner put the pair on (p, e) — none for the owner's own word
+        (a set mood), the same PART of each axis for a step down (only where it lies on the pair's side)."""
+        if not keep:
+            return dict(private_p=0.0, private_e=0.0)
+        pp, pe = cls._private_now(base, now)
+
+        def _part(share: float, old: float, new: float) -> float:
+            if not share or not old or share * old <= 0 or old * new <= 0:
+                return 0.0
+            return max(-abs(new), min(abs(new), share * (new / old)))
+        return dict(private_p=round(_part(pp, base.p, p), 4), private_e=round(_part(pe, base.e, e), 4))
+
+    @staticmethod
+    def _hold_end(at: str) -> str:
+        """§4TX: when an owner-set mood stops being held — the manner's day end."""
+        try:
+            end = M.manner_ends_at(at)
+        except Exception:  # noqa: BLE001
+            end = None
+        return _iso(end) if end is not None else ""
+
+    def _manner_row_locked(self, base: Mood, cause: str, now: Optional[datetime.datetime]) -> None:
+        """§4TX: a manner change is a history row (kind "manner") — the pair as it stands, the change as cause."""
+        row = Mood(p=base.p, e=base.e, label=base.label, intensity=base.intensity,
+                   set_at=_iso(now), cause=cause)
+        self._append_history_locked(row, M.KIND_MANNER, prev=self._describe(base))
+        self._append_event_locked(kind=M.KIND_MANNER, cause=cause, dp=0.0, de=0.0, now=now)
+
     def reset_mood(self, *, note: str = "", now: Optional[datetime.datetime] = None,
-                   ) -> Tuple[MoodView, MoodView]:
+                   keep_manner: bool = False) -> Tuple[MoodView, MoodView]:
         """The owner said "neutral": the pair goes to 0, 0 AND the manner is
-        cleared. Returns ``(before, after)``."""
+        cleared. ``keep_manner`` (§4TX: a mood stepped down to nothing): the
+        manner stays as it is. Returns ``(before, after)``."""
         with self._lock:
             base = self._settle_locked(now)
             before = self._view_of(base, now)
@@ -635,13 +880,13 @@ class SelfStateThread:
             # expired manner or a pair decayed under the first threshold (it
             # never reaches exactly 0) is zeroed silently, with no "the owner
             # said so" event to show up later as a reason
-            visible = was_mood or bool(before.manner)
+            visible = was_mood or (bool(before.manner) and not keep_manner)
             # the STORED record, not ``base`` (round-2 review): ``base`` has
             # an expired manner already blanked, so testing it left that
             # manner on disk for a clock set back to revive
             stored = self._state.mood
             on_file = bool(stored is not None and stored.manner)
-            if not visible and not on_file and base.p == 0.0 and base.e == 0.0:
+            if not visible and (keep_manner or not on_file) and base.p == 0.0 and base.e == 0.0:
                 return before, before            # nothing on file to reset
             new = Mood(
                 p=0.0, e=0.0, updated_at=at, label=M.NEUTRAL, intensity=0, novelty=False,
@@ -649,12 +894,21 @@ class SelfStateThread:
                 cause=(OWNER_CAUSE if was_mood else base.cause),
                 recent=((list(base.recent) + [{"at": at, "cause": OWNER_CAUSE, "kind": M.KIND_OWNER}])
                         if visible else list(base.recent))[-MOOD_RECENT_CAUSES:],
+                owner_at=(at if visible else base.owner_at),
+                **(self._kept_manner(base, now) if keep_manner else {}),
             )
             self._store_locked(new)
+            self.pair_epoch += 1
+            if visible:
+                self._append_event_locked(kind=M.KIND_OWNER, cause=OWNER_CAUSE + ": neutral",
+                                          dp=-base.p, de=-base.e, after=M.NEUTRAL, now=now)
             if was_mood:
                 self._append_history_locked(new, M.KIND_OWNER,
                                             _cap_text(note, _MOOD_EVIDENCE_MAX_CHARS),
                                             prev=before.describe())
+            if before.manner and not keep_manner:
+                # §4TX: the manner it cleared is said too (review: it vanished without a line)
+                self._manner_row_locked(new, f"the owner cleared the manner ({before.manner}) with neutral", now)
             return before, self._view_of(new, now)
 
     def set_manner(self, manner: str, intensity: int, *,
@@ -670,6 +924,8 @@ class SelfStateThread:
             stored = self._state.mood
             if not man and not before.manner and not (stored is not None and stored.manner):
                 return before, before            # nothing set (an expired one on file is dropped below)
+            owner = self._kept_owner(stored, now)
+            owner["owner_at"] = _iso(now)
             new = Mood(
                 p=base.p, e=base.e, updated_at=base.updated_at or _iso(now), label=base.label,
                 intensity=base.intensity, novelty=base.novelty, source=base.source,
@@ -677,8 +933,13 @@ class SelfStateThread:
                 manner=man,
                 manner_intensity=(max(1, min(3, int(intensity))) if man else 0),
                 manner_set_at=(_iso(now) if man else ""),
+                **owner,
             )
             self._store_locked(new)
+            if man:
+                self._manner_row_locked(new, f"the owner set the manner: {man}, {new.manner_intensity} of 3", now)
+            elif before.manner:
+                self._manner_row_locked(new, f"the owner cleared the manner ({before.manner})", now)
             return before, self._view_of(new, now)
 
     def mood_history(self, *, limit: int = 20) -> List[Dict[str, object]]:

@@ -105,7 +105,9 @@ class TestDialects:
             assert line in body, line
 
     @pytest.mark.parametrize("form,anchor,needles", [
-        ("moodtesseract", "const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign)", ["gaitFlash"]),
+        # 2026-11-09: the hypercube kernel no longer flares (operator: steady);
+        # the tool flash is spoken by the shells' corner sparks
+        ("moodtesseract", "bp.sz = (corner ? 1.0 + 0.6 * gaitFlash : 0.8)", ["gaitFlash"]),
         ("tesseract-flow", "cube2Flow += (dtF / 60) * (0.020", ["gaitFlow"]),
     ])
     def test_each_branch_speaks_its_dialect(self, graph_nc, form, anchor, needles):
@@ -118,7 +120,7 @@ class TestDialects:
         i = graph_nc.index("const axis = DIAL.radialAxis;")
         body = graph_nc[i:i + 1400]
         assert "DIAL.read === 'contract' ? TUNE.radialRead * gait.read : 0" in body
-        assert "DIAL.tool === 'kick' ? TUNE.toolKick * toolFlash : 0" in body
+        assert "'kick'" not in body and "toolKick" not in body   # the dead kick dialect, removed 2026-11-09
         assert "DIAL.write === 'wave' ? gait.write : 0" in body
         assert "else if (axis === 'y') { p.y *= f; }" in body
         assert "let f = axis === 'none' ? 1.0 : radial;" in body

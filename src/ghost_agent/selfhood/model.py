@@ -14,9 +14,12 @@ the callers don't have to branch on availability.
 
 from __future__ import annotations
 
+import datetime
 import logging
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Optional
+from typing import Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
 from .autobiographical import (
     AutobiographicalMemory,
@@ -92,6 +95,25 @@ class SelfModel:
             self.autobio = None
             self.state = None
             self.narrative = None
+        # §4TX: the reaction ledger — what the owner's reactions to ONE reply have already done to the mood
+        self._ledger_lock = threading.Lock()
+        #: reply (request id) → {slot: (dp, de, at, pair epoch)} — the reactions standing for it
+        self._standing: "OrderedDict[str, Dict[str, Tuple[float, float, datetime.datetime, int]]]" = OrderedDict()
+        #: reply → what its reactions REALLY moved the pair by so far, and when, and under which word of the
+        #: owner (``(dp, de, at, owner_at)``) — it decays with the pair (review r2: a thumb changed after the
+        #: first one wore off overshot), and an owner's set or reset since makes it void
+        self._applied: Dict[str, Tuple[float, float, datetime.datetime, str]] = {}
+        #: reply → the part of ``_applied`` the owner's message sentiment put in (same shape): it is the
+        #: "private share" others do not hear, and it comes back out when a stronger reaction replaces it
+        self._private_booked: Dict[str, Tuple[float, float, datetime.datetime, str]] = {}
+        #: an owner message (its request id) → the reply it answers (the owner's previous request id)
+        self._answers: "OrderedDict[str, str]" = OrderedDict()
+        #: conversation → its last owner reply (review r2: one global "last reply" booked a Slack correction
+        #: against the last web reply); "" = a request with no conversation key
+        self._last_reply: "OrderedDict[str, str]" = OrderedDict()
+        #: conversation → the owner request still running in it (review r4: a message sent while the
+        #: previous turn was still running was booked against the reply before that one)
+        self._inflight: "OrderedDict[str, str]" = OrderedDict()
 
     # -----------------------------------------------------------------
     # The wake-up text (no longer spliced into any prompt — §4NM)
@@ -236,13 +258,14 @@ class SelfModel:
     # The mood (§4TC) — read, and the ONLY writers besides set_mood
     # -----------------------------------------------------------------
 
-    def mood(self, *, now=None, quiet_s=None) -> MoodView:
+    def mood(self, *, now=None, quiet_s=None, for_reply: bool = False, audience: str = "owner") -> MoodView:
         """The mood NOW (a pure read). A neutral view when selfhood is
-        disabled or the read fails — a reader never has to branch."""
+        disabled or the read fails — a reader never has to branch.
+        ``for_reply`` / ``audience``: the mood a reply hears (§4TX, ``SelfStateThread.mood``)."""
         if not self.enabled or self.state is None:
             return MoodView()
         try:
-            return self.state.mood(now=now, quiet_s=quiet_s)
+            return self.state.mood(now=now, quiet_s=quiet_s, for_reply=for_reply, audience=audience)
         except Exception as e:
             logger.debug("mood read skipped: %s: %s", type(e).__name__, e)
             return MoodView()
@@ -280,28 +303,209 @@ class SelfModel:
             return None
         return self._apply(ev, now=now)
 
-    def note_owner_reaction(self, kind: str, *, now=None) -> Optional[MoodView]:
-        """A thumbs-up / thumbs-down, a correction of the last reply, thanks
-        (``mood.KIND_*``). The caller decides that it was the OWNER's."""
-        return self._apply(M.reaction_event(str(kind or "")), now=now)
+    #: how many replies the ledger remembers (in memory: a restart forgets it, and a later reaction counts in full)
+    LEDGER_REPLIES = 200
+    #: why a reaction moved nothing
+    HELD_ALREADY_COUNTED = "already counted for this reply"
+    HELD_AT_LIMIT = "the mood is already at its limit"
 
-    def owner_arrived(self, *, now=None) -> None:
+    @property
+    def _last_reply_id(self) -> str:
+        """The last owner reply of any conversation (tests, diagnostics)."""
+        return next(reversed(self._last_reply.values()), "") if self._last_reply else ""
+
+    def _owner_word(self) -> int:
+        """Which pair the ledger's amounts belong to: ``SelfStateThread.pair_epoch``, moved only when the
+        owner REPLACES the pair (a set mood, a "neutral" that cleared one) — review r3: the manner moved the
+        old stamp too, and a thumb changed after "be terse" counted the old thumb twice."""
+        try:
+            return int(getattr(self.state, "pair_epoch", 0) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    @staticmethod
+    def _now_of(now) -> datetime.datetime:
+        if now is None:
+            return datetime.datetime.now(datetime.timezone.utc)
+        return now if now.tzinfo is not None else now.replace(tzinfo=datetime.timezone.utc)
+
+    @staticmethod
+    def _booked_now(entry, now: datetime.datetime, owner_word: int) -> Tuple[float, float]:
+        """A booked amount at ``now``: decayed with the pair; nothing once the owner set or reset the mood
+        after it was booked (the pair it was part of is gone)."""
+        if not entry or entry[3] != owner_word:
+            return 0.0, 0.0
+        elapsed = max(0.0, (now - entry[2]).total_seconds())
+        return M.decay(entry[0], elapsed), M.decay(entry[1], elapsed)
+
+    @classmethod
+    def _standing_now(cls, standing, now: datetime.datetime, owner_word: int) -> Dict[str, Tuple[float, float]]:
+        """The reactions standing for one reply, each decayed to ``now`` (review r3: a weaker reaction brought
+        a worn-off stronger one back at full strength); none from before the owner replaced the pair."""
+        out: Dict[str, Tuple[float, float]] = {}
+        for slot, entry in (standing or {}).items():
+            v = cls._booked_now(entry, now, owner_word)
+            if v[0] or v[1]:
+                out[slot] = v
+        return out
+
+    @staticmethod
+    def _sentiment_counts(standing: Dict[str, Tuple[float, float]]) -> bool:
+        """Is the message sentiment one of the two reactions ``_total`` keeps for this reply?"""
+        v = standing.get(M.KIND_SENTIMENT)
+        if not v or not v[0]:
+            return False
+        rest = [w[0] for k, w in standing.items() if k != M.KIND_SENTIMENT]
+        if v[0] > 0:
+            return all(v[0] >= w for w in rest if w > 0)
+        return all(v[0] <= w for w in rest if w < 0)
+
+    def note_owner_reaction(self, kind: str, *, now=None, request_id: str = "",
+                            reply_id: str = "") -> Optional[MoodView]:
+        """A thumbs-up / thumbs-down (``reply_id``: the reply it rates), a
+        correction of the last reply or thanks (``request_id``: the owner's
+        message that said it) — ``mood.KIND_*``. The caller decides that it
+        was the OWNER's. Through the reaction ledger (``_react``)."""
+        return self._react(M.reaction_event(str(kind or "")), now=now, request_id=request_id,
+                           reply_id=reply_id)[0]
+
+    def note_owner_sentiment(self, label: str, score: float, *, now=None, request_id: str = "",
+                             arrived: str = "") -> Tuple[Optional[MoodView], float, str]:
+        """§4TW: the tone of an owner's message (``mood.sentiment_event``). The caller decides that it was the
+        OWNER's message. ``(mood after or None, pleasantness applied, why none)`` — §4TX: through the reaction
+        ledger, and held (not applied) when the owner set the mood after the message ``arrived``."""
+        return self._react(M.sentiment_event(label, score), now=now, request_id=request_id, arrived=arrived)
+
+    def _target(self, request_id: str, reply_id: str) -> str:
+        if reply_id:
+            return str(reply_id)
+        if request_id:
+            return self._answers.get(str(request_id)) or ("msg:" + str(request_id))
+        return ""
+
+    @staticmethod
+    def _total(standing: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
+        """What the reactions to one reply are worth together: the strongest
+        pleasant one plus the strongest unpleasant one — a thumbs-down, the
+        correction that came with it and the unhappy tone of that message are
+        ONE verdict, the strongest of them; a thumb changed is replaced."""
+        ups = [v for v in standing.values() if v[0] > 0]
+        downs = [v for v in standing.values() if v[0] < 0]
+        up = max(ups, key=lambda v: v[0]) if ups else (0.0, 0.0)
+        down = min(downs, key=lambda v: v[0]) if downs else (0.0, 0.0)
+        return up[0] + down[0], up[1] + down[1]
+
+    def _react(self, ev: Optional["M.Event"], *, now=None, request_id: str = "", reply_id: str = "",
+               arrived: str = "") -> Tuple[Optional[MoodView], float, str]:
+        """§4TX (review: a thumbs-down, the correction and the unhappy tone of
+        the same message counted three times; toggling a thumb drifted the
+        mood down): an owner's reaction is booked against the REPLY it is
+        about. The mood moves by the difference its arrival makes to that
+        reply's total (``_total``), never by the reaction on its own."""
+        if ev is None or not self.enabled or self.state is None:
+            return None, 0.0, ""
+        try:
+            why = self.state.hold_reason(now=now, arrived=arrived)
+            if why:
+                self.state.nudge(ev.dp, ev.de, ev.cause, ev.kind, novelty=ev.novelty, now=now, arrived=arrived)
+                return None, 0.0, why
+            at = self._now_of(now)
+            with self._ledger_lock:
+                target = self._target(request_id, reply_id)
+                word = self._owner_word()
+                was = booked = (0.0, 0.0)
+                adjust: Optional[Tuple[float, float]] = None
+                private = (0.0, 0.0)
+                if not target:
+                    dp, de = ev.dp, ev.de
+                else:
+                    slot = "thumb" if ev.kind in (M.KIND_THUMB_UP, M.KIND_THUMB_DOWN) else ev.kind
+                    entries = dict(self._standing.get(target) or {})
+                    entries[slot] = (ev.dp, ev.de, at, word)
+                    standing = self._standing_now(entries, at, word)
+                    total = self._total(standing)
+                    was = self._booked_now(self._applied.get(target), at, word)
+                    dp, de = round(total[0] - was[0], 4), round(total[1] - was[1], 4)
+                    # the owner's own message tone is private while it is one of the two that count
+                    # (review r3: rebuilt on every reaction — a thumb changed back brings it back)
+                    if self._sentiment_counts(standing):
+                        private = standing[M.KIND_SENTIMENT]
+                    booked = self._booked_now(self._private_booked.get(target), at, word)
+                    adjust = (round(private[0] - booked[0], 4), round(private[1] - booked[1], 4))
+                    self._standing[target] = entries
+                    self._standing.move_to_end(target)
+                    while len(self._standing) > self.LEDGER_REPLIES:
+                        old, _ = self._standing.popitem(last=False)
+                        self._applied.pop(old, None)
+                        self._private_booked.pop(old, None)
+                if dp == 0.0 and de == 0.0:
+                    self.state.note_held(ev.kind, ev.cause, ev.dp, ev.de, self.HELD_ALREADY_COUNTED, now=now)
+                    return None, 0.0, self.HELD_ALREADY_COUNTED
+                before, after = self.state.nudge(dp, de, ev.cause, ev.kind, novelty=ev.novelty, now=now,
+                                                 arrived=arrived, private_adjust=adjust)
+                if after is before:
+                    # held after all (the owner set the mood in between): nothing booked
+                    return None, 0.0, (self.state.hold_reason(now=now, arrived=arrived)
+                                       or self.HELD_ALREADY_COUNTED)
+                ap, ae = round(after.p - before.p, 4), round(after.e - before.e, 4)
+                if ev.kind == M.KIND_SENTIMENT:
+                    # review r5/r6: book what the state really stored — the change scaled by what the clamp
+                    # let through, on top of what was booked
+                    rp = max(0.0, min(1.0, ap / dp)) if dp else 0.0
+                    re_ = max(0.0, min(1.0, ae / de)) if de else 0.0
+                    private = (booked[0] + (private[0] - booked[0]) * rp,
+                               booked[1] + (private[1] - booked[1]) * re_)
+                if target:
+                    # review r2: what REALLY moved (the clamp may have absorbed it), not the event's size
+                    self._applied[target] = (was[0] + ap, was[1] + ae, at, word)
+                    self._private_booked[target] = (private[0], private[1], at, word)
+                if ap == 0.0 and ae == 0.0:
+                    return after, 0.0, self.HELD_AT_LIMIT
+                return after, ap, ""
+        except Exception as e:
+            logger.debug("mood reaction skipped: %s: %s", type(e).__name__, e)
+            return None, 0.0, ""
+
+    def owner_arrived(self, *, now=None, request_id: str = "", conversation: str = "") -> None:
         """An owner's request has arrived. Writes down what time did to the
         mood, closes a boredom the journal holds ("the quiet ended"), and
         stamps the owner's presence in the state file. The caller decides
         that the request is the OWNER's. Never raises."""
         if not self.enabled or self.state is None:
             return
+        if request_id:
+            # §4TX: this message answers the owner's previous reply (the reaction ledger's key)
+            with self._ledger_lock:
+                key, rid = str(conversation or ""), str(request_id)
+                running = self._inflight.get(key)
+                self._answers[rid] = ((running if running and running != rid else "")
+                                      or self._last_reply.get(key) or ("msg:" + rid))
+                while len(self._answers) > self.LEDGER_REPLIES:
+                    self._answers.popitem(last=False)
+                self._inflight[key] = rid
+                self._inflight.move_to_end(key)
+                while len(self._inflight) > self.LEDGER_REPLIES:
+                    self._inflight.popitem(last=False)
         try:
             self.state.owner_arrived(now=now)
         except Exception as e:
             logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
 
-    def owner_turn_ended(self, *, now=None) -> None:
+    def owner_turn_ended(self, *, now=None, request_id: str = "", conversation: str = "") -> None:
         """An owner's turn has ended: the next quiet is measured from here
-        (persisted, so a restart does not change it). Never raises."""
+        (persisted, so a restart does not change it). ``request_id``: this
+        reply — the next owner message's reactions are about it. Never raises."""
         if not self.enabled or self.state is None:
             return
+        if request_id:
+            with self._ledger_lock:
+                key = str(conversation or "")
+                if self._inflight.get(key) == str(request_id):
+                    del self._inflight[key]
+                self._last_reply[key] = str(request_id)
+                self._last_reply.move_to_end(key)
+                while len(self._last_reply) > self.LEDGER_REPLIES:
+                    self._last_reply.popitem(last=False)
         try:
             self.state.mark_owner_turn(now=now)
         except Exception as e:
@@ -331,13 +535,15 @@ class SelfModel:
     # Introspection / debug
     # -----------------------------------------------------------------
 
-    def stats(self) -> dict:
+    def stats(self, *, audience: str = "owner") -> dict:
         """Cheap snapshot of what the selfhood module is holding —
         useful for the introspective_consistency / consciousness_probe
-        scripts and for log-line summaries."""
+        scripts and for log-line summaries. ``audience="public"`` (§4TX
+        review r3: introspect on a public surface): the mood without the
+        owner's own sentiment share, as the public reply hears it."""
         if not self.enabled:
             return {"enabled": False}
-        _mood = self.mood()
+        _mood = self.mood(audience=audience) if audience != "owner" else self.mood()
         return {
             "enabled": True,
             "root": str(self.root),

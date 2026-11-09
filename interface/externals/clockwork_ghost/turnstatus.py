@@ -86,6 +86,7 @@ ICON_CLASS = {
     "🔒": "accent",
     "📣": "accent",
     "🪞": "accent",
+    "💗": "accent",    # SENTIMENT (§4TW)
     "🎭": "accent",   # MIRROR (§4SV)
     "🎓": "accent",
     "👍": "accent",   # FEEDBACK_POS — human outcome label (/api/feedback)

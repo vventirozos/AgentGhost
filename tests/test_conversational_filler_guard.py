@@ -25,16 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_SRC = REPO_ROOT / "src" / "ghost_agent" / "core" / "agent.py"
 
 
-# Replica of the guard's matching predicate — kept in sync with the
-# source via the `test_source_matches_replica` guard below.
-INTENT_PATTERN = re.compile(
-    r"\b(?:i['’]?ll|i\s+will|i\s+am\s+going\s+to|"
-    r"let\s+me|let's|gonna|"
-    r"now\s+(?:i['’]?m\s+)?(?:running|calling|using|executing|"
-    r"invoking|firing)|"
-    r"running|calling|invoking|firing\s+off|executing\s+(?:the|a))\b",
-    re.IGNORECASE,
-)
+# §4TY (2026-11-09): the guard's predicate is the real helper — the old
+# replica (intent anywhere + tool name anywhere) drifted from nothing and
+# pinned the shape that rejected req 8ecb1424 twice.
+from ghost_agent.core.agent import _filler_promised_tool
 
 TOOL_NAMES = [
     "execute", "file_system", "knowledge_base", "forget",
@@ -44,20 +38,9 @@ TOOL_NAMES = [
 
 
 def matches_filler_guard(reply_text: str) -> list[str]:
-    """Return the list of tool names the guard would flag. Empty list
-    means the guard would NOT fire on this reply."""
-    clean = reply_text.lower()
-    if not INTENT_PATTERN.search(clean):
-        return []
-    hits = []
-    for t in TOOL_NAMES:
-        pat_underscore = rf"\b{re.escape(t)}\b"
-        pat_spaced = rf"\b{re.escape(t.replace('_', ' '))}\b"
-        if re.search(pat_underscore, clean) or (
-            "_" in t and re.search(pat_spaced, clean)
-        ):
-            hits.append(t)
-    return hits
+    """The tool the guard would flag, as a list; empty = it would not fire."""
+    hit = _filler_promised_tool(reply_text, TOOL_NAMES)
+    return [hit] if hit else []
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +108,11 @@ class TestGuardDoesNotFireOnCasualConversation:
 
 class TestGuardStillFiresOnRealForgetfulness:
     def test_ill_execute_without_tool_call(self):
-        reply = "I'll execute the script to check the output."
+        reply = "I'll `execute` the script to check the output."
         assert "execute" in matches_filler_guard(reply)
 
     def test_let_me_execute(self):
-        reply = "Let me execute that command now."
+        reply = "Let me use the execute tool for that command now."
         assert "execute" in matches_filler_guard(reply)
 
     def test_running_file_system_write(self):
@@ -147,7 +130,7 @@ class TestGuardStillFiresOnRealForgetfulness:
         assert "deep_research" in matches_filler_guard(reply)
 
     def test_now_im_calling_execute(self):
-        reply = "Now I'm calling execute with the rendered script."
+        reply = "Now I'm calling `execute` with the rendered script."
         assert "execute" in matches_filler_guard(reply)
 
 
@@ -157,16 +140,11 @@ class TestGuardStillFiresOnRealForgetfulness:
 
 
 class TestSourceWiring:
-    def test_source_has_intent_pattern(self):
-        src = AGENT_SRC.read_text()
-        # Distinguishing signatures of the new rule.
-        assert "_intent_pattern" in src
-        assert "has_intent" in src
-
-    def test_source_uses_word_boundary_tool_matching(self):
-        src = AGENT_SRC.read_text()
-        assert r"\b{re.escape(t)}\b" in src
-        assert r"\b{re.escape(t.replace('_', ' '))}\b" in src
+    def test_plain_english_verb_is_not_a_tool_promise(self):
+        """§4TY: a one-word tool name that is an English verb counts only
+        when written as a tool (backticks / "… tool")."""
+        assert matches_filler_guard("Let me execute that command now.") == []
+        assert matches_filler_guard("I'll forget about it, promise.") == []
 
     def test_source_no_longer_uses_raw_substring_match(self):
         """Regression guard: the old naive form was

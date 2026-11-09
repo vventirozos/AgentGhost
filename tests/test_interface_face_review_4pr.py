@@ -65,12 +65,13 @@ export class Vector3 {
   clone() { return new Vector3(this.x, this.y, this.z); }
   length() { return Math.hypot(this.x, this.y, this.z); }
   multiplyScalar(s) { this.x *= s; this.y *= s; this.z *= s; return this; }
+  applyMatrix4(m) { const e = m.elements, x = this.x, y = this.y, z = this.z; this.x = e[0] * x + e[4] * y + e[8] * z + e[12]; this.y = e[1] * x + e[5] * y + e[9] * z + e[13]; this.z = e[2] * x + e[6] * y + e[10] * z + e[14]; return this; }
   distanceToSquared(v) { const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z; return dx * dx + dy * dy + dz * dz; }
   lerpVectors(a, b, t) { this.x = a.x + (b.x - a.x) * t; this.y = a.y + (b.y - a.y) * t; this.z = a.z + (b.z - a.z) * t; return this; }
 }
 class Euler { constructor() { this.x = 0; this.y = 0; this.z = 0; } }
 export class Object3D {
-  constructor() { globalThis.__o3d++; this.position = new Vector3(); this.scale = new Vector3(1, 1, 1); this.rotation = new Euler(); this.matrix = { position: new Vector3(), scale: new Vector3(1, 1, 1) }; this.children = []; this.visible = true; }
+  constructor() { globalThis.__o3d++; this.position = new Vector3(); this.scale = new Vector3(1, 1, 1); this.rotation = new Euler(); this.matrix = { position: new Vector3(), scale: new Vector3(1, 1, 1) }; this.children = []; this.visible = true; this.up = new Vector3(0, 1, 0); this.matrixWorld = { elements: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }; }
   add(o) { this.children.push(o); }
   updateMatrix() { this.matrix.position.copy(this.position); this.matrix.scale.copy(this.scale); }
   lookAt(x, y, z) { this.lookTarget = new Vector3(x, y, z); }

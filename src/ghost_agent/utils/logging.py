@@ -977,6 +977,7 @@ class Icons:
     MEM_REINFORCE = "💪"  # an existing memory/skill strengthened or merged (NOT 🔄 RETRY)
     USER_ID      = "👤"
     SELF_STATE   = "🪞"   # selfhood state / mood transition
+    SENTIMENT    = "💗"   # §4TW: the sentiment service's rating of an owner message (shadow)
     MIRROR       = "🎭"   # §4SV: the Mirror — the daily I-sentence and the owner's `mirror` command
     DREAM        = "🌙"   # REM / dream consolidation cycle (NOT 💤 — that's SYSTEM_SHUT)
     SKIP         = "⏩"   # a step/cycle deliberately skipped

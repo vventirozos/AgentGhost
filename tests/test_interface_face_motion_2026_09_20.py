@@ -81,12 +81,13 @@ export class Vector3 {
   clone() { return new Vector3(this.x, this.y, this.z); }
   length() { return Math.hypot(this.x, this.y, this.z); }
   multiplyScalar(s) { this.x *= s; this.y *= s; this.z *= s; return this; }
+  applyMatrix4(m) { const e = m.elements, x = this.x, y = this.y, z = this.z; this.x = e[0] * x + e[4] * y + e[8] * z + e[12]; this.y = e[1] * x + e[5] * y + e[9] * z + e[13]; this.z = e[2] * x + e[6] * y + e[10] * z + e[14]; return this; }
   distanceToSquared(v) { const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z; return dx * dx + dy * dy + dz * dz; }
   lerpVectors(a, b, t) { this.x = a.x + (b.x - a.x) * t; this.y = a.y + (b.y - a.y) * t; this.z = a.z + (b.z - a.z) * t; return this; }
 }
 class Euler { constructor() { this.x = 0; this.y = 0; this.z = 0; } }
 export class Object3D {
-  constructor() { this.position = new Vector3(); this.scale = new Vector3(1, 1, 1); this.rotation = new Euler(); this.matrix = { position: new Vector3(), scale: new Vector3(1, 1, 1) }; this.children = []; this.visible = true; }
+  constructor() { this.position = new Vector3(); this.scale = new Vector3(1, 1, 1); this.rotation = new Euler(); this.matrix = { position: new Vector3(), scale: new Vector3(1, 1, 1) }; this.children = []; this.visible = true; this.up = new Vector3(0, 1, 0); this.matrixWorld = { elements: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }; }
   add(o) { this.children.push(o); }
   updateMatrix() { this.matrix.position.copy(this.position); this.matrix.scale.copy(this.scale); }
   lookAt(x, y, z) { this.lookTarget = new Vector3(x, y, z); }
@@ -240,9 +241,13 @@ import { face, tick, snapshot, emit } from './harness.mjs';
 tick(240);
 let prev = snapshot(); const d = [];
 for (let f = 0; f < 900; f++) { tick(1); const cur = snapshot();
-  d.push(Math.hypot(cur[240].x - prev[240].x, cur[240].y - prev[240].y, cur[240].z - prev[240].z)); prev = cur; }
-let jerk = 0; for (let i = 1; i < d.length; i++) jerk = Math.max(jerk, Math.abs(d[i] - d[i - 1]));
-emit({ form: face.getForm(), tailJerk: jerk });
+  // a visible step only: a stream grain that wraps rim → kernel does so while
+  // faded out (2026-11-09: the kernel's node count changed which grain is 240)
+  const vis = cur[240].s > 0.05 && prev[240].s > 0.05;
+  const step = Math.hypot(cur[240].x - prev[240].x, cur[240].y - prev[240].y, cur[240].z - prev[240].z);
+  d.push(vis && step < 0.5 ? step : null); prev = cur; }
+let jerk = 0, pairs = 0; for (let i = 1; i < d.length; i++) if (d[i] != null && d[i - 1] != null) { pairs++; jerk = Math.max(jerk, Math.abs(d[i] - d[i - 1])); }
+emit({ form: face.getForm(), tailJerk: jerk, pairs });
 """,
     "framerate": r"""
 import { face, tick, setHz, camera, scene, emit } from './harness.mjs';
@@ -346,9 +351,9 @@ def test_idle_is_pop_free_on_the_still_forms(lab):
     # frame at idle was an idle-twitch pop. Old lattice: ~9 per minute.
     r = _run(lab["new"], "spikes", "empty")
     assert r["idleSpikes"] == 0, r
-    # ...and the twitch fires on its documented 6–14s cadence (+ the ~0.8s
-    # chance gate): 3–9 per minute, never the ~30 the 0.03× slip produced.
-    assert 2 <= r["twitches"] <= 12, r
+    # The idle twitch itself was removed 2026-11-09 (its guard was always
+    # false on the tesseract, and the empty form draws nothing): none fires.
+    assert r["twitches"] == 0, r
 
 
 def test_descent_tail_glides(lab):
@@ -356,6 +361,7 @@ def test_descent_tail_glides(lab):
     # (the 20Hz sample shift); the bead's own rolling stays under 0.03.
     r = _run(lab["new"], "jerk", "descent")
     assert r["tailJerk"] < 0.04, r
+    assert r["pairs"] > 500, r       # measured on most of the 900 frames, not skipped
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -402,7 +408,8 @@ def test_cube2_infinite_cube_contract(lab):
     assert r["turnRate"] > 3 * r["idleRate"], r
     assert r["offRate"] < r["turnRate"], r
     # v3 (2026-09-21): 24 line-only shells × (72 edge + 72 ruling) segments + ≤184 ties + 54 kernel edges
-    assert 20 * 144 + 54 <= r["lines"] <= 24 * 144 + 23 * 8 + 54, r
+    # 2026-11-09: shells inside the hypercube are hidden (≥ 15 drawn), its 32 edges
+    assert 15 * 144 + 32 <= r["lines"] <= 24 * 144 + 23 * 8 + 32, r
     assert r["camZ"] == 5.0 and r["camMoved"] is False, r
 
 
@@ -410,7 +417,7 @@ def test_cube2_kernel_sits_on_the_view_axis(lab):
     r = _run(lab["new"], "focus", "moodtesseract")
     assert abs(r["sx"]) < 0.15 and abs(r["sy"]) < 0.15, r
     assert abs(r["camZ"] - 5.0) < 1e-9, r
-    assert r["lines"] >= 20 * 144 + 54, r
+    assert r["lines"] >= 15 * 144 + 32, r
 
 
 # ═══════════════════════════════════════════════════════════════════════════

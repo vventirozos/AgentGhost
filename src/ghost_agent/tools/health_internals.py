@@ -273,6 +273,12 @@ def _models(context, out: _Parts) -> None:
                 out.unchecked.append(f"model node {name} (no live test was run; last known: {reading})")
         return "; ".join(bits) or "no other model node configured"
     out.read("model nodes", _nodes)
+
+    def _sentiment():
+        # §4TW: the mood is secondary, so a paused service is said, never a problem. In-memory state only (no I/O)
+        from ..selfhood.sentiment import health_text
+        return health_text()
+    out.read("sentiment service", _sentiment)
     out.parts.append("(from my own recent calls; no live test was run)")
 
 

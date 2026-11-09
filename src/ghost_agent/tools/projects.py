@@ -4349,6 +4349,9 @@ async def tool_manage_projects(
             except Exception:
                 pass
             updated: List[Dict[str, Any]] = []
+            #: §4TX: the tasks THIS call closed DONE (a re-close of a task already DONE is not one) — the
+            #: mood's "finished a project task" counts these
+            closed_now: List[str] = []
             missing: List[str] = []
             result_only: List[str] = []
             gated: List[str] = []
@@ -4652,6 +4655,7 @@ async def tool_manage_projects(
                     # really closed, each gate it went over is in the ledger
                     # and the events (the owner reads both)
                     if st_enum == TaskStatus.DONE and _after == TaskStatus.DONE and not _done_before:
+                        closed_now.append(str(tid))
                         for _g, _why_w in (("model_run", _waive_note), ("postconditions", _post_waiver),
                                            ("constraints", _c_over if _c_over_used else "")):
                             if not _why_w:
@@ -4782,6 +4786,8 @@ async def tool_manage_projects(
                         misquoted_reasons.append(f"{_qt}: {_misq}")
             payload: Dict[str, Any] = {"updated": updated,
                                        "count": len(updated)}
+            if closed_now:
+                payload["closed"] = closed_now
             if missing:
                 payload["missing"] = missing
                 # Name the ids that DO exist (2026-08-01): a bare

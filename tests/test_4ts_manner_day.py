@@ -318,7 +318,7 @@ def test_the_evil_tone_line_says_it_is_a_voice_and_keeps_the_limits():
         assert "evil" in line and "theatrical villain's voice" in line
         assert "in the wording only" in line and "never at a person" in line
         assert "no insults or threats toward anyone" in line and "changes no answer and no refusal" in line
-        assert "the same facts" in line and "no refusing" in line
+        assert "the same facts" in line and "no refusal" in line
     assert "villain" not in M.tone_line("neutral", 0, "sarcastic", 2)       # the gloss is evil's only
 
 

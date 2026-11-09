@@ -42,7 +42,28 @@ from ghost_agent.selfhood import SelfModel
 from ghost_agent.selfhood import mood as MD
 from ghost_agent.tools import introspect as I
 from ghost_agent.tools import registry as R
-from ghost_agent.tools.introspect import tool_introspect
+from ghost_agent.tools.introspect import tool_introspect as _real_tool_introspect
+import re as _re
+
+#: §4TX: a set mood's reply names when its hold ends ("; it holds as set until Nov 10 04:00 (…)"), which
+#: depends on when the suite runs — the exact replies below are pinned without it (the hold is pinned in
+#: test_4tc_set_mood.py and test_4tc_mood_engine.py)
+_HOLD_RE = _re.compile(r"; it holds as set until [^()]*\(nothing moves it until then; 'neutral' takes it off\)")
+
+
+class _NoHold(str):
+    def __new__(cls, out):
+        obj = super().__new__(cls, _HOLD_RE.sub("", out))
+        obj._out = out
+        return obj
+
+    def __getattr__(self, name):
+        return getattr(self._out, name)
+
+
+async def tool_introspect(*a, **kw):
+    out = await _real_tool_introspect(*a, **kw)
+    return _NoHold(out) if isinstance(out, str) and _HOLD_RE.search(out) else out
 from ghost_agent.tools.outcome import OutcomeStatus
 from ghost_agent.utils import provenance as P
 from ghost_agent.utils.logging import (
@@ -191,7 +212,7 @@ async def test_a_missing_or_non_text_mood_is_an_argument_error_and_changes_nothi
     assert sm.state.path.read_bytes() == before
     m = sm.state.mood()
     assert (m.label, m.intensity, m.manner, m.source) == ("content", 2, "formal", "owner")
-    assert len(_history(sm)) == 1
+    assert [h["kind"] for h in _history(sm)] == ["owner", "manner"]          # §4TX: the manner is a row too
 
 
 async def test_a_non_text_evidence_is_dropped_not_stored_as_its_repr(tmp_path):
@@ -519,7 +540,7 @@ async def test_set_mood_runs_through_the_real_dispatch(mock_context, tmp_path):
     ts = _ts(tool_calls=[_tc(1, "introspect", {"action": "set_mood", "mood": "content", "evidence": "a quiet day"})])
     await agent._dispatch_and_process_tool_batch(ts)
     ran = [m for m in ts.tools_run_this_turn if not m.get("_synthetic")]
-    assert len(ran) == 1 and str(ran[0]["content"]) == "Mood set to 'content', 2 of 3 (a quiet day)."
+    assert len(ran) == 1 and _HOLD_RE.sub("", str(ran[0]["content"])) == "Mood set to 'content', 2 of 3 (a quiet day)."
     assert _lab(sm) == "content" and ts.execution_failure_count == 0
 
 
@@ -553,9 +574,9 @@ async def test_two_identical_reads_in_one_batch_still_collapse(mock_context, tmp
     n = []
     real = sm.stats
 
-    def spy():
+    def spy(**kw):
         n.append(1)
-        return real()
+        return real(**kw)
     sm.stats = spy
     agent = _real_agent(mock_context, sm)
     ts = _ts(tool_calls=[_tc(1, "introspect", {"action": "stats"}), _tc(2, "introspect", {"action": "stats"})])
@@ -732,10 +753,11 @@ def test_the_enum_and_the_tools_actions_agree():
 def test_the_fold_shrinks_what_the_model_is_shown():
     """Before §4TB: introspect 3,527 + self_state 1,922 characters of JSON,
     and the one definition left was 3,508. §4TC adds an action, two
-    parameters and the two closed lists within an allowance of 450: still
-    far under what the two tools took together."""
+    parameters and the two closed lists within an allowance of 450 (§4TX: 500 —
+    `manner_intensity` and `step`): still far under what the two tools took
+    together."""
     size = len(json.dumps(_defn("introspect")))
-    assert size <= 3508 + 450 < 3527 + 1922
+    assert size <= 3508 + 500 < 3527 + 1922
 
 
 def test_the_prompt_rule_names_the_write_and_no_removed_surface():

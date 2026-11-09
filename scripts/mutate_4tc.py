@@ -34,9 +34,10 @@ RT = "src/ghost_agent/api/routes.py"
 JS = "interface/static/matrix_graph.js"
 
 # anchors used by more than one mutant (each is ONE exact place in its file)
-_TAG = ('    if novelty and p > 0 and e > 0:\n'
+_TAG = ('    if novelty and p > 0 and e > 0 and region(p, e) == _CURIOUS_BASE:\n'
         '        return CURIOUS, n, True\n')
-_CLEAN = '    if (calls >= CLEAN_TURN_MIN_CALLS and trouble == 0 and bool(sig.completed)\n'
+_CLEAN = '    clean = guards == 0 and not pressure and bool(sig.completed) and share <= CLEAN_TURN_MAX_SHARE\n'
+_UNITS = '    units = min(float(TROUBLE_CAP), min(failures, TROUBLE_CAP) * weight + guards + pressure)\n'
 _ROW = ('            if changed:\n'
         '                self._append_history_locked(new, str(kind or ""), prev=before.describe())\n')
 _MOVES = ('        return (_rk() == "owner" and turn_origin(context) == "user"\n'
@@ -45,16 +46,18 @@ _HEARD = '        if kind in ("owner", "member", "probe", "job"):\n'
 _SCHED = '        return kind == "background" and str(request_id_context.get() or "").startswith("sched-")\n'
 _THUMB = ("                    if (not unchanged and is_owner_label_source(source)\n"
           "                            and turn_is_recent_enough(traj)):\n")
-_BORED_GATE = "        if n == 0:\n            # boredom: only over a NEUTRAL mood"
+_BORED_GATE = "        if n == 0 and not for_reply:\n            # boredom: only over a NEUTRAL mood"
 _QUIET_END = "            if was > 0:\n"
 _ARRIVED = ("            if not mood_moves_on_this_request(self.context):\n"
             "                return\n"
             "            sm = _mood_model(self.context)\n"
             "            if sm is not None:\n"
-            "                sm.owner_arrived()")
+            "                sm.owner_arrived(request_id=str(request_id_context.get() or \"\"),\n"
+            "                                 conversation=_mood_conversation())")
 _OWNERS = "            owners = mood_moves_on_this_request(context) is True\n"
 _VIEW = '        out.append(f"{indent}{head}: {label}, {n} of 3" + (f" — {cause}" if cause else ""))\n'
-_HEALTH = '    mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto"}\n    try:\n'
+_HEALTH = ('    mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",\n'
+           '            "held_until": ""}\n    try:\n')
 _SYS = '                stable_system_prompt = (base_prompt + stable_skill_instruction).replace("\\r", "")\n'
 
 MUT = [
@@ -81,14 +84,17 @@ MUT = [
     # (review 12) the tag: pleasant AND energetic — trouble wins the sign of P
     ("G6 curious-outside-its-region", MD, _TAG, '    if novelty:\n        return CURIOUS, n, True\n'),
     ("G7 novelty-never-tags", MD, _TAG, '    if False:\n        return CURIOUS, n, True\n'),
+    # G8: region(p, e) == cheerful already implies e > 0, so the energy test AND the region test go together
     ("G8 the-tag-survives-a-lost-energy", MD, _TAG, '    if novelty and p > 0:\n        return CURIOUS, n, True\n'),
-    ("G9 the-tag-needs-the-diagonal-again", MD, _TAG, '    if novelty and region(p, e) == _CURIOUS_BASE:\n        return CURIOUS, n, True\n'),
+    # G9 was "the-tag-needs-the-diagonal-again": §4TX made that the rule (only where the plain region is
+    # cheerful), so the mutant now drops it again — research at high energy with trouble (restless) reads curious
+    ("G9 the-tag-ignores-the-plain-region", MD, _TAG, '    if novelty and p > 0 and e > 0:\n        return CURIOUS, n, True\n'),
     # ── quiet → boredom ──
     # ── (review, MAJOR 2) quiet → boredom: read-time only ──
     ("B8 boredom-after-three-hours", MD, "BOREDOM_AFTER_S = 6 * 3600.0", "BOREDOM_AFTER_S = 3 * 3600.0"),
     ("B9 the-second-level-after-a-day", MD, "BOREDOM_DEEP_AFTER_S = 12 * 3600.0", "BOREDOM_DEEP_AFTER_S = 24 * 3600.0"),
     ("B10 boredom-never-reaches-two", MD, "    return 2 if q >= BOREDOM_DEEP_AFTER_S else 1", "    return 1"),
-    ("B11 boredom-replaces-a-live-mood", ST, _BORED_GATE, "        if True:\n            # boredom: only over a NEUTRAL mood"),
+    ("B11 boredom-replaces-a-live-mood", ST, _BORED_GATE, "        if not for_reply:\n            # boredom: only over a NEUTRAL mood"),
     ("B12 boredom-is-never-read", ST, _BORED_GATE, "        if False:\n            # boredom: only over a NEUTRAL mood"),
     ("B13 the-owner-is-answered-bored", ST, "        if _owner_is_asking():\n            return None", "        if False:\n            return None"),
     ("B14 the-process-clock-beats-the-stored-stamp", ST, "        if age is not None:\n            return age\n        fn = self._quiet_fn", "        if False:\n            return age\n        fn = self._quiet_fn"),
@@ -115,24 +121,34 @@ MUT = [
     ("B22 an-arrival-does-not-stamp-the-owner", ST,
      "                self._append_history_locked(row, M.KIND_QUIET_END, prev=f\"{M.BORED}, {was} of 3\")\n            self.mark_owner_turn(now=now)",
      "                self._append_history_locked(row, M.KIND_QUIET_END, prev=f\"{M.BORED}, {was} of 3\")"),
-    ("B23 the-end-of-an-owners-turn-is-not-stamped", AG, "                    _sm_mood.owner_turn_ended()\n", ""),
-    ("B24 anyones-arrival-ends-the-quiet", AG, _ARRIVED,
-     "            sm = _mood_model(self.context)\n            if sm is not None:\n                sm.owner_arrived()"),
+    ("B23 the-end-of-an-owners-turn-is-not-stamped", AG,
+     "                    _sm_mood.owner_turn_ended(request_id=str(req_id or \"\"),\n"
+     "                                              conversation=_mood_conversation())\n", ""),
+    ("B24 anyones-arrival-ends-the-quiet", AG, _ARRIVED, _ARRIVED.split("                return\n", 1)[1]),
     ("B25 the-arrival-is-never-noted", AG, "        self._mood_owner_arrived()                  # §4TC: an owner's request ends the quiet\n", ""),
     ("B26 a-thumb-row-hides-the-open-quiet", ST, "            if kind != M.KIND_QUIET:\n                continue", "            if kind != M.KIND_QUIET:\n                break"),
-    ("B27 the-diary-reads-the-boredom-rows", NA, "                    if row.get(\"kind\") not in (KIND_QUIET, KIND_QUIET_END)]", "                    if True]"),
+    # §4TX: the diary also leaves out the manner rows — the mutant lets only the boredom rows back in
+    ("B27 the-diary-reads-the-boredom-rows", NA,
+     "                    if row.get(\"kind\") not in (KIND_QUIET, KIND_QUIET_END, KIND_MANNER)]",
+     "                    if row.get(\"kind\") not in (KIND_MANNER,)]"),
     ("B28 the-diary-reads-the-mood-of-the-instant", NA, "        block = state.format_as_prefix(include_mood=False)", "        block = state.format_as_prefix(include_mood=True)"),
     # ── events: one owner turn ──
     ("E1 a-failure-lifts-the-pleasantness", MD, "EV_TROUBLE = (-0.12, +0.08)", "EV_TROUBLE = (+0.12, +0.08)"),
     ("E2 trouble-has-no-cap", MD, "TROUBLE_CAP = 4", "TROUBLE_CAP = 40"),
-    ("E3 a-guard-event-is-not-trouble", MD, "    trouble = failures + guards", "    trouble = failures"),
-    ("E4 a-turn-with-a-failure-is-a-clean-turn", MD, _CLEAN, "    if (calls >= CLEAN_TURN_MIN_CALLS and bool(sig.completed)\n"),
-    ("E5 a-turn-that-was-cut-is-a-clean-turn", MD, _CLEAN, "    if (calls >= CLEAN_TURN_MIN_CALLS and trouble == 0\n"),
-    ("E7 a-long-turn-is-also-a-clean-turn", MD, "            and not long_turn):", "            and True):"),
+    ("E3 a-guard-event-is-not-trouble", MD, _UNITS, _UNITS.replace(" + guards + pressure)", " + pressure)")),
+    # §4TX: a clean turn may have up to CLEAN_TURN_MAX_SHARE of its calls failed (both `clean` and
+    # `_clean_reward` read it); the mutant lets any share of failures through
+    ("E4 a-turn-with-a-failure-is-a-clean-turn", MD, "CLEAN_TURN_MAX_SHARE = 0.10", "CLEAN_TURN_MAX_SHARE = 1.0"),
+    ("E5 a-turn-that-was-cut-is-a-clean-turn", MD, _CLEAN, _CLEAN.replace(" and bool(sig.completed)", "")),
+    # §4TX: a long CLEAN turn now keeps its reward on purpose; the mutant makes EVERY long turn (failures, a
+    # cut, nothing but excused calls) a clean long one — full reward, energy-only cost
+    ("E7 a-long-turn-is-also-a-clean-turn", MD,
+     '    long_clean = clean and calls > 0 and calls >= max(0, int(getattr(sig, "excused", 0) or 0))\n',
+     "    long_clean = True\n"),
     ("E8 one-page-is-a-research-turn", MD, "RESEARCH_MIN_SOURCES = 3", "RESEARCH_MIN_SOURCES = 1"),
     ("E9 research-carries-no-novelty", MD, "KIND_TURN, novelty=True))", "KIND_TURN, novelty=False))"),
     ("E10 a-long-turn-raises-the-energy", MD, "EV_LONG_TURN = (-0.15, -0.30)", "EV_LONG_TURN = (-0.15, +0.30)"),
-    ("E12 the-call-count-does-not-make-a-turn-long", MD, "    long_turn = dur >= LONG_TURN_S or calls >= LONG_TURN_CALLS", "    long_turn = dur >= LONG_TURN_S"),
+    ("E12 the-call-count-does-not-make-a-turn-long", MD, "    long_turn = dur >= LONG_TURN_S or all_calls >= LONG_TURN_CALLS", "    long_turn = dur >= LONG_TURN_S"),
     # ── events: the owner's reactions ──
     ("E13 a-thumbs-up-lowers-it", MD, "EV_THUMB_UP = (+0.25, 0.0)", "EV_THUMB_UP = (-0.25, 0.0)"),
     # (review r2, 4) thumbs move the pleasantness only
@@ -150,11 +166,11 @@ MUT = [
     ("E27 a-question-is-praise", MD, "    if _is_question(t):\n        return False", "    if False:\n        return False"),
     ("E28 is-and-that-are-filler-again", MD, 'PRAISE_FILLER = frozenset({"ok", "okay", "ghost", "mate", "that\'s",', 'PRAISE_FILLER = frozenset({"is", "that", "ok", "okay", "ghost", "mate", "that\'s",'),
     ("E29 a-closing-quote-hides-the-question-mark", MD, "    for ch in reversed(text):", "    for ch in reversed(text[-1:]):"),
-    ("E30 cheers-is-no-thanks", MD, '{"thanks", "thx", "cheers", "great",', '{"thanks", "thx", "great",'),
+    ("E30 cheers-is-no-thanks", MD, '{"thanks", "thx", "ty", "cheers", "great",', '{"thanks", "thx", "ty", "great",'),
     ("E31 many-thanks-is-no-thanks", MD, '("many", "thanks"), ', ""),
     # (review 10) context pressure is named as that
     ("E24 context-pressure-is-called-a-loop-guard", MD, '            parts.append("the context ran out of room (context pressure)")', '            parts.append("a loop guard stepped in once")'),
-    ("E25 context-pressure-is-no-trouble", MD, "    trouble = failures + guards + pressure", "    trouble = failures + guards + 0 * pressure"),
+    ("E25 context-pressure-is-no-trouble", MD, _UNITS, _UNITS.replace(" + guards + pressure)", " + guards + 0 * pressure)")),
     # (review 8) what the mood does not look at; the owner's word holds for the turn
     ("E26 the-owners-word-does-not-hold-for-the-turn", MD, "    if bool(sig.owner_set):\n        return out", "    if False:\n        return out"),
     # ── who may move it ──
@@ -186,10 +202,10 @@ MUT = [
      "                return\n"
      "            sm = _mood_model(self.context)\n"
      "            if sm is not None:\n"
-     "                sm.note_owner_reaction(kind)",
+     "                sm.note_owner_reaction(kind, request_id=str(request_id_context.get() or \"\"))",
      "            sm = _mood_model(self.context)\n"
      "            if sm is not None:\n"
-     "                sm.note_owner_reaction(kind)"),
+     "                sm.note_owner_reaction(kind, request_id=str(request_id_context.get() or \"\"))"),
     ("W11 any-verdict-of-the-judge-is-a-correction", AG, "            if _contradicts is True:\n                from ..selfhood.mood import KIND_CORRECTION", "            if _contradicts is not None:\n                from ..selfhood.mood import KIND_CORRECTION"),
     ("W12 a-label-from-any-source-moves-the-mood", FB, _THUMB, "                    if (not unchanged\n                            and turn_is_recent_enough(traj)):\n"),
     ("W13 the-same-thumb-again-counts-again", FB, _THUMB, "                    if (is_owner_label_source(source)\n                            and turn_is_recent_enough(traj)):\n"),
@@ -212,31 +228,37 @@ MUT = [
     ("J3 the-owners-change-is-booked-as-automatic", ST, "                novelty=(label == M.CURIOUS), source=M.SOURCE_OWNER,", "                novelty=(label == M.CURIOUS), source=M.SOURCE_AUTO,"),
     ("J4 an-event-keeps-the-owners-name-on-a-new-mood", ST, "                source=(M.SOURCE_AUTO if changed else base.source),", "                source=base.source,"),
     ("J5 neutral-keeps-the-pair", ST, "                p=0.0, e=0.0, updated_at=at, label=M.NEUTRAL, intensity=0, novelty=False,", "                p=base.p, e=base.e, updated_at=at, label=M.NEUTRAL, intensity=0, novelty=False,"),
+    # J6 (repaired): "neutral" still clears the manner; only the §4TX step-down (keep_manner=True) keeps it
     ("J6 neutral-keeps-the-manner", ST,
-     "                        )[-MOOD_RECENT_CAUSES:],\n            )\n            self._store_locked(new)\n            if was_mood:",
-     "                        )[-MOOD_RECENT_CAUSES:],\n                manner=base.manner, manner_intensity=base.manner_intensity,\n"
-     "            )\n            self._store_locked(new)\n            if was_mood:"),
+     "                **(self._kept_manner(base, now) if keep_manner else {}),\n",
+     "                **self._kept_manner(base, now),\n"),
     ("J7 setting-a-manner-resets-the-mood", ST, "                p=base.p, e=base.e, updated_at=base.updated_at or _iso(now), label=base.label,", "                p=0.0, e=0.0, updated_at=base.updated_at or _iso(now), label=base.label,"),
     ("J8 the-journal-has-no-cap", ST, "MOOD_HISTORY_MAX_ROWS = 1200", "MOOD_HISTORY_MAX_ROWS = 120000"),
     ("J10 a-row-from-before-the-pair-is-read", ST, '            if not isinstance(d, dict) or "at" not in d or "p" not in d:', "            if not isinstance(d, dict):"),
     ("J11 an-old-stored-mood-is-loaded", SC, '        if not isinstance(d, dict) or "p" not in d or "e" not in d:', "        if not isinstance(d, dict):"),
     ("J13 the-diary-gets-no-timeline", NA, "            if steps:\n                block = (block", "            if False:\n                block = (block"),
     # (review 6) a byte that is not UTF-8
-    ("J14 a-bad-byte-costs-the-whole-journal", ST, 'read_text(encoding="utf-8", errors="replace").splitlines()', 'read_text(encoding="utf-8").splitlines()'),
-    ("J15 a-bad-byte-switches-the-cap-off", ST, '            with self.mood_history_path.open("rb") as f:\n                lines = f.readlines()', '            with self.mood_history_path.open("r", encoding="utf-8") as f:\n                lines = [ln.encode("utf-8") for ln in f.readlines()]'),
+    ("J14 a-bad-byte-costs-the-whole-journal", ST, 'self.mood_history_path.read_text(encoding="utf-8", errors="replace").splitlines()', 'self.mood_history_path.read_text(encoding="utf-8").splitlines()'),
+    # §4TX: the compaction is shared by the journal and the events log (`_compact_locked(path, …)`)
+    ("J15 a-bad-byte-switches-the-cap-off", ST, '            with path.open("rb") as f:\n                lines = f.readlines()', '            with path.open("r", encoding="utf-8") as f:\n                lines = [ln.encode("utf-8") for ln in f.readlines()]'),
     # (review r2, 5) the tag belongs to the move that set it; (7) lines that are no rows
     ("J18 the-tag-survives-a-later-event", ST, "                                       novelty=bool(novelty))\n            changed = (label, n) != (base.label, base.intensity)\n            cause = _cap_text", "                                       novelty=bool(base.novelty or novelty))\n            changed = (label, n) != (base.label, base.intensity)\n            cause = _cap_text"),
     ("J19 the-owners-word-keeps-an-old-tag", ST, "                novelty=(label == M.CURIOUS), source=M.SOURCE_OWNER,", "                novelty=(base.novelty or label == M.CURIOUS), source=M.SOURCE_OWNER,"),
     ("J20 a-json-line-that-is-no-object-is-read", ST, '            if not isinstance(d, dict) or "at" not in d or "p" not in d:', '            if "at" not in d or "p" not in d:'),
-    ("J21 a-line-nested-too-deep-breaks-the-reader", ST, "            except (ValueError, RecursionError):", "            except ValueError:"),
+    ("J21 a-line-nested-too-deep-breaks-the-reader", ST,
+     "            except (ValueError, RecursionError):\n                continue                       # not JSON",
+     "            except ValueError:\n                continue                       # not JSON"),
     # (review 11) mutants the review found alive
     ("J16 today-is-the-utc-day", ST, "        today = now.astimezone(tz).date()", "        today = now.date()"),
     ("J17 a-settled-step-down-loses-the-owner", ST, "        if not (base.source == M.SOURCE_OWNER and n and label == base.label):\n            cur.source = M.SOURCE_AUTO", "        if True:\n            cur.source = M.SOURCE_AUTO"),
     # ── the owner's word: set_mood ──
     ("S1 a-word-that-is-no-mood-is-stored", IT, "        if target is None:\n            return _unknown_mood(word)", '        if target is None:\n            target = ("content", _M.ANCHOR_DIRECTION["content"])'),
     ("S2 a-word-that-is-no-manner-is-let-through", IT, "        if not man:\n            return _unknown_manner(man_word)", "        if not man:\n            pass"),
-    ("S3 the-intensity-asked-for-is-ignored", IT, "            _before, after = state.set_owner_mood(label, direction, level, note=why)", "            _before, after = state.set_owner_mood(label, direction, 2, note=why)"),
-    ("S4 the-manner-ignores-the-intensity", IT, "            _before, after = state.set_manner(man, level)", "            _before, after = state.set_manner(man, 2)"),
+    ("S3 the-intensity-asked-for-is-ignored", IT,
+     "            _before, after = state.set_owner_mood(label, direction, level, note=why, hold=",
+     "            _before, after = state.set_owner_mood(label, direction, 2, note=why, hold="),
+    # §4TX: the manner has its own level now (`man_level`)
+    ("S4 the-manner-ignores-the-intensity", IT, "            _before, after = state.set_manner(man, man_level)", "            _before, after = state.set_manner(man, 2)"),
     ("S5 manner-none-takes-the-mood-off-too", IT, '            before, _after = state.set_manner("", 0)', "            before, _after = state.reset_mood()"),
     ("S6 an-intensity-three-anchor-reads-back-as-two", MD, "ANCHOR_MAGNITUDE = {1: 0.32, 2: 0.60, 3: 0.90}", "ANCHOR_MAGNITUDE = {1: 0.32, 2: 0.60, 3: 0.70}"),
     ("S7 grumpy-means-down", MD, '"grumpy": ("irritable", None)', '"grumpy": ("down", None)'),
@@ -261,22 +283,28 @@ MUT = [
     ("V12 a-stamp-from-another-day-shows-no-date", IT, '    return local.strftime("%H:%M") if local.date() == today else local.strftime("%b %d %H:%M")', '    return local.strftime("%H:%M")'),
     ("V13 the-story-of-a-boredom-lists-old-events", IT, "    elif view.label == _M.BORED and view.cause == _M.quiet_cause(view.intensity):", "    elif False:"),
     # (review r2, 6) on a public surface: no causes
-    ("V14 a-view-shows-the-cause-in-a-channel", IT, "        if cause and _reply_is_public():\n            cause = MOOD_REASONS_PRIVATE", "        if False:\n            cause = MOOD_REASONS_PRIVATE"),
+    ("V14 a-view-shows-the-cause-in-a-channel", IT, "        if _reply_is_public():\n            cause = MOOD_REASONS_PRIVATE         # the public view", "        if False:\n            cause = MOOD_REASONS_PRIVATE         # the public view"),
     ("V15 the-story-says-why-in-a-channel", IT, "    if public:\n        if not view.neutral:\n            lines.append(f\"Why: {MOOD_REASONS_PRIVATE}.\")", "    if False:\n        if not view.neutral:\n            lines.append(f\"Why: {MOOD_REASONS_PRIVATE}.\")"),
     ("V16 the-timeline-shows-its-causes-in-a-channel", IT, '    cause = str(row.get("cause") or "").strip() if notes else ""', '    cause = str(row.get("cause") or "").strip()'),
     ("V17 a-surface-that-cannot-be-read-is-private", IT, "    except Exception:  # noqa: BLE001\n        return True\n\n\ndef _mood_lines", "    except Exception:  # noqa: BLE001\n        return False\n\n\ndef _mood_lines"),
     ("V18 the-step-not-yet-written-shows-its-cause-in-a-channel", IT, '(f" — {view.cause}" if view.cause and not public else "")', '(f" — {view.cause}" if view.cause else "")'),
     ("V3 the-owners-note-is-shown-in-a-channel", IT, "        steps = [_mood_step(r, notes=not public) for r in shown]", "        steps = [_mood_step(r, notes=True) for r in shown]"),
     ("V5 the-view-line-drops-the-cause", IT, _VIEW, '        out.append(f"{indent}{head}: {label}, {n} of 3")\n'),
-    ("V7 health-names-any-source", RT, '"source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto"}', '"source": str(getattr(_m, "source", "") or "auto")}'),
+    ("V7 health-names-any-source", RT, '"source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto",', '"source": str(getattr(_m, "source", "") or "auto"),'),
     ("V8 health-has-no-mood-object-without-a-reading", RT, _HEALTH, "    mood = None\n    try:\n"),
     ("V10 the-face-cools-for-an-irritable-mood", JS, "        case 'irritable': return 0.045;", "        case 'irritable': return -0.045;"),
     # ── the tone line: its text ──
     ("L1 level-three-may-not-name-the-mood", MD, '    3: "At 3 it is strong, and you may say outright that you are in this mood.",', '    3: "At 3 it is strong throughout.",'),
-    ("L2 the-level-sentence-is-the-manners", MD, '                + LEVEL_SENTENCE[n] + " " + _LIMITS)', '                + MANNER_LEVEL_SENTENCE[mn] + " " + _LIMITS)'),
-    ("L3 the-limits-leave-out-completeness-and-refusing", MD, '"the same tool use, the same completeness, no refusing. "', '"the same tool use. "'),
-    ("L4 a-manner-alone-gives-no-line", MD, '    if man:\n        return (f"MANNER (set by the owner): {man}, {mn} of 3."', '    if False:\n        return (f"MANNER (set by the owner): {man}, {mn} of 3."'),
-    ("L5 the-manner-is-left-out-of-a-mood-line", MD, '                + (f" MANNER (set by the owner): {man}, {mn} of 3." if man else "")', '                + ""'),
+    # §4TX: the level sentence is picked into `level` (the remarked form after the first reply of a mood)
+    ("L2 the-level-sentence-is-the-manners", MD, '                + level + " " + why + " " + _LIMITS)', '                + MANNER_LEVEL_SENTENCE[mn] + " " + why + " " + _LIMITS)'),
+    ("L3 the-limits-leave-out-completeness-and-refusing", MD,
+     'the same facts, numbers, tool use and completeness, "\n'
+     '           "no new topics or asides; the mood changes no answer and no refusal. Code,',
+     'the same facts, numbers and tool use, "\n'
+     '           "no new topics or asides. Code,'),
+    # L4/L5 (repaired): the manner line gained its gloss (`{gloss}`) before §4TX; the behaviour is unchanged
+    ("L4 a-manner-alone-gives-no-line", MD, '    if man:\n        return (f"MANNER (set by the owner): {man}, {mn} of 3.{gloss}"', '    if False:\n        return (f"MANNER (set by the owner): {man}, {mn} of 3.{gloss}"'),
+    ("L5 the-manner-is-left-out-of-a-mood-line", MD, '                + (f" MANNER (set by the owner): {man}, {mn} of 3.{gloss}" if man else "")', '                + ""'),
     # ── the tone line: who hears it, and where it sits ──
     ("H1 no-reply-carries-the-line", AG, '                    _ds_parts.append(("mood_tone", _mood_tone_block(self.context)))        # §4TC\n', ""),
     ("H2 a-member-does-not-hear-it", AG, _HEARD, '        if kind in ("owner", "probe", "job"):\n'),

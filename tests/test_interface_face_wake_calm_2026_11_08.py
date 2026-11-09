@@ -165,7 +165,6 @@ def test_no_visual_reads_the_one_frame_tool_pulse():
     assert filecmp.cmp(hand, _STATIC / "matrix_graph.js", shallow=False), hand
     for needle in ("pulseT + 0.6 * toolFlash + 0.15 * c2n", "+ 0.20 * toolFlash + 0.25 * recallSpark",
                    "gaitFlash = DIAL.tool === 'flash' ? toolFlash : 0;",
-                   "TUNE.toolKick * toolFlash : 0",
                    "toolFlash += (toolPulse - toolFlash) * ease(TOOL_FLASH_RISE);"):
         assert needle in code, needle
 

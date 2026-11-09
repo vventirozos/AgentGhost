@@ -6,7 +6,9 @@ wheel "too colorful, attracts too much attention" and set the current
 direction — exactly two poles, dark ocean blue and dark arterial red,
 mutating into each other through dark violet bridges. The ring still has
 5 stops (the shader's palette() contract is unchanged) but every stop
-must live on the blue↔red axis: no greens, no yellows.
+must live on the blue↔red axis: no greens, no yellows. 2026-11-09: the
+operator added ONE dark green, at the rim (stop 0), and the ring became a
+clamped line (kernel red → purple → blue → green rim).
 
 These pins catch regressions that would quietly break the scheme:
 - the palette shrinking, brightening, or drifting off the thermal axis,
@@ -53,14 +55,29 @@ def test_palette_stays_dark(graph_js):
         assert max(channels) <= 0xD0, f"palette stop #{hexcode} too bright"
 
 
-def test_palette_stays_on_the_thermal_axis(graph_js):
-    # Two-pole scheme: every stop is a blue, a red, or a violet bridge —
-    # green must never be the dominant channel (that's the jewel wheel's
-    # teal/emerald sneaking back in).
+def test_palette_is_the_depth_scale(graph_js):
+    # 2026-11-09 (operator): red kernel → purple → blue → DARK GREEN rim.
+    # Exactly one green stop, the FIRST (the rim, nearest the camera); the
+    # rest stay on the thermal axis (green never dominant), so the jewel
+    # wheel's teal/emerald cannot creep into the middle of the scale.
     m = re.search(r"palette:\s*\[(.*?)\]", graph_js, re.DOTALL)
-    for hexcode in re.findall(r"#([0-9a-fA-F]{6})", m.group(1)):
-        r, g, b = (int(hexcode[i:i + 2], 16) for i in (0, 2, 4))
-        assert g < max(r, b), f"stop #{hexcode} has a dominant green channel"
+    stops = [tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+             for h in re.findall(r"#([0-9a-fA-F]{6})", m.group(1))]
+    r, g, b = stops[0]
+    assert g > max(r, b), "stop 0 (the rim) must be the green"
+    assert g <= 0x50, "the rim green must stay dark"
+    for r, g, b in stops[1:]:
+        assert g < max(r, b), "only the rim stop may be green"
+    blue, violet, red = stops[1], stops[2], stops[3]
+    assert blue[2] > blue[0] and red[0] > red[2] and violet[0] > blue[0] and violet[2] > red[2]
+
+
+def test_palette_clamps_instead_of_wrapping(graph_js):
+    # A wrapped ring would blend the red kernel straight into the green rim
+    # whenever the drift pushed it past the last stop (red↔green = mud).
+    i = graph_js.index("vec3 palette(float t)")
+    body = graph_js[i:i + 300]
+    assert "clamp(t, 0.0, 0.8)" in body and "fract(t)" not in body
 
 
 def test_hue_wave_travels_spatially(graph_js):

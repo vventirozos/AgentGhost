@@ -130,7 +130,7 @@ def test_the_member_gates_are_in_place():
              and "_user_asked_for_notification" in ast.unparse(n.test))
     assert "not requester_is_member()" in ast.unparse(n.test)
     # filler guard: a member's mentioned tools are filtered to its allowlist
-    assert "mentioned_tools = [t for t in mentioned_tools if t in _MEMBER_ALLOWED_TOOLS]" in src
+    assert "tool_names = [t for t in tool_names if t in _MEMBER_ALLOWED_TOOLS]" in src
 
 
 # ── (S5) the constraint extractor ────────────────────────────────────────────

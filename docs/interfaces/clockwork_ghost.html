@@ -188,7 +188,7 @@
   <p>
     The three QPainter faces below were <strong>removed</strong>. The handheld now runs the
     <em>same</em> <code>matrix_graph.js</code> the browser does (<code>webface.py</code> +
-    <code>webface/</code>), so it gets the thermal two-pole palette, every form the browser has
+    <code>webface/</code>), so it gets the same colours (red kernel to green rim since 2026-11-09, after a <code>deploy.sh</code>), every form the browser has
     (the mood tesseract, and the empty form when animations are off, since 2026-11-06), the immersion
     dive, pulses and error flinches — and future work on the web face lands here for free instead
     of the two drifting into forks. The Animations button turns them on and off, like the web UI's button. <code>client.py</code>'s <code>mood_loop</code> reads the agent's mood from <code>/api/health</code> every 25 s (<code>GHOST_MOOD_POLL_S</code>) and hands it to the face; a failed poll keeps the look it has.

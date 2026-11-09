@@ -18,7 +18,8 @@ uniforms and ``getDebugState().tesseract``:
                 breath clock, stronger on a user turn
   5 scan        the search gait's ring lights the LINES it crosses
                 (uLineSweep, reach 7 — the stack is deeper than 2.4)
-  6 kernel      a 3×3×3 lattice (2×2×2 mobile) with explicit edges, no
+  6 kernel      a 3×3×3 lattice (2×2×2 mobile) with explicit edges — a
+                4D HYPERCUBE since 2026-11-09 (16 vertices, 32 edges) — no
                 proximity tangle
   7 verdicts    pass: wobble collapses + twists unwind fast; refute: a
                 shudder on the wobble; stop: the shared exhale
@@ -69,9 +70,17 @@ const dT = face.getDebugState();
 const twAbs = dT.tesseract.tw.map(Math.abs);
 const uv = lines.geometry.attributes.aLightPass.array; const bases = new Set();
 for (let e = 0; e < 12; e++) bases.add(Math.round(uv[(e * 6) * 2] * 1000) / 1000);
+const kbT = face.getDebugState().tesseract.kernelBase;
+const cornerSizesBefore = snapshot().slice(0, kbT).map(p => p.s);
 face.noteToolCall(); tick(8);   // §4TQ: the flash rises over ~0.15 s (peak ~frame 8)
 const dTool = face.getDebugState();
-const cornerSizesTool = snapshot().slice(0, 8).map(p => p.s);
+// 2026-11-09: a shell still inside the hypercube is dimmed on purpose, so the
+// flash is read as growth of the SAME corners, not an absolute size.
+// the shells' corner nodes that are visible (a frame inside the kernel is hidden)
+const cornerSizesTool = snapshot().slice(0, kbT).map((p, k) => [p.s, cornerSizesBefore[k]])
+  // full-size corners only: the outermost frame is fading out at the edge (its
+// own taper shrinks it ~25 % in these 8 frames — measured 2026-11-09)
+  .filter(([a, b]) => b > 0.999).map(([a, b]) => a / b);
 tick(400);
 face.noteVerdict('pass'); tick(5); const wobPass = face.getDebugState().tesseract.wob;
 const pA = face.getDebugState().tesseract; tick(60); const pB = face.getDebugState().tesseract;
@@ -89,7 +98,7 @@ emit({ rest, idleP95: p95Of(idle), turnP95: p95Of(turn), turnMax: maxOf(turn),
        seedsTurnMax: Math.max(...dT.tesseract.seeds), seedsTurnMean: dT.tesseract.seeds.reduce((a, b) => a + b, 0) / dT.tesseract.seeds.length, edgePhaseBases: bases.size,
        flashTool: dTool.gaitFlash, cornerSizesTool, wobPass, twPassDecay: twB / Math.max(1e-9, twA), shudder,
        sweepOn, nan, wraps: turn.reduce((m, s) => m + s.wraps, 0), lines: lines.geometry.drawRange.count / 2, linesNow: { ...face.getDebugState().tesseract.lines },
-       kernelBase: d0.tesseract.kernelBase, shells: d0.tesseract.shells, kernelN: d0.tesseract.kernelN,
+       kernelBase: d0.tesseract.kernelBase, shells: d0.tesseract.shells, kernelVerts: d0.tesseract.kernelVerts, kernelEdges: d0.tesseract.kernelEdges,
        stream: d0.tesseract.stream, rollIdleRate: (face.getDebugState().tesseract.roll - d0.tesseract.roll) / ((1200 + 900 + 8 + 400 + 5 + 60 + 400 + 12 + 400 + 120 + 600) / 60),
        centerDim: lines.material.uniforms.uCenterDim.value,
        sceneRoll: scene.rotation.z - sceneZ0, rollAcc: face.getDebugState().tesseract.roll - d0.tesseract.roll });
@@ -97,7 +106,7 @@ emit({ rest, idleP95: p95Of(idle), turnP95: p95Of(turn), turnMax: maxOf(turn),
     "stream": r"""
 import { face, tick, snapshot, emit } from './harness.mjs';
 face.setForm('moodtesseract'); tick(300);
-const d = face.getDebugState().tesseract; const kb = d.kernelBase, kn = d.kernelN * d.kernelN * d.kernelN;
+const d = face.getDebugState().tesseract; const kb = d.kernelBase, kn = d.kernelVerts;
 const s0 = kb + kn, N = snapshot().length;                       // stream nodes follow the kernel
 const a = snapshot(); tick(30); const b = snapshot();
 let out = 0, inn = 0, seen = 0; const speeds = [];
@@ -163,13 +172,15 @@ def mech(lab):
 
 def test_one_corridor_edges_rulings_ties_and_a_lattice_kernel(mech):
     L = mech["rest"]["lines"]
-    assert mech["shells"] == 24 and mech["kernelN"] == 3
-    assert 20 * 72 <= L["shells"] <= 24 * 72, L               # faded shells skip their edges
-    assert 20 * 72 <= L["rulings"] <= 24 * 72, L              # a "+" on every face: 12 rulings × 6 segments
-    assert 19 * 8 <= L["ties"] <= 23 * 8, L                   # consecutive pairs only, the wrap pair skipped
-    assert L["kernel"] == 3 * 3 * 3 * 2, L                    # 54 lattice edges
+    assert mech["shells"] == 24 and mech["kernelVerts"] == 16 and mech["kernelEdges"] == 32   # hypercube 2026-11-09
+    # faded shells skip their edges; since 2026-11-09 so do the ~6 still inside
+    # the hypercube (hidden until they cross its surface): 20 → 15
+    assert 15 * 72 <= L["shells"] <= 24 * 72, L
+    assert 15 * 72 <= L["rulings"] <= 24 * 72, L              # a "+" on every face: 12 rulings × 6 segments
+    assert 14 * 8 <= L["ties"] <= 23 * 8, L                   # consecutive pairs only, the wrap pair skipped
+    assert L["kernel"] == 32, L                               # the hypercube's 32 edges (54 for the old lattice)
     assert mech["kernelBase"] == 12 * 8                       # corners on every other shell
-    assert mech["stream"] == 250 - 12 * 8 - 27
+    assert mech["stream"] == 250 - 12 * 8 - 16
     # the drawn count and the per-kind stats of the SAME frame (2026-10-30: the
     # temperament varies the clock, so how many shells are faded at the END
     # no longer equals the count at rest by coincidence)
@@ -179,7 +190,7 @@ def test_one_corridor_edges_rulings_ties_and_a_lattice_kernel(mech):
 
 def test_the_stream_rides_the_expansion_at_spread_speeds(lab):
     r = _run(lab["new"], "stream")
-    assert r["streamNodes"] == 250 - 12 * 8 - 27, r
+    assert r["streamNodes"] == 250 - 12 * 8 - 16, r
     assert r["out"] > 0.9 * r["seen"], r                       # expansion: matter recedes from the kernel
     assert r["spreadRatio"] > 1.6, r                           # a wide speed spread — streams shear
 
@@ -215,7 +226,9 @@ def test_every_edge_has_its_own_packet_phase(mech):
 
 def test_a_tool_call_flashes_the_corners(mech):
     assert mech["flashTool"] > 0.3, mech
-    assert all(s > 1.15 for s in mech["cornerSizesTool"]), mech
+    z = sorted(mech["cornerSizesTool"])
+    assert len(z) >= 32, mech                                  # several visible frames measured
+    assert z[0] > 1.15, z
 
 
 def test_pass_crystallises_and_refute_shudders(mech):

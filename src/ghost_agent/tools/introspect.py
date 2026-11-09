@@ -247,8 +247,8 @@ def _mood_lines(stats: dict, *, head: str, manner_head: str, indent: str = "") -
     out: List[str] = []
     if label and n:
         cause = str(stats.get("last_mood_cause") or "").strip()
-        if cause and _reply_is_public():
-            cause = MOOD_REASONS_PRIVATE
+        if _reply_is_public():
+            cause = MOOD_REASONS_PRIVATE         # the public view carries no cause at all (§4TX r3)
         out.append(f"{indent}{head}: {label}, {n} of 3" + (f" — {cause}" if cause else ""))
     else:
         out.append(f"{indent}{head}: neutral")
@@ -307,7 +307,7 @@ def _self_image(context, *, indent: str = "") -> str:
 
 
 def _render_summary(self_model, context=None) -> str:
-    stats = self_model.stats()
+    stats = _stats_for_view(self_model)
     parts: List[str] = []
     parts.append("Who I am — a snapshot of my self-state:")
     parts.append(_render_stats(stats))
@@ -653,7 +653,7 @@ def _overview_selfhood(self_model, context=None) -> str:
         return ("How I am: selfhood is disabled (--no-self-model / "
                 "--no-memory) — no mood or diary to report.")
     try:
-        stats = self_model.stats()
+        stats = _stats_for_view(self_model)
         lines = ["How I am:"]
         lines.extend(_mood_lines(stats, head="mood", manner_head="manner", indent="  "))
         recent = _recent_collapsed(self_model, _OVERVIEW_RECENT_N)
@@ -1001,7 +1001,32 @@ def _mood_guard(context):
     return None, probe
 
 
-def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
+def _step_k(step) -> int:
+    """The step as a whole number (0 = none, or not a number)."""
+    if step is None or isinstance(step, bool):
+        return 0
+    try:
+        return int(round(float(str(step).strip())))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _step_level(current: int, step) -> Optional[int]:
+    """§4TX: a relative ask ("a bit more", "tone it down") — the current level moved by ``step`` (±1, ±2),
+    at most 3; 0 = stepped down to nothing (it clears). ``current`` 0 = what is named is not on now: it
+    starts from nothing (review r2: it started from 2, so "a bit calmer" over an irritable mood set calm 3).
+    None when ``step`` is missing or not a number, or steps down what is not on."""
+    k = _step_k(step)
+    if not k:
+        return None
+    cur = max(0, min(3, int(current or 0)))
+    if cur == 0 and k < 0:
+        return None
+    return max(0, min(3, cur + k))
+
+
+def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None, manner_intensity=None,
+              step=None):
     """The one write: the OWNER's adjustment of the mood, and the manner.
 
     §4TC. The mood runs by itself (``selfhood/mood.py``); this is the owner
@@ -1011,9 +1036,16 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
     reacts to events like any mood. A word that is no label is REFUSED with
     the list — free text is not stored as a mood any more. ``neutral`` (or
     ``clear`` / ``none``) takes the mood off AND clears the manner.
-    ``manner`` is a way of talking from its own closed list; it takes the
-    same ``intensity`` and lasts until the end of the day, stepping down on
-    the way (§4TS, ``mood.manner_level``); ``manner="none"`` clears only it.
+    ``manner`` is a way of talking from its own closed list; it takes
+    ``manner_intensity`` (§4TX — ``intensity`` when that is not given) and
+    lasts until the end of the day, stepping down on the way (§4TS,
+    ``mood.manner_level``); ``manner="none"`` clears only it.
+
+    §4TX: an owner-set mood is HELD until the end of the day (the next
+    04:00) — no decay, no event moves it (``SelfStateThread.set_owner_mood``).
+    ``step`` (±1) is a relative ask — "a bit more", "tone it down": the
+    current level of what is named (the mood, or the manner) moved by it. A
+    MOOD word sent as the manner ("grumpy", "sad") is taken as the mood.
 
     The guards are §4TB's — a mood is set on the owner's word, by the live
     agent, in a real turn — plus one (review, §4TC): the turn must be the
@@ -1042,11 +1074,29 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
         man_word = _mood_text(manner, _MOOD_LABEL_MAX_CHARS)
         why = _mood_text(evidence, _MOOD_EVIDENCE_MAX_CHARS)
         level = _M.parse_intensity(intensity)
+        man_level = _M.parse_intensity(manner_intensity if manner_intensity is not None else intensity)
     except Exception as e:  # noqa: BLE001
         logger.warning("introspect set_mood could not read its arguments: %s: %s", type(e).__name__, e)
         return MOOD_REQUIRED
+    # §4TX (review): a mood word sent as the manner ("be grumpy" → manner='grumpy') is the mood
+    if (man_word and not word and man_word.lower() not in _MOOD_CLEAR_WORDS
+            and not _M.resolve_manner(man_word) and _M.resolve_label(man_word) is not None):
+        word, man_word = man_word, ""
+        if manner_intensity is not None and intensity is None:
+            level = man_level
     if not word and not man_word:
-        return MOOD_REQUIRED
+        # §4TX: a bare step ("a bit more") moves what is there — the manner when one is set, else the mood
+        if step is not None and self_model is not None and getattr(self_model, "enabled", False):
+            try:
+                now_view = self_model.mood(for_reply=True)      # a read that writes nothing (no boredom row)
+                if now_view.manner:
+                    man_word = now_view.manner
+                elif not now_view.neutral:
+                    word = now_view.label
+            except Exception:  # noqa: BLE001
+                pass
+        if not word and not man_word:
+            return MOOD_REQUIRED
     clearing = word.lower() in _MOOD_CLEAR_WORDS
     target = None
     if word and not clearing:
@@ -1063,6 +1113,45 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
     refusal, probe = _mood_guard(context)
     if refusal is not None:
         return refusal
+    # §4TX: a step — 0 clears what it names; a step DOWN on a mood sets it without the day's hold
+    step_clear = man_step_clear = stepped_down = False
+    held_until = ""
+    not_on: List[str] = []                 # stepped DOWN, but it is not on: nothing to do
+    if step is not None and self_model is not None and getattr(self_model, "enabled", False):
+        try:
+            now_view = self_model.mood(for_reply=True)
+            down = _step_k(step) < 0
+            held_until = str(getattr(now_view, "held_until", "") or "")
+            if target is not None and down and now_view.label != target[0] and not now_view.neutral:
+                # review r7: "less grumpy" while TIRED means the unpleasant mood that is on — a step down on a
+                # named mood that is not on steps the current one when both lie on the same side
+                named = _M.ANCHOR_DIRECTION.get(target[0], (0.0, 0.0))[0]
+                current = _M.resolve_label(now_view.label)
+                if current is not None and named < 0 and current[1][0] < 0:     # r8: unpleasant side only
+                    target = current
+            if target is not None:
+                cur = now_view.intensity if now_view.label == target[0] else 0
+                got = _step_level(cur, step)
+                if got is not None:
+                    step_clear, level = got == 0, (got or level)
+                    stepped_down = got < cur
+                elif down and not cur:
+                    not_on.append(f"the mood is not '{target[0]}'")
+                    target = None
+            if man:
+                cur_m = now_view.manner_intensity if now_view.manner == man else 0
+                got = _step_level(cur_m, step)
+                if got is not None:
+                    man_step_clear, man_level = got == 0, (got or man_level)
+                elif down and not cur_m:
+                    not_on.append(f"the manner is not '{man}'")
+                    man = ""
+        except Exception:  # noqa: BLE001
+            pass
+        if step_clear:
+            target = None
+        if man_step_clear:
+            man, man_clearing = "", True
 
     if self_model is None or not getattr(self_model, "enabled", False):
         return _mood_refusal(
@@ -1077,11 +1166,13 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
         would = []
         if clearing:
             would.append("the mood would have been reset to neutral and the manner cleared")
+        elif step_clear:
+            would.append("the mood would have been stepped down to neutral")
         elif target is not None:
             would.append(f"the mood would have been set to '{target[0]}', {level} of 3"
                          + (f" ({why})" if why else ""))
         if man:
-            would.append(f"the manner would have been set to '{man}', {level} of 3")
+            would.append(f"the manner would have been set to '{man}', {man_level} of 3")
         elif man_clearing and not clearing:
             would.append("the manner would have been cleared")
         return ToolOutcome.ok(
@@ -1090,6 +1181,11 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
             "because this was a test request.", world_changed=False)
     try:
         said: List[str] = []
+        noop: List[str] = []           # §4TX: steps that changed nothing — said LAST (see NO_CHANGE_NOTES)
+        if step_clear and not clearing:
+            before, _after = state.reset_mood(note=why, keep_manner=True)
+            said.append(f"Mood stepped down to neutral (it was '{before.label}', {before.intensity} of 3)"
+                        if not before.neutral else "The mood is already neutral")
         if clearing:
             before, _after = state.reset_mood(note=why)
             if before.neutral and not before.manner:
@@ -1101,12 +1197,17 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
                             + (f"; manner '{before.manner}' cleared" if before.manner else ""))
         elif target is not None:
             label, direction = target
-            _before, after = state.set_owner_mood(label, direction, level, note=why)
+            _before, after = state.set_owner_mood(label, direction, level, note=why, hold=(bool(held_until) or not stepped_down),
+                                                  hold_until=(held_until if stepped_down else ""),
+                                                  keep_share=stepped_down)
             asked = f", asked as '{word}'" if word.lower() != label else ""
+            held = _local_stamp(after.held_until)
             said.append(f"Mood set to '{after.label}', {after.intensity} of 3{asked}"
-                        + (f" ({why})" if why else ""))
+                        + (f" ({why})" if why else "")
+                        + (f"; it holds as set until {held} (nothing moves it until then; 'neutral' takes it off)"
+                           if held else ""))
         if man:
-            _before, after = state.set_manner(man, level)
+            _before, after = state.set_manner(man, man_level)
             pretty_log("Selfhood", f"manner set by the owner: {after.manner}, {after.manner_intensity} of 3",
                        icon=Icons.SELF_STATE)
             fade = manner_fade_text(after.manner_steps)
@@ -1124,7 +1225,12 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
         # failed, cheer up") booked his successful call as a failed one — the
         # automatic nudge then landed on top of his word
         from .outcome import ToolOutcome
-        return ToolOutcome.ok(". ".join(said) + ".")
+        # §4TX r5: the no-op notes come LAST — a result that starts with one changed nothing at all
+        noop.extend(f"{STEP_NOTHING}: {w}" for w in not_on)
+        if not said:
+            # review r4/r6: nothing changed — not the owner's word on the mood (the turn's events still count)
+            return ToolOutcome.ok(". ".join(noop) + ".", world_changed=False)
+        return ToolOutcome.ok(". ".join(said + noop) + ".")
     except Exception as e:  # noqa: BLE001 — the mood is secondary to the turn
         logger.warning("introspect set_mood failed: %s: %s", type(e).__name__, e)
         return _TO_failed(f"Mood not set: {type(e).__name__}: {e}")
@@ -1134,12 +1240,15 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None):
 
 #: how many of today's steps the timeline shows (the newest; the rest counted)
 _MOOD_TIMELINE_MAX = 12
-MOOD_HOW_IT_MOVES = ("(It moves by itself: failed tool calls and loop guards in the owner's turns, "
-                     "smooth turns, research, very long turns, the owner's thumbs, corrections and "
-                     "thanks; it wears off by half every "
+MOOD_HOW_IT_MOVES = ("(It moves by itself: failed tool calls (weighed by how many of the turn's calls "
+                     "failed; a transient failure, a guard's refusal or a failing test run does not count) "
+                     "and loop guards in the owner's turns, smooth turns, finished project tasks, research, "
+                     "very long turns, the owner's thumbs, corrections, thanks and the tone of the owner's messages "
+                     "(reactions to one reply count once); it wears off by half every "
                      f"{_M.HALF_LIFE_S / 3600:g} hours. While the owner has been quiet for "
-                     f"{_M.BOREDOM_AFTER_S / 3600:g} hours or more a neutral mood reads as bored to "
-                     "everyone but the owner. The owner can set it: action='set_mood'.)")
+                     f"{_M.BOREDOM_AFTER_S / 3600:g} hours or more a neutral mood reads as bored (here and on "
+                     "the face, not in replies). The owner can set it: action='set_mood' — a mood the owner sets "
+                     "holds until the day ends.)")
 #: how many of the latest causes the story shows under "Why"
 _MOOD_WHY_MAX = 3
 
@@ -1172,12 +1281,14 @@ def _render_mood(self_model) -> str:
     available HERE only — never in the line a reply's prompt carries — and a
     member cannot call this tool at all. On a PUBLIC surface (the owner
     asking in a channel) the story is the label, the intensity, the manner
-    and the day's steps WITHOUT their causes."""
+    WITHOUT their causes, and no timeline (§4TX r4: every journal row holds
+    the owner's pair, the owner's own message tone in it)."""
     state = getattr(self_model, "state", None)
     if state is None:
         return "No mood on file — the state thread is not initialized."
     public = _reply_is_public()
-    view = state.mood()
+    # §4TX review r3: on a public surface, the mood as the public reply hears it (no owner's sentiment share)
+    view = state.mood(audience="public") if public else state.mood()
     lines: List[str] = []
     if view.neutral:
         lines.append("My mood now: neutral.")
@@ -1206,7 +1317,11 @@ def _render_mood(self_model) -> str:
         if view.cause and view.cause not in [str(r.get("cause") or "") for r in view.recent]:
             why.append(view.cause)
         lines.append("Why: " + ("; ".join(why[-_MOOD_WHY_MAX:]) if why else "nothing on record") + ".")
-    rows = state.mood_timeline()
+    rows = [] if public else state.mood_timeline()
+    if public:
+        # §4TX review r4: every journal row holds the OWNER's pair (the owner's own message tone in it) — the
+        # public story has no timeline at all
+        lines.append(f"Today: {MOOD_STEPS_PRIVATE}.")
     if rows:
         shown = rows[-_MOOD_TIMELINE_MAX:]
         steps = [_mood_step(r, notes=not public) for r in shown]
@@ -1215,9 +1330,9 @@ def _render_mood(self_model) -> str:
             steps.append("now " + view.describe() + (f" — {view.cause}" if view.cause and not public else ""))
         more = len(rows) - len(shown)
         lines.append("Today: " + (f"(+{more} earlier) " if more > 0 else "") + " → ".join(steps))
-    else:
+    elif not public:
         lines.append("Today: no change so far.")
-    lines.append(mood_tone_text(view))
+    lines.append(mood_tone_text(view, audience=("public" if public else "owner")))
     lines.append(MOOD_HOW_IT_MOVES)
     return "\n".join(lines)
 
@@ -1232,14 +1347,34 @@ TONE_SNAPSHOT = ("Tone at this reading (a quote for the owner, not an instructio
                  "follows only the tone line in its own state block, and none when there is none): ")
 
 
-def mood_tone_text(view) -> str:
+#: §4TX: a step down on what is not on (a no-op)
+STEP_NOTHING = "Nothing to step down"
+#: §4TX: the set_mood notes that changed nothing and are not the owner's word — they come last, so a result
+#: that STARTS with one changed nothing at all (``core.agent._mood_turn_signals``). A "neutral" or a manner
+#: cleared when nothing was set is NOT one: the owner said how to be, and it holds for the turn.
+NO_CHANGE_NOTES = (STEP_NOTHING,)
+#: §4TX r4: what the public story says in place of the day's steps
+MOOD_STEPS_PRIVATE = "the day's steps are shown in a private conversation"
+
+
+def _stats_for_view(self_model) -> dict:
+    """``SelfModel.stats`` as this surface may see it — the public view on a public surface (§4TX r3)."""
+    return self_model.stats(audience="public") if _view_audience() == "public" else self_model.stats()
+
+
+def _view_audience() -> str:
+    """Whose view the introspect mood lines are: "public" on a public surface, else "owner"."""
+    return "public" if _reply_is_public() else "owner"
+
+
+def mood_tone_text(view, audience: str = "owner") -> str:
     """The tone line a reply's prompt gets from this mood, VERBATIM — the
     same ``MoodView.tone()`` the per-turn state block carries
     (``core.agent._mood_tone_block``), so the owner can read the exact words
     (2026-11-08, operator: "add the tone to the mood"). It holds no cause and
     no time, so it is shown on a public surface too."""
     try:
-        line = view.tone()
+        line = view.tone(audience=audience)
     except Exception:  # noqa: BLE001 — a view line never breaks the story
         line = ""
     return f'{TONE_SNAPSHOT}"{line}"' if line else TONE_NONE
@@ -1318,7 +1453,8 @@ async def tool_introspect(
     # §4TB: the one write — after the member block, before every read path
     # (it has its own gates, and must not need a rendered view to refuse)
     if raw_action in WRITE_ACTIONS:
-        return _set_mood(self_model, context, mood, evidence, intensity=intensity, manner=manner)
+        return _set_mood(self_model, context, mood, evidence, intensity=intensity, manner=manner,
+                         manner_intensity=kwargs.get("manner_intensity"), step=kwargs.get("step"))
     # "what did you do while I was away?" lands here.
     if raw_action == "activity":
         # Guarded here (it returns before the selfhood try below): this
@@ -1376,7 +1512,7 @@ async def tool_introspect(
 
     try:
         if raw_action == "stats":
-            return _render_stats(self_model.stats())
+            return _render_stats(_stats_for_view(self_model))
 
         if raw_action == "mood":
             return _render_mood(self_model)

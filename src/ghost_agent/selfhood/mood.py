@@ -192,7 +192,9 @@ def read_off(p: float, e: float, *, held_label: str = "", held_intensity: int = 
     # gone) the tag is dropped and the plain region is read. (WHO keeps the
     # tag is the store's rule: it belongs to the move that set it — decay
     # keeps it, any later event that is not a research event clears it.)
-    if novelty and p > 0 and e > 0:
+    # §4TX (review): only where the plain region is cheerful — research with a failure or two at high energy
+    # read "curious 3" where the pair said restless
+    if novelty and p > 0 and e > 0 and region(p, e) == _CURIOUS_BASE:
         return CURIOUS, n, True
     return held_region(p, e, held_label if held_label != NEUTRAL else ""), n, False
 
@@ -257,26 +259,44 @@ KIND_THUMB_UP = "thumb_up"
 KIND_THUMB_DOWN = "thumb_down"
 KIND_CORRECTION = "correction"
 KIND_PRAISE = "praise"
+KIND_SENTIMENT = "sentiment"  # §4TW: the tone of the owner's message (the sentiment service)
 KIND_OWNER = "owner"          # the owner said so in chat (set_mood)
 KIND_QUIET = "quiet"          # a reader first saw the boredom of a long quiet
 KIND_QUIET_END = "quiet_end"  # the owner came back
 KIND_DECAY = "decay"          # it wore off
+KIND_MANNER = "manner"        # §4TX: the owner set or cleared the manner (a history row, the pair untouched)
 
 #: one failed tool call, or one time a loop guard stepped in
 EV_TROUBLE = (-0.12, +0.08)
 #: at most this many of them count in one turn
 TROUBLE_CAP = 4
-#: a turn of at least ``CLEAN_TURN_MIN_CALLS`` tool calls, none failed, no
-#: guard, completed, not a long one
+#: §4TX (review 11-09, the live data: 10 % failing calls made a third of the day irritable): the failures of a
+#: turn weigh by the SHARE of its calls that failed — one failure in a long successful turn is a small thing,
+#: three out of three is not. Each failure counts ``min(1, max(TROUBLE_SHARE_FLOOR, 2 × share))`` of
+#: ``EV_TROUBLE``; guards and context pressure count in full
+TROUBLE_SHARE_FLOOR = 0.25
+#: a turn of at least ``CLEAN_TURN_MIN_CALLS`` tool calls, at most ``CLEAN_TURN_MAX_SHARE`` of them failed, no
+#: guard. §4TX: the reward grows with the work done (``CLEAN_TURN_BASE`` + ``CLEAN_TURN_PER_CALL`` per call, at
+#: most ``CLEAN_TURN_MAX``), shrinks with the failed share, and a long turn keeps it
 EV_CLEAN_TURN = (+0.08, 0.0)
 CLEAN_TURN_MIN_CALLS = 3
+CLEAN_TURN_BASE = 0.04
+CLEAN_TURN_PER_CALL = 0.02
+CLEAN_TURN_MAX = 0.16
+CLEAN_TURN_MAX_SHARE = 0.10
 #: a turn whose research tools read at least ``RESEARCH_MIN_SOURCES`` pages
 EV_RESEARCH = (+0.15, +0.20)
 RESEARCH_MIN_SOURCES = 3
-#: a very long turn — by wall time or by the number of tool calls
+#: a very long turn — by wall time or by the number of tool calls: a slog, tired
 EV_LONG_TURN = (-0.15, -0.30)
+#: §4TX: a very long turn that went through clean costs ENERGY only, and earns the full clean reward whatever
+#: its call count — calm after good long work, not tired, not bored (review: four successful long research
+#: turns read "bored"/"tired")
+EV_LONG_CLEAN_TURN = (0.0, -0.30)
 LONG_TURN_S = 900.0
 LONG_TURN_CALLS = 25
+#: §4TX: a project task finished in the owner's turn (manage_projects marked it DONE) — once per turn
+EV_TASK_DONE = (+0.15, +0.10)
 #: the owner's reactions
 #: thumbs move the pleasantness only (review r2: with an energy component,
 #: toggling up / down on one turn pumped the energy by +0.05 per "up")
@@ -284,6 +304,14 @@ EV_THUMB_UP = (+0.25, 0.0)
 EV_THUMB_DOWN = (-0.30, 0.0)
 EV_CORRECTION = (-0.20, 0.0)
 EV_PRAISE = (+0.10, 0.0)
+#: §4TW: the tone of any owner message, whatever it is about (operator 11-09: "option 1" — the mood feels WITH
+#: the owner: his good news lifts it, his bad news lowers it). A third of a thumb; confident scores only; a
+#: message the praise check already counted is not counted twice
+#: §4TX: with a little energy each way (a quarter of the pleasantness: the pair stays on the axis), so the owner's
+#: bad news reads "down" — feeling with the owner — and moves the energy the same way, never "irritable"
+EV_SENTIMENT_POSITIVE = (+0.08, +0.02)
+EV_SENTIMENT_NEGATIVE = (-0.08, -0.02)
+SENTIMENT_MIN_SCORE = 0.85
 
 
 @dataclass(frozen=True)
@@ -297,52 +325,83 @@ class TurnSignals:
     completed: bool = True     # False for a turn that was cut off
     pressure: bool = False     # the turn ended under the context-pressure lockdown
     owner_set: bool = False    # the owner SET the mood or the manner in this turn
+    excused: int = 0           # §4TX: failed calls NOT counted (transient, a guard's refusal, a failing test run)
+    tasks_done: int = 0        # §4TX: project tasks marked DONE in this turn
 
 
 def _n(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
+def _clean_reward(calls: int, share: float) -> float:
+    if calls < CLEAN_TURN_MIN_CALLS or share > CLEAN_TURN_MAX_SHARE:
+        return 0.0
+    return round(min(CLEAN_TURN_MAX, CLEAN_TURN_BASE + CLEAN_TURN_PER_CALL * calls) * (1.0 - share), 4)
+
+
 def turn_events(sig: TurnSignals) -> List[Event]:
     """The events of one owner turn. A plain chat turn (no tools, no guard,
     not long) gives none — and neither does a turn in which the owner set
-    the mood or the manner: his word holds for the turn."""
+    the mood or the manner: the owner's word holds for the turn.
+
+    §4TX: failures weigh by the share of the turn's calls that failed (only
+    the ones that count — ``excused`` are not in ``failures``); a clean
+    reward grows with the calls and survives a long turn; a long turn costs
+    energy only; a finished project task is its own event."""
     out: List[Event] = []
     if bool(sig.owner_set):
         return out
-    calls = max(0, int(sig.tool_calls or 0))
-    failures = max(0, int(sig.failures or 0))
+    all_calls = max(0, int(sig.tool_calls or 0))
+    # review r2: an excused failure is neither a failure nor a success — it is out of the count (three Tor
+    # timeouts are not "a turn of 3 tool calls went through")
+    calls = max(0, all_calls - max(0, int(getattr(sig, "excused", 0) or 0)))
+    failures = max(0, min(int(sig.failures or 0), calls or int(sig.failures or 0)))
     guards = max(0, int(sig.guards or 0))
     sources = max(0, int(sig.sources or 0))
+    done = max(0, int(sig.tasks_done or 0))
     try:
         dur = max(0.0, float(sig.duration_s or 0.0))
     except (TypeError, ValueError):
         dur = 0.0
     pressure = 1 if bool(sig.pressure) else 0
-    trouble = failures + guards + pressure
-    if trouble > 0:
-        k = min(trouble, TROUBLE_CAP)
+    share = (failures / calls) if calls else (1.0 if failures else 0.0)
+    weight = min(1.0, max(TROUBLE_SHARE_FLOOR, 2.0 * share)) if failures else 0.0
+    units = min(float(TROUBLE_CAP), min(failures, TROUBLE_CAP) * weight + guards + pressure)
+    if units > 0:
         parts = []
         if failures:
-            parts.append(_n(failures, "tool call", "tool calls") + " failed")
+            parts.append(_n(failures, "tool call", "tool calls") + " failed"
+                         + (f" (of {calls})" if calls > failures else ""))
         if guards:
             parts.append("a loop guard stepped in " + ("once" if guards == 1 else f"{guards} times"))
         if pressure:
             parts.append("the context ran out of room (context pressure)")
-        out.append(Event(EV_TROUBLE[0] * k, EV_TROUBLE[1] * k,
+        out.append(Event(round(EV_TROUBLE[0] * units, 4), round(EV_TROUBLE[1] * units, 4),
                          " and ".join(parts) + " in this turn", KIND_TURN))
     if sources >= RESEARCH_MIN_SOURCES:
         out.append(Event(EV_RESEARCH[0], EV_RESEARCH[1],
                          f"read {sources} sources in a research turn", KIND_TURN, novelty=True))
-    long_turn = dur >= LONG_TURN_S or calls >= LONG_TURN_CALLS
+    if done:
+        out.append(Event(EV_TASK_DONE[0], EV_TASK_DONE[1],
+                         "finished " + _n(done, "project task", "project tasks"), KIND_TURN))
+    long_turn = dur >= LONG_TURN_S or all_calls >= LONG_TURN_CALLS
+    clean = guards == 0 and not pressure and bool(sig.completed) and share <= CLEAN_TURN_MAX_SHARE
+    reward = _clean_reward(calls, share) if clean else 0.0
+    # a long turn with nothing done — or mostly excused calls — is a slog, not good long work
+    long_clean = clean and calls > 0 and calls >= max(0, int(getattr(sig, "excused", 0) or 0))
+    if long_turn and long_clean:
+        # §4TX review r2: a long clean turn earns the full reward whatever its call count (a 20-minute
+        # turn of 2 good calls is not a slog)
+        reward = round(CLEAN_TURN_MAX * (1.0 - share), 4)
     if long_turn:
-        out.append(Event(EV_LONG_TURN[0], EV_LONG_TURN[1],
-                         f"a very long turn ({int(dur // 60)} min, {_n(calls, 'tool call', 'tool calls')})",
+        ev = EV_LONG_CLEAN_TURN if long_clean else EV_LONG_TURN
+        out.append(Event(ev[0], ev[1],
+                         f"a very long turn ({int(dur // 60)} min, {_n(all_calls, 'tool call', 'tool calls')})",
                          KIND_TURN))
-    if (calls >= CLEAN_TURN_MIN_CALLS and trouble == 0 and bool(sig.completed)
-            and not long_turn):
-        out.append(Event(EV_CLEAN_TURN[0], EV_CLEAN_TURN[1],
-                         f"a turn of {calls} tool calls went through without a failure", KIND_TURN))
+    if reward > 0:
+        out.append(Event(reward, EV_CLEAN_TURN[1],
+                         (f"a turn of {calls} tool calls went through without a failure" if not failures else
+                          f"a turn of {calls} tool calls went through, {failures} of them failed"), KIND_TURN))
     return out
 
 
@@ -369,6 +428,20 @@ def reaction_event(kind: str) -> Optional[Event]:
     return None
 
 
+def sentiment_event(label, score) -> Optional[Event]:
+    """The tone of the owner's message as an event, or None: neutral, unknown, or below
+    ``SENTIMENT_MIN_SCORE``."""
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not score >= SENTIMENT_MIN_SCORE:
+        return None
+    if label == "positive":
+        return Event(EV_SENTIMENT_POSITIVE[0], EV_SENTIMENT_POSITIVE[1], "the owner's message sounded upbeat",
+                     KIND_SENTIMENT)
+    if label == "negative":
+        return Event(EV_SENTIMENT_NEGATIVE[0], EV_SENTIMENT_NEGATIVE[1], "the owner's message sounded unhappy",
+                     KIND_SENTIMENT)
+    return None
+
+
 # Thanks / praise in the owner's message. NARROW on purpose (review, §4TC:
 # of 18 live matches of a plain word list 6 were not praise — "make it look
 # awesome", "this wasn't awesome", "a great number of files", "thanks to the
@@ -381,17 +454,23 @@ def reaction_event(kind: str) -> Optional[Event]:
 #: at most this many words
 PRAISE_MAX_WORDS = 6
 #: one-word thanks / praise
-PRAISE_WORDS = frozenset({"thanks", "thx", "cheers", "great", "perfect", "awesome", "nice", "bravo",
-                          "ευχαριστώ", "ευχαριστω", "σ'ευχαριστώ", "σ'ευχαριστω",
-                          "μπράβο", "μπραβο", "τέλεια", "τελεια"})
+PRAISE_WORDS = frozenset({"thanks", "thx", "ty", "cheers", "great", "perfect", "awesome", "nice", "bravo",
+                          "excellent", "amazing", "brilliant", "superb", "fantastic", "wonderful",
+                          # Greek, compared without accents (``_fold``): ευχαριστώ, μπράβο, τέλεια / τέλειο,
+                          # ωραία / ωραίο, άψογο / άψογα, εξαιρετικό / εξαιρετικά, υπέροχο / υπέροχα
+                          "ευχαριστω", "σ'ευχαριστω", "μπραβο", "τελεια", "τελειο", "ωραια", "ωραιο",
+                          "αψογο", "αψογα", "εξαιρετικο", "εξαιρετικα", "υπεροχο", "υπεροχα"})
 #: two-word thanks / praise
 PRAISE_PAIRS = frozenset({("thank", "you"), ("thank", "u"), ("many", "thanks"), ("well", "done"),
                           ("good", "job"), ("great", "job"), ("nice", "work"), ("great", "work"),
-                          ("good", "work")})
+                          ("good", "work"), ("nice", "one"), ("good", "stuff"),
+                          ("καλη", "δουλεια"), ("ωραια", "δουλεια")})
 #: words that may stand beside them. "is", "it's" and "that" are NOT among
 #: them ("is that so great", "is that perfect" are questions, not praise).
 PRAISE_FILLER = frozenset({"ok", "okay", "ghost", "mate", "that's", "thats", "very", "so",
-                           "much", "a", "lot", "really", "πολύ", "πολυ", "σε", "σου", "ρε"})
+                           "much", "a", "lot", "really", "πολυ", "σε", "σου", "ρε", "σ"})
+#: §4TX: a message that is nothing but these emoji is thanks too
+PRAISE_EMOJI = frozenset({"👍", "🙏", "👏", "🙌", "❤", "💯", "🔥"})
 _PRAISE_TOKEN_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*")
 #: a message that ENDS with one of these is a question (";" is also what the
 #: Greek question mark normalises to)
@@ -409,6 +488,11 @@ def _is_question(text: str) -> bool:
     return False
 
 
+def _fold(word: str) -> str:
+    """A word without its accents (Greek tonos, dialytika): "τέλειο" and "τελειο" are one word."""
+    return "".join(ch for ch in unicodedata.normalize("NFD", word) if not unicodedata.combining(ch))
+
+
 def has_praise(text) -> bool:
     """Is the owner's message thanks or praise — and nothing else? At most
     ``PRAISE_MAX_WORDS`` words; every word is a praise word, half of a praise
@@ -421,7 +505,10 @@ def has_praise(text) -> bool:
     t = unicodedata.normalize("NFKC", text).replace("\u2019", "'").replace("\u2018", "'").lower()
     if _is_question(t):
         return False
-    words = _PRAISE_TOKEN_RE.findall(t)
+    words = [_fold(w) for w in _PRAISE_TOKEN_RE.findall(t)]
+    if not words:
+        rest = "".join(ch for ch in t if not ch.isspace() and ch not in "\ufe0f\u200d!.")
+        return bool(rest) and all(ch in PRAISE_EMOJI or 0x1F3FB <= ord(ch) <= 0x1F3FF for ch in rest)
     if not words or len(words) > PRAISE_MAX_WORDS:
         return False
     found, i = 0, 0
@@ -532,14 +619,33 @@ MANNER_LEVEL_SENTENCE = {
     2: "At 2 it is clearly noticeable, with a remark or two in character.",
     3: "At 3 it is strong throughout.",
 }
-_LIMITS = ("WHAT you say stays exactly as it would be: the same facts, the same numbers, "
-           "the same tool use, the same completeness, no refusing. "
-           "This applies to every reply, serious ones included.")
+#: §4TX: a remark about the mood is made once per conversation — the next replies of the same mood keep the
+#: tint without saying it again (review: "a remark or two" every reply became a verbal tic)
+REMARKED_LEVEL_SENTENCE = {
+    2: "At 2 it is clearly noticeable in the wording; it already showed earlier in this conversation, so no "
+       "remark about it.",
+    3: "At 3 it is strong; you already let it show in this conversation, so do not announce it again.",
+}
+_LIMITS = ("WHAT you say stays exactly as it would be: the same facts, numbers, tool use and completeness, "
+           "no new topics or asides; the mood changes no answer and no refusal. Code, file contents, tool "
+           "arguments and commands carry no tone. Precedence: the owner's rules, then correctness, then the "
+           "manner, then the mood. This applies to every reply, serious ones included.")
+#: §4TX: who asks why — the owner is pointed at the real cause, anyone else is told it is not about them
+WHY_OWNER = 'Asked why, call introspect(action="mood") first - never guess a cause.'
+WHY_OTHERS = "It is not about the person you are talking to; never invent a cause."
+#: §4TX review r2: the owner on a public surface — others read the reply, and the owner may be its cause
+WHY_PUBLIC = "Others read this reply: never explain the mood or invent a cause here."
 
 
-def tone_line(label: str, intensity: int, manner: str = "", manner_intensity: int = 0) -> str:
+def tone_line(label: str, intensity: int, manner: str = "", manner_intensity: int = 0, *,
+              remarked: bool = False, audience: str = "owner") -> str:
     """The sentence that makes the mood audible in a reply — "" for a neutral
-    mood with no manner. A function of its four arguments and nothing else."""
+    mood with no manner. A function of its arguments and nothing else.
+
+    ``remarked``: the same mood was already heard earlier in this
+    conversation — the tint stays, the remark is not made again.
+    ``audience``: "owner", "others" (a member) or "public" (the owner on a
+    public channel) — which sentence a "why" gets."""
     try:
         n = int(intensity)
     except (TypeError, ValueError):
@@ -553,11 +659,13 @@ def tone_line(label: str, intensity: int, manner: str = "", manner_intensity: in
     mn = mn if mn in MANNER_LEVEL_SENTENCE else DEFAULT_INTENSITY
     gloss = f" ({MANNER_GLOSS[man]}.)" if man in MANNER_GLOSS else ""
     if has_mood:
+        level = REMARKED_LEVEL_SENTENCE.get(n, LEVEL_SENTENCE[n]) if remarked else LEVEL_SENTENCE[n]
+        why = {"others": WHY_OTHERS, "public": WHY_PUBLIC}.get(audience, WHY_OWNER)
         return (f"YOUR MOOD RIGHT NOW: {label}, {n} of 3."
                 + (f" MANNER (set by the owner): {man}, {mn} of 3.{gloss}" if man else "")
                 + " Speak in that mood: it must be audible in HOW you phrase this reply - "
                   "word choice, rhythm - the way a person in that mood would say the same thing. "
-                + LEVEL_SENTENCE[n] + " " + _LIMITS)
+                + level + " " + why + " " + _LIMITS)
     if man:
         return (f"MANNER (set by the owner): {man}, {mn} of 3.{gloss}"
                 " Speak in that manner: it must be audible in HOW you phrase this reply - "
@@ -685,9 +793,12 @@ def manner_level(intensity, set_at: str, *, now: Optional[datetime.datetime] = N
     elif now.tzinfo is None:
         now = now.replace(tzinfo=datetime.timezone.utc)
     start = parse_iso_utc(set_at)
-    if start is not None and (start - now).total_seconds() > MANNER_MIN_LIFE_S:
-        return 0          # set well in the FUTURE (a hand edit, a clock set back): no day to read
     level = max(0, min(3, int(intensity)))
+    if start is not None and (start - now).total_seconds() > MANNER_MIN_LIFE_S:
+        # set in the FUTURE: a clock set back keeps the manner at its set level until the clock catches up
+        # (§4TX review: it read 0 and the next write dropped it for good); a stamp a day or more ahead is a
+        # hand edit, and no day is read from it
+        return level if (start - now).total_seconds() < 86400.0 else 0
     for at, lvl in steps:
         if now >= at:
             level = lvl

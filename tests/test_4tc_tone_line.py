@@ -38,8 +38,13 @@ ASK = "how old is Bruno?"
 
 HOW = (" Speak in that mood: it must be audible in HOW you phrase this reply - word choice, rhythm - "
        "the way a person in that mood would say the same thing. ")
-LIMITS = ("WHAT you say stays exactly as it would be: the same facts, the same numbers, the same tool use, "
-          "the same completeness, no refusing. This applies to every reply, serious ones included.")
+LIMITS = ("WHAT you say stays exactly as it would be: the same facts, numbers, tool use and completeness, "
+          "no new topics or asides; the mood changes no answer and no refusal. Code, file contents, tool "
+          "arguments and commands carry no tone. Precedence: the owner's rules, then correctness, then the "
+          "manner, then the mood. This applies to every reply, serious ones included.")
+#: §4TX: the owner is pointed at the real cause; anyone else is told it is not about them
+WHY = 'Asked why, call introspect(action="mood") first - never guess a cause.'
+WHY_OTHERS = "It is not about the person you are talking to; never invent a cause."
 LEVEL = {1: "At 1 it is a faint tint: word choice only, no remarks about it.",
          2: "At 2 it is clearly noticeable, with a remark or two in character.",
          3: "At 3 it is strong, and you may say outright that you are in this mood."}
@@ -49,7 +54,22 @@ LEVEL = {1: "At 1 it is a faint tint: word choice only, no remarks about it.",
 
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_the_line_for_a_mood_at_each_level(n):
-    assert M.tone_line("irritable", n) == f"YOUR MOOD RIGHT NOW: irritable, {n} of 3." + HOW + LEVEL[n] + " " + LIMITS
+    assert M.tone_line("irritable", n) == (f"YOUR MOOD RIGHT NOW: irritable, {n} of 3." + HOW + LEVEL[n] + " "
+                                           + WHY + " " + LIMITS)
+    assert M.tone_line("irritable", n, audience="others") == (
+        f"YOUR MOOD RIGHT NOW: irritable, {n} of 3." + HOW + LEVEL[n] + " " + WHY_OTHERS + " " + LIMITS)
+
+
+@pytest.mark.parametrize("n,level", [
+    (1, "At 1 it is a faint tint: word choice only, no remarks about it."),
+    (2, "At 2 it is clearly noticeable in the wording; it already showed earlier in this conversation, so no "
+        "remark about it."),
+    (3, "At 3 it is strong; you already let it show in this conversation, so do not announce it again."),
+])
+def test_a_mood_already_heard_in_the_conversation_keeps_its_tint_without_a_new_remark(n, level):
+    """§4TX (review: "a remark or two" every reply became a verbal tic)."""
+    assert M.tone_line("down", n, remarked=True) == (f"YOUR MOOD RIGHT NOW: down, {n} of 3." + HOW + level + " "
+                                                     + WHY + " " + LIMITS)
 
 
 def test_level_one_is_a_tint_and_only_level_three_may_name_the_mood():
@@ -62,7 +82,7 @@ def test_level_one_is_a_tint_and_only_level_three_may_name_the_mood():
 def test_the_line_with_a_manner_names_it_between_the_mood_and_the_instruction():
     line = M.tone_line("cheerful", 2, "sarcastic", 3)
     assert line == ("YOUR MOOD RIGHT NOW: cheerful, 2 of 3. MANNER (set by the owner): sarcastic, 3 of 3."
-                    + HOW + LEVEL[2] + " " + LIMITS)              # the level sentence is the MOOD's
+                    + HOW + LEVEL[2] + " " + WHY + " " + LIMITS)  # the level sentence is the MOOD's
 
 
 @pytest.mark.parametrize("m,level", [
@@ -98,7 +118,8 @@ def test_every_line_is_one_line_with_the_limits_and_no_number_of_the_pair():
                 line = M.tone_line(label, n, manner, 2)
                 assert "\n" not in line and line.endswith(LIMITS)
                 assert not re.search(r"\d\.\d|\d:\d\d|ago|because|since", line), line
-    assert len(M.tone_line("irritable", 3, "sarcastic", 3)) < 600
+    # §4TX: + the "why" sentence, no tone in code / tool arguments, the precedence (was < 600)
+    assert len(M.tone_line("irritable", 3, "sarcastic", 3)) < 800
 
 
 def test_the_line_depends_on_the_label_the_intensity_and_the_manner_only(tmp_path):
@@ -142,6 +163,16 @@ class _req:
 
 
 EXPECT = M.tone_line("irritable", 2) + "\n\n"
+#: §4TX: what a member hears (not told the owner's "why")
+EXPECT_OTHERS = M.tone_line("irritable", 2, audience="others") + "\n\n"
+#: §4TX r2: the owner in a public channel (others read it; the owner may be its cause)
+EXPECT_PUBLIC = M.tone_line("irritable", 2, audience="public") + "\n\n"
+
+
+def _expected(who):
+    if who.get("role") == "member":
+        return EXPECT_OTHERS
+    return EXPECT_PUBLIC if who.get("surface") == "public" else EXPECT
 
 
 @pytest.mark.parametrize("who", [
@@ -158,7 +189,7 @@ def test_every_main_loop_reply_carries_the_line(tmp_path, who):
     ctx = _ctx(tmp_path)
     with _req(**who):
         assert A.mood_is_heard_on_this_request(ctx) is True
-        assert A._mood_tone_block(ctx) == EXPECT
+        assert A._mood_tone_block(ctx) == _expected(who)
 
 
 @pytest.mark.parametrize("rid", ["sub-3", "sim-9", "bench-1", "replay-7", "SYSTEM", ""])
@@ -211,6 +242,7 @@ def test_a_neutral_mood_with_no_manner_is_zero_bytes(tmp_path):
         assert A._mood_tone_block(_ctx(tmp_path / "none", label="")) == ""
         worn = _ctx(tmp_path / "worn")
         worn.self_model.state.state.mood.updated_at = "2026-01-01T00:00:00Z"       # long worn off
+        worn.self_model.state.state.mood.held_until = ""                          # §4TX: and its hold over
         assert A._mood_tone_block(worn) == ""
         assert A._mood_tone_block(_ctx(tmp_path / "manner", label="", manner="terse")) == (
             M.tone_line("neutral", 0, "terse", 2) + "\n\n")
@@ -250,23 +282,24 @@ def test_building_the_line_writes_nothing(tmp_path):
     assert st.path.read_bytes() == raw and st.mood_history_path.read_bytes() == rows
 
 
-@pytest.mark.parametrize("who,heard", [
-    ({"rid": "sched-morning-news"}, True), ({"rid": "probe-4tc"}, True), ({"rid": "job-3"}, True),
-    ({"rid": "slack-4tc-m", "role": "member"}, True),
-    ({"rid": "web-4tc-tone"}, False), ({"rid": "slack-4tc", "surface": "public"}, False),       # the owner
+@pytest.mark.parametrize("who", [
+    {"rid": "sched-morning-news"}, {"rid": "probe-4tc"}, {"rid": "job-3"},
+    {"rid": "slack-4tc-m", "role": "member"},
+    {"rid": "web-4tc-tone"}, {"rid": "slack-4tc", "surface": "public"},       # the owner
 ])
-def test_the_boredom_of_a_running_quiet_is_heard_by_everyone_answered_meanwhile_but_the_owner(tmp_path, who, heard):
-    """Review: read-time only. Level 1 after six quiet hours (word choice
-    only), 2 after twelve; the owner's own message has ended the quiet."""
+def test_the_boredom_of_a_running_quiet_is_heard_by_no_reply(tmp_path, who):
+    """§4TX (review: every night the morning report and the members were answered "bored"): a quiet is not
+    taken out on whoever writes next. Read-time only, still shown on the face and by introspect."""
     import datetime as dt
     ctx = _ctx(tmp_path, label="")
     st = ctx.self_model.state
-    st.mark_owner_turn(now=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=7))
-    with _req(**who):
-        assert A._mood_tone_block(ctx) == ((M.tone_line("bored", 1) + "\n\n") if heard else "")
-    st.mark_owner_turn(now=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=13))
-    with _req(**who):
-        assert A._mood_tone_block(ctx) == ((M.tone_line("bored", 2) + "\n\n") if heard else "")
+    for hours, level in ((7, 1), (13, 2)):
+        st.mark_owner_turn(now=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours))
+        with _req(**who):
+            assert A._mood_tone_block(ctx) == ""
+        if who["rid"].startswith(("sched-", "probe-", "job-")) or who.get("role") == "member":
+            with _req(**who):
+                assert (st.mood().label, st.mood().intensity) == ("bored", level)        # the face still sees it
     assert st.state.mood is None                                 # never in the pair
 
 
@@ -411,7 +444,9 @@ async def test_everyone_who_is_answered_hears_it_through_the_real_loop(tmp_path,
     raw = agent.context.self_model.state.path.read_bytes()
     with _req(**who):
         payload = await _send(agent, rid=who["rid"])
-    assert M.tone_line("cheerful", 2) in payload["messages"][-1]["content"]
+    audience = ("others" if who.get("role") == "member"
+                else "public" if who.get("surface") == "public" else "owner")
+    assert M.tone_line("cheerful", 2, audience=audience) in payload["messages"][-1]["content"]
     assert "YOUR MOOD" not in _system(payload)
     mood_now = json.loads(agent.context.self_model.state.path.read_text())["mood"]
     assert mood_now == json.loads(raw)["mood"]                   # hearing it does not move it
@@ -459,7 +494,7 @@ def test_the_tool_definition_is_static_text():
 
 def test_the_introspect_definition_grew_by_no_more_than_the_allowance():
     size = len(json.dumps(next(t for t in R.TOOL_DEFINITIONS if t["function"]["name"] == "introspect")))
-    assert 3508 < size <= 3508 + 450
+    assert 3508 < size <= 3508 + 500          # §4TX: + manner_intensity and step
 
 
 # ── the state block mechanics (§4RC) ────────────────────────────────────────
