@@ -2174,6 +2174,20 @@ body.zen-mode #rail-scrim {
     border-bottom: 1px solid var(--hairline);
     flex-shrink: 0;
 }
+.panel-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+/* Notification header buttons: 32px reads as a tap target on a phone and
+   matches the rounder top-bar icons better than the 28px/4px log buttons. */
+#notif-panel .render-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    color: var(--eyebrow-color, #fff);
+}
+#notif-panel .render-btn:hover { color: #fff; }
 .panel-title {
     font-family: var(--font-mono);
     font-size: 0.7rem;

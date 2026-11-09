@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=8.6">
+    <link rel="stylesheet" href="/static/style.css?v=8.7">
 </head>
 
 <body>
@@ -316,8 +316,18 @@
     <div id="notif-panel" class="hidden" aria-label="Notifications">
         <div class="panel-header">
             <span class="panel-title">NOTIFICATIONS</span>
-            <button id="notif-clear" class="render-btn" title="Clear all" aria-label="Clear all notifications">⌫</button>
-            <button id="notif-close" class="render-btn" title="Close" aria-label="Close notifications">✕</button>
+            <!-- Both actions grouped on the right (2026-11-08): with three
+                 children under space-between the clear button floated in
+                 the middle, and the old text glyphs drew differently per font
+                 (iOS); SVG strokes match the top-bar icons. -->
+            <div class="panel-actions">
+                <button id="notif-clear" class="render-btn" title="Clear all" aria-label="Clear all notifications">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>
+                </button>
+                <button id="notif-close" class="render-btn" title="Close" aria-label="Close notifications">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
         </div>
         <div id="notif-list"></div>
     </div>
