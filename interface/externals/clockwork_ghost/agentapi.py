@@ -314,19 +314,26 @@ async def fetch_turns(client, base: str, key: str):
 
 async def fetch_mood(client, base: str, key: str):
     """``(label, intensity)`` from ``/api/health``, or None when the agent did
-    not answer or sent something else: the face then keeps the look it has."""
+    not answer or sent something else: the face then keeps the look it has.
+    §4UA: ``(rest_label, "rest")`` while the mood is neutral and the
+    character's resting point is not."""
     try:
         r = await client.get(f"{base}/api/health", headers=headers(key))
         if r.status_code != 200:
             return None
         mood = r.json().get("mood")
         label, n = mood.get("label"), mood.get("intensity")
+        rest = mood.get("rest")
     except Exception:  # noqa: BLE001
         return None
     if not (isinstance(label, str) and re.fullmatch(r"[a-z]{1,24}", label)):
         return None
     if not (isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 3):
         return None
+    # §4UA: while the mood is neutral, the character's resting point at the faint
+    # 'rest' strength (the web UI's status.js `faceMoodFrom` does the same)
+    if n == 0 and isinstance(rest, str) and rest != "neutral" and re.fullmatch(r"[a-z]{1,24}", rest):
+        return rest, "rest"
     return label, n
 
 

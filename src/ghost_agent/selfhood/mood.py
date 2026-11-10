@@ -181,6 +181,33 @@ def decay_step_s(magnitude: float, level: int) -> float:
     return HALF_LIFE_S * math.log2(m / bound)
 
 
+# ── the resting point (§4UA) ────────────────────────────────────────────────
+#
+# The character (the Mirror's sentence) sets where the pair rests: the numbers
+# a reader sees settle at ``rest`` instead of at 0. The store keeps the DEVIATION from the
+# rest and decays it toward 0 exactly as before; the label and the level are
+# read off the deviation alone, exactly as before, and a reader sees the
+# numbers ``rest + deviation``. The rest SHOWS (numbers, face, introspect);
+# it never changes which mood is heard or how strongly (operator 11-10, after
+# five review rounds of a rest that tilted the level, each MAJOR inside the
+# last fix).
+
+#: the largest |rest| on either axis: under the lowest bound a held level is
+#: kept down to (``INTENSITY_THRESHOLDS[0] - INTENSITY_MARGIN`` = 0.16), so the
+#: numbers shown at rest never look like a mood anyone hears.
+REST_MAX = 0.12
+
+
+def rest_clamp(rest) -> Tuple[float, float]:
+    """A resting point as two numbers in [-REST_MAX, REST_MAX]; anything
+    unreadable is (0, 0)."""
+    try:
+        rp, re_ = rest
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    return (max(-REST_MAX, min(REST_MAX, clamp(rp))), max(-REST_MAX, min(REST_MAX, clamp(re_))))
+
+
 def read_off(p: float, e: float, *, held_label: str = "", held_intensity: int = 0,
              novelty: bool = False) -> Tuple[str, int, bool]:
     """``(label, intensity, novelty)`` for a pair, given what was held."""

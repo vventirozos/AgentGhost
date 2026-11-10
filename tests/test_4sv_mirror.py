@@ -1,5 +1,6 @@
 """§4SV / §4SV-b: the Mirror — a daily I-sentence (toy strange loop) on the main model at background
-priority; the latest sentence is one line of `introspect` and reaches no prompt on its own."""
+priority; the latest sentence is one line of `introspect` (and, §4TZ, of the owner's state block —
+tests/test_4tz_mirror_loop.py)."""
 import asyncio
 import datetime
 import json
@@ -20,6 +21,8 @@ class _LLM:
 
     async def chat_completion(self, payload, **kw):
         self.calls.append((payload, kw))
+        if "temperament rest" in payload["messages"][-1]["content"]:     # §4UA: the resting-point question
+            return {"choices": [{"message": {"content": "0 0"}}]}
         return {"choices": [{"message": {"content": self.content}}]}
 
 
@@ -233,14 +236,16 @@ def test_registered_as_an_idle_job_with_a_purpose():
     assert "mirror" in A.IDLE_JOB_PURPOSE
 
 
-def test_the_sentence_reaches_introspect_and_nothing_else():
+def test_the_sentence_reaches_introspect_and_the_owner_state_block_only():
     """§4SV-b: the idle phase and the command (core/agent.py) and the one
     `introspect` line (tools/introspect.py) are the module's only importers —
-    no prompt builder, no state block, no memory writer. Read from the syntax
-    tree: an import in a comment or a string is not an import."""
+    no prompt builder, no memory writer. §4TZ: the state-block reader
+    (`self_image_section` / `self_image_block`) is named by core/agent.py and nowhere else (its one
+    owner-gated section). Read from the syntax tree: an import in a comment
+    or a string is not an import."""
     import ast
     src = Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
-    importers, taken, namers = set(), {}, set()
+    importers, taken, namers, block_namers = set(), {}, set(), set()
     for p in src.rglob("*.py"):
         rel = str(p.relative_to(src))
         tree = ast.parse(p.read_text(encoding="utf-8"))
@@ -261,12 +266,18 @@ def test_the_sentence_reaches_introspect_and_nothing_else():
                      else n.name if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.alias)) else "")
             if ident in ("self_image_line", "_self_image"):
                 namers.add(rel)
-    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py", "memory/experience.py"}
+            if ident in ("self_image_block", "self_image_section", "_self_image_block"):
+                block_namers.add(rel)
+    # §4UA: main.py attaches the character's resting point to the mood (`rest_pair`)
+    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py", "memory/experience.py",
+                                                 "main.py"}
     assert taken["tools/introspect.py"] == {"home_from_memory_dir", "self_image_line"}   # the one-line reader only
     # §4SZ: the experience store asks whether a message is the "mirror" COMMAND (a system command is
     # not an experience) — the matcher only, nothing that reads the diary
     assert taken["memory/experience.py"] == {"is_mirror_command"}
     assert namers == {"selfhood/mirror.py", "tools/introspect.py"}
+    assert block_namers == {"selfhood/mirror.py", "core/agent.py"}
+    assert "self_image_section" in taken["core/agent.py"]
 
 
 # ── the idle phase (review m5) ──────────────────────────────────────────────
@@ -287,11 +298,13 @@ def test_phase_looks_once_then_waits_for_its_cooldown(home):
     asyncio.run(a._mirror_phase(ctx, ran, notes))
     assert ran == ["mirror"] and notes["mirror"].startswith("new I-sentence")
     ran2, notes2 = [], {}
+    # §4UA: one look = the sentence call + the resting-point question
+    assert len(llm.calls) == 2 and "temperament rest" in llm.calls[1][0]["messages"][1]["content"]
     asyncio.run(a._mirror_phase(ctx, ran2, notes2))          # inside the hour: nothing
-    assert ran2 == [] and len(llm.calls) == 1
+    assert ran2 == [] and len(llm.calls) == 2
     a._last_mirror_try_at = datetime.datetime.min             # hour passed, same day: not listed
     asyncio.run(a._mirror_phase(ctx, ran2, notes2))
-    assert ran2 == [] and len(llm.calls) == 1
+    assert ran2 == [] and len(llm.calls) == 2
 
 
 def test_phase_books_a_deferred_call_and_survives(home):
@@ -449,12 +462,13 @@ def _hours(got):
     return sorted(int(g["text"].split("h:")[0].split()[-1]) for g in got)
 
 
-def test_pick_replies_takes_three_different_ones_at_random(tmp_path, monkeypatch):
-    _pool(monkeypatch, range(1, 9))
+def test_pick_replies_takes_six_different_ones_at_random(tmp_path, monkeypatch):
+    """§4TZ: six per look (was three)."""
+    _pool(monkeypatch, range(1, 13))
     draws = set()
     for seed in range(20):
         got = M.pick_replies(tmp_path, now=NOW, rng=random.Random(seed))
-        assert len(got) == M.REPLIES_PER_LOOK == 3 and len({g["at"] for g in got}) == 3
+        assert len(got) == M.REPLIES_PER_LOOK == 6 and len({g["at"] for g in got}) == 6
         draws.add(tuple(_hours(got)))
     assert len(draws) > 5                                      # a draw, not the first three of the window
 
@@ -518,7 +532,7 @@ def test_banner_lists_the_replies_of_the_latest_look(tmp_path):
     assert len(lines) == 3 and lines[1] == ">"
     assert lines[0].startswith("> (2026-11-05 ") and lines[0].endswith("the weather…")
     assert lines[2].startswith("> (2026-11-05 ") and lines[2].endswith("the index build…")
-    assert "My latest sentence is a line in what I read when you ask how I am" in b
+    assert "My latest sentence is in what I read before every reply to you" in b
 
 
 def test_self_image_line(tmp_path):

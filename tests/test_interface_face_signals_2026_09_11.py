@@ -94,6 +94,8 @@ class TestFacePureHelpers:
         fns = ("let targetMoodHue = 0, _moodLive = null; const moodLook = () => null;\n" + _fn(graph_js, "moodHueFor") + "\n"
                + _fn(graph_js, "moodHueScale") + "\n" + _fn(graph_js, "setMoodHue"))
         assert eval_js(fns, "[1, 2, 3, 0, null, undefined, 'x', 9].map(moodHueScale)") == [0.5, 1, 1.5, 1, 1, 1, 1, 1]
+        assert eval_js(fns, "moodHueScale('rest')") == 0.25                     # §4UA: the resting point
+        assert eval_js(fns, "setMoodHue('irritable', 'rest')") == pytest.approx(0.01125)
         got = eval_js(fns, "[setMoodHue('irritable', 1), setMoodHue('irritable', 2), setMoodHue('irritable', 3),"
                            " setMoodHue('irritable'), setMoodHue('tired', 3), setMoodHue('neutral', 0),"
                            " setMoodHue(null, null)]")
@@ -323,9 +325,25 @@ class TestStatusFeedsTheFace:
         assert "feedFace();" in status_js[i:i + 900]
         i = status_js.index("async function feedFace()")
         body = status_js[i:i + 900]
-        assert "face.setMoodHue(health && health.mood ? health.mood.label : null," in body
-        assert "health && health.mood ? health.mood.intensity : null);" in body        # §4TC
+        # §4UA: the label and intensity go through `faceMoodFrom` (executed below)
+        assert "const fm = faceMoodFrom(health && health.mood);" in body and "face.setMoodHue(fm[0], fm[1]);" in body
         assert "fetch('/api/turns'" in body and "face.setBackgroundBusy(backgroundBusyFrom(data, mine))" in body
+
+    def test_the_face_shows_the_mood_or_while_neutral_the_resting_point(self, status_js):
+        """§4UA: executed. A mood wins; a neutral mood with a resting point shows the rest at 'rest'; a neutral
+        rest, a missing one, a non-string one or no mood at all is the plain mood (null for no mood)."""
+        fn = _fn(status_js, "faceMoodFrom")
+        out = eval_js(fn, """[
+            faceMoodFrom({label: 'irritable', intensity: 2, rest: 'calm'}),
+            faceMoodFrom({label: 'neutral', intensity: 0, rest: 'calm'}),
+            faceMoodFrom({label: 'neutral', intensity: 0, rest: 'neutral'}),
+            faceMoodFrom({label: 'neutral', intensity: 0}),
+            faceMoodFrom({label: 'neutral', intensity: 0, rest: 7}),
+            faceMoodFrom({label: 'neutral', intensity: 0, rest: ''}),
+            faceMoodFrom(null),
+        ]""")
+        assert out == [["irritable", 2], ["calm", "rest"], ["neutral", 0], ["neutral", 0], ["neutral", 0],
+                       ["neutral", 0], [None, None]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -354,10 +372,11 @@ class TestHealthCarriesMood:
                                                     held_until="2026-09-12T02:00:00Z"))
         assert body["mood"] == {"label": "irritable", "intensity": 2, "manner": "sarcastic",
                                 "set_at": "2026-09-11T10:00:00Z", "source": "owner",
-                                "cause": "the owner said so (set_mood)", "held_until": "2026-09-12T02:00:00Z"}
+                                "cause": "the owner said so (set_mood)", "held_until": "2026-09-12T02:00:00Z",
+                                "rest": "neutral"}
         body = self._health(lambda: SimpleNamespace(label="bored", intensity=1, manner="", source="auto", set_at=""))
         assert body["mood"] == {"label": "bored", "intensity": 1, "manner": "", "set_at": "", "source": "auto",
-                                "cause": "", "held_until": ""}
+                                "cause": "", "held_until": "", "rest": "neutral"}
 
     def test_the_cause_is_capped_and_a_neutral_mood_has_none(self):
         """§4TX: the chip's tooltip says why — in the system's own words, capped."""
@@ -369,7 +388,7 @@ class TestHealthCarriesMood:
         assert (body["mood"]["cause"], body["mood"]["held_until"]) == ("", "")
 
     NEUTRAL = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
-               "held_until": ""}
+               "held_until": "", "rest": "neutral"}
 
     def test_a_neutral_mood_keeps_the_manner_and_names_no_owner(self):
         body = self._health(lambda: SimpleNamespace(label="neutral", intensity=0, manner="formal",
@@ -388,7 +407,7 @@ class TestHealthCarriesMood:
     def test_an_out_of_range_intensity_is_brought_into_range(self):
         body = self._health(lambda: SimpleNamespace(label="tired", intensity=9, manner=None, source="x", set_at=None))
         assert body["mood"] == {"label": "tired", "intensity": 3, "manner": "", "set_at": "", "source": "auto",
-                                "cause": "", "held_until": ""}
+                                "cause": "", "held_until": "", "rest": "neutral"}
 
     def test_the_real_state_thread_feeds_the_endpoint(self, tmp_path):
         from ghost_agent.selfhood import SelfModel
@@ -410,9 +429,9 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=19.18" in index and "style.css?v=8.7" in index
-    assert "matrix_graph.js?v=19.18" in app and "workspace.js?v=9.6" in app
-    assert "status.js?v=7.8" in ws and "palette.js?v=7.6" in ws
+    assert "app.js?v=19.19" in index and "style.css?v=8.7" in index
+    assert "matrix_graph.js?v=19.19" in app and "workspace.js?v=9.7" in app
+    assert "status.js?v=7.9" in ws and "palette.js?v=7.6" in ws
 
 
 def test_the_chip_tooltip_names_the_mood_its_cause_and_the_manner(status_js):

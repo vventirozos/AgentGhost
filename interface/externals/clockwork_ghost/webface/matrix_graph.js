@@ -1208,12 +1208,13 @@ const MOOD_LOOKS = {
         bright: 1.05, hue: 0, drift: 1.5, heat: 0.3, droop: 0, gap: 0.5, doze: 0, react: 1.3 },
 };
 // Share of the look at each intensity: 1 barely there, 2 clear, 3 unmistakable.
-const MOOD_STRENGTH = { 1: 0.35, 2: 0.7, 3: 1 };
+// §4UA: 'rest' — the character's resting point while the mood is neutral, fainter than a 1.
+const MOOD_STRENGTH = { 1: 0.35, 2: 0.7, 3: 1, rest: 0.15 };
 // Pure. An unknown label or intensity 0 is neutral; an absent intensity reads as 2.
 export function moodLook(label, intensity) {
     const key = String(label || '').toLowerCase();
     const look = Object.prototype.hasOwnProperty.call(MOOD_LOOKS, key) ? MOOD_LOOKS[key] : null;
-    const n = intensity == null ? 2 : Number(intensity);
+    const n = intensity == null ? 2 : intensity === 'rest' ? 'rest' : Number(intensity);
     const k = MOOD_STRENGTH[n];
     if (!look || !k) return MOOD_NEUTRAL;
     const out = {};
@@ -1254,6 +1255,7 @@ export function moodHueFor(label) {
     }
 }
 export function moodHueScale(intensity) {
+    if (intensity === 'rest') return 0.25;          // §4UA: the resting point, a quarter of a 2
     const n = Number(intensity);
     return n === 1 ? 0.5 : n === 3 ? 1.5 : 1.0;      // 2, absent or unreadable → as given
 }

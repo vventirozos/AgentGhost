@@ -751,6 +751,21 @@ def _effort_default_known() -> str:
         return ""
 
 
+def _rest_label(state) -> str:
+    """§4UA: the region of the mood's resting point ("neutral" at (0, 0), with
+    no state, or when unreadable) — a label the face already has a look for."""
+    try:
+        from ..selfhood import mood as _M
+        rp, re_ = state.rest()
+        if not (rp or re_):
+            return "neutral"
+        got = _M.region(float(rp), float(re_))
+        # review r1 m2: a character that is only unhurried is not bored — boredom is a quiet, not a temperament
+        return "calm" if got == _M.BORED else got
+    except Exception:  # noqa: BLE001 — health must never raise
+        return "neutral"
+
+
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
 async def api_health(request: Request):
     """Runtime introspection for the operator + NetMon + the RSS supervisor
@@ -834,7 +849,7 @@ async def api_health(request: Request):
     # ("auto" | "owner"). A read — it never moves the mood. getattr-chained
     # so a mock or a boot without a self-model can never 500 the endpoint.
     mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
-            "held_until": ""}
+            "held_until": "", "rest": "neutral"}
     try:
         _st = getattr(getattr(context, "self_model", None), "state", None)
         _read = getattr(_st, "mood", None)
@@ -850,10 +865,12 @@ async def api_health(request: Request):
                     "source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto",
                     # §4TX: why, in the system's own words (never a message), and the owner's hold
                     "cause": str(getattr(_m, "cause", "") or "")[:200] if _n else "",
-                    "held_until": str(getattr(_m, "held_until", "") or "") if _n else ""}
+                    "held_until": str(getattr(_m, "held_until", "") or "") if _n else "",
+                    # §4UA: where the mood rests (the character) — the face shows it faintly while neutral
+                    "rest": _rest_label(_st)}
     except Exception:  # noqa: BLE001 — health must never raise
         mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
-            "held_until": ""}
+            "held_until": "", "rest": "neutral"}
 
     # §4RQ: seconds the main slot is still kept for the conversation that last
     # used it (§4RP, GHOST_SLOT_KEEP_S); 0 when nothing owns it. Read by

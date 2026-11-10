@@ -12676,6 +12676,71 @@ def _mood_tone_block(context) -> str:
         return ""
 
 
+def self_image_is_heard_on_this_request(context) -> bool:
+    """§4TZ: does this reply carry the Mirror's self-image? Only a reply to the
+    OWNER on a private surface (operator 11-10: "owner only" — the sentence is
+    drawn from the owner's replies alone), and a probe of one (it must see
+    what a real owner turn sees). NOT a member (a member's probe included), a
+    public channel, a scheduled task, a job wake, a sub-agent, self-play, a
+    bench or replay run, a coding leaf or a contained copy."""
+    try:
+        from ..utils.logging import request_kind as _rk
+        if _rk() not in ("owner", "probe"):
+            return False
+        if requester_is_member() or reply_is_public():
+            return False
+        return not _mood_run_is_contained(context)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: §4TZ (review r1): per request, the self-image section its FIRST turn heard —
+#: frozen, so a look that lands mid-request (background priority, already
+#: generating when the request arrived) or a transient unreadable diary never
+#: shows the model two self-portraits or "no longer applies". The turn record
+#: carries which sentence (its date) the reply heard. Bounded; in memory.
+_SELF_IMAGE_BY_REQ: "collections.OrderedDict[str, Tuple[str, str, float]]" = collections.OrderedDict()
+#: a frozen section older than this is not the same request: a client may send
+#: its own X-Request-ID, and one reused for a later request must not keep an
+#: old sentence (longer than the longest request, §4RA's 180-min ceiling)
+_SELF_IMAGE_FREEZE_S = 4 * 3600
+
+
+def self_image_heard(req_id: str) -> str:
+    """The date of the Mirror sentence request ``req_id`` heard ("" = none)."""
+    with _MOOD_MEMO_LOCK:
+        got = _SELF_IMAGE_BY_REQ.get(str(req_id or ""))
+        return got[1] if got and got[0] else ""
+
+
+def _self_image_block(context) -> str:
+    """§4TZ: the Mirror's latest sentence as a section of the per-turn state
+    block, after the cached head (never the system slot, never a tool
+    description) — the return path of the strange loop. "" (zero bytes)
+    when this request does not hear it or there is no sentence yet. The
+    same bytes on every turn of a request (frozen at its first turn)."""
+    try:
+        if not self_image_is_heard_on_this_request(context):
+            return ""
+        req_id = str(request_id_context.get() or "")
+        if req_id:
+            with _MOOD_MEMO_LOCK:
+                got = _SELF_IMAGE_BY_REQ.get(req_id)
+            if got is not None and time.monotonic() - got[2] < _SELF_IMAGE_FREEZE_S:
+                return got[0]
+        from ..selfhood.mirror import home_from_memory_dir, self_image_section
+        text, date = self_image_section(home_from_memory_dir(getattr(context, "memory_dir", None)))
+        if req_id:
+            with _MOOD_MEMO_LOCK:
+                _SELF_IMAGE_BY_REQ[req_id] = (text, date, time.monotonic())
+                _SELF_IMAGE_BY_REQ.move_to_end(req_id)
+                while len(_SELF_IMAGE_BY_REQ) > _MOOD_MEMO_MAX:
+                    _SELF_IMAGE_BY_REQ.popitem(last=False)
+        return text
+    except Exception:  # noqa: BLE001 — a state block never breaks a turn
+        return ""
+
+
 def _defuse_rule_text(text: str) -> str:
     """No chat-template control tokens inside an injected rule (§4MB)."""
     return re.sub(r"<\|[^|>]{0,40}\|>", "", str(text or ""))
@@ -14643,9 +14708,10 @@ class GhostAgent:
         # Phase 2.8c (§4SV): the Mirror — a toy strange loop. Once a day the
         # main model rewrites the agent's one-sentence self-description from
         # its earlier sentences plus a few of the owner's replies. §4SV-b: the
-        # latest sentence is one line of `introspect` (overview, summary) and
-        # in no prompt otherwise; the owner's `mirror` command shows the
-        # diary. The MAIN model at background priority (operator: the model that
+        # latest sentence is one line of `introspect` (overview, summary);
+        # §4TZ: and one section of the state block of every owner reply on a
+        # private surface (`_self_image_block`); the owner's `mirror` command
+        # shows the diary. The MAIN model at background priority (operator: the model that
         # wrote the replies reads them); the conversation is saved first
         # (§4RV). Listed on the Idle Cycle line only when it looked.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
@@ -32124,6 +32190,7 @@ class GhostAgent:
                         _ds_parts.append(("owner_rule_command", f"### OWNER RULE COMMAND\n{_owner_rule_note_ctx.get()}\n\n"))
                     _ds_parts.append(("owner_rules", _owner_rules_block(self.context)))    # §4NA
                     _ds_parts.append(("mood_tone", _mood_tone_block(self.context)))        # §4TC
+                    _ds_parts.append(("self_image", _self_image_block(self.context)))      # §4TZ
                     try:
                         from .prompts import build_project_briefing
                         _proj_store = getattr(self.context, "project_store", None)
@@ -36897,6 +36964,9 @@ class GhostAgent:
         _heard = mood_tone_heard(req_id or "")
         if _heard:
             _extra["mood_tone"] = _heard
+        _si = self_image_heard(req_id or "")                    # §4TZ: which Mirror sentence it heard
+        if _si:
+            _extra["self_image"] = _si
         # §4OG-2 (b): the DELIVERABLE decides before any shape rule — a green
         # last run, or a file this turn wrote that the reply hands over
         try:

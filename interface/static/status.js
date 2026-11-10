@@ -167,6 +167,15 @@ export function initStatus(_ctx) {
     // is NOT ours holds the lock (a dream / self-play turn → a second,
     // slower breath at the edge). Pure decision in `backgroundBusyFrom`;
     // executed under node.
+    // §4UA: what the face shows of the mood — the mood itself, or, while it is
+    // neutral, the character's resting point at the faint 'rest' strength.
+    function faceMoodFrom(mood) {
+        if (!mood) return [null, null];
+        if (!mood.intensity && typeof mood.rest === 'string' && mood.rest && mood.rest !== 'neutral') {
+            return [mood.rest, 'rest'];
+        }
+        return [mood.label, mood.intensity];
+    }
     function backgroundBusyFrom(turnsPayload, mySessionId) {
         const turns = (turnsPayload && Array.isArray(turnsPayload.turns)) ? turnsPayload.turns : [];
         return turns.some(t => t && t.running && (t.session_id || null) !== (mySessionId || null));
@@ -179,8 +188,8 @@ export function initStatus(_ctx) {
         if (!face) return;
         try {
             if (typeof face.setMoodHue === 'function') {
-                face.setMoodHue(health && health.mood ? health.mood.label : null,
-                                health && health.mood ? health.mood.intensity : null);
+                const fm = faceMoodFrom(health && health.mood);
+                face.setMoodHue(fm[0], fm[1]);
             }
             if (typeof face.setBackgroundBusy === 'function') {
                 const res = await fetch('/api/turns', { signal: AbortSignal.timeout(6000) });

@@ -34,7 +34,7 @@ import datetime
 import json
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -101,6 +101,13 @@ _SAME_QUIET_S = 60.0
 _BORED_SCAN_ROWS = 50
 
 
+def _shown(dev: float, r: float) -> float:
+    """§4UA: a number as readers see it — rest + deviation, clamped. At rest
+    0 exactly the old ``round(dev, 4)`` (review r2: ``clamp(-0.0 + 0.0)``
+    wrote ``0.0`` where the journal had ``-0.0``)."""
+    return round(dev, 4) if r == 0.0 else round(M.clamp(dev + r), 4)
+
+
 def _iso(now: Optional[datetime.datetime]) -> str:
     """The on-disk timestamp for ``now`` (None = the wall clock)."""
     if now is None:
@@ -129,6 +136,10 @@ class MoodView:
     #: the manner's steps still ahead, ``(on-disk stamp, level from then)``,
     #: the last one the end of its day (§4TS); () with no manner
     manner_steps: Tuple[Tuple[str, int], ...] = ()
+    #: §4UA review r2: what an event really moved the STORED pair by (the
+    #: deviation; ``p``/``e`` above are rest + deviation, clamped) — set on
+    #: ``nudge``'s after-view only; the reaction ledger books this
+    moved: Tuple[float, float] = field(default=(0.0, 0.0), compare=False, repr=False)
 
     @property
     def neutral(self) -> bool:
@@ -189,6 +200,9 @@ class SelfStateThread:
         #: (start of the quiet as a timestamp, highest boredom level the
         #: journal has a row for) — what `_note_bored` last worked out
         self._bored_seen: Optional[Tuple[float, int]] = None
+        #: §4UA: where the pair rests — attached by the process that owns the
+        #: Mirror (``main.py``); None = rest at (0, 0), as before
+        self._rest_fn: Optional[Callable[[], Tuple[float, float]]] = None
 
     # -----------------------------------------------------------------
     # Persistence
@@ -253,6 +267,22 @@ class SelfStateThread:
         state file (``last_owner_turn_at``)."""
         self._quiet_fn = quiet_fn if callable(quiet_fn) else None
 
+    def attach_rest(self, rest_fn: Optional[Callable[[], Tuple[float, float]]]) -> None:
+        """§4UA: give the thread its resting point — the character's, read
+        from the Mirror. The thread only READS it, on every read of the pair."""
+        self._rest_fn = rest_fn if callable(rest_fn) else None
+
+    def rest(self) -> Tuple[float, float]:
+        """§4UA: the resting point now, clamped (``M.rest_clamp``); (0, 0)
+        when none is attached or it cannot be read — never raises."""
+        fn = self._rest_fn
+        if fn is None:
+            return 0.0, 0.0
+        try:
+            return M.rest_clamp(fn())
+        except Exception:  # noqa: BLE001 — the rest never costs the mood
+            return 0.0, 0.0
+
     def quiet_seconds(self, *, now: Optional[datetime.datetime] = None) -> Optional[float]:
         """How long the owner has been quiet, or None when nobody knows.
         Measured from the PERSISTED stamp of the last owner turn, so a
@@ -285,7 +315,9 @@ class SelfStateThread:
         """What the stored pair is worth at ``now``: ``(p, e, label,
         intensity, novelty)``. Pure — decay, then the label and intensity
         read off with what was held. (Boredom is not here: it is never a
-        value of the pair.)"""
+        value of the pair.) §4UA: ``p, e`` are the DEVIATION from the
+        resting point (what is stored); label and intensity are read off it
+        alone, as before — the rest only moves the numbers a reader sees."""
         if stored is None:
             return 0.0, 0.0, M.NEUTRAL, 0, False
         # an age that cannot be established is not "now": the pair is
@@ -367,10 +399,11 @@ class SelfStateThread:
         — the mood a member or a public channel hears: the part the owner's
         own sentiment put in the pair is left out, and so is the cause."""
         stored = self._state.mood
+        rest = self.rest()                       # §4UA: shown numbers only
         p, e, label, n, _nov = self._evolve(stored, now)
         held = self._held_until(stored, now)
         base = dict(
-            p=round(p, 4), e=round(e, 4),
+            p=_shown(p, rest[0]), e=_shown(e, rest[1]),
             recent=tuple(dict(r) for r in (stored.recent if stored is not None else ())),
             held_until=(_iso(held) if held is not None else ""),
             **self._manner_now(stored, now),
@@ -389,7 +422,7 @@ class SelfStateThread:
             o_label, o_n, _ = M.read_off(q_p, q_e, held_label=("" if shared else stored.label),
                                          held_intensity=(0 if shared else stored.intensity),
                                          novelty=stored.novelty)
-            base.update(p=round(q_p, 4), e=round(q_e, 4), recent=())
+            base.update(p=_shown(q_p, rest[0]), e=_shown(q_e, rest[1]), recent=())
             if o_n == 0:
                 return MoodView(**base)
             same = (o_label, o_n) == (label, n) and not shared
@@ -441,8 +474,10 @@ class SelfStateThread:
             return
         try:
             self.mood_history_path.parent.mkdir(parents=True, exist_ok=True)
+            rp, re_ = self.rest()                # §4UA: the pair as read (rest + deviation)
             rec = {"label": m.label, "intensity": m.intensity,
-                   "p": round(m.p, 3), "e": round(m.e, 3),
+                   "p": round(m.p if rp == 0.0 else M.clamp(m.p + rp), 3),
+                   "e": round(m.e if re_ == 0.0 else M.clamp(m.e + re_), 3),
                    "at": m.set_at, "cause": m.cause, "kind": kind}
             if note:
                 rec["note"] = note
@@ -688,7 +723,8 @@ class SelfStateThread:
         twice when nothing was applied."""
         with self._lock:
             base = self._settle_locked(now)
-            before = self._view_of(base, now)
+            rest = self.rest()                   # §4UA: one rest for both views of the event
+            before = self._view_of(base, now, rest)
             try:
                 dp, de = float(dp), float(de)
             except (TypeError, ValueError):
@@ -735,7 +771,7 @@ class SelfStateThread:
             self._append_event_locked(kind=kind, cause=cause, dp=dp, de=de, after=self._describe(new), now=now)
             if changed:
                 self._append_history_locked(new, str(kind or ""), prev=before.describe())
-            return before, self._view_of(new, now)
+            return before, self._view_of(new, now, rest, moved=(round(p - base.p, 4), round(e - base.e, 4)))
 
     @staticmethod
     def _describe(m: Mood) -> str:
@@ -782,10 +818,12 @@ class SelfStateThread:
         return dict(manner=m.manner, manner_intensity=level, manner_set_at=m.manner_set_at,
                     manner_steps=ahead)
 
-    @classmethod
-    def _view_of(cls, m: Mood, now: Optional[datetime.datetime] = None) -> MoodView:
+    def _view_of(self, m: Mood, now: Optional[datetime.datetime] = None, rest=None,
+                 moved: Tuple[float, float] = (0.0, 0.0)) -> MoodView:
+        cls = type(self)
+        rp, re_ = self.rest() if rest is None else rest   # §4UA: a reader sees rest + deviation
         return MoodView(
-            label=m.label, intensity=m.intensity, p=round(m.p, 4), e=round(m.e, 4),
+            label=m.label, intensity=m.intensity, p=_shown(m.p, rp), e=_shown(m.e, re_), moved=moved,
             source=(m.source if m.intensity else M.SOURCE_AUTO), set_at=m.set_at,
             cause=(m.cause if m.intensity else ""),
             recent=tuple(dict(r) for r in m.recent),
@@ -812,6 +850,7 @@ class SelfStateThread:
             base = self._settle_locked(now)
             before = self._view_of(base, now)
             n = max(1, min(3, int(intensity)))
+            # §4UA: the anchor IS the deviation — the label and level read off it are the ones the owner named
             p, e = M.anchor_for(direction, n)
             at = _iso(now)
             changed = (label, n) != (base.label, base.intensity)

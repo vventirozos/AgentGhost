@@ -277,6 +277,12 @@ class SelfModel:
         if self.enabled and self.state is not None:
             self.state.attach_owner_clock(quiet_fn)
 
+    def attach_rest(self, rest_fn) -> None:
+        """§4UA: where the mood rests — the character's resting point, read
+        from the Mirror (``mirror.rest_pair``). The mood only reads it."""
+        if self.enabled and self.state is not None:
+            self.state.attach_rest(rest_fn)
+
     def _apply(self, ev: Optional["M.Event"], *, now=None) -> Optional[MoodView]:
         """Put one event through ``SelfStateThread.nudge``. Never raises —
         the mood is secondary to everything."""
@@ -447,7 +453,8 @@ class SelfModel:
                     # held after all (the owner set the mood in between): nothing booked
                     return None, 0.0, (self.state.hold_reason(now=now, arrived=arrived)
                                        or self.HELD_ALREADY_COUNTED)
-                ap, ae = round(after.p - before.p, 4), round(after.e - before.e, 4)
+                # §4UA review r2: the STORED move, not the views' (rest + deviation clamps at ±1)
+                ap, ae = after.moved
                 if ev.kind == M.KIND_SENTIMENT:
                     # review r5/r6: book what the state really stored — the change scaled by what the clamp
                     # let through, on top of what was booked

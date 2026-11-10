@@ -1333,8 +1333,30 @@ def _render_mood(self_model) -> str:
     elif not public:
         lines.append("Today: no change so far.")
     lines.append(mood_tone_text(view, audience=("public" if public else "owner")))
+    if not public:
+        rest = resting_point_text(state)
+        if rest:
+            lines.append(rest)
     lines.append(MOOD_HOW_IT_MOVES)
     return "\n".join(lines)
+
+
+#: §4UA: how the character's resting point is described (owner's view only — it comes from the Mirror,
+#: whose sentence is drawn from the owner's conversations)
+REST_TEXT = ("Resting point (set by my character, the Mirror's sentence): with nothing happening my mood "
+             "settles at pleasantness {p:+.2f}, energy {e:+.2f} — too faint to be a mood; which mood I am in, "
+             "and how strongly, comes from what happens.")
+
+
+def resting_point_text(state) -> str:
+    """§4UA: the resting point as one line, "" at (0, 0) or when unreadable."""
+    try:
+        rp, re_ = state.rest()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not rp and not re_:
+        return ""
+    return REST_TEXT.format(p=rp, e=re_)
 
 
 #: what the mood view says when the replies get no tone line
