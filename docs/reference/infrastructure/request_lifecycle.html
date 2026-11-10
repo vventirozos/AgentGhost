@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request lifecycle — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <div class="subnav">
+      <a href="agent.html">The agent core (core.agent)</a>
+      <a href="architecture.html">System Architecture</a>
+      <a href="bus.html">Event bus (core.bus)</a>
+      <a href="how_it_works.html">One message, end to end</a>
+      <a href="isolation.html">Isolation (core.isolation)</a>
+      <a href="mandatory_tor.html">Mandatory Tor (fail-closed egress)</a>
+      <a href="prompts.html">Prompts (core.prompts)</a>
+      <a class="current" href="request_lifecycle.html">Request lifecycle</a>
+      <a href="request_scope.html">Request scope (core.request_scope)</a>
+      <a href="safety.html">Safety and privacy</a>
+      <a href="tool_registry.html">Tool registry (tools.registry)</a>
+    </div>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>Request lifecycle</h1>
+  <p class="subtitle">What happens between an HTTP <code>POST /api/chat</code> and the SSE chunk landing in the client.</p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 1000 720" xmlns="http://www.w3.org/2000/svg" font-size="11">
+      <rect width="1000" height="720" fill="#131822"/>
+      <defs><marker id="rl1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/></marker></defs>
+
+      <rect x="40" y="20" width="920" height="40" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="500" y="45" text-anchor="middle" fill="#e6e9ef">[1] Client POST /api/chat with X-Ghost-Key + OpenAI-format messages</text>
+
+      <rect x="40" y="80" width="920" height="40" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="500" y="105" text-anchor="middle" fill="#e6e9ef">[2] api/routes.py — auth, set request_id ContextVar, choose stream vs JSON</text>
+
+      <rect x="40" y="140" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="165" text-anchor="middle" fill="#e6e9ef">[3] GhostAgent.handle_chat — classify thinking budget, sampling profile</text>
+
+      <rect x="40" y="200" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="225" text-anchor="middle" fill="#e6e9ef">[4] MemoryBus.hydrate_context — owner facts (graph), experience, history, fused by RRF with hand-tuned intent weights</text>
+
+      <rect x="40" y="260" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="500" y="285" text-anchor="middle" fill="#e6e9ef">[5] tools.registry.get_active_tool_definitions — base tools + dynamic acquired skills</text>
+
+      <rect x="40" y="320" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="500" y="345" text-anchor="middle" fill="#e6e9ef">[6] ContextManager.compress_if_needed — L0..L4 progressive compression as required</text>
+
+      <rect x="40" y="380" width="920" height="40" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="500" y="405" text-anchor="middle" fill="#e6e9ef">[7] LLMClient.chat_completion(stream=True) — circuit-breaker filtered, round-robin pool</text>
+
+      <rect x="40" y="440" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="465" text-anchor="middle" fill="#e6e9ef">[8] Stream loop — accumulate &lt;tool_call&gt;XML, parse args, dispatch tool</text>
+
+      <rect x="40" y="500" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="500" y="525" text-anchor="middle" fill="#e6e9ef">[9] tool_failure.classify → retry / fatal / diagnostic / unknown — fold result back</text>
+
+      <rect x="40" y="560" width="920" height="40" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="500" y="585" text-anchor="middle" fill="#e6e9ef">[10] Verifier.verify_* (worker pool) — confirm/refute substantive evidence</text>
+
+      <rect x="40" y="620" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="645" text-anchor="middle" fill="#e6e9ef">[11] Final SSE chunk + DONE marker</text>
+
+      <rect x="40" y="680" width="920" height="30" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="500" y="700" text-anchor="middle" fill="#e6e9ef">[12] Background: write events to journal · idle scheduler runs maintenance later</text>
+
+      <line x1="500" y1="60" x2="500" y2="80" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="120" x2="500" y2="140" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="180" x2="500" y2="200" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="240" x2="500" y2="260" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="300" x2="500" y2="320" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="360" x2="500" y2="380" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="420" x2="500" y2="440" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="480" x2="500" y2="500" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="540" x2="500" y2="560" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="600" x2="500" y2="620" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="660" x2="500" y2="680" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+    </svg>
+    <p class="caption">Figure 10 — Twelve-step request lifecycle.</p>
+  </div>
+
+  <h2>Stage details</h2>
+  <ol>
+    <li><strong>HTTP entry</strong> — <a href="../interfaces/api_routes.html">routes.py</a> validates the <code>X-Ghost-Key</code> header. Streaming responses set the <code>X-Request-ID</code> response header for correlation with the agent log.</li>
+    <li><strong>Context setup</strong> — the request_id is bound to a <code>contextvars.ContextVar</code> so log lines from inside tool calls inherit it.</li>
+    <li><strong>Sampling decision</strong> — <a href="agent.html"><code>get_sampling_params</code></a> picks coding vs general profile; <a href="agent.html"><code>classify_thinking_budget</code></a> picks tight or extended (the <code>selfplay</code> budget no longer exists).</li>
+    <li><strong>Hydration</strong> — see <a href="../memory/memory_hydration.html">memory hydration (RRF)</a>.</li>
+    <li><strong>Tool list</strong> — built per-turn so semantic skill routing reflects the current query.</li>
+    <li><strong>Compression</strong> — <a href="../performance/context_manager.html">ContextManager</a> decides how aggressively to summarise, only escalating beyond L0 if the budget is &gt; 60 % full.</li>
+    <li><strong>Upstream call</strong> — chat completion streamed back through <a href="../performance/llm.html">LLMClient</a>; circuit breaker skips OPEN nodes.</li>
+    <li><strong>Tool dispatch</strong> — XML tool blocks parsed; the registry's bound async lambda runs the tool inside the Docker sandbox.</li>
+    <li><strong>Failure handling</strong> — <a href="../reliability/tool_failure.html">tool_failure.classify</a> + retry/replan/diagnostic; <a href="../reliability/fallback_chains.html">fallback_chains</a> may surface alternative tools.</li>
+    <li><strong>Verification</strong> — only invoked on substantive tool output (skips bookkeeping tools).</li>
+    <li><strong>Final response</strong> — streamed as-is. (Until §4NN an <code>UncertaintyTracker</code> risk summary — <em>Assumptions I made</em> — could be appended, and a critical unknown stopped the turn with a clarifying question; both were removed with the tracker.)</li>
+    <li><strong>Background</strong> — events appended to the journal; the idle scheduler later files them into memory (memory journal) and, after longer quiet, runs the <a href="../memory/dream_cycle.html">maintenance cycle</a>.</li>
+  </ol>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2>Marking a diagnostic request (§4FB)</h2>
+  <p>Alongside <code>X-Request-ID</code>, <code>POST /api/chat</code> honours
+  <code>X-Ghost-Origin: probe</code>: the route prefixes the request id with
+  <code>probe-</code> (keeping a client-supplied id under it, never doubling an existing
+  prefix), <code>turn_origin</code> answers <code>"probe"</code>, and the turn runs the
+  full live path without teaching, crediting retrievals or
+  being reflected on. Use it for every operator/Claude probe &mdash; a probe that taught
+  once became playbook lesson 49.</p>
+  <p>The companion endpoint <code>POST /api/lessons/quarantine</code> was removed with the lesson store on 2026-11-06 (§4TD).</p>
+
+</main>
+</body>
+</html>

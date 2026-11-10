@@ -4,36 +4,38 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ghost Agent — a self-hosted AI agent</title>
-<meta name="description" content="Ghost Agent is a self-hosted AI agent. It runs on your own hardware, remembers what you tell it, does the work in a sandbox, and checks its own answers.">
+<meta name="description" content="Ghost Agent is a self-hosted AI agent on four machines at home: it talks, listens, searches the web and the dark web over Tor, draws, remembers, codes in a sandbox, runs its own labs and has a mood.">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
 <aside class="sidebar">
-  <h1>Ghost Agent</h1>
+  <a class="brand" href="index.html"><span class="mark"></span>Ghost Agent</a>
   <nav>
-    <h3>Start here</h3>
-    <a class="current" href="index.html">What Ghost Agent is</a>
-    <a href="getting-started.html">Install and run it</a>
-    <a href="interfaces.html">Interfaces</a>
-
-    <h3>How it works</h3>
-    <a href="how-it-works.html">One message, end to end</a>
-    <a href="memory.html">What it remembers</a>
-    <a href="tools.html">What it can do</a>
-    <a href="ghost-labs.html">Labs: real machines</a>
-    <a href="self-improvement.html">Checking and learning</a>
-    <a href="learning-loop.html">Owner rules</a>
-    <a href="long-horizon.html">Long tasks</a>
-
-    <h3>Running it</h3>
-    <a href="safety.html">Safety and privacy</a>
-    <a href="configuration.html">Settings that matter</a>
-    <a href="troubleshooting.html">When something breaks</a>
-
+    <a class="current" href="index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="start/getting-started.html">Getting started</a>
+    <a href="start/installation.html">Installation</a>
+    <a href="start/configuration.html">Settings that matter</a>
+    <a href="start/troubleshooting.html">When something breaks</a>
+    <a href="start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="features/interfaces.html">Interfaces</a>
+    <a href="features/voice.html">Voice</a>
+    <a href="features/search.html">Search &amp; the web</a>
+    <a href="features/darkweb.html">Dark-web search</a>
+    <a href="features/pictures.html">Pictures</a>
+    <a href="features/memory.html">Memory</a>
+    <a href="features/documents.html">Documents (RAG)</a>
+    <a href="features/coding.html">Coding &amp; sandbox</a>
+    <a href="features/projects.html">Projects &amp; autonomy</a>
+    <a href="features/labs.html">Labs</a>
+    <a href="features/selfhood.html">Selfhood</a>
+    <a href="features/performance.html">Performance</a>
+    <a href="features/reliability.html">Reliability</a>
+    <a href="features/personal.html">Personal services</a>
+    <a href="features/infrastructure.html">Infrastructure</a>
     <h3>Reference</h3>
-    <a href="glossary.html">Glossary</a>
-    <a href="reference.html">Deep reference</a>
-    <span class="nav-note">A page per module, written for maintainers.</span>
+    <a href="reference/index.html">All reference pages</a>
   </nav>
 </aside>
 
@@ -41,544 +43,116 @@
   <section class="hero">
     <span class="eyebrow">Documentation</span>
     <h1>Ghost Agent</h1>
-    <p class="subtitle">A self-hosted AI agent. It runs on your own hardware, remembers what you tell it, does the work in a sandbox, and runs program checks on what it delivered — a page that loads, files that exist.</p>
+    <p class="subtitle">A personal AI agent that runs on four machines at home. It talks and listens, searches the web and the dark web over Tor, draws pictures, remembers you, writes and runs code in a sandbox, spins up its own lab machines — and has a mood and a picture of itself.</p>
     <div class="hero-meta">
-      <span class="badge">Python 3.10+</span>
-      <span class="badge">Runs locally</span>
-      <span class="badge">Docker sandbox</span>
+      <span class="badge">Runs at home</span>
       <span class="badge good">Tor-only egress</span>
       <span class="badge">No accounts, no API keys</span>
+      <span class="badge">Docker sandbox</span>
+      <span class="badge">Local models</span>
     </div>
   </section>
 
-  <p class="lede">Most AI assistants are a website you send text to. Ghost is a program you run. Nothing leaves your machine unless you asked for something that needs the internet — and when it does, it goes out through Tor.</p>
+  <p class="lede">Most AI assistants are a website you send text to. Ghost is a program you run. Nothing leaves the house unless you ask for something that needs the internet — and then it goes out through Tor.</p>
 
-  <h2>What actually happens when you send a message</h2>
-  <p>This is the whole product in five steps. Everything else in these docs is a detail of one of them.</p>
+  <h2 id="features">What it can do</h2>
+  <p>One card per feature. Each opens a page written for a newcomer — what it does, what to say to try it, where it runs and its limits — with the deep reference pages linked at the bottom.</p>
 
+  <!-- features -->
+<div class="feature-grid">
+  <a class="feature" href="features/interfaces.html"><span class="ft">Interfaces</span><span class="fd">Web console, Slack, the handheld, the CLI and the API.</span><span class="fm">7 reference pages</span></a>
+  <a class="feature" href="features/voice.html"><span class="ft">Voice</span><span class="fd">Talk to it and hear it answer: Whisper speech-to-text, Phonon (English) and macOS (Greek) voices.</span><span class="fm">1 reference page</span></a>
+  <a class="feature" href="features/search.html"><span class="ft">Search &amp; the web</span><span class="fd">Web search, deep research and the browser — over Tor only.</span><span class="fm">2 reference pages</span></a>
+  <a class="feature" href="features/darkweb.html"><span class="ft">Dark-web search</span><span class="fd">Search and research .onion sites through Ahmia, Torch and Torgle.</span><span class="fm">1 reference page</span></a>
+  <a class="feature" href="features/pictures.html"><span class="ft">Pictures</span><span class="fd">Generate and edit images, likeness from real photos, and vision.</span><span class="fm">3 reference pages</span></a>
+  <a class="feature" href="features/memory.html"><span class="ft">Memory</span><span class="fd">What it remembers about you, how it recalls it, and the rules you teach it.</span><span class="fm">19 reference pages</span></a>
+  <a class="feature" href="features/documents.html"><span class="ft">Documents (RAG)</span><span class="fd">Ask questions over your PDFs, audio and videos; get PDF reports.</span><span class="fm">2 reference pages</span></a>
+  <a class="feature" href="features/coding.html"><span class="ft">Coding &amp; sandbox</span><span class="fd">Writes and runs code in a Docker sandbox, with services and jobs.</span><span class="fm">19 reference pages</span></a>
+  <a class="feature" href="features/projects.html"><span class="ft">Projects &amp; autonomy</span><span class="fd">Multi-step projects, scheduled tasks and an autopilot that works while idle.</span><span class="fm">16 reference pages</span></a>
+  <a class="feature" href="features/labs.html"><span class="ft">Labs</span><span class="fd">Throwaway real machines on a Raspberry Pi for experiments.</span><span class="fm">1 reference page</span></a>
+  <a class="feature" href="features/selfhood.html"><span class="ft">Selfhood</span><span class="fd">Mood, tone, the self-image (Mirror), the sentiment model and the face.</span><span class="fm">3 reference pages</span></a>
+  <a class="feature" href="features/performance.html"><span class="ft">Performance</span><span class="fd">Head and slot saves, cache protection, MTP, node offload and time budgets.</span><span class="fm">5 reference pages</span></a>
+  <a class="feature" href="features/reliability.html"><span class="ft">Reliability</span><span class="fd">The verifier, guards and breakers, health checks and feedback.</span><span class="fm">17 reference pages</span></a>
+  <a class="feature" href="features/personal.html"><span class="ft">Personal services</span><span class="fd">Portfolio, weather and games.</span><span class="fm">2 reference pages</span></a>
+  <a class="feature" href="features/infrastructure.html"><span class="ft">Infrastructure</span><span class="fd">The four machines, Tor-only egress, isolation and supervision.</span><span class="fm">11 reference pages</span></a>
+</div>
+<!-- /features -->
+
+  <h2 id="machines">Four machines</h2>
+  <p>The work is split by what each machine is good at. The agent itself lives on the Mac Studio; the others serve it over a private network.</p>
+  <div class="machines">
+    <div class="machine">
+      <h4>Mac Studio</h4>
+      <span class="spec">M4 Max · 36 GB · "eva"</span>
+      <ul>
+        <li>The agent and its main model (Qwen3.8-27B)</li>
+        <li>Web console, API and Slack bot</li>
+        <li>Docker sandbox, Tor, all memory</li>
+      </ul>
+    </div>
+    <div class="machine">
+      <h4>Mac mini</h4>
+      <span class="spec">M4 · 16 GB · "nova"</span>
+      <ul>
+        <li>Helper model (Gemma E4B)</li>
+        <li>Speech-to-text and voices</li>
+        <li>Sentiment model, portfolio service</li>
+      </ul>
+    </div>
+    <div class="machine">
+      <h4>Jetson Orin</h4>
+      <span class="spec">GPU · "ghost"</span>
+      <ul>
+        <li>Image generation</li>
+      </ul>
+    </div>
+    <div class="machine">
+      <h4>Raspberry Pi 5</h4>
+      <span class="spec">"disorder"</span>
+      <ul>
+        <li>Labs: throwaway machines for experiments</li>
+      </ul>
+    </div>
+  </div>
+  <p>More in <a href="features/infrastructure.html">Infrastructure</a>.</p>
+
+  <h2 id="one-message">One message, end to end</h2>
   <div class="diagram">
     <ol class="flow">
-      <li>
-        <h4>You send a message</h4>
-        <p>From the web page, Slack, your voice, or a plain HTTP request. It all arrives at the same place.</p>
-      </li>
-      <li>
-        <h4>Ghost looks up what it already knows</h4>
-        <p>It puts your profile, the facts it holds about you and the rules you approved in front of the model — before the model starts thinking. Older documents, notes and past conversations stay on disk and are searched when you ask it to recall something.</p>
-      </li>
-      <li>
-        <h4>The model decides what to do</h4>
-        <p>Answer directly, or reach for a tool: run some code, read a file, search the web, look at an image. Tools that touch your machine run inside a Docker container, not on your actual system.</p>
-      </li>
-      <li>
-        <h4>It repeats until the job is done</h4>
-        <p>Tool result goes back to the model, which decides the next step. Most questions take one pass. Real tasks take several.</p>
-      </li>
-      <li>
-        <h4>Mechanical checks look at what it delivered</h4>
-        <p>Mostly program checks, not a second opinion on the answer: does the page it built load without errors, are the files it claims on disk, is the reply an answer rather than narration, does an image show what the reply says. The reply waits up to 15 seconds for them; a page that throws or a missing file gets one repair round before sending. A failure found later is recorded. The second-model judge that used to read every answer is off since 2026-10-14 (§4OW).</p>
-      </li>
+      <li><h4>You send a message</h4><p>From the web console, Slack, the handheld, your voice or a plain HTTP request. It all arrives at the same place.</p></li>
+      <li><h4>Ghost puts what it knows in front of the model</h4><p>Your profile, the facts it holds about you, the rules you gave it, and — for its own voice — its current mood.</p></li>
+      <li><h4>The model answers or reaches for a tool</h4><p>Search, browse, run code, read a file, draw a picture, open a lab. Anything that touches a machine runs in a container; anything that touches the internet goes through Tor.</p></li>
+      <li><h4>It repeats until the job is done</h4><p>Each tool result goes back to the model, which picks the next step.</p></li>
+      <li><h4>Program checks look at what it delivered</h4><p>Does the page it built load, are the files it claims on disk, does the picture show what it says? A failure gets one repair round before the reply goes out.</p></li>
     </ol>
-    <p class="caption">The turn loop. Steps 3 and 4 repeat; step 5 runs once.</p>
   </div>
+  <p>The long version: <a href="reference/infrastructure/how_it_works.html">One message, end to end</a>.</p>
 
-  <p><a href="how-it-works.html">One message, end to end</a> walks through the same five steps with the parts named, for when you need to debug one of them.</p>
-
-  <h2>Is this for you?</h2>
-
+  <h2 id="fit">Is this for you?</h2>
   <div class="cols">
     <div>
       <h4>A good fit if</h4>
       <ul>
-        <li>You want an assistant that keeps working when your internet or a vendor's API doesn't.</li>
-        <li>You care that your conversations stay on your own disk.</li>
-        <li>You're comfortable running a couple of background services and reading a log.</li>
-        <li>You want it to remember your projects across weeks, not just the current chat.</li>
+        <li>You want your conversations to stay on your own disks.</li>
+        <li>You want an assistant that remembers your projects for weeks, not one chat.</li>
+        <li>You are comfortable running a few services and reading a log.</li>
       </ul>
     </div>
     <div>
       <h4>A poor fit if</h4>
       <ul>
-        <li>You don't have a machine that can run a large language model locally, or a spare box to run one on.</li>
-        <li>You want zero setup. This needs Docker, Tor, and an LLM server running before it will start.</li>
-        <li>You need frontier-model reasoning quality. Ghost is built around a local model and trades some raw capability for privacy and control.</li>
+        <li>You want zero setup: it needs Docker, Tor and a local model server before it starts.</li>
+        <li>You need frontier-model quality. A local model trades raw capability for privacy and control.</li>
       </ul>
     </div>
   </div>
 
-  <h2>What you need before you start</h2>
-  <dl class="kv">
-    <dt>An LLM server</dt>
-    <dd>Anything that speaks the OpenAI chat API — llama.cpp, vLLM, or Ollama. Ghost runs on <strong>Qwen3.8-27B</strong> (since 2026-10-24; it was developed on Qwen 3.6 35B-A3 before that), and the prompts assume a model of roughly that capability. See the note on model choice below.</dd>
+  <h2 id="costs">What it costs</h2>
+  <p>A local model reasons less well than a frontier API. Search over Tor against scrapers is slower and less accurate than a keyed search API. The checks are mechanical: they catch a broken page or a missing file, not an invented fact — on hand-graded turns about 43% of answers were right and 14% wrong, and invented knowledge is the main open failure. More moving parts means more that can quietly stop, which is why so much of the tooling exists to notice that.</p>
 
-    <dt>Docker</dt>
-    <dd>The daemon must be running. Every piece of code Ghost executes goes into a container, so without Docker the tools that matter won't work.</dd>
+  <div class="note good"><strong>Start here.</strong> <a href="start/getting-started.html">Getting started</a> walks through installing and running it, in order. <a href="reference/index.html">All reference pages</a> lists every deep page by feature.</div>
 
-    <dt>Tor</dt>
-    <dd>A local Tor daemon on port <code>9050</code>. Ghost refuses to start without it — see <a href="safety.html">Safety and privacy</a> for why that's deliberate.</dd>
-
-    <dt>Python 3.10+</dt>
-    <dd>Plus the packages in <code>requirements.txt</code>. A virtual environment is strongly recommended.</dd>
-  </dl>
-
-  <div class="note">
-    <strong>A note on model choice.</strong> Ghost is developed and tested against <em>uncensored</em> models — for the main model and for the helper models on the other nodes. It works with a standard aligned model, but expect refusals on operations that are routine for an agent running on your own machine and unusual for a chat assistant: clearing out its own sandbox, deleting files you asked it to delete, searching Tor hidden services, or handling security material.
-    <br><br>
-    A refusal doesn't look like an error. The tool never runs, the model explains why it won't, and the turn completes normally — so it reads as "the feature is broken" when the model simply declined. If something won't work, check the log for the model refusing rather than the tool failing. If you turn the LLM judge back on (<code>GHOST_VERIFIER_JUDGE=1</code>, off by default since §4OW), the same applies to it: an aligned judge can reject a perfectly good answer on subject matter alone.
-  </div>
-
-  <p><a href="getting-started.html">Install and run it</a> has the full sequence, in order, with the environment variables spelled out.</p>
-
-  <h2>Start here</h2>
-  <div class="card-grid">
-    <a class="card" href="getting-started.html">
-      <h3>Install and run it</h3>
-      <p>Prerequisites, environment variables, first start, and how to tell it's actually working.</p>
-    </a>
-    <a class="card" href="interfaces.html">
-      <h3>Interfaces</h3>
-      <p>Web UI, Slack, voice, desktop client, CLI and the HTTP API. With clips of the web UI reacting to a live request.</p>
-    </a>
-    <a class="card" href="how-it-works.html">
-      <h3>One message, end to end</h3>
-      <p>The turn loop in detail — what runs, in what order, and what to look for in the log when it goes wrong.</p>
-    </a>
-  </div>
-
-  <h2>The rest of the guide</h2>
-  <div class="card-grid">
-    <a class="card" href="memory.html">
-      <h3>What it remembers</h3>
-      <p>The kinds of memory, what goes in each, which ones reach a prompt, and how to correct something it got wrong about you.</p>
-    </a>
-    <a class="card" href="tools.html">
-      <h3>What it can do</h3>
-      <p>The toolbox — code, files, web, browser, images, projects, scheduled tasks — and when it reaches for each.</p>
-    </a>
-    <a class="card" href="ghost-labs.html">
-      <h3>Labs: real machines</h3>
-      <p>Disposable database servers, clusters and web apps on a separate host, plus kept apps that stay online. Includes worked examples.</p>
-    </a>
-    <a class="card" href="self-improvement.html">
-      <h3>Checking and learning</h3>
-      <p>The mechanical checks after each answer, the idle-time jobs, and what was tried and removed.</p>
-    </a>
-    <a class="card" href="learning-loop.html">
-      <h3>Owner rules</h3>
-      <p>Standing instructions you dictate ("learn this rule: …"): the commands, the limits, and what was removed from the learning system on 2026-11-05.</p>
-    </a>
-    <a class="card" href="long-horizon.html">
-      <h3>Long tasks</h3>
-      <p>The clock and the report it must leave room for, the task state the system writes, what survives a stop, and the guards on a long build.</p>
-    </a>
-    <a class="card" href="safety.html">
-      <h3>Safety and privacy</h3>
-      <p>What leaves your machine, what can't, and how the sandbox and Tor rules are enforced.</p>
-    </a>
-    <a class="card" href="configuration.html">
-      <h3>Settings that matter</h3>
-      <p>The twenty settings worth knowing, out of sixty-six — including how to move work onto a second machine.</p>
-    </a>
-    <a class="card" href="troubleshooting.html">
-      <h3>When something breaks</h3>
-      <p>Sorted by symptom: won't start, acts like it has amnesia, tools failing, slow, or answering wrongly.</p>
-    </a>
-    <a class="card" href="glossary.html">
-      <h3>Glossary</h3>
-      <p>Plain-English definitions for the terms this project uses — hydration, trajectory, maintenance cycle, verifier.</p>
-    </a>
-    <a class="card" href="reference.html">
-      <h3>Deep reference</h3>
-      <p>A page per module, for changing the code. Dense, and honest about what it doesn't cover.</p>
-    </a>
-  </div>
-
-  <h2>How it compares</h2>
-
-  <p>Self-hosted agents are a crowded category, and most of what Ghost does has an equivalent somewhere. The table below is about <em>where the line is drawn</em> — what's built in versus bolted on, enforced versus configured, measured versus assumed.</p>
-
-  <div class="note">
-    <strong>No product names, on purpose.</strong> These projects move quickly and a name-by-name matrix goes stale within months — and it would ask you to trust a claim about someone else's code that we haven't audited. The middle column describes the <em>common design</em> across self-hosted agents and the tools built for them, not any one project. Where something is genuinely widespread, it says so.
-  </div>
-
-  <div class="scroll">
-  <table>
-    <thead><tr><th>Capability</th><th>The usual approach</th><th>In Ghost</th></tr></thead>
-    <tbody>
-      <tr>
-        <td><strong>Runs on your own hardware</strong></td>
-        <td>The whole point of the category. Widely available.</td>
-        <td>Same. No advantage claimed.</td>
-      </tr>
-      <tr>
-        <td><strong>Sandboxed execution</strong></td>
-        <td>Common, especially in coding agents — usually a container per session.</td>
-        <td>Same idea. One shared directory, its own process and network namespaces, memory and process caps.</td>
-      </tr>
-      <tr>
-        <td><strong>Memory across sessions</strong></td>
-        <td>A mature field now, with several dedicated frameworks. Usually one store — vectors, sometimes plus a graph — retrieved by top-<em>k</em> similarity.</td>
-        <td>Several stores. Every prompt gets your profile, the facts it holds about you and the rules you approved; the fact and document store, past episodes and past conversations are searched when you ask (<code>recall</code>). The prompt sources are merged by <strong>rank rather than score</strong>, with a fixed weight table — the learned weights were removed on 2026-10-11 (§4NN).</td>
-      </tr>
-      <tr>
-        <td><strong>Anonymous egress</strong></td>
-        <td>Direct connections. Tor is available as an optional add-on for specific tools, so the agent's other traffic still goes out normally.</td>
-        <td>Tor is the transport for the <strong>whole process</strong>. A boot probe plus a process-wide socket guard blocks any direct connection to a public address. Unreachable Tor means Ghost <em>doesn't start</em>.</td>
-      </tr>
-      <tr>
-        <td><strong>Hidden-service (.onion) search</strong></td>
-        <td>Available — several capable bolt-on skills exist, some with identity rotation.</td>
-        <td>Built in, on the same enforced transport. Each retry takes a fresh circuit, and engines sharing one search index are tagged so corroboration counts <em>independent</em> sources.</td>
-      </tr>
-      <tr>
-        <td><strong>Checking its own answers</strong></td>
-        <td>A known pattern — a critic or reviewer agent, usually wired per workflow by the developer.</td>
-        <td>Mechanical checks on what the turn produced: does a built page load, are claimed files on disk, is the reply an answer, does an image show what the reply says. A page that throws or a missing file gets one repair round within a 15-second window before sending; a failure found later is recorded and is not shown to you. The second-model judge is off since 2026-10-14 (§4OW): measured on real turns it was wrong on 9 of 17 refusals. It does not check whether facts in an answer are true.</td>
-      </tr>
-      <tr>
-        <td><strong>Learning from its own runs</strong></td>
-        <td>Uncommon. Memory frameworks store what happened; they don't generally change behaviour because of it.</td>
-        <td>It does not. You dictate a rule ("learn this rule: …") and it is in every prompt of yours, at most 10 rules. The self-teaching passes (automatic skills, self-written lessons, reflection, post-mortems) were measured on real turns, did not help (§4NC/§4ND), and were removed on 2026-10-11 (§4NM). The idle replay of your failed turns, which proposed rules for you to approve, was removed on 2026-11-05 (§4SZ): 13 replays in 27 days, nothing proposed in the last 17.</td>
-      </tr>
-      <tr>
-        <td><strong>Tuning its own prompts</strong></td>
-        <td>Real and in production use — reflective optimizers like GEPA are an established technique, typically run offline against a strong teacher model.</td>
-        <td>Not any more. Ghost ran that family of optimizer against its own local model from mid-2026; no tuned prompt ever beat the hand-written one on real turns, and the optimizer and its autonomy loop were removed on 2026-10-11 (§4NM). Every prompt it uses today is hand-written; the small loader that renders tool descriptions from their signatures is all that remains.</td>
-      </tr>
-      <tr>
-        <td><strong>Models it trains itself</strong></td>
-        <td>Rare in self-hosted agents.</td>
-        <td>None now. It used to train two small logistic-regression models on its own turns — a process reward model and a complexity router — but nothing that changed an answer ever consumed either, and both were removed on 2026-10-11 (§4NM).</td>
-      </tr>
-      <tr>
-        <td><strong>Acting without being asked</strong></td>
-        <td>Agents generally act when invoked. Scheduling is usually external.</td>
-        <td>A background loop (the <em>idle scheduler</em>) runs memory upkeep and housekeeping during idle time, and never interrupts a turn. Scheduled and condition-triggered tasks are first-class.</td>
-      </tr>
-      <tr>
-        <td><strong>Measuring whether a change helped</strong></td>
-        <td>Rare outside published benchmarks.</td>
-        <td>The failure census: a report over the owner's turns, checked against a sample graded blind by hand every 14 days. Live randomised A/B arms were tried and dropped: at this traffic none could reach a verdict (§4ND), and the whole experiments registry was removed on 2026-10-11 (§4NN). The owner's regression suite was removed on 2026-11-05 (§4SZ): it held no kept test.</td>
-      </tr>
-      <tr>
-        <td><strong>Third-party accounts</strong></td>
-        <td>Usually at least one key — a search API is the common case.</td>
-        <td>None. Search runs against scrapers over Tor, which costs result quality and is a deliberate trade.</td>
-      </tr>
-    </tbody>
-  </table>
-  </div>
-
-  <h3>What that costs</h3>
-  <p>The same table read the other way. A local model caps reasoning quality below what a frontier API gives you. Search over Tor against scrapers is slower and less accurate than a keyed search API. The answer checks are mechanical, so they catch a broken page or a missing file but not an invented fact — on hand-graded owner turns (2026-10-14 to 10-20) about 43% were right and 14% wrong, and invented knowledge is the main open failure. The idle upkeep only runs if the machine stays on and idle. And more moving parts means more that can quietly stop working — several subsystems here have been silently inert for weeks at a time before instrumentation caught them, which is why so much of the tooling is about detecting that specific failure.</p>
-
-  <h2>The unusual parts, in detail</h2>
-
-  <p>The mechanism behind each of the rows above.</p>
-
-  <h3>It remembers across sessions, in several shapes</h3>
-  <p>Closing the chat wipes nothing. Facts and documents, relationships between things, a profile of you, the rules you gave it, a running journal, and past episodes and conversations are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. Only your profile, your facts and your rules go into every prompt; the rest is searched when you ask. <a href="memory.html">How memory works →</a></p>
-
-  <h3>It checks what it delivered</h3>
-  <p>After each reply, mechanical checks look at what the turn actually produced. Does the page it built load without errors? Are the files it says it wrote on disk? Is the reply an answer, not just narration of its work? Does an image show what the reply describes? A failure is recorded with the turn. Since 2026-10-14 (§4OW) the second-model <em>judge</em> that also read the answer against the evidence is off by default. Measured on a week of real use, it was wrong on 9 of 17 refusals, and none of them was shown to you. <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on. <a href="self-improvement.html">How the self-check works →</a></p>
-
-  <h3>It follows the rules you give it</h3>
-  <p>Say "learn this rule: answer in English" and the sentence is in every prompt of yours from then on. "show my rules" lists your rules; "forget rule N" removes one after you confirm. There are at most 10. Ghost does not grade or teach itself — measured, that didn't work — and since 2026-11-05 it no longer proposes rules either: the idle loop that replayed your failed turns and the regression tests were removed after 27 days in which they produced almost nothing. A 👎 is still recorded as your label on the turn. <a href="learning-loop.html">Owner rules, with the commands →</a></p>
-
-  <h3>It can search Tor hidden services</h3>
-  <p>Normal search engines don't index <code>.onion</code> sites, so there's a separate path through the dedicated onion engines. Each retry is forced onto a fresh Tor circuit, because whether an engine answers depends on which exit you drew — and engines that share a search index are counted once, so corroboration means independent sources. <a href="tools.html">How onion search works →</a></p>
-
-  <h3>It fails closed on the network</h3>
-  <p>Outbound traffic goes through Tor, and this is enforced rather than intended: a boot-time probe plus a process-wide block on direct connections to public addresses. If Tor is unreachable, Ghost won't start. A silently-cleartext agent is worse than a stopped one. <a href="safety.html">How that's enforced →</a></p>
-
-  <h3>It works while you're away</h3>
-  <p>Given a quiet stretch, Ghost files away facts from your recent turns, tidies its memory stores and project workspaces, and backs the stores up once a day. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
-
-  <h2>Every advanced feature, in one table</h2>
-
-  <p>The six sections above are the ones worth prose. This is the rest of them — the whole advanced surface in one place, each row linking to the page that explains it properly.</p>
-
-  <div class="note">
-    <strong>The right-hand column is the honest part.</strong> <span class="badge good">on</span> means it runs on a stock install with no flag. A flag or environment variable means it doesn't, and that's what turns it on. <span class="badge warn">opt-in</span> marks the ones that are off by default because they're experimental or expensive — they are listed here rather than quietly omitted, because a feature you believe is running and isn't is worse than one you know is off.
-  </div>
-
-  <div class="scroll">
-  <table>
-    <thead><tr><th>Feature</th><th>What it does</th><th>Default</th></tr></thead>
-    <tbody>
-      <tr class="group"><td colspan="3">Memory and context</td></tr>
-      <tr>
-        <td><a href="core/bus.html"><strong>Rank-fusion memory</strong></a></td>
-        <td>The prompt's memory sources merged by <em>rank</em> with a fixed weight table, because similarity scores from different stores aren't comparable to each other. Since October 2026 only your rules and facts about you are added to every prompt; the vector, graph, episode and past-session stores answer when you ask (<code>recall</code>). The prompt tiers for those stores were removed on 2026-10-11 (§4NM).</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="memory/episodes.html"><strong>Episodic memory</strong></a></td>
-        <td>Whole past episodes — the sequence of actions and how it turned out — recalled when you ask. Since 2026-10-10 they are no longer added to every prompt (15% relevant, 19% harmful).</td>
-        <td><span class="badge warn">on request</span></td>
-      </tr>
-      <tr>
-        <td><a href="memory/experience.html"><strong>Experience</strong></a></td>
-        <td>How past turns like this one went — only turns a human graded (the census, your 👍/👎): the steps and the pages that answered them, and what went wrong in a graded-wrong one. Off in prompts: the October 2026 replay did not prove it (fewer wrong answers, no more right ones); the index keeps syncing for a later re-measure.</td>
-        <td><span class="badge warn">off (replay inconclusive)</span></td>
-      </tr>
-      <tr>
-        <td><a href="memory/fact_ledger.html"><strong>Fact ledger</strong></a></td>
-        <td>When each fact about you was stated, replaced or removed, and in your own words — always written; shown on questions about yourself once a replay proves it (the October 2026 replay did not: seeded rows carry store dates, not the dates you said things).</td>
-        <td><span class="badge good">written</span> <span class="badge warn">shown: off (replay failed)</span></td>
-      </tr>
-      <tr>
-        <td><a href="memory/graph.html"><strong>Knowledge graph</strong></a></td>
-        <td>Entities and the relationships between them. Facts about you still reach every prompt; the rest is recalled when you ask (added to every prompt it was 20% relevant, 16% harmful).</td>
-        <td><span class="badge warn">on request</span></td>
-      </tr>
-      <tr>
-        <td><a href="memory/profile.html"><strong>User profile</strong></a></td>
-        <td>What it knows about you, corrected key by key — a new answer replaces the old one instead of piling up beside it.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="memory/skills.html"><strong>Lessons playbook (removed)</strong></a></td>
-        <td>The lessons Ghost once wrote for itself. Out of every prompt since 2026-10-13 (§4ON); the store and its two tools were removed on 2026-11-06 (§4TD). Your rules are in their own file. <a href="learning-loop.html">Owner rules →</a></td>
-        <td><span class="badge warn">out of use (removal planned)</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/context_manager.html"><strong>Context-pressure governor</strong></a></td>
-        <td>Read budgets that tighten as the context window fills, and a five-step compression ladder before anything is thrown away.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/head_saves.html"><strong>Head and conversation saves</strong></a></td>
-        <td>The ~28k-token prompt head and the conversation that holds the model's one slot are saved to disk. They come back in about a second instead of being re-read: after another conversation's turn, a channel member, an effort-level change, or a picture look, which the image tool runs on the main model. Live: the reply after a look went from 179&nbsp;s to 14&nbsp;s. Old files are cleaned up automatically.</td>
-        <td><span class="badge good">on</span> via the launcher: <code>GHOST_HEAD_SAVES=1</code>, <code>GHOST_CONV_KEEP=1</code></td>
-      </tr>
-      <tr>
-        <td><a href="tools/memory_tools.html"><strong>Document Q&amp;A</strong></a></td>
-        <td>PDFs, pages and recordings ingested into a searchable store, then questioned scoped to one document rather than to everything it knows.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="tools/memory_tools.html"><strong>Local transcription</strong></a></td>
-        <td>Long audio and video transcribed on your own machine in twelve-minute windows, with timestamps kept as breadcrumbs.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-
-      <tr class="group"><td colspan="3">Answering, and checking the answer</td></tr>
-      <tr>
-        <td><a href="core/verifier.html"><strong>Mechanical checks</strong></a></td>
-        <td>After each reply: page load, written files, reply shape, turn state, memory claims, and the image pixel check. A page that throws or a missing file gets one repair round inside a 15-second window.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/verifier.html"><strong>LLM judge (two-stage verifier)</strong></a></td>
-        <td>A second model names the reply's weakest claims, then judges each one against what the tools actually returned. Off since 2026-10-14 (§4OW): wrong on 9 of 17 refusals measured on real turns.</td>
-        <td><span class="badge warn">off</span> <code>GHOST_VERIFIER_JUDGE=1</code></td>
-      </tr>
-      <tr>
-        <td><a href="core/objection.html"><strong>Objection adjudication</strong></a></td>
-        <td>A judge's objection about a number or a quote is settled by arithmetic and string search <em>before</em> anyone's opinion is consulted. Only runs when the LLM judge is on.</td>
-        <td><span class="badge warn">off with the judge</span></td>
-      </tr>
-      <tr>
-        <td><a href="configuration.html"><strong>Pre-flight failure guard</strong></a></td>
-        <td>A tool call that just failed the same way is refused up front, handing back the previous error instead of repeating it.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-
-      <tr class="group"><td colspan="3">Learning from its own runs</td></tr>
-      <tr>
-        <td><a href="tools/acquired_skills.html"><strong>Tools it writes itself</strong></a></td>
-        <td>It can write and register a new Python tool for itself, available on the next turn and retired automatically if it stops earning its place.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="tools/composed_skills.html"><strong>Composed skills</strong></a></td>
-        <td>Multi-step tool sequences ("macros") kept under one name. Removed on 2026-11-05 (§4TA): nothing proposed or used them. <code>youtube_transcribe</code>, the one macro in real use, is a built-in tool now; a recurring bundle such as a daily report is an <a href="learning-loop.html">owner rule</a>.</td>
-        <td><span class="badge bad">removed</span></td>
-      </tr>
-      <tr>
-        <td><a href="algorithms/dream_cycle.html"><strong>Maintenance cycle</strong></a></td>
-        <td>Idle-time upkeep of the stores: project digests, manifest backfill, daily snapshots, trajectory archive, forget-archive purges, graph prune and merge. The REM consolidation that used to write lessons here was removed on 2026-10-11 (§4NM).</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="learning-loop.html"><strong>Owner rules</strong></a></td>
-        <td>Up to 10 standing instructions you dictate ("learn this rule: …"), shown on every one of your turns. One file, changed only by your own commands.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="learning-loop.html#removed"><strong>Failure replay</strong></a></td>
-        <td>Replayed <em>your</em> real failures while idle, diagnosed one rule, tested it and proposed it to you, and ran your regression tests. Removed on 2026-11-05 (§4SZ): 13 replays and 5 adopted rules in 27 days, nothing new in the last 17, and no kept test. Invented practice problems (synthetic self-play) had been removed on 2026-10-11 (§4NM).</td>
-        <td><span class="badge bad">removed</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/feedback.html"><strong>Human feedback</strong></a></td>
-        <td>A 👍/👎 writes a ground-truth label that outranks every machine verdict. The failure census and the index of graded turns read it. It no longer starts a replay (removed 2026-11-05).</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-
-      <tr class="group"><td colspan="3">Doing the work</td></tr>
-      <tr>
-        <td><a href="sandbox/docker.html"><strong>Docker sandbox</strong></a></td>
-        <td>Code runs in a persistent container with its own process and network namespaces — not on your actual system.</td>
-        <td>needs Docker</td>
-      </tr>
-      <tr>
-        <td><a href="sandbox/jobs.html"><strong>Background jobs</strong></a></td>
-        <td>A command that outgrows its time budget is detached and supervised instead of killed halfway.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="sandbox/services.html"><strong>Sandbox services</strong></a></td>
-        <td>Long-running servers it starts for itself, with pidfiles, logs, liveness probes and leased ports.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="tools/browser.html"><strong>Browser automation</strong></a></td>
-        <td>Headless Chromium with DNS forced through Tor and a cookie profile that survives between sessions.</td>
-        <td>needs Docker</td>
-      </tr>
-      <tr>
-        <td><a href="tools/search.html"><strong>Web search</strong></a></td>
-        <td>Several scraped engines over Tor, plus deeper research and fact-check passes — no search API key anywhere.</td>
-        <td>needs Tor</td>
-      </tr>
-      <tr>
-        <td><a href="tools/darkweb_search.html"><strong>Onion search</strong></a></td>
-        <td>Hidden-service engines, a fresh circuit per retry, and engines sharing an index counted once so corroboration means independent sources.</td>
-        <td>needs Tor</td>
-      </tr>
-      <tr>
-        <td><a href="tools/quarantine.html"><strong>Dark-web quarantine</strong></a></td>
-        <td>A file downloaded from a hidden service lands beside the sandbox, not in it: hashed, never run or shown, inspected only inside a network-less container, purged after 7 days, owner only.</td>
-        <td>needs Tor + Docker</td>
-      </tr>
-      <tr>
-        <td><a href="tools/vision.html"><strong>Vision</strong></a></td>
-        <td>Reads images and PDFs; a UI check comes back as a pass/fail verdict rather than a description.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="tools/image_gen.html"><strong>Image generation</strong></a></td>
-        <td>Generates images on a GPU node. Without the node the tool isn't advertised to the model at all.</td>
-        <td><code>--image-gen-nodes</code></td>
-      </tr>
-      <tr>
-        <td><a href="tools/report_pdf.html"><strong>PDF reports</strong></a></td>
-        <td>Multi-page styled documents rendered locally and served back as a download.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="tools/database.html"><strong>Database work</strong></a> (removed &sect;4SX E: SQL runs on a lab machine)</td>
-        <td>A DBA agent over PostgreSQL, with the SQL validated before it's allowed to run.</td>
-        <td>needs Postgres</td>
-      </tr>
-      <tr>
-        <td><a href="tools/projects.html"><strong>Projects</strong></a></td>
-        <td>Work that outlives a conversation: a task tree, artifacts, and an append-only event log of what happened.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/project_advancer.html"><strong>Project autoadvance</strong></a></td>
-        <td>While idle, pushes one active project forward by a single step under hard budgets, stopping at anything that needs you.</td>
-        <td><code>--autoadvance-idle</code></td>
-      </tr>
-      <tr>
-        <td><a href="tools/tasks.html"><strong>Scheduled and watch tasks</strong></a></td>
-        <td>Cron and interval jobs, plus watches that poll a condition and fire the moment it becomes true.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/delegation.html"><strong>Background jobs</strong></a></td>
-        <td>Long commands moved to the background, read and stopped with the <code>run</code> tool (<code>jobs</code> is now an alias of it, &sect;4SX D5). (Sub-agent delegation and the swarm were removed 2026-10-30, &sect;4SI.)</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="algorithms/node_offload.html"><strong>Node offload</strong></a></td>
-        <td>Background, check, vision and coding work sent to other machines, sized to each node's measured throughput. In production one helper box (Nova) does research and fact extraction.</td>
-        <td><code>--worker-nodes</code> etc.</td>
-      </tr>
-      <tr>
-        <td><a href="algorithms/workspace.html"><strong>Workspace continuity</strong></a></td>
-        <td>Watches your files, remembers how tasks turned out, and knows what it has already looked up.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="interfaces/voice_server.html"><strong>Voice</strong></a></td>
-        <td>Speech in and speech out, with transcription on a local audio model.</td>
-        <td>needs a node</td>
-      </tr>
-
-      <tr class="group"><td colspan="3">Privacy, safety and operations</td></tr>
-      <tr>
-        <td><a href="algorithms/mandatory_tor.html"><strong>Mandatory Tor egress</strong></a></td>
-        <td>A process-wide socket guard: any direct connection to a public address raises, and unreachable Tor means Ghost won't start.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="safety.html"><strong>Stylometric scrubbing</strong></a></td>
-        <td>Outbound search text is normalised toward neutral phrasing, so your writing style isn't itself a fingerprint.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="algorithms/circuit_breaker.html"><strong>Circuit breaker</strong></a></td>
-        <td>Three consecutive failures takes a node out of rotation; it half-opens to probe after a cooldown.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="logging.html"><strong>Log redaction</strong></a></td>
-        <td>Secrets, onion addresses, home paths and personal details masked in both console and file logs.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/autonomous_activity.html"><strong>Activity ledger and liveness probes</strong></a></td>
-        <td>What it did while you were away, read from a real ledger — plus a probe per subsystem answering whether that subsystem actually fired.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="core/sessions.html"><strong>Durable sessions</strong></a></td>
-        <td>A conversation started in Slack carries on in the web UI; the history lives on the server, not the client.</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-      <tr>
-        <td><a href="algorithms/selfhood.html"><strong>Self-model</strong></a></td>
-        <td>An autobiographical log, a mood and a running diary, readable through <code>introspect</code>. The mood moves by itself, can be set in chat, and is audible in how replies are phrased (2026-11-06, §4TC). The wake-up prefix that put self-state in every prompt, and the idle job that derived a mood, were removed on 2026-10-11 (§4NM).</td>
-        <td><span class="badge good">on</span></td>
-      </tr>
-
-      <tr class="group"><td colspan="3">Off by default — opt-in and experimental</td></tr>
-      <tr>
-        <td><a href="self-improvement.html"><strong>Test-time scaling</strong></a></td>
-        <td>On a borderline verdict, generates several candidate answers and picks the winner by comparing them against each other.</td>
-        <td><span class="badge warn">opt-in</span> <code>GHOST_TTS_ADAPTIVE_BON=1</code></td>
-      </tr>
-      <tr>
-        <td><a href="configuration.html"><strong>Push notifications</strong></a></td>
-        <td>Webhook, ntfy or iOS Web Push when something happens while you're away — public targets go out over Tor like everything else.</td>
-        <td><span class="badge warn">opt-in</span> <code>--notify-ntfy</code></td>
-      </tr>
-    </tbody>
-  </table>
-  </div>
-
-  <p class="caption">Anything not in this table is either a detail of something that is, or lives in the <a href="reference.html">deep reference</a> — a page per module, 110 of them.</p>
-
-  <div class="note">
-    <strong>New to the project?</strong> Read this page, then <a href="getting-started.html">Install and run it</a>, then <a href="how-it-works.html">One message, end to end</a>. That's about twenty minutes and covers everything you need to run Ghost day to day. The <a href="reference.html">deep reference</a> is there when you need to change the code.
-  </div>
-
-  <div class="pager">
-    <span></span>
-    <a class="next" href="getting-started.html">
-      <span class="dir">Next</span>
-      <span class="to">Install and run it</span>
-    </a>
-  </div>
-
-  <footer>
-    <p>These pages are written from the source in <code>src/ghost_agent/</code> and <code>interface/</code>, and were last checked against it on <strong>2026-08-04</strong>. The feature table above — including every entry in its <em>Default</em> column — was verified against the code on <strong>2026-08-26</strong>; the answer-checking, memory and learning claims on this page were corrected against the production launcher on <strong>2026-10-26</strong>.</p>
-    <p>Where a page says something the code contradicts, the code is right — please open an issue.</p>
-  </footer>
+  <footer><p>Ghost Agent documentation.</p></footer>
 </main>
 </body>
 </html>

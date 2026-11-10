@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fallback chains (tools.fallback_chains) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <div class="subnav">
+      <a href="audit_2026_05.html">Audit &amp; Hardening (2026-05)</a>
+      <a href="checking_and_learning.html">Checking and learning</a>
+      <a href="circuit_breaker.html">Circuit breaker</a>
+      <a href="claim_binding.html">Claim binding (core.claim_binding)</a>
+      <a href="claude_trainer.html">Claude Trainer</a>
+      <a href="evidence_gate.html">Evidence gate (core.evidence_gate)</a>
+      <a href="failure_dimension.html">Failure dimensions (core.failure_dimension)</a>
+      <a class="current" href="fallback_chains.html">Fallback chains (tools.fallback_chains)</a>
+      <a href="feedback.html">Feedback (thumbs) (core.feedback)</a>
+      <a href="logging.html">Logging &amp; Monitoring</a>
+      <a href="metacognition.html">Metacognition Uplift</a>
+      <a href="objection.html">Objections (core.objection)</a>
+      <a href="outcome.html">Turn outcome (tools.outcome)</a>
+      <a href="strikes.html">Strikes (core.strikes)</a>
+      <a href="system_tool.html">Health, weather and location (system tool) (tools.system)</a>
+      <a href="tool_failure.html">Tool failures (tools.tool_failure)</a>
+      <a href="verifier.html">Verifier (core.verifier)</a>
+    </div>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>tools / fallback_chains.py</h1>
+  <p class="subtitle">Suggest alternative tools when a tool fails so the agent doesn't waste a turn.</p>
+
+  <h2>Chains</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Failed tool</th><th>Fallback chain</th></tr></thead>
+    <tbody>
+      <tr><td><code>deep_research</code></td><td><code>web_search</code> → <code>recall</code></td></tr>
+      <tr><td><code>web_search</code></td><td><code>deep_research</code> → <code>recall</code></td></tr>
+      <tr><td><code>execute</code></td><td><code>file_system</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>API</h2>
+  <ul>
+    <li><code>get_fallback_chain_hint(failed_tool, error_text="") -&gt; Optional[str]</code> — Returns <code>"FALLBACK SUGGESTION: …"</code> for the first usable fallback in the chain. It skips <code>web_search</code> on a CAPTCHA error and <code>execute</code> on a docker error. The turn loop imports it as <code>get_fallback_hint</code>; do not confuse it with <code>tool_failure.get_fallback_hint</code>.</li>
+  </ul>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="4lm">No chain for vision_analysis <span class="tag">2026-10-04 &sect;4LM</span></h2>
+  <p>The <code>vision_analysis → file_system</code> suggestion ("read the file as text") was removed. It led to a binary-file refusal that points back at vision. It contradicted the failure's own "Do NOT retry". It also named a tool members cannot use. Each vision failure message now carries its own next step.</p>
+</main>
+</body>
+</html>

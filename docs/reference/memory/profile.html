@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Owner profile (memory.profile) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="owner_rules.html">Owner rules</a>
+      <a class="current" href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>memory / profile.py — ProfileMemory</h1>
+  <p class="subtitle">Canonical user profile with multi-value merge semantics.</p>
+
+  <h2>Storage</h2>
+  <p>JSON at <code>path/user_profile.json</code>; atomic temp + <code>os.replace</code>; <code>threading.RLock</code> guards reads / writes.</p>
+
+  <h2>Schema</h2>
+  <pre><code>{
+  "root":          { "name": Value },
+  "relationships": { "wife|husband|son|daughter": Value },
+  "interests":     { "science|general|...": Value },
+  "assets":        { "car|...": Value }
+}
+
+Value := str                      # LEGACY — as_of unknown
+       | {"v": str, "as_of": ISO} # stamped
+       | list[Value]              # multi-valued (merge keys)</code></pre>
+  <p>Both shapes coexist for ever: a legacy bare value is never back-filled with a fabricated date. See <a href="#provenance">provenance</a> below.</p>
+
+  <h2>Canonicalisation</h2>
+  <p>Common synonyms remap at write time: <code>wife → relationships.wife</code>, <code>vehicle → assets.car</code>, etc. The caller receives the rewritten key in the return message so the agent can keep its mental model synced.</p>
+
+  <h2>Merge semantics</h2>
+  <p>Scalar → scalar: replace if different, else promote both to a list. Lists are deduped and order-preserved. <strong>Singular keys are exempt</strong> (they replace) and merged lists are now <strong>bounded</strong> — see below.</p>
+
+  <h2>Singleton keys — corrections replace, not accumulate (2026-07-22)</h2>
+  <p>Singular relationship / possession / identity keys — <code>wife</code>, <code>husband</code>, <code>spouse</code>, <code>son</code>, <code>daughter</code>, <code>car</code>, <code>home</code>, <code>employer</code>, <code>name</code>, … (module-level <code>_SINGLETON_KEYS</code>) — are now SINGLETONS: a second write REPLACES rather than merges. The merge branch exists for facts that genuinely coexist (<code>python</code> AND <code>rust</code> are both interests), but applied to a singular noun it turned every correction into an accumulation: <code>update("relationships","wife","Anna")</code> then <code>(…,"wife","Maria")</code> produced <code>- wife: Anna, Maria</code>, injected into the system prompt every turn for ever with nothing anywhere able to reconcile it. These are exactly the keys the canonicalisation table CREATES, so a correction was guaranteed to hit the merge branch. Rule of thumb: a genuinely multi-valued fact belongs under a PLURAL key (<code>pets</code>, <code>children</code>, <code>languages</code>, <code>topics</code>), which keeps merge semantics untouched.</p>
+
+  <h2>Bounded merge — no unbounded prompt growth (2026-07-22)</h2>
+  <p>Merging keys were previously uncapped, and every merged key is rendered inline by <code>get_context_string()</code> into <em>every</em> system prompt, so an unbounded key is a slow context-pressure leak. A merging key is now capped at <code>_MAX_VALUES_PER_KEY = 8</code>, dropping the OLDEST first (the newest statement is the most likely to be current) with the trim logged at <code>WARNING</code>. <code>notes.info</code> — the DEFAULT sink a malformed <code>profile_update</code> lands in (the callers default <code>category="notes", key="info"</code>, so any dict the model emits without those keys dumps the whole extracted fact here) — gets a much tighter ring: <code>_SINK_MAX_VALUES = 3</code> values of <code>_SINK_MAX_VALUE_CHARS = 200</code> chars each. It had no cap, no TTL and no dedup beyond exact-string match, growing straight into the prompt. Tests: <code>tests/test_memory_store_durability.py</code>.</p>
+  <p><strong>Log levels (2026-07-25):</strong> the sink ring rotating at its designed 3-cap is routine by-design behaviour, not a leak signal — it now logs at <code>debug</code> only. A <em>real</em> multi-valued key overflowing the 8-cap keeps the operator-stream <code>WARNING</code>: that is the context-pressure-leak signal the message exists for. (The repeated <code>notes.info</code> WARNING was operator-flagged as noise the same day the smart-memory caller stopped feeding the sink — see below.)</p>
+
+  <h2>Forgetting values (not just keys)</h2>
+  <p>The profile is injected into the system prompt every turn via <code>get_context_string()</code>, so it is the <em>authoritative</em> source the model answers from — vector and graph stores are secondary. This made one deletion bug user-visible: pets / interests / assets are stored as <strong>values</strong> (e.g. <code>assets.pets = ["Bruno the dog", "Mortimer the iguana"]</code>), but <code>unified_forget</code>'s profile sweep only matched <strong>keys</strong>. <code>forget('mortimer')</code> therefore never reached the row — it kept being injected, so the model kept "remembering" the deleted pet even after reporting success. The merge semantics above compounded it: a "Mortimer is gone" interaction <em>appended</em> a soft-delete tombstone string (<code>"Mortimer the iguana (removed)"</code>) rather than deleting anything.</p>
+  <p><code>prune_value(category, key, target)</code> closes this: it removes every list item (or a matching scalar) whose text <em>mentions</em> the target, collapsing a surviving singleton list back to a scalar and dropping the key — and the category — when nothing remains. Matching is <strong>token/word-boundary aware</strong> so <code>forget('age')</code> does not strip a value of <code>'language'</code>, while <code>forget('mortimer')</code> still matches <code>'Mortimer the iguana (removed)'</code>. <code>unified_forget</code> now runs this value sweep after its key sweep (see <a href="memory_tools.html">memory tools</a>). <em>Since 2026-10-03 a scalar is removed only when it IS (or starts with) the entity; a field that merely mentions it is listed — <a href="memory_tools.html#rereview">current rules</a>.</em></p>
+
+  <h2>Robustness — <code>profile_update</code> shape</h2>
+  <p>The smart-memory consolidation prompt asks the LLM to return <code>profile_update</code> as an object (<code>{category, key, value}</code>). The model occasionally ignores this and emits a bare string instead. The agent now coerces any non-dict <code>profile_update</code> to <code>None</code> at parse time: such a fact is still stored as a normal <code>auto</code> vector memory but skips the <code>identity</code> / <code>profile_memory.update</code> path entirely. This prevents the previous crash — <code>'str' object has no attribute 'get'</code> — which fired (and was swallowed) when a high-score string slipped into the identity branch.</p>
+
+  <h2>Project-state screening + sink-write guard (2026-07-25)</h2>
+  <p>Operator log review caught the profile being polluted by <em>project chatter</em>: the smart-memory scorer inflated tracked-project status sentences to 0.90, storing them as timeless user truths AND churning them through the 3-slot <code>notes.info</code> ring (100% of the user's notes became project state). Three layers now stop this, all in <code>core/agent.py</code>'s <code>run_smart_memory_task</code>:</p>
+  <ul>
+    <li><strong>Prompt rescoring.</strong> The scoring matrix scores TRACKED-PROJECT STATE at 0.2 → DISCARD ("the project store already records these"); a durable user preference learned during project work stays 0.9.</li>
+    <li><strong>Deterministic backstop <code>_is_tracked_project_state</code></strong> (small models inflate past the prompt). A fact is project-state when it carries a <em>verified</em> 12-hex project id, the bound project's title, or — added the same day after a buffered-journal drain refilled the freshly-scrubbed ring with paraphrased state naming neither — agent-workflow verification vocabulary (<code>_WORK_STATE_CUE_RE</code>: "verifier", "refuted", "failed verification", "previous attempts", "project IDs"). Preference-phrased sentences are exempted <em>before</em> any of these checks. Both the fact and the <em>effective</em> profile value (<code>profile_update.value</code> falls back to the fact) are screened.</li>
+    <li><strong>Sink-write guard.</strong> A <code>profile_update</code> naming NEITHER <code>category</code> nor <code>key</code> — the shape that lands in the <code>notes.info</code> junk drawer with the whole fact as its value — is dropped entirely (debug log): the fact is already stored in vector memory on the same path, so the sink write was pure duplication that churned the ring on every consolidation. A well-formed <code>profile_update</code> naming its slot flows unchanged; such facts degrade to <code>auto</code> (not <code>identity</code>), the same convention as the non-dict shape above.</li>
+  </ul>
+  <p>Tests: <code>tests/test_project_state_memory_hygiene.py</code> (backstop + workflow cue), <code>tests/test_agent_smart_updates.py</code> (sink guard), <code>tests/test_memory_store_durability.py</code> (log levels).</p>
+
+  <h2>API</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Method</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>load() / save(data)</code></td><td>Whole-file read / write. <code>load()</code> UNWRAPS to the legacy shape; <code>save()</code> preserves the stamps of unchanged values.</td></tr>
+      <tr><td><code>load_raw() -&gt; dict</code></td><td>The on-disk shape, stamps included. Used by update / delete / prune_value / get_context_string — going through <code>load()</code> there would strip provenance on the next save.</td></tr>
+      <tr><td><code>as_of(category, key) -&gt; str | None</code></td><td>When this store learned the value (newest stamp for a multi-valued key). None when unknown — never a guess.</td></tr>
+      <tr><td><code>stamp(category, key, as_of) -&gt; int</code></td><td>Attach provenance to UNSTAMPED items only. Cannot change a value; refuses a falsy date. Returns how many it stamped.</td></tr>
+      <tr><td><code>update(category, key, value, as_of=None) -&gt; str</code></td><td>Merge-semantic update; returns sync message describing canonical mapping.</td></tr>
+      <tr><td><code>delete(category, key) -&gt; str</code></td><td>Remove a whole key; status string.</td></tr>
+      <tr><td><code>prune_value(category, key, target) -&gt; str</code></td><td>Remove list items / a scalar that <em>mention</em> <code>target</code> (token-boundary match); drops the key/category when emptied. Lets <code>forget</code> reach entities stored as values.</td></tr>
+      <tr><td><code>get_context_string() -&gt; str</code></td><td>Format for LLM injection.</td></tr>
+    </tbody>
+  </table></div>
+
+
+  <h2 id="provenance">Per-value provenance — <code>as_of</code> (2026-09-04)</h2>
+  <p>Anchoring (below) fixes decaying facts that have a <strong>derivable invariant</strong>: an age has a birth date behind it, so the current value can be recomputed. Plenty of facts decay with no invariant — an employer, a location, "currently learning X". For those the only truthful thing the store can say is <em>when it learned them</em>, and a bare string could not say even that.</p>
+  <p>That gap was not hypothetical. The corpus-repair script could not ask this store when <code>relationships.sons</code> was recorded; it had to infer the date from the <em>contradiction log</em>, a different store — which is why it carries a <code>--said-at</code> flag and a refuse-to-guess rule.</p>
+
+  <h3>Stamps are per VALUE, not per key</h3>
+  <p>A merging key accumulates its items at different times, so one stamp for the key would be a lie about every item but the last. A scalar becomes <code>{"v": …, "as_of": …}</code>; a list becomes a list of those. Promotion from scalar to list carries the existing item over untouched, so its own date survives.</p>
+
+  <h3>The reader contract is what makes this cheap</h3>
+  <p><code>load()</code> returns the <strong>legacy shape</strong> — every value unwrapped to a plain string or list — so all twelve production readers (enumerated from the AST, not from a hand-written list) are untouched by the migration. Only code that wants provenance calls <code>load_raw()</code> or <code>as_of()</code>. <code>save()</code> re-attaches the stamp of any value handed back unchanged, which closes the <code>save(load())</code> footgun structurally: once unwrapped the two shapes are indistinguishable, so no convention could.</p>
+
+  <h3>Quiet by default</h3>
+  <p>A marker only appears where it changes how the fact should be read. A <strong>durable</strong> key (<code>_DURABLE_KEYS</code>: name, birthday, pronouns, wife, sons, …) is never marked — a name is not more doubtful for being a year old. A perishable value younger than <code>_STALE_AFTER_DAYS = 90</code> renders exactly as before. Past that it reads <code>(as of 2026-04-01)</code>, and past <code>_VERY_STALE_AFTER_DAYS = 365</code>, <code>(as of 2024-02-01, may be stale)</code>. An unstamped legacy value is never marked either: absent provenance is not evidence of age. The marker is a fixed date string, so it does not churn the byte-stable <code>{{PROFILE}}</code> prefix.</p>
+  <p><strong>A restatement refreshes the stamp</strong>, on both the scalar and the list path — the user saying a fact again is evidence it is still true, and "last confirmed" is what the marker reports.</p>
+
+  <h3>Recovering provenance for the existing corpus</h3>
+  <p>A one-time backfill, <code>scripts/repair_temporal_anchors.py --targets profile-stamps</code> (run in 2026-07; the script was deleted in the post-§4NN tidy-up, 2026-10-11, its job done). Dates were <em>recovered</em>, never invented, and only from stores that record a fact WRITE: the minted vector fact (<code>User &lt;key&gt; is &lt;value&gt;</code>) and the contradiction log, which preserved superseded ones verbatim (the log went with belief versioning in §4NN). A document that happens to contain the words records nothing about the profile — the first version matched any corpus mention and dated <code>name = Vasilis</code> from a chess prompt and <code>debugging_tool_macos = dtrace</code> from a PostgreSQL manual. Values shorter than 12 characters are not attributable by text match at all. Anything undatable is reported UNRECOVERED rather than stamped with today, which would date every legacy fact to the day of the upgrade and make the marker lie for a year.</p>
+  <p><code>ProfileMemory.stamp()</code> is the write path, deliberately surgical: routing the backfill through <code>update()</code> would re-anchor, canonicalise and cap the values — a migration able to rewrite what it was only supposed to date. It cannot change a value, never overwrites an existing stamp, and refuses a falsy date.</p>
+  <p class="warn"><strong>⚠ Deploy order: code, then data.</strong> New code reads legacy bare values fine (unwrapping is identity on a string), but an agent still running the older <code>ProfileMemory</code> renders a stamped value as a raw dict — <code>{'v': 'Athens, Greece', 'as_of': …}</code> — straight into every system prompt, and hands the same dict to <code>tool_check_location</code>. The script printed this before applying.</p>
+
+  <h2>Temporal anchoring — a stated age is not a fact (2026-09-04)</h2>
+  <p>This store renders bare, <strong>unstamped</strong> <code>- key: value</code> lines into <code>### USER PROFILE ###</code> on every turn, so anything time-dependent written into it reads as present tense for ever. Live: <code>relationships.sons = "Markos (9 years old) and Kosmas (4 months old)"</code>, stated 2026-07-07, was still being recalled verbatim two months later.</p>
+  <p>Two changes, both in this file:</p>
+  <ul>
+    <li><code>update()</code> anchors at the store BOUNDARY — <code>"Kosmas (4 months old)"</code> is stored as <code>"Kosmas (born ~2026-02-20)"</code>. Placed here rather than per-caller because every writer funnels through <code>update()</code>: the <code>update_profile</code> tool (both paths), the bus's <code>_profile</code> leg, and smart-memory consolidation. Nothing can bypass it.</li>
+    <li><code>get_context_string()</code> DERIVES the current value at render time: <code>- sons: Markos (born ~2017-01 → ~9 years old) and Kosmas (born ~2026-02-20 → ~6 months old)</code>. The disk keeps constants; the prompt gets what is true today, and the model is never asked to subtract a timestamp it will not notice. The gloss is a rounded age, not a date, so the block still changes only when the age changes — <code>{{PROFILE}}</code> is inside the byte-stable system prefix and must not churn daily.</li>
+  </ul>
+  <p><strong><code>_same_fact()</code> is the dedup change this forced.</strong> Anchoring makes two statements of the same fact differ in bytes ("4 months old" in July, "6 months old" in September), so the exact-string merge dedup would have kept BOTH and injected two contradictory birth dates into every prompt. Values carrying an anchor now compare on <code>temporal.signature()</code> — anchor-blind — so the newer statement refines in place. The exemption is deliberately scoped to anchored values: everything else keeps byte-exact semantics, so this cannot silently collapse distinct interests (<code>python</code> and <code>Python</code> still both persist). See <a href="temporal.html">memory / temporal.py</a> for the full design, the known limitations, and the corpus-repair script. Tests: <code>tests/test_temporal_anchoring.py</code>.</p>
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Fail-closed on transient read errors.</strong> ProfileMemory was the only small store without the <code>_degraded</code> discipline its siblings have: an EIO/EACCES read was treated as corruption — the INTACT profile was shunted to a <code>.corrupt-*</code> sidecar, identity reverted to <code>{"name": "User"}</code>, and the next <code>save()</code> overwrote the real file. Now: OSError (≠ FileNotFoundError) serves the default in-memory, leaves the on-disk file untouched, and BLOCKS writes until a read succeeds; parse corruption keeps the sidecar path. <code>save()</code> also fsyncs before the rename (torn-write window). The bus's profile leg and the smart-memory consolidation both now REQUIRE category+key on a profile_update — the old "info"/"notes" defaults minted permanent junk keys like <code>cli_tools.info</code> outside the notes ring (no rotation, no value cap, injected into every prompt). Tests: <code>::TestProfileFailClosed</code>.</p>
+
+  <h2 id="4sn">Age of a birth-date field (2026-10-31, §4SN)</h2>
+  <p>The age was derived only for a value that says "born …". <code>root.birthdate: 1980-01-26</code> and <code>wife_birthdate</code> were shown raw, so "how old am I?" left the model to subtract. A birth-date <em>key</em> (<code>birthdate</code>, <code>birthday</code>, <code>dob</code>, <code>*_birthdate</code>) now renders <code>1980-01-26 → 46 years old</code>. The stored value is unchanged, and a value that already says "born" is not glossed twice. The text changes once a year per person, so the cached prompt head changes with it.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="writes-review">Empty values and replaced values <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <p><code>update()</code> refuses an empty value (None, blank, zero-width, "null", "none", <code>[]</code>…) — an extractor's null was
+  stored as "None". A replaced single-value field keeps the value before it under <code>previous</code> (one level) and says
+  "(was: …)", so a background writer can no longer swap <code>root.name</code> without a trace.</p>
+  <h2 id="r8">Corrections and forget helpers <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p class="note"><strong>Correction</strong> to the section above: <code>update()</code> refuses <code>None</code>, blank,
+  zero-width, "null", "nil", "undefined", <code>[]</code>, <code>{}</code> — but "none" and "N/A" are real answers ("allergies:
+  none") and are stored.</p>
+  <ul>
+    <li><code>mentions(value, target)</code> — the one mention rule for the forget profile leg and <code>prune_value</code>:
+    whole word, accent- and case-folded, any script; a multi-word target as a folded phrase on word boundaries. The old
+    ASCII-only split never found a Greek name.</li>
+    <li><code>drop_previous(category, key)</code> and <code>remove_item(category, key, item)</code> — item-level deletes for the
+    forget executor (one exact list item, not every item mentioning a word).</li>
+  </ul>
+  <p><code>delete(category, key, exact=True)</code> skips the canonical field map — the forget executor deletes the field the user
+  was shown.</p>
+  <h2 id="4kz">The profile is the authority; the rest are mirrors <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <p>After every profile write — <code>update_profile</code> (bus or direct), its delete, or the background extractor —
+  <code>tools.memory.sync_owner_mirrors</code> reads the field back and makes its mirrors EQUAL it:
+  <code>GraphMemory.sync_owner_field</code> (the <code>user HAS_&lt;KEY&gt;</code> edges, stale ones deleted and archived) and
+  <code>VectorMemory.sync_owner_field</code> (the identity rows <code>User &lt;key&gt; is …</code>, by EXACT key — the old
+  distance-based <code>smart_update</code> deleted the sibling key's row). New rows are written first; stale ones go only when
+  they landed, and a refused write reports PARTIAL. Measured before: three live HAS_WIFE edges after a correction, the old
+  HAS_LOCATION beside the new, a list item's row replaced by the next item's.</p>
+  <p>The extractor writes an owner-stated <code>profile_update</code> on its own, independent of the fact's score ("remember that
+  I moved" never reached the profile); <code>drop_previous</code> uses the canonical field map.</p>
+  <h2 id="4lb">What every prompt carries <span class="tag">2026-10-03 &sect;4LB</span></h2>
+  <p>Measured over 40 owner turns: the profile was relevant to 4 and used by none, yet carried the street address and a
+  physical description every time — and the model wrote "Kaledonias 83" into Tor web searches. Now:</p>
+  <ul>
+    <li><strong>On request only:</strong> <code>root.address</code>, every <code>*_description</code>, and any
+    address-like key (<code>address</code>, <code>street</code>, <code>postcode</code>, <code>zip</code> in the key name —
+    the model chooses keys, and <code>root.home_address</code> was rendered) are left out of the prompt and NAMED at the end
+    ("on request only — recall them when the task needs them, never put them in a web search"). The owner extends the list
+    in <code>profile_prompt_policy.json</code> (<code>{"on_demand": [...]}</code>). The model reaches them through
+    <code>recall</code> (the identity mirror rows).</li>
+    <li><strong>Egress (r2, <code>memory/egress.py</code>):</strong> one detector for every outbound path — the dispatch
+    hook AND the tool callables themselves (a tool that calls another tool reaches them directly: <code>youtube_transcribe</code> calls <code>knowledge_base</code>). It folds the text
+    (lower case, accents off, Greek transliterated, URL-decoded; a JSON string is parsed, so \u-escaped Greek is seen) and
+    matches the street + house number in either order, with "street/st/odos" between and the street by its stem
+    (Καλεδονίας / Kaledonias), the number bounded (83 ≠ 830; 83A is 83), and the postcode with or without the Greek space.
+    The match is replaced, in the text as written, by the address's SUBURB (<code>egress.locality</code>: the address
+    without street, number and postcode — "Kalopetres"), else the owner's city, else "nearby". Operator 2026-10-03:
+    with "Athens" the live probe searched the wrong suburb. The model is TOLD: a rewritten call's result ends with
+    <code>egress.privacy_note</code> ("[privacy: … replaced by its area, 'Kalopetres' … search there]") — appended,
+    never in front, because a result's head is parsed (an "Error:" prefix classifies a failed call). Not told, the model
+    re-guessed the town and searched another Kaledonias Ave (r4).
+    <code>OUTBOUND_TOOLS</code> says which arguments of which tool leave: every argument of web_search, deep_research,
+    darkweb_search, darkweb_research, fact_check and browser; <code>location</code>/<code>city</code>/<code>query</code>
+    of system_utility (the geocoder); only URLs for file_system, knowledge_base and vision_analysis (their local paths and
+    the owner's own text never leave); for <code>execute</code> and (&sect;4SX B) <code>lab</code>, only URL literals inside the code (<code>"url_literals"</code>: the code is the owner's own, but the machine it runs on has Tor egress). Descriptions are prompt-only — as
+    egress terms their first clause rewrote unrelated queries ("brown hair dye").</li>
+    <li><strong>Weather</strong> geocodes a LOCALITY: the location/city field, else a home/residence/address value with
+    its street, number and postcode removed ("Kifisias 10, Marousi" → Marousi).</li>
+    <li>The coding persona carries the PREFERENCES only (it carried the whole profile a second time); the profile closes the
+    system prompt, so a change re-prefills only the tail.</li>
+  </ul>
+  <h2 id="4li">The address detector, after the final review <span class="tag">2026-10-04 &sect;4LI</span></h2>
+  <ul>
+    <li>Folding runs NFKC, drops invisible format characters, and maps Cyrillic look-alikes and "c" to their Latin /
+    "k" forms, so "Ｋaledonias ８３", a zero-width space or "Caledonias" match. "Kaledhonias" is tolerated, and so is
+    a spaced number ("8 3").</li>
+    <li>Between street and number, "no. / nr / # / number / αριθμός" are allowed. A call that carries the street stem
+    AND its number anywhere ("house 83 on Kaledonias", the street and the number in separate arguments) has both
+    replaced (<code>egress.address_parts</code>).</li>
+    <li>The postcode, including "101-01" and "GR-10101", is scrubbed on its own, but never inside an identifier:
+    arXiv <code>2401.10101</code>, <code>issues/10101</code> and <code>v1.10101.tar.gz</code> are left as written.</li>
+    <li><code>execute</code> is outbound for the URLs inside its code: a <code>curl 'https://…?q=Kaledonias+83'</code>
+    is scrubbed, while the rest of the code (a letter it writes) is the owner's and is left alone.</li>
+    <li>An address under any key the model picks (<code>home</code>, <code>residence</code>, <code>lives_at</code>,
+    <code>homeAddress</code>, <code>addr</code>, <code>domicile</code>), or any value that reads as a street address
+    (a street word or postcode plus a word and a house number; a <code>location</code> with a house number), is kept
+    out of the prompt and scrubbed.</li>
+    <li>Not covered, accepted: deliberate obfuscation (base64, double URL-encoding, spelled-out numbers).</li>
+  </ul>
+</main>
+
+<h2 id="4mn">§4MN (2026-10-08): removals are archived first</h2>
+<p><code>delete</code>, <code>remove_item</code>, <code>drop_previous_mentioning</code> and <code>prune_value</code> append the removed value to <code>profile_removed.jsonl</code> (fsynced, kept 30 days like forgotten episodes) <em>before</em> changing the profile. If the archive cannot be written, nothing is removed, and the result starts with "Error:" so the forget report shows ⚠️, never ✅. The 30-day retention is also enforced daily by the dream (<code>purge_removed_archive</code>, line by line, so one unreadable line no longer stops it). The owner's own facts had been the one store deleted with no copy.</p>
+<h2 id="kb-review-1030">2026-10-30: mirror names</h2>
+<p><code>mirror_name(category, key)</code> is the name a field's graph and vector copies use: the bare key in <code>MIRROR_ROOT_CATEGORY</code> ("root"), <code>&lt;category&gt;_&lt;key&gt;</code> elsewhere. See <a href="memory_tools.html#kb-review-1030">the review</a>.</p>
+
+</body>
+</html>

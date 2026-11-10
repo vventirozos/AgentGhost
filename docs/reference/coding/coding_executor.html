@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coding executor (core.coding_executor) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <div class="subnav">
+      <a href="acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a href="code_claims.html">Code claims (core.code_claims)</a>
+      <a class="current" href="coding_executor.html">Coding executor (core.coding_executor)</a>
+      <a href="coding_loop.html">Coding loop (core.coding_loop)</a>
+      <a href="docker.html">Docker sandbox (sandbox.docker)</a>
+      <a href="execute.html">Running code (execute) (tools.execute)</a>
+      <a href="experiment_gate.html">Experiment gate (core.experiment_gate)</a>
+      <a href="file_system.html">File system tool (tools.file_system)</a>
+      <a href="jobs.html">Sandbox jobs (sandbox.jobs)</a>
+      <a href="probe_model.html">Probe-model experiments (tools.probe_model)</a>
+      <a href="probe_transcripts.html">Probe transcripts (core.probe_transcripts)</a>
+      <a href="quarantine.html">Quarantine (tools.quarantine)</a>
+      <a href="runs.html">Runs (tools.runs)</a>
+      <a href="services.html">Sandbox services (sandbox.services)</a>
+      <a href="skill_acquisition.html">Skill acquisition</a>
+      <a href="workspace.html">Workspace tool (tools.workspace)</a>
+      <a href="workspace_cleanup.html">Workspace cleanup (core.workspace_cleanup)</a>
+      <a href="workspace_continuity.html">Workspace Continuity</a>
+      <a href="workspace_track.html">Workspace tracking (tools.workspace_track)</a>
+    </div>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / coding_executor.py</h1>
+  <p class="subtitle">The real per-task coding executor for autonomous batches: build one leaf for real — write files, verify — instead of marking shallow work done.</p>
+
+  <h2>Why</h2>
+  <p>When <a href="../projects/project_advancer.html"><code>advance_many</code></a> runs a
+  batch ("proceed with all remaining tasks"), each coding tick used to generate
+  a SINGLE shell command. That produced <strong>theatrical completion</strong>:
+  a leaf marked DONE having written nothing — observed live, where "create
+  hello.txt" was classified as research, ran a <code>web_search</code>, and was
+  reported complete with no file on disk. This module makes a coding tick
+  actually build.</p>
+
+  <h2>What it does</h2>
+  <p><code>build_coding_task(context, description, *, tool_runner, ledger="")</code>
+  is bounded by design — the task tree already decomposes the work, so this just
+  builds ONE leaf well:</p>
+  <ol>
+    <li><strong>Spec</strong> — one LLM call returns a JSON object: <code>files</code> (each a <code>path</code> + FULL <code>content</code>), an optional <code>verify</code> shell command, a one-line <code>summary</code>, and a one-line <code>ledger</code> fact. The project's <a href="../infrastructure/prompts.html">design ledger</a> AND its current files (<code>existing_files</code>, gathered by <code>project_advancer._gather_project_files</code>) are fed in, with an instruction to EXTEND those files rather than recreate them — so a single-file app accretes across tasks instead of each task overwriting the last. The project's <strong>research briefs</strong> (<code>research_context</code>, gathered by <code>project_advancer._gather_research_briefs</code>) are fed in too, as a READ-ONLY <strong>PROJECT RESEARCH</strong> reference block (2026-06-22) — so the build follows the design decisions the agent researched instead of ignoring its own work; these are explicitly framed as "NOT files to edit" and kept out of <code>existing_files</code>.</li>
+    <li><strong>Write</strong> — each file via the <code>file_system</code> tool (<code>operation="write"</code>), capped at <code>MAX_FILES</code> (16) / <code>MAX_CONTENT_CHARS</code> (400k) per file.</li>
+    <li><strong>Verify</strong> — runs the <code>verify</code> command via <code>execute</code>; a failure (per <code>project_advancer._looks_like_failure</code>) fails the build.</li>
+    <li>Returns a <code>CodingResult</code> (<code>ok</code>, <code>summary</code>, <code>files</code>, <code>ledger_note</code>, <code>detail</code>).</li>
+  </ol>
+
+  <h2>Don't clobber prior work (2026-06-20)</h2>
+  <p>A later failure: on a single-file app each task REGENERATED the whole
+  file with <code>write</code> and OVERWROTE the previous task — three tasks
+  "completed" left a 2.7KB shell with neither the File Explorer nor the Snake
+  game, and frontend tasks (no shell <code>verify</code>) had no gate to catch
+  it. Three defences:</p>
+  <ul>
+    <li><strong>Non-regression guard</strong> — a full-content rewrite of an <em>existing</em> file is REFUSED if the new content is materially smaller (<code>&lt;85%</code>) or drops the file's existing structural identifiers (HTML ids, function/class names, CSS selectors). It must be a SUPERSET.</li>
+    <li><strong>Edit, don't clobber</strong> — a file entry may carry <code>edits</code> (<code>[{"find":…,"replace":…}]</code>, <code>{"after":…}</code>, or <code>{"before":"</body>",…}</code>) applied via <code>file_system operation="replace"</code>, so a feature is ADDED to an existing file without re-sending it. A non-matching edit fails the task.</li>
+    <li><strong>Append (the easy incremental primitive, 2026-06-20)</strong> — a file entry may carry <code>"append":"<only the new code>"</code>; the executor writes <code>old + new</code>. It's a strict superset (can never regress), and the model emits ONLY the new snippet. This was added because re-emitting a whole ~8KB file choked the small model on task 2 of a live single-file build — it returned an EMPTY spec twice and the task failed. With <code>append</code>/<code>edits</code> the model only produces the delta. Existing files are now shown to the model as compact head+tail EXCERPTS (not full content), and the prompt steers hard toward <code>append</code>/<code>edits</code> over full <code>content</code>.</li>
+  </ul>
+  <p><strong>No per-task render (correction).</strong> An earlier version
+  headless-rendered each HTML task and failed it on an uncaught JS exception.
+  That was <em>wrong for incremental builds</em>: no intermediate task produces
+  a complete working page — the shell exists before the apps, an app before the
+  next — so rendering each tick failed legitimate in-progress work. Observed
+  live: the Core-shell task built real files (a 799B <code>index.html</code> +
+  <code>script.js</code> + 7.7KB <code>style.css</code>), then a render of the
+  app-less shell "crashed" on a not-yet-defined reference, the retry returned an
+  empty spec, and a good task was marked FAILED. The render gate was removed;
+  the <strong>non-regression guard is the real protection</strong>, and a shell
+  <code>verify</code> still hard-gates runnable code. Whole-app rendering
+  belongs to a final verification task, not to every tick.</p>
+  <p><strong>Retry with feedback.</strong> A refused write or a failed verify
+  is regenerated ONCE with the exact failure reason fed back, then the task
+  fails. Single-file projects (detected from the goal in
+  <code>advance_once</code>) pass <code>single_file=True</code> to strengthen
+  the "grow the one file" steer.</p>
+
+  <h2>Recover the spec from the reasoning channel (2026-06-22)</h2>
+  <p>A live failure mode killed 5 coding leaves in one project: every attempt
+  logged <code>coding_executor: no file spec parsed (len=0)</code> with an EMPTY
+  raw window, and <code>advance_once</code> marked the task FAILED with
+  <em>"model produced no file spec for the task"</em>. The cause was not the
+  model — it was <code>_generate_build_spec</code> reading only
+  <code>message.content</code>. Reasoning models (Qwen via llama.cpp) emit their
+  chain-of-thought in a separate <code>reasoning_content</code> field; when the
+  think block consumes the whole <code>max_tokens</code> budget without closing,
+  the parser routes EVERYTHING — including the JSON build spec — into
+  <code>reasoning_content</code> and leaves <code>content</code> empty. The
+  executor saw <code>""</code> and gave up.</p>
+  <p>The fix mirrors the established pattern in <a href="../infrastructure/agent.html">agent.py</a>
+  (~L2973) and <a href="../projects/project_research.html">project_research.py</a>: when
+  <code>content</code> yields no usable spec, fall back to
+  <code>reasoning_content</code> (then to the two channels concatenated, for a
+  spec split across the <code>&lt;/think&gt;</code> boundary). A genuinely empty
+  response (upstream contention) still fails — but only after the fallback was
+  tried, and the diagnostic now logs BOTH channel lengths
+  (<code>content=N reasoning=M</code>) instead of a misleading empty window.
+  Covered by <code>test_build_recovers_spec_from_reasoning_content</code> and
+  siblings in <code>tests/test_coding_executor.py</code>.</p>
+
+  <h2>Think-ate-the-budget: one no-think retry (2026-07-06)</h2>
+  <p>The reasoning-channel fallback above only helps when the JSON spec actually
+  made it into <code>reasoning_content</code>. The worse shape (observed live
+  2026-07-06, twice in one project: <code>content=0
+  reasoning=40&ndash;62k chars</code>) is the model spending the ENTIRE
+  16384-token budget on think-prose and never starting the JSON at all — each
+  occurrence a ~5-minute generation lost, logged as
+  <code>extract_json_from_text: malformed JSON-like content</code> followed by
+  <code>no file spec parsed</code>. <code>_generate_build_spec</code> now
+  detects exactly this signature (no usable spec AND empty
+  <code>content</code> AND non-empty <code>reasoning</code>) and retries
+  ONCE with thinking disabled, using the established no-think recipe from
+  <code>project_research._llm_call</code>/<code>dream.py</code>: the
+  <code>/no_think</code> soft-switch, the
+  <code>chat_template_kwargs {"enable_thinking": false}</code> hard-switch, and
+  a system nudge. Attempt&nbsp;1 keeps thinking ON (design depth is worth it
+  when it works); prose-in-<code>content</code> failures do NOT trigger the
+  retry (that's the normal feedback loop's job). Covered by
+  <code>test_think_only_response_retries_once_without_thinking</code> and
+  <code>test_prose_content_does_not_trigger_nothink_retry</code>.</p>
+
+  <h2>Already-built leaf: empty <code>files</code> + a <code>verify</code> (2026-06-22)</h2>
+  <p>When a task's deliverable was already written by a prior interactive turn,
+  the autoadvance tick re-picks the task and the model — correctly — returns a
+  spec with <code>"files": []</code> and a <code>"verify"</code> command ("nothing
+  to write; just check it runs"). The executor used to reject empty
+  <code>files</code> as "model produced no file spec" and FAIL the task
+  (observed live: the Model Architecture task FAILED in autoadvance though
+  <code>model.py</code> existed and ran). Now an empty file list with a
+  <code>verify</code> RUNS the verify: it passes → the task succeeds (no files
+  written); it fails → the task fails with the real verify error fed back to the
+  retry, not the generic no-spec message. Empty <code>files</code> AND no
+  <code>verify</code> still fails as before. Covered by
+  <code>test_empty_files_with_passing_verify_succeeds</code> and siblings in
+  <code>tests/test_coding_executor.py</code>.</p>
+
+  <h2>Capacity caps raised off the small-model era (2026-06-22)</h2>
+  <p>An audit for leftovers tuned to a weaker model surfaced several caps that
+  were starving or fragmenting code from the current strong model:</p>
+  <ul>
+    <li><strong><code>MAX_ATTEMPTS</code> 2 → 4 and <code>MAX_FILES</code> 8 → 16.</strong> A capable model often fixes a verify failure on attempt 3-4; the hard stop at 2 turned a recoverable build into a batch-halting FAILURE. And a single "scaffold the app" leaf can legitimately emit a dozen+ files, which 8 silently dropped.</li>
+    <li><strong>Append/edits steer rebalanced.</strong> The spec prompt previously pushed <code>append</code> as "STRONGLY PREFERRED" and told the model to "avoid <code>edits</code>" — biasing toward additive-only changes (you cannot append your way to a bug fix or refactor). It now picks by INTENT: <em>adding → append; changing existing code → edits</em>.</li>
+    <li><strong>IIFE auto-wrap made conservative.</strong> <code>_isolate_scripts</code> wrapped EVERY appended inline <code>&lt;script&gt;</code> in an IIFE to prevent cross-block identifier collisions — but that SILENTLY scoped away intentional globals, breaking <code>&lt;button onclick="startGame()"&gt;</code> wired to a top-level <code>function startGame()</code> with no error the model could see. Wrapping is now SKIPPED when the body exposes a global (<code>window.x = …</code>) or declares a name referenced by an inline <code>on*=</code> handler; self-contained blocks are still isolated. Covered by <code>tests/test_coding_executor_accretion.py</code>.</li>
+    <li><strong>Spec <code>max_tokens</code> 8192 → 16384.</strong> This is the
+    one call that emits a COMPLETE file as embedded JSON <code>content</code>; at
+    8192 (~24-32 KB) it was 12× below the 400 KB a file may be, and a reasoning
+    model spends part of the budget in <code>reasoning_content</code> before the
+    JSON starts — so a new full file + think preamble could truncate into invalid
+    JSON.</li>
+    <li><strong>Existing-file excerpt 800/400 → 2000/1000, block cap 12 KB →
+    40 KB.</strong> An 800/400 head+tail of a grown <code>index.html</code> hid
+    the middle, where an <code>edits</code> find/replace anchor often lives, so
+    the model guessed an anchor that byte-failed. With a 65 K-token context the
+    prompt budget easily affords real structural visibility.</li>
+    <li><strong>Oversized full <code>content</code> now FAILS, not silently
+    sliced.</strong> A file over <code>MAX_CONTENT_CHARS</code> used to be
+    <code>content[:cap]</code> — a hard cut mid-code that wrote broken output.
+    It now returns a "split across multiple files" failure, mirroring the
+    append path's "never truncate" stance. Covered by
+    <code>test_oversized_content_fails_loudly_not_silently_truncated</code>.</li>
+    <li><strong>Single-command fallback <code>max_tokens</code> 1024 → 4096</strong>
+    (<code>project_advancer.default_code_generator</code>) — that command "may
+    invoke <code>python3 -c</code>", so it can carry a whole inline program that
+    1024 tokens truncated mid-script.</li>
+  </ul>
+
+  <h2>Empty upstream responses ≠ "no file spec" (2026-06-22)</h2>
+  <p>A fully empty completion (<code>content=0 reasoning=0</code>) is upstream
+  contention/overload, not the model failing to produce a spec — feedback
+  retries can't fix it. Previously each empty response consumed a full
+  feedback-retry, so a 2-task autoadvance hammered the server with 8 instant
+  empty calls and then mislabeled the tasks "model produced no file spec",
+  dumping the agent into a long manual repair. Now <code>_generate_build_spec</code>
+  returns <code>(spec, was_empty)</code>; on an empty response the executor backs
+  off (<code>_EMPTY_BACKOFF_S</code>) and retries, capped at
+  <code>MAX_EMPTY_RETRIES</code> (2) <em>separately</em> from the normal
+  <code>MAX_ATTEMPTS</code>, then fails with an honest <em>"LLM returned empty
+  responses (Nx) — likely upstream contention, not a code problem; retry
+  later"</em>. Covered by
+  <code>test_empty_response_fails_with_honest_contention_message</code> and
+  <code>test_empty_then_valid_recovers_after_backoff</code>.</p>
+
+  <h2>Fail loud, not shallow</h2>
+  <p>If the spec is empty, a write is refused/rejected, or verify fails, the
+  build returns <code>ok=False</code>. <code>advance_once._finalize_coding</code>
+  then marks the task FAILED, which <strong>stops the batch loop</strong> so the
+  user can take the hard task themselves — the opposite of silently marking it
+  done. On success it registers the produced files as deliverable artifacts (so
+  <a href="workspace_cleanup.html">cleanup</a> keeps them) and appends the
+  ledger note. Covered by <code>tests/test_coding_executor_accretion.py</code>.</p>
+
+  <h2>Wiring</h2>
+  <p>Passed as <code>coding_executor=build_coding_task</code> into
+  <code>advance_once</code> / <code>advance_many</code> from both the
+  <a href="../projects/projects_tool.html"><code>manage_projects autoadvance</code></a>
+  tool path and the idle autoadvancer (<a href="../infrastructure/agent.html">agent.py</a> phase
+  2.95). It is NOT an open-ended agent loop — one spec call, N writes, one
+  verify — so per-tick context stays bounded however many tasks the batch runs.</p>
+  <p><strong>Background lane (2026-06-22).</strong> <code>build_coding_task</code>
+  takes <code>is_background</code>, threaded into the spec-generation
+  <code>chat_completion</code>. The IDLE autoadvancer sets it <code>True</code>
+  (along with its classifier + code-generator calls) so its ~8K-token spec call
+  goes through the client's background lane — waiting for foreground to clear and
+  capped concurrency — and a user who starts typing mid-build isn't stuck behind
+  it. The user-initiated <code>manage_projects autoadvance</code> tool leaves it
+  <code>False</code> (foreground): the user is actively waiting on that batch.
+  Covered by <code>test_spec_call_is_foreground_by_default</code> /
+  <code>test_spec_call_uses_background_when_requested</code>.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_coding_executor.py</code> — happy path (write + verify),
+  verify-failure, write-rejection, empty spec, no-verify, markdown-fenced JSON,
+  unavailable executor, and the <code>advance_once</code> integration (DONE +
+  artifacts + ledger on success, FAILED on a broken build), plus the
+  classification fix that routes file/build leaves here.</p>
+  <h2>Post-build gates (2026-07-08)</h2>
+  <p>Two gates run after the spec's own <code>verify</code> succeeds, both feeding the build-retry loop on failure (chess-session post-mortem: a build passed every mechanical check while violating the user's core constraint and shipping three crash-on-first-touch bugs):</p>
+  <ul>
+    <li><strong>Smoke gate</strong> (<code>core/build_gates.smoke_gate</code>): <code>py_compile</code> every written <code>.py</code>; when a Flask app is detected, sweep its routes with <code>test_client</code> (no server process): parameterless GET routes must not 5xx, POST routes get an empty JSON body and may 4xx but must not 5xx. The generated script self-bounds with <code>SIGALRM(45s)</code> so an import that starts a blocking server can't wedge the sandbox exec.</li>
+    <li><strong>Constraint gate</strong> (<code>core/build_gates.constraint_gate</code>): one background LLM audit of the files the task produced (<code>files_from_specs</code>) against the project's stored constraints — <em>judgement</em>-based, unlike the evidence-based DONE-gate in <code>tools/projects.py</code>. A confirmed violation becomes retry feedback quoting the constraint + evidence. The same gate guards the interactive <code>manage_projects task_update→DONE</code> path (refusal with an explicit <code>CONSTRAINT-OVERRIDE:</code> escape hatch for user-approved exceptions).</li>
+  </ul>
+  <p>Both gates <strong>fail open</strong> on infrastructure errors — a broken gate must never block builds. Covered by <code>tests/test_build_gates.py</code> (including an end-to-end run of the real smoke script against a Flask app with a 500-ing route) and <code>tests/test_probe_before_hypothesis.py</code> (wiring pins).</p>
+
+  <h2>Write-time syntax signal consumed (2026-07-14)</h2>
+  <p>file_system's write/replace paths append <code>⚠ SYNTAX CHECK FAILED: …</code> (ast/node-backed, HTML <code>&lt;script&gt;</code> blocks included) to an otherwise-successful result when the file left on disk does not parse. The interactive loop reads that warning in-context — but this executor discarded it: <code>_looks_like_write_error</code> only inspects the result's head. Observed live (first build after the check came alive in production): a 6-task autoadvance batch rewrote <code>index.html</code> five times, every write was flagged with the same <code>Identifier 'WebOS' has already been declared</code>, every task still closed DONE, and the broken build was only caught when the final turn browsed the page.</p>
+  <p><code>_syntax_fail_reason(path, out)</code> now extracts the diagnostic and all three apply paths (<code>append</code>, full-<code>content</code> write, <code>edits</code> — the last edit's result reflects the final on-disk state) surface it as an apply <em>failure</em>: the file stays on disk (file_system semantics unchanged), but the build's retry-with-feedback loop gets the exact line to fix and steers the retry toward <code>edits</code>. On exhausted attempts the task fails honestly via <code>_finalize_coding</code> — stopping the batch — instead of piling more features onto a file that doesn't parse. Fails open when the checker produced no warning (unknown extension, node absent). Covered by <code>tests/test_autoadvance_syntax_gate.py</code>.</p>
+
+  <h2>Anchored success/error classifiers (bug-hunt 2026-07-26b)</h2>
+  <p><code>_op_ok</code> was <code>"success" in out[:200]</code> — a SUBSTRING test. The file_system no-match message embeds the filename (<code>… NOT found in 'payment_success.html'</code>), so a FAILED replace on any <code>*success*</code>-named file (common in web deliverables) had "success" land in the window and counted the un-applied edit as applied — closing the coding leaf DONE with the file unchanged. Now anchored on the SUCCESS head (<code>head.startswith("success")</code>), matching the sibling <code>_looks_like_write_error</code>, whose own <code>"security error" in head</code> substring nit (misclassifying a successful write to a <code>security error handler.py</code>) was anchored to <code>startswith</code> in the same pass. Tests: <code>::TestOpOkAnchored</code>.</p>
+
+  <h2>Never corrupt a working Python file (2026-08-01, "Mini AI" incident)</h2>
+  <p>Autoadvance re-picked a task whose deliverable an interactive turn had already built and
+  verified (the ledger still said PENDING), and the spec appended a SECOND full implementation
+  into the working <code>core.py</code>. Python appends have no isolation (unlike HTML's
+  IIFE-wrapped scripts): the merged file hit a SyntaxError at line 379, three repair attempts
+  failed against it, the task was marked FAILED and the project rolled up FAILED — all while a
+  working file had existed on disk minutes earlier. Three defenses, all <em>pre-write</em>
+  (the post-write syntax signal catches damage only after the working file is already gone):</p>
+  <ul>
+    <li><strong><code>_py_append_guard</code></strong> — an append to a <em>parsing</em>
+    <code>.py</code> file is refused when it re-defines top-level <code>def</code>/<code>class</code>
+    names already present (a duplicate implementation, not an extension), when it adds a second
+    <code>if __name__ == "__main__"</code> block, or when the merged result would not
+    <code>ast.parse</code>. A broken base keeps the old flow (mid-repair files need appends).</li>
+    <li><strong>Overwrite guard</strong> — full-<code>content</code> replacement of a parsing
+    <code>.py</code> file with content that does not parse is refused before the write; the
+    working file survives on disk and the retry gets the exact diagnostic.</li>
+    <li><strong>Verify-only path is first-class</strong> — the spec prompt (system rules + an
+    <code>ALREADY ON DISK</code> steer rendered by <code>_render_already_built</code> when the
+    task description names files that already exist) tells the model to return
+    <code>{"files": [], "verify": "…"}</code> when the deliverable already works.
+    <code>_generate_build_spec</code>'s <code>_usable</code> now accepts a verify-only spec, so
+    it can't be clobbered by the reasoning-channel fallback or steered into re-implementation
+    by the retry loop; <code>build_coding_task</code>'s existing no-files path honours the
+    verify and closes the task without rebuilding. A verify-only spec whose verify is
+    kill-shaped (<code>pkill</code>/<code>fuser -k</code>/…) is refused with feedback rather than
+    skip-passed: with no files, the verify is the ONLY check, so the <code>_run_verify</code>
+    "skip, the files may be good" rationale doesn't apply (review pass, same day).</li>
+  </ul>
+  <p>Tests: <code>tests/test_project_ledger_integrity_fixes.py</code> (guards, disk-survival
+  end-to-end, verify-only survival, ALREADY-ON-DISK steer).</p>
+
+  <h2>Double-escaped spec content: bounded pre-write repair (2026-08-01, req 50855398)</h2>
+  <p>The spec model sometimes emits a file as a one-line JSON-escaped string that survives
+  extraction verbatim — every newline a literal <code>\n</code> pair. Writing it lands a broken
+  file the retry loop demonstrably cannot fix (live: three attempts on
+  <code>data_generator.py</code>, all still escaped, task FAILED). <code>_apply_file</code>'s
+  full-<code>content</code> path now runs <code>_maybe_unescape_double_escaped</code>: trigger
+  only on the exact shape (.py, ≤2 real newlines, ≥5 literal <code>\n</code>, original does NOT
+  parse), decode only the common escapes (<code>\n \t \r \" \' \\</code> — not
+  <code>unicode_escape</code>, which mangles UTF-8), and accept the repair ONLY when the result
+  <code>ast.parse</code>s — a tolerant repair must bound its OUTPUT, not just its trigger. On
+  any miss the original is written and the (now shape-naming) syntax feedback drives the retry.
+  Tests: <code>tests/test_req50855398_fixes.py</code>.</p>
+
+
+  <h2 id="replace-failure-label">A failed replace now names the reason it actually failed <span class="tag">2026-08-11</span></h2>
+  <p>
+    Every non-<code>SUCCESS</code> replace was reported to the model as
+    <em>&ldquo;anchor not found&rdquo;</em> — a diagnosis, not an observation, and often the wrong
+    one. That string is prefixed with <code>YOUR PREVIOUS ATTEMPT FAILED:</code> into the next
+    attempt's prompt, so a wrong label steers every retry at the wrong hypothesis. Live on one
+    request: a syntax-regression rollback (<code>REJECTED: that replace would introduce a syntax
+    error … unexpected indent</code>) was relabelled &ldquo;anchor not found&rdquo;, and the model
+    spent <b>20 minutes and 14 attempts hunting for a better anchor</b> while the defect was its
+    replacement's indentation.
+  </p>
+  <p>
+    <code>_replace_failure_kind()</code> classifies the observed rejection: syntax rollback,
+    ambiguous anchor, genuine anchor miss, marker leak, blocked write. <b>An unrecognised shape
+    returns a neutral phrase rather than the most likely guess</b> — the caller appends the tool's
+    raw text anyway, so saying less beats saying something false. Pinned in
+    <code>tests/test_audit_4at_round3_fixes.py</code>.
+  </p>
+
+  <h2 id="silent-drops">Two ways a task closed DONE claiming work that never happened <span class="tag">2026-08-11</span></h2>
+  <p>
+    <b>Dropped edits.</b> <code>edits</code> apply only when the path is in the prompt snapshot, and
+    that snapshot is hard-capped at 12 files. An <code>edits</code> entry for an unsnapshotted file
+    fell through to the <code>content</code> branch, found <code>None</code>, and returned
+    &ldquo;skipped, not a failure&rdquo; — zero tool calls, no reason, nothing in <code>written</code>.
+    A sibling entry that <em>did</em> apply then made the spec look successful. It now returns an
+    explicit reason naming the file and the cap.
+  </p>
+  <p>
+    <b>Edits beyond the snapshot are read, not refused (&sect;4QA-d, 2026-10-19).</b> That reason told the
+    model to &ldquo;name it in <code>files</code> so it is read first&rdquo; &mdash; a read that did not
+    exist, so every retry failed the same way (live: task 43c19f8b7511 edited
+    <code>tools/run_harness_on_outputs.py</code> in a 30-file project and closed FAILED). An
+    <code>edits</code> entry for a file outside the snapshot is now read from disk first and its edits
+    applied. Edits are exact-match, so a guessed anchor writes nothing; the path goes to
+    <code>touched</code>, so the next attempt's prompt shows the file. A missing file returns
+    &ldquo;does not exist &hellip; write it with <code>content</code>&rdquo;; an unreadable one returns a
+    reason. Never silence. The snapshot itself now keeps the files the task names (see
+    <a href="../projects/project_advancer.html">project_advancer</a>). Tests:
+    <code>tests/test_4qa_unsnapshotted_edits.py</code>.
+  </p>
+  <p>
+    <b>A full overwrite past the snapshot is guarded too (review r19).</b> A <code>content</code>
+    entry for a file outside the snapshot had no baseline, so the non-regression and Python-parse guards
+    were skipped: a 6&nbsp;KB module with 200 defs was replaced by 22 bytes. It is now read first. A
+    missing file is a new file. A read that answers <code>Error: &hellip;</code> (too large, budget,
+    permission) refuses the overwrite: &ldquo;use <code>edits</code>&rdquo;. So does a <code>--- p SAMPLE ONLY</code> reply: a large
+    long-line file exists even when no full text comes back (r20). Any other reply is not a file_system
+    read result and keeps the old no-baseline path. <code>_read_live_file</code> also treats file_system's
+    sandbox-ROOT fallback (&ldquo;NOTE: &hellip; serving the file at the sandbox ROOT&rdquo;) as
+    <em>missing</em>. That root file is not this project's: as a baseline it refused a new
+    <code>main.py</code> as a shrink, and an <code>append</code> built on its content. A whole read of a <em>big</em> root file answers &ldquo;Error: &hellip; too large&rdquo; without that
+    note, so an error reply is probed with a one-line ranged read (<code>_is_root_fallback</code>), which
+    carries it (r21). <code>edits</code> to a project file too large to read (or SAMPLE ONLY) are applied
+    without a copy, since exact-match edits need none. Before, they were refused with no way for a retry
+    to succeed. The task-named-file pattern now
+    also finds a name that ends a sentence (&ldquo;&hellip; into recursive_harness.py.&rdquo;) one written <code>./app/main.py</code> (r24) and a dot-path such as <code>.github/workflows/ci.yml</code>. A <code>../lib/util.py</code> name is outside the project, so it is not taken as <code>lib/util.py</code> (r25).
+  </p>
+  <p>
+    <b>Rewrite judged against a prefix.</b> <code>_gather_project_files</code> truncates silently, so
+    a 300&nbsp;KB <code>index.html</code> snapshotted at 4&nbsp;KB made a 20&nbsp;KB full rewrite look
+    like <em>growth</em> (20000 &gt; 4000×0.85) and the non-regression guard waved through the loss of
+    280&nbsp;KB. For <code>.py</code> the truncated prefix usually fails <code>ast.parse</code>, which
+    disables the overwrite guard entirely. Truncated entries now carry
+    <code>SNAPSHOT_TRUNCATED_MARK</code>, and a marked baseline forces a live re-read — <b>refusing if
+    the re-read fails</b>, because a refusal costs one retry and a wrong pass costs the file.
+  </p>
+  <p>
+    ⚠ The marker has <b>one</b> definition, imported rather than copied — producer/consumer drift is
+    the defect class this module already carries scars for. ⚠ The first pass marked only the
+    budget-exhaustion branch; the <em>per-file</em> truncation fires first and far more often, and
+    only a producer-side pin caught it (mutation-testing showed removing the marker reddened nothing).
+  </p>
+
+  <h2 id="shape-routing">Executor chosen by leaf shape <span class="tag">2026-09-08 · §4FL</span></h2>
+  <p>The seam at the top of <code>build_coding_task</code> asks <code>coding_loop.executor_kind(context, project_id, description=, existing_files=)</code>. Precedence: <code>GHOST_CODING_EXECUTOR</code> → the project's <code>metadata.executor</code> (either value) → the shape rule (<code>leaf_shape</code>: the leaf names an existing file, by path or basename as a whole word, whose content holds ≥ <code>GHOST_LEAF_GROW_LINES</code> = 80 lines; the largest named file decides) → spec. A routed leaf logs "routing leaf to the agentic loop — it extends app.py (279 lines …)". The leaf bench pins its control arm to <code>metadata.executor = "spec"</code> since the default would otherwise route its growing leaves to the loop. See <a href="coding_loop.html">coding_loop</a>.</p>
+
+  <h2 id="think-policy">Think policy, kept rejections, append rollback, two pre-write guards <span class="tag">2026-09-03 · §4EI</span></h2>
+  <p>
+    Request <code>463111ad</code> (an Elden Ring tracker, 7 leaves, <code>autoadvance count=all</code>) ran
+    49 minutes and closed 3 DONE / 3 FAILED with a page that was mostly unreachable. Every mechanism
+    below is a fix for one thing that run did, and each has a pin in
+    <code>tests/test_coding_executor_think_policy_and_append_guards.py</code> that fails on the old code.
+  </p>
+  <p>
+    <b>Think policy.</b> The coding model drafted the <em>whole file</em> inside its think block, so every
+    leaf hit the 30K reasoning ceiling (removed since, §4SD) with zero content (6 of 6 thinking attempts, ~115&nbsp;s each), and
+    only the no-think retry ever produced a spec. Thinking still earns its cost on a model that plans in
+    3–15K, so the executor now adapts instead of switching: after
+    <code>GHOST_CODING_THINK_SKIP_AFTER</code> (default 2) <em>consecutive</em> aborted think phases —
+    an exact n-gram loop or the whole budget eaten with no content (the 30K ceiling was a third, until §4SD) — the spec call starts with
+    thinking disabled (<code>_spec_nothink_call</code>: the same <code>/no_think</code> +
+    <code>enable_thinking=False</code> recipe the retry used). One clean think phase resets the streak; a
+    restart resets it too. The streak is kept <b>per LLM client</b> (weak-keyed), so the one production
+    client adapts once per process while test doubles never see each other.
+    <b>§4FJ disarm path (2026-09-07).</b> "A clean think phase resets" could never fire once the streak had
+    tripped — no think phase ran any more — so the no-think regime was sticky until a restart, and the
+    single-file leaf bench measured that regime at 2/6 DONE against 6/6 for think-with-fallback in the same
+    process (§4FI). Now, after <code>GHOST_CODING_THINK_PROBE_AFTER</code> (default 3) no-think spec calls —
+    or immediately after a verify failure on a spec that was built no-think — ONE spec call thinks again as a
+    <em>probe</em>: a clean probe resets the streak (thinking is back), an aborted probe extends the no-think
+    window by another <code>PROBE_AFTER</code> calls. <code>0</code> or negative disables probing (the
+    pre-§4FJ sticky behaviour). The probe, the reset and the verify-triggered probe are logged at WARNING
+    so they show in the operator stream. Pins: <code>tests/test_4fj_think_probe_and_workspace.py</code>
+    (the window, a clean and an aborted probe, the knob, and the verify hook at its real call site in
+    <code>build_coding_task</code>). <code>0</code> = never think on
+    spec calls; a negative value = never adapt. The system hint also tells the model not to draft file
+    contents in its thinking. A no-think first call that comes back reasoning-only is <em>not</em> retried
+    with the same recipe.
+  </p>
+  <p>
+    <b>Rejected output is kept.</b> Four of the run's five no-think retries returned complete specs
+    (server-side <code>truncated&nbsp;=&nbsp;0</code>, tail <code>"ledger":"…"}</code>) that the parser
+    rejected, and neither the 400-char log preview nor four live reproductions could say why. When no
+    usable spec is parsed, the raw content and reasoning channels are now written verbatim to
+    <code>$GHOST_HOME/system/coding_executor_failures/</code> (newest <code>UNPARSED_SPEC_KEEP</code>
+    = 30 files survive; nothing is written when <code>GHOST_HOME</code> is unset or the upstream reply was
+    empty), and the warning names the file. Two related tightenings: <code>_usable</code> no longer accepts
+    a <code>files</code> entry with no <code>content</code>/<code>append</code>/<code>edits</code> (the
+    truncation repair salvages <code>[{"path": …}]</code> out of a broken spec, and accepting that skipped
+    the retry and the dump), and <code>_generate_build_spec</code> honours its own contract by returning
+    <code>{}</code> on every failure. In <code>extract_json_from_text</code>, a brace-unbalanced text
+    that <em>ends</em> with <code>}</code> is now reported as <b>UNBALANCED</b> (a quote or escape inside
+    a string desynced the scan) instead of "TRUNCATED … cut off at max_tokens" — the old message sent the
+    reader to the token budget when the defect was inside a string.
+  </p>
+  <p>
+    <b>Append rollback.</b> A syntax-failed <code>append</code> used to stay on disk with feedback "fix it
+    with <code>edits</code>"; the model answered with another append, the file grew 18K→22K, and the same
+    line failed four times. An append is a pure addition, so the pre-append content is a complete known
+    state: the executor now writes it back (<code>_restore_file</code>), marks the snapshot authoritative,
+    and the feedback says the append was <b>reverted</b> and asks for the whole block again. If the restore
+    write itself fails, the old taint→edits flow applies unchanged. New files and <code>content</code>
+    rewrites keep the taint flow (there is no prior state to restore).
+    <b>Already-broken base:</b> if the diagnostic's line number lies <em>before</em> the appended
+    block's start line (<code>_syntax_error_before_block</code> / <code>_appended_block_start_line</code>:
+    the <code>&lt;/body&gt;</code> line for HTML, two past the last non-blank line otherwise), the file was
+    broken before this append — no revert, and the feedback says "line N is in the EXISTING file".
+    A line inside or <em>after</em> the block is the block's fault (an unterminated construct is reported
+    at the next token, in the tail the append pushed down) and reverts. The helper reads the reason
+    <code>_syntax_fail_reason</code> already produced, not the raw tool result.
+  </p>
+  <p>
+    <b>Two pre-write guards</b> (append and content). (1) <em>Placeholder elision</em>: a line that is only
+    <code>...</code>/<code>…</code>, bare or in a <code>//</code>, <code>/* */</code> or
+    <code>&lt;!-- --&gt;</code> comment, in an HTML/JS/TS/CSS file is refused before the write, naming the
+    line — the Talismans leaf shipped two such lines and failed its own syntax check on every retry.
+    Python is exempt: <code>...</code> is a valid statement there; an inline prose ellipsis
+    (<code>Loading...</code>) is not a whole line and passes. (2) <em>Duplicate routing key</em>: an HTML
+    append whose <b>top-level</b> element carries an <code>id</code> or <code>data-*</code> key the file
+    already has (or that the fragment uses twice) is refused, because selectors and routers match the
+    first element — two leaves appended a second <code>&lt;section data-section="bearings"&gt;</code>
+    that the SPA could never show, and both closed DONE. Nested duplicates (a <code>data-item</code> inside
+    a new section) are allowed, and the guard is HTML-only.
+  </p>
+  <p>
+    <b>Spec structure repair (the rejection cause, proven by the kept files).</b> The live proof's
+    kept outputs showed why complete-looking no-think specs failed: not quote escaping but three
+    structural slips at the <code>files</code> boundary — (i) <code>…"},"path":…</code>, the
+    <code>{</code> opening the next entry dropped; (ii) a top-level key (<code>"verify"</code>…) emitted
+    while the files array is still open, the <code>]</code> dropped; (iii) the output simply ending with
+    <code>files</code> and the top object open, <code>]}</code> never emitted (finish reason
+    <em>stop</em>). Braces balance in (i) and (ii), so the scan said "malformed" and every salvage
+    failed. <code>_repair_spec_structure</code> re-parses, and at the parser's own error offset — only
+    when the misplaced token is a known spec key and the string-aware container stack matches — inserts
+    exactly the dropped character(s), then requires a strict <code>json.loads</code> to a dict; an
+    unchanged text is never returned as a repair. It runs last in <code>_parse_spec_channels</code>,
+    the one extraction chain the streamed call and the retry now share. Pinned on the six real files
+    in <code>tests/fixtures/spec_structure_4ei/</code> (one inserted character each for 1–4 and 6; two
+    <code>{</code> plus <code>]}</code> for 5). The sixth shape — the <code>}</code> closing the last
+    file entry dropped before <code>]</code> — came from a post-deploy sanity leaf on the
+    <em>thinking</em> path, which the grammar below cannot cover; the repair is what keeps that path
+    honest.
+  </p>
+  <p>
+    <b>JSON grammar on the no-think call.</b> The repair handles three known shapes; the grammar
+    removes the class. <code>_spec_nothink_call</code> now sends llama-server's OpenAI-compatible
+    <code>response_format</code> (the client posts the payload dict as-is, so no passthrough was
+    needed): by default a <code>json_schema</code> named <code>build_spec</code> built from
+    <code>SPEC_JSON_SCHEMA</code>, which is deliberately loose — it requires only the shape that
+    failed (a <code>files</code> <em>array of objects</em>, each with a <code>path</code>) and allows
+    extra keys and any edits item shape, so it cannot starve a legitimate spec. The server compiles
+    it to GBNF and constrains every sampled token, so a dropped <code>{</code>/<code>]</code> and the
+    <code>```json</code> fence become impossible. Thinking calls never carry it (a think block is not
+    JSON), and the main turn loop is untouched. <code>GHOST_CODING_SPEC_JSON_GRAMMAR</code>:
+    unset/<code>1</code> = schema, <code>object</code> = shape-free <code>json_object</code>,
+    <code>0</code> = off. A backend that errors while the grammar is on gets exactly one retry without
+    it, so the grammar can never fail a leaf by itself; with the grammar off a failing call is not
+    retried. Proven against the live server through the executor's real prompt builder: 4 of 4
+    usable specs in 12–22&nbsp;s, no repair needed, including three runs of the history task that had
+    been rejected 5 of 5 times without it.
+  </p>
+  <p>
+    ⚠ The first draft's dump helper was named <code>_dump_rejected_spec(content, …)</code>, which the
+    <code>test_outcome_consumers_r3</code> AST enumeration reads as a result classifier (a hint word in the
+    name plus a <code>content</code> parameter). It is not one; it was renamed to what it is
+    (<code>_keep_unparsed_spec_output</code>) rather than added to an exempt list.
+  </p>
+
+  <h2 id="agentic-seam">The agentic alternative and its seam (§4FG, 2026-09-07)</h2>
+  <p>The top of <code>build_coding_task</code> — after the llm/tool_runner check and before any spec call — now consults <code>coding_loop.executor_kind(context)</code>: <code>GHOST_CODING_EXECUTOR=agentic</code> or a project's <code>metadata.executor = "agentic"</code> routes the leaf to <a href="coding_loop.html">core.coding_loop</a>, a bounded edit-test loop that returns the same <code>CodingResult</code>, so every caller (idle autoadvance, the <code>manage_projects</code> tool, the HTTP route) inherits the choice from one place. The default stayed this spec executor until the §4FG/§4FI leaf bench (script deleted 2026-10-11, §4NM) showed the loop's DONE rate is not worse; §4FL now selects by leaf shape. Pinned executed in <code>tests/test_4fg_coding_loop.py</code>.</p>
+
+<h2 id="4pg">§4PG (2026-10-15)</h2>
+<p><code>CodingResult.verified</code> — true only when the verify command ran and exited 0 (the spec path and the agentic leaf both stamp it); <code>parse_leaf_reply</code> takes the last VERIFY line that is a real command (never a re-quoted contract placeholder, never <code>true</code>/<code>none</code>); a timed-out or crashed attempt's files are carried into the next attempt; dotfile deliverables are snapshotted; <code>BackgroundDeferred</code> is re-raised so the advancer reopens the leaf. See <a href="../projects/project_advancer.html#4pg">the advancer page</a>.</p>
+
+<h2 id="4qa">Placeholder documents and existence-only verifies <span class="tag">2026-10-18 &sect;4QA</span></h2>
+<ul>
+  <li>A <code>.md</code>/<code>.markdown</code>/<code>.rst</code> write (full or append result) whose every line is blank or an elision marker (<code>...</code>, <code>…</code>, TODO/TBD) is refused before writing (<code>elided_document_reason</code>). A short real document (a one-line README) is not refused here. The 8-word floor (<code>hollow_document_reason</code>) applies only to a deliverable a task <em>declared</em>.</li>
+  <li>A verify that only checks existence (<code>test -f/-e/-s</code>, <code>[ -f … ]</code>, <code>ls</code>, <code>echo</code>, <code>true</code>, chained with <code>&amp;&amp;</code>/<code>;</code>) still RUNS, so a missing file fails, but it no longer makes the build <code>verified</code>. Live, every deliverable of the 25-task run "verified" with <code>test -f</code>. Only a single plain line counts: a multi-line verify (<code>echo 'running'</code> then <code>pytest</code>) or one with <code>$(…)</code> or backticks runs real code and is a real verify. The verify-only path (no files, an existing deliverable) uses the same rule (<code>_run_verify_ex</code>, <code>verified=ran</code>) &mdash; it used to say <code>verified=True</code> for <code>test -f</code> over the 3-byte file.</li>
+</ul>
+<h2 id="4sd-open-items">The spec call yields to the owner; an owner's build keeps the conversation <span class="tag">2026-10-30 &sect;4SD</span></h2>
+<p>Operator: "fix all the remaining open items". Two of them were here:</p>
+<ul>
+  <li><strong>A background spec call yields.</strong> Only the file streams yielded the slot. The planning call (thinking, up to 16,384 tokens) held it for minutes while the owner waited. <code>_OwnerWatch</code> is now the one rule both streams use: background only; the baseline <code>foreground_requests</code> is read at the first chunk; it yields when that count rises or a foreground call waits (<code>foreground_tasks</code>). <code>_stream_spec_completion</code> returns the abort reason <code>YIELDED</code>. <code>_spec_stream</code> calls it again (the partial is dropped, and the next call waits in the client until the owner is done), at most <code>_MAX_YIELDS</code> times, then it runs on. A yield is not a think abort: the think policy never sees it. In the spec stream the owner check runs after each frame is read (the file stream keeps its check before the frame: a yield there costs at most one more continuation round, not bytes), so a spec whose finish reason arrived is kept even if the owner arrives in its finish or trailing frames (review r1–r2). The background no-think call is streamed as well (it was one non-streamed call that could not yield). A grammar the server rejects ends a stream with an error frame, not an exception, so an empty answer under the grammar is retried once without it. A <code>BackgroundDeferred</code> is re-raised, never retried as a grammar failure (review r1: it parked twice). Accepted: a stream cut after part of its JSON returns that part (the attempt's retry handles it).</li>
+  <li><strong>An owner's build takes the side path.</strong> A foreground executor call (spec, no-think spec, generated file) does not open with the head, so it replaced the owner's conversation in the slot unsaved, and the next turn re-read it. <code>_main_call_kw</code> passes <code>side_main=True</code> with a <code>task_label</code> ("coding spec", "generated file") on foreground calls only, as the §4SC cut-write continuation does. See <a href="../performance/llm.html#4sd-side-stream">llm</a>.</li>
+</ul>
+<p>Pins: <code>tests/test_4sd_open_items.py</code>.</p>
+<h2 id="4sd-generate">A big new file gets its own call <span class="tag">2026-10-29 &sect;4SD</span></h2>
+<p>Operator: "given that a project could handle large files, how would you suggest doing this?" → "do it". The spec call returned every file's <em>complete</em> text inside one JSON reply: thinking plus every file in <code>max_tokens</code> 16,384, JSON-escaped (10–20&nbsp;% larger), and a reply cut anywhere was invalid JSON — every file of the attempt lost. Now:</p>
+<ul>
+  <li><strong>The spec is a plan.</strong> A brand-new file of more than ~100 lines is named with <code>"generate": "&lt;what it must contain&gt;"</code> (purpose, structure, the functions/ids/APIs other files rely on) instead of its code. <code>content</code> stays for short new files, <code>append</code>/<code>edits</code> for existing ones. The JSON grammar (<code>SPEC_JSON_SCHEMA</code>), the structure repair (<code>_SPEC_ENTRY_KEYS</code>) and the usable-spec check know the key.</li>
+  <li><strong>One streamed call per file</strong> (<code>_materialize_generated</code> → <code>_generate_file</code>): thinking off (the plan was the thinking), raw text only — no fence, no JSON. It is shown the task, the constraints, the ledger, the research, <em>the whole plan</em>, and as read-only reference (<code>_render_reference</code> — not the spec's "USE <code>append</code>" steer) the project's files, the plan's <code>content</code> siblings and every file generated before it, so the files agree — this spec's generated files FIRST (r20: the reference is cut at 40,000 chars and the file the next one must match came last and was cut). Streamed because a 64k reply takes over an hour and the client's non-streamed read timeout is far shorter (<code>_stream_file_text</code> reads the finish reason). A BACKGROUND stream gives the one main slot back as soon as a user request starts or a foreground LLM call waits (r22: an unattended file call could run ~28k tokens while the owner's turn waited behind it; r23: the baseline is read at the FIRST chunk, after the client's park admitted the stream — read before it, a round admitted after a yield or inside an image render's idle window never yielded again; never after a finish reason; a yielded opener fragment is dropped, not a bad round): the round ends as a cut that costs no round (at most <code>_MAX_YIELDS</code> 12 times per file) and the next round's call waits for the owner as every background call does (then defers). A broken call is a discarded round (the text before it is kept); the owner coming back (<code>BackgroundDeferred</code>) still reopens the leaf — after the files this plan finished are written through every guard (r24, as when time runs out; r25 also when the spec call itself defers). Residue: a deferral right after an owner turn that created the same new path writes over it when the generated text passes the size guard (the owner writing that exact path mid-leaf). Each kept round is coding progress for the request (<code>_note_round_progress</code> → §4RA), so a web request earns its extensions while a leaf writes.</li>
+  <li><strong>Its output limit</strong> (<code>_file_call_cap</code>) is the window's room — <code>agent.output_cap_for_tool_turn</code>, up to 64k, never under 16k, from the server's <code>/props</code> n_ctx (<code>_window_tokens</code>, cached 10 min; unknown → 16k) — and never more than the time left can hold: (time left − <code>GENERATE_RESERVE_S</code> 300&nbsp;s for verify and the gates) × <code>GENERATE_TOK_PER_S</code> 12 (slower than the measured 15–30). The time left (<code>_time_left_s</code>, read call by call) is the leaf's deadline and, inside a request, the most that request can still have — its ceiling <em>with</em> every extension it could earn, less what it spent (<code>_request_left_s</code>: Slack's 30 min binds; the web and the CLI have none). Under <code>GENERATE_MIN_TOKENS</code> 2,048 no call starts: the file fails as <em>out of time</em>, as does one that used its rounds at time-shortened sizes.</li>
+  <li><strong>A file is complete at the end marker</strong>, or when the model ENDS a round that wrote text (finish "stop"). An empty round — or one that only re-sent the file's end — ends nothing (review r11: a cut, then an empty stop, closed the leaf with half the file). There is no confirming round (r14: after a "stop" it only invited echoes — <code>&lt;/html&gt;</code> twice — remnants and prose into the file). <strong>An unfinished file is continued</strong>, up to <code>GENERATE_ROUNDS</code> 6 rounds, with the main loop's cut-write rules (<code>core/write_continuation</code>: <code>continuation_messages</code>, the end marker, <code>strip_tail_overlap</code>, <code>restarts_from_head</code>/<code>restarts_file</code>, <code>is_repetition</code> — r19: only on a CUT round's last 40 lines, since a stuck model is still repeating when the limit cuts it and a level file's literal map or a board of equal rows is content; residue: a cut landing inside a long run of equal rows discards that round once —, <code>drop_chatter</code>); a cut reply keeps whole lines; a round's own text is never touched (<code>_clean_file_round</code>: only a LEADING <code>&lt;think&gt;</code> block goes (closed or not, any case; an orphan leading <code>&lt;/think&gt;</code> too, r19) with the rest of its own line and any whole blank lines after it — the next line keeps its indentation (r17/r18: <code>&lt;think&gt;\n\n&lt;/think&gt;\n\n</code> left a blank first line, so a shebang moved and a wrapper was not seen); a reply that is only a <code>&lt;think&gt;</code> block fails with that reason, so a file that really starts with a literal <code>&lt;think&gt;</code> tag loses it (residue). The end marker ends the file at the FIRST line that ends with it, on its own or glued (<code>};&lt;&lt;&lt;END OF FILE&gt;&gt;&gt;</code>); everything after that line goes ("Done!", a usage example, a repeated marker — r17/r18), except a bare fence on the very next non-blank line when the file opened with a wrapper (r19: a usage example's fence after the marker of an unwrapped file went into it), kept for the unwrap. A marker alone on its line with any bold/backtick decoration or a full stop (<code>**&lt;&lt;&lt;END OF FILE&gt;&gt;&gt;</code>, <code>&lt;&lt;&lt;END OF FILE&gt;&gt;&gt;.**</code>; backticks balanced) is the marker (r19/r21); text glued before it keeps its line verbatim (r20: <code>from m import *</code>, a template literal's closing backtick), a trailing <code>**</code>/<code>.</code> after a glued marker goes. A string constant that holds it is text (r16); a marker line inside a multi-line string ends the file (residue: the marker is the protocol's own sentinel) — r15: the shared round cleaner removed a <code>&lt;think&gt;</code> anywhere and unwrapped fences round by round, cutting real text). A fence around the file goes by ONE rule on the finished text (<code>_unwrap_file</code>; review r9–r14: five round-by-round rules each cut real text or kept a fence), for every file but prose ones (<code>_file_kind</code> "prose": .txt/.rst/.adoc/.tex/.log/.org and extensionless README/CHANGELOG/LICENSE/NOTES/AUTHORS/CONTRIBUTING — their first fence is their own; a Makefile, Dockerfile, .env, an .html page and <code>notes.js</code>/<code>license.py</code> are code and unwrapped, r16–r18); a CRLF wrapper, and one after a leading blank line or space, is one too (r18/r19): a fence on the first line and a bare close of the same backticks on the last line both go; a first-line fence no line closes goes alone. In a markdown file (<code>.md</code>/<code>.mdx</code>/<code>.markdown</code>/<code>.rmd</code>/<code>.qmd</code>, also as an inner extension: <code>README.md.j2</code>, r17) only <code>```markdown</code>/<code>```md</code> or a 4+-backtick fence is a wrapper, and it loses its close only when the fence lines balance (a README's own last block keeps its close). Anything else — prose around a fence, a fence mid-file (a cut round that re-fenced) — is left whole, never cut, for the write tool's syntax check (.py, .json, .js, .sh, inline HTML scripts) and the gates; in a .css/.yaml/.md file it can reach disk. a cut one-line file fails with "a single line longer than one reply"; the first call is never judged; a continuation round is judged by ONE rule per file kind (r21, after r15–r20 each moved the line): in a CODE file, a round that opens with a chatter line — a chatter start ("Here's", "Sure,", "I'll continue"; r22 also "Let me continue", "Okay,", "Below is", a curly "Here’s", "The rest of the file"; r24 "The file is (already) complete.", "This completes…", "That's the complete file.", "No further content…", also in parentheses — these at column 0 only, r25: an indented docstring line is the file's) with no code character in it (<code>_is_opener</code>; <code>'</code> <code>`</code> <code>(</code> <code>)</code> are prose there, <code>= ; { } [ ] &lt; &gt; " $ # | &amp; \</code> are code: "continuing = False" is code) — and is only that line is discarded, or with the marker ends the file ("Sure! It is complete."); with lines after it the opener goes when it names the file/rest/remaining/code or ends with ":" (<code>_strip_opener_ok</code>; a YAML <code>remaining:</code> key is no chatter start), and the lines after it are never judged ("    return t", "  fi\ndone", "  port: 8080" are code without a code character — r20 dropped them); residue: continuation rounds see only the task, the brief and the file's own head and tail — not the plan or the other files (a file cut mid-way is finished blind to sibling APIs; verify catches it); the unattended step's hard timeout (60 s after the leaf's deadline) can cancel a stream when the client's park for the owner ran long — the task goes back to READY but this attempt's unwritten generated files are lost and generated again (agent work only); each yield before the first whole line repeats the file call's prefill; a docstring line "Here's how the rest of the file works:" (or an HTML text line "Here are our hours (Mon to Fri):") that a cut lands right before goes; a short opener that does not name the file ("Sure, here you go.") stays; a closing sentence after the code on a finished round with no marker stays (no rule can tell it from a prose file's last line); a regenerated .js/.html that does not parse is written and flagged after (only .py is parsed before). In a PROSE/markdown file the shared rule: a short chatter round is discarded unless it ended (finish "stop" or the marker — its last paragraph), and no line is cut (r15/r16: the shared rule cut a GUIDE.md's "Here are the house rules:"); two discarded rounds fail the attempt with the reason fed back. Past <code>MAX_CONTENT_CHARS</code> the attempt fails with "split it into smaller files".</li>
+  <li><strong>The written text goes through <code>_apply_file</code> as <code>content</code></strong>, so every write guard applies unchanged (elision, syntax, duplicate keys, the render gate, verify). <code>generate</code> is for NEW files: a path in the snapshot (compared normalised, <code>./a.js</code> = <code>a.js</code>) or on disk (a live read; an unreadable one counts as existing) is refused with feedback to use <code>edits</code>/<code>append</code> (a big sandbox-ROOT file of the same name is not this one: <code>_is_root_fallback</code>) — except a file this leaf generated itself (<code>own</code>), which a retry regenerates shown its previous version and the failure — unless the file on disk differs from it (the owner edited it between attempts: refused with "keep that change: use edits/append", r19; the regeneration was shown the leaf's text and dropped the edit) — (<code>own</code> holds the file as the write tool LEFT it — a live read after the write, <code>_disk_text</code>: r18, the tool's own unwrap and CRLF normalising made the leaf's own file read as an owner's edit and the shorter regeneration was refused), and which the overwrite guards then judge as the new file it was. The own-file rule covers only a regenerated entry (marked <code>_ghost_generated</code> — a mark the model's own entries are stripped of), judged by the file ON DISK (an owner's edit made while it regenerated is judged by every guard; a file the read cannot hold — over the read cap, or a spent read budget — cannot be shown to be the leaf's and keeps every guard: a refusal costs a retry, a wrong pass the owner's edit, r14), it follows the leaf's own later edits/appends, and it covers only the size/anchor guard: a later plain <code>content</code> stub, or a regeneration that does not parse, is refused as before. A generated file that landed but failed a post-write check is the leaf's own too. An entry with <code>generate</code> and <code>content</code>/<code>append</code>/<code>edits</code>, two <code>generate</code> entries for one path, a <code>generate</code> entry plus any other entry for the same path (r17: the content entry would have overwritten the generated file), and a blank, non-string or <code>..</code> path are refused. Every entry is checked before any file is generated. An .html file written whole must close <code>&lt;/html&gt;</code> only when it opened <code>&lt;html</code> (r22: a Jinja child template or a partial was refused on every attempt). A file generated but not yet written waits in <code>pending</code> (path → brief, text): a later file's failure does not lose it, and a retry reuses it — but only for THIS plan's same <code>generate</code> entry: each new spec drops a pending text whose path the plan now writes another way, renamed, re-briefed or dropped (a verify-only plan drops all, r22; an unusable reply — no files and no verify, or a refused kill-shaped verify (r24) — is no plan and drops nothing, r23; residue: a spec reply cut by the limit and salvaged into a partial list drops the pending files of entries it lost) (r21: the time gate wrote an older plan's file over the newer attempt's); a write refusal drops it too (it is generated anew). A refusal keeps the previous attempt's reason in the feedback (<code>EARLIER:</code>). A file call is given the failure when the file is the leaf's own (always — r21: a pytest trace names only the test file while the bug is in the code; r20 routed by name and told the code "keep it"), or when the failure names the new file (<code>_feedback_for</code>; r20: b.js, refused before it was written, got nothing); the previous version's header says the ATTEMPT failed and to fix what the failure is about (r20: a good a.js read "it failed" for b.js's refusal). A failed batch refreshes <code>own</code> for the leaf's files it touched (r20: edit 1 of 2 landed and the next <code>generate</code> was refused as an owner's edit). The spec feedback strings (no spec, a truncated HTML file, edits on a missing file, the append steer) name <code>generate</code> for a new file over ~100 lines.</li>
+  <li><strong>A leaf has a wall clock</strong> (<code>_leaf_deadline</code>): <code>GHOST_LEAF_BUILD_MAX_S</code> (default 7,200&nbsp;s), lowered by a caller's deadline in <code>leaf_deadline_context</code> — the unattended step runs under <code>project_advancer._with_leaf_deadline</code> (its 45-min cap less a minute). No new attempt starts with less than <code>GENERATE_MIN_ATTEMPT_S</code> left: the generated files a refused batch never reached are written first (through every guard, r20) — after ONE attempt that is a slow leaf — "out of time after one attempt", back to READY (r13) — after two or more a build that kept failing — "no time for another attempt — &lt;the last failure&gt;", FAILED (r12). Out of time: the leaf stops at once — the files that completed — this attempt's and this plan's pending ones (r21) — are written (through every guard) so the next step builds on them instead of generating them again — and reports "out of time: … wrote a.js (not verified yet); the task goes back to READY". Out of time inside a file call after two or more failed attempts is the same failure as at the gate — "no time for another attempt", FAILED (r19: a build that kept failing came back READY whenever the time ended mid-file). The result carries <code>out_of_time</code> (a type, <code>OutOfTime</code>, not a prefix), and <code>project_advancer._finalize_coding</code> puts the task back to READY as for a timed-out step (event <code>autoadvance_out_of_time</code>, summary prefix <code>OUT_OF_TIME_PREFIX</code>) — FAILED is never retried unattended. <code>advance_many</code> stops the batch there (<code>stop_reason</code> "out_of_time"; review r12: the READY task was picked again at once, 40 times in one owner batch), so each run makes one attempt at it; unattended, the step budget and the no-progress pause (three steps that close nothing — a written file is not progress, §4MQ) bound the repeats and tell the owner.</li>
+</ul>
+<p>Not changed here (open, reported to the operator): an owner-path (foreground) executor stream — the spec call before §4SD, and now each file call — does not take §4SC's side path, so a kept conversation over ~31k tokens is parked by llama rather than saved first.</p>
+<p>Pins: <code>tests/test_4sd_executor_generate.py</code>.</p>
+<h2 id="4tp">The request's own data reaches the build <span class="tag">2026-11-07 &sect;4TP</span></h2>
+<p>Request 298833ef: the main turn fetched the owner's portfolio (real prices, cost basis, P/L) with
+<code>portfolio</code>, then ran <code>manage_projects autoadvance</code>. The executor that wrote <code>app.js</code>
+saw the task, the project files and the ledger, but not the numbers. It made up prices (+15&nbsp;% P/L where the real
+figure was −3&nbsp;%).</p>
+<ul>
+  <li><code>core/request_data.py</code> keeps, by request id, each successful result of a <strong>data tool</strong>
+  in the request (the dispatcher calls <code>note_result</code> through <code>request_effects.after_tool_result</code>).
+  The data tools are an allow-list, <code>DATA_TOOLS</code>: <code>portfolio</code>. Review r1: a
+  deny-list also swept the health check (internal hosts, service state) and the owner's location into every build.
+  Review r2: <code>check_weather</code> with no location names the owner's place, so it is not on the list either. A new
+  data tool is added there. A result from outside
+  content is never kept even then (<code>utils.provenance.is_untrusted_source</code>), so a page's text cannot reach a
+  prompt that writes and runs code. Failures, refusals and stopped calls are not kept.</li>
+  <li>The spec prompt (<code>_generate_build_spec</code>), every file prompt (<code>_generate_prompt</code>) and the
+  agentic leaf's prompt (<code>coding_loop._leaf_prompt</code>, review r1: a task routed agentic had none; it is built
+  in the parent request, since the leaf's own turn runs as <code>sub-leaf-…</code>) carry
+  <code>DATA THIS REQUEST FETCHED</code>, after the research block. It tells the
+  model to use these exact values, never to invent one that should come from there, and to label anything missing as
+  sample data and say so in its summary.</li>
+  <li>Bounds: 4,000 chars per result, 9,000 in all (§4TI-b: portfolio lines now carry IBKR's names, so an 18-holding summary is about 3,700), the newest kept (shown oldest first), 12 per request. A repeat of
+  the same text replaces the earlier row. Forgotten when the request ends (<code>handle_chat</code>'s
+  <code>finally</code>). An unattended step (no request) has none.</li>
+</ul>
+<p>Not covered: values the model read on the web. It must put them in the task text. The one-command project generator
+(<code>project_advancer.default_code_generator</code>) does not get the block.</p>
+<p>Pins: <code>tests/test_4tp_notify_hold_request_data.py</code>.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Personal tools — Ghost Agent</title>
+<meta name="description" content="Everyday personal tools: a read-only view of your brokerage portfolio, the weather and forecast, your location, and games of chess and tic-tac-toe against the agent.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a class="current" href="personal.html">Personal services</a>
+    <div class="subnav">
+      <a href="../reference/personal/game_routes.html">Games (api.game_routes)</a>
+      <a href="../reference/personal/portfolio.html">Portfolio (tools.portfolio)</a>
+    </div>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Personal tools</h1>
+    <p class="subtitle">Small, useful things for the owner: how the portfolio is doing, what the weather will be this week, and a game of chess. The portfolio is read-only by construction, and the games are played by the model itself, never by a hidden engine.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac Studio (eva) + Mac mini (nova)</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <h3>Portfolio</h3>
+  <p>The <code>portfolio</code> tool reads your Interactive Brokers holdings from a separate small service. It can tell you the value, cash, gains against cost, today's change and dividends; look at one holding with its average cost and recent trades; check concentration and currency mix, and how today's mix would have behaved in the past (volatility, worst fall, comparison with a benchmark); show the range of past returns over one month, three months and a year; and give review prompts from fixed rules, each with its reason and the case <em>against</em> acting.</p>
+  <p>It <strong>cannot trade</strong>. The service has no order code, accepts only reads, and the IBKR Flex reports it uses only hand out statements. The agent never sees the Flex token or the account id.</p>
+  <h3>Weather and location</h3>
+  <p>Ask about the weather and the agent gets the current conditions and a 7-day forecast, with day names in the place's own calendar. Ask for hourly detail and it adds today and tomorrow in 3-hour steps. If you name no place, it uses the location saved in your profile. It uses keyless public sources over Tor (Open-Meteo first, wttr.in as a fallback).</p>
+  <h3>Games</h3>
+  <p>You can play <strong>chess</strong> and <strong>tic-tac-toe</strong> against the agent. "Against the agent" is literal: a client sends the position, and the model chooses the reply move. Code checks that every move is legal and detects the end of the game. If the model cannot give a legal move after three tries, the game says so instead of quietly letting an engine move for it. The model can add a short comment on the position, so a client can coach you as you play.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“How is my portfolio today?”</td><td>Total value, cash, gain against cost, today's change, and one line per holding.</td></tr>
+      <tr><td>“Am I too concentrated in one stock?”</td><td>The health view: concentration, currency mix, volatility and worst fall of today's mix.</td></tr>
+      <tr><td>“Anything I should review?”</td><td>Rule-based prompts (for example one company above 20 % of the account), each with a reason and the case against acting. Never a buy or sell instruction.</td></tr>
+      <tr><td>“Will it rain in Thessaloniki tomorrow?”</td><td>Current conditions plus the 7-day outlook for that place.</td></tr>
+      <tr><td>“What's the weather like?”</td><td>The same, for the location saved in your profile.</td></tr>
+      <tr><td>“Where am I?”</td><td>The location stored in your profile, if there is one.</td></tr>
+      <tr><td>A move on a chess board client, e.g. <code>e4</code></td><td>The agent replies with its own move, a short comment, and the game status (check, draw claim, game over).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Portfolio: a service does the maths</h4><p>The IBKR service downloads a Flex statement, adds public prices, and computes every figure. The agent's tool passes that text through unchanged. Old or missing data is labelled inside the answer as <em>STALE</em> or <em>Data gap</em>, never guessed.</p></li>
+    <li><h4>Weather: geocode, then forecast</h4><p>The place name is turned into coordinates, then the forecast is asked for. Each call verifies TLS and retries over a fresh Tor circuit. An unknown place gets a clear "could not find a location named …" message.</p></li>
+    <li><h4>Games: the client owns the board</h4><p>Each move request carries the whole state (a chess FEN, or nine tic-tac-toe cells). The server applies your move, asks the model for its reply, checks legality, and returns the new state.</p></li>
+  </ol>
+
+  <h2 id="where">Where it runs</h2>
+  <ul>
+    <li>The <strong>portfolio service</strong> runs on the Mac mini (nova). By the owner's choice it uses the normal internet and a Flex token; the agent itself stays Tor-only and only reads text from it over the private network.</li>
+    <li><strong>Weather and location</strong> run in the agent on the Mac Studio (eva), out over Tor.</li>
+    <li><strong>Games</strong> are an HTTP endpoint on the agent (eva), answered by the main model. Apps running in a lab can reach this game endpoint and nothing else of the agent.</li>
+  </ul>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>The portfolio tool is hidden until its service address and key file are configured. Channel members never get it.</li>
+    <li>Portfolio figures are as fresh as the last Flex statement. When the token expires, the service keeps the last statement and says so.</li>
+    <li>Forecast ranges come from past returns. They are not predictions.</li>
+    <li>Weather depends on public services reached over Tor; a refusal from them is reported, not hidden. A member's weather request never reads the owner's saved location.</li>
+    <li>The games need a client that sends the position. Chess needs the <code>python-chess</code> library on the agent.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/personal/game_routes.html">Games (api.game_routes)</a></li>
+    <li><a href="../reference/personal/portfolio.html">Portfolio (tools.portfolio)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

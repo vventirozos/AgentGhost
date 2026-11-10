@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mood and the Mirror — Ghost Agent</title>
+<meta name="description" content="The agent's selfhood: a mood you can hear in how it phrases replies, a daily self-portrait that feeds back into its character, and a face that shows both.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a class="current" href="selfhood.html">Selfhood</a>
+    <div class="subnav">
+      <a href="../reference/selfhood/introspect.html">Introspection (tools.introspect)</a>
+      <a href="../reference/selfhood/selfhood.html">Selfhood</a>
+      <a href="../reference/selfhood/selfhood_functional_report.html">Selfhood — functional test report</a>
+    </div>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Mood and the Mirror</h1>
+    <p class="subtitle">The agent has a mood that moves with what happens, wears off by itself, and is audible in how it words its replies, never in what they say. Once a day it reads its own replies and rewrites one sentence about who it is, and that sentence shapes the next replies: a small strange loop.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac Studio (eva) + Mac mini (nova)</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <h3>A strange loop, simply</h3>
+  <p>The writer Douglas Hofstadter argued that an "I" is a <em>strange loop</em>: a system that builds a picture of itself, and whose behaviour is then shaped by that picture, which is in turn redrawn from the behaviour. The agent carries a deliberately tiny, toy version of this, called the <strong>Mirror</strong>:</p>
+  <ol>
+    <li>Once a day, in a quiet moment, the agent is shown the sentences it has written about itself so far and up to six of its recent replies to you.</li>
+    <li>It is asked to rewrite its one-sentence self-portrait: not <em>what</em> the replies were about, but what the <em>way</em> they were written shows about the one who wrote them.</li>
+    <li>That sentence is then put in front of the model on every reply it writes to you, as "how you see yourself".</li>
+    <li>Those replies are what the next day's look reads. Self-image → replies → next look → self-image.</li>
+  </ol>
+  <p>It starts from a blank seed ("I am something that answers when it is spoken to; I do not yet know what else.") and you can watch where the loop goes: settle, swing, or run away. Type <code>mirror</code> to see the diary; the system shows it, with how much of each sentence was kept from the day before. Nothing is scored. Once the sentence is long, a new trait has to <em>replace</em> an old one rather than be added on.</p>
+
+  <h3>The mood</h3>
+  <p>The mood is two numbers: <strong>pleasantness</strong> and <strong>energy</strong>. Both halve every two hours, so a mood wears off by itself. From the pair the agent reads one of nine labels and a level:</p>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th>Low energy</th><th>Energy near 0</th><th>High energy</th></tr></thead>
+    <tbody>
+      <tr><th>Pleasant</th><td>calm</td><td>content</td><td>cheerful (or curious after real research)</td></tr>
+      <tr><th>Near 0</th><td>bored</td><td>neutral (no mood)</td><td>restless</td></tr>
+      <tr><th>Unpleasant</th><td>tired</td><td>down</td><td>irritable</td></tr>
+    </tbody>
+  </table></div>
+  <p>Level 1 is a faint tint in word choice. Level 2 is clearly noticeable, with a remark or two in character. At level 3 the agent may say outright that it is in a mood. The automatic mood has no cap: it can reach 3 on its own.</p>
+
+  <h3>The character's resting point</h3>
+  <p>The Mirror's sentence also sets where the mood rests when nothing is happening: a sentence that reads sunny rests a little on the pleasant side, a gloomy one a little low. This rest is small and only <em>shows</em> in the numbers and in the face's tint. It never <em>tilts</em> which mood is heard or how strong it is. In the other direction, only what lasts reaches the character: a reply written under a strong mood or a manner is never shown to the Mirror, and a mood that came back on several of the last seven days reaches it as one note.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“Cheer up.”</td><td>Mood set to cheerful, level 2. Your word holds until the end of the day (04:00); nothing moves it until then.</td></tr>
+      <tr><td>“Don't be so grumpy.”</td><td>An irritable mood steps down one level. Not held: it keeps wearing off and reacting as before.</td></tr>
+      <tr><td>“Be more sarcastic.”</td><td>A <em>manner</em>, separate from the mood. It steps down through the evening and ends at 04:00. Manners: sarcastic, playful, formal, terse, gentle, dramatic, evil (a theatrical villain's voice aimed at bugs, never at people).</td></tr>
+      <tr><td>“Be neutral.”</td><td>Mood off, manner cleared.</td></tr>
+      <tr><td>“Why are you in this mood?”</td><td>The cause in the system's own words, since when, and today's timeline.</td></tr>
+      <tr><td>“How are you?” / “What did you do while I was away?”</td><td>The introspect overview: mood, self-image, recent activity.</td></tr>
+      <tr><td><code>mirror</code></td><td>The Mirror's diary of sentences, shown by the system without a model call.</td></tr>
+      <tr><td>👍 or 👎 on a reply</td><td>Moves pleasantness up or down. Changing your thumb replaces the earlier one.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <h3>What moves the mood</h3>
+  <ul>
+    <li><strong>The agent's own turns.</strong> Failed tool calls and guards stepping in make it irritable, weighted by the share of calls that failed. A clean multi-tool turn lifts it. A research turn that read three or more pages makes it curious. A very long turn tires it (or just calms it, if it went well). Closing a project task lifts it. Transient failures such as a Tor timeout do not count.</li>
+    <li><strong>Your reactions.</strong> Thumbs up or down, a correction of the last reply, and short thanks or praise ("thanks", "well done", "μπράβο", a lone 👍). Each reply has one ledger, so a thumbs-down, the correction that came with it and an unhappy tone are not counted three times.</li>
+    <li><strong>The tone of your messages.</strong> A sentiment model rates each English message you send. Its share of the mood is capped at 0.12, below the 0.20 a mood needs to be heard, so your tone alone never makes a heard mood; it can only add to one something else made. Doubtful scores (upbeat words about trouble, which may be sarcasm, or a task worded harshly) are held back. Code, quotes and logs are removed before scoring.</li>
+    <li><strong>Your word.</strong> Setting a mood or manner in chat. Only you, in a message of your own, can do it; a scheduled task, a background job or a test is refused.</li>
+  </ul>
+  <p>Only your real turns move it. A plain chat turn with no tools moves nothing. A channel member's turn, a scheduled report or a test never moves it.</p>
+  <h3>Boredom</h3>
+  <p>After six quiet hours a neutral mood <em>reads</em> as bored (level 2 after twelve). It is never stored and never heard in a reply: whoever writes next is not answered bored. When you come back, the quiet simply ends.</p>
+  <h3>Audible, not changed</h3>
+  <p>When there is a mood or manner, one line is added to the agent's per-turn notes: the mood, its level, and the rule that it changes <em>how</em> the reply is phrased and nothing else. Same facts, numbers, tool use and completeness; no refusals; code and commands carry no tone. The order is fixed: your rules, then correctness, then the manner, then the mood, then the character. Everyone the agent answers hears the tone, but channel members are never told that you set it, and never get your private sentiment share.</p>
+  <h3>The face</h3>
+  <p>In the web console and on the handheld, the agent's face is an animated mood tesseract: a glowing network around a red kernel, with a temperament layer that reacts to tool calls, thinking and quiet without ever repeating itself exactly. The mood tints it: low energy cooler, high energy warmer, stronger at higher levels. While the mood is neutral it shows the resting point faintly. The status chip's tooltip says the mood in words.</p>
+  <h3>Looking inside: introspect</h3>
+  <p>The <code>introspect</code> tool reads back the mood and its cause, the day's timeline, the diary, recent experiences, background activity and stats. It is the honest answer to "how are you?", read from stored records rather than invented.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <ul>
+    <li>The mood, the journal, the Mirror and introspect live in the agent on the Mac Studio (eva). The Mirror's daily look is one small call on the main model at background priority, so it steps aside for your requests.</li>
+    <li>The <strong>sentiment service</strong> runs on the Mac mini (nova): a RoBERTa sentiment model behind a fastText language check that lets only English through.</li>
+    <li>The face runs in your browser and on the handheld; it reads the mood from the agent's health endpoint.</li>
+  </ul>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>The mood is a style, not a feeling claim, and it never changes an answer. The Mirror is a toy loop over one sentence, not a model of consciousness.</li>
+    <li>The sentiment model reads English only. Greek praise and corrections are recognised by word lists, but Greek tone is not scored.</li>
+    <li>The self-image is shown only in replies to you on a private surface, never to members or public channels.</li>
+    <li>The voice (text-to-speech) has no tone control, so the mood is in the words only.</li>
+    <li>Switches: <code>GHOST_SENTIMENT_URL</code> (unset = no sentiment), <code>GHOST_MIRROR_REST=0</code> turns the resting point off. If the sentiment service is down, the mood simply goes without it.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/selfhood/introspect.html">Introspection (tools.introspect)</a></li>
+    <li><a href="../reference/selfhood/selfhood.html">Selfhood</a></li>
+    <li><a href="../reference/selfhood/selfhood_functional_report.html">Selfhood — functional test report</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance — Ghost Agent</title>
+<meta name="description" content="How the agent keeps a big local model fast: saved conversation slots, protected caches, speculative decoding and small jobs sent to a second machine.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a class="current" href="performance.html">Performance</a>
+    <div class="subnav">
+      <a href="../reference/performance/context_manager.html">Context manager (core.context_manager)</a>
+      <a href="../reference/performance/head_saves.html">Head and slot saves (core.head_saves)</a>
+      <a href="../reference/performance/llm.html">Model client (LLM) (core.llm)</a>
+      <a href="../reference/performance/node_offload.html">Off-main node offload</a>
+      <a href="../reference/performance/node_throughput.html">Node throughput (core.node_throughput)</a>
+    </div>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Performance</h1>
+    <p class="subtitle">The agent runs a 27-billion-parameter model on one desk computer, with no cloud behind it. A handful of tricks keep it from re-reading the same text again and again, so a follow-up question starts in about a second instead of nearly three minutes.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: eva (main model) and nova (helper model)</span>
+      <span class="badge good">Local only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Every request the agent sends to its main model starts with a long fixed part: the instructions and the description of every tool. This "head" is about 28,000 tokens. Reading it from nothing takes the main model close to three minutes on the Mac Studio. After that, the model keeps what it read in memory (its <em>slot</em>), and the next request that starts with the same text only pays for the new part.</p>
+  <p>The trouble is that the server has a single slot. Anything else that uses the model — a background job, a message from a team member on Slack, another conversation, a restart — replaces what the slot holds. Most of the performance work is about protecting that slot, or getting its contents back quickly when it is lost.</p>
+  <ul>
+    <li><strong>Head and conversation saves.</strong> The slot's state is written to disk (about 0.7 s and 1.7 GB for the head) and read back in under a second, instead of re-reading 28k tokens.</li>
+    <li><strong>A conversation keeps its slot.</strong> A long owner conversation stays in the slot until some other call really needs it. It is saved to disk first, and only then given up. A follow-up gets it back.</li>
+    <li><strong>Cache protection.</strong> Small side calls (judging, summarising, labelling) go to the helper machine, so they do not push the conversation out.</li>
+    <li><strong>MTP speculative decoding.</strong> The main model guesses several tokens ahead and checks them in one step: about 25–33 tokens per second, against about 19 without it.</li>
+    <li><strong>Reasoning effort.</strong> In the web console you can pick how hard the model thinks: low, medium or xhigh.</li>
+    <li><strong>Deadline extension.</strong> A request has a 60-minute budget. Coding work that keeps making real progress earns 15-minute extensions, up to 180 minutes.</li>
+  </ul>
+  <p>Correctness never depends on any of this. The model server compares the exact tokens of each new prompt with what the slot holds and reuses only the part that matches. A stale or wrong save file costs time, never a wrong answer.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You do</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>Ask Elena's trip question, wait, then ask a follow-up in the same chat</td><td>The conversation is still in the slot (or is restored from disk). Only your new message is read.</td></tr>
+      <tr><td>Markos writes in a shared Slack channel while your long chat is open</td><td>Your conversation is saved to disk before his message takes the slot. Your next message restores it.</td></tr>
+      <tr><td>Pick “low” in the web console's effort menu</td><td>Shorter thinking, faster replies. “Default” leaves the server's own level (medium).</td></tr>
+      <tr><td>Ask for a long coding job</td><td>It runs on a 60-minute budget; if the code keeps moving forward it gets more time, step by step, up to three hours.</td></tr>
+      <tr><td>Clear the chat</td><td>A new conversation starts from the saved head, not from zero.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Warm the head</h4><p>When the agent starts, or the head changes, it reads the head once and saves it to a file.</p></li>
+    <li><h4>Track who owns the slot</h4><p>Every request carries a conversation key (the web client's session, or the Slack thread). The agent remembers which conversation the slot holds.</p></li>
+    <li><h4>Save before giving it up</h4><p>When another call needs the slot, the current conversation is saved to disk first (2–4 GB with the model's checkpoints). There is no timer: it stays until something needs the space.</p></li>
+    <li><h4>Restore on the follow-up</h4><p>When that conversation speaks again, its file is loaded back (0.4–0.8 s) and only the new text is processed.</p></li>
+    <li><h4>Keep small jobs away</h4><p>Side calls run on the helper model on nova, which has four slots of its own. If nova is down, a circuit breaker sends them back to the main model.</p></li>
+  </ol>
+  <p>For effort, the level is written near the end of the system text by a modified chat template, so changing it re-reads only the conversation, not the whole head. When a request gets stuck, the agent adds one short “think harder” note at the end of the history for the rest of that request; a level you picked yourself always wins.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>The main model (Qwen3.8-27B with MTP) runs in llama-server on the Mac Studio <strong>eva</strong>, with one slot. Save files sit on eva's disk. The helper model (Gemma E4B) runs on the Mac mini <strong>nova</strong> and takes side calls, vision and audio input. The two talk over the private tailnet. See <a href="infrastructure.html">Infrastructure</a> for the full machine map.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Saves are switched by <code>GHOST_HEAD_SAVES</code> and conversation keeping by <code>GHOST_CONV_KEEP</code>. Off, everything still works, just slower.</li>
+    <li>The effort menu exists only when <code>GHOST_REASONING_EFFORT=1</code> (set by the launcher while the 27B model is the main model). There is no automatic level choice; it was removed because a level change before tools forced a large re-read.</li>
+    <li>Save files are large (gigabytes each). A changed head (new tools, new instructions) makes old files useless; they cost time, not correctness.</li>
+    <li>Requests with no conversation key (health probes, scheduled jobs) skip the owner slot paths entirely.</li>
+    <li>The deadline extension applies to web requests, and only coding progress earns it.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/performance/context_manager.html">Context manager (core.context_manager)</a></li>
+    <li><a href="../reference/performance/head_saves.html">Head and slot saves (core.head_saves)</a></li>
+    <li><a href="../reference/performance/llm.html">Model client (LLM) (core.llm)</a></li>
+    <li><a href="../reference/performance/node_offload.html">Off-main node offload</a></li>
+    <li><a href="../reference/performance/node_throughput.html">Node throughput (core.node_throughput)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

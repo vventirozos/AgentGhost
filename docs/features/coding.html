@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coding — Ghost Agent</title>
+<meta name="description" content="Ghost writes and runs code in a locked-down sandbox, hosts small services, and proves what it says it ran.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a class="current" href="coding.html">Coding &amp; sandbox</a>
+    <div class="subnav">
+      <a href="../reference/coding/acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a href="../reference/coding/code_claims.html">Code claims (core.code_claims)</a>
+      <a href="../reference/coding/coding_executor.html">Coding executor (core.coding_executor)</a>
+      <a href="../reference/coding/coding_loop.html">Coding loop (core.coding_loop)</a>
+      <a href="../reference/coding/docker.html">Docker sandbox (sandbox.docker)</a>
+      <a href="../reference/coding/execute.html">Running code (execute) (tools.execute)</a>
+      <a href="../reference/coding/experiment_gate.html">Experiment gate (core.experiment_gate)</a>
+      <a href="../reference/coding/file_system.html">File system tool (tools.file_system)</a>
+      <a href="../reference/coding/jobs.html">Sandbox jobs (sandbox.jobs)</a>
+      <a href="../reference/coding/probe_model.html">Probe-model experiments (tools.probe_model)</a>
+      <a href="../reference/coding/probe_transcripts.html">Probe transcripts (core.probe_transcripts)</a>
+      <a href="../reference/coding/quarantine.html">Quarantine (tools.quarantine)</a>
+      <a href="../reference/coding/runs.html">Runs (tools.runs)</a>
+      <a href="../reference/coding/services.html">Sandbox services (sandbox.services)</a>
+      <a href="../reference/coding/skill_acquisition.html">Skill acquisition</a>
+      <a href="../reference/coding/workspace.html">Workspace tool (tools.workspace)</a>
+      <a href="../reference/coding/workspace_cleanup.html">Workspace cleanup (core.workspace_cleanup)</a>
+      <a href="../reference/coding/workspace_continuity.html">Workspace Continuity</a>
+      <a href="../reference/coding/workspace_track.html">Workspace tracking (tools.workspace_track)</a>
+    </div>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Coding</h1>
+    <p class="subtitle">Ghost writes code and runs it for real, inside a Docker sandbox that cannot touch the host and reaches the internet only through Tor. It can keep long jobs and small web services running, and it is checked against claiming it ran something it did not.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: eva (Mac Studio)</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <ul>
+    <li><strong>execute</strong> runs Python or shell in the sandbox and reads back the output, errors, exit code and any files written. Python can run in a stateful Jupyter session.</li>
+    <li><strong>file_system</strong> lists, reads, searches, writes and edits files in the workspace. Large files are written in parts.</li>
+    <li><strong>Jobs</strong>: a run that is still working after about 90 seconds is not killed. It becomes a background job, and Ghost is woken when it finishes.</li>
+    <li><strong>Services</strong>: a web app or API can be started as a named service that outlives the turn and even an agent restart. Ports 8100 to 8104 are reachable from outside the sandbox.</li>
+    <li><strong>PostgreSQL 18 client</strong>: <code>psql</code> is installed in the sandbox.</li>
+    <li><strong>probe_model</strong>: for experiments about language models, Ghost can send prompts to a model for real and keep the raw answers as a transcript the system writes.</li>
+  </ul>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>(upload <code>sales.csv</code>) “Plot monthly sales and save it as sales.png.”</td><td>Ghost reads the file, runs pandas and matplotlib in the sandbox, and shows the picture.</td></tr>
+      <tr><td>“Build a small to-do web app for Elena and host it.”</td><td>Files are written to the workspace, the app is started as a service on a port in 8100–8104, and Ghost checks it really listens.</td></tr>
+      <tr><td>“Download this dataset and train the model; tell me when it is done.”</td><td>The long run becomes a background job; the result comes back when it lands.</td></tr>
+      <tr><td>“Run the tests and fix what fails.”</td><td>Ghost runs pytest, edits, reruns, and reports what it actually saw pass.</td></tr>
+      <tr><td>“Ask the model the same question at three temperatures and compare.”</td><td><code>probe_model</code> runs the prompts in a fresh context and saves the transcript to a file.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>A persistent container</h4><p>One Docker container holds the workspace, bind-mounted from <code>$GHOST_HOME/sandbox</code>. The host's home folder is not reachable. Network access goes through Tor.</p></li>
+    <li><h4>Guarded runs</h4><p>Each command has a 600-second budget for going quiet. A run that is still making progress is detached as a supervised job, marked clearly as "still running", so nobody mistakes it for a success.</p></li>
+    <li><h4>Services</h4><p>A service is launched as its own process group with a log and a registry entry. Start checks that it is alive and that its port binds; if it crashed, you get the log tail with the cause.</p></li>
+    <li><h4>Claims are checked</h4><p>When Ghost says "the tests pass" or "I ran it", the system compares that with what its own tools actually returned. Claims without matching tool output are flagged.</p></li>
+    <li><h4>Experiments need proof</h4><p>In a project, an experiment task can be marked done only with a saved probe_model transcript (or an explicit waiver). This stops "simulated" model answers written by hand from passing as results.</p></li>
+  </ol>
+
+  <h2 id="where">Where it runs</h2>
+  <p>Everything runs on <strong>eva</strong>: the agent, the main model that writes the code, and the Docker sandbox. probe_model uses the main model by default, or the helper model on <strong>nova</strong> as a second, different subject. Real database servers for bigger tests live on lab machines (see ghost-labs on the Pi), not in the sandbox.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Only five service ports (8100–8104) are reachable from outside.</li>
+    <li>The sandbox has no clearnet access; downloads are slower over Tor and some sites block Tor.</li>
+    <li>probe_model takes at most 8 prompts per call and 600 seconds in total; inside your turn it shares the main model, so the conversation is re-read after it.</li>
+    <li>Files downloaded from .onion sites go to a quarantine that cannot be opened or run, only inspected.</li>
+    <li>Switches: <code>GHOST_SANDBOX_MEM</code> sets the container's memory limit.</li>
+  </ul>
+  <p>Deep reference: <a href="../reference/coding/execute.html">execute</a>, <a href="../reference/coding/jobs.html">jobs</a>, <a href="../reference/coding/services.html">services</a>, <a href="../reference/coding/docker.html">Docker sandbox</a>, <a href="../reference/coding/file_system.html">file_system</a>, <a href="../reference/coding/workspace.html">workspace</a>, <a href="../reference/coding/probe_model.html">probe_model</a>, <a href="../reference/coding/experiment_gate.html">experiment gate</a>, <a href="../reference/coding/code_claims.html">code claims</a>, <a href="../reference/coding/quarantine.html">quarantine</a>.</p>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/coding/acquired_skills.html">Acquired skills (tools.acquired_skills)</a></li>
+    <li><a href="../reference/coding/code_claims.html">Code claims (core.code_claims)</a></li>
+    <li><a href="../reference/coding/coding_executor.html">Coding executor (core.coding_executor)</a></li>
+    <li><a href="../reference/coding/coding_loop.html">Coding loop (core.coding_loop)</a></li>
+    <li><a href="../reference/coding/docker.html">Docker sandbox (sandbox.docker)</a></li>
+    <li><a href="../reference/coding/execute.html">Running code (execute) (tools.execute)</a></li>
+    <li><a href="../reference/coding/experiment_gate.html">Experiment gate (core.experiment_gate)</a></li>
+    <li><a href="../reference/coding/file_system.html">File system tool (tools.file_system)</a></li>
+    <li><a href="../reference/coding/jobs.html">Sandbox jobs (sandbox.jobs)</a></li>
+    <li><a href="../reference/coding/probe_model.html">Probe-model experiments (tools.probe_model)</a></li>
+    <li><a href="../reference/coding/probe_transcripts.html">Probe transcripts (core.probe_transcripts)</a></li>
+    <li><a href="../reference/coding/quarantine.html">Quarantine (tools.quarantine)</a></li>
+    <li><a href="../reference/coding/runs.html">Runs (tools.runs)</a></li>
+    <li><a href="../reference/coding/services.html">Sandbox services (sandbox.services)</a></li>
+    <li><a href="../reference/coding/skill_acquisition.html">Skill acquisition</a></li>
+    <li><a href="../reference/coding/workspace.html">Workspace tool (tools.workspace)</a></li>
+    <li><a href="../reference/coding/workspace_cleanup.html">Workspace cleanup (core.workspace_cleanup)</a></li>
+    <li><a href="../reference/coding/workspace_continuity.html">Workspace Continuity</a></li>
+    <li><a href="../reference/coding/workspace_track.html">Workspace tracking (tools.workspace_track)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

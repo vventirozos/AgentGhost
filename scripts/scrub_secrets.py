@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """One-shot scrub of persisted stores whose writes predate the 2026-07-20
-redaction fixes (docs/audit_fixes.html Round 10): lowercase/colon secret
+redaction fixes (docs/reference/reliability/audit_2026_05.html Round 10): lowercase/colon secret
 assignments (`password: hunter2`, `db_password = hunter2`, `api_key: sk_…`)
 passed every rule, so the trajectory corpus, LLM recordings, and the
 selfhood diary may hold raw secrets.

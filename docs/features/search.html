@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web search and browsing — Ghost Agent</title>
+<meta name="description" content="Ghost looks things up, researches, checks claims and drives a real browser, all over Tor.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a class="current" href="search.html">Search &amp; the web</a>
+    <div class="subnav">
+      <a href="../reference/search/browser.html">Browser (tools.browser)</a>
+      <a href="../reference/search/search.html">Web search (tools.search)</a>
+    </div>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Web search and browsing</h1>
+    <p class="subtitle">Ghost can look up a fact, research a topic across many sources, check whether a claim is true, or open a real browser and click through a site. Every request leaves through Tor, so the sites never see who is asking.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac Studio (eva)</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Ghost has four web tools and picks the one that fits the question:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Tool</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>web_search</code></td><td>Quick lookups: a date, a price, a definition. Returns the top results with their text.</td></tr>
+      <tr><td><code>deep_research</code></td><td>Reads several sources, follows them up, and writes one answer with citations.</td></tr>
+      <tr><td><code>fact_check</code></td><td>Takes a statement and researches whether the sources support or refute it.</td></tr>
+      <tr><td><code>browser</code></td><td>A real browser for pages that need clicking, typing, scrolling or a screenshot.</td></tr>
+    </tbody>
+  </table></div>
+  <p>There are no paid search APIs and no accounts. The agent is Tor-only by design: it keeps no keyed services, so nothing ties a search to its owner.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“When does the Thessaloniki book fair open this year?”</td><td>One <code>web_search</code>, an answer with the source.</td></tr>
+      <tr><td>“Research the trade-offs between heat pumps and gas boilers for a flat in Athens.”</td><td><code>deep_research</code> reads several pages and writes a summary that names where each point came from.</td></tr>
+      <tr><td>“Is it true that octopuses have three hearts?”</td><td><code>fact_check</code> returns a verdict with the evidence for and against.</td></tr>
+      <tr><td>“Open the train timetable site and find the last train from Larissa tonight.”</td><td>The <code>browser</code> loads the page, fills the form, reads the result and can show a screenshot.</td></tr>
+      <tr><td>Paste a YouTube link</td><td>Ghost fetches captions (or the audio) over Tor and returns the start of the transcript.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Clean the query</h4><p>The search engines Ghost reaches over Tor do not understand <code>site:</code>, quoted phrases or <code>AND</code>/<code>OR</code>; with them a search returns nothing. Ghost strips these and turns <code>site:python.org</code> into a keyword, and says so in the result. A past year added to a “today” question is dropped too, so old pages do not win.</p></li>
+    <li><h4>Race several engines</h4><p>Which search engine answers depends on the Tor exit in use, and it changes from circuit to circuit. So Ghost fires one request per engine (DuckDuckGo, Yandex, Brave, Yahoo) at the same time and takes the first good answer. A retry uses a fresh Tor circuit rather than the one that just failed.</p></li>
+    <li><h4>Read the pages</h4><p>The top results are fetched with safeguards that stop a page from pointing Ghost at your private network. PDFs are parsed; picture-heavy pages can be read by the vision model.</p></li>
+    <li><h4>Answer from the evidence</h4><p>The model writes its reply from what the pages actually say. A checker afterwards compares claims in the reply against the tool results.</p></li>
+  </ol>
+  <h3 id="browser">The browser</h3>
+  <p>The browser runs inside the Docker sandbox. It reaches the internet only through Tor, plus any service the sandbox itself is hosting, and never the rest of your network. It can click, type, scroll, wait for elements and take screenshots, and it can open <code>.onion</code> addresses. A dead onion site is remembered for a while so Ghost does not keep retrying it.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>Everything runs on the Mac Studio (eva): the search tools in the agent, the browser in the Docker sandbox, and the Tor client they both use. Nothing goes out over the normal internet.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Tor is slow and some sites block it. A typical search takes 10–20 seconds; a deep research run takes minutes.</li>
+    <li>Use plain keywords. To prefer a source, name it (“python asyncio docs”), don't use <code>site:</code>.</li>
+    <li>Sites behind logins or heavy bot checks may refuse the browser. YouTube refuses most Tor exits; a link usually works in under half a minute, sometimes not at all.</li>
+    <li>Results are cached briefly, so asking the same thing twice in a row is fast.</li>
+    <li>Channel members in Slack can use <code>web_search</code> only; <code>deep_research</code>, <code>fact_check</code> and the browser are owner tools.</li>
+    <li>Production runs with <code>--mandatory-tor</code>: if Tor is down, searches fail rather than leak out directly.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/search/browser.html">Browser (tools.browser)</a></li>
+    <li><a href="../reference/search/search.html">Web search (tools.search)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

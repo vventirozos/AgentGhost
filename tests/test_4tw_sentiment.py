@@ -655,6 +655,8 @@ def test_the_rating_line(answer, line):
 
 def test_the_rating_line_says_why_the_mood_did_not_move():
     answer = {"label": "positive", "score": 0.84, "probs": {"negative": 0.06, "neutral": 0.10, "positive": 0.84}}
+    neutral = {"label": "neutral", "score": 0.81, "probs": {"negative": 0.15, "neutral": 0.81, "positive": 0.04}}
+    assert C.rating_line(neutral, 0.0, "neutral") == "neutral 0.81 (neg 0.15 · pos 0.04) · mood unmoved — message neutral"
     assert C.rating_line(answer, 0.0, "below 0.85") == "positive 0.84 (neg 0.06 · neu 0.10) · mood unmoved (below 0.85)"
 
 

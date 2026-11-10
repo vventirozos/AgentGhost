@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Ghost Agent</title>
+<meta name="description" content="Plain-English definitions for the terms Ghost Agent's code, logs and reference docs use.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="getting-started.html">Getting started</a>
+    <a href="installation.html">Installation</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+    <a class="current" href="glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../features/interfaces.html">Interfaces</a>
+    <a href="../features/voice.html">Voice</a>
+    <a href="../features/search.html">Search &amp; the web</a>
+    <a href="../features/darkweb.html">Dark-web search</a>
+    <a href="../features/pictures.html">Pictures</a>
+    <a href="../features/memory.html">Memory</a>
+    <a href="../features/documents.html">Documents (RAG)</a>
+    <a href="../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../features/labs.html">Labs</a>
+    <a href="../features/selfhood.html">Selfhood</a>
+    <a href="../features/performance.html">Performance</a>
+    <a href="../features/reliability.html">Reliability</a>
+    <a href="../features/personal.html">Personal services</a>
+    <a href="../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Reference</span>
+  <h1>Glossary</h1>
+  <p class="subtitle">This project's logs and source use a lot of shorthand. Here's what it all means, in ordinary words.</p>
+
+  <div class="note">
+    <strong>Reading the deep reference?</strong> Keep this page open beside it. The module pages assume every term below.
+  </div>
+
+  <h2>The core loop</h2>
+
+  <dl class="kv terms">
+    <dt>Turn</dt>
+    <dd>One complete exchange: your message in, Ghost's answer out. A turn can contain many model calls and many tool calls internally. Capped at 40 passes.</dd>
+
+    <dt>Hydration</dt>
+    <dd>Searching memory and pasting the relevant results above your message <em>before</em> the model sees it. "The hydration was empty" means the memory search found nothing useful, not that memory is broken.</dd>
+
+    <dt>RRF · Reciprocal Rank Fusion</dt>
+    <dd>How several memory stores get merged into one ranked list. Each result is scored by its <em>position</em> in each list rather than its raw similarity score, because the stores don't share a scale. Something ranked highly by several stores beats something ranked highly by one. Each source's weight comes from one hand-tuned table per question type (factual, procedural, contextual) in <code>core/bus.py</code>; the learned weights that used to override it were removed on 2026-10-11 (§4NN).</dd>
+
+    <dt>Tool call</dt>
+    <dd>The model's request to do something — run code, read a file, search. Ghost accepts two formats and will attempt one repair on a malformed one.</dd>
+
+    <dt>Trajectory</dt>
+    <dd>The recorded log of one turn: what was asked, what tools ran, what came back, how it ended. This is what <code>introspect</code> and the failure census read.</dd>
+
+    <dt>Streaming vs non-streaming</dt>
+    <dd>Whether the answer arrives word by word or in one piece. It matters more than it sounds: streamed answers are checked <em>after</em> they reach you, so a failed check is recorded after the fact (and, since §4NF, not shown to you) rather than repaired before sending.</dd>
+  </dl>
+
+  <h2>Memory</h2>
+
+  <dl class="kv terms">
+    <dt>Vector memory</dt>
+    <dd>The searchable pile of facts and document passages. "Vector" because text is stored as a list of numbers representing its meaning, which is what makes searching by meaning possible.</dd>
+
+    <dt>Embedding / embedder</dt>
+    <dd>The model that turns text into those numbers. Changing it invalidates everything already stored — the old numbers stay valid-looking but stop meaning anything, which is why Ghost refuses to start on a mismatch.</dd>
+
+    <dt>Graph memory</dt>
+    <dd>Entities and the relationships between them. Answers "how is X connected to Y?" where the searchable pile can't. Since §4OM only copies of your profile facts and your projects are written to it.</dd>
+
+    <dt>Episode</dt>
+    <dd>A stored sequence of actions and their outcome — <em>I tried X, it failed because Y, so I did Z</em>. Unlike a fact, it has causality and order. Searched only when you ask; not added to prompts since 2026-10-10.</dd>
+
+    <dt>Journal</dt>
+    <dd>The short-term queue. Things noticed during a conversation land here first, and a background pass files them into long-term memory a couple of minutes later.</dd>
+
+    <dt>Scratchpad</dt>
+    <dd>Notes for the current conversation only. Expires after a day. Used to park a long tool result without carrying it in the context.</dd>
+
+    <dt>Profile</dt>
+    <dd>Durable facts about you. Special because it's <em>always present</em> in the prompt rather than searched — which is why a wrong entry here is so persistent.</dd>
+
+    <dt>Lesson</dt>
+    <dd>A recorded mistake-and-fix pair in the playbook (the lesson store). Lessons were out of every prompt from 2026-10-13 (§4ON), and the store with its two tools (<code>learn_skill</code>, <code>list_lessons</code>) was removed on 2026-11-06 (§4TD, <a href="../reference/index.html">what it was</a>). A lesson is not a rule; see <a href="../reference/memory/owner_rules.html#retired">Owner rules</a>.</dd>
+
+    <dt>Rule (owner rule)</dt>
+    <dd>A standing instruction you dictate: "learn this rule: answer in English". Ghost stores the sentence itself (no model call) and puts it in the prompt of every one of your turns, under <code>### OWNER RULES</code>. At most 10 rules, each 8 to 400 characters, kept in <code>$GHOST_HOME/system/owner_rules.json</code>. "show my rules" lists them; "forget rule N", then "confirm forget rule N", removes one (a bare "yes" removes nothing). Each command is an exact phrase that is the whole message: "add rule: …", "delete rule N", "remove rule N" and "show all rules" (without "my") are not commands and go to the model as ordinary chat, with a note that names the messages that work. A dictated rule is one line after a colon and holds no question mark: a text with a question mark anywhere in it is a question, not a rule, so a rule cannot quote a question with its mark. A damaged rules file is left exactly as it is: no rule is shown and every rule command says so until the file reads again. Until 2026-11-05 a rule was proposed by the failure-replay loop and adopted with "learn rule N"; that loop was removed, and "learn rule N" is now an ordinary message that changes nothing. See <a href="../reference/memory/owner_rules.html">Owner rules</a>.</dd>
+
+    <dt>Skill</dt>
+    <dd>An <em>acquired skill</em>: a reusable tool Ghost wrote for itself ("show me your skills" lists them). Until 2026-11-06 the word also named the lesson store (<code>SkillMemory</code>), which is removed.</dd>
+  </dl>
+
+  <h2>Checking itself</h2>
+
+  <dl class="kv terms">
+    <dt>Verifier</dt>
+    <dd>The checks run on a finished turn. Since 2026-10-14 (§4OW) only the mechanical ones run: does a built page load, are claimed files on disk, is the reply an answer, does an image show what the reply says. The second-model <em>judge</em> that read the answer against the evidence is off (<code>GHOST_VERIFIER_JUDGE=1</code> turns it back on).</dd>
+
+    <dt>Verdict · confirmed / refuted</dt>
+    <dd>The verifier's decision. "Refuted" means a check failed — today a mechanical one, such as a page that throws or a file that isn't there.</dd>
+
+    <dt>Escalation</dt>
+    <dd>Part of the LLM judge, so off with it: when the cheap judge refused an answer, the main model re-examined it and <em>its</em> verdict won, because the cheap judge refused more often than it should.</dd>
+
+    <dt>Auto-repair</dt>
+    <dd>Ghost getting a bounded second attempt at an answer a check refused, with the failure in hand — rather than shipping something that just failed. With the judge off (§4OX) the reply waits up to 15 seconds for the mechanical checks, and a page that throws or a missing file gets one repair round before sending (<code>GHOST_MECHANICAL_REPAIR_BUDGET</code>). A failure found later is recorded, not shown to you (§4NF).</dd>
+
+    <dt>Loop breaker</dt>
+    <dd>A guard that stops Ghost repeating the same successful-but-useless action forever — clicking the same button, taking the same screenshot, concluding nothing. Fires on the third identical repeat.</dd>
+
+    <dt>Pre-flight guard</dt>
+    <dd>Blocks a tool call that already failed the same way recently, handing the model the previous error instead of re-running a known failure.</dd>
+  </dl>
+
+  <h2>Background work</h2>
+
+  <dl class="kv terms">
+    <dt>The Mirror (§4SV, 2026-11-02; §4SV-b, 2026-11-05; §4TZ and §4UA, 2026-11-10)</dt>
+    <dd>A small side experiment inspired by Hofstadter's "strange loop". Once a day, in an idle window, Ghost's main model (the one that wrote the replies) is shown two things: the sentences Ghost has written about who it is (the last seven; a run of unchanged days is one line), and up to six replies Ghost gave you since the last look (two days back at most), picked at random (the start of each). It is asked to rewrite the last sentence: what the way the replies were written shows about the one who wrote them, leaving their subject out. Nothing is scored. Say <em>"mirror"</em> to see the last seven sentences and the replies the latest look used; the system answers that itself, with no model call. Since §4SV-b the latest sentence is one line (<code>self-image: …</code>) in what <code>introspect</code> returns for <em>overview</em> and <em>summary</em>, so it can colour the answer when you ask Ghost how it is, and that answer is one of the replies a later look may pick. Since §4TZ the sentence is also one short section (<code>### HOW YOU SEE YOURSELF</code>) of what Ghost reads before every reply to you on a private surface, after the cached head, so it shapes how every reply to you is written, and those replies are what the next look reads. That is the loop. Members, public channels, scheduled tasks and background runs never get it. Once the sentence is 30 words or more, the look must replace a trait instead of adding one, and <em>"mirror"</em> shows how much of each sentence was kept from the day before. Since §4UA the sentence is also Ghost's <em>character</em> for the mood: it sets where the mood rests when nothing happens (a faint resting point, too small to be a mood by itself, that the face shows while the mood is neutral), replies written under a strong mood or a manner are not shown to the look, and only a mood that keeps coming back over a week is mentioned to it. Only your own replies are picked (never a channel member's, a probe's or a job's). The diary is <code>system/selfhood/mirror.jsonl</code>; the first line is a seed sentence. The four sentences written before 11-05 stay in the diary and in what <em>"mirror"</em> shows, but Ghost is no longer shown them: the new look started again from the seed. The console line is <code>🎭 Mirror</code>.</dd>
+    <dt>Idle scheduler (formerly "biological watchdog" · "Biological Daemon")</dt>
+    <dd>The background loop that runs the idle-time jobs: memory-journal consolidation, maintenance, store hygiene, workspace tidy, project autoadvance (autopilot projects only), the self and workspace narratives and the Mirror. (Failure replay, the regression suite and the stale open-questions listing were on this list until they were removed on 2026-11-05.) At boot it prints <code>Idle Scheduler — started; jobs: …</code> naming exactly the jobs this boot will run. If it dies, Ghost keeps answering but stops its background upkeep; the status chip then says <em>idle scheduler DEAD</em>. Renamed on 2026-10-11 (§4NN); the code still calls it <code>biological_watchdog</code>, and the <code>/api/health</code> key is still <code>biological_watchdog_alive</code>.</dd>
+
+    <dt>Memory journal (formerly "Hippocampus")</dt>
+    <dd>The queue of memories buffered during your turns and consolidated into the stores once you have been quiet for a while. Its log lines are tagged <code>Memory Journal</code>; if you come back mid-drain it stops with <code>owner returned — paused with N item(s) left</code> and finishes later. Renamed on 2026-10-11 (§4NN).</dd>
+
+    <dt>Maintenance cycle (formerly "dream cycle" · REM)</dt>
+    <dd>Store upkeep: project digests, manifest backfill, the daily verified snapshot, the trajectory archive, forget-archive purges, graph prune and merge. Becomes eligible after about ten minutes of quiet; on a quiet day it runs about every six hours. The lesson-writing consolidation that gave it the "dream" name was removed on 2026-10-11 (§4NM), and the phase itself was renamed <code>maintenance</code> the same day: the idle log line, the activity ledger and the liveness table say <code>maintenance</code>, and one line after each pass says what it did (<code>N project activity digests written; N project file descriptions written; store backup taken (&lt;file&gt;) / no store backup this pass (one a day) / FAILED; memory graph cleaned: N stale links removed, N duplicate entities merged</code> (or <code>memory graph cleanup not due (every 6 h)</code> / <code>FAILED</code>), then the memory reconcile's repairs when it made any, led by <code>nothing needed — </code> when the pass changed nothing (§4PQ; it read <code>maintenance: project digests N, manifests N, snapshot yes/no, graph pruned N, graph merged N</code> until 2026-10-16)). Older ledger rows tagged <code>dream</code> are read as <code>maintenance</code>. The code module is still <code>core/dream.py</code> (class <code>Dreamer</code>), and the CLI switch is still <code>--no-dream</code>.</dd>
+
+    <dt>Idle window</dt>
+    <dd>The stretch of quiet in which the idle jobs may run. Most jobs need more than 10 or 15 minutes of it and at most 60. After an hour with no request the window restarts, every hour, so those jobs can run again during a long absence. The restart never changes the clock that records when you were last active. Log line: <code>no request for Nm — the idle window restarted: …</code>.</dd>
+
+    <dt>Signature</dt>
+    <dd>An internal prompt described by its inputs, outputs and a baseline instruction. The loader in <code>optim/</code> renders tool descriptions from them. (They were once the targets of a prompt optimizer; see GEPA under <em>Removed</em>.)</dd>
+
+    <dt>Distillation</dt>
+    <dd>In this codebase, <code>distill/</code> is the trajectory collector: it records turns, redacts them and promotes your corrections. The failure-cluster distillation that wrote lessons from it was removed on 2026-10-11 (§4NM).</dd>
+  </dl>
+
+  <h2 id="removed-4sz">Removed on 2026-11-05 (§4SZ)</h2>
+  <p>These terms appear in logs and in the project journal from 2026-10-09 to 2026-11-05. The mechanisms no longer exist. Why they went is on <a href="../reference/memory/owner_rules.html#removed">Owner rules</a>.</p>
+
+  <dl class="kv terms">
+    <dt>Failure replay (the idle slot formerly called "self-play"; "the learning loop")</dt>
+    <dd>An idle slot that ran after about an hour of quiet. It replayed one of <em>your</em> flagged requests, diagnosed it, tested one candidate rule and proposed it to you; "learn rule N" adopted the rule. In 27 days it made 13 replays and proposed 9 rules, of which 5 were adopted, and it proposed nothing in its last 17 days.</dd>
+
+    <dt>Proposed rule · candidate rule</dt>
+    <dd>A rule the failure replay had tested and was waiting for you to adopt ("learn rule N") or set aside ("dismiss rule N"). There are no proposed rules any more: you state a rule yourself. The old rule commands ("learn rule N", "dismiss rule N", "show all proposed rules") are not commands any more. They change nothing and go to the model as ordinary messages; the model is told that there are no proposed rules and which messages work (<a href="../reference/memory/owner_rules.html#retired-commands">Owner rules</a>).</dd>
+
+    <dt>Regression suite · regression test</dt>
+    <dd>A question you said was answered wrong, plus checks a program could run on the reply ("mentions 18.6", "opens postgresql.org"). Proposed from your 👎, kept only when you said "keep test N", re-asked after every update and daily. The suite held 0 kept tests when it was removed on 2026-11-05. Its commands ("keep test N", "show regression tests", "run regression tests") are not recognised any more: they reach the model as ordinary chat.</dd>
+
+    <dt>Reaction judge</dt>
+    <dd>A background call in which the main model read your next message after an answer and decided whether it showed the answer had missed. It ran 1 to 6 calls a day and fed only the failure replay and the regression suite. Its old verdict files, when present, are still read by the failure census.</dd>
+  </dl>
+
+  <h2>Removed in October 2026 (§4NM)</h2>
+  <p>These terms still appear in old logs, the project journal and the audit page. None of the mechanisms exists any more; each was measured on real turns, found not to help, and deleted on 2026-10-11.</p>
+
+  <dl class="kv terms">
+    <dt>Reflection</dt>
+    <dd>Re-read recent failed turns and wrote lessons. Its lessons reached the turn they were for 18% of the time.</dd>
+
+    <dt>Post-mortem</dt>
+    <dd>Read the whole transcript of a bad run and filed a classified defect report. 129 of 130 runs found nothing.</dd>
+
+    <dt>Self-play (synthetic) · challenge templates · adversarial generator · frontier</dt>
+    <dd>Invented practice problems, aimed at the clusters Ghost was most uncertain about. Passed 8 of 9 at the first try; replaced by failure replay on your real failures, which was itself removed on 2026-11-05.</dd>
+
+    <dt>Dream REM consolidation · counterfactual replay</dt>
+    <dd>Generalised memories into lessons, and re-ran recorded episodes with one thing changed to grade a lesson's effect. The control leg of the replay engine never reproduced recorded outcomes reliably enough to label anything.</dd>
+
+    <dt>Automatic skills · skill pruning</dt>
+    <dd>Turned repeated tool sequences into "skills" and retired lessons by a utility score. The skills were trivial; the pruning deleted 13 good lessons on noisy labels.</dd>
+
+    <dt>GEPA · prompt tuning · tool ontology</dt>
+    <dd>An optimizer that rewrote three internal prompts and the tool descriptions from successful turns, its autonomy loop, and the analysis of whether the toolbox was carved right. No tuned prompt was ever shown to help on live traffic.</dd>
+
+    <dt>PRM · Process Reward Model · MCTS</dt>
+    <dd>A small local model that scored partial plans, and the lookahead that would have consumed it. Nothing on the request path ever read either.</dd>
+
+    <dt>Router (complexity router) · System-2 planner</dt>
+    <dd>A classifier that predicted request difficulty, and the planning path it gated. Nothing used the label; the planner never ran in production. The planner itself (<code>--use-planning</code>, its prompt, the per-turn plan and its <code>GHOST_PLANNER_*</code> knobs) was deleted in the second pass of the same day. The project task tree (<code>core/planning.py</code>) is a different thing and stays.</dd>
+
+    <dt>Foresight · imagination · risk governor · PPI</dt>
+    <dd>Per-tool-call outcome predictions, the gate that would have let them steer, a nudge on struggling turns, and the arm report's estimator. Its depth estimates were 10–26 points wrong; the rest had no consumer.</dd>
+
+    <dt>Evolve (scaffold mutation) · negative controls · bench banks</dt>
+    <dd>Self-proposed changes to the agent's own scaffolding behind a fence, the known-bad candidates that tested the fence, and the externally graded task banks that scored them. The banks were saturated (≥90%) and the mutator never shipped a change.</dd>
+
+    <dt>Wake-up prefix · derived-mood idle job</dt>
+    <dd>A block of self-state in every prompt and an idle job that derived a mood while nobody was talking. The self-state is still written and is read on demand through <code>introspect</code>; the mood is shown there too — since 2026-11-06 it is no longer derived from verdicts but moves with events and decays (see <em>Mood</em>).</dd>
+
+    <dt>Owner-facing verifier corrections</dt>
+    <dd>The switch (<code>GHOST_VERIFIER_SHOW_OWNER</code>) that showed you the late verifier's corrections, notices and source caveats. 2 of the last 3 shown corrections were false. Verdicts are still recorded; a channel member's correction still reaches the member.</dd>
+
+    <dt>Vector, episode and session hydration tiers · vector match floor</dt>
+    <dd>The fetchers that put fact-store hits, past episodes and past replies into every prompt, the topical graph fetch, their four <code>GHOST_BUS_*_TIER</code> switches and <code>GHOST_VECTOR_MATCH_FLOOR</code>. A prompt now gets your facts (when you ask about yourself); <code>recall</code> still searches every store.</dd>
+
+    <dt>Competence in prompts and in the confidence score</dt>
+    <dd>The per-domain success table in the prompt and as a term of the confidence blend (<code>GHOST_COMPETENCE_PROMPT</code>, <code>GHOST_CONF_COMPETENCE</code>). It counted error-free calls, not successful turns. The profile itself was removed later, with the confidence score (see below).</dd>
+
+    <dt>Equal-mass bench cap · bench enrollment</dt>
+    <dd>The calibration cap on bench rows and experiment enrollment for bench solves. Old bench rows on disk are still read: the source rank <code>bench_validator</code> and the bench direction gate stay. (The offline judge bench library <code>eval/verify_bench.py</code> is kept — the verifier's tests drive it.)</dd>
+
+    <dt>Scripts for removed subsystems</dt>
+    <dd><code>objection_replay.py</code>, <code>label_noise_audit.py</code>, <code>measure_undecidable_turns.py</code>, <code>ablation_trackb4.py</code>, <code>lesson_generalize_legacy_4kw.py</code>.</dd>
+  </dl>
+
+  <h2>Removed in October 2026, second batch (§4NN)</h2>
+  <p>Deleted on 2026-10-11 after the first batch. Each had no consumer on the request path, or was switched off in production. Their old data files stay on disk; nothing reads them.</p>
+
+  <dl class="kv terms">
+    <dt>Belief versioning · contradiction log (<code>ContradictionLog</code>)</dt>
+    <dd>A ledger of every stored belief Ghost revised and why. Nothing had read it into a prompt since §4KZ. The project advancer still detects a contradiction between sibling tasks and records it as a <code>contradiction_detected</code> project event; only the separate ledger write went. <code>contradiction_log.json</code> is left on disk.</dd>
+
+    <dt>Uncertainty tracker · <code>flag_uncertainty</code> · λ (uncertainty penalty)</dt>
+    <dd>A tool the model called to register unknowns and assumptions, a per-turn scan for hedging phrases, the <em>Recurring uncertainties</em> prompt block, the clarifying-question gate (<em>"Before I proceed, I need to clarify…"</em>) and the <em>Assumptions I made</em> reply footer. The confidence score's penalty <code>× (1 − λ·pressure)</code> went with it. <code>uncertainty_log.jsonl</code> is left on disk.</dd>
+
+    <dt><code>--deep-reason</code> · HypothesisTester · System-3 hypothesis grounding</dt>
+    <dd>After repeated failures, generated root-cause hypotheses and ran a minimal sandbox test for each. The crisis pivot itself still runs (and still looks up past recoveries); it no longer generates or tests hypotheses. <code>--deep-reason</code> is still <em>accepted</em> so an old launcher boots, but it does nothing — remove it from the launcher. <code>GHOST_HYPOTHESIS_GROUNDING</code> is no longer read.</dd>
+
+    <dt>Experiments registry · live randomised arms · PPI · <code>introspect action='experiments'</code></dt>
+    <dd>The A/B arm machinery (<code>core/experiments.py</code>, its estimator <code>core/ppi.py</code>, request enrolment, the <code>experiments</code> trajectory stamp, the <code>GHOST_EXPERIMENTS</code> switch). Every spec was already disabled, so every consumer now takes its no-arm path: the evidence-gate steer is gone, adaptive best-of-N follows <code>GHOST_TTS_ADAPTIVE_BON</code> only, and the batched <code>paths</code> read in <code>file_system</code> is no longer offered. <code>introspect</code> lost its <code>experiments</code> action and its overview section. <code>system/experiments.json</code> is left on disk.</dd>
+
+    <dt>Learned RRF weights</dt>
+    <dd>Per-intent source weights fitted from logged turns (<code>core/rrf_weights.py</code>, <code>system/rrf/weights.json</code>). The hand-tuned table in <code>core/bus.py</code> is now the only one, and it lists the live prompt sources (your facts in the graph; the lesson source went on 2026-11-06).</dd>
+
+    <dt>Biological · Hippocampus · REM · Dream Mode (log names)</dt>
+    <dd>Renamed, not removed: the loop is the <em>idle scheduler</em>, its log tag <code>Idle Maintenance</code> (was <code>Biological Hook</code>), the memory queue the <em>memory journal</em>, and the maintenance pass logs <code>Maintenance Digests</code>, <code>Maintenance Manifest</code> and <code>Trajectory Archive</code> (were <code>Dream Projects</code>, <code>Dream Manifest</code>, <code>Dream Mode</code>).</dd>
+  </dl>
+
+  <h2>Removed later in October 2026</h2>
+  <p>Cut because it did not do its job when measured. Its data files stay on disk; nothing reads them.</p>
+
+  <dl class="kv terms">
+    <dt>Confidence score · calibration · competence profile · arbiter</dt>
+    <dd>A per-answer confidence number blended from a per-task-type success table (the <em>competence profile</em>) and how uncertain the model's word choices were, re-fitted every hour against how turns actually ended (<em>calibration</em>). Its job was to pick the least confident answers for a deeper check and, once a day, to ask you to 👍/👎 one of the shakier answers. Measured against real outcomes it ranked answers no better than a coin flip, and the deeper check it fed sat behind a verifier judge that is switched off. The second-solver <em>arbiter</em>, already switched off, went with it. The <code>metacog conf</code> log line and the confidence figure on the <code>turn outcome</code> line appear only in old logs.</dd>
+  </dl>
+
+  <h2>Models and machines</h2>
+
+  <dl class="kv terms">
+    <dt>Upstream</dt>
+    <dd>The LLM server Ghost talks to. Ghost is not a model; it's a program that uses one.</dd>
+
+    <dt>Node pool</dt>
+    <dd>A group of extra LLM machines assigned to one kind of work. Ghost has five: worker, critic, coding, vision, image-gen (the swarm pool was removed 2026-10-30).</dd>
+
+    <dt>Worker node</dt>
+    <dd>A machine for background and small jobs, so they don't compete with your conversation for the main model.</dd>
+
+    <dt>Critic node</dt>
+    <dd>The machine that ran the LLM judge. With the judge off (§4OW) it has no regular work: the image pixel check runs there only with <code>GHOST_VISUAL_CHECK_POOL=critic</code>, unset in production since 2026-11-07. In production it is the same helper box as the worker node.</dd>
+
+    <dt>Swarm</dt>
+    <dd>Fanning one task out across several models in parallel.</dd>
+
+    <dt>Circuit breaker</dt>
+    <dd>After a node fails repeatedly, Ghost stops sending it work for a while instead of retrying into a dead machine. "Open" means it's been taken out of rotation. Nothing to do with Tor circuits.</dd>
+
+  </dl>
+
+  <h2>Network and sandbox</h2>
+
+  <dl class="kv terms">
+    <dt>Tor circuit</dt>
+    <dd>The chain of relays your traffic takes. The last one — the exit node — is what the destination site sees.</dd>
+
+    <dt>NEWNYM</dt>
+    <dd>Tor's "give me a fresh circuit" signal. Ghost sends it after a 503, on the theory that a rate-limited exit will clear on a different route. Not sent for 401 or 403, which a new exit wouldn't fix.</dd>
+
+    <dt>SOCKS5h</dt>
+    <dd>A proxy mode where the <em>proxy</em> resolves hostnames, not your machine. The "h" is the whole point: without it your own DNS server sees every site you visit, even though the traffic itself is anonymous.</dd>
+
+    <dt>Egress guard</dt>
+    <dd>The process-wide block on direct connections to public addresses. Makes "everything goes through Tor" enforced rather than merely intended.</dd>
+
+    <dt>Fail closed</dt>
+    <dd>When something's wrong, stop rather than degrade. Ghost refuses to boot without Tor instead of quietly using a normal connection.</dd>
+
+    <dt>Sandbox</dt>
+    <dd>The Docker container where all code runs. It shares exactly one directory with your machine and has its own network and process namespaces.</dd>
+
+    <dt>SSRF guard</dt>
+    <dd>Refuses fetches aimed at private or loopback addresses, so a tool call can't be turned into a scanner of your own network.</dd>
+
+    <dt>Hidden service · .onion</dt>
+    <dd>A site reachable only through Tor, with no ordinary domain name. Normal search engines don't index them, which is why searching for one needs a separate set of engines.</dd>
+
+    <dt>Circuit isolation</dt>
+    <dd>Deliberately sending each request over a different Tor route. Used for search because whether an engine answers depends on which exit node you happen to have — the same query can fail then succeed with nothing changed but the circuit.</dd>
+
+    <dt>Independent corroboration</dt>
+    <dd>Counting a result as confirmed only when genuinely separate sources report it. Several onion engines share one underlying search index, so they're tagged and counted once rather than mistaken for agreement.</dd>
+  </dl>
+
+  <h2>Sense of self</h2>
+
+  <dl class="kv terms">
+    <dt>Selfhood</dt>
+    <dd>The group of features that give Ghost continuity across sessions: a first-person diary, a running narrative, and state it carries forward.</dd>
+
+    <dt>Self-state</dt>
+    <dd>What Ghost keeps about its own state between sessions: its mood (two numbers that move with what happens and wear off by themselves, or put where you tell it to — see <em>Mood</em>) and when it was last active. Read back on demand through <code>introspect</code>. Until 2026-11-05 it also held open questions, unfinished threads and operating principles Ghost wrote for itself through a <code>self_state</code> tool; the tool made six real writes in four months and nothing read them, so both were removed (the prefix that once put self-state in every prompt was removed on 2026-10-11, §4NM).</dd>
+
+    <dt>Mood (§4TC, 2026-11-06) · manner</dt>
+    <dd>How Ghost is, as two numbers: pleasantness and energy. They move by themselves — failed tool calls and loop guards in your turns lower the first and raise the second, a smooth turn or your thumbs-up lifts it, research makes it curious, a very long turn tires it, and the tone of your own English messages nudges it a little, whatever they are about (your good news lifts it, a bad day lowers it; §4TW, 2026-11-09) — and they wear off by half every two hours. (A long quiet moves nothing: after six hours without you a neutral mood <em>reads</em> as bored on the face and in <code>introspect</code> — never in a reply, and never to you; your message ends the quiet.) Since §4TX (2026-11-09) a failure counts by how much of the turn failed, a hiccup (Tor, a timeout, a guard saying no, a failing test run) does not count, a finished project task lifts it, and your reactions to one reply — a thumb, a correction, thanks, the tone of that message — count once, as one verdict. A label (cheerful, content, calm, restless, bored, irritable, down, tired, curious) and an intensity from 1 to 3 are read off them, and one line in each turn's state makes the mood audible in <em>how</em> the reply is phrased; the facts, the numbers and the tool use stay the same. You — and only you, in a message of your own — can put it where you want in chat ("cheer up", "don't be so grumpy", "a bit more", "be neutral"), and it stays there until the end of the day (§4TX) — Ghost calls <code>introspect(action="set_mood")</code> — and ask why it is in the mood it is in (<code>introspect(action="mood")</code>: the cause, since when, today's timeline). A <strong>manner</strong> is separate: a way of talking you set ("be more sarcastic" — sarcastic, playful, formal, terse, gentle, dramatic or evil) that lasts until the end of that day (04:00), getting fainter in the last hours, unless you clear it sooner or say it again. Until 2026-11-06 the mood was a label derived from the verifier's verdicts (idle / satisfied / stuck) that no reply depended on.</dd>
+
+    <dt>Narrative consolidation</dt>
+    <dd>Periodically rewriting many individual experiences into one running summary, so "what have you been doing?" has an answer that isn't a list of a thousand events.</dd>
+
+    <dt>Workspace model</dt>
+    <dd>The counterpart to selfhood, pointed outward: what changed in <em>your</em> files, what scheduled tasks did, which URLs it has already read.</dd>
+
+  </dl>
+
+  <h2>Measurement</h2>
+
+  <dl class="kv terms">
+    <dt>Ablation</dt>
+    <dd>Turning a feature off to measure whether it was helping. Most of the <code>--no-*</code> flags exist for this.</dd>
+
+    <dt>Arm</dt>
+    <dd>One side of a comparison. "Control arm" is the current behaviour; "treatment arm" is the change being tested. No arm runs today: none could reach a verdict at this traffic (§4ND), and the experiments registry was removed on 2026-10-11 (§4NN) — see <em>Removed</em>.</dd>
+
+    <dt>Bench</dt>
+    <dd>A fixed set of test cases used to score a component in isolation, so two versions can be compared fairly.</dd>
+
+    <dt>Metacognition uplift</dt>
+    <dd>An optional add-on that, with <code>--enable-metacog</code>, logs each time the shell or SQL checks block a command and counts the blocks for a summary at shutdown. The checks themselves always run. (It used to also watch host health and raise re-plan alarms; that was removed in §4PT, 2026-10-17.)</dd>
+  </dl>
+
+  <div class="pager">
+    <a class="prev" href="troubleshooting.html">
+      <span class="dir">Previous</span>
+      <span class="to">When something breaks</span>
+    </a>
+    <a class="next" href="../reference/index.html">
+      <span class="dir">Next</span>
+      <span class="to">Deep reference</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>If a term in the reference pages isn't here, it's worth adding — the deep pages are written for people who already know all of this.</p>
+  </footer>
+</main>
+</body>
+</html>

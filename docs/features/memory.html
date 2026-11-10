@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory — Ghost Agent</title>
+<meta name="description" content="Ghost remembers who you are, what you told it, and what happened before, across every conversation.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a class="current" href="memory.html">Memory</a>
+    <div class="subnav">
+      <a href="../reference/memory/adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="../reference/memory/attribution.html">Attribution (memory.attribution)</a>
+      <a href="../reference/memory/dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="../reference/memory/dream_cycle.html">Maintenance cycle</a>
+      <a href="../reference/memory/episodes.html">Episodes (memory.episodes)</a>
+      <a href="../reference/memory/experience.html">Experience (memory.experience)</a>
+      <a href="../reference/memory/fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="../reference/memory/failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="../reference/memory/frontier.html">Frontier (memory.frontier)</a>
+      <a href="../reference/memory/graph.html">Knowledge graph (memory.graph)</a>
+      <a href="../reference/memory/journal.html">Journal (memory.journal)</a>
+      <a href="../reference/memory/memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="../reference/memory/memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="../reference/memory/owner_rules.html">Owner rules</a>
+      <a href="../reference/memory/profile.html">Owner profile (memory.profile)</a>
+      <a href="../reference/memory/readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="../reference/memory/scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="../reference/memory/temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="../reference/memory/vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Memory</h1>
+    <p class="subtitle">Closing the chat does not erase anything. Ghost keeps several kinds of memory, each good at a different question, and you can see, correct and delete what it holds.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: eva (Mac Studio)</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>A single pile of searchable text is bad at ordinary questions. "What do I know about Postgres?", "Who is Markos to me?" and "What went wrong last time?" want different kinds of answer. So Ghost keeps separate stores:</p>
+  <ul>
+    <li><strong>Your profile</strong>: your name, city, work, preferences. It is not searched; it is written into every conversation, so Ghost never has to look it up.</li>
+    <li><strong>Facts (vector recall)</strong>: notes stored so they can be found by meaning, not exact words. Ask about "the database move" and it finds a note that said "migrating the schema".</li>
+    <li><strong>Relationships (knowledge graph)</strong>: who and what is connected to what, such as "Elena is my sister" or "the NetMon project runs on the Pi".</li>
+    <li><strong>Temporal facts</strong>: facts with a time, so "I used to drive a Fiat, now a Volvo" keeps both and knows which is current.</li>
+    <li><strong>The fact ledger</strong>: an append-only history. Each time a fact about you is stated, replaced or removed, one line records the date and the words you used. It lets Ghost answer "since when do you know where I live?".</li>
+    <li><strong>Episodes</strong>: what happened, in order: asked X, tried Y, failed because Z, switched to W.</li>
+    <li><strong>The journal</strong>: an inbox. Your turns queue here at once, and when things are quiet a background pass reads your own lines and files the facts you stated into the stores above.</li>
+    <li><strong>The scratchpad</strong>: short notes for the current work, gone after a day.</li>
+    <li><strong>Owner rules</strong>: instructions you dictated, shown on every one of your turns.</li>
+  </ul>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“I moved to Thessaloniki last month.”</td><td>The journal picks it up; your profile city is replaced (not added to), and the ledger records the change.</td></tr>
+      <tr><td>“Where do I live?”</td><td>Answered from the profile, which is in every prompt.</td></tr>
+      <tr><td>“What did we decide about Kosmas's website?”</td><td>Ghost calls <code>recall</code> and searches facts, episodes and past conversations by meaning.</td></tr>
+      <tr><td>“Actually my brother is Bruno, not Markos.”</td><td>Single-valued facts are corrected in place.</td></tr>
+      <tr><td>“Learn this rule: always answer in English.”</td><td>The system stores the sentence without a model call. It rides every one of your turns. At most ten rules.</td></tr>
+      <tr><td>“Show my rules” / “forget rule 2”</td><td>The system lists them from the store. Forgetting shows what will go and needs “confirm forget rule 2” within 15 minutes.</td></tr>
+      <tr><td>“Forget everything about project Atlas.”</td><td>Ghost shows a numbered list of what it found (files, facts, profile fields, graph facts, conversations) and deletes only what you confirm (“yes” or “only 1 and 3”).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Write</h4><p>Your message goes to the journal straight away. After about two minutes of quiet, a model reads only your own lines, picks out the facts you stated, and files them. A question such as "do you remember my wife?" never counts as stating a fact.</p></li>
+    <li><h4>Prepare each turn</h4><p>Every turn carries your profile, the facts about you and your rules. For a question about yourself, matching facts are searched and added above the conversation ("hydration"). Lists from different stores are merged by rank position, not by raw score, because their scores are not comparable.</p></li>
+    <li><h4>Search on demand</h4><p>The rest (general facts, the graph, episodes, past conversations) is searched only when Ghost calls <code>recall</code>. Measured on real turns, adding them to every prompt helped little and sometimes harmed.</p></li>
+    <li><h4>Tidy when idle</h4><p>When nobody is talking to it, Ghost drains the journal and consolidates its stores.</p></li>
+  </ol>
+  <p>Ghost does not invent lessons or rules for itself. The only learning is what you tell it: your facts and your rules. The old "proposed rules" step was removed, so "dismiss rule N" and "learn rule N" are now ordinary messages.</p>
+  <p>Not the same as memory: asking about one document you fed it ("in the Postgres manual, how do I…") uses <code>knowledge_base</code> query, which searches only that document. See <a href="documents.html">Documents</a>.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>Everything lives on <strong>eva</strong>, as plain files under <code>$GHOST_HOME/system/</code>: the stores in <code>system/memory/</code>, past conversations in <code>system/sessions/</code>. There is no outside database. Backing up <code>$GHOST_HOME</code> backs up the agent's whole memory; deleting it makes Ghost forget you completely. The embedding model runs locally; nothing about you is sent to a keyed service.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Something you said 30 seconds ago may not be findable yet; the journal drains after a quiet spell.</li>
+    <li>"It forgot" means one of two things: never stored, or stored but not found. Ask it to search for the fact directly first.</li>
+    <li>A wrong profile entry follows every turn until you correct it. The web console has a memory-correction control for stubborn ones.</li>
+    <li>At most ten owner rules; an eleventh is refused until you forget one.</li>
+    <li>Channel members do not read or write your private memory.</li>
+    <li>The fact ledger is always written but shown in prompts only behind a switch (off), and the experience store is off too (<code>GHOST_EXPERIENCE_TIER</code>).</li>
+    <li>Changing the embedding model makes Ghost refuse to start rather than return nonsense; a re-embed script exists for a real switch.</li>
+  </ul>
+  <p>Deep reference: <a href="../reference/memory/vector.html">vector</a>, <a href="../reference/memory/graph.html">graph</a>, <a href="../reference/memory/temporal.html">temporal</a>, <a href="../reference/memory/profile.html">profile</a>, <a href="../reference/memory/fact_ledger.html">fact ledger</a>, <a href="../reference/memory/episodes.html">episodes</a>, <a href="../reference/memory/journal.html">journal</a>, <a href="../reference/memory/scratchpad.html">scratchpad</a>, <a href="../reference/memory/owner_rules.html">owner rules</a>, <a href="../reference/memory/memory_hydration.html">hydration</a>, <a href="../reference/memory/memory_tools.html">memory tools</a>.</p>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/memory/adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a></li>
+    <li><a href="../reference/memory/attribution.html">Attribution (memory.attribution)</a></li>
+    <li><a href="../reference/memory/dream.html">Maintenance (dream) (core.dream (maintenance))</a></li>
+    <li><a href="../reference/memory/dream_cycle.html">Maintenance cycle</a></li>
+    <li><a href="../reference/memory/episodes.html">Episodes (memory.episodes)</a></li>
+    <li><a href="../reference/memory/experience.html">Experience (memory.experience)</a></li>
+    <li><a href="../reference/memory/fact_ledger.html">Fact ledger (memory.fact_ledger)</a></li>
+    <li><a href="../reference/memory/failclosed.html">Fail-closed stores (memory.failclosed)</a></li>
+    <li><a href="../reference/memory/frontier.html">Frontier (memory.frontier)</a></li>
+    <li><a href="../reference/memory/graph.html">Knowledge graph (memory.graph)</a></li>
+    <li><a href="../reference/memory/journal.html">Journal (memory.journal)</a></li>
+    <li><a href="../reference/memory/memory_hydration.html">Memory hydration (RRF)</a></li>
+    <li><a href="../reference/memory/memory_tools.html">Memory tools (tools.memory)</a></li>
+    <li><a href="../reference/memory/owner_rules.html">Owner rules</a></li>
+    <li><a href="../reference/memory/profile.html">Owner profile (memory.profile)</a></li>
+    <li><a href="../reference/memory/readonly.html">Read-only memory (memory.readonly)</a></li>
+    <li><a href="../reference/memory/scratchpad.html">Scratchpad (memory.scratchpad)</a></li>
+    <li><a href="../reference/memory/temporal.html">Temporal facts (memory.temporal)</a></li>
+    <li><a href="../reference/memory/vector.html">Vector memory (memory.vector)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

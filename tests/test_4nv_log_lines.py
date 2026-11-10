@@ -123,7 +123,7 @@ def test_the_title_table_in_the_docs_is_current():
                        capture_output=True, text=True, env={"PYTHONPATH": str(ROOT / "src"),
                                                             "HF_HUB_OFFLINE": "1", "GHOST_API_KEY": "x",
                                                             "PATH": "/usr/bin:/bin"})
-    assert r.returncode == 0, "docs/logging.html title table is stale — run scripts/gen_log_titles.py"
+    assert r.returncode == 0, "docs/reference/reliability/logging.html title table is stale — run scripts/gen_log_titles.py"
 
 
 @pytest.mark.parametrize("mod", ["memory.audio_ingest", "memory.youtube_ingest", "memory.youtube_canary",

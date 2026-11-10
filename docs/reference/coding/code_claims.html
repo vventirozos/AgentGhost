@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code claims (core.code_claims) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <div class="subnav">
+      <a href="acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a class="current" href="code_claims.html">Code claims (core.code_claims)</a>
+      <a href="coding_executor.html">Coding executor (core.coding_executor)</a>
+      <a href="coding_loop.html">Coding loop (core.coding_loop)</a>
+      <a href="docker.html">Docker sandbox (sandbox.docker)</a>
+      <a href="execute.html">Running code (execute) (tools.execute)</a>
+      <a href="experiment_gate.html">Experiment gate (core.experiment_gate)</a>
+      <a href="file_system.html">File system tool (tools.file_system)</a>
+      <a href="jobs.html">Sandbox jobs (sandbox.jobs)</a>
+      <a href="probe_model.html">Probe-model experiments (tools.probe_model)</a>
+      <a href="probe_transcripts.html">Probe transcripts (core.probe_transcripts)</a>
+      <a href="quarantine.html">Quarantine (tools.quarantine)</a>
+      <a href="runs.html">Runs (tools.runs)</a>
+      <a href="services.html">Sandbox services (sandbox.services)</a>
+      <a href="skill_acquisition.html">Skill acquisition</a>
+      <a href="workspace.html">Workspace tool (tools.workspace)</a>
+      <a href="workspace_cleanup.html">Workspace cleanup (core.workspace_cleanup)</a>
+      <a href="workspace_continuity.html">Workspace Continuity</a>
+      <a href="workspace_track.html">Workspace tracking (tools.workspace_track)</a>
+    </div>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / code_claims.py — did this turn RUN what it wrote?</h1>
+  <p class="subtitle">The claim-keyed arm of the unverified-write guard (§4PH, 2026-10-15): a reply that says the code works, was tested or passes is checked against the turn's own write/run ledger, whatever the last tool was.</p>
+
+  <h2>Why it exists</h2>
+  <p>Until §4PH the one mechanical guard between a coding turn and a false "it works" was <code>_is_unverified_mutation(last_tool)</code> in <a href="../infrastructure/agent.html">core.agent</a>: it fired only when the turn's LAST action was a successful whole-file write. A trailing <code>ls</code>, a read-back of the file, <code>python --version</code> &mdash; anything &mdash; cleared it, and nothing anywhere read the reply's own claim. Reproduced by the §4PH readers: write 3,000 chars &rarr; <code>execute ls</code> &rarr; "I tested it and it works" shipped clean (no note, no failed label, the project work_log said <em>completed</em> with the claim as its note); a file whose only run FAILED with a traceback shipped under "all tests pass". The corpus agreed: of 82 owner replies claiming works/tested/verified, 27 ran nothing; 1 of 158 coding turns ran a test runner; both released apps carried demonstrable bugs behind "Verified: calendar render".</p>
+
+  <h2>The ledger</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>code_evidence(tools_run)</code></td><td>key (basename, case-folded) &rarr; <code>{path, write_idx, run_idx, run_ok, via}</code>. Writes: a <code>file_system</code> SUCCESS confirmation (write / append / edit / replace shapes, via the same anchored parser the FILE-ARTIFACT check uses), a shell heredoc / redirect / <code>tee</code> inside an <code>execute</code> command, or <code>execute(filename=, content=)</code>. Runs: an <code>execute</code> whose command, filename, args or ephemeral script text names the file (an <code>import x</code> counts as <code>x.py</code>), a test-suite run (<code>is_suite_command</code>) for every non-web file, a <code>browser</code> / <code>vision_analysis</code> call whose url/path names a page. ORDER matters: only a run AFTER the last write counts, a run before the final edit tested an older version. A detached (promoted) run is neither a pass nor a failure.</td></tr>
+      <tr><td><code>unbacked_code_writes(tools_run)</code></td><td><code>(never_run, failed_last)</code> &mdash; code files whose final version nothing ran / loaded, and those whose last run after the final write failed (exit &ne; 0, a declared failed status, a browser <code>STATUS</code> other than OK).</td></tr>
+      <tr><td><code>claims_code_works(reply)</code></td><td>The first affirmative works / tested / verified / passes phrase ("it works", "all tests pass", "tested, works", "I ran it", "works as expected", Greek "δουλεύει" / "το έτρεξα"), or "". A negation, conditional or future in the same clause ("could not test", "untested", "should work", "cannot confirm it works", "if the tests pass") is not a claim.</td></tr>
+      <tr><td><code>unbacked_claim_note(reply, tools_run, forbids_running)</code></td><td>The note and failed label for a claim with no backing run &mdash; ONE wording for both delivery paths: <em>"⚠ Unverified claim: this reply says "…", but <code>app.py</code> was written this turn and never run. Treat it as UNTESTED…"</em> (or <em>"…the last run of <code>app.py</code> after it was written FAILED. Treat it as BROKEN until a run passes."</em>). A request that said "don't run it" is said, not failed (§4KW) &mdash; but the claim is still named as unbacked.</td></tr>
+      <tr><td><code>unbacked_claim_directive(reply, tools_run)</code></td><td>The in-loop repair directive, naming the file: run it or its tests (load a page), read the result, fix or say so, then answer naming what was run.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Where it is wired</h2>
+  <ul>
+    <li><code>_unverified_mutation_note(last_tool, request, tools_run, reply)</code> &mdash; when the last-tool shape does not fire, the claim arm runs over <code>reply</code>. Finalize passes its final content, the stream drain its accumulated content; both append the note and stamp the trajectory <code>failed</code> with <code>UNVERIFIED_MUTATION_REASON</code> (a prior a late PASS may lift). The streamed project work_log now books the same turn <code>verifier:failed</code> too (it booked "completed" with the claim as the note).</li>
+    <li><code>_run_internal_turn</code> (the in-loop repair gate) &mdash; <code>unbacked_claim_directive</code> over the delivery view forces the "actually RUN it" re-entry on both verdict branches; after the repair round the post-loop note re-reads the ledger, so an <code>ls</code> in reply to the directive still lands the note.</li>
+    <li>No size or shape exemption: the operator's 2026-09-23 decision (no footer on a correct small write; targeted edits exempt) was about a write with NO claim. A reply that affirmatively says "tested" about a 400-byte <code>run.sh</code> nothing ran is a false statement at any size. A write with no claim and a trailing tool is unchanged.</li>
+  </ul>
+
+  <h2>The reader's round (r3)</h2>
+  <p>A fresh reader of the diff found the first cut over-eager in both directions, all reproduced and fixed: the detector matched mechanism prose ("This works <em>by</em> splitting…", "a regex <em>which</em> works on both") and honest reporting ("I ran the tests and 2 of 5 failed") &mdash; now `that|which` are not subjects, a mechanism preposition after "works" disqualifies, and "I ran/tested X" needs an outcome word; the ledger missed <code>python -m app</code>, <code>python -c 'import calc; …'</code>, <code>uvicorn main:app</code> and a load of the served root &mdash; now imports are read from the command, <code>-m</code> and <code>mod:app</code> targets map to <code>mod.py</code>, a root URL names <code>index.html</code>; and a collected job's banner (under the "Collected N finished job(s)" header) must still yield its exit code to <code>_exec_ok</code> (see <a href="../reliability/tool_failure.html#4ph">tool_failure</a>). One battery mutant proved equivalent (the "run before the last write" guard &mdash; a later write replaces the record) and the dead guard was removed.</p>
+
+  <h2>Residuals</h2>
+  <ul>
+    <li>Two files with the same basename in different directories share a key (a run of either backs both).</li>
+    <li>A run is identified by NAME: <code>python3 app.py</code> that imports a changed <code>util.py</code> backs <code>app.py</code> only; a suite run backs every non-web file written. A page is backed by any OK load of its basename.</li>
+    <li>The detector reads English and a little Greek; a claim phrased some other way is not caught (fail-open: a missed note, never a false one on a backed file).</li>
+  </ul>
+  <p>Pins: <code>tests/test_4ph_coding_turn_review.py</code> (detector positives/negatives, ledger shapes, both delivery paths pass the reply, the in-loop wiring, the streamed work_log backfill). Battery: <code>scripts/mutate_4ph.py</code>.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install and run it — Ghost Agent</title>
+<meta name="description" content="Install Ghost Agent: prerequisites, environment variables, first start, and how to confirm it's actually working.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a class="current" href="getting-started.html">Getting started</a>
+    <a href="installation.html">Installation</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+    <a href="glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../features/interfaces.html">Interfaces</a>
+    <a href="../features/voice.html">Voice</a>
+    <a href="../features/search.html">Search &amp; the web</a>
+    <a href="../features/darkweb.html">Dark-web search</a>
+    <a href="../features/pictures.html">Pictures</a>
+    <a href="../features/memory.html">Memory</a>
+    <a href="../features/documents.html">Documents (RAG)</a>
+    <a href="../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../features/labs.html">Labs</a>
+    <a href="../features/selfhood.html">Selfhood</a>
+    <a href="../features/performance.html">Performance</a>
+    <a href="../features/reliability.html">Reliability</a>
+    <a href="../features/personal.html">Personal services</a>
+    <a href="../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Start here</span>
+  <h1>Install and run it</h1>
+  <p class="subtitle">Four things have to be running before Ghost will start. Get those right and the rest is one command.</p>
+
+  <h2>The order matters</h2>
+  <p>Ghost is not a standalone program — it's a coordinator. It expects three other services to already exist, and it checks for them at boot. Start them in this order.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>An LLM server</h4>
+        <p>Anything that speaks the OpenAI chat API: llama.cpp's <code>llama-server</code>, vLLM, or Ollama. Ghost runs on <strong>Qwen3.8-27B</strong> (its prompts were developed on Qwen 3.6 35B-A3); a much smaller model will follow the tool-calling format badly and you'll see a lot of failed turns.</p>
+        <span class="where">Ghost connects to this via <code>--upstream-url</code>. Default: <code>http://127.0.0.1:8088</code></span>
+      </li>
+      <li>
+        <h4>Docker</h4>
+        <p>The daemon needs to be running before Ghost starts. Every piece of code the agent executes goes into a container — no Docker means the <code>execute</code>, <code>browser</code> and file tools can't work.</p>
+        <span class="where">Ghost talks to the Docker socket directly. You don't need to build anything; it pulls <code>python:3.11-slim-bookworm</code> on first use.</span>
+      </li>
+      <li>
+        <h4>Tor</h4>
+        <p>A local Tor daemon listening on <code>9050</code>. Ghost probes it at boot and <strong>refuses to start if it's unreachable</strong>. That's on purpose — see <a href="../reference/infrastructure/safety.html">Safety and privacy</a>.</p>
+        <span class="where">On macOS: <code>brew install tor &amp;&amp; brew services start tor</code></span>
+      </li>
+      <li>
+        <h4>Ghost itself</h4>
+        <p>Once the three above are up, start the agent.</p>
+      </li>
+    </ol>
+  </div>
+
+  <h2>Install</h2>
+
+  <pre class="shell">git clone &lt;your-repo&gt; Agent
+cd Agent
+
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt</pre>
+
+  <p>The first install pulls in ChromaDB, sentence-transformers and PyTorch, so it's a large download and takes a while. That's a one-time cost.</p>
+
+  <h2>Environment variables</h2>
+  <p>Four of these matter. Set them in your shell profile or a startup script — Ghost reads them at boot, not from a config file.</p>
+
+  <pre class="shell">export GHOST_HOME="$HOME/ghost"          # where everything is stored
+export GHOST_API_KEY="&lt;a long random string&gt;"
+export GHOST_MODEL="qwen3.8-27b"     # must match your LLM server's model name
+export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Variable</th><th>Default if unset</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>GHOST_HOME</code></td>
+        <td><code>~/ghost_llamacpp</code></td>
+        <td>The root of everything Ghost owns: memory, logs, the sandbox, learned skills, trajectories. Back up this one directory and you've backed up the agent.</td>
+      </tr>
+      <tr>
+        <td><code>GHOST_API_KEY</code></td>
+        <td>none</td>
+        <td>The key clients send as an <code>X-Ghost-Key</code> header. Required if you bind to anything other than localhost.</td>
+      </tr>
+      <tr>
+        <td><code>GHOST_MODEL</code></td>
+        <td><code>qwen3.8-27b</code></td>
+        <td>The model name Ghost asks the upstream server for. If this doesn't match what your LLM server serves, every request fails.</td>
+      </tr>
+      <tr>
+        <td><code>TOR_PROXY</code></td>
+        <td><code>socks5://127.0.0.1:9050</code></td>
+        <td>Where the Tor SOCKS proxy lives. The default is correct for a standard local Tor install.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note warn">
+    <strong>Not a real setting:</strong> <code>GHOST_SANDBOX_DIR</code> appears in some older instructions but nothing reads it at startup. The sandbox directory is always <code>$GHOST_HOME/sandbox</code>. Setting it has no effect.
+  </div>
+
+  <h3>What lives under GHOST_HOME</h3>
+  <dl class="kv">
+    <dt>sandbox/</dt>
+    <dd>The working directory shared with the Docker container. Files the agent creates for you land here.</dd>
+    <dt>system/memory/</dt>
+    <dd>All the memory stores — the vector database, the graph, your profile, your rules, the journal, past episodes.</dd>
+    <dt>system/ghost-agent.log</dt>
+    <dd>The durable log. The live console shows a cleaner version of the same thing.</dd>
+    <dt>system/trajectories/</dt>
+    <dd>A record of each turn. <code>introspect</code> and the failure census read it. Safe to delete; you just lose that history.</dd>
+    <dt>system/owner_rules.json</dt>
+    <dd>Your rules ("learn this rule: …"). Deleting it deletes them. See <a href="../reference/memory/owner_rules.html">Owner rules</a>.</dd>
+  </dl>
+
+  <h2>Start it</h2>
+
+  <pre class="shell">python -m src.ghost_agent.main \
+    --upstream-url "http://127.0.0.1:8088" \
+    --host 127.0.0.1 --port 8000 \
+    --verbose</pre>
+
+  <p>Boot is noisy on purpose — it prints each subsystem as it loads, so a hang tells you exactly which one is stuck. Expect it to take 30–60 seconds the first time while the embedding model loads.</p>
+
+  <div class="note">
+    <strong>Binding beyond localhost.</strong> <code>--host 0.0.0.0</code> makes Ghost reachable from your network. It will <em>refuse to start</em> in that mode unless you've either set a real <code>GHOST_API_KEY</code> or passed <code>--api-key ''</code> to knowingly turn auth off. An unset key on a public bind is indistinguishable from a mistake, so Ghost treats it as one.
+  </div>
+
+  <h2>Check that it actually works</h2>
+  <p>"It started" and "it works" are different things. Ghost can boot in a degraded state where HTTP answers fine but memory never loaded. The health endpoint is how you tell.</p>
+
+  <pre class="shell">curl -s -H "X-Ghost-Key: $GHOST_API_KEY" \
+     http://127.0.0.1:8000/api/health | python -m json.tool</pre>
+
+  <p>Three fields are worth reading every time:</p>
+
+  <dl class="kv">
+    <dt>memory_system_loaded</dt>
+    <dd>Must be <code>true</code>. If it's <code>false</code>, Ghost booted without memory — it will still answer you, but it remembers nothing and every background pass is silently disabled.</dd>
+    <dt>biological_watchdog_alive</dt>
+    <dd>Must be <code>true</code>. This is the idle scheduler (the key keeps its old name) — the background loop that runs maintenance and the other housekeeping jobs while idle. If it's <code>false</code>, that loop died and Ghost has stopped its background work. At boot it logs <code>Idle Scheduler — started; jobs: …</code> with the jobs it will run.</dd>
+    <dt>nodes</dt>
+    <dd>Which extra LLM machines are wired up, by role. An empty list for a role means that work runs on your main model instead. Not a problem — just worth knowing.</dd>
+  </dl>
+
+  <p>Then send it something:</p>
+
+  <pre class="shell">curl -s -X POST http://127.0.0.1:8000/api/chat \
+  -H "X-Ghost-Key: $GHOST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"'"$GHOST_MODEL"'","messages":[{"role":"user","content":"What is 2+2? Answer in one word."}],"stream":false}'</pre>
+
+  <p>If that returns an answer, the whole chain works: your client reached Ghost, Ghost reached the LLM server, and the reply came back.</p>
+
+  <h2>Add a face</h2>
+  <p>The HTTP API is the foundation, but nobody wants to talk to <code>curl</code> all day. The web UI is a separate process that talks to the agent you just started:</p>
+
+  <pre class="shell">python interface/server.py</pre>
+
+  <p>Slack, voice and the desktop client are also separate processes. The <a href="../features/interfaces.html">Interfaces</a> page covers all of them, including which ports they use and what each one is good for.</p>
+
+  <h2>Keeping it running</h2>
+  <p>Ghost is meant to run continuously — the maintenance passes only fire when it's been idle for a while, so an agent you start and stop never gets to do them. On macOS that means a <code>launchd</code> job; on Linux, a systemd unit.</p>
+
+  <div class="note warn">
+    <strong>If you use launchd with <code>KeepAlive</code>:</strong> a plain <code>kill</code> restarts the process (that's how you deploy a change), and only <code>launchctl bootout</code> actually stops it. Make sure <code>GHOST_HOME</code> is exported inside the job definition — a launchd process doesn't inherit your shell profile, and without it Ghost quietly starts on a brand-new empty memory at the default path.
+  </div>
+
+  <h2>If it won't start</h2>
+  <p>Most first-run failures are one of four things, and each has a distinct symptom. <a href="troubleshooting.html">When something breaks</a> walks through them.</p>
+
+  <div class="pager">
+    <a class="prev" href="../index.html">
+      <span class="dir">Previous</span>
+      <span class="to">What Ghost Agent is</span>
+    </a>
+    <a class="next" href="../features/interfaces.html">
+      <span class="dir">Next</span>
+      <span class="to">Interfaces</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>src/ghost_agent/main.py</code> on 2026-08-04. For every flag rather than the ones that matter, see <a href="../reference/interfaces/cli_reference.html">the full CLI reference</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

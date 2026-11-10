@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frontier (memory.frontier) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a class="current" href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="owner_rules.html">Owner rules</a>
+      <a href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>memory / frontier.py — FrontierTracker</h1>
+  <p class="subtitle">Per-cluster self-play telemetry: mastery, brittleness, difficulty tiers, saturation.</p>
+  <p class="note warn"><strong>Idle since 2026-10-11 (§4NM).</strong> Synthetic self-play — the pipeline that recorded runs here and chose the next cluster from them — was removed, together with the PRM-weighted <code>pick_frontier_seed</code> path (<code>core/frontier_selection.py</code>), the challenge templates whose tiers this store scaled, and the reflection phase that marked hot clusters. The idle slot that followed it replayed the owner's real failures (<code>core/failure_replay.py</code>) and did not pick clusters; that slot, and the adaptive cooldown that read this store, were removed on 2026-11-05 (§4SZ). The JSON file stays on disk with its recorded telemetry and the class is kept for reading it; nothing records a new run. The sections below are the record of the mechanism as built.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>JSON at <code>memory_dir/self_play_frontier.json</code>.</li>
+    <li>Cross-process advisory lock at <code>memory_dir/self_play_frontier.json.lock</code> via <code>fcntl</code>; falls back to threading-only on non-POSIX.</li>
+  </ul>
+
+  <h2>Schema</h2>
+  <pre><code>{
+  "runs": [{ "timestamp", "cluster_key", "challenge", "passed", "attempts_used",
+             "length", "delta", "mistake" }],
+  "clusters": {
+    "&lt;cluster_key&gt;": {
+      "runs": int,
+      "best_length": int,
+      "last_length": int,
+      "last_compression": float,
+      "mastered": bool,
+      "recent_outcomes": [last 10 runs],
+      "recent_hashes":   [last 20 challenge SHA1s],
+      "total_first_try_wins": int,
+      "unlocked_tier_index": int  // monotonic
+    }
+  }
+}</code></pre>
+
+  <h2>Constants</h2>
+  <div class="kv">
+    <dt>MAX_RUNS</dt><dd>200 (tail evict)</dd>
+    <dt>DEDUP_WINDOW</dt><dd>20 challenge hashes — used to detect duplicate challenge texts (common on deterministic templates)</dd>
+    <dt>MASTERED_STREAK</dt><dd>5 consecutive first-try wins + ≥1 run with delta &gt; 0.05 <em>or</em> best_length at the floor (see MASTERY_LENGTH_FLOOR)</dd>
+    <dt>MASTERY_LENGTH_FLOOR</dt><dd>5 — when <code>best_length</code> (a tool-invocation count; minimal solve ≈ 3-4 calls) is at/below this, the delta&gt;0.05 requirement is arithmetically unreachable and the first-try streak alone decides mastery (2026-07-27: concurrency 6/6, sql 6/6, regex_parse 5/5 were pinned unmastered forever at best_length=4)</dd>
+    <dt>BRITTLE_WINDOW</dt><dd>3 — rolling window for brittleness scoring</dd>
+    <dt>SATURATION_WINDOW</dt><dd>2 — last N runs all first-try wins with near-zero delta (lowered from 3 after a 13-cycle loop produced 0 net lessons; at 2 the cluster rotates out one clean cycle after a struggle)</dd>
+    <dt>SATURATION_DELTA_EPSILON</dt><dd>0.001</dd>
+  </div>
+  <p><strong>The compression signal is dead at the floor — measured, 2026-08-04.</strong> Over the
+  live 200-run ring there is exactly <strong>1</strong> positive <code>delta</code> (and 1 above
+  the 0.05 mastery bar); the census is 83 zeros and 116 negatives (−0.5 ×86, −1.0 ×17 — the
+  failure sentinel — plus a tail at −1.5/−2/−2.5). All <strong>8</strong> tracked clusters sit at
+  <code>best_length=4</code>. That is arithmetic, not a bug: <code>description_length</code> is a
+  tool-invocation count whose minimal viable solve is 3-4 calls, so a cluster can improve at most
+  once and never again. The floor waiver already keeps mastery reachable, but any consumer that
+  treats <code>compression_delta</code> as a live learning signal is reading a constant. Making it
+  informative means changing <em>what is measured</em> (solution token count, AST size, the
+  existing novelty score) — an operator decision, not a code cleanup.</p>
+
+  <h2>Dedup behaviour on duplicate challenges</h2>
+  <p>Deterministic templates (shop.db GROUP BY, data.csv aggregation, logs/ ERROR+WARN counting, etc.) produce byte-identical challenge text on every re-roll, so every re-roll hits <code>recent_hashes</code> as a duplicate. The dedup path splits two concerns:</p>
+  <ul>
+    <li><strong>Protect mastery counters</strong>: <code>runs</code>, <code>total_first_try_wins</code>, <code>best_length</code>, and <code>unlocked_tier_index</code> do NOT advance on a duplicate. Without this guard a deterministic template would ratchet any cluster to "mastered" in a handful of re-rolls.</li>
+    <li><strong>…and mastery itself, since 2026-08-04.</strong> The guard above protected the counters but not the <em>verdict</em>: <code>mastered</code> is decided from the last <code>MASTERED_STREAK</code> entries of <code>recent_outcomes</code>, which duplicates necessarily join (saturation reads the same ring) — so a re-rolled challenge counted toward mastery through the back door. Measured on the live frontier file: <code>data_analysis</code> was stored <code>mastered</code> on a 5-run window containing 2 duplicates, and <code>regex_parse</code> had <strong>10 of 10</strong> recent outcomes flagged duplicate — one real run away from mastering on a streak of pure re-rolls. The streak now filters <code>duplicate=True</code> entries out. This cannot re-create the "pinned unmastered and re-picked forever" pathology the floor waiver fixed: duplicates carry <code>passed=True, delta=0.0</code>, so they keep <code>_cluster_is_saturated</code> true and <code>pick_seed</code> skips the cluster regardless of mastery.</li>
+    <li><strong>Preserve saturation signal</strong>: the outcome IS still appended to <code>recent_outcomes</code> (tagged <code>duplicate=True</code>, <code>delta=0.0</code>) and state IS persisted. This is what lets <code>_cluster_is_saturated</code> and the brittle-pool decay guard observe that the agent is now acing a template it previously struggled on.</li>
+  </ul>
+  <p>The earlier implementation returned early on dedup without any state update. For deterministic templates the hash is stable across every re-roll, so a single struggled-then-won run would fossilise the cluster's <code>recent_outcomes[-1]</code> forever — no amount of subsequent clean wins could rotate the cluster out of the brittle pool. Incident 2026-04-21 11:56: 5 consecutive sql cycles all targeted the same template because the 09:06 DD struggled-then-won entry was pinned as the most-recent outcome.</p>
+
+  <h2>Generation-time diversity window (2026-07-18)</h2>
+  <p>The hash dedup above only refuses to <em>record</em> a byte-identical prompt — it cannot see a reworded near-duplicate, and it acts after the cycle already ran. State key <code>recent_challenges</code> now holds the head text (<code>RECENT_CHALLENGE_HEAD</code>&nbsp;=&nbsp;600 chars) of the last <code>RECENT_CHALLENGE_KEEP</code>&nbsp;=&nbsp;12 accepted LLM-generated challenges (templates excluded — they rotate by design and must not be crowded out of their own themes).</p>
+  <ul>
+    <li><code>note_generated_challenge(text)</code> — append at generation-accept time, independent of whether the run later records (an infra-aborted cycle still consumed the theme).</li>
+    <li><code>recent_generated_challenges(limit)</code> — newest-last heads, injected into the generation prompt as negative examples. Since 2026-07-29 the dreamer compresses each head into a <code>filename — gist</code> fingerprint before injection (quoting full same-skeleton openers pattern-reinforced the shape it was banning — see <a href="dream.html">dream</a>).</li>
+    <li><code>most_similar_recent_challenge(text) → (sim, head)</code> — token-set <em>containment</em> (|A∩B| / min|A|,|B| — robust to padded rewordings where Jaccard under-scores) plus <code>RECENT_CHALLENGE_FILE_BONUS</code>&nbsp;=&nbsp;0.25 when both texts name the same mock data file (the strongest repeat tell: the mode-collapsed generator reuses <code>transaction_log.csv</code> even when it rewords everything else). The dreamer rejects at ≥&nbsp;0.60. Measured: reworded fraud-scan pair → 0.66&nbsp;+&nbsp;bonus&nbsp;=&nbsp;0.91; different theme → 0.24.</li>
+  </ul>
+  <div class="note"><strong>Why:</strong> 4 of 6 LLM-generated challenges in the 2026-07-17 overnight run were the same <code>transaction_log.csv</code> fraud scan — each accepted, solved on attempt 1, recorded; zero new signal. Tests: <code>tests/test_frontier_diversity_guard.py</code>.</div>
+
+  <h2>Saturation detection</h2>
+  <p>A cluster is <strong>saturated</strong> when <code>_cluster_is_saturated(stats)</code> returns True: its last <code>SATURATION_WINDOW</code> runs are all first-try passes with delta &le; <code>SATURATION_DELTA_EPSILON</code>. Semantics: the template bank has no new learning signal for this cluster — continuing to target it burns cycles on material the agent already aces.</p>
+  <p>Saturated clusters are filtered out of <code>_get_brittle_clusters_scored</code> so the brittleness lottery never re-picks them. <code>pick_seed</code> handles the "everything saturated" case by returning <code>mode="exploration"</code> with a <code>saturated_clusters</code> list attached for the caller:</p>
+  <pre><code>{"mode": "exploration", "cluster_key": None, "saturated_clusters": [...], "hint": "..."}</code></pre>
+  <p>The caller (the dream loop) reads this and chooses a saturation-aware source: bumped journal probability, or a 20/80 coin-flip between <code>pick_random_template(exclude_clusters=saturated)</code> and LLM-gen (the majority path now falls through to LLM-gen for genuinely novel material instead of rotating to yet another deterministic template).</p>
+
+  <h2>Brittleness scoring</h2>
+  <pre><code>brittleness = failures · 2  +  hard_wins(≥3 attempts) · 2  +  soft_wins(2 attempts) · 1</code></pre>
+  <p>Saturated clusters are excluded from this score regardless of where they'd otherwise rank.</p>
+  <p><strong>Recent-win decay guard</strong>: if the <em>most recent</em> run in the brittleness window is a clean first-try pass with delta &le; <code>SATURATION_DELTA_EPSILON</code>, the cluster is excluded from the brittle pool even if older struggled-then-won runs in the window would otherwise score it. This prevents a single attempts=2 outlier from anchoring a cluster as "brittle" for the next 10+ cycles of clean wins — the pathology that caused a single hard-won sql challenge to keep pulling sql back into the frontier for the rest of a loop.</p>
+
+  <h2>Tier unlocks <span class="tag">removed 2026-10-11 (§4NM)</span></h2>
+  <p><code>unlocked_tier_index</code> only moves upward — once unlocked, a tier is sticky even after a regression. Tiers: <code>basic</code>, <code>intermediate</code>, <code>advanced</code>, <code>expert</code>. Each unlock costs <code>TIER_UNLOCK_THRESHOLD = 3</code> cumulative first-try wins.</p>
+  <p>Tier drives <strong>two</strong> things in the self-play loop:</p>
+  <ol>
+    <li><strong>LLM prompt hint.</strong> <code>get_difficulty_hint(cluster)</code> returns a one-liner from <code>DIFFICULTY_HINTS</code> describing the tier's complexity floor. The dream loop injects this into the challenge-generation prompt when the LLM path is used.</li>
+    <li><strong>Deterministic template scaling.</strong> <code>get_difficulty_tier(cluster)</code> is piped into <code>try_template</code> / <code>pick_random_template</code> (challenge templates, removed) as a resolver, and each template scales its problem size (1× / 2× / 3× / 4×) and activates its hard-mode twist (NA rows, malformed lines, stopwords, NULL columns, extra log levels, expert concurrency variants) when tier is <code>advanced</code> or <code>expert</code>.</li>
+  </ol>
+  <p>Before this wiring, the tier was purely cosmetic: the template bank always rendered at basic and the agent 1-shot every cluster in production. Tier is now the mechanism that turns a first-try win at basic into a harder challenge at the next cycle, so a cluster can accumulate real mastery signal rather than saturating on a fixed shape.</p>
+
+  <h2>Frontier-aware cluster selection (PRM-weighted) <span class="tag">removed 2026-10-11 (§4NM)</span></h2>
+  <p>Brittleness scoring sees outcomes but not <em>coverage</em>: a cluster the agent has barely tried looks identical to a cluster it solves first-try, because both have no recent failures. <code>pick_frontier_seed</code> is the extension that splits these by combining two complementary signals computed in the pure-function layer at <code>core/frontier_selection.py</code> (removed with the PRM):</p>
+  <ul>
+    <li><strong>PRM uncertainty</strong> — <code>PRMScorer.uncertainty(state, action)</code> as <code>1 − 2·|p − 0.5|</code>. A representative <code>PlanState</code> per cluster (<code>"solve a {cluster} challenge"</code>) is scored; clusters where the PRM has no opinion (untrained, or genuinely at the decision boundary) score near 1.0.</li>
+    <li><strong>Trajectory rarity</strong> — <code>1 / (1 + log1p(count))</code> over <code>Trajectory.cluster</code> groupings from <code>TrajectoryCollector.iter_trajectories()</code>. Smooth, bounded in (0, 1]; well-explored clusters decay slowly so a high-uncertainty veteran cluster can still be picked.</li>
+  </ul>
+  <p>The two are <strong>multiplied</strong>: a cluster needs both "we don't know much about it" AND "we don't have many examples" to win. Saturated clusters (per <code>list_saturated_clusters()</code>) are excluded with weight 0. <code>pick_weighted</code> samples in proportion.</p>
+  <p>Three transparent fallbacks restore the legacy <code>pick_seed</code> behaviour without behavioural drift:</p>
+  <ol>
+    <li><strong>Empty signals</strong> — caller passed no uncertainty / no rarity (PRM untrained AND trajectory store empty). Preserves existing behaviour at cold-boot.</li>
+    <li><strong>Uniform-sample sanity floor</strong> — with probability <code>uniform_sample_prob</code> (default 0.2, exposed as <code>--frontier-uniform-sample-prob</code>), the picker bypasses frontier weighting and calls <code>pick_seed</code> directly. The PRM is itself learned from trajectories the self-play loop produces; without this floor a cold bias could self-reinforce onto a single cluster.</li>
+    <li><strong>All weights zero</strong> — every non-saturated cluster has one signal at 0 (e.g., NaN crept in, or every candidate was excluded). Falls back rather than picking nothing.</li>
+  </ol>
+  <p>Returned dict mirrors <code>pick_seed</code>'s shape so call sites need no schema branching, plus extra fields for inspection:</p>
+  <pre><code>{
+  "mode": "frontier_weighted",
+  "cluster_key": "...",
+  "difficulty_tier": "...",
+  "saturated_clusters": [...],
+  "weight": float,          # combined uncertainty × rarity
+  "uncertainty": float,
+  "rarity": float,
+  "hint": "FRONTIER TARGET (PRM-weighted): ..."
+}</code></pre>
+  <p>The hint string always begins with <code>FRONTIER TARGET (PRM-weighted)</code> so logs can distinguish it from the brittle-pool path. Fallback seeds carry an extra <code>frontier_fallback</code> key (<code>"uniform_sample"</code> or <code>"no_positive_weight"</code>) for log attribution.</p>
+  <p>Gate conditions in <a href="dream.html"><code>Dreamer.synthetic_self_play</code></a> use <code>isinstance()</code> rather than truthiness because MagicMock-backed test contexts return Mocks for any attribute access — type-checks fail closed for both <code>ctx.prm_scorer</code> and <code>ctx.trajectory_collector</code>.</p>
+
+  <h2>Methods</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>get_cluster_stats(key)</code></td><td>Stats blob.</td></tr>
+      <tr><td><code>get_brittle_clusters(limit)</code></td><td>Top brittle clusters by score (saturated clusters filtered out).</td></tr>
+      <tr><td><code>get_difficulty_tier(key)</code></td><td><code>basic</code> / <code>intermediate</code> / <code>advanced</code> / <code>expert</code>.</td></tr>
+      <tr><td><code>get_difficulty_hint(key)</code></td><td>Tier-specific prompt hint.</td></tr>
+      <tr><td><code>_cluster_is_saturated(stats) → bool</code> (classmethod)</td><td>Check if last N runs are all trivial first-try wins.</td></tr>
+      <tr><td><code>list_saturated_clusters() → list</code></td><td>All currently-saturated cluster keys.</td></tr>
+      <tr><td><code>pick_seed(random_explore_prob=0.2)</code></td><td>Choose next cluster + hint for self-play (brittle-pool path). Returns exploration mode with <code>saturated_clusters</code> when all brittle candidates are saturated. Callers typically pass <code>random_explore_prob=0.35</code> (dream loop default) so even non-saturated picks get breathing room.</td></tr>
+      <tr><td><code>pick_frontier_seed(uncertainty_by_cluster, rarity_by_cluster, uniform_sample_prob=0.2, random_explore_prob=0.35)</code></td><td>Frontier-weighted alternative. Combines PRM uncertainty + trajectory rarity, excludes saturated clusters, falls back to <code>pick_seed</code> on empty signals / sanity-sample roll / all-zero weights. Returns the same dict shape as <code>pick_seed</code> with <code>mode="frontier_weighted"</code>.</td></tr>
+      <tr><td><code>record_run(cluster_key, challenge, attempts_used, passed, description_length, mistake) → dict</code></td><td>Log a run; returns <code>{compression_delta, mastered, is_new_cluster, …}</code>.</td></tr>
+      <tr><td><code>adaptive_cooldown(base, floor, ceiling, cluster_key)</code></td><td>Cooldown seconds based on recent progress. Used by both the idle scheduler (minutes–hours) and <code>self_play_loop</code> (5–180 s clamped).</td></tr>
+      <tr><td><code>cluster_run_weights(candidates) → dict</code></td><td>2026-07-27: inverse-frequency weights <code>1/(1+runs)</code> per candidate cluster (unseen = top weight 1.0). Passed by the dream loop into <code>pick_random_template(cluster_weights=…)</code> so template draws favour under-practiced clusters.</td></tr>
+      <tr><td><code>least_practiced_clusters(limit=3, extra_candidates=None) → list</code></td><td>2026-07-27: <code>[(cluster, runs)]</code> ascending over tracked ∪ extra candidates, mastered clusters excluded. Feeds the LLM generator's COVERAGE TARGET prompt block.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Curriculum-balance fixes (2026-07-27 log eval)</h2>
+  <p>The overnight eval found 82% of 154 recorded runs in the two most-practiced clusters
+  (data_analysis 66, python_general 61) while web_automation had 1 lifetime run — and the
+  mastery gate structurally unable to fire once <code>best_length</code> reached the
+  tool-invocation floor (delta &gt; 0.05 unreachable at best=4, so concurrency 6/6 first-try,
+  sql 6/6, regex_parse 5/5 were re-served forever). Three changes: the
+  <strong>MASTERY_LENGTH_FLOOR waiver</strong> (streak alone decides at the floor), the
+  <strong>inverse-run-count weights</strong> for random template draws, and the
+  <strong>COVERAGE TARGET</strong> generation-prompt steer (only when the seed doesn't pin a
+  cluster — a frontier/reflection hint always wins).
+  Tests: <code>tests/test_selfplay_curriculum_2026_07_27.py</code>.</p>
+
+  <h2>Reflection-driven curriculum targeting <span class="tag">removed 2026-10-11 (§4NM)</span></h2>
+  <p>New methods <code>note_reflection_failure(cluster_key, diagnosis)</code> and <code>get_reflection_hot_clusters(limit, within_days)</code>. Reflection biological phase 2.5 now records which cluster each reflected interactive-turn failure belongs to (stored under <code>clusters[key].reflection_failures</code>, bounded at 20 per cluster).</p>
+  <p><code>pick_seed</code> gained a <code>reflection_priority_prob</code> parameter (default 0.35): with that probability it drills a reflection-hot cluster instead of a self-play-brittle one. This closes the loop so self-play practices the topics the agent fails at in REAL user turns, not only the topics it fails at in self-play.</p>
+  <div class="note"><strong>Tests:</strong> covered by <code>tests/test_frontier_reflection_targeting.py</code>.</div>
+
+  <h2>Cluster schema back-fill (2026-07-08)</h2>
+  <p>A cluster entry can be <em>created</em> by a writer with a partial shape — <code>note_reflection_failure</code> used to record into a bare <code>{}</code> — and older persisted files predate newer keys. <code>record_run</code>'s full-defaults <code>setdefault</code> silently no-ops on such an existing dict, so its direct reads (<code>cluster["runs"]</code>) raised <code>KeyError('runs')</code> and <strong>no run was ever recorded for that cluster</strong> (observed live: <code>python_general</code> existed with only <code>reflection_failures</code>, and every self-play run on it logged <code>Frontier record_run failed: 'runs'</code>). All cluster access now goes through <code>_ensure_cluster</code> — <code>setdefault</code> plus per-key back-fill from <code>_cluster_defaults()</code> — which normalizes partial/legacy entries in place while preserving extra keys like <code>reflection_failures</code>. No data migration needed; the state file heals on next write.</p>
+  <div class="note"><strong>Tests:</strong> <code>tests/test_frontier_tracker.py::TestPartialClusterSchemaBackfill</code> (reflection-created cluster, exact legacy on-disk shape, full-schema creation).</div>
+
+  <h2>Tests</h2>
+  <p>Frontier-tracker invariants are pinned by <code>tests/test_frontier_tracker.py</code>; the new frontier-weighted picker is covered by <code>tests/test_frontier_pick_frontier_seed.py</code> (fallback ladder + dict-shape contract) and the dream integration by <code>tests/test_dream_frontier_weighted.py</code> (real PRM + real <code>TrajectoryCollector</code>, mocked LLM/sandbox).</p>
+
+  <h3 id="4gj">The store the §4M fsync sweep missed <span class="tag">2026-09-13 &sect;4GJ</span></h3>
+  <p><code>_save</code> wrote the temp file and renamed it with no flush or fsync, while every sibling store (skills, competence, the contradiction log — removed §4NN — journal, the auto-skill store) carries the §4M "fsync before rename" comment. A power loss after the rename publishes a zero-length <code>frontier_state.json</code>, <code>_load</code> quarantines it as corrupt, and self-play restarts with empty cluster mastery and tier history. It now flushes and fsyncs before the rename, and uses a PID-unique temp name (the §4BW fixed-temp-name fix had missed this file too). Pins: <code>tests/test_memory_store_reconcile_4gj.py</code>.</p>
+  <footer><a href="../../index.html">← Back to index</a></footer>
+
+  <h2 id="run-provenance">Runs record which template produced them <span class="tag">2026-08-11</span></h2>
+  <p>
+    A frontier run stored only the cluster it was <em>filed under</em>, never the template that
+    produced it. So when attribution turned out to be <b>51% wrong</b>, working out what belonged
+    where required re-rendering the entire template bank at four tiers and matching challenge hashes
+    — forensics, because the record did not say. <code>runs[]</code> now carries
+    <code>template_key</code>, and an <b>empty</b> value is itself information: the challenge had no
+    template (LLM-generated or journal-mined), which is the distinction the cluster field
+    structurally cannot carry.
+  </p>
+</main>
+</body>
+</html>

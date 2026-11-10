@@ -4,7 +4,7 @@
 (2026-08-17) found this path had ZERO automated coverage while carrying the
 retry budget, the stale-reqId clear, the double-tap latch and the
 re-find-live-node logic — all documented in
-docs/interfaces/web_server.html and asserted nowhere. Two mutations proved
+docs/reference/interfaces/web_server.html and asserted nowhere. Two mutations proved
 it: deleting the retry entirely, and sending `source:'api'` instead of
 `'web'` (which would make every web label indistinguishable from a script's
 in the corpus), both survived the whole suite.

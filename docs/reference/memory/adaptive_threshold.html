@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adaptive recall threshold (memory.adaptive_threshold) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a class="current" href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="owner_rules.html">Owner rules</a>
+      <a href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>memory / adaptive_threshold.py — AdaptiveThreshold</h1>
+  <p class="subtitle">Self-tuning recall acceptance threshold. Trades precision for recall based on observed usefulness. <strong>Not built in production:</strong> since &sect;4LF (2026-10-04) it exists only with <code>GHOST_ADAPTIVE_THRESHOLD=1</code>, which the launcher does not set; recall runs on the fixed <code>--smart-memory 0.9</code>.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>JSON at <code>memory_dir/adaptive_threshold.json</code>.</li>
+    <li>Atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</li>
+  </ul>
+
+  <h2>Load hardening (2026-07-22)</h2>
+  <p><code>_load()</code> distinguishes three outcomes rather than the old <code>except Exception: pass</code> that silently started from the initial threshold and let the very next <code>record()</code> atomically overwrite the intact file — the whole learned window gone, at no log level:</p>
+  <ul>
+    <li><strong>absent</strong> → keep the seeded initial threshold (normal cold start);</li>
+    <li><strong>corrupt</strong> (bad JSON / wrong type / non-list window / undecodable bytes) → move the raw bytes to a timestamped <code>adaptive_threshold.corrupt-*.json</code> sidecar, <code>WARNING</code>, restart from the initial threshold;</li>
+    <li><strong>present-but-unreadable</strong> (<code>OSError</code> — EIO / EACCES) → run on the initial threshold but set <code>_degraded</code> (logged at <code>ERROR</code>); while set, <code>_save()</code> REFUSES to write over the on-disk state.</li>
+  </ul>
+  <p>Tests: <code>tests/test_memory_store_durability.py</code>.</p>
+
+  <h2>State</h2>
+  <pre><code>{ "threshold": float, "window": [(score, was_useful), ...] }   # window cap = 100</code></pre>
+  <p><code>WINDOW_SIZE = 100</code> · <code>MIN_OBSERVATIONS = 20</code> before recalculation kicks in.</p>
+
+  <h2>API</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(memory_dir, initial=0.7)</code></td><td>Seed threshold (overridden by <code>--smart-memory</code> CLI flag).</td></tr>
+      <tr><td><code>record(score, was_useful, effective_threshold=None)</code></td><td>Record observation, recalculate threshold.</td></tr>
+      <tr><td><code>get_threshold() -&gt; float</code></td><td>Current threshold.</td></tr>
+      <tr><td><code>get_stats() -&gt; dict</code></td><td>Diagnostics: observations, useful_rate, etc.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Recalculation rule</h2>
+  <p>The threshold is set to <strong>90 % of the minimum useful score</strong>, but never below the median of useless scores. It rises at most 0.02 per update (<code>MAX_STEP_UP</code>); falls are instant. With no useful observation, or 20 useless ones in a row (<code>STARVATION_RUN</code>), it decays ×0.98 per update. Floor 0.3, ceiling 0.95.</p>
+
+  <h2>Known limitation — the learned threshold is dead weight under <code>--smart-memory 0.9</code></h2>
+  <p>The 2026-07-22 durability pass did <strong>not</strong> change the retention numbers — this is a documented caveat, not a change. Under the live flag the learned value is effectively inert: the consumer takes <code>max(cli_selectivity, learned)</code>, so with <code>--smart-memory 0.9</code> the effective bar is already &gt;= 0.9; the learned value can never exceed 0.9 (the upward candidate is <code>min(useful_scores) * 0.9 &lt;= 0.9</code>) and its update rule can only ratchet DOWN toward the 0.3 floor when the window starves — so it can neither raise nor lower the bar. Compounding it, <code>was_useful</code> is self-referential as wired in <code>core.agent</code>: the signal fed back is "the score cleared the bar", not "the memory was later retrieved and helped", so the loop measures its own gate rather than utility. The class becomes load-bearing again only for a selectivity below ~0.9. Changing the arithmetic alters what the agent remembers, so it is a retention decision that was deliberately kept out of a persistence fix.</p>
+  <p><strong>Not the same axis as the 2026-07-24 outcome loop.</strong> The <a href="../index.html">outcome-gated learning loop</a> supplies exactly the "the memory was later retrieved and <em>helped or hurt</em>" signal this <code>was_useful</code> feedback lacks — but it applies it on the <em>retrieval/utility</em> axis (per-lesson <code>succeeded/failed_retrievals</code> → <code>compute_lesson_utility</code> → prune), NOT to this <em>write-admission</em> threshold. The two are deliberately separate: this class gates what enters smart-memory (a retention decision), and was left untouched. Wiring the real outcome signal into <em>this</em> gate remains a possible follow-up but is an operator-visible retention change, not part of the 2026-07-24 work.</p>
+
+  <h2>Concurrency</h2>
+  <p><code>threading.RLock</code> guards both reads and writes. Writes are atomic via temp file.</p>
+
+
+
+  <h2>…and the way back <span class="tag">2026-09-09 &sect;4FP</span></h2>
+  <p>The guard above is right and the audit kept it. What was missing is the DISARM. <code>_degraded</code>
+  was cleared only in <code>__init__</code>, so one transient <code>OSError</code> &mdash; an EIO, an EACCES
+  during a deploy, an <code>ENFILE</code>/<code>EMFILE</code> when the box runs out of descriptors &mdash;
+  stopped this store writing for the <em>life of the process</em>, which for this agent is days, announced by
+  a single log line. The sibling stores <code>contradiction_log</code> (removed in §4NN) and <code>profile</code> re-read on
+  every operation and clear the flag by themselves; their comments cite each other as sharing one discipline,
+  and two of the four had quietly drifted out of it.</p>
+  <p>The policy now lives in <a href="failclosed.html"><code>memory/failclosed.py</code></a>: retry the read
+  that armed it (rate-limited, and the clock starts EXPIRED so a blip lasting one write costs one write),
+  clear the flag only when a read actually SUCCEEDS, and merge whatever accumulated while blind onto the
+  history it could not see &mdash; history first, then the blind observations, which is just chronological
+  order. A failed retry restores the in-memory state exactly and stays closed. Pins:
+  <code>tests/test_failclosed_recovery.py</code>; battery 18/18.</p>
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><code>record()</code> takes <code>effective_threshold</code> — the bar acceptance ACTUALLY gated on (<code>max(cli, learned)</code>). <code>cleared_bar</code> was computed against the learned value alone, so under the live CLI 0.9 / learned ≈0.6 split, scores in (0.6, 0.9) were score-rejects mislabelled "cleared the bar" and excluded from the median-useless clamp — blinding it to exactly the band that should raise the bar once the CLI value is lowered. Saves fsync before rename. Tests: <code>::TestAdaptiveThresholdEffectiveBar</code>.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

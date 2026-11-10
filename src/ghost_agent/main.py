@@ -379,7 +379,7 @@ def parse_args():
     # logged (`metacog valid`) and counted in the shutdown `metacog summary`.
     # The validators themselves always run. (§4PJ removed the confidence
     # score and arbiter; §4PT host telemetry and the replan bridge.) See
-    # docs/algorithms/metacognition.html.
+    # docs/reference/reliability/metacognition.html.
     parser.add_argument("--enable-metacog", action="store_true", help="Log and count pre-execution validator blocks (shell); the validators run either way.")
     # §4PT: host telemetry was removed. Its flags are still ACCEPTED (and
     # ignored) so a launcher that passes them keeps starting.

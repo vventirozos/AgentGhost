@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request scope (core.request_scope) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <div class="subnav">
+      <a href="agent.html">The agent core (core.agent)</a>
+      <a href="architecture.html">System Architecture</a>
+      <a href="bus.html">Event bus (core.bus)</a>
+      <a href="how_it_works.html">One message, end to end</a>
+      <a href="isolation.html">Isolation (core.isolation)</a>
+      <a href="mandatory_tor.html">Mandatory Tor (fail-closed egress)</a>
+      <a href="prompts.html">Prompts (core.prompts)</a>
+      <a href="request_lifecycle.html">Request lifecycle</a>
+      <a class="current" href="request_scope.html">Request scope (core.request_scope)</a>
+      <a href="safety.html">Safety and privacy</a>
+      <a href="tool_registry.html">Tool registry (tools.registry)</a>
+    </div>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / request_scope.py — the request's project and conversation</h1>
+  <p class="subtitle">&sect;4SX B0 (2026-11-04). The project and conversation a request works in are a value carried in a ContextVar, not shared state on the agent's context. The model of conversation focus is described in <a href="../projects/projects_tool.html#4sx-b0">projects &rarr; conversation focus</a>.</p>
+
+  <h2>What is in it</h2>
+  <ul>
+    <li><code>RequestScope(conversation_key, project_id, origin, persist, context)</code>. It is mutable on purpose. A switch that runs in a child or gathered task must change the request's project, and a child task's <code>ContextVar.set</code> would not reach its parent.</li>
+    <li><code>install(scope)</code> / <code>reset(token)</code> / <code>current_scope(context=None)</code>. With <code>context</code>, a scope is returned only when it was built for that very object.</li>
+    <li><code>conversation_key_for_session(session_id)</code> returns <code>session:&lt;id&gt;</code>, keeps a Slack <code>slack:&lt;…&gt;</code> id as-is, and returns <code>""</code> when there is none.</li>
+    <li>Origins: <code>owner</code>, <code>member</code>, <code>probe</code>, <code>unattended</code>, <code>leaf</code> (the constants <code>ORIGIN_OWNER</code>, <code>ORIGIN_MEMBER</code>, <code>ORIGIN_PROBE</code>, <code>ORIGIN_UNATTENDED</code>, <code>ORIGIN_LEAF</code>). The sixth origin, <code>replay</code> (<code>ORIGIN_REPLAY</code>), was removed on 2026-11-05 (§4SZ) with the failure replay that used it.</li>
+  </ul>
+
+  <h2>How it is used</h2>
+  <ul>
+    <li><code>GhostContext.current_project_id</code> and <code>conversation_key</code> are properties. Inside a request they read and write that context's scope. Outside one (idle loops, startup), or for a context the scope was not built for, they are the object's own value. <code>copy.copy(context)</code> keeps the values in force at copy time as the copy's own.</li>
+    <li><code>GhostAgent._build_request_scope</code> builds the scope at <code>handle_chat</code> start, right after the origin contextvar. A passed scope (a leaf's) wins. Otherwise it picks, in order: member; probe; unattended (<code>sched-</code>/<code>sub-</code>/<code>job-</code>, or any population other than <code>user</code>); owner. Only the owner with a session id gets <code>persist=True</code>. Without a session id, the key is the first-message hash, which still pairs previews and late corrections. Until 2026-11-05 a <em>replay</em> origin sat between member and probe, for the failure-replay and regression-test requests (ids <code>probe-fr-…</code>, <code>probe-rt-…</code>). Those requests no longer exist (§4SZ), and the constant <code>ORIGIN_REPLAY</code> was removed with them. <code>tools/labs.py</code> and <code>tools/projects.py</code> no longer have a "replay" branch either; a member is still refused there.</li>
+    <li><code>tools.projects.begin_request_focus</code> runs inside the turn lock. A persisting scope reads its conversation's focus row, and the shared scratchpad follows the request's project.</li>
+    <li><code>tools.projects._set_current</code> writes the row (switch/create/resume) or clears it (exit), and only for a persisting scope.</li>
+    <li>The streamed drain runs after <code>handle_chat</code>'s finally. It captures the scope and re-installs it, like the other request contextvars.</li>
+  </ul>
+  <p>Pins: <code>tests/test_project_conversation_scope.py</code>.</p>
+</main>
+</body>
+</html>

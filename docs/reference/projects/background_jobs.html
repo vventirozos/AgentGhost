@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Background jobs — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a class="current" href="background_jobs.html">Background jobs</a>
+      <a href="cross_project_map.html">Cross-project map</a>
+      <a href="long_tasks.html">Long tasks</a>
+      <a href="planning.html">Planning (core.planning)</a>
+      <a href="project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a href="project_research.html">Project research (core.project_research)</a>
+      <a href="project_safety.html">Project safety (core.project_safety)</a>
+      <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="projects_routes.html">Projects API (api.projects_routes)</a>
+      <a href="projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="task_close.html">Closing tasks (core.task_close)</a>
+      <a href="task_kind.html">Task kinds (core.task_kind)</a>
+      <a href="task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>Background jobs</h1>
+  <p class="subtitle">core/jobs.py · tools/delegate.py (the <code>jobs</code> tool). The page keeps its old
+  file name so existing links still work.</p>
+  <p class="warn"><strong>Removed 2026-10-30 (&sect;4SI).</strong> The <code>delegate</code> tool
+  (tool-using sub-agents, core/subagent.py) and <code>delegate_to_swarm</code> (tools/swarm.py and the
+  LLM swarm pool) were removed: the operator no longer needed the swarm. tools/delegate.py now holds only
+  the <code>jobs</code> tool. The <code>save_as</code> data-flow that used to be described here belonged to
+  <a href="../index.html">composed_skills</a>, removed on 2026-11-05 (&sect;4TA).</p>
+  <p class="warn"><strong>&sect;4SX D5 (2026-11-05).</strong> <code>jobs</code> is no longer advertised: it is an alias of the
+  <a href="../coding/runs.html"><code>run</code></a> tool. Its replies (below) now name <code>run</code>
+  (<code>run status</code>, <code>run collect name=&lt;job id&gt;</code>, <code>run stop name=&lt;job id&gt;</code>). The registry
+  described here is unchanged.</p>
+
+  <h2>The job registry (<code>jobs</code>)</h2>
+  <p><code>core.jobs.JobRegistry</code> is the status surface every
+  fire-and-forget mechanism was missing. A promoted sandbox command (below)
+  registers into it (so did <code>delegate</code> and <code>delegate_to_swarm</code> until
+  &sect;4SI), and the <code>jobs</code> tool reports every job together: <code>status</code> (running + recently finished),
+  <code>collect</code> (a finished job's full result — or every unread result),
+  <code>cancel</code>. In-memory by design: jobs are per-process (their asyncio
+  tasks die with the process), so persisting them would only resurrect zombies.
+  Completed jobs are retained (bounded at 50, FIFO-evicted, running jobs never
+  evicted) so a later turn can still collect a result the model never read.
+  Tasks are spawned via <code>spawn_bg</code> — the codebase's one
+  fire-and-forget primitive (strong ref + contextvar propagation + exception
+  logging), never a bare <code>create_task</code>.</p>
+  <p class="warn"><strong>Sandbox jobs join the surface <span class="tag">2026-08-11</span>.</strong>
+  An <code>execute</code> command still working after 90&nbsp;s is detached
+  rather than left blocking the turn
+  (<a href="../coding/jobs.html">sandbox.jobs</a>) and appears here as kind
+  <code>sandbox</code>. When it lands, the reaper WAKES the model with its
+  result through the same internal-turn path scheduled tasks use, so the
+  work continues without the operator; this surface is for asking about it in
+  between. It breaks one assumption of the
+  registry above: the process lives in the CONTAINER, not this Python process,
+  so its row carries no asyncio task and nothing in-process can land it.
+  <code>_sync_sandbox_jobs</code> therefore reconciles against the supervisor
+  before every <code>jobs</code> answer — landing a finished job's exit code and
+  output tail, enforcing the lifetime cap via <code>reap()</code>, and ADOPTING a
+  job promoted before this process started (a promoted job survives an agent
+  restart; without adoption it would run and be reaped with nothing able to
+  report it). <code>cancel</code> on such a row kills the real process group
+  FIRST and only marks the row when the supervisor reports a VERIFIED kill —
+  a boolean, not a message prefix: "already done — nothing to cancel" carries
+  no <code>Error:</code> and was being read as a successful kill, overwriting
+  a completed job's result with CANCELLED. Cancelling the row alone
+  would leave precisely the invisible orphan the subsystem exists to prevent.
+  A row whose supervisor record has vanished is failed loudly rather than left
+  hanging RUNNING for ever, and a FAILED job still hands back its output — a
+  build that broke at minute 12 collecting as a bare "exited 1" leaves the
+  model nothing to act on but the command it was just told not to re-run. The
+  supervisor's log is deliberately NOT deleted at landing: this sync runs on
+  every <code>jobs</code> call, so forgetting there destroyed the full output
+  before anyone could read it. Test:
+  <code>tests/test_jobs_tool_sandbox.py</code>.</p>
+
+  <p class="warn"><strong>Collect read-marking <span class="tag">2026-07-22</span>.</strong>
+  <code>jobs(action='collect')</code> with no <code>job_id</code> (the "collect all"
+  case) previously re-dumped <em>every</em> retained finished job — up to 50 ×
+  8000 chars ≈ 400&nbsp;KB — back into context on every call, and the status text
+  steered the model to keep doing exactly that (a real context-pressure hazard).
+  <code>Job</code> gained a <code>collected</code> flag: a no-id collect now returns
+  only un-collected finished jobs and marks them collected via
+  <code>JobRegistry.mark_collected</code>; a repeat says "no NEW results" with a
+  by-id re-fetch hint. An explicit <code>collect(job_id=…)</code> still returns
+  that job's result <em>unconditionally</em> (explicit re-fetch is never hidden).
+  Test: <code>test_jobs_collect_readmark.py</code>.</p>
+  <p>History: <code>Job.result_resolver</code> was added (2026-07-14 bug hunt) so a swarm job, whose worker
+  returned a bool while its output landed in the scratchpad, collected its real content. The swarm is gone
+  (&sect;4SI); the optional hook stays on <code>Job</code>.</p>
+
+<h2 id="4ns">§4NS — background jobs <span class="tag">2026-10-12</span></h2>
+<ul>
+  <li><strong>Results</strong> over 8,000 characters say they were cut; every alias of collect (<code>get</code>, <code>fetch</code>)
+  marks the output untrusted; a restart-lost result is named as such.</li>
+  <li><strong>Ownership:</strong> a turn that is not the owner's (probe, scheduled run, job wake) sees, collects
+  and cancels only the jobs IT started (<code>started_by</code> on every job).</li>
+  <li>The sub-agent fixes made in &sect;4NS (FAILED on unfinished turns, own execute folder, no command
+  promotion, polling hint) went with <code>delegate</code> in &sect;4SI.</li>
+</ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_jobs_tool_sandbox.py</code>, <code>tests/test_jobs_collect_readmark.py</code>, and the registry part of <code>tests/test_delegation_and_dataflow.py</code>.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Probe transcripts (core.probe_transcripts) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <div class="subnav">
+      <a href="acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a href="code_claims.html">Code claims (core.code_claims)</a>
+      <a href="coding_executor.html">Coding executor (core.coding_executor)</a>
+      <a href="coding_loop.html">Coding loop (core.coding_loop)</a>
+      <a href="docker.html">Docker sandbox (sandbox.docker)</a>
+      <a href="execute.html">Running code (execute) (tools.execute)</a>
+      <a href="experiment_gate.html">Experiment gate (core.experiment_gate)</a>
+      <a href="file_system.html">File system tool (tools.file_system)</a>
+      <a href="jobs.html">Sandbox jobs (sandbox.jobs)</a>
+      <a href="probe_model.html">Probe-model experiments (tools.probe_model)</a>
+      <a class="current" href="probe_transcripts.html">Probe transcripts (core.probe_transcripts)</a>
+      <a href="quarantine.html">Quarantine (tools.quarantine)</a>
+      <a href="runs.html">Runs (tools.runs)</a>
+      <a href="services.html">Sandbox services (sandbox.services)</a>
+      <a href="skill_acquisition.html">Skill acquisition</a>
+      <a href="workspace.html">Workspace tool (tools.workspace)</a>
+      <a href="workspace_cleanup.html">Workspace cleanup (core.workspace_cleanup)</a>
+      <a href="workspace_continuity.html">Workspace Continuity</a>
+      <a href="workspace_track.html">Workspace tracking (tools.workspace_track)</a>
+    </div>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / probe_transcripts.py</h1>
+  <p class="subtitle">&sect;4QA-e: a results file that cites a probe transcript should quote the model's words &mdash; an <strong>advisory</strong> check: it reports, it never holds a close.</p>
+
+  <h2 id="why">Why it exists</h2>
+  <p>In project 448d5afa86f0 the experiments were rerun for real with <a href="probe_model.html">probe_model</a> (2026-10-19). The write-ups invented no answers, but six of them put reworded text in quote marks:</p>
+  <ul>
+    <li>"aggregate of my attention patterns" became "aggregate of attention patterns";</li>
+    <li>"I am a process, not a substance" became "identity as process, not substance".</li>
+  </ul>
+  <p>The transcript is the data. A quote that is not in it is not data.</p>
+
+  <h2 id="kept">Kept copies</h2>
+  <p><code>probe_model</code> calls <code>record()</code> for every transcript it saves. The bytes go to <code>&lt;memory_dir&gt;/probe_transcripts/&lt;project&gt;/&lt;sha256&gt;.md</code>, and <code>index.jsonl</code> notes the path the transcript was saved as. The model can edit the sandbox copy but not this one, so the check never compares a quote with a transcript rewritten to match it (ownership by bytes, &sect;4QA). <code>recorded()</code> skips any copy whose bytes no longer hash to its name. If a transcript could not be kept, the tool result says the write-up will not be checked, and a warning is logged.</p>
+
+  <h2 id="advisory">Advisory, not a gate (operator, 2026-10-19)</h2>
+  <p>Built first as a gate that refused DONE, the check went through five fresh-eye rounds (r27&ndash;r31), and each found 3&ndash;9 MAJOR defects. Honest write-ups were refused (labels such as <code>&gt; Layer 3 &mdash;</code>, headings inside blocks, notes such as "(max_tokens reached)"), and close rewordings got through (stripped labels, ties with the prompt's words). A fuzzy "is this a rewording?" judge cannot be both. The operator chose <strong>advisory</strong>: the close always stands, and a write-up that seems to reword the answers is reported.</p>
+  <p><code>task_deliverable.note_misquotes(store, project_id, task_id, description, stored_description)</code> (async) runs once a task has <em>really</em> closed DONE &mdash; after every gate, and never on a re-close of a task already DONE (r32: a close refused by a later gate, or a build held NEEDS_USER, was noted as "closed"). The check itself runs in a worker thread, so it never stalls the agent (r32: up to 16&nbsp;s on the event loop), and only after every write of the call or step (r33: awaited mid-loop, a cancel left a task DONE with its old promised path):</p>
+  <ul>
+    <li><code>task_update</code>: the task closes, and the payload carries <code>quote_warnings</code> plus <code>agent_instruction_quote_check</code>, which names each quote next to what the transcript says and asks the model to fix the file now;</li>
+    <li>both advancer closes (build and research, owner-run or unattended): the task closes.</li>
+  </ul>
+  <p>The owner gets <em>one</em> line in the project ledger, rewritten in place: <code>&sect;4QA-e quote check (advisory): the write-ups of N closed task(s) &mdash; &lt;the last five ids&gt; (+k earlier) &mdash; seem to quote the probe answers with words changed; &hellip;</code>. It carries no transcript text (r32: the ledger keeps only 2,400 characters and is shown as trusted every turn &mdash; a long line pushed the owner's design lines out, and a probe answer reached the briefing raw), and one line per project rather than per task (r33: twelve rerun tasks would have filled the ledger). The ids it counts are kept in the project metadata (<code>quote_check_tasks</code>). The details go to the model in the <code>task_update</code> payload, at most three tasks listed. If the check itself fails, a warning is logged and the close is untouched.</p>
+  <h2 id="check">The check</h2>
+  <p><code>quote_problem_of(ws, description, memory_dir, project_id, stored_description, project_text)</code> does the work.</p>
+  <p>It reads the file the task declares in the description given to the call <em>and</em> the one declared in the stored description. It applies when that file <em>cites</em> a kept transcript, by its saved path or its file name as a whole name.</p>
+  <p>The check reads up to 1&nbsp;MB of the write-up, dropping a cut last line (r30: the old 64&nbsp;KB head cut a verbatim answer mid-word). What counts as a quote:</p>
+  <ul>
+    <li>each <em>line</em> of a <code>```text</code> block (found by a line scanner; an unclosed fence runs to the end), and each cell when the line holds <code>|</code>;</li>
+    <li>each line of a <code>&gt;</code> blockquote. Fence lines (<code>&gt; ```markdown</code>) are dropped; an attribution line is judged like any other (r32: dropping lines that start with a dash let a reworded line through unread). When a line's double-quoted spans of 4 or more words sit among fewer than 3 content words of the writer's own, only those spans are quotes; otherwise the whole line is (r30: a reworded line passed on one verbatim span inside it). <strong>&sect;4QB-b:</strong> the writer's <em>source note</em> is not counted as the writer's words and is not part of a whole-line quote: a <code>[src: &hellip;]</code> / <code>[source: &hellip;]</code> note anywhere on the line, and then a parenthesis ending the line <em>right after a double-quoted span of 4 or more words</em> &mdash; or after a cell of 4 or more words that opens with a quote mark and ends with the outer quote closing right after a nested one (<code>"&hellip; of a "self."" (label)</code>; r3: a cell merely opening and ending with a quote mark was gamed by <code>"&hellip;" said the model, a "stream" (99% of runs)</code>) &mdash; (italic marks between are allowed: <code>&gt; "&hellip;" (layer-cascade, convergence)</code>, <code>*"&hellip;"* (control)</code>). For the writer-word count, each note counts only if it holds at most 8 words of the writer's own (<code>src</code> is one of them; quotes inside are not counted); a whole-line quote drops every <code>[src:]</code> note whatever its length, and a label parenthesis only if it holds no quote. Quotes inside a note are still judged on their own; a longer note is the writer talking and still counts. A parenthesis that does <em>not</em> follow such a quote &mdash; on a plain <code>&gt;</code> line, in a table cell, or after a one-word scare quote &mdash; is the quote's own end and is judged (r1: <code>&gt; Layer 4 dominates &hellip; (about 95% of runs)</code> passed unread; r2: so did <code>&hellip; a "stream" (about 99% of runs)</code>);</li>
+    <li>double-quoted spans (<code>"&hellip;"</code>, <code>&ldquo;&hellip;&rdquo;</code>, <code>&laquo;&hellip;&raquo;</code>, <code>&bdquo;&hellip;&ldquo;</code>) of 4 or more words, outside code blocks.</li>
+  </ul>
+  <p>From each line, a leading list marker (<code>1.</code>, <code>-</code>) and a writer's label (<code>**Response 1:**</code>, <code>*Prompt 1 (control):*</code>, <code>Layer 2:</code>) are removed first.</p>
+  <p><strong>Fine:</strong> the quote's words stand, in order, in <em>one</em> kept transcript, in the task's <em>stored</em> description, or in the project's title and goal (r29: the write-ups quote the hypothesis). Case, punctuation, markdown, backticks and line breaks are ignored. An ellipsis, a <code>[bracketed]</code> insertion or a writer's note in parentheses (<code>(sic)</code>, <code>(truncated)</code>, <code>(emphasis mine)</code>) splits the quote into pieces; every piece is matched as whole words, in order, in the same source; one-word pieces count too (r29), but a quote whose pieces are all single words is not a quote. No workspace file is a source.</p>
+  <p><strong>Flagged, verbatim but wrong:</strong> every piece is in one transcript but in another order, or the longer pieces are there in order and a one-word piece is not (<code>"My identity is not &hellip; suffering"</code>). A quote longer than 60 words is judged by its sentences; one whose sentences are each verbatim but not one after another is a splice and is flagged (mark each cut with &hellip;).</p>
+  <p><strong>Flagged, reworded:</strong> a quote found in no source that <em>rewords</em> a passage of the model's <em>answers</em> (<code>_reworded</code>). Only the <code>```text</code> answer blocks are judged, not the prompts or the header (r29: the prompts hold the planner's hypothesis, which a write-up may restate). A quote at least as close to the planner's words (the prompts, the task, the project's title and goal) as to the answer is the planner's and passes (r30: an answer that echoed the hypothesis made a quote of the hypothesis read as a rewording of the answer). Stopwords are dropped and the rest are the content words. The quote rewords a passage when, in some stretch of the transcript as long as the quote plus <code>SLACK</code> = 3 words, both of these hold:</p>
+  <ul>
+    <li>at least <code>NEAR_RATIO</code> = 0.6 of its content words stand in the quote's order (longest common subsequence);</li>
+    <li>at least 3 content words match, or a pair of content words stands side by side in both.</li>
+  </ul>
+  <p>A quote with fewer than 3 content words is not judged. <strong>Left alone:</strong> anything else, i.e. a quote of a source this check does not hold (Hofstadter, a web page).</p>
+  <p><strong>Calibration</strong> (r28, the live 448d5afa86f0 data):</p>
+  <ul>
+    <li>8 of 8 real rewordings flagged;</li>
+    <li>0 of 30 famous quotes flagged ("I think, therefore I am", "the map is not the territory", &hellip;);</li>
+    <li>0 of 94 research and design quotes flagged;</li>
+    <li>about 2&nbsp;s against 28 transcripts.</li>
+  </ul>
+  <p>The fixtures are in <code>tests/fixtures/4qa_run1/</code>. At most 200 unfound quotes of 3 or more content words (r31: numbers and heading cells no longer count), or 2&nbsp;s per file, at most two files &mdash; the clock covers the verbatim look-ups too (r33: 1&nbsp;MB pasted verbatim took 11&nbsp;s), but not <em>finding</em> the quotes, which runs first and must stay linear (&sect;4QB-b r1: a line of unclosed <code>[src:</code> was quadratic, 100&nbsp;KB in 5.6&nbsp;s; brackets now stop at the next <code>[</code>) &mdash; (checked inside the scan too, r30: one 2,000-word block took 36&nbsp;s), are judged per file; past either a warning is logged and the rest pass.</p>
+  <p>The report names each reworded quote next to the transcript passage it rewords, in the transcript's own characters (aligned even after a letter such as <code>&#304;</code> whose lower case is longer), and gives the two fixes: copy it word for word, or remove the quote marks (or the <code>&gt;</code>) and say it as your own summary.</p>
+
+  <h2 id="history">Review history</h2>
+  <ul>
+    <li><strong>r27</strong> (3 MAJOR): "every quote must be in a transcript" refused 7 honest quotes in the live write-ups and every third-party quote. A description rewritten in the closing call was a quote source, and re-pointing the deliverable dodged the check.</li>
+    <li><strong>r28</strong> (3 MAJOR, all in the r27 fix): a bag of <em>all</em> words over a quote-length window refused 18 of 30 famous quotes on stopwords alone. Snapshotted workspace files as sources let an edited transcript copy, and the first run's reworded write-ups, launder a rewording. The sources were removed, not patched.</li>
+    <li><strong>r29</strong> (3 MAJOR): the prompts and header were judged, so restating the hypothesis was refused; one-word pieces were dropped, so <code>&hellip; suffering</code> added an unseen word; the first run's transcripts were not kept, so a quote of run 1 was judged against the rerun. Fixed: answers only, project goal as a source, one-word pieces matched, and the rerun script keeps run 1's system-written transcripts under <code>results/run1-600tok/</code>.</li>
+    <li><strong>r30</strong> (9 MAJOR): a slow scan with no limit inside one quote (36&nbsp;s); false refusals of labels, attributions, writers' notes, write-ups past 64&nbsp;KB and the echoed hypothesis; a reworded blockquote line shielded by an inner span; re-pointing in two calls; the rerun script's second apply moving the rerun's files; and <code>probe_model</code> without <code>save_to</code> saying the cut answers were "in the saved file". Fixed by judging lines, stripping labels and notes, the in-scan clock, the 1&nbsp;MB read, the planner comparison, a re-point refusal, the marker over every step, and an honest note.</li>
+    <li><strong>r31</strong> (7 MAJOR, again inside the r30 fixes): honest labels, headings and notes outside the allow-lists were refused; the label stripper and the attribution rule erased changed words; a tie with the prompt's words let an answer be replaced; trivial table cells used up the 200-quote cap; a short splice passed; the re-point refusal was dodged by renaming the file; the stored description laundered a quote over two calls. &rarr; the check became <strong>advisory</strong> (operator), the re-point refusal was removed, the cap counts only judgeable quotes, and more writer's notes split a quote. The rest are the limits below, now costing a missed or a needless warning instead of a held task.</li>
+    <li><strong>r32</strong> (1 CRIT, 3 MAJOR in the advisory plumbing): a long note wiped the 2,400-character design ledger; a close refused by a later gate was noted as closed; the check stalled the event loop; probe text reached the trusted briefing. Fixed: a fixed, once-per-task ledger line; the note after the real close; a worker thread with 2&nbsp;s per file; re-closes skipped; the attribution rule removed.</li>
+    <li><strong>r33</strong> (2 MAJOR in the r32 fixes): a line per task still filled the ledger; awaiting the check mid-loop let a cancel half-apply a close. Fixed: one rolling line per project; the notes after every write. Also: the clock now bounds the verbatim look-ups, and a hard project delete removes the kept transcripts.</li>
+    <li><strong>&sect;4QB-b</strong> (2026-10-19, the downstream run): the advisory check flagged 34 quotes in 5 write-ups; by hand about 28 were word for word. The agent had started labelling each quote (<code>&gt; "&hellip;" (layer-cascade, convergence)</code>, <code>[src: "&hellip;"]</code>), the label's 3 words made the line "the writer talking", and the line was judged whole with the label glued on. Lines with nested quotes (<code>"vertigo"</code>, <code>a "self."</code>) broke the spans and hit the same path. After the fix the 5 files hold 9 flags and all write-ups 17, each checked by hand against the transcript: words added, dropped or changed ("simulated interiority", "self-describing, formally", "Definational", "Identity <em>is</em> a function"), a model heading joined to its text without &hellip;, or a <code>[src:]</code> quote of the agent's own write-up (not a transcript). Fresh-eye r1 (2 MAJOR in this fix): any short closing parenthesis was dropped, also on a plain <code>&gt;</code> line where it is the quote's own end (a changed figure passed); the <code>[src:</code> pattern, and the older bracket in the splitter, were quadratic on unclosed brackets, outside the 2&nbsp;s clock. Fixed: a label only right after a closing quote; brackets stop at <code>[</code>; linearity tests. Fresh-eye r2 (1 MAJOR in the r1 fix): a one-word scare quote before the parenthesis still made it a label; now the quote must be a span of 4 or more words. Four vacuous tests fixed (labels of 3 content words, every closing quote mark, a reworded quote in a note on a whole-line quote, only <code>src</code>/<code>source</code> notes). Rule for a whole-line quote ending in a nested one added (the live line <code>&hellip; of a "self."" (self-referential-start, convergence)</code> was flagged needlessly). Fresh-eye r3 (1 MAJOR in that rule): it checked only the cell's first and last characters, so a line opening with a quote, then the writer's words, then a scare quote kept its reworded parenthesis unread; now the outer quote must close right after the nested one. Left: a writer who deliberately ends with <code>"stream""</code>. Two write-ups with real misquotes (<code>analysis/convergence-signature.md</code>, <code>results/cross-model-validation.md</code>) were never checked at close: they name no transcript file.</li>
+  </ul>
+
+  <h2 id="limits">Not checked, or misjudged</h2>
+  <ul>
+    <li>Labels, attributions, headings and writer's notes outside the forms listed above may be flagged needlessly; a changed word inside a stripped bold label is not judged. A quote as close to the prompts as to the answer passes.</li>
+    <li>A task's description may be rewritten to hold a reworded quote, which then counts as a source.</li>
+    <li>A <code>probe_model</code> call still running when its project is hard-deleted keeps its transcript under the removed id (r34, accepted: nothing reads it).</li>
+    <li>A deliverable that cites no transcript. Removing the citation removes the check.</li>
+    <li>A task that declares no deliverable file (no <code>&rarr; path</code>). The &sect;4QA-e rerun script made the control task declare <code>results/control-condition.md</code>, which held 5 of the 8 rewordings.</li>
+    <li>Quotes with fewer than 3 content words ("it's a feature of complexity" for "it is a feature of complexity"). They are too short to tell from a famous phrase the model also used.</li>
+    <li>Quotes in any other file the task wrote, quotes in single quotes, and double-quoted spans broken across lines.</li>
+    <li>&sect;4QB-b, accepted: a parenthesis of at most 8 words right after a quote of 4 or more words is taken as its label and not read, even when it rewords the model (<code>"&hellip;" (and truth is painful again)</code>). A plain <code>&gt;</code> line ending in a source label is judged with the label on, so it may be flagged needlessly. Unquoted text inside <code>[src: &hellip;]</code> was never read (the splitter drops brackets).</li>
+    <li>Quotes in a fence with no language or another language (<code>```</code>, <code>```markdown</code>) outside a blockquote: they can be code.</li>
+    <li>A heavy paraphrase that compresses the answer (about 40 words said in 20) falls outside the window and passes; so does a dropped word hidden by an ellipsis (<code>"is &hellip; a bug"</code> for "is not a bug").</li>
+    <li>A parent task that declares a file: it closes by roll-up, and no gate runs (an existing limitation).</li>
+    <li>Transcripts saved before &sect;4QA-e, which were never kept &mdash; except the first real run of 448d5afa86f0, which the rerun script keeps (only files that start with the system's own transcript header).</li>
+  </ul>
+
+  <p>Pins: <code>tests/test_4qa_probe_quotes.py</code>, <code>tests/test_4qa_rerun_experiments.py</code>.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

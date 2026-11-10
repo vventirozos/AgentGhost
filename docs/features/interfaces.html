@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interfaces — Ghost Agent</title>
+<meta name="description" content="Every way to talk to Ghost: the web console, Slack, the handheld, the command line and the HTTP API, all sharing one brain.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a class="current" href="interfaces.html">Interfaces</a>
+    <div class="subnav">
+      <a href="../reference/interfaces/api_routes.html">HTTP API routes (api.routes)</a>
+      <a href="../reference/interfaces/cli.html">Ghost CLI</a>
+      <a href="../reference/interfaces/cli_reference.html">CLI Reference</a>
+      <a href="../reference/interfaces/clockwork_ghost.html">Clockwork Ghost</a>
+      <a href="../reference/interfaces/sessions.html">Sessions &amp; turn cancellation</a>
+      <a href="../reference/interfaces/slack_bot.html">Slack bot</a>
+      <a href="../reference/interfaces/web_server.html">Web server</a>
+    </div>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Interfaces</h1>
+    <p class="subtitle">The agent itself is an HTTP service with no screen of its own. A web console, a Slack bot, a handheld, a command line and an API all talk to it, and they all share one memory.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac Studio (eva)</span>
+      <span class="badge">Clients: browser, Slack, ClockworkPi, terminal</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Ghost has one brain and many doors. Memory, projects and your rules belong to the agent, not to the window you type in. Start something in Slack on your phone, finish it in the web console at your desk, and Ghost knows it is the same work.</p>
+  <p>Each interface is a separate program. You can restart one without touching the others, and if a page loads but nothing answers, that tells you the agent is down, not the console.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Interface</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td>Web console</td><td>Day-to-day use. The most complete one: streaming replies, files, voice, the live log, the animated face.</td></tr>
+      <tr><td>Slack bot</td><td>Reaching Ghost from anywhere, and letting a few other people in a channel ask it things.</td></tr>
+      <tr><td>ClockworkPi handheld</td><td>A small dedicated screen you can carry around.</td></tr>
+      <tr><td>CLI</td><td>Quick questions from a terminal or a shell script.</td></tr>
+      <tr><td>HTTP API</td><td>Building something of your own. OpenAI- and Ollama-shaped endpoints.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You do</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>Send a message in the web console, then type another before the reply ends</td><td>The second message is queued and handed to the running turn, so you can add “and in euros, please” without waiting.</td></tr>
+      <tr><td>Tap the ONLINE light in the header</td><td>The live log opens beside the chat, so a long turn shows which tool it is sitting in instead of a spinner.</td></tr>
+      <tr><td>Give a reply 👍 or 👎</td><td>The turn is labelled right or wrong and the label is kept with it. In Slack a reaction does the same; in the CLI type <code>/good</code> or <code>/bad why it was wrong</code>.</td></tr>
+      <tr><td>Hold the mic button and speak</td><td>Your words are transcribed and sent. See <a href="voice.html">Voice</a>.</td></tr>
+      <tr><td>Ask “tell me when the backup finishes”</td><td>Ghost can use its <code>notify_operator</code> tool to queue a message for you. It is held until the request ends, then picked up by whichever clients are listening: the Slack bot DMs you, the web console shows it or pushes a phone alert.</td></tr>
+      <tr><td><code>ghost -p "how much disk is free in the sandbox?"</code></td><td>The CLI asks once and prints the answer, handy in a pipeline.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <h3 id="web">The web console</h3>
+  <p>A chat page with what a local agent needs: file upload (pick or photograph a file and ask about it in the same step), downloads of files Ghost made, memory correction, a project view, and saving or loading a whole workspace as a zip. Replies stream word by word. Every message has a ⋯ menu: <em>Regenerate</em> on a reply, <em>Edit &amp; resend</em> on yours. A turn that stops early carries a <em>Retry</em> button.</p>
+  <p>Behind the chat sits the face: an animated corridor of frames around a glowing kernel that shows what Ghost is doing and how it feels. It runs hot while Ghost works, scans while it searches, draws inward while it reads, and finishes with a green ring when a turn went well or red when it went wrong. Each mood (cheerful, calm, curious, tired and so on) has its own colours and tempo. One button in the header turns the face and its animations off and on; the choice is saved on the server, so every device follows it.</p>
+  <p>Installed on a phone as a home-screen app, the console opens even offline, resumes a turn that was running when you closed it, and asks before enabling push alerts (on an iPhone, add it to the Home Screen first).</p>
+
+  <h3 id="slack">The Slack bot</h3>
+  <p>The bot connects out to Slack, so nothing is exposed to the internet. Direct messages are answered for the owner only. In channels you add it to, it also answers other people in your workspace; set <code>GHOST_SLACK_OPEN_CHANNEL=0</code> to lock it back to you alone. Slack sometimes delivers a message twice; the bot remembers each message for ten minutes and answers it once. If the bot is restarted mid-request, it posts a note in the thread asking you to send it again.</p>
+  <p>To silence someone, list their Slack member IDs in <code>GHOST_SLACK_SHADOW_BAN</code>. Their messages and reactions are dropped without a reply, and the owner can never be banned by mistake.</p>
+
+  <h3 id="4kj-member">A channel member is not the owner</h3>
+  <p>When Bruno, a colleague in a shared channel, asks Ghost something, his turn is walled off from Elena, the owner. The client tells the agent who is asking (owner or member). A member's turn gets plain web search (including dark-web search), image making and looking at pictures, nothing else: no files, no code, no browser, no memory. Elena's profile, address, location, recall and private data never appear in it, and tools that would read or change her data are refused. Ghost is told this up front, so Bruno gets a plain “that can't be done on this channel” rather than a hunt for a way around. A member's own pasted image is kept as his file, not Elena's.</p>
+
+  <h3 id="4kd-slack">A member never teaches</h3>
+  <p>Nothing a member does changes how Ghost treats the owner. A member's turn writes nothing to the owner's memory or journal, is not used to grade or tune the agent, does not update its record of what tools work, and loads no owner recall into the conversation. Slack requests are tagged as such, so a rating on them is kept with that turn but never turns into a lesson.</p>
+
+  <h3 id="maintenance">Maintenance mode</h3>
+  <p>While maintenance is on, the Slack bot sends nothing to the agent: mentions, DMs (the owner's too), uploads and 👍/👎 all stop at the bot, and each message gets one maintenance reply in its thread. Strangers and banned users still get silence, and notifications from the agent still reach the owner.</p>
+  <p>The switch is one file, <code>~/Data/AI/Logs/ghost-slack-maintenance</code> (path set by <code>GHOST_SLACK_MAINTENANCE_FILE</code>). The bot checks it on every message, so it takes effect at once and survives restarts. The file's text is the reply; an empty file gives a default “down for maintenance” line.</p>
+  <pre><code>echo "Upgrading the model, back at 20:00" &gt; ~/Data/AI/Logs/ghost-slack-maintenance   # on
+rm ~/Data/AI/Logs/ghost-slack-maintenance                                          # off</code></pre>
+  <p>The owner can also DM the bot <code>maintenance on</code>, <code>maintenance on: back at 20:00</code>, <code>maintenance off</code> or <code>maintenance status</code>. The command must be the whole message, so “maintenance on my car is due” is still an ordinary request.</p>
+
+  <h3 id="handheld">The handheld and the CLI</h3>
+  <p>The ClockworkPi uConsole client is a small native app for a carry-around screen. It keeps a local chat log and shows the same face. The CLI (<code>interface/externals/cli/ghost</code>) answers one question with <code>-p</code>, or opens an interactive session when run without arguments.</p>
+
+  <h3 id="api">The HTTP API</h3>
+  <p>Every interface above is a client of this. The main routes:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Endpoint</th><th>What it is for</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/chat</code></td><td>Send a message, streaming or not (Ollama-shaped).</td></tr>
+      <tr><td><code>POST /v1/chat/completions</code></td><td>The OpenAI-shaped equivalent for OpenAI-compatible tools.</td></tr>
+      <tr><td><code>GET /api/health</code></td><td>Is it alive and healthy?</td></tr>
+      <tr><td><code>POST /api/upload</code> · <code>GET /api/download/…</code></td><td>Move files in and out of the sandbox.</td></tr>
+      <tr><td><code>POST /api/turn/cancel</code></td><td>Stop a running turn.</td></tr>
+      <tr><td><code>GET /api/notifications/pending</code></td><td>Anything the agent needs you for.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Every call needs the <code>X-Ghost-Key</code> header. A client that serves other people also sends <code>X-Ghost-Requester: member</code> for their turns; no header means the owner.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>The agent, the API, the web console server and the Slack bot all run on the Mac Studio (eva), each supervised so it restarts if it dies. Browsers, phones, the handheld and Slack reach them over a private network. Voice requests are passed on to the Mac mini (nova) for speech-to-text and speech.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Installing the console on a phone needs HTTPS with a certificate the phone trusts.</li>
+    <li><code>GHOST_SLACK_OPEN_CHANNEL=0</code> restricts Slack to the owner; <code>GHOST_SLACK_SHADOW_BAN</code> is read once at start, so a ban needs a bot restart.</li>
+    <li>A shared Slack channel is not a security boundary in itself: the member wall in the agent is what keeps the owner's data private.</li>
+    <li>Only the last <code>notify_operator</code> call of a request is sent.</li>
+    <li>A member's ratings are recorded but nothing acts on them.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/interfaces/api_routes.html">HTTP API routes (api.routes)</a></li>
+    <li><a href="../reference/interfaces/cli.html">Ghost CLI</a></li>
+    <li><a href="../reference/interfaces/cli_reference.html">CLI Reference</a></li>
+    <li><a href="../reference/interfaces/clockwork_ghost.html">Clockwork Ghost</a></li>
+    <li><a href="../reference/interfaces/sessions.html">Sessions &amp; turn cancellation</a></li>
+    <li><a href="../reference/interfaces/slack_bot.html">Slack bot</a></li>
+    <li><a href="../reference/interfaces/web_server.html">Web server</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infrastructure — Ghost Agent</title>
+<meta name="description" content="The four machines the agent runs on, what each one does, and how one request travels between them.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a class="current" href="infrastructure.html">Infrastructure</a>
+    <div class="subnav">
+      <a href="../reference/infrastructure/agent.html">The agent core (core.agent)</a>
+      <a href="../reference/infrastructure/architecture.html">System Architecture</a>
+      <a href="../reference/infrastructure/bus.html">Event bus (core.bus)</a>
+      <a href="../reference/infrastructure/how_it_works.html">One message, end to end</a>
+      <a href="../reference/infrastructure/isolation.html">Isolation (core.isolation)</a>
+      <a href="../reference/infrastructure/mandatory_tor.html">Mandatory Tor (fail-closed egress)</a>
+      <a href="../reference/infrastructure/prompts.html">Prompts (core.prompts)</a>
+      <a href="../reference/infrastructure/request_lifecycle.html">Request lifecycle</a>
+      <a href="../reference/infrastructure/request_scope.html">Request scope (core.request_scope)</a>
+      <a href="../reference/infrastructure/safety.html">Safety and privacy</a>
+      <a href="../reference/infrastructure/tool_registry.html">Tool registry (tools.registry)</a>
+    </div>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Infrastructure</h1>
+    <p class="subtitle">Ghost Agent lives on four small computers at home, joined by a private network. Nothing runs in a cloud, and the agent reaches the internet only through Tor.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: eva, nova, ghost, disorder</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">Four machines, what runs where</h2>
+  <div class="machines">
+    <div class="machine"><h4>eva</h4><span class="spec">Mac Studio, M4 Max, 36 GB</span>
+      <ul>
+        <li>The agent itself (launchd daemon, restarted if it dies)</li>
+        <li>Main model: Qwen3.8-27B with MTP on llama-server</li>
+        <li>Web console, API and Slack bot</li>
+        <li>Docker sandbox for code and browsing</li>
+        <li>Tor egress and all memory stores</li>
+      </ul></div>
+    <div class="machine"><h4>nova</h4><span class="spec">Mac mini, M4, 16 GB</span>
+      <ul>
+        <li>Helper model: Gemma E4B (side calls, vision, audio input)</li>
+        <li>Whisper speech-to-text</li>
+        <li>Phonon text-to-speech</li>
+        <li>Sentiment service</li>
+        <li>Portfolio service</li>
+      </ul></div>
+    <div class="machine"><h4>ghost</h4><span class="spec">Jetson Orin</span>
+      <ul>
+        <li>Image generation: Qwen-Image-2.1-Turbo via stable-diffusion.cpp</li>
+      </ul></div>
+    <div class="machine"><h4>disorder</h4><span class="spec">Raspberry Pi 5</span>
+      <ul>
+        <li>ghost-labs: small long-running experiments</li>
+      </ul></div>
+  </div>
+  <p>A fifth device, a ClockworkPi uConsole handheld, is only a client: it talks to the agent the same way the web console does. All machines reach each other over a private tailnet.</p>
+
+  <h2 id="flow">One request, across the machines</h2>
+  <p>Say Elena asks by voice from the handheld: “Draw me a lighthouse at dusk and tell me tomorrow's weather.”</p>
+  <ol class="flow">
+    <li><h4>Client → eva</h4><p>The handheld sends the audio to the agent's API on eva, with the owner's key.</p></li>
+    <li><h4>eva → nova</h4><p>The audio goes to Whisper on nova and comes back as text.</p></li>
+    <li><h4>eva: main model</h4><p>The agent builds the prompt (head, memories, conversation) and the main model on eva decides which tools to call.</p></li>
+    <li><h4>eva → Tor → internet</h4><p>The weather lookup leaves through Tor. Nothing goes out directly.</p></li>
+    <li><h4>eva → ghost</h4><p>The picture request goes to the Jetson; the finished image comes back and is looked at before the reply mentions it.</p></li>
+    <li><h4>eva → nova → client</h4><p>The reply text is spoken by Phonon on nova and streamed back to the handheld.</p></li>
+  </ol>
+  <pre>handheld ─► eva (agent + main model) ─► nova (Whisper)
+                 │  ├─► Tor ─► internet (weather)
+                 │  ├─► ghost (image)
+                 │  └─► nova (helper model, TTS)
+                 └─────────────────────────► reply to handheld</pre>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say or do</th><th>Which machines work</th></tr></thead>
+    <tbody>
+      <tr><td>“What's new in astronomy this week?”</td><td>eva (model, Tor, browser in the sandbox)</td></tr>
+      <tr><td>Send a photo: “What plant is this?”</td><td>eva and nova (vision on the helper model)</td></tr>
+      <tr><td>“Paint Markos a cat in a raincoat”</td><td>eva and ghost</td></tr>
+      <tr><td>“Check your health”</td><td>eva reads its own records, including the state of nova, ghost and the labs</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <p><strong>Supervision.</strong> The agent runs as a system launchd daemon with KeepAlive, so a crash brings it straight back. A deploy is a SIGTERM to the launchd job; the operator first waits until no foreground request is running, so nobody's reply is cut off.</p>
+  <p><strong>Tor only.</strong> The agent uses no keyed cloud APIs and goes to the internet only through Tor. Inside the Docker sandbox a private Tor runs alongside firewall rules that send every connection through it and reject the rest (other UDP, ICMP, all IPv6). The rules are loaded before Tor starts, so the sandbox fails closed. Separate services the operator chooses, on other machines, may use the normal internet.</p>
+  <p><strong>Isolation.</strong> Each request carries who is asking. The owner's memories, files and rules are walled off from team members and the public; a member's request cannot read the owner's stores.</p>
+  <p><strong>One model slot.</strong> The main model has one slot, so the agent works hard to keep it for the conversation that matters; see <a href="performance.html">Performance</a>.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>Everything that holds data or decides anything runs on eva. nova, ghost and disorder are helpers: if one is off, the agent carries on without that ability (or, for side calls, falls back to the main model).</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>eva has 36 GB of memory shared between the main model, the sandbox and the stores; that is why the model has a single slot.</li>
+    <li>If Tor is down, the agent cannot reach the web at all. This is on purpose.</li>
+    <li>Sandbox Tor is controlled by <code>GHOST_TOR</code>; provisioning (apt, pip, browser download) happens before the rules go in.</li>
+    <li>The handheld depends on eva; it does no model work itself.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/infrastructure/agent.html">The agent core (core.agent)</a></li>
+    <li><a href="../reference/infrastructure/architecture.html">System Architecture</a></li>
+    <li><a href="../reference/infrastructure/bus.html">Event bus (core.bus)</a></li>
+    <li><a href="../reference/infrastructure/how_it_works.html">One message, end to end</a></li>
+    <li><a href="../reference/infrastructure/isolation.html">Isolation (core.isolation)</a></li>
+    <li><a href="../reference/infrastructure/mandatory_tor.html">Mandatory Tor (fail-closed egress)</a></li>
+    <li><a href="../reference/infrastructure/prompts.html">Prompts (core.prompts)</a></li>
+    <li><a href="../reference/infrastructure/request_lifecycle.html">Request lifecycle</a></li>
+    <li><a href="../reference/infrastructure/request_scope.html">Request scope (core.request_scope)</a></li>
+    <li><a href="../reference/infrastructure/safety.html">Safety and privacy</a></li>
+    <li><a href="../reference/infrastructure/tool_registry.html">Tool registry (tools.registry)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projects and autopilot — Ghost Agent</title>
+<meta name="description" content="Multi-step projects with tasks, research and safety checks, an opt-in autopilot that advances them while you are away, plus scheduled tasks, watches and background jobs.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a class="current" href="projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a href="../reference/projects/autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a href="../reference/projects/background_jobs.html">Background jobs</a>
+      <a href="../reference/projects/cross_project_map.html">Cross-project map</a>
+      <a href="../reference/projects/long_tasks.html">Long tasks</a>
+      <a href="../reference/projects/planning.html">Planning (core.planning)</a>
+      <a href="../reference/projects/project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a href="../reference/projects/project_research.html">Project research (core.project_research)</a>
+      <a href="../reference/projects/project_safety.html">Project safety (core.project_safety)</a>
+      <a href="../reference/projects/project_store.html">Project store (memory.projects)</a>
+      <a href="../reference/projects/projects_routes.html">Projects API (api.projects_routes)</a>
+      <a href="../reference/projects/projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="../reference/projects/task_close.html">Closing tasks (core.task_close)</a>
+      <a href="../reference/projects/task_kind.html">Task kinds (core.task_kind)</a>
+      <a href="../reference/projects/task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="../reference/projects/tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="../reference/projects/triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Projects and autopilot</h1>
+    <p class="subtitle">Work that takes weeks instead of one chat: a project holds a plan of tasks, their order, their files and their research, and survives restarts. If you switch it on, an autopilot moves a project forward one task at a time while you are away.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac Studio (eva)</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Most questions are answered in one turn. Some jobs are bigger: build a small web app with tests, compare five databases and write a report, migrate a schema and check it on a real server. The model cannot keep a plan like that in its head for days, and a stop in the middle must not lose the work. A <strong>project</strong> is the durable to-do structure for that kind of job.</p>
+  <p>A project has a goal, a tree of <strong>tasks</strong> (with "do this before that" links), its own folder in the sandbox, its research notes and its files. Every later turn about the project gets a short briefing: what is done, what is open, what is waiting and why. So "where are we on the chess app?" is answered from the stored record, not from memory or a guess.</p>
+  <p>The agent does not open a project for everything. It creates one only when you ask, or when the work really spans many files and many turns. A large single-file page or script is built directly, with no task tree.</p>
+  <p>Alongside projects sit three smaller tools for work that is not a conversation:</p>
+  <ul>
+    <li><strong>Scheduled tasks</strong> fire on a clock ("every morning at nine, summarise the news").</li>
+    <li><strong>Watches</strong> fire on a condition ("tell me when this page stops answering").</li>
+    <li><strong>Background jobs</strong> keep long commands running after the reply, and wake the agent with the result when they finish.</li>
+  </ul>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“Start a project: a Flask app for Bruno's bakery orders, with login, SQLite and pytest. Plan it first.”</td><td>A project is created, the goal is split into ordered tasks, and the plan is shown. The agent then <em>stops and waits</em> for your go-ahead.</td></tr>
+      <tr><td>“Proceed with the next task.”</td><td>Exactly one task is done in a full turn: files written, tests run, and the task is closed only if its promised file exists and is not empty.</td></tr>
+      <tr><td>“Do the next three.” / “Finish the project.”</td><td>A bounded loop runs one checkpointed task at a time and stops at the first task that is done, fails, needs you, or hits the budget. Then it reports.</td></tr>
+      <tr><td>“Research payment providers for the bakery project.”</td><td>Searches run over Tor, and a Markdown brief with sources is saved in the project's <code>research/</code> folder. Later turns see it in the briefing.</td></tr>
+      <tr><td>“Turn on autopilot for the bakery project.”</td><td>While you are idle, the agent advances that project one task per idle window. Waiting tasks stay waiting.</td></tr>
+      <tr><td>“Where are we on the bakery project?”</td><td>A status read from the store: done, running, waiting (and on what), failed.</td></tr>
+      <tr><td>“Every weekday at 08:00, send me a short weather and news summary.”</td><td>A scheduled task with a cron time and a stored prompt. Cron times are UTC, so the agent converts your local time.</td></tr>
+      <tr><td>“Watch Elena's shop site and tell me if it goes down.”</td><td>A watch that runs a check command in the sandbox every minute or more. It fires once when the condition becomes true, and re-arms only after it clears.</td></tr>
+      <tr><td>“What did you do while I was away?”</td><td>The activity log: autopilot ticks, scheduled runs, finished jobs, tasks that need you.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Plan</h4><p>The goal is decomposed into tasks. Each task can depend on others, and a task never starts until everything it depends on is DONE. A task also says what kind it is (coding, research, or one that needs you).</p></li>
+    <li><h4>Advance, one task at a time</h4><p>By default the agent does one task per go-ahead from you. "Do all" becomes a loop of small, separate ticks, so the context window stays small however long the project is.</p></li>
+    <li><h4>Close only on evidence</h4><p>A task is DONE only when the file it promised exists and is not hollow, its dependencies are closed, and its result passes the task's check. Otherwise it stays open and the reply says why.</p></li>
+    <li><h4>Wait honestly</h4><p>A task that cannot go on is shown as <em>WAITING</em> with a reason: waiting on you (a decision, an approval), on another task, or held until you run it yourself. The five states you see are PENDING, RUNNING, DONE, FAILED and WAITING.</p></li>
+    <li><h4>Autopilot while idle</h4><p>When you have been away for a while, the idle scheduler picks one active project that has autopilot on and runs a single tick, with a cool-down between ticks. If every open task is stuck behind a failed one, autopilot pauses and tells you once which task to retry.</p></li>
+  </ol>
+  <h3>The safety check</h3>
+  <ul>
+    <li><strong>Budgets.</strong> A project can cap its steps, its runtime and its tool calls. A batch stops when a cap is reached.</li>
+    <li><strong>Human gates.</strong> A task marked as needing human approval (deleting real data, sending something to a customer) can never be closed by the agent. It goes to WAITING on you.</li>
+    <li><strong>Holds.</strong> Some tasks are never run unattended, for example a model experiment. Autopilot leaves them for your own turn.</li>
+    <li><strong>Contradictions.</strong> If a new result plainly contradicts an earlier one, the project records it.</li>
+    <li><strong>Opt-in only.</strong> Only your own message turns autopilot on. A scheduled task, a background job or a test cannot.</li>
+  </ul>
+  <h3>Labs inside a project</h3>
+  <p>A project can use disposable machines on the labs host, for example a real PostgreSQL to test a migration. Autopilot may create labs for its own project; they are destroyed when its step ends. See <a href="labs.html">Labs</a>.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>Everything runs on the Mac Studio (eva): the project store, the scheduler, the sandbox where code is written and tested, and the main model that does the work. Research goes out over Tor like all of the agent's web traffic. The web console has a Projects view over the same store. Labs used by a project run on the Raspberry Pi (disorder).</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Autopilot is off for every project until you turn it on for that project. It advances only one project per idle tick, and never closes a task that needs you.</li>
+    <li>The idle autopilot loop needs the agent to run with <code>--autoadvance-idle</code>.</li>
+    <li>Watches poll no faster than every 60 seconds. Scheduled-task times are UTC.</li>
+    <li>Background jobs live in memory: they end if the agent restarts. Finished results are kept for a while so a later turn can collect them.</li>
+    <li>"Archive" keeps a project and its files; "delete" removes it.</li>
+    <li>A task's checks are mechanical. A DONE task proves a real file exists and passed its check, not that the work is perfect.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/projects/autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a></li>
+    <li><a href="../reference/projects/background_jobs.html">Background jobs</a></li>
+    <li><a href="../reference/projects/cross_project_map.html">Cross-project map</a></li>
+    <li><a href="../reference/projects/long_tasks.html">Long tasks</a></li>
+    <li><a href="../reference/projects/planning.html">Planning (core.planning)</a></li>
+    <li><a href="../reference/projects/project_advancer.html">Project autopilot (core.project_advancer)</a></li>
+    <li><a href="../reference/projects/project_research.html">Project research (core.project_research)</a></li>
+    <li><a href="../reference/projects/project_safety.html">Project safety (core.project_safety)</a></li>
+    <li><a href="../reference/projects/project_store.html">Project store (memory.projects)</a></li>
+    <li><a href="../reference/projects/projects_routes.html">Projects API (api.projects_routes)</a></li>
+    <li><a href="../reference/projects/projects_tool.html">Projects tool (tools.projects)</a></li>
+    <li><a href="../reference/projects/task_close.html">Closing tasks (core.task_close)</a></li>
+    <li><a href="../reference/projects/task_kind.html">Task kinds (core.task_kind)</a></li>
+    <li><a href="../reference/projects/task_wait.html">Waiting tasks (core.task_wait)</a></li>
+    <li><a href="../reference/projects/tasks.html">Scheduled tasks (tools.tasks)</a></li>
+    <li><a href="../reference/projects/triggers.html">Triggers (core.triggers)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

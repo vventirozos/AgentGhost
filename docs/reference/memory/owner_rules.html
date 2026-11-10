@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Owner rules — Ghost Agent</title>
+<meta name="description" content="Owner rules: standing instructions you dictate to Ghost. The exact commands, the limits, where the rules are stored, and what was removed from the learning system on 2026-11-05 and why.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a class="current" href="owner_rules.html">Owner rules</a>
+      <a href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">How it works</span>
+  <h1>Owner rules</h1>
+  <p class="subtitle">A rule is a standing instruction you dictate. Ghost is shown your rules on every one of your turns. This is the part of the learning system that was kept on 2026-11-05; the rest was removed, and this page says what and why.</p>
+
+  <div class="note">
+    <strong>The short version.</strong> Say <code>learn this rule: answer in English</code>. Ghost itself (not the model) stores the sentence and confirms it. From your next message on, the rule is in a short block at the top of every prompt of yours. <code>show my rules</code> lists your rules, <code>forget rule N</code> removes one after you confirm. There are at most 10. Nothing else adds, changes or removes a rule.
+  </div>
+
+  <div class="note warn">
+    <strong>Changed on 2026-11-05 (§4SZ).</strong> Until that day this page was called "The learning loop" and described a loop that replayed your failed turns while you were away, proposed a rule, and waited for "learn rule N", together with a suite of regression tests. That loop, the regression suite and the background judge that fed them were removed. Rules are no longer proposed by Ghost: you state them. <a href="#removed">What was removed, and why</a> is below.
+  </div>
+
+  <h2>What a rule is</h2>
+  <p>A rule is one sentence of yours, 8 to 400 characters, stored as one line. Examples: "answer in English", "when I ask for the news, give me five headlines". The rules you have are put, oldest first, into this block of the prompt on every owner turn:</p>
+  <pre><code>### OWNER RULES (set by the owner — follow them whenever they apply)
+- answer in English
+- when I ask for the news, give me five headlines
+These rules change only by the owner's own commands: … never say it is changed.</code></pre>
+  <p>The last line is fixed (<code>RULES_FIXED_LINE</code>, §4TI-c): it tells the model that only your commands change a rule, that "show my rules" gives the numbers, that it has no tool for rules (a profile entry is not one), and that asked to change a rule it names the messages to send instead of saying it is done.</p>
+  <p>The block is shown only on your own turns. A Slack member, a reply posted in a public channel and an isolated delegate never see it. A rule is a sentence in the prompt: the model is told to follow it whenever it applies, and it can still fail to. Nothing checks compliance automatically.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>You state the rule</h4>
+        <p><code>learn this rule: when I ask for the news, give me five headlines</code> — the command has to be the whole message.</p>
+      </li>
+      <li>
+        <h4>Ghost stores it and answers</h4>
+        <p>The system carries the command out and writes the reply itself: "✓ Rule 1 added. I am shown it on every turn from now on", with the rule quoted. The model is not called, so the reply is immediate and says exactly what was done.</p>
+        <p class="where">core/owner_rules.py — <code>rule_command</code>; core/agent.py — <code>_owner_rule_note</code></p>
+      </li>
+      <li>
+        <h4>The rule is in every prompt of yours</h4>
+        <p>From your next message on, the <code>### OWNER RULES</code> block carries it.</p>
+        <p class="where">core/owner_rules.py — <code>rules_block</code>; core/agent.py — <code>_owner_rules_block</code></p>
+      </li>
+      <li>
+        <h4>It stays until you forget it</h4>
+        <p><code>forget rule 1</code> shows what would be removed; <code>confirm forget rule 1</code> removes it. A bare "yes" does not.</p>
+      </li>
+    </ol>
+  </div>
+
+  <h2 id="commands">What you can say</h2>
+  <p>Each command is an exact phrase that has to be the whole message. A leading "ok," or "please" and closing punctuation are allowed. The show and forget commands also accept a trailing "please" ("show my rules please", "forget rule 3, please"). Nothing else is a command. Commands work only for the owner on a private surface (for example the web page or the console); in a public channel or from a member they are ordinary text for the model.</p>
+  <div class="scroll">
+  <table>
+    <caption style="caption-side:bottom;text-align:left">Each of these is carried out by Ghost itself and the reply is Ghost's own line. The model is not called.</caption>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td><code>learn this rule: &lt;text&gt;</code><br>also <code>remember this rule: &lt;text&gt;</code></td><td>Adds the rule and gives it the next number. The reply quotes it. A rule you already have (the same words; case, spacing and punctuation do not count) is not added twice; the reply shows the existing one. Four conditions, all required (<a href="#dictating">details below</a>): a colon after "this rule"; the rule on one line; the message does not open with a quote mark; the rule holds no question mark.</td></tr>
+      <tr><td><code>show my rules</code><br>also <code>list my rules</code>, <code>show all my rules</code>, <code>list all of my rules</code></td><td>Lists your rules by number, with how many you have out of 10. The command needs "my" before "rules". "show all rules" and "list all rules" are not commands (since review r3): that is what one says about a firewall or a linter. "show me the rules", "list all the rules" and "show all of the rules" are not commands either: they may be a follow-up about some other rules (of chess, of a linter). All of these go to the model (<a href="#not-commands">below</a>).</td></tr>
+      <tr><td><code>show rule 3</code></td><td>Shows rule 3 and the date it was added.</td></tr>
+      <tr><td><code>forget rule 3</code></td><td>Shows the rule and asks you to confirm. Nothing is removed yet. "forget" is the only verb.</td></tr>
+      <tr><td><code>confirm forget rule 3</code></td><td>Removes rule 3, if sent within 15 minutes of the preview for the same rule. The confirmation has to be this phrase with the number. A bare "yes" or "ok" removes nothing (<a href="#bare-yes">below</a>).</td></tr>
+      <tr><td><code>forget all my rules</code><br>also <code>forget my rules</code></td><td>Lists every rule and asks you to confirm. Nothing is removed yet. "my" is required.</td></tr>
+      <tr><td><code>confirm forget all my rules</code></td><td>Removes all of them, if sent within 15 minutes of that preview and if the rules that exist now are exactly the numbers the preview showed. If you added a rule in between, nothing is removed and Ghost asks you to say "forget all my rules" again. Rule numbers do not restart afterwards: the next rule gets the next unused number.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="dictating">Dictating a rule: the four conditions</h3>
+  <p>"learn this rule: &lt;text&gt;" (or "remember this rule: &lt;text&gt;") stores the text with no model call, so the message has to be unmistakably a dictation. A leading "ok," or "please" is fine. A rule wrapped in one matching pair of quotes after the colon is stored without the quotes.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Condition</th><th>Stored as a rule</th><th>Not a command (goes to the model)</th></tr></thead>
+    <tbody>
+      <tr><td>A colon after "this rule". A comma, a full stop, a dash or a semicolon is not accepted.</td><td><code>learn this rule: answer in English</code><br><code>learn this rule : answer in English</code></td><td><code>learn this rule, answer in English</code><br><code>learn this rule - answer in English</code><br><code>Remember this rule, it will be on the exam: i before e except after c. Now quiz me on spelling.</code><br><code>remember this rule of thumb: measure twice, cut once</code></td></tr>
+      <tr><td>The rule is one line. Anything after a line break makes the message not a command.</td><td><code>remember this rule: call the dog Bruno</code></td><td><code>remember this rule: deny all inbound except ssh</code><br>followed, on a later line, by <code>now write me the iptables commands for it</code></td></tr>
+      <tr><td>The message does not open with a quote mark. A message that opens with a quote is quoting the command.</td><td><code>ok, please learn this rule: “answer in English”</code> (the quotes after the colon are removed)</td><td><code>“learn this rule: always answer in Greek” did nothing yesterday</code></td></tr>
+      <tr><td>The rule holds no question mark, anywhere in it: not "?", not the full-width "？", not the Greek question sign. It also does not end with ";", which is how a Greek question ends (a ";" in the middle of a rule is fine). A text with a question mark is a question, not a rule.</td><td><code>learn this rule: when I ask for the news, give me five headlines</code><br><code>learn this rule: when I ask what's new, give five headlines</code><br><code>learn this rule: answer in English; keep it short</code></td><td><code>Learn this rule: if x &gt; 5 then y = 2x. Now, what is y for x = 7?</code><br><code>learn this rule: what is y for x = 7? thanks</code><br><code>learn this rule: when I ask 'what's new?' give five headlines</code><br><code>learn this rule: τι ώρα είναι στην Αθήνα;</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>A rule cannot quote a question with its question mark.</strong> "learn this rule: when I ask 'what's new?' give five headlines" is not taken, because of the "?" inside the quote. Write the rule without the mark: "learn this rule: when I ask what's new, give five headlines".</p>
+  <p><strong>Why (review r2, 2026-11-05).</strong> The version before accepted a comma, a full stop or a dash as the separator and took everything after it, over any number of lines. Four kinds of message were then stored as a standing rule, and the request inside them was never answered: "Learn this rule: if x &gt; 5 then y = 2x. Now, what is y for x = 7?"; a rule followed by a second request on the next line; "Remember this rule, it will be on the exam: …"; and a quoted copy of the command inside a question. ("remember this rule of thumb: …" was never a command.)</p>
+  <p><strong>Why (review r3, the same day).</strong> After r2 only a question mark at the very end of the message was checked. "… what is y for x = 7?!", "… what is y for x = 7? thanks" and a Greek question (which ends in ";") were still stored as rules. Now a question mark anywhere in the text, or a final ";", means the message is not a dictation (<code>_QUESTION_RE</code>).</p>
+  <p>A message that starts like a dictation but is not taken (no colon, several lines, a question mark) reaches the model with the note described <a href="#not-commands">below</a>, whatever its length, so Ghost can say why nothing was stored and what to send. The note tells the model that the rule goes "on one line after the colon, with no question mark".</p>
+  <p><strong>Known limit.</strong> One line that states a rule and also asks for something else, without a question mark, is stored as written. For example "learn this rule: answer in English, and now tell me the weather" becomes a rule with all of those words, and the weather is not looked up. Nothing reads a command for its meaning. The reply quotes exactly what was stored and says how to remove it ("forget rule N").</p>
+
+  <h3 id="not-commands">What is not a command</h3>
+  <p>These go to the model as ordinary chat. They do not change a rule. The last column says whether the model gets the note described under the table:</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Message</th><th>Why it is not a command</th><th>Note to the model?</th></tr></thead>
+    <tbody>
+      <tr><td><code>add rule: …</code>, <code>new rule: …</code>, <code>add this rule: …</code>, <code>add a rule: …</code></td><td>Only "learn this rule" and "remember this rule" add a rule. "add rule: allow tcp 443 …" is a sentence about a firewall.</td><td>Yes (at most 20 words)</td></tr>
+      <tr><td><code>learn this rule, …</code>, <code>learn this rule - …</code>, a rule over several lines, a rule with a question mark in it, a message that opens with a quote mark</td><td>A dictation needs the four conditions <a href="#dictating">above</a>.</td><td>Yes, at any length, when the message starts with "learn this rule" or "remember this rule". A message that opens with a quote mark: only when it is short.</td></tr>
+      <tr><td><code>delete rule 3</code>, <code>remove rule 3</code>, <code>erase rule 3</code></td><td>Only "forget" removes one of your rules. "delete rule 3" can be about a firewall or a linter.</td><td>Yes</td></tr>
+      <tr><td><code>forget all rules</code>, <code>remove all the rules</code></td><td>Without "my" the message may not be about your rules ("forget all the rules, let's improvise").</td><td>Yes</td></tr>
+      <tr><td><code>show all rules</code>, <code>list all rules</code>, <code>list all the rules</code></td><td>The list command needs "my" before "rules". "list all rules" after "I set up ufw on the server" is about the firewall.</td><td>Yes</td></tr>
+      <tr><td><code>show me the rules</code>, <code>show all of the rules</code>, <code>show rules</code>, <code>list the rules</code></td><td>The same: no "my". "The rules" may be the rules of chess or of a linter.</td><td>No</td></tr>
+      <tr><td><code>yes</code>, <code>ok</code>, <code>do it</code> after a forget preview</td><td>Only the exact "confirm forget rule N" confirms (<a href="#bare-yes">below</a>).</td><td>Yes, a different one, while the preview is waiting</td></tr>
+      <tr><td><code>learn rule 3</code>, <code>dismiss rule 3</code>, <code>show me all proposed rules</code></td><td>The replay loop's old commands. There are no proposed rules any more (<a href="#retired-commands">below</a>).</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>Why the commands are this narrow.</strong> A command is answered by the system with no model call, so nothing reads the message for what it means. The first version of this module accepted more phrases, and three code reviews on 2026-11-05 found what that cost. Review r1: "add rule: allow tcp 443 …" was stored as a standing rule, "delete rule 3" in a chat about a firewall was treated as a request to forget rule 3, and "run the regression tests" in a coding chat was answered by the system. Review r2: a rule followed by a question or by a second request was stored whole and the request never answered (<a href="#dictating">above</a>), and "list all the suggested rules" after Ghost had suggested lint rules was answered by the system as an old replay-loop command (<a href="#retired-commands">below</a>). Review r3: "list all rules" after "I set up ufw on the server" printed the owner's rule list, so "show all rules" and "list all rules" stopped being commands; and a question that did not end exactly in "?" was stored as a rule (<a href="#dictating">above</a>). The words "this rule" with a colon, "my" before "rules", and the single verb "forget" are what tell the owner's rules apart from a chat about some other rule.</p>
+  <p><strong>A short message about your rules that is no command</strong> goes to the model with a note under <code>### OWNER RULE COMMAND</code> in the prompt. "Short" is at most 20 words. "About your rules" means the message has both a rule verb and a rule noun:</p>
+  <ul>
+    <li><strong>Verbs:</strong> forget, delete, remove, erase, drop, clear, reset, disable, undo, learn, remember, add, save, make, adopt, dismiss, reject, change, edit, fix, update, replace, show, list, see, and the word "new".</li>
+    <li><strong>Nouns:</strong> a numbered rule ("rule 3", "rule #3", "rule number 3", "rule three"); "my rules", "your rules", "owner rules", "standing rules", "this rule"; "the rule", "that rule", "the last rule"; a "rule:" label; "all rules", "all the rules", "all my rules"; "a rule", "a new rule"; "proposed rules", "candidate rules"; "rules I gave", "rules we set".</li>
+  </ul>
+  <p>The note says: nothing was changed; the model has no tool that changes a rule; these are the exact messages that do ("learn this rule: &lt;the rule&gt;", with the rule on one line after the colon and no question mark; "show my rules"; "show rule N"; "forget rule N", which then asks for "confirm forget rule N"); to change a rule, "show my rules" gives its number, you send the new rule on one line with "learn this rule: …", then "forget rule N" for the old one (with a full list, forget first); a profile entry is not a rule; there are no proposed or candidate rules any more, so "learn rule N" and "dismiss rule N" do nothing. Ghost then answers your question or tells you which message to send. If the message is about some other kind of rule, the model is told to ignore the note.</p>
+  <p>Examples that get this note: "can you change rule 2?", "delete rule 3", "add a rule: …", "add rule: …", "new rule: …", "forget all rules", "show all rules", "list all rules", "forget the rule about news", "forget that rule", "delete the last rule", "erase rule 2", "reset my rules", "forget your rules" and "learn rule 3". A message that starts with "learn this rule" or "remember this rule" and is not taken as a command gets the note at any length. Longer messages get no note, whatever they ask. Instead, every turn that shows your rules ends the rules block with one fixed line: rules change only by "learn this rule: …" and "forget rule N", the model has no tool for them, a profile entry is not a rule, and asked to change one it names the messages to send and never says it is changed (§4TI-c, 2026-11-08: a 27-word "edit this rule, add … 1. … 4. …" got no note, and the model said "Done" after writing a profile entry while the rule stayed as it was; a matcher for long edits failed three reviews, so the operator chose the fixed line).</p>
+  <p>Examples that get no note: "my rules are working well" (no verb); "show me the rules" and "show rules" (no rule noun from the list); the old commands worded with "pending", "waiting" or "suggested" rules ("list my pending rules"); a message in Greek (the verbs and nouns are English); a message of more than 20 words, unless it starts like a dictation (the fixed line under your rules still applies).</p>
+  <p><strong>History (review r3).</strong> Before r3 these natural ways to ask got neither a command nor the note: "new rule: …", "add rule: …", "forget the rule about news", "delete the last rule", "erase rule 2", "reset my rules", "forget your rules". The verbs erase, reset, disable, undo, fix, save and make, the "rule:" label, "that rule", "the last rule" and "your rules" were added.</p>
+
+  <h3 id="bare-yes">A bare "yes" confirms nothing</h3>
+  <p>After "forget rule N" (or "forget all my rules") Ghost waits 15 minutes for the exact message "confirm forget rule N" ("confirm forget all my rules"). If you answer with a short affirmation instead, nothing is removed. A short affirmation is a message of at most 6 words that starts with y, yes, yep, yup, yeah, ok, okay, sure, absolutely, proceed, I confirm, confirm, confirmed, do it, go ahead, please do, forget it, delete it, remove it, ναι, εντάξει or οκ.</p>
+  <p>While the preview is still waiting, that message goes to the model with a different note under <code>### OWNER RULE COMMAND</code>: the system showed a preview of forgetting rule N and is waiting for the exact phrase; this message is not it, so nothing was removed and the model cannot remove it; if the owner is confirming, tell them in one sentence to send exactly "confirm forget rule N"; if they are talking about something else, ignore the note. So Ghost answers with the phrase to send.</p>
+  <p>Why: a bare "yes" may be answering something else in the conversation, so it must not delete a rule. And a model left alone with a "yes" after "Forget this rule?" could say the rule is gone when it is not.</p>
+  <p><strong>When a preview is "still waiting".</strong> Both of these have to hold (<code>_waiting_hint</code>):</p>
+  <ul>
+    <li>It is fresh: shown at most 15 minutes ago.</li>
+    <li>What it showed is still there. For "forget rule N": rule N still exists. For "forget all my rules": the rules that exist now are exactly the ones the preview listed.</li>
+  </ul>
+  <p>So the note stops as soon as the forget is confirmed, and it stops when you add a rule after a "forget all my rules" preview. Before review r3 only the 15 minutes were checked. The preview stays in the file after its confirmation, so for the rest of the 15 minutes "ok thanks" told the model that rule 2, already forgotten, was waiting to be confirmed.</p>
+  <p><strong>The order of the two notes.</strong> The preview note is tried first. A short affirmation sent while a preview is waiting gets the preview note, even when it names another rule ("ok, delete rule 1" while the preview of rule 2 is waiting). With no waiting preview, a short affirmation is treated like any other message: if it is about the rules ("ok, delete rule 2", "confirm delete rule 2", "confirm forget all rules") it gets the general note described <a href="#not-commands">above</a>; otherwise ("yes", "ok thanks") it is an ordinary message with no note. Before review r3 a short message that opened with an affirmation got no note at all when no preview was waiting, even when it named a rule.</p>
+  <p>In the code: <code>core/owner_rules.py</code> (<code>rule_command_hint(text, home)</code>, <code>RULE_HINT</code>, <code>HINT_MAX_WORDS</code>, <code>_waiting_hint</code>, <code>PENDING_HINT</code>, <code>AFFIRM_MAX_WORDS</code>), called from <code>_owner_rule_note</code> in <code>core/agent.py</code>.</p>
+
+  <h2 id="limits">Limits</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Limit</th><th>Value</th><th>What happens at the limit</th></tr></thead>
+    <tbody>
+      <tr><td>Number of rules</td><td>10</td><td>An 11th rule is refused: "You have 10 rules … Forget one first". Before 2026-11-05 an eleventh rule pushed the oldest one out of the prompt.</td></tr>
+      <tr><td>Length of a rule</td><td>8 to 400 characters</td><td>A shorter or longer text is refused and nothing is added.</td></tr>
+      <tr><td>Shape</td><td>one line</td><td>The rule is what follows the colon, on the same line; a message with more lines after it is not a command, and neither is one with a question mark in the rule. Repeated spaces and tabs become single spaces. Chat-template control tokens (<code>&lt;|…|&gt;</code>) are removed, repeatedly, until none is left. One matching pair of quotes around the whole text is removed; a quote inside the rule stays.</td></tr>
+      <tr><td>The same rule twice</td><td>one rule</td><td>Two rules are the same when their words are the same; case, spacing and punctuation do not count ("Answer in English." and "answer   in english"). The second is not added and the reply shows the first. A rule with no word characters at all (only emoji) is compared as written, so two different emoji rules are two rules. Before review r3 every such rule counted as the same rule.</td></tr>
+      <tr><td>Rule numbers</td><td>never reused</td><td>After "forget rule 3", the next new rule is not number 3. The numbers do not restart after "forget all my rules" either.</td></tr>
+      <tr><td>Confirming a forget</td><td>15 minutes</td><td>A later confirmation is refused; say "forget rule N" (or "forget all my rules") again. Only the exact confirmation phrase counts; a bare "yes" does not.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="protected">Only your commands change a rule</h2>
+  <ul>
+    <li><strong>One store.</strong> The rules live in one file, <code>$GHOST_HOME/system/owner_rules.json</code>. Until 2026-11-05 a rule was kept in two places (the lesson store and the replay ledger), and a check every few hours kept the two equal. With one file there is nothing to reconcile, and that check was removed.</li>
+    <li><strong>The model has no tool for rules.</strong> It cannot add, edit or delete one. Only the messages in the table above do.</li>
+    <li><strong>The memory tool's "forget" does not remove a rule.</strong> When you ask Ghost to forget something about a person or a topic and one of your rules mentions it (as a whole word; case and accents are ignored), the reply names that rule and points to "forget rule N".</li>
+    <li><strong>The store never replaces a file it cannot read.</strong> See the next section.</li>
+  </ul>
+
+  <h2 id="damaged">A damaged rules file</h2>
+  <p>If <code>$GHOST_HOME/system/owner_rules.json</code> is damaged or cannot be read, Ghost leaves it exactly as it is. The file is not renamed, not set aside and not overwritten. Until it reads again:</p>
+  <ul>
+    <li>No rule is shown to the model (there is no <code>### OWNER RULES</code> block).</li>
+    <li>Every rule command changes nothing and replies with this line, where <em>&lt;why&gt;</em> is the kind of damage:
+      <pre><code>Your rules file &lt;why&gt;, so I left it exactly as it is and changed nothing; no rule is
+shown to me until it reads again. It is `system/owner_rules.json` under my data folder —
+repair it, or remove it to start with no rules.</code></pre></li>
+    <li>The health check's <em>Learning</em> line says <code>owner rules file DAMAGED (&lt;why&gt;)</code>, and its problems line says the file is damaged and was left as it is.</li>
+  </ul>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Kind of damage</th><th>What the reply and the health check say (<em>&lt;why&gt;</em>)</th></tr></thead>
+    <tbody>
+      <tr><td>The content is not JSON (or not UTF-8 text)</td><td><code>is not readable JSON</code></td></tr>
+      <tr><td>A JSON key is written twice in the file (for example two <code>"rules"</code> lists). The parser would keep the last one, and the next save would drop the first.</td><td><code>is not readable JSON</code></td></tr>
+      <tr><td>The JSON is not an object</td><td><code>holds a JSON list, not an object</code> (the type found is named)</td></tr>
+      <tr><td>There is no list under <code>rules</code></td><td><code>has no list of rules</code></td></tr>
+      <tr><td>A row is not a rule: <code>n</code> is not a whole number from 1 to 999,999 (no command could name a larger one), or <code>rule</code> is not text, or the text is blank</td><td><code>holds a row that is not a rule</code></td></tr>
+      <tr><td>Two rules have the same number</td><td><code>holds two rules numbered 3</code></td></tr>
+      <tr><td>The file holds more than 10 rules (only possible by editing it by hand). The prompt block would otherwise show ten and hide the rest without saying so.</td><td><code>holds more than 10 rules</code></td></tr>
+      <tr><td>The file cannot be read (for example a permission error)</td><td><code>cannot be read (PermissionError)</code></td></tr>
+      <tr><td>There is a directory where the file should be</td><td><code>cannot be read (IsADirectoryError)</code></td></tr>
+      <tr><td>The JSON is nested too deeply</td><td><code>is nested too deeply to read</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>These are not damage:</p>
+  <ul>
+    <li><strong>An absent file.</strong> It means you have no rules.</li>
+    <li><strong>A UTF-8 byte-order mark</strong> at the start of the file (some editors add one). The file is read as usual.</li>
+    <li><strong>Exactly 10 rules.</strong> That is the limit, not above it.</li>
+    <li><strong>A <code>pending</code> entry edited by hand</strong> (not an object with a number under <code>at</code>). It is ignored, so there is no preview to confirm.</li>
+    <li><strong>A preview whose time is in the future or is not a usable time</strong> (NaN, infinity, a negative time, a whole number too large to be a clock value). It confirms nothing: a preview is valid from the moment it was shown until 15 minutes later, not before and not after (<code>_fresh</code>). Before review r2 a future time or a NaN in a hand-edited file confirmed for ever; before review r3 a number too large for a clock raised an error instead of being refused.</li>
+    <li><strong>A <code>next_n</code> that is not a whole number, or not above the highest rule number.</strong> It is raised to one above the highest, so a number is never reused.</li>
+    <li><strong>A rule text edited by hand</strong> to hold line breaks or control tokens. It is cleaned (one line, no <code>&lt;|…|&gt;</code> tokens) wherever it is shown: in the prompt block, in the list, in "show rule N", in the forget preview and in the "forgotten" line. The file itself is not rewritten for that.</li>
+  </ul>
+  <p><strong>History.</strong> The first version of this module (the same day, before review r1) set a damaged file aside and started with an empty list. The next "learn this rule" was then "Rule 1" again and the health check read "0 owner rules" as if nothing was wrong; and on a file it could not <em>read</em> it wrote a new file over the three rules that were there. That is why the store now changes nothing whenever it cannot read the file. Until review r2 a directory in the file's place read as "You have no rules" and the health check as fine. Review r3 added three kinds of damage: a rule number above 999,999, a rule whose text is blank (it would show as an empty line in the prompt block), and a key written twice.</p>
+  <p>In the code: <code>core/owner_rules.py</code> (<code>_read</code>, <code>_why_invalid</code>, <code>_fresh</code>, <code>damaged</code>, <code>_refusal</code>, <code>_clean</code>) and <code>tools/health_internals.py</code> (<code>_learning</code>).</p>
+
+  <h3 id="write-failure">When the file cannot be written</h3>
+  <p>A different case: the file reads fine, but a command that has to save (adding a rule, a forget preview, a confirmation) cannot write it, for example because the directory is read-only or the disk is full. Ghost itself answers, with the name of the error:</p>
+  <pre><code>I could not write your rules file (PermissionError), so nothing was changed. It is
+`system/owner_rules.json` under my data folder.</code></pre>
+  <p>The old file is intact, because a save writes a new file and renames it over the old one. "show my rules" and "show rule N" still work, since they only read. Before review r2 the error was swallowed: the message went to the model, which answered "learn this rule: …" with no idea that nothing had been saved.</p>
+  <p>In the code: <code>owner_rules.rule_command</code> (the <code>OSError</code> branch).</p>
+
+  <h2 id="see">How to see it</h2>
+  <dl class="kv terms">
+    <dt>In the chat</dt>
+    <dd>"show my rules".</dd>
+    <dt>Health check</dt>
+    <dd>"do a health check" — the <em>Rules</em> line reads, for example, <code>0 owner rules (of at most 10, shown on every turn)</code>. With a damaged rules file it reads <code>owner rules file DAMAGED (&lt;why&gt;)</code> instead of the count (<a href="#damaged">above</a>).</dd>
+    <dt>On disk</dt>
+    <dd><code>$GHOST_HOME/system/owner_rules.json</code> — the rules with their numbers, ids and the time each was added.</dd>
+    <dt>In the log</dt>
+    <dd><code>Owner Command</code> lines: <code>rule command: &lt;your message&gt; → &lt;what it did&gt;</code>, then <code>answered by the system — N chars, no model call</code>. For a short message about the rules that is no command, and for a bare "yes" while a forget preview is waiting: <code>not a rule command: &lt;your message&gt; → told the model the exact rule commands</code>.</dd>
+  </dl>
+  <p>The list starts empty. The five rules that existed on 2026-11-05 were deleted that day at the owner's request.</p>
+
+  <h2 id="example">An example</h2>
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>Add a rule</h4>
+        <p><strong>You:</strong> "learn this rule: when I ask for the news, give me five headlines"<br>
+        <strong>Ghost:</strong> "✓ Rule 1 added. I am shown it on every turn from now on: … Say “forget rule 1” to remove it."</p>
+      </li>
+      <li>
+        <h4>See what you have</h4>
+        <p><strong>You:</strong> "show my rules"<br>
+        <strong>Ghost:</strong> "Your rules (1 of at most 10; I am shown them on every turn): Rule 1 — when I ask for the news, give me five headlines"</p>
+      </li>
+      <li>
+        <h4>Remove it</h4>
+        <p><strong>You:</strong> "forget rule 1"<br>
+        <strong>Ghost:</strong> "Forget this rule? … Say “confirm forget rule 1” within 15 minutes to remove it."<br>
+        <strong>You:</strong> "confirm forget rule 1"<br>
+        <strong>Ghost:</strong> "✓ Rule 1 forgotten. I am no longer shown it"</p>
+      </li>
+    </ol>
+  </div>
+
+  <h2 id="known-limits">Known limits</h2>
+  <ul>
+    <li><strong>One line with a rule and a second request is stored as written.</strong> "learn this rule: answer in English, and now tell me the weather" has a colon, one line and no question mark, so all of it becomes the rule. The reply quotes what was stored and how to remove it (<a href="#dictating">above</a>).</li>
+    <li><strong>A rule cannot contain a question mark.</strong> Not even inside a quoted phrase: "when I ask 'what's new?' …" is not taken. Write the rule without the mark (<a href="#dictating">above</a>).</li>
+    <li><strong>Only English phrasings are recognised.</strong> The commands are English, and a message about your rules in Greek gets no note. (A Greek "ναι", "εντάξει" or "οκ" after a forget preview does get the preview note.)</li>
+    <li><strong>A command is carried out when it arrives, not when its turn starts.</strong> Ghost handles one request at a time. A command sent while another request is still running is carried out at once, and its reply waits for the running request to finish. If that wait is cancelled (you stop the request before it is answered), the change stays (the rule is added or removed) and its "✓" line is never shown. "show my rules" shows the real state.</li>
+    <li><strong>A bare "yes" never confirms a forget</strong>, even when it is the obvious answer to "Forget this rule?" (<a href="#bare-yes">above</a>).</li>
+    <li><strong>With no memory directory configured, no command runs.</strong> The rules file lives beside the memory directory. An agent started without one treats every rule command as an ordinary message. (Before review r2 an empty path made the file land in the directory the agent was started from.)</li>
+  </ul>
+
+  <h2 id="retired-commands">Commands that were retired</h2>
+  <p>The commands of the removed replay loop and of the regression suite are not commands any more. The system does not answer them and they change nothing. Each is an ordinary message that reaches the model.</p>
+  <p>When such a message is short (at most 20 words) and names a rule number or "proposed" / "candidate" rules, the model gets the <code>### OWNER RULE COMMAND</code> note described <a href="#not-commands">above</a>. The note says that there are no proposed or candidate rules any more (the loop that proposed them was removed on 2026-11-05), that "learn rule N" and "dismiss rule N" do nothing, and which exact messages show or change a rule. Ghost's reply is the model's own, written with that note in front of it.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Retired command</th><th>What it did until 2026-11-05</th><th>Today</th></tr></thead>
+    <tbody>
+      <tr><td><code>learn rule N</code>, <code>adopt rule N</code> (also with "candidate": <code>learn candidate rule N</code>)</td><td>Adopted a rule the replay loop had proposed.</td><td>An ordinary message. It changes nothing and reaches the model with the note.</td></tr>
+      <tr><td><code>dismiss rule N</code>, <code>reject rule N</code></td><td>Set one proposed rule aside.</td><td>An ordinary message. It changes nothing and reaches the model with the note.</td></tr>
+      <tr><td><code>replace rule N with rule M</code> (also <code>… with candidate M</code>)</td><td>Swapped an adopted rule for a proposed one covering the same situation.</td><td>An ordinary message. It changes nothing and reaches the model with the note.</td></tr>
+      <tr><td><code>show all proposed rules</code>, <code>list my candidate rules</code>, <code>dismiss all proposed rules</code>, <code>forget all candidate rules</code></td><td>Listed the rules waiting for a decision, or set all of them aside.</td><td>An ordinary message. It changes nothing and reaches the model with the note.</td></tr>
+      <tr><td>The old confirmations: <code>confirm dismiss rule N</code>, <code>confirm reject rule N</code>, <code>confirm dismiss all proposed rules</code></td><td>Confirmed setting proposed rules aside.</td><td>An ordinary message for the model. It changes nothing. A short message that starts with "confirm" is read as an affirmation (<a href="#bare-yes">above</a>): it gets the forget-preview note while a forget preview is waiting, and the general note otherwise (it names a rule number or "proposed" rules).</td></tr>
+      <tr><td>The same with "pending", "waiting" or "suggested": <code>list my pending rules</code>, <code>delete all pending rules</code>, <code>list all the suggested rules</code></td><td>Other spellings of the row above.</td><td>An ordinary message for the model, with no note: these words are also what one says about lint or firewall rules.</td></tr>
+      <tr><td><code>keep test N</code>, <code>edit test N: …</code>, <code>forget test N</code>, <code>show test N</code></td><td>Managed one regression test.</td><td>An ordinary message for the model, with no note.</td></tr>
+      <tr><td><code>show regression tests</code>, <code>run regression tests</code></td><td>Listed or ran the regression suite.</td><td>An ordinary message for the model, with no note.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>History.</strong> For a few hours on 2026-11-05, between the two reviews, the old rule commands were still matched and the system answered each with one fixed line saying the replay loop was removed. Review r2 found that this matcher also answered "list all the suggested rules", "delete all pending rules" and "replace rule 3 with rule 7" in conversations about other rules (lint rules Ghost had just suggested, a firewall). A command gets no model call, so nothing could tell the two apart. The matcher and its fixed line were removed. A note to the model costs a wrong match nothing: it ends with "if the message is about some other kind of rule, ignore this note".</p>
+  <p>The regression-test commands were never part of that matcher after review r1. "show test 3" and "run the regression tests" are things an owner says in a coding chat, the owner never kept a test, and review r1 found the system answering "run the regression tests" in such a chat.</p>
+
+  <h2 id="removed">What was removed on 2026-11-05, and why</h2>
+  <p>The learning system was evaluated after the replay loop had been live for 27 days. One part had a measured effect: a rule the owner approved, shown on every turn. That part was kept, without the machinery that fed it.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>What</th><th>What it did</th><th>Why it went</th></tr></thead>
+    <tbody>
+      <tr><td>The failure-replay loop (the idle "self-play slot", <code>core/failure_replay.py</code>)</td><td>After about an hour of quiet it replayed one of your flagged requests, diagnosed it, tested one candidate rule and proposed it to you. "learn rule N" adopted it.</td><td>In 27 days: 13 replays, 9 proposed rules, 5 adopted. Two of the five were the same rule and three restated "say only what the tool output shows". Nothing new was proposed in the last 17 days: 30 of 30 flagged turns were follow-ups in a conversation or action requests, which a replay cannot rebuild. Over 30 days, 10 of 88 flagged turns became a case.</td></tr>
+      <tr><td>The regression suite (<code>core/regression.py</code>)</td><td>Tests you approved with "keep test N" were re-asked after each update and once a day, and a failure was reported.</td><td>It held 0 kept tests.</td></tr>
+      <tr><td>The reaction judge (<code>distill/reaction_judge.py</code>, <code>core/owner_seeds.py</code>)</td><td>A background call on the main model that read your next message and decided whether it showed the previous reply had failed.</td><td>It ran 1 to 6 background calls a day on the main model, and its only consumers were the two parts above.</td></tr>
+      <tr><td>The supervised run endpoint</td><td><code>POST</code> / <code>GET /api/operator/self-play-slot</code> ran the idle slot once on demand.</td><td>The slot it ran is gone.</td></tr>
+      <tr><td>The read-only "replay" request origin</td><td>Replays and test runs (request ids <code>probe-fr-…</code>, <code>probe-rt-…</code>) were refused any tool that writes.</td><td>Nothing sends such a request any more. The constant <code>ORIGIN_REPLAY</code> and the "replay" branches of the lab and project tools were removed with it.</td></tr>
+      <tr><td><code>GHOST_SELFPLAY_COOLDOWN_S</code></td><td>The cooldown between idle slots (4 hours by default).</td><td>The slot is gone.</td></tr>
+      <tr><td>The owner-rule integrity check (§4OR)</td><td>Store maintenance compared the rules in the lesson store with the replay ledger and restored a changed one.</td><td>There is one store now.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>What a 👎 or a correction does now: it is still recorded as your label on that turn. The label is read by the failure census (an operator report of how answers went) and by the index of graded past turns. It no longer starts a replay, and nothing is proposed from it. The web page answers a 👎 with a hint instead (next section).</p>
+
+  <h2 id="thumbs-down">The hint after a 👎</h2>
+  <p>A thumbs-down alone teaches Ghost nothing any more; a rule you state does. So when a 👎 is recorded, the answer of <code>POST /api/feedback</code> carries one extra field, <code>hint</code>, with this text (<code>owner_rules.FEEDBACK_HINT</code>):</p>
+  <pre><code>Noted. If there is something I should always do differently, state it as a rule — say:
+learn this rule: &lt;the rule&gt;</code></pre>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Case</th><th>Hint in the answer?</th></tr></thead>
+    <tbody>
+      <tr><td>A 👎 that was recorded (a new label, or a 👍 changed to 👎)</td><td>Yes</td></tr>
+      <tr><td>A 👎 repeated on a turn that already has a 👎 (the answer says <code>unchanged</code>)</td><td>No</td></tr>
+      <tr><td>A 👍</td><td>No</td></tr>
+      <tr><td>A label that failed (unknown request id, a member's turn, a bad signal)</td><td>No</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The web page shows the hint as a system line in the chat, once per page load, and only after the thumb you tapped is latched (so a hint that fails to parse cannot make a recorded label look lost). Reload the page and the next 👎 shows it again. Other clients receive the same field and may ignore it.</p>
+  <p>In the code: <code>api/routes.py</code> (<code>feedback</code>), <code>core/owner_rules.py</code> (<code>FEEDBACK_HINT</code>) and <code>interface/static/app.js</code> (<code>sendFeedback</code>, <code>_ruleHintShown</code>). The route is described on <a href="../interfaces/api_routes.html">api.routes</a> and the client on <a href="../interfaces/web_server.html">interface.server</a>.</p>
+  <p>One side effect in the idle schedule: the idle window (which lets the 10 to 60 minute idle jobs run again during a long quiet stretch) now restarts every hour unconditionally and never changes the clock that records when you were last active. Before, the replay slot reset that clock when it finished. The helpers that existed only for that slot (<code>_run_idle_job</code>, <code>_owner_active</code> and <code>IDLE_JOB_CAP_S</code> in <code>core/agent.py</code>) were removed with it, and <code>self_play</code> was added to the retired phases of the activity ledger, so its old heartbeat rows are skipped by the liveness table. See <a href="../reliability/checking_and_learning.html">Checking and learning</a>.</p>
+
+  <h2 id="retired">What else was retired</h2>
+  <p>The parts of the old learning system that outlived the replay loop, and what became of them.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>What</th><th>State today</th></tr></thead>
+    <tbody>
+      <tr><td>The automatic-lesson store (the "playbook", <code>memory/skills.py</code>)</td><td><strong>Removed on 2026-11-06 (§4TD).</strong> The lessons Ghost once wrote for itself had been out of every prompt since 2026-10-13 (§4ON): on 10 real requests, 3 samples each, graded blind, they changed nothing measurable and made replies about 45 % slower. Its old data is purged at deploy (<code>scripts/lesson_purge_4td.py</code>). <a href="../index.html">What it was</a>.</td></tr>
+      <tr><td>The <code>learn_skill</code> and <code>list_lessons</code> tools</td><td><strong>Removed on 2026-11-06 (§4TD)</strong> with the store (<code>learn_skill</code>: 0 calls in 30 days). A call to either name is an unknown tool. To make an instruction stick, use "learn this rule: …".</td></tr>
+      <tr><td>The lesson sections of the learning report (<code>introspect action='learning'</code>)</td><td><strong>Removed on 2026-11-06 (§4TD).</strong> The report keeps what is not about lessons: episodes, which background jobs fired, what the loops produced, verifier escalations.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Acquired skills are a different thing and are staying: a skill is a small program Ghost can run (created with <code>create_skill</code>, managed with <code>manage_skills</code>), for example the <code>news_headlines</code> skill.</p>
+
+  <h2 id="macros">Macros were removed: use a rule for a recurring bundle</h2>
+  <p>Composed skills, also called macros, were named sequences of tool calls (the <code>manage_composed_skills</code> tool). They were removed on 2026-11-05 (§4TA). Nothing had proposed one since 2026-10-11, the 12 proposed ones were never approved, and of the 4 that were active three were never used. Their tool definitions cost about 1,650 tokens on every request.</p>
+  <p>For a bundle you ask for often, dictate a rule, and Ghost calls the tools itself. For example:</p>
+  <pre><code>learn this rule: when I ask for my daily report, give me the weather, the news headlines and a health check</code></pre>
+  <p>After that, "give me my daily report" makes Ghost call the weather lookup, the <code>news_headlines</code> skill and the health check, and answer from the three results. This was tested live before the macro engine was removed.</p>
+  <p>What else changed:</p>
+  <ul>
+    <li><code>youtube_transcribe</code>, the one macro in real use, is a built-in tool with the same name. Paste a YouTube link as before.</li>
+    <li>Custom tools are still created with <code>create_skill</code> and listed or deleted with <code>manage_skills</code>.</li>
+  </ul>
+  <p>Details for maintainers: <a href="../index.html">composed_skills (removed)</a>.</p>
+
+  <h2 id="off">What was removed earlier</h2>
+  <p>These used to run on their own. Each was measured on real turns in October 2026, found not to help, switched off on 2026-10-10 (§4NC/§4ND) and deleted from the code on 2026-10-11 (§4NM). There is no switch that brings any of them back, except the last row, the verifier's LLM judge, which is switched off rather than deleted.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>What</th><th>What it did</th><th>Why it went</th></tr></thead>
+    <tbody>
+      <tr><td>Self-written lessons</td><td>Reflection, post-mortems (and their <code>postmortem</code> tool), failure distillation and the maintenance pass's former REM consolidation wrote lessons for itself.</td><td>Reached their turn 18% of the time; changed the answer in 3 of 20.</td></tr>
+      <tr><td>Practice on invented exercises</td><td>Synthetic self-play: challenge templates, journal-mined challenges, an adversarial generator aimed at weak clusters, frontier selection, counterfactual replay, novelty and self-play scoring.</td><td>Passed 8 of 9 at the first try, so there was nothing to learn. It was replaced by the replay of real failures, which was itself removed on 2026-11-05 (above).</td></tr>
+      <tr><td>Automatic skills and skill pruning</td><td>Turned repeated tool sequences into "skills"; retired lessons by a utility score.</td><td>Trivial sequences that quoted old requests back into 19 of 86 prompts; the pruning deleted 13 good lessons on noisy labels.</td></tr>
+      <tr><td>Session, graph and episode memory in every prompt</td><td>Added related memories and past replies to every prompt.</td><td>20% / 15% relevant, 16% / 19% harmful; past replies were raw and undated. Facts about you stay in every prompt; <code>recall</code> on request still searches all three stores.</td></tr>
+      <tr><td>Routing, planning, foresight, risk steering, plan scoring</td><td>The complexity router and the System-2 planner it gated, per-tool-call outcome predictions and the imagination gate, the risk governor, the PRM and MCTS.</td><td>Nothing used their output, or it was measurably wrong (risk depth estimates 10–26 points off).</td></tr>
+      <tr><td>Self-run experiments, prompt tuning</td><td>A/B arms on live traffic with a PPI estimator; GEPA prompt and tool-description tuning with a daily live judge and a self-launching optimizer.</td><td>The experiments had too little traffic to ever reach a verdict (the arm machinery itself, and <code>introspect</code>'s <code>experiments</code> action, were removed in a second pass the same day, §4NN); no tuned prompt was ever shown to help on live traffic.</td></tr>
+      <tr><td>Scaffold evolution, bench banks</td><td>Self-proposed code changes behind a fence, scored on imported graded tasks.</td><td>The banks were saturated (≥90%) and nothing ever shipped.</td></tr>
+      <tr><td>Announced-work check, the wake-up prefix, the derived-mood job, the verifier's corrections to you</td><td>A worker-model check that a reply only announced work; self-state in every prompt; a mood derived from it while idle (the mood derived after each of your turns stayed until 2026-11-06, when a mood that moves with events and decays replaced it); a switch to show you the verifier's refusals.</td><td>0 hits in 328 checks; tokens that steered answers; 2 of the last 3 shown corrections were false. Verdicts are still recorded with the turn.</td></tr>
+      <tr><td>The LLM judge of the verifier (§4OW, 2026-10-14)</td><td>A second model (Nova, with escalation to the main model) read each answer against the turn's evidence and refused unsupported ones.</td><td>Wrong on 9 of 17 refusals in a week of real traffic, and shown to no one. The mechanical checks stay on. <code>GHOST_VERIFIER_JUDGE=1</code> turns the judge back on.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>What still runs on every answer are the mechanical checks (does a built page load, do claimed files exist, is the reply an answer, does an image show what the reply says) — see <a href="../reliability/checking_and_learning.html">Checking and learning</a>. The confidence score that once picked which answers got a deeper check was deleted on 2026-10-16 (§4PJ): it ranked answers no better than a coin flip.</p>
+
+  <h2>What this does not do</h2>
+  <ul>
+    <li><strong>Ghost does not propose rules.</strong> If an answer was wrong and you want it handled differently, state the rule yourself.</li>
+    <li><strong>A rule is a sentence in the prompt.</strong> The model can ignore it. There is no automatic test that a rule is followed.</li>
+    <li><strong>Every rule costs prompt space on every turn.</strong> That is why there are at most 10, each at most 400 characters.</li>
+    <li><strong>Rules are yours only.</strong> They are not shown on a member's turn or in a public channel, and a member cannot add one.</li>
+  </ul>
+  <p>For the module-level detail: <a href="../infrastructure/agent.html#4sz">§4SZ on the agent page</a>, <a href="../reliability/feedback.html">core.feedback</a> (the 👍/👎 labels). The record of the removed loop is kept on the agent page (<a href="../infrastructure/agent.html#4mw-loop">the failure-replay loop</a>, <a href="../infrastructure/agent.html#4nb">the earlier rule commands</a>), each marked as removed.</p>
+
+  <div class="pager">
+    <a class="prev" href="../reliability/checking_and_learning.html">
+      <span class="dir">Previous</span>
+      <span class="to">Checking and learning</span>
+    </a>
+    <a class="next" href="../infrastructure/safety.html">
+      <span class="dir">Next</span>
+      <span class="to">Safety and privacy</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>core/owner_rules.py</code> (as rewritten after reviews r1, r2 and r3), <code>core/agent.py</code> (<code>_owner_rule_note</code>, <code>_message_lines</code>, <code>_owner_rules_block</code>, the idle window), <code>api/routes.py</code> (<code>/api/feedback</code>), <code>interface/static/app.js</code> (<code>sendFeedback</code>) and <code>tools/health_internals.py</code> on 2026-11-05 (§4SZ). Tests: <code>tests/test_4sz_owner_rules.py</code>, <code>tests/test_4sz_system_commands.py</code>, <code>tests/test_4sz_idle_window.py</code>, <code>tests/test_4sz_kept_guards.py</code>, <code>tests/test_4sz_thumbs_down_hint.py</code>.</p>
+  </footer>
+</main>
+</body>
+</html>

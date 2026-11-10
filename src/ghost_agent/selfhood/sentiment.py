@@ -392,11 +392,14 @@ async def score_message(content, root, *, request_id: str = "", tor_proxy: Optio
 
 def rating_line(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -> str:
     """The log line's content: the rating and what it did to the mood, never the words.
-    ``positive 0.95 (neg 0.01 · neu 0.04) · mood +0.08``, ``neutral 0.89 (…) · mood unmoved (neutral)``,
-    ``unknown — not English · mood unmoved``."""
+    ``positive 0.95 (neg 0.01 · neu 0.04) · mood +0.08``, ``neutral 0.89 (…) · mood unmoved — message neutral``,
+    ``unknown — not English · mood unmoved``. A neutral message says so in words: a bare ``(neutral)`` read as the
+    MOOD being neutral while the owner's set mood held."""
     label = str(answer.get("label") or "")
     if nudge:
         effect = f"mood {nudge:+.2f}".replace("-", "−")
+    elif held == "neutral" and label == "neutral":
+        effect = "mood unmoved — message neutral"
     else:
         effect = "mood unmoved" + (f" ({held})" if held and label != "unknown" else "")
     if label == "unknown":

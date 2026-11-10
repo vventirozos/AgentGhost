@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Autonomous activity (core.autonomous_activity) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a class="current" href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a href="background_jobs.html">Background jobs</a>
+      <a href="cross_project_map.html">Cross-project map</a>
+      <a href="long_tasks.html">Long tasks</a>
+      <a href="planning.html">Planning (core.planning)</a>
+      <a href="project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a href="project_research.html">Project research (core.project_research)</a>
+      <a href="project_safety.html">Project safety (core.project_safety)</a>
+      <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="projects_routes.html">Projects API (api.projects_routes)</a>
+      <a href="projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="task_close.html">Closing tasks (core.task_close)</a>
+      <a href="task_kind.html">Task kinds (core.task_kind)</a>
+      <a href="task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / autonomous_activity.py <span class="mono">+ utils/notify.py</span></h1>
+  <p class="subtitle">The agent's "mouth" (2026-07-11): a structured ledger of
+  autonomous outcomes + an all-phase "Background activity" digest + outbound
+  push notifications. Closes the biggest open loop of the 2026-07 feature
+  survey — the agent did real work while idle but had no way to tell anyone.</p>
+
+  <h2>Why</h2>
+  <p>Before this module, 12 of the 13 idle phases surfaced their outcomes only
+  as <code>pretty_log</code> lines on the console; the post-mortem defect queue
+  had <em>no</em> surfacing at all; and scheduled turns (cron jobs that fire a
+  full <code>handle_chat</code>) <strong>discarded their final content</strong>
+  — only pass/fail reached the workspace ledger. Only project autoadvance had
+  a user-facing digest (<code>core.project_digest</code>), and even that was
+  pull-only. Blocked <em>needs-user</em> project tasks accumulated silently
+  until the operator happened to open a chat.</p>
+
+  <h2>The ledger</h2>
+  <p><code>ActivityLog</code> — append-only JSONL at
+  <code>$GHOST_HOME/system/autonomous_activity.jsonl</code>. One record per
+  operator-relevant autonomous outcome:
+  <code>{ts, phase, summary, severity, meta}</code>. Two severities:</p>
+  <ul>
+    <li><code>info</code> — digest-only (maintenance ran, narratives, …).</li>
+    <li><code>notify</code> — digest <em>plus</em> immediate push + the
+    external-consumer feed (needs-user project tasks, scheduled-turn
+    conclusions).</li>
+  </ul>
+  <p>Fail-safe by contract: <code>record()</code>/<code>read_since()</code>
+  never raise into a caller — a broken ledger must never break a turn or an
+  idle phase. <code>read_since(offset)</code> is byte-offset watermarked,
+  only consumes complete lines (a partially-written tail is left for the next
+  read), skips corrupt lines, and silently re-baselines on a stale offset.</p>
+
+  <h2>Producers</h2>
+  <ul>
+    <li><strong>Idle phases</strong> — <code>GhostAgent._record_autonomous_activity</code>
+    is called at each phase's completion point in <code>_biological_tick</code> (the idle scheduler's tick):
+    the maintenance cycle (logged as <code>maintenance</code> since 2026-10-11, §4NM — older rows say
+    <code>dream</code> and are read as <code>maintenance</code> via <code>PHASE_ALIASES</code> /
+    <code>canonical_phase</code>, ledger and heartbeat alike; the row's summary is the pass's own
+    line, <code>N project activity digests written; N project file descriptions written; store backup taken (&lt;file&gt;) / no store backup this pass (one a day) / FAILED; memory graph cleaned: N stale links removed, N duplicate entities merged</code> (or <code>memory graph cleanup not due (every 6 h)</code> / <code>FAILED</code>), then the memory reconcile's repairs when it made any, led by <code>nothing needed — </code> when the pass changed nothing (§4PQ; it read <code>maintenance: project digests N, manifests N, snapshot yes/no, graph pruned N, graph merged N</code> until 2026-10-16)),
+    the narratives (the calibration refit also wrote rows until its removal in &sect;4PJ, 2026-10-16; the stale open-questions job, phase <code>open_questions</code>, until 2026-11-05 — &sect;4TB removed it with the <code>self_state</code> tool and added the phase to <code>RETIRED_PHASES</code>). Until 2026-11-05 the
+    failure-replay slot also wrote rows here (phase <code>self_play</code>, shown as <code>self-play</code>: replay stages, reaction-judge
+    passes, regression-suite runs, &sect;4MW/&sect;4NE); the slot was removed in &sect;4SZ, and
+    <code>PHASE_EXPECTATION</code> no longer lists <code>self_play</code>, so nothing expects its heartbeat.
+    <code>self_play</code> was also added to <code>RETIRED_PHASES</code> (beside <code>calibration</code>, &sect;4PJ): the
+    liveness table skips a retired phase, so the slot's old heartbeat rows are not printed as an
+    "UNREGISTERED phase" for the 7 days they stay in the table's window.
+    <code>maintenance</code> is the only phase registered as periodic. The phases that used to write rows
+    here — reflection, post-mortem, skills_auto, the PRM and router retrains, bench, dream
+    replay and evolve — were removed on 2026-10-11 (&sect;4NM); their old rows stay readable.</li>
+    <li><strong>Project advancer</strong> — <code>_record_needs_user_activity</code>
+    pushes <code>severity=notify</code> records for
+    <code>autoadvance_needs_user</code> / <code>human_gate_triggered</code>
+    outcomes (all three sites). The digest renderer <em>excludes</em> the
+    <code>project</code> phase (<code>DIGEST_EXCLUDED_PHASES</code>) because the
+    project digest already renders those — the record exists purely for push.</li>
+    <li><strong>Scheduled turns</strong> — <code>main._run_proactive_task</code>
+    now captures <code>handle_chat</code>'s returned content and sinks it via
+    <code>record_scheduled_result()</code> (severity=notify — a cron job's whole
+    point is "tell me what you found"). Failures are recorded too.</li>
+    <li><strong>The model itself</strong> — the <code>notify_operator</code>
+    tool (<code>tools/notify_tool.py</code>, added later on 2026-07-11) lets
+    the agent DELIBERATELY push one short line (severity=notify, phase
+    <code>agent_message</code>) when asked to "report back in Slack" / "notify
+    me" or when long background work concludes. Rails: 500-char clamp,
+    12/hour rate limit, and an <em>honesty contract</em> — the confirmation
+    names only the delivery channels that are actually live instead of claiming
+    "sent to Slack" blindly (made true on 2026-11-05: see <a href="#4tb">&sect;4TB</a> —
+    until then it listed every client that had <em>ever</em> acknowledged). Delegated sub-agents could NOT reach this tool
+    (not in their allowlist — the main agent reports; a delegate paging the
+    operator is spam surface; sub-agents were removed 2026-10-30, §4SI). Tests:
+    <code>tests/test_notify_operator.py</code> (14).
+    <br><strong>Finish-line guard (2026-07-13, req 11fe11d8):</strong> the model
+    can PLAN the notify call in its reasoning and then finalize without making
+    it — the user's one explicit delivery requirement silently dropped (the
+    verifier confirms such turns: the deliverable itself is fine). The turn
+    loop now detects an explicit notify-me ask in the user text
+    (<code>_user_asked_for_notification</code> — narrow by design; negations and
+    questions <em>about</em> Slack don't arm it) and, when a turn is about to
+    ship its final response with <code>notify_operator</code> never called,
+    injects ONE steer toward the call (never against a force-finalising
+    loop-breaker; one-shot per request). Tests:
+    <code>tests/test_notify_finish_guard.py</code>.
+    <br><strong>Bug hunt (2026-07-14):</strong> (a) the 12/hour rate limit
+    consumed a slot in <code>_rate_limited()</code> BEFORE the record was
+    written, so a failed write still burned budget — split into a check
+    (<code>_rate_limited</code>) and a commit (<code>_note_sent</code>, called
+    only after a successful write); (b) push egress classification
+    (<code>utils/notify.py</code> <code>url_needs_tor</code>) diverged from the
+    egress guard's LAN-suffix list — a <code>.home</code>/<code>.arpa</code>
+    target was called "direct" here but BLOCKED at the socket under
+    <code>--mandatory-tor</code>, silently dropping the push. Now both share the
+    guard's constants; (c) the fire-and-forget <code>send_soon</code> task is
+    retained (asyncio holds only a weak ref → possible GC-drop mid-push).</li>
+  </ul>
+
+  <h2>Consumers</h2>
+  <ol>
+    <li><strong>Next-turn digest</strong> — <code>_finalize_and_return</code>
+    renders unseen records as a <em>"Background activity while you were
+    away:"</em> header (after the project digest), watermarked at
+    <code>$GHOST_HOME/system/activity_digest.json</code>; first run baselines
+    silently. Each item is clamped to 140 chars so the whole block stays under
+    the 1500-char bound <code>_strip_leading_banners</code> peels — a longer
+    block would break the correction-fingerprint peel (the 2026-07-07 bug
+    class). The banner-peel loop allows up to 5 stacked blocks now
+    (correction + clarifying + project digest + activity digest + headroom).
+    <br><strong>Notify-only since 2026-07-17 (operator decision).</strong> The
+    banner renders <code>severity="notify"</code> records only
+    (<code>severities=(SEVERITY_NOTIFY,)</code> at the call site): scheduled-task
+    conclusions, deliberate <code>notify_operator</code> messages, failures.
+    Routine info-severity maintenance (the maintenance phase, calibration refits until &sect;4PJ, replay
+    stages — and, before §4NM, the PRM / router retrains and skills graduation) had every post-idle reply opening
+    with a wall of refit bullets the operator already saw on the live stream —
+    it no longer auto-surfaces anywhere in chat. The watermark still advances
+    over info records (seen-but-silent), and identical (phase, summary) repeats
+    collapse into one <code>(×N)</code> line. The info records remain reachable
+    on demand — see consumer 4.</li>
+    <li><strong>Outbound push</strong> — <code>utils.notify.OutboundNotifier</code>,
+    wired as the ledger's <code>on_notify</code> callback in <code>main.py</code>.
+    Transports: <code>--notify-webhook</code> (JSON POST) and/or
+    <code>--notify-ntfy</code> (ntfy text POST), env fallbacks
+    <code>GHOST_NOTIFY_WEBHOOK</code>/<code>GHOST_NOTIFY_NTFY</code>.
+    <strong>Egress posture:</strong> loopback/RFC1918/Tailscale-CGNAT/LAN-suffix
+    targets connect directly (the egress guard allows them); PUBLIC targets are
+    only reached through the Tor SOCKS proxy (upgraded to <code>socks5h://</code>
+    so DNS resolves inside Tor); with mandatory-tor and no proxy, a public
+    target is skipped outright. Best-effort: one retry per transport, failures
+    logged and swallowed — the durable record is already in the ledger.</li>
+    <li><strong>External deliverers</strong> —
+    <code>GET /api/notifications/pending?consumer=NAME</code> returns undelivered
+    <code>notify</code>-severity records + a watermark;
+    <code>POST /api/notifications/ack</code> advances the per-consumer watermark
+    (stored in <code>$GHOST_HOME/system/notify_consumers.json</code>). A consumer
+    that never acked is baselined to end-of-ledger (no historical replay).
+    The Slack bot (<code>interface/externals/slack_bot</code>) runs a
+    <code>notification_poller</code> when <code>GHOST_NOTIFY_SLACK_CHANNEL</code>
+    is set — poll → <code>chat_postMessage</code> → ack, so a crash re-serves
+    rather than drops.
+    <br><strong>Wedge fixed 2026-07-13 (both halves).</strong> The pipeline was
+    silently dead 2026-07-11→13: (a) <em>server</em> — <code>read_since</code>'s
+    <code>limit</code> bounds <em>scanned lines</em>, so a poll window full of
+    info-severity records (dream/self-play spam) returned <code>[]</code> without
+    ever reaching the notify records beyond it; <code>pending</code> now scans
+    forward in 200-line chunks (≤50/poll) until it has <code>limit</code> notify
+    records or EOF, and <code>limit</code> is a soft bound — whole chunks are
+    kept, since truncating mid-chunk would advance the watermark past records
+    never returned; (b) <em>bot</em> — the poller only acked non-empty
+    responses, so the empty-but-advanced watermark was never persisted and every
+    poll re-scanned the same window forever. The bot now acks every response
+    that carries a watermark (still after delivery, so at-least-once holds) and
+    logs <code>delivered N notification(s)</code> so a silent pipeline is
+    diagnosable. Backlog proof at fix time: 4 stranded records (2 days) arrived
+    in one DM.
+    <br><strong>Ack clamp (2026-07-14 bug hunt).</strong> The wedge above had a
+    twin on the CLIENT side: <code>/ack</code> stored the posted watermark
+    verbatim, so a value past EOF (client bug, or a stale large value replayed
+    after a ledger truncation) permanently wedged the consumer — every
+    <code>/pending</code> then returned nothing and re-echoed the huge watermark,
+    so no future record was ever served. Ack now clamps to
+    <code>[0, current_offset()]</code>.</li>
+    <li><strong>On-demand report (2026-07-17)</strong> —
+    <code>introspect action='activity'</code> (tools/introspect.py →
+    <code>render_activity_report</code>): the model-facing answer to
+    <em>"what did you do while I was away?"</em> now that maintenance is
+    silent in the banner. ALL severities, newest first, timestamped ages,
+    <code>(×N)</code>-collapsed; <code>hours</code> window (default 24, cap
+    336) and <code>limit</code> (default 30, cap 100). Reads the whole ledger
+    from byte 0 (≈100KB/week — cheaper than a second watermark) and does NOT
+    consume the banner watermark: it is a read, not an ack. Branches BEFORE
+    the tool's <code>self_model</code> gate, so it works with selfhood
+    disabled; the registry passes <code>context</code> through for
+    <code>get_activity_log</code>.</li>
+  </ol>
+
+  <h2>Internal-request gate</h2>
+  <p>Turns the agent fires at itself (req_id prefixes <code>sched-</code>,
+  <code>job-</code>, <code>sub-</code>; see
+  <code>INTERNAL_REQUEST_PREFIXES</code>) skip BOTH digest blocks — an internal
+  turn consuming the watermark would silently eat the operator's next "while
+  you were away" report. This also fixed a latent bug where a cron turn
+  consumed the <em>project</em> digest watermark.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_autonomous_activity.py</code> — ledger roundtrip /
+  offsets / corruption / partial-tail, watermark + consumer semantics, digest
+  rendering incl. the banner-strip contract, the notify-only severity gate +
+  ×N dedupe + on-demand report (2026-07-17;
+  <code>introspect action='activity'</code> coverage lives in
+  <code>tests/test_selfhood_introspect_tool.py</code>), scheduled-turn
+  capture, notifier
+  egress routing + MockTransport delivery, the /api/notifications endpoints,
+  and source-inspection wiring checks for main.py / agent.py /
+  project_advancer.py / the Slack poller.</p>
+
+  <h2>Promised-notification backstop at finalize (2026-08-01, req 50855398)</h2>
+  <p>When the user explicitly asked to be notified ("notify me in slack when you're done") and
+  the turn ends WITHOUT a <code>notify_operator</code> call, <code>core/agent.py</code>'s
+  <code>_notify_promise_backstop</code> writes the notify-severity record directly at finalize —
+  model not involved. The in-loop finish-line guard (2026-07-13) steers the model once but
+  deliberately stands down on force-finalising ends (strike cap, think-loop halt) — which is
+  exactly when the promise matters most: the incident request died at strike 6/6 after 1789s,
+  the notification never fired, and the verifier late-refuted the turn for that alone. The
+  backstop fires on any non-internal end (aborted OR steer-ignored), labels the outcome honestly
+  ("Task stopped early after repeated failures — …" vs "Done — …"), stamps <code>req_id</code>
+  so the same turn's digest doesn't echo it, and respects <code>notify_operator</code>'s
+  12/hour budget. Review-pass hardenings (same day): the failure label keys on the strike count,
+  never <code>force_stop</code> (terminal-tool successes set it — "stopped after failures — Dream
+  cycle complete" was the bug shape); simulation turns (<code>context.simulated</code> since §4TD)
+  never page the operator; an ERRORED <code>notify_operator</code> call does not count as
+  promise-kept; and the STREAMED final path (the web UI always streams) carries its own twin
+  wiring next to the streamed trajectory/work_log block. Tests:
+  <code>tests/test_req50855398_fixes.py</code>.</p>
+
+  <h2>Notify promise persists on the PROJECT (2026-08-01, req 5299219b)</h2>
+  <p>"proceed with all tasks, notify me in slack when you're done" died 3.9s in when a restart
+  landed mid-turn. The ask lived only in that request's text: the follow-up "resume … proceed"
+  requests completed the project and no ping fired — the per-request detector and the finalize
+  backstop only read the CURRENT message. An explicit notify ask is a delivery requirement on
+  the <em>work</em>, not the message: <code>core/notify_promise.py</code> now persists it in the
+  project's metadata (<code>notify_on_done</code>) at REQUEST START — before the first LLM call,
+  so an early death can't lose it — exactly the pattern stored constraints already use. It fires
+  when the project reaches DONE/FAILED, from whichever path gets it there: both finalize twins
+  (with model-notified dedupe — a successful <code>notify_operator</code> call or a fired
+  per-request backstop consumes the flag silently) and main.py's <code>on_project_done</code>
+  hook for idle-loop completions (which stands down while a foreground request is active). The
+  flag is consumed with an ATOMIC metadata pop (<code>BEGIN IMMEDIATE</code> read-modify-write),
+  so a hook/finalize race delivers exactly once; a rate-limited attempt LEAVES the flag for a
+  later one. Records use the <code>project</code> phase: Slack/push delivery via the consumer
+  feed, no double-render in the chat banner (project digest covers that surface).</p>
+  <p>Review-pass hardenings (same day): the settle fire runs for INTERNAL turns too (a cron or
+  sub-agent turn that completes the project keeps the user's promise — only capture is
+  internal-gated, so a delegated prompt echoing "notify me…" can't store a promise nobody made);
+  an ACTIVE stored promise suppresses the per-request backstop (its "Done —" would be premature
+  mid-project and guarantee a double ping at settle time); the streamed twin fires against the
+  drain-snapshot project id, never the live pointer a concurrent turn can re-point; and a failed
+  ledger write RESTORES the consumed flag for a later retry. Known residual: a project rolled to
+  FAILED by the idle loop delivers on the next foreground turn touching it (the store's
+  done-hook fires only on DONE by design). Tests: <code>tests/test_notify_promise.py</code>
+  (13, incl. the request-52 replay).</p>
+
+  <h2>No-op consumer acks skip the write (2026-08-01)</h2>
+  <p><code>save_consumer_offset</code> returns early when the stored watermark already equals the
+  new value. Idle pollers (slack, web-ui) re-ack an unchanged watermark every ~30s; each ack
+  rewrote <code>notify_consumers.json</code> — pointless fsync churn around the clock, and it
+  kept the file's mtime permanently fresh, which destroyed the documented wedge diagnostic
+  ("stale <code>notify_consumers.json</code> mtime = wedged consumer", 2026-07-13 postmortem).
+  The Slack bot additionally skips the ack HTTP call itself when the watermark hasn't moved
+  (see <a href="../interfaces/slack_bot.html">the bot page</a>); this store-level guard covers
+  every other consumer. Tests:
+  <code>tests/test_autonomous_activity.py::test_save_consumer_offset_skips_noop_writes</code>.</p>
+
+  <h2>The idle-attempt heartbeat &mdash; <code>idle_attempts.json</code> (2026-08-30, &sect;4DY)</h2>
+
+  <p>The ledger on this page records <strong>outcomes</strong>: a phase writes a
+  row when it did something. That is the right contract for the digest, and it
+  leaves one question unanswerable &mdash; <em>did this loop run?</em> A loop
+  that ran and correctly declined looks exactly like one that never ran.</p>
+
+  <p>Measured 2026-08-30: the learning-health view printed
+  <code>&#10007; DEAD router_train 0/24h 0/7d</code> while the loop had run
+  thirty minutes earlier and logged <em>&ldquo;the labelled corpus is 89% the
+  same as the last look &hellip; not re-running the same test on the same
+  evidence&rdquo;</em>. Its last ledger row was its last real <em>retrain</em>
+  &mdash; exactly what the ledger promises. &ldquo;Produced nothing&rdquo; was
+  being rendered as &ldquo;is dead&rdquo;, and
+  <code>negative_controls</code> &mdash; genuinely stale &mdash; sat in the same
+  alarm list, which is how a column gets learned-ignored.</p>
+
+  <p>A second signal answers the other half. It lives beside the ledger at
+  <code>$GHOST_HOME/system/idle_attempts.json</code> and is deliberately
+  <strong>not</strong> more ledger rows: a skip per idle cycle would add ~30
+  rows/day to a file that never rotates, and would blur the outcome contract.</p>
+
+  <h3>Outcome classes &mdash; only <code>declined</code> suppresses</h3>
+  <div class="scroll"><table>
+    <tr><th>Value</th><th>Means</th><th>Suppresses the DEAD alarm?</th></tr>
+    <tr><td><code>entered</code></td><td>the phase started work; the outcome is unknown</td><td>No</td></tr>
+    <tr><td><code>declined</code></td><td>it ran and producing nothing was correct (skip-if-unchanged)</td><td><strong>Yes</strong></td></tr>
+    <tr><td><code>failed</code></td><td>it raised, <em>or</em> the trainer reported an exception (<code>report.exception</code>), <em>or</em> it produced a model the sanity gate rejected</td><td>No</td></tr>
+  </table></div>
+
+  <p class="warn">&#9888; <strong>Every non-success exit must stamp (2026-09-20,
+  verification round R1-1).</strong> <em>(The router phase this was found on was removed on 2026-10-11, §4NM; the rule holds for every remaining phase.)</em> The router phase had <em>two</em> places it
+  can decline: the exact corpus-fingerprint skip in the phase itself, and the
+  trainer's own &ldquo;the labelled corpus is 89% the same as the last look
+  &mdash; the deployed model stays&rdquo; bail inside
+  <code>RouterTrainer.run()</code>. The 2026-08-30 fix stamped
+  <code>declined</code> only at the first; on a corpus that grows daily the exact
+  fingerprint always changes, so the first never fired and the second &mdash;
+  the branch that actually runs, hourly &mdash; left a bare
+  <code>entered</code>. Result: <code>&#10007; DEAD router_train</code> printed
+  every day by the very view built to stop printing it. Now the in-trainer bail
+  stamps <code>declined</code> when <code>report.exception</code> is false and
+  <code>failed</code> when it is true (the trainer sets the flag at each of its
+  <code>except</code> sites; an AST pin fails if a new handler forgets it), and
+  a rejected model stamps <code>failed</code>. Executed-path pins in
+  <code>tests/test_idle_attempt_heartbeat.py</code> drive the real phase with a
+  bailing, a raising and an insane-model trainer and read the stamp back
+  &mdash; the earlier executed test accepted <code>entered</code> as a valid
+  answer, which is why it was green in both worlds.</p>
+
+  <p class="warn">&#9888; The first version stored a bare timestamp stamped at
+  entry. A loop that <em>crashes on every cycle</em> was then byte-identical to
+  one that declined, and the view asserted &ldquo;a healthy outcome-free
+  run&rdquo; about a permanently broken loop &mdash; a false <em>green</em>,
+  which this subsystem treats as worse than the false alarm it replaced. The
+  stamp is written where the phase <em>enters</em> its work, so
+  <code>entered</code> is exactly what a crash leaves behind.</p>
+
+  <h3>File contract</h3>
+  <pre><code>{"router_train": {"ts": 1788068709.49, "result": "declined"}}</code></pre>
+  <p>A <strong>bare float</strong> is the pre-outcome-class format written by
+  the first generation. It cannot prove a run declined, so it is read as
+  <code>entered</code> and never suppresses. Rows with a non-finite, boolean,
+  or unparseable <code>ts</code> are dropped individually &mdash; one bad row
+  must not discard the others.</p>
+
+  <h3>Recency is bounded on BOTH sides</h3>
+  <p><code>attempt_suppresses_alarm()</code> requires
+  <code>-60s &le; (now &minus; ts) &le; alarm_window</code>. The lower bound is
+  the point: a one-sided test let any <em>future</em> stamp &mdash; an NTP step
+  back, a hand-edited file, a JSON <code>Infinity</code> literal &mdash;
+  suppress the alarm forever. The 60&nbsp;s of slack absorbs the fact that the
+  consumer captures <code>now</code> and <em>then</em> reads the file.</p>
+
+  <h3>Writing</h3>
+  <p><code>record_attempt()</code> holds a module lock, writes through a
+  <code>pid+uuid</code> temp with <code>write_text_nofollow</code>, and
+  <code>os.replace</code>s it in. A pid-only temp name collides between
+  <em>threads</em> of one process (8&times;30 stamps recovered 0 of 240 and left
+  the file unparseable) &mdash; the same &sect;4BW shape
+  <code>sandbox/services.py</code> and <code>sandbox/jobs.py</code> already fix.
+  An unreadable file is <strong>refused</strong>, never overwritten: falling
+  back to <code>{}</code> would destroy every other phase&rsquo;s stamp.</p>
+
+  <h3>What the operator sees</h3>
+  <p>A suppressed row is stated, not silently dropped &mdash; a zero with the
+  alarm withheld is indistinguishable from a zero nobody looked at:</p>
+  <pre><code>    router_train    0 /24h    0 /7d   periodic
+        &#9492; RAN 0.5h ago and produced nothing &mdash; this loop records an
+          OUTCOME, and declining is a healthy outcome-free run.</code></pre>
+
+  <p><code>negative_controls</code> was reclassified
+  <code>EXPECT_PERIODIC &rarr; EXPECT_ON_OUTPUT</code> in the same change: it
+  runs on a <strong>seven-day</strong> interval judged against a 24&nbsp;h alarm
+  window, so a healthy weekly loop alarmed six days in seven. Its real liveness
+  signal is its own state file, which
+  <code>core/liveness.py::_negative_controls_probe</code> already reads.</p>
+
+  <h2 id="4kw-review4">Internal turns are their own population; a job wake reports <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><code>turn_origin</code> returns <code>"internal"</code> for <code>job-</code>/<code>sched-</code>/<code>sub-</code> request ids:
+    the trajectory is <code>task_kind="internal"</code>, no calibration row is booked and the turn never teaches. They were recorded
+    as <code>user_request</code> while <code>is_internal_request</code> said internal.</li>
+    <li>A finished background job's wake turn records its conclusion like a scheduled task (<code>record_scheduled_result</code>):
+    "say briefly what the job produced &mdash; the user has not seen this output" was discarded.</li>
+    <li>A restored interval task keeps its cadence (anchored at <code>created_at</code>): each restart put the next run a full
+    interval after boot, so a daily task never fired on a box restarting more often.</li>
+  </ul>
+
+<h2 id="4ld">Unprompted messages and stopping <span class="tag">2026-10-04 &sect;4LD</span></h2>
+<ul>
+  <li><strong>"Notify me when it's done"</strong> on a turn that only LAUNCHED background work (a delegate, a swarm, a
+  promoted command — a <code>job-…</code> id in its tool results) no longer sends "Done —" at launch: sub-agent and swarm
+  jobs are armed (<code>job.meta["notify_owner_req"]</code>) and <code>jobs.notify_owner_job_finished</code> writes the
+  notice with the real outcome when the job finishes; sandbox jobs already wake a turn that reports theirs. The in-loop
+  steer stands down the same way. (Delegates and the swarm were removed 2026-10-30, §4SI; promoted commands remain.)</li>
+  <li>A negation cancels a notification ask only in its own clause ("stop pinging me so often, but notify me when the
+  build is done" is an ask).</li>
+  <li>Scheduled-task pages: see <a href="tasks.html#4ld">tasks §4LD</a>. The Slack bot warns at start when
+  <code>GHOST_NOTIFY_SLACK_CHANNEL</code> names a channel (results carry the owner's context).</li>
+  <li><strong>Sub-agents</strong> running at once are capped across calls (<code>MAX_RUNNING_DELEGATES</code> = 8).</li>
+  <li><strong>Stopping:</strong> uvicorn now waits at most <code>_HTTP_SHUTDOWN_GRACE_S</code> (6 s) for open requests and
+  the watchdog <code>_BIO_SHUTDOWN_GRACE_S</code> (5 s), so the app's shutdown — drains, the abort record of an interrupted
+  turn, <code>sched.shutdown</code> — runs inside launchd's 20 s kill (45 of 49 stops died before it).</li>
+  <li><strong>Idle cooldowns</strong> persist in <code>system/idle_cooldowns.json</code>
+  (<code>_sync_idle_anchors</code>); a failing idle phase logs a WARNING at most once an hour and is listed as
+  <code>name(failed)</code>, not "ran" (<code>_idle_phase_failed</code>).</li>
+</ul>
+
+<h2 id="4lf">Background learning: what re-ran on unchanged input <span class="tag">2026-10-04 &sect;4LF</span></h2>
+<p class="note"><em>History (2026-10-11, §4NM).</em> Fresh self-play, the post-mortem engine, graduated skills, bench, dream replay, evolve and the planner named below were removed on 2026-10-11. The idle-window roll and the input keys for the narratives are what remains of this round.</p>
+<p>Measured over 28 days (285 boots): ~60% of the main model's generation was background; fresh self-play made progress
+in 1 of 197 frontier runs and its lessons were used in 1 owner turn; the selfhood and workspace narratives were rewritten
+~590× on the main model and read ~4×; dream re-ran mostly on self-play input; nine live experiments randomise owner turns
+and none can reach a verdict at current traffic. Fixed here (what runs and how often is the operator's call):</p>
+<ul>
+  <li><strong>Input keys survive a restart:</strong> both narratives keep their "input unchanged" key beside the
+  narrative (<code>*.inputkey</code>) — 213 of 354 rewrites were the first after a boot; postmortem keeps its failed
+  analyses with an attempt count (<code>postmortem_failed_analyses.json</code>, at most
+  <code>_FAILED_ANALYSIS_MAX_TRIES</code> = 3 across restarts — ~230 main-model calls re-tried the same two turns).</li>
+  <li><strong>The idle window rolls without self-play</strong> (superseded on 2026-11-05, &sect;4SZ: the slot is removed, the window restarts every hour unconditionally, and no idle phase writes the user clock; the log line is <code>no request for Nm — the idle window restarted: …</code>)<strong>:</strong> self-play's finally was the only idle-time writer of the
+  clock, so <code>--no-self-play</code> or a longer self-play cooldown silently stopped every 15–60 min phase for a whole
+  away stretch. When self-play is off or cooling down the tick rolls the phases' WINDOW anchor
+  (<code>_idle_window_at</code>; "idle-window" in the tick summary) — never the user clock, which bench, the bench drain,
+  dream replay and evolve read for their own floors (all four removed on 2026-10-11, §4NM). <code>--no-self-play</code> ablated only the failure-replay slot (the flag and the slot no longer exist).</li>
+  <li><strong>Graduated skills:</strong> only NEW evidence (higher support or changed confidence) is a verification — the
+  same corpus re-graduated every skill every run (950 "verifications" on one) and refreshed
+  <code>last_verified_at</code>, which disabled the 14-day staleness rule.</li>
+  <li><strong>Experiments:</strong> <code>imagine_preflight</code> and <code>search_yield_steer</code> are in
+  <code>TRIGGER_KEYS</code>; their triggered block was never reported. (The experiments registry was removed on 2026-10-11, §4NN; the ledger kind <code>experiment_verdict</code> is no longer produced, and its digest label was dropped in the post-§4NN tidy-up — an old row renders as its raw slug.)</li>
+</ul>
+
+<h3 id="4lf-decisions">The operator's decisions (2026-10-04, "proceed with your recommendations")</h3>
+<ul>
+  <li><strong>All nine live experiments concluded to CONTROL</strong> (<code>system/experiments.json</code>: each entry kept
+  with <code>enabled: false</code> and a dated <code>concluded</code> note; backup
+  <code>experiments.json.pre-4lf-*</code>; since §4NN nothing reads the file). None could reach a verdict at current traffic (~3,850 resolved turns per arm for
+  a 5pp effect). Owner turns no longer run the planner (control arm); self-play still forced the planner on until both were removed on 2026-10-11 (§4NM) — the inline planner and <code>--use-planning</code> were deleted outright the same day. With <code>fs_batch</code> off, the warmup primes one head again.</li>
+  <li><strong>Self-play</strong> every 4 h (<code>_SELFPLAY_COOLDOWN</code>, <code>GHOST_SELFPLAY_COOLDOWN_S</code>; both removed on 2026-11-05 with the slot, &sect;4SZ); the
+  adaptive cooldown's ceiling now scales with the base (a fixed 2 h ceiling SHORTENED a 4 h base after a failure).
+  <strong>Bench</strong> every 6 h (<code>GHOST_BENCH_COOLDOWN_S</code>).</li>
+  <li>Launcher (<code>bin/start-ghost-agent.sh</code>, backup <code>.pre-4lf-*</code>):
+  <code>--self-narrative-cooldown 86400</code>, <code>--workspace-narrative-cooldown 21600</code>,
+  <code>--calib-refit-cooldown 21600</code> (an ignored no-op since §4PJ, 2026-10-16, and no longer passed), <code>GHOST_DREAM_MIN_NEW=10</code>, <code>GHOST_NEGCTRL=0</code> (both inert since 2026-10-11, §4NM: nothing reads them).</li>
+  <li>The adaptive recall threshold is built only with <code>GHOST_ADAPTIVE_THRESHOLD=1</code> (it never changed a
+  decision under <code>--smart-memory 0.9</code>).</li>
+  <li><strong>Quiet hours:</strong> <code>/api/notifications/pending</code> serves nothing between
+  <code>GHOST_QUIET_HOURS</code> (default <code>23-07</code> local; empty/"off" disables) and leaves the watermark, so the
+  first poll after the window delivers what was held (<code>autonomous_activity.in_quiet_hours</code>).</li>
+  <li>&sect;4LI: quiet hours do not hold a batch that contains a notice the owner ASKED for (phase
+  <code>agent_message</code>: the notify tool, the "notify me when done" backstop, finished jobs, late corrections;
+  <code>scheduled_task</code> results; a project notify promise), and hold nothing while the owner was active in the
+  last 30 minutes (<code>owner_awaits</code>). The agent's own overnight noise still waits until morning. A malformed
+  <code>GHOST_QUIET_HOURS</code> is logged once. Tests run with quiet hours off (<code>tests/conftest.py</code>):
+  five notification tests failed when the suite ran at night.</li>
+  <li>&sect;4LI: the "notify me when done" backstop defers only when a finish notice was actually ARMED. A turn that
+  merely listed a finished job, or ran a sandbox job (another registry), used to send nothing at all.</li>
+  <li>&sect;4LI: scheduled and probe runs cannot <code>stop</code> the owner's tasks one at a time either. A watch is
+  checked under its real id (<code>watch_&lt;hash&gt;</code>), and the agent's own job (the idle dream monitor) does
+  not count toward <code>MAX_TASKS</code>.</li>
+</ul>
+
+<h2 id="4tb">notify_operator reports delivery truthfully <span class="tag">2026-11-05 &sect;4TB</span></h2>
+<p><strong>What was wrong.</strong> Delivery is by polling: a client (the Slack bot, the web console, the handheld) asks
+<code>/api/notifications/pending</code> and acknowledges what it showed. The tool's confirmation listed every consumer in
+<code>notify_consumers.json</code> — every client that had <em>ever</em> acknowledged — as "(poller, ≤30s)": one silent
+for five days was still a channel. It always added "next-turn digest", although a record written in an owner turn is
+left out of the digest by design (<code>_seen_in_conversation</code>, &sect;4ME). And the description promised "Slack DM /
+phone" whether or not a phone transport is configured. In four months: 26 calls, 0 errors.</p>
+<ul>
+  <li><strong>Who is polling now.</strong> The offsets file is not rewritten by an unchanged acknowledgement (see "No-op
+  consumer acks" above), so nothing on disk says whether a client is still there. The pending endpoint now notes each
+  poll in memory, on the context (<code>note_consumer_poll</code>; read with <code>consumer_polls</code>; at most 32
+  names). A restart forgets it; a live client is back at its next poll.</li>
+  <li><strong>A client is a channel only while it is polling and registered:</strong> it polled within the last
+  5 minutes (<code>CONSUMER_POLLING_WINDOW_S</code>) <em>and</em> it has a stored position. It is listed as
+  <code>the operator's '&lt;name&gt;' client (last polled 12s ago)</code>. No cadence is claimed (review: "≤30s" was
+  a guess about the client).</li>
+  <li><strong>Every other known client is named as not reachable</strong>, on a second line: a registered client
+  that is away, <code>not polling now — last polled 5.0d ago; it receives this at its next poll</code> (or
+  <code>no poll since the agent started</code>); a client that polls and has no stored position,
+  <code>connected, but not registered yet: it has not acknowledged its starting point — it may not receive
+  this</code> (it receives the message only if it then acknowledges a starting point it was given before the
+  message; one that never acknowledges is re-baselined past every record). The line names at most 6 clients and
+  then <code>+N more</code>; a name is listed once.</li>
+  <li><strong>"Queued", never "delivered".</strong> With a channel: <code>Notification queued for the operator via:
+  …</code>. With registered clients and none polling: <code>Notification queued; no client is polling right now — it
+  is delivered when one reconnects.</code> With <em>no</em> registered client (review: the sentence above is false
+  then — a first-contact client is baselined past the record): <code>Notification queued in the activity ledger; no
+  client is registered for notifications yet — a client that connects later starts after this message and will not
+  receive it (it stays readable in the activity ledger).</code> The last line says where the message goes ("ONLY to
+  the operator") and where it does not.</li>
+  <li><strong>Consumer names (review).</strong> A name arrives in a request and ends up in text the model reads. A
+  name with a line break wrote a "SYSTEM NOTE:" line of its own into the result. A name is now a plain token,
+  <code>[A-Za-z0-9_.-]{1,32}</code> (<code>valid_consumer_name</code>) <em>to be shown</em>. Review r2: the first fix
+  hid a client under any other name altogether, so with only "my phone" registered the result said no client was
+  registered and that it would not receive the message, which it did. A client counts whatever its name: any name
+  with a stored position is registered, and its polls are recorded (the table is keyed by the raw name). Only the
+  display is restricted: such a client is <code>another client (name not shown; last polled 12s ago)</code>, several
+  are <code>2 other clients (names not shown; …)</code>. A first-contact poll under an odd name is served as before
+  and not recorded. A null position in the consumers file is no registration.</li>
+  <li><strong>The poll table cannot be used against a real client (review).</strong> It holds 32 names. 33 one-shot
+  names pushed the live client out, and the next notification said nobody was polling. The endpoint now tells the
+  table whether the polling client is registered; when the table is full the oldest entry <em>without</em> a position
+  goes first, so a run of one-shot names evicts itself.</li>
+  <li><strong>An unreadable consumers file</strong> gives one plain line, <code>Clients: the client list could not be
+  read.</code>, and the head <code>Notification queued in the activity ledger; which client will show it is not
+  known.</code> Before, the whole client report was dropped silently.</li>
+  <li><strong>The digest is named only when the digest will show the record.</strong> The digest's filter is one
+  predicate, <code>digest_shows</code>, used by <code>render_activity_digest</code> and asked by the tool about a record
+  shaped like the one it wrote. A call in an owner turn is not listed there; a call in a scheduled or job turn is.</li>
+  <li><strong>The description</strong> names "their own notification channels (Slack DM, the web console; phone push
+  only when configured)" and keeps "reaches ONLY the operator".</li>
+  <li><strong>Unchanged:</strong> the 500-character clamp, the 12/hour limit, the probe dry run, the label on a message
+  written after outside content, the finish-line steer and the promise backstop (<code>_notify_delivered</code> reads
+  the declared status and the head, both as before).</li>
+</ul>
+<p>Pins: <code>tests/test_4tb_notify_delivery.py</code>.</p>
+
+<h2 id="4ms">§4MS: repeats stay</h2>
+<p><em>(Reflection, bench and the counterfactual loop named here were removed on 2026-10-11, §4NM.)</em> About 66% of the ledger repeats the previous record of its phase (241 "stable pass", 227 "τ=0.81", 165 "graduated N"). A write-time dedupe was built and then removed in the same round: the digest's <code>[phase] ×N</code> counts and the counterfactual loop's "recheck still failing" tally read those repeats as information. The jobs that re-ran with nothing new are the cause, and those were gated instead (reflection, self-play, bench).</p>
+<h2 id="4tp">notify_operator is held until the request ends <span class="tag">2026-11-07 &sect;4TP</span></h2>
+<p><strong>What was wrong.</strong> Request 298833ef: "build a dashboard of my portfolio … notify me in Slack when it's
+done". The model called <code>notify_operator</code> ("Portfolio Dashboard project is done ✅") after one render. The
+message went out at once. In the next turn the model saw the dashboard showed invented prices, edited
+<code>app.js</code> and checked it again for five more minutes. The owner had "done" for work that was not done.</p>
+<ul>
+  <li><strong>Held.</strong> <code>handle_chat</code> opens the request for notifications (<code>notify_tool.open_request</code>,
+  right before the <code>try</code> whose <code>finally</code> closes it). A <code>notify_operator</code> call inside it is
+  not written to the ledger. It is kept, and the tool answers <code>Notification HELD. It is sent to the operator when
+  this request ends …</code>, with the clients polling now. The <code>finally</code> calls <code>flush_held</code>, which
+  writes it (same phase, severity and <code>req_id</code> as before) and spends the hourly budget then. The rate limit is
+  checked at the call; a call over it holds nothing.</li>
+  <li><strong>The last call wins.</strong> A later call in the same request replaces the held message (the receipt says
+  so). The tool description says it is sent when the request ends and that a later call replaces an earlier one.</li>
+  <li><strong>What changed after it.</strong> The dispatcher reports each change (<code>core/request_effects.change_label</code>:
+  a file written or edited, project work, a mutating shell command, a script run, an image) to
+  <code>note_change</code>. Changes after the held message are named under it when it is sent:
+  <code>(Changed after this message was written: app.js.)</code>, at most 6 names, then <code>+N more</code>. A
+  replacement starts with no changes. <code>node --check</code> and other read-only commands are not changes.</li>
+  <li><strong>An early end is said.</strong> A cancelled request, a Stop, a shutdown (<code>CancelledError</code>) or an
+  error still sends the held message, with <code>(The request ended early — … — so this may not be the final state.)</code></li>
+  <li><strong>Not held:</strong> a call with no open request (an idle job, a background runner, request id
+  <code>SYSTEM</code>) is sent at once, as before. A probe is never sent.</li>
+  <li><strong>The finish-line backstop is unchanged.</strong> A held receipt is an OK tool row, so
+  <code>_notify_delivered</code> counts it and the backstop and the project promise stand down. The message itself is
+  written by the <code>finally</code>, after finalize.</li>
+</ul>
+<ul>
+  <li><strong>How the request ended</strong> is read in the <code>finally</code> from the exception in flight, compared
+  with the one in flight when the request started (review r1: a caller awaiting <code>handle_chat</code> inside its own
+  <code>except</code> would otherwise make a normal end read "ended with an error").</li>
+  <li>At most 256 requests are open at once; past that an open request with nothing held is dropped first.</li>
+</ul>
+<p>Residue, reported to the operator:</p>
+<ul>
+  <li>A held message is lost if the process dies without unwinding (SIGKILL, power loss).</li>
+  <li>A <strong>streamed</strong> reply streams after the <code>finally</code>: the message goes out as the reply starts,
+  and a Stop during the reply is not noted under it (the work is finished by then; no tool runs in the stream).</li>
+  <li><strong>Progress pings</strong> inside one long request are no longer possible: "ping me when part 1 is done" is sent
+  at the end, and a later call replaces it.</li>
+  <li>A background job launched in the request writes its own "done" when it finishes, so it can arrive before the
+  request's held "started X" message.</li>
+  <li>The rate limit is checked at the call and spent at the send, so a job or backstop notice in between can make it
+  13 in an hour.</li>
+  <li>A change in the same batch as the notify call, processed after it, is named as "after" though the model knew of it.
+  A script the command heuristic does not see as changing (<code>node build.js</code>) is not named.</li>
+</ul>
+<p>Pins: <code>tests/test_4tp_notify_hold_request_data.py</code>.</p>
+</main>
+</body>
+</html>

@@ -1,5 +1,5 @@
 """§4SX Phase D2: a project owns its runs, services, jobs and labs — one teardown for the tool and the console
-(docs/labs/PHASE_D.md D2 + design review r1 H1/H2/H3/M4/M5/M8)."""
+(docs/reference/labs/PHASE_D.md D2 + design review r1 H1/H2/H3/M4/M5/M8)."""
 from __future__ import annotations
 
 import json

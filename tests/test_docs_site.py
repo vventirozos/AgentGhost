@@ -24,31 +24,14 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _DOCS = _REPO / "docs"
-_SRC = _REPO / "src" / "ghost_agent"
 
-# The 12 hand-written guide pages. Everything else under docs/ is reference.
-_GUIDE_PAGES = (
-    "index.html", "getting-started.html", "interfaces.html", "how-it-works.html",
-    "memory.html", "tools.html", "self-improvement.html", "safety.html",
-    "configuration.html", "troubleshooting.html", "glossary.html", "reference.html",
-)
-
-# Pages that describe a module that is gone, kept only so old links don't 404.
-# A page appearing here is a decision; a page NOT here whose module vanished is
-# drift, and `test_no_new_orphan_reference_pages` fails on it.
-_KNOWN_TOMBSTONES = {
-    "core/agent_qwen.html",     # deleted 2026-07-27, page is an explicit tombstone
-    "core/workspace_model.html",  # code moved to workspace/model.py
-    "core/delegation.html",     # covers core/subagent.py + core/jobs.py + tools/delegate.py
-    "tools/qwen_bridge.html",   # module removed
-    "tools/memory_tools.html",  # covers tools/memory.py
-    "tools/database.html",      # §4SX-s: postgres_admin removed 2026-11-05, page is a tombstone
-    "tools/composed_skills.html",  # §4TA: the macro engine removed 2026-11-05, page is a tombstone
-    "memory/skills.html",       # §4TD: the lesson store removed 2026-11-06, page is a tombstone
-}
-
-# Doc directories that mirror a source package one-to-one.
-_MIRRORED = ("core", "memory", "tools", "sandbox")
+# The site map lives in scripts/docs_site.py (2026-11-10: by feature, not by code module).
+import sys as _sys
+_sys.path.insert(0, str(_REPO / "scripts"))
+import docs_site as _SITE  # noqa: E402
+_FEATURE_PAGES = tuple(f"features/{slug}.html" for slug, _t, _s in _SITE.FEATURES)
+_START_PAGES = tuple(p for p, _t in _SITE.START)
+_TOP_DIRS = {"start", "features", "reference", "assets"}
 
 
 def _pages():
@@ -85,48 +68,64 @@ def test_no_broken_internal_links():
     assert not broken, "broken internal links:\n  " + "\n  ".join(broken)
 
 
-@pytest.mark.parametrize("name", _GUIDE_PAGES)
-def test_guide_page_exists_and_has_full_nav(name):
+@pytest.mark.parametrize("name", ("index.html",) + _START_PAGES + _FEATURE_PAGES + ("reference/index.html",))
+def test_every_site_map_page_exists_and_marks_itself_current(name):
     page = _DOCS / name
-    assert page.exists(), f"guide page {name} is missing"
+    assert page.exists(), f"page {name} in the site map is missing"
     body = page.read_text()
-    for other in _GUIDE_PAGES:
-        assert f'href="{other}"' in body, f"{name} does not link to {other}"
-    # Exactly one entry is marked current, and it is this page.
     current = re.findall(r'<a class="current" href="([^"]+)"', body)
-    assert current == [name], f"{name} should mark itself current, got {current}"
+    assert len(current) == 1 and (page.parent / current[0]).resolve() == page.resolve(), (
+        f"{name} should mark itself current, got {current}")
 
 
-def test_home_page_body_links_to_every_guide_page():
-    """The sidebar is not discovery.
-
-    Every guide page was reachable from every sidebar, yet `interfaces.html`
-    was still hard to find because the home page's own "Start here" grid
-    omitted it — a reader working down the page never saw it. So the home
-    page BODY, not just its nav, has to reach all of them.
-    """
-    home = (_DOCS / "index.html").read_text()
-    body = home.split("</aside>")[-1]
-    missing = [name for name in _GUIDE_PAGES
-               if name != "index.html" and f'href="{name}"' not in body]
-    assert not missing, (
-        "index.html body (outside the sidebar) does not link to:\n  "
-        + "\n  ".join(missing))
+def test_every_page_is_what_the_build_makes_it():
+    """The sidebar, the feature pages' reference lists, the home cards and the reference index are generated:
+    `python scripts/docs_site.py build` after adding, moving or retitling a page."""
+    stale = _SITE.build(False)
+    assert not stale, "pages out of date — run `python scripts/docs_site.py build`:\n  " + "\n  ".join(stale)
 
 
-def test_every_reference_page_links_back_to_the_guide():
+def test_home_page_body_links_to_every_feature_and_the_start():
+    """The sidebar is not discovery: the home page BODY reaches every feature and the getting-started page."""
+    body = (_DOCS / "index.html").read_text().split("</aside>")[-1]
+    missing = [n for n in _FEATURE_PAGES + ("start/getting-started.html",) if f'href="{n}"' not in body]
+    assert not missing, "index.html body does not link to:\n  " + "\n  ".join(missing)
+
+
+def test_every_page_links_back_to_the_home_page():
     stranded = []
     for page in _pages():
-        rel = _rel(page)
-        if rel in _GUIDE_PAGES:
+        prefix = "../" * (len(page.relative_to(_DOCS).parts) - 1)
+        if f'href="{prefix}index.html"' not in page.read_text():
+            stranded.append(_rel(page))
+    assert not stranded, "pages with no link back to the home page:\n  " + "\n  ".join(stranded)
+
+
+def test_pages_live_only_where_the_site_map_puts_them():
+    """index.html at the top; everything else under start/, features/ or reference/<feature>/."""
+    slugs = {slug for slug, _t, _s in _SITE.FEATURES}
+    stray = []
+    for page in _DOCS.rglob("*"):
+        if not page.is_file() or page.suffix not in (".html", ".md"):
             continue
-        body = page.read_text()
-        depth = len(page.relative_to(_DOCS).parts) - 1
-        prefix = "../" * depth
-        if f'href="{prefix}index.html"' not in body:
-            stranded.append(rel)
-    assert not stranded, (
-        "reference pages with no link back to the guide:\n  " + "\n  ".join(stranded))
+        parts = page.relative_to(_DOCS).parts
+        if parts == ("index.html",) or parts[0] in ("start", "features", "assets"):
+            continue
+        if parts[0] == "reference" and (parts == ("reference", "index.html") or
+                                        (len(parts) == 3 and parts[1] in slugs)):
+            continue
+        stray.append(_rel(page))
+    assert not stray, "pages outside the site map:\n  " + "\n  ".join(sorted(stray))
+
+
+def test_every_feature_page_has_its_sections():
+    missing = []
+    for name in _FEATURE_PAGES:
+        body = (_DOCS / name).read_text()
+        for anchor in ("what", "try", "how", "where", "limits"):
+            if f'id="{anchor}"' not in body:
+                missing.append(f"{name}#{anchor}")
+    assert not missing, "feature pages missing a section:\n  " + "\n  ".join(missing)
 
 
 def test_every_table_is_inside_a_scroll_wrapper():
@@ -164,37 +163,6 @@ def test_html_div_tags_are_balanced():
         if counter.depth != 0:
             unbalanced.append(f"{_rel(page)} ({counter.depth:+d})")
     assert not unbalanced, "unbalanced <div>:\n  " + "\n  ".join(unbalanced)
-
-
-def test_no_new_orphan_reference_pages():
-    """A page whose module was deleted is drift unless it's a known tombstone."""
-    orphans = []
-    for sub in _MIRRORED:
-        doc_dir = _DOCS / sub
-        src_dir = _SRC / sub
-        if not (doc_dir.is_dir() and src_dir.is_dir()):
-            continue
-        for page in sorted(doc_dir.glob("*.html")):
-            rel = f"{sub}/{page.name}"
-            if rel in _KNOWN_TOMBSTONES:
-                continue
-            if not (src_dir / f"{page.stem}.py").exists():
-                orphans.append(rel)
-    assert not orphans, (
-        "reference pages for modules that no longer exist — document the move or "
-        "add to _KNOWN_TOMBSTONES:\n  " + "\n  ".join(orphans))
-
-
-def test_tombstone_list_stays_accurate():
-    """A tombstone whose module came BACK should leave the list."""
-    resurrected = []
-    for rel in sorted(_KNOWN_TOMBSTONES):
-        sub, name = rel.split("/")
-        if (_SRC / sub / f"{Path(name).stem}.py").exists():
-            resurrected.append(rel)
-    assert not resurrected, (
-        "these modules exist again — drop them from _KNOWN_TOMBSTONES:\n  "
-        + "\n  ".join(resurrected))
 
 
 def test_readme_doc_links_point_at_pages_that_exist():

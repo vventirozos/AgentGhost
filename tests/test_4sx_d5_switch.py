@@ -1,6 +1,6 @@
 """§4SX Phase D5: the switch — `run` advertised, `manage_services` / `jobs` as aliases mapped onto `run`, every
 tool-name set wired by meaning, promoted `execute` jobs recorded as `job` runs, the briefing's RUNNING block, the
-leaf's runs ended with the leaf, the Phase C operator route gone (docs/labs/PHASE_D.md D5-design)."""
+leaf's runs ended with the leaf, the Phase C operator route gone (docs/reference/labs/PHASE_D.md D5-design)."""
 from __future__ import annotations
 
 import asyncio

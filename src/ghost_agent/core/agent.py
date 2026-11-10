@@ -27221,7 +27221,7 @@ class GhostAgent:
         _tp_note = _two_panel_note(final_ai_content, tools_run_this_turn, last_user_content)
         if _tp_note:
             final_ai_content = (final_ai_content or "").rstrip() + _tp_note
-            # (an existing title: a new one needs the docs/logging.html table regenerated)
+            # (an existing title: a new one needs the docs/reference/reliability/logging.html table regenerated)
             pretty_log("Unshown Image", "two-panel picture: the reply did not say so — appended the "
                        "tool's note", icon=Icons.IMAGE_GEN)
 

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evidence gate (core.evidence_gate) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <div class="subnav">
+      <a href="audit_2026_05.html">Audit &amp; Hardening (2026-05)</a>
+      <a href="checking_and_learning.html">Checking and learning</a>
+      <a href="circuit_breaker.html">Circuit breaker</a>
+      <a href="claim_binding.html">Claim binding (core.claim_binding)</a>
+      <a href="claude_trainer.html">Claude Trainer</a>
+      <a class="current" href="evidence_gate.html">Evidence gate (core.evidence_gate)</a>
+      <a href="failure_dimension.html">Failure dimensions (core.failure_dimension)</a>
+      <a href="fallback_chains.html">Fallback chains (tools.fallback_chains)</a>
+      <a href="feedback.html">Feedback (thumbs) (core.feedback)</a>
+      <a href="logging.html">Logging &amp; Monitoring</a>
+      <a href="metacognition.html">Metacognition Uplift</a>
+      <a href="objection.html">Objections (core.objection)</a>
+      <a href="outcome.html">Turn outcome (tools.outcome)</a>
+      <a href="strikes.html">Strikes (core.strikes)</a>
+      <a href="system_tool.html">Health, weather and location (system tool) (tools.system)</a>
+      <a href="tool_failure.html">Tool failures (tools.tool_failure)</a>
+      <a href="verifier.html">Verifier (core.verifier)</a>
+    </div>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / evidence_gate.py — the evidence-sufficiency check</h1>
+  <p class="subtitle">One pure function reads the turn's tool results and answers "did any call this turn return substantive evidence?". When every evidence-bearing call came back empty, weak or errored, the turn is marked as having no evidence. Shipped 2026-09-07 (journal §4FD) as an EVIDENCE CHECK steer under the experiment arm <code>evidence_gate</code>; that arm was concluded to control (&sect;4LF), and on 2026-10-11 (&sect;4NN) the steer itself (<code>GhostAgent._evidence_gate_block</code>) was removed with the experiments registry. <strong>What remains</strong> is the pure function <code>assess_turn_evidence</code>, which the claim binder (<a href="claim_binding.html">core.claim_binding</a>) and the turn-state check (<code>core/turn_state_check.py</code>) use as the single definition of an "empty" result.</p>
+
+  <h2>Why it exists</h2>
+  <p>The largest real failure class in six weeks of live turns (~30 of 124 labelled failures, and most of the human 👎) was a confident answer produced after every retrieval came back empty or unrelated: <code>recall</code> returned rows about pg_stat when asked for a project codename and the agent invented a name; <code>browser extract_text</code> returned <code>LENGTH: 1</code> and the agent answered "around 4 hours"; web search returned nothing usable 54 times and the agent defined a Greek dessert anyway. arXiv 2606.21409 measures the mechanism — unreliable retrieval is worse than none (44.8 → 4.7 F1 on shuffled context) — and this model abstains readily when it is told the evidence is empty. Nothing told it.</p>
+
+  <h2>What it does</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>assess_turn_evidence(tools_run)</code></td><td>Walks the turn's recorded tool results (synthetic loop-minted rejections excluded). Only <code>EVIDENCE_TOOLS</code> count (searches, recall/knowledge_base, browser, file_system <em>reads</em>, execute, fact_check, news, system_utility); a <code>file_system</code> mutation (any operation outside <code>FS_READ_OPS</code>) is not consulted at all. Returns an <code>EvidenceAssessment</code>: <code>consulted</code>, <code>substantive</code>, and one reason per empty call.</td></tr>
+      <tr><td><code>row_call_facts(row)</code></td><td>The (arguments, text, is_error) of one recorded row, read from the row's <strong>real</strong> shape: the loop records a tool row as the API message it sends upstream (<code>role</code>/<code>tool_call_id</code>/<code>name</code>/<code>content</code>), so the parsed arguments live on the <code>ToolOutcome</code> (<code>content.call_args</code>) and failure is the outcome's own <code>status</code>. Hand-built rows may still carry <code>arguments</code>/<code>args</code> and <code>error</code> keys.</td></tr>
+      <tr><td><code>EvidenceAssessment.fires</code></td><td>True only when the turn consulted evidence and got none of it. A chat turn with no retrieval never fires; one good result among empties never fires.</td></tr>
+      <tr><td><code>render_evidence_steer(assessment)</code></td><td>The steer text: names up to four reasons, forbids stating facts that were not retrieved, and allows exactly two moves — one more targeted attempt, or say plainly what was not found, and stop.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>The empty shapes</h2>
+  <p>Each shape is the tool's <em>own</em> wording, and this module is the single place they are recognised — a tool that rewords its empty result reddens the shape pin in <code>tests/test_evidence_gate.py</code> rather than silently disarming the gate.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Tool</th><th>Empty when</th></tr></thead>
+    <tbody>
+      <tr><td>browser</td><td><code>HTTP_STATUS: 4xx/5xx</code>, or <code>LENGTH:</code> under <code>BROWSER_MIN_TEXT</code> (40) characters of page text</td></tr>
+      <tr><td>web_search, darkweb_search, deep_research, fact_check, news</td><td>"No search results found", "Zero …", "(0 results)", or an empty body — checked <em>before</em> the generic error prefix, since the search tool's empty result is worded as an ERROR</td></tr>
+      <tr><td>recall, knowledge_base</td><td>"Zero high-confidence memories found", or the §4FD header "best match: LOW" (see <a href="../memory/memory_tools.html">memory_tools</a>)</td></tr>
+      <tr><td>file_system reads</td><td>"not found." / "does not exist", or <code>[Empty]</code></td></tr>
+      <tr><td>execute</td><td>a non-zero <code>EXIT CODE:</code></td></tr>
+      <tr><td>any</td><td>an <code>error</code>-flagged result, or an <code>ERROR:</code> / <code>Error:</code> head</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Loop wiring and the arm (removed §4NN)</h2>
+  <p class="note">History. Nothing below runs any more: no steer is injected, no arm is consulted, and <code>GHOST_EVIDENCE_GATE</code> is not read.</p>
+  <p><code>GhostAgent._evidence_gate_block(tools_run_this_turn, req_id)</code> is called at the volatile-state assembly site, right after the explicit-constraints block, and its text rides the volatile block (never a tool result — the corpus stays what the tool returned, the §4K lesson). It is arm-gated: <code>experiments.arm_for(ctx, "evidence_gate", req_id)</code>; the trigger is marked on <em>both</em> arms (<code>evidence_gate_fired</code>: True on treatment, False on control) so the report can condition on turns where it would have fired; the text ships on treatment only. The key is registered in <code>TRIGGER_KEYS</code> and <code>CONTEXT_MUTATING_KEYS</code>. Kill switch: <code>GHOST_EVIDENCE_GATE=0</code>; an unregistered arm is inert.</p>
+
+  <h2>The gate read keys no row ever carried <span class="tag">2026-09-13</span></h2>
+  <p>The first version read <code>t["arguments"]</code> and <code>t["error"]</code>. No production row has either: the dispatch loop's row is the API message, and an extra dict key would be sent upstream. With no operation visible every <code>file_system write</code> fell into the read branch, its "SUCCESS: Wrote …" counted as substantive, and one scratch-file write silenced the gate for the whole turn — the confabulation class it was built for was unguarded from the day it shipped, and the shape pins could not see it because they hand-build rows <em>with</em> the keys. Two changes: <code>ToolOutcome</code> gained a <code>call_args</code> slot that the loop fills from the parsed call (invisible to the payload — the outcome is a <code>str</code>), and the gate reads <code>row_call_facts</code>: arguments from the outcome, error from the outcome's status (a <code>REJECTED</code> or <code>FAILED</code> result is empty even when its text has no <code>ERROR:</code> head; <code>PARTIAL</code> and <code>UNRESOLVED</code> are judged by their text — a <code>fact_check</code> partial carries the research results, a promoted <code>execute</code> job its output), and mutations skipped. The R3 review of this fix found two defects inside it: the canonical rewrap helper <code>with_text</code> (which the context cutter runs on tool rows in place every iteration) rebuilt the outcome without <code>call_args</code>, and <code>is_failure</code> ("not OK") had made partial results errors — both fixed and mutated. <code>tests/test_evidence_gate_real_rows.py</code> drives the real <code>_dispatch_and_process_tool_batch</code> and asserts the row shape, the recorded arguments and the gate's verdict on the same input; 8 gate/row mutants killed (PROJECT_JOURNAL §4GG).</p>
+
+  <div class="note"><strong>Tests:</strong> <code>tests/test_evidence_gate_real_rows.py</code> (real rows, through the loop), <code>tests/test_evidence_gate.py</code> — every real shape both ways, the fires-only-when-all-empty rule, synthetic exclusion, bounded reasons, and (until §4NN) the arm gating, the kill switch, an AST pin on the loop call and the registry keys — those pins left with the steer. Mutation battery §4FD: all gate mutants killed.</div>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="4ln">Browser rows read by their header <span class="tag">2026-10-04 &sect;4LN</span></h2>
+  <p>A browser row is judged by its own <code>STATUS:</code> header, and the generic <code>Error</code>-head scan is skipped for it. A page whose text opens "Error handling in …" is evidence. A navigate with no page text stays evidence, because canvas pages and the agent's own apps have none.</p>
+</main>
+</body>
+</html>

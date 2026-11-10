@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projects tool (tools.projects) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a href="background_jobs.html">Background jobs</a>
+      <a href="cross_project_map.html">Cross-project map</a>
+      <a href="long_tasks.html">Long tasks</a>
+      <a href="planning.html">Planning (core.planning)</a>
+      <a href="project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a href="project_research.html">Project research (core.project_research)</a>
+      <a href="project_safety.html">Project safety (core.project_safety)</a>
+      <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="projects_routes.html">Projects API (api.projects_routes)</a>
+      <a class="current" href="projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="task_close.html">Closing tasks (core.task_close)</a>
+      <a href="task_kind.html">Task kinds (core.task_kind)</a>
+      <a href="task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>tools / projects.py</h1>
+  <p class="subtitle">Long-term project state management exposed as a single LLM tool.</p>
+
+  <h2>Tool: <code>manage_projects</code></h2>
+
+  <h2>Create gating — don't spin up a project unprompted (2026-06-21)</h2>
+  <p>Observed live: the prompt <em>"Create a single-file browser OS with desktop, taskbar, 5+ apps&hellip;"</em> made the agent call <code>action=create</code> and build a task tree, even though nobody asked for a project and the whole deliverable is one <code>index.html</code>. Project creation is <strong>100% model-driven</strong> — no code path auto-creates one — so the cause was guidance, not logic: the system prompt's <code>TOOL ORCHESTRATION</code> triggers had explicit rules for self-play, lessons, skills, RAG and web, but <em>nothing</em> on when to enter project mode vs. stay in free-chat; the tool description's "a new named multi-step effort" read as a match for any multi-feature build; and memory/RAG surfaced prior browser-OS projects, reinforcing the bias (visible in the model's own thought: <em>"I can see references to previous browser OS projects. Let me create a new project"</em>).</p>
+  <p>The fix is explicit gating in two places. The system prompt (<code>prompts.py</code>) gains a <code>PROJECT MODE GATING</code> trigger, and the <code>manage_projects</code> tool description gains a <code>GATING for create</code> clause. Both state the same policy: create a project ONLY when <strong>(1)</strong> the user explicitly asks to start/track a project, OR <strong>(2)</strong> the deliverable genuinely spans <strong>multiple files/modules AND multiple turns</strong>. A self-contained single-file deliverable — even a large one (a one-file browser OS, game, or script) — is a <strong>one-shot</strong>: build it directly with <code>file_system</code> write, no project, no task tree. Past similar projects in memory are explicitly disqualified as a reason to create a new one. (This complements the pre-existing <code>_is_cohesive_single_file</code> detection, which only collapsed an <em>already-created</em> single-file project to one task — it never stopped the project being created.) Covered by <code>tests/test_project_create_gating.py</code>.</p>
+
+  <h3>Project-level actions</h3>
+  <ul>
+    <li><code>create</code> · <code>list</code> · <code>get</code> · <code>switch</code> · <code>exit</code> · <code>update</code> · <code>archive</code> · <code>delete</code> · <code>resume</code> · <code>status</code> · <code>budget</code> · <code>autopilot</code> · <code>promote_from_context</code></li>
+    <li>Cross-project: <code>search</code> · <code>set_dependency</code> · <code>clone</code></li>
+    <li>Release: <code>release</code> · <code>create_version</code> · <code>unrelease</code> · <code>verify_release</code></li>
+  </ul>
+  <h3>Delete vs. archive</h3>
+  <ul>
+    <li><b><code>archive</code></b> — soft, reversible. Flips status to <code>ARCHIVED</code>; the row and the on-disk workspace are kept, and <code>resume</code> brings it back. This is what the old <code>delete</code> used to do.</li>
+    <li><b><code>delete</code></b> — hard, <b>permanent</b>. Removes the project row, all its tasks/artifacts/events (FK <code>ON DELETE CASCADE</code> with <code>PRAGMA foreign_keys=ON</code>, including scratchpad-snapshot events), <b>and</b> the project's workspace directory on disk (<code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code>). The on-disk removal only fires for a path strictly inside the configured sandbox root, so a stray/custom <code>workspace_dir</code> can never wipe an arbitrary directory. The tool schema steers the model toward <code>archive</code> unless the user clearly means to erase. Covered by <code>tests/test_projects_store.py</code> and <code>tests/test_projects_tool.py</code>.</li>
+  </ul>
+  <h3>Hard delete removes the project's graph edges <span class="tag">2026-10-06</span></h3>
+  <p>Live req 2cb40b10: the user deleted two projects and re-asked the same question. Recall still returned <code>user RESUMES project 7b62e5e533d1</code> and <code>project 7b62e5e533d1 TESTED 4-layer recursive cascade</code>, so the model read "the user runs this as a project" and created a third. A hard <code>delete</code> (chat tool, and <code>DELETE /api/projects/{pid}?hard=true</code>) now calls <code>_unlink_project_in_graph</code> &rarr; <a href="../memory/graph.html#forget-project"><code>GraphMemory.forget_project</code></a>, which removes every edge naming the project: the tool's <code>project:&lt;id&gt;</code> node, the extractor's <code>project &lt;id&gt;</code> node, <code>project HAS_ID &lt;id&gt;</code>, the project's <code>task:&lt;tid&gt;</code> nodes, and, unless another project still has that title, the generic <code>project HAS_TITLE &lt;title&gt;</code> edge and the edges of the node named by a multi-word title (owner life facts kept). <code>archive</code> keeps the edges (it is resumable). Best-effort: a graph failure never fails the delete. Logged as <code>Project Graph</code> 🧹. Covered by <code>tests/test_project_delete_graph_unlink.py</code>.</p>
+  <p>Note: the web API <code>DELETE /api/projects/{pid}</code> takes an explicit <code>?hard=</code> query flag (default soft/archive) — the frontend chooses; it is independent of the chat tool's <code>delete</code> (which is always hard).</p>
+  <h3>Eligibility gate for unconfirmed hard deletes (2026-06-12) &mdash; <strong>removed 2026-09-06</strong></h3>
+  <p><em>History.</em> One <em>"i don't really like it, delete it an make something else"</em> once cascaded into <strong>six successive hard deletes</strong> &mdash; five of them of projects the agent had created seconds earlier in the same request and the user never saw &mdash; because each new turn re-read the instruction as unfulfilled. A gate, <code>_delete_eligibility_error()</code>, then refused any hard delete whose target was neither the project active when the user's message arrived (a <code>context.request_start_project_id</code> snapshot stamped in <code>handle_chat</code>) nor named in the message by id or title.</p>
+  <p><strong>Removed (req 1e593552, journal &sect;4FC).</strong> Live, the gate refused the user's own delete. The conversation had just finished a project; it auto-rolled to DONE and left project mode, so it was not active when <em>"i got everything i needed &hellip; actually delete it"</em> arrived, and the message named it by neither id nor its exact stored title. The refusal repeated five times across the model's retries &mdash; a <code>switch</code> to the project could not change a snapshot taken at request start &mdash; until the strike ledger gave up, and the project survived. The operator's rule: <em>a project that resolves by id or title is deletable whether or not it is activated.</em> Both ends went together: <code>delete</code> consults no request-start or wording condition, and <code>handle_chat</code> no longer stamps the snapshot. What remains on the path is unchanged &mdash; the loud not-found refusal, service stop before the rmtree, the tombstone, and the activation clear &mdash; and <code>archive</code> is untouched. Pinned by <code>tests/test_project_delete_ungated.py</code>: the live shape replayed (not active, unnamed, snapshot None &rarr; row, workspace and tombstone all observable), a mid-request-created project deletable, switch-then-delete, the not-found and archive controls, and an AST enumeration that no source site reads or writes the snapshot (with its own can-fail check).</p>
+  <h3>Task-level actions</h3>
+  <ul>
+    <li><code>task_add</code> · <code>task_update</code> · <code>task_decompose</code> · <code>task_next</code> · <code>task_list</code> · <code>task_delete</code></li>
+  </ul>
+  <h3>Task ordering (prerequisites)</h3>
+  <ul>
+    <li><code>task_add</code> accepts <code>depends_on=[ids]</code> — prerequisite sibling task ids that must be DONE before the new task becomes eligible for <code>task_next</code> / autoadvance. A peer-ordering edge, distinct from parent/child <code>dependency_type</code>.</li>
+    <li><code>task_decompose</code> accepts <code>sequential=true</code> — chains the generated subtasks so each runs only after the previous is DONE (works for both the under-a-task and top-level fan-out forms). Default <code>false</code> = all subtasks independently runnable.</li>
+  </ul>
+  <h3>Other</h3>
+  <ul>
+    <li><code>artifact_add</code> · <code>artifact_list</code> · <code>event_log</code> · <code>constraint_retire</code> · <code>cleanup</code></li>
+    <li><code>describe_file</code> · <code>file_history</code> · <code>unregister_file</code> — the per-file manifest and action history (<code>file_path</code>).</li>
+    <li><code>ledger</code> — append one durable fact to the project's <strong>design ledger</strong> (<code>ledger="…"</code>), or omit it to read the ledger back. See "Working memory" below.</li>
+    <li><code>config</code> <span class="badge">1B</span> — upsert one durable <strong>setting</strong> (<code>config_key="GHOST_MODEL" config_value="qwen3.8-27b"</code>): env vars, key flags, dependency versions, model, ports, DB URIs. Empty <code>config_value</code> deletes the key; omit both to read the config map back. Bounded + surfaced in the <a href="../infrastructure/prompts.html">project briefing</a>'s <code>CONFIG</code> section every turn. Backed by <code>ProjectStore.get_config / set_config_value</code>.</li>
+    <li><code>autoadvance</code> — run the autonomous advancer. <code>count</code> selects how many tasks: a number (<code>"3"</code>) or <code>"all"</code> to run to completion; default <code>1</code>. Drives <a href="project_advancer.html"><code>advance_many()</code></a>, a bounded loop that checkpoints each task and stops at the first of done / nothing else runnable / count / budget. It runs with <code>stop_on_fail=False</code>: it continues past an isolated FAILED task and reports it, and (&sect;4SR) past a task waiting on you, which is not one of the <code>count</code> asked for (reported as <code>gated</code>); and (&sect;4SU Phase 5) your own batch goes past a model-experiment task to the tasks that do not wait on it, then stops as <code>model_experiment</code> (or, when a failure outranks it, lists it in <code>model_experiments</code>), so the turn runs it with <code>probe_model</code>. An unattended batch still stops at it; a circuit breaker stops it on repeated failures. Returns <code>{advanced, count, ran, gated, requested, stop_reason, agent_instruction}</code> (<code>ran</code>: entries that really ran; <code>gated</code>: how many were left at a gate; plus <code>needs_user_tasks</code> (gates) / <code>held_tasks</code> (holds your own run picks up) / <code>failed_tasks</code> / <code>autopilot</code> when they apply).</li>
+  </ul>
+
+  <h2>Working memory &amp; decomposition granularity (2026-06-20)</h2>
+  <p>Two changes target the failure where a long, per-turn project felt clunky
+  and lossy (a single "proceed" turn re-deriving state for ~96 s, then thrashing
+  on a 14-task / one-file decomposition):</p>
+  <ul>
+    <li><strong>Design ledger</strong> — <code>action=ledger ledger="single HTML file at browser-os.html; windows are .window divs opened via openApp(id)"</code> records a durable fact (file layout, key API/function name, convention). It is bounded + dedup'd in project metadata and surfaced in the <a href="../infrastructure/prompts.html">project briefing</a> every turn, so later turns inherit it instead of re-reading files to rediscover it. A <code>ledger="…"</code> may also ride along on a <code>task_update status=DONE</code> to capture the decision as the task closes. Backed by <code>ProjectStore.get_ledger / append_ledger / set_ledger</code>.</li>
+    <li><strong>Per-file decomposition</strong> — the <code>subtasks</code> description and the tool/<code>create</code> instructions now steer toward tasks that each own a FILE or a bounded function you can build and verify alone (a thin shell + one file per feature), and explicitly warn against N tasks that all edit the same file — that forces whole-file context every turn and doesn't scale.</li>
+    <li><strong><code>create</code> honours <code>subtasks</code> (2026-06-20)</strong> — the model routinely calls <code>action=create</code> WITH <code>subtasks</code>, believing create decomposes too. Those used to be silently dropped, leaving the project with ZERO tasks while the model believed they existed — so a later "proceed" found "no plan" and the flow derailed (observed live, twice). <code>create</code> now decomposes the <code>subtasks</code> in the same call (sequential-aware) and returns <code>tasks_created</code>; the success instruction reflects whether tasks already exist or still need <code>task_decompose</code>.</li>
+  </ul>
+  <p>Together with the <strong>DONE SO FAR</strong> briefing digest (auto-surfacing
+  completed tasks' <code>result_summary</code>), these give the next turn "what
+  exists and how it works" cheaply. Covered by
+  <code>tests/test_project_working_memory.py</code>.</p>
+
+  <h2>Pacing — one task per go-ahead (2026-06-20)</h2>
+  <p>Projects advance <strong>one task at a time, under user direction</strong>,
+  not in an automatic sprint through the whole tree. After <code>create</code>
+  or <code>task_decompose</code>, the tool returns a stop-and-await
+  <code>agent_instruction</code> telling the agent to present the plan and
+  <strong>wait</strong> — do not begin executing. The agent then advances
+  exactly the next task on each explicit user go-ahead ("proceed to next
+  task"), closing just that id with <code>task_update status=DONE</code>. This
+  is the counterpart to the briefing's <a href="../infrastructure/prompts.html">ONE TASK
+  AT A TIME</a> directive; it exists because grinding every task in one turn
+  floods the context window on large projects. Covered by
+  <code>tests/test_project_pacing.py</code>.</p>
+  <p><strong>Batch ("proceed with all", 2026-06-20).</strong> When the user
+  explicitly asks for MORE than one task — <em>"do the next 3"</em>,
+  <em>"proceed with all remaining tasks"</em>, <em>"finish the project"</em> —
+  the agent routes to <code>autoadvance count=&lt;N|"all"&gt;</code> instead of
+  grinding them itself. That runs <a href="project_advancer.html"><code>advance_many</code></a>,
+  a <strong>bounded autonomous loop</strong>: each task is a separate
+  checkpointed tick (so context stays bounded however many run), and it pauses
+  at the first of done / a task needing the user / budget / a FAILED task, then
+  reports. This is how "do everything" stays safe on a large project — a loop of
+  bounded ticks, not one context-busting turn. A single "proceed"/"next" still
+  runs as a full agent turn (higher per-task quality). Each coding tick BUILDS
+  for real via <a href="../coding/coding_executor.html"><code>build_coding_task</code></a>
+  (write files + verify), failing loudly on a hard task rather than marking
+  shallow work done. Covered by <code>tests/test_advance_pacing.py</code> and
+  <code>tests/test_coding_executor.py</code>.</p>
+
+  <h2>list always surfaces the ids (2026-07-05)</h2>
+  <p>The ids were always present in <code>action=list</code>'s JSON, but the model's user-facing summaries dropped them — the user was left referencing projects by <em>title</em> for follow-up commands (delete/switch), which is exactly the ambiguity-prone path the delete-resolution machinery below exists to defend against. The list result now additionally carries a ready-made <code>display</code> block — one line per project, <strong>id first</strong>, status, title, with the conversation-bound project marked <code>&lt;- ACTIVE</code> — plus a <code>note</code> directing the model to always show the ids when presenting projects ("the id is the only unambiguous reference for follow-up get/switch/update/delete calls"). Empty store renders <code>(no projects)</code>. Covered by <code>tests/test_projects_tool.py::test_list_display_block_leads_with_ids</code>.</p>
+
+  <h2>get miss → recall fallback (2026-07-14)</h2>
+  <p>Journal §4C recall-routing variance: "when does project Kestrel ship?" routed the model to <code>manage_projects</code>, got a bare <code>project not found</code>, and it gave up — while the answer sat in vector memory at 0.76 relevance. A <code>get</code> whose reference resolves to no tracked project now runs <code>_not_found_with_recall</code>: a <code>search_advanced</code> pass over vector memory (MEDIUM-or-better band, score &lt; 1.15). Hits come back as a <strong>non-error</strong> payload — <code>{"project": null, "note": ..., "memory_recall": [facts]}</code> — so the model answers from the facts without a strike or a second unprompted tool hop; no hits keeps the plain error plus a redirect to the <code>recall</code> tool. The <code>recall</code> tool description carries the mirror-image nudge. Tests: <code>tests/test_iterative_recall_expand.py</code>.</p>
+
+  <h2>switch / get resolve a title → id (2026-06-22)</h2>
+  <p>The model routinely passes a project's <strong>title</strong> where an id
+  is expected (<code>switch petai</code>), which hard-errored with "project not
+  found" and burned a <strong>strike</strong> before the model recovered via
+  <code>list</code>+<code>switch</code>-by-id (observed live). <code>switch</code>
+  and <code>get</code> now run the reference through the shared
+  <code>_resolve_project_ref</code> (id first, then a case-insensitive title
+  match) before erroring, so <code>switch petai</code> resolves to the real id.
+  A genuinely unknown reference still errors (the destructive-action contract is
+  unchanged), and an ambiguous title surfaces the candidate ids instead of
+  silently picking one. Covered by <code>tests/test_projects_tool.py</code>.</p>
+
+  <h2>Read with no active project: guide, don't strike (2026-06-22)</h2>
+  <p>A READ action — <code>get</code> / <code>task_list</code> / <code>task_next</code> —
+  invoked with no resolvable project (none passed, none active) used to return
+  <code>ERROR: project_id is required…</code>. The agent loop scores an
+  <code>ERROR</code>-prefixed tool result as a failure and burns a <strong>strike</strong>
+  — harsh for a recoverable usage slip (the model just forgot to say WHICH
+  project), and it happened at the very start of a "resume my project" turn
+  before the model recovered with <code>list</code>+<code>switch</code> (observed
+  live). These reads now return a non-error <code>{"no_active_project": true,
+  "projects": [...], "agent_instruction": "pick one and switch"}</code> — no
+  strike, and the project list is right there so the model can <code>switch</code>
+  in one step instead of an extra <code>list</code> round-trip.
+  <strong>Mutations</strong> (<code>task_add</code>, <code>research</code>, …)
+  keep the hard error: you must not write to an unspecified project. Covered by
+  <code>tests/test_projects_tool.py</code>.</p>
+  <p><strong>On a failed/paused batch, STOP and report (2026-06-20).</strong>
+  When the loop stops early (a task FAILED, budget, or needs-user), the result
+  instruction now tells the agent to report exactly which tasks completed vs
+  not and hand back to the user — explicitly NOT to keep building the
+  remaining/failed tasks by hand. That manual fallback is what thrashed for
+  ~700s live and exposed the project-scoping race; calling
+  <code>autoadvance</code> again, in the turn where the user has answered, is
+  the way to continue. <strong>&sect;4SR:</strong> a task waiting on the owner
+  no longer stops the batch: it is skipped, the rest run, and
+  <code>needs_user_tasks</code> is listed on every stop. "Run all tasks" is not
+  the answer to a gate; when the user answers, the agent does that task in that
+  turn (see <a href="project_advancer.html#4sr">project_advancer &sect;4SR</a>).</p>
+  <h3>Auto-research</h3>
+  <ul>
+    <li><code>research</code> — research a topic and persist a summarised brief in the project workspace. Pass <code>topic="…"</code> for a single topic, or omit it (optionally with <code>max_topics</code>) to auto-derive several from the project goal + open tasks. Each brief lands at <code>research/&lt;slug&gt;.md</code>, is indexed in project metadata, and is surfaced under <strong>RESEARCH NOTES</strong> in the project briefing. See <a href="project_research.html">core.project_research</a>.</li>
+    <li><code>research_list</code> — return the project's research index (topic → path → preview). Read a brief with <code>file_system</code> before re-researching the same thing.</li>
+  </ul>
+
+  <h2>Duplicate guard</h2>
+  <p><code>_DUPLICATE_CREATE_WINDOW_SECONDS = None</code> — a same-title project that is still <strong>in flight</strong> (status ACTIVE / PAUSED / NEEDS_USER) is reused rather than re-created, which stops the model spawning duplicates of work that's already underway. A <strong>terminal</strong> same-title project (DONE / FAILED / BLOCKED / ARCHIVED, the <code>_TERMINAL_PROJECT_STATUSES</code> set) is <em>not</em> reused — it's superseded by a fresh <code>create</code>. Previously any non-ARCHIVED match was reused, which resurrected a finished project (with its stale tasks and on-disk files) when the user asked to start a <em>new</em> one of the same name. Covered by <code>tests/test_project_delete_and_guard.py</code>.</p>
+
+  <h2>Delete / archive resolution</h2>
+  <p>Users refer to a project by NAME ("delete the minecraft clone project"), but the destructive actions key on the opaque hex id. <code>delete</code> and <code>archive</code> now run the reference through <code>_resolve_project_ref</code>: a real id is used directly; otherwise a case-insensitive <strong>title match</strong> is tried (the model can pass the name as <code>project_id</code>, or an explicit <code>title</code>). If nothing matches, the action <strong>fails loudly with an ERROR</strong> rather than silently no-op'ing — a silent <code>deleted:false</code> is what previously let a "delete" be reported as done while the project survived (and was then resurrected by the duplicate guard). Several projects sharing a title resolve to an <em>ambiguous</em> error listing the candidate ids, so the caller must disambiguate instead of deleting the wrong one. Covered by <code>tests/test_project_delete_and_guard.py</code>.</p>
+
+  <h2><code>artifact_list</code> — artifacts become readable (2026-07-18)</h2>
+  <p>The artifact store had a write action (<code>artifact_add</code>) and no read action —
+  the deliverable manifest, <code>note</code>/<code>url</code> artifacts, and autoadvance's
+  stored <code>tool_call</code> outputs (up to 8&nbsp;k chars each) were unreachable through
+  the tool surface. <code>action=artifact_list</code> lists them: project-wide by default,
+  scoped with <code>task_id</code>, filtered with <code>artifact_kind</code>, paged with
+  <code>limit</code> (newest kept). Non-<code>file</code> payloads are truncated to 400 chars;
+  file paths are returned whole. The status snapshot also gained
+  <code>deliverables</code> / <code>retrospective</code> (terminal states only) /
+  <code>last_dream_digest</code> keys. Covered by
+  <code>tests/test_project_readside_plumbing.py</code>.</p>
+
+  <h2>Release blocks on a missing deliverable (2026-08-22, operator decision)</h2>
+  <p>The item queue&nbsp;#10 left open: the release dossier listed deliverables without checking they exist. The rehearsal <em>did</em> have a "deliverable(s) missing on disk" check — with two defects that made it both leaky and, on some projects, permanently wrong:</p>
+  <ul>
+    <li><strong>It only ran when the project had NO services.</strong> The check sat in the <code>else</code> of the service branch, so any project with a registered service was released without its files being looked at. Both halves are part of "is this shippable"; they are no longer mutually exclusive.</li>
+    <li><strong>It statted the raw payload.</strong> Rows carrying the redundant <code>projects/&lt;id&gt;/</code> prefix resolved to <code>&lt;ws&gt;/projects/&lt;id&gt;/…</code> and read as missing. Measured on the live WebOS project: 3 reported missing, two of which — <code>index.html</code> and <code>server.js</code>, its actual output — are present. That is a <em>permanent false block</em>, and its documented repair (<code>unregister_file</code>) would have had the operator delete the registration of a file that exists. The check now goes through <code>missing_deliverables()</code>, which normalises via the same path contract registration uses.</li>
+  </ul>
+  <p>A third hole appeared while attacking the fix: <code>missing_deliverables()</code> deliberately reports <em>nothing</em> when the whole workspace directory is absent — correct for the briefing, since a missing directory is not evidence about individual files, and badly wrong for a release gate. Deleting the entire workspace made the rehearsal report <em>"all 1 deliverable(s) present"</em> and pass. A release gate has to be conservative, so registered deliverables plus a non-existent workspace is now its own refusal.</p>
+  <p>The refusal names the repair (restore the file, or drop the stale record with <code>unregister_file</code>) — a block with no way forward is what stranded a project permanently the last time. Both live released projects re-pass the gate unchanged, and <code>action=release</code> remains the only path to <code>RELEASED</code>: <code>update</code> refuses the status outright, so the gate cannot be walked around.</p>
+
+  <h2>Release immutability leaked through four operations (2026-08-21, queue&nbsp;#12)</h2>
+  <p>A <code>RELEASED</code> project is human-attested and immutable, and the enforcement is deliberately not advisory: the briefing steers, but the agent's measured failure mode is regressing working artifacts, so <code>file_system</code>'s write path itself refuses. It refused from a <strong>deny-list of guarded operations</strong> — <code>("write", "replace", "delete", "move", "append")</code> — and a deny-list leaks exactly the way you would expect. Reproduced against a real released project:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Operation</th><th>Before</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>write</code></td><td>blocked</td><td>listed</td></tr>
+      <tr><td><code>copy</code></td><td><strong>allowed</strong></td><td>not listed at all</td></tr>
+      <tr><td><code>rename</code></td><td><strong>allowed</strong></td><td>the dispatcher accepts <code>["rename", "move"]</code>; only <code>move</code> was listed, so one alias of the SAME branch was guarded and the other open</td></tr>
+      <tr><td><code>download</code></td><td><strong>allowed</strong></td><td>not listed; would write a fetched file straight in</td></tr>
+      <tr><td><code>move</code></td><td><strong>allowed</strong></td><td>listed, but the guard read <code>path or filename or destination</code> — and <code>path</code> holds the SOURCE, so moving INTO a release was never inspected</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three of those four landed files inside the released workspace in a live reproduction. The guard is now an <strong>allow-list of read-only operations</strong> (<code>read</code>, <code>read_chunked</code>, <code>inspect</code>, <code>search</code>, <code>find</code>, and the seven <code>list</code> aliases) — everything else is checked, so a newly-added mutating operation is guarded by default instead of being forgotten. Every candidate target is inspected rather than the first one that happens to be set, which is what closes the move/copy destination hole. Reads of a released project stay open; over-blocking would make the guarantee useless in the other direction, and that is pinned too.</p>
+
+  <h2>A registered deliverable is a CLAIM, and the briefing said FACT (2026-08-21, queue&nbsp;#10)</h2>
+  <p><code>register_file_artifact</code> records a path. It normalises that path carefully — that part has its own incident history — but it never checks that a file is there, and nothing reconciles afterwards. The list is then rendered into every project briefing as <em>"DELIVERABLES (N file(s) the project built)"</em>, so an unverified claim reaches the model as an assertion, and the model will cite files it never produced.</p>
+  <p>Measured on the live store: <strong>3 of 66 registered deliverables did not exist</strong> — and none of them had been removed by the cleanup sweep. Every <code>workspace_tidy</code> event on that box deleted only debris (<code>.browser_runner.py</code>, <code>__pycache__</code>, screenshots), which is what ruled the sweep out as the cause.</p>
+  <p>The record is deliberately <strong>not</strong> rewritten: a file can legitimately be deleted after the fact, and the claim is audit data. The READ path learns to be honest instead — the same shape as the selfhood mood's staleness TTL and the diary's follow-the-corpus rule:</p>
+  <ul>
+    <li><code>ProjectStore.missing_deliverables()</code> stats each registered path <em>through the same normaliser registration uses</em>. That matters: some stored payloads carry the redundant <code>projects/&lt;id&gt;/</code> prefix (rows written before the 2026-07-20 fix), and comparing the raw payload against disk reported three <em>present</em> files as missing, including a project's actual <code>index.html</code>. Marking a real file MISSING is a worse lie than the one being fixed.</li>
+    <li>The prompt briefing counts them in the header and marks each one <code>⚠ MISSING</code> <em>next to the path</em> — not after 110 characters of description, where the warning is one the reader has already skipped. A missing file is never comma-packed with the present ones, because that packed line reads as a list of things that exist.</li>
+    <li>The tool briefing carries <code>deliverables_missing</code>, since the prompt header points the model at <code>artifact_list</code> for detail — otherwise the reader walks from the caveat straight to an unqualified list.</li>
+    <li><code>fork</code> and <code>clone</code> stop re-registering a claim whose file is not in the source. Registration there exists to put COPIED files in the child's keep-set; a path that was never there protects nothing, and copying it propagates the phantom into a new project. Phantoms compounded across forks otherwise.</li>
+  </ul>
+  <p>Unknown is never reported as missing: with no sandbox root configured, or a workspace directory that is gone entirely, the check returns nothing rather than flagging every deliverable — a checker that cannot see the disk must not bury a real single-file loss in noise.</p>
+
+  <h2><code>cleanup</code> — tidy the workspace on demand (2026-07-18)</h2>
+  <p><code>action=cleanup</code> runs the recurring tidy
+  (<a href="../coding/workspace_cleanup.html">workspace_cleanup.tidy_project_workspace</a>)
+  on the bound project with <strong>no age gate</strong>: stray screenshots, caches and
+  browser scaffolding go immediately; deliverables, source files and media referenced
+  by the code are never touched. The same tidy also runs automatically from the idle
+  loop (phase 2.7d, 6-hourly, 24&nbsp;h age gate) — this action is for "clean up the
+  project" asked directly. Covered by <code>tests/test_workspace_tidy.py</code>.</p>
+  <p><strong>Reference validated at the boundary (2026-07-20).</strong> <code>cleanup</code>
+  is destructive, but it was the one destructive action that skipped
+  <code>_resolve_project_ref</code>: the model-supplied <code>project_id</code> went raw
+  into <code>tidy_project_workspace</code>, so a traversal id like <code>"../.."</code>
+  resolved to the sandbox <em>parent</em> and the tidy walked (and deleted from)
+  directories outside the project sandbox. The reference is now resolved against the
+  store like <code>delete</code>/<code>archive</code>: an unknown ref fails loudly
+  ("nothing was cleaned"), an ambiguous title lists the candidate ids, and only a real
+  project id reaches the tidy. The sweep itself additionally asserts containment under
+  <code>projects/</code> (see <a href="../coding/workspace_cleanup.html">core.workspace_cleanup</a>).
+  Covered by <code>tests/test_projects_tool_review_fixes.py</code>.</p>
+
+  <h2><code>update</code> metadata merges — a partial update can't wipe project state (2026-07-20)</h2>
+  <p><code>action=update</code> resolves <code>project_id</code> through
+  <code>_resolve_project_ref</code> (a title or stale id doesn't silently match zero rows),
+  then applies any of <code>title</code> / <code>goal</code> / <code>status</code> /
+  <code>kind</code> / <code>metadata</code>. For <code>metadata</code>:</p>
+  <ul>
+    <li><strong>Boundary coercion.</strong> A stringified JSON object (the model often
+    quotes object params) is parsed; anything that is not a JSON object — e.g.
+    <code>metadata='["x"]'</code> parsing to a list — is rejected with an error instead of
+    being persisted verbatim, where it used to poison every later
+    <code>dict(metadata)</code>/<code>metadata.get(...)</code> reader.</li>
+    <li><strong>Merge, not replace.</strong> The dict is passed to
+    <a href="project_store.html"><code>ProjectStore.update_project</code></a>, which
+    shallow-<em>merges</em> it into the existing metadata inside a single
+    <code>BEGIN IMMEDIATE</code> transaction. The metadata blob carries system state
+    (design ledger, config slot, <code>steps_used/steps_cap</code>, research index, runtime
+    counters), so the old whole-dict replace made a budget-raise through
+    <code>action=update metadata=…</code> silently destroy all of it. (Since §4MQ the model's
+    <code>metadata=</code> cannot name a budget key at all; the owner uses <code>action=budget</code>.)</li>
+    <li><strong>No replace from the tool surface.</strong> The tool deliberately does not
+    expose the store's <code>metadata_replace</code> flag: merge is the only behavior
+    reachable from the LLM; a true whole-dict replacement is a deliberate store-API call
+    (<code>update_project(id, metadata=…, metadata_replace=True)</code>).</li>
+  </ul>
+  <p>Covered by <code>tests/test_projects_store.py</code> (merge / budget-raise /
+  opt-in replace) and <code>tests/test_projects_tool_review_fixes.py</code>
+  (non-dict rejection).</p>
+
+  <h2>Defect reports reopen DONE projects (2026-07-18)</h2>
+  <p>A bug-report-shaped request (the same <code>_is_bug_report_intent</code> gate
+  that drives the repro-first nudge) arriving while a <strong>DONE</strong> project is
+  bound now records a <code>FIX (defect): &lt;request head&gt;</code> task via
+  <code>GhostAgent._note_defect_on_done_project</code>. <code>add_task</code>'s
+  DONE→ACTIVE semantic (2026-07-11) reopens the project, and the defect shows in
+  OPEN TASKS on every later turn — so "work pending" survives across sessions.
+  Deduped: while any open <code>FIX (defect):</code> task exists, repeated
+  "still broken" messages don't stack duplicates. Before this, a completed
+  project's briefing kept saying "DONE, no open tasks" through an entire evening
+  of fix attempts, and the surviving defect lived nowhere. The
+  <code>action=status</code> snapshot also now carries <code>recent_work_log</code>
+  (see <a href="project_store.html">memory.projects</a>). Covered by
+  <code>tests/test_project_work_log.py</code>.</p>
+
+  <h2>DONE-gate for visual/runnable tasks (2026-06-09)</h2>
+  <p><code>task_update status=DONE</code> on a task that builds a <strong>runnable/visual artifact</strong> is <strong>held</strong> when no verification evidence is given (no <code>result</code> and no existing <code>result_summary</code>). The gated ids + an instruction are returned: verify with the browser tool (<code>screenshot</code>, <code>click_center=true</code> for a game), read the <a href="../search/browser.html"><code>RENDER_CHECK</code> / <code>PRE_INTERACTION</code></a> lines, then re-call with a <code>result</code> describing what rendered. This targets the live anti-pattern where the agent wrote <code>index.html</code>, marked every task DONE before testing, and claimed a blank game "works".</p>
+  <p><strong>Precision (2026-06-09, after a false-positive).</strong> The matcher (<code>_is_visual_artifact_task</code>) is HIGH-precision and word-boundary anchored. The first cut used broad words and misfired on a <em>philosophy</em> project — a text reflection "…whether the <em>scene</em> is pre-existing or being constructed" matched " scene", and "<em>game</em> theory" matched "game" — gating ordinary research tasks for ~6 wasted turns. The keyword set is now limited to tokens unambiguous in software work (<code>webgl, three.js, canvas, shader, hud, sprite, playable, gameplay, game loop, render loop, minecraft, frontend, …</code>), matched on word boundaries (so "hud" can't fire inside "shudder", nor "3d" inside "add"). <strong>Escape hatch:</strong> the gate message offers two clears — verify (for a real visual artifact) <em>or</em>, for a text/research/markdown task the gate misfired on, simply re-call with a one-line <code>result</code>. The handler also accepts <code>result_summary</code>/<code>summary</code> as aliases for <code>result</code> (the model's natural names), so the bypass works first try. Covered by <code>tests/test_run_failure_fixes.py</code>.</p>
+
+  <h2 id="4su">Closes the plan refuses are reported (&sect;4SU Phase 0, 2026-11-02)</h2>
+  <ul>
+    <li><strong>Human gates</strong> are approved only explicitly. A close of a <code>HUMAN_GATE:</code> task parks it NEEDS_USER. Only a close in a <em>later</em> owner request whose message <strong>names the task by id</strong> approves it (operator 11-02: "name it" after review r3, where "go ahead, tell me the weather" released an overnight deploy gate; then "task id only" after review r4, where the model could rename a gated task to match whatever the owner typed and common title words named unrelated gates). The message (this request's own owner message as provenance recorded it, not the context's <code>last_user_content</code>, which outlives its turn) needs an approval word ("approve", "approved", "lgtm", "sign off", "εγκρίνω") <em>directly followed by</em> the task's id: the whole id or a 6+ character prefix, as a whole word, that no other task of the project shares. It must name no other task of the project (review r5: "approve A, leave B parked" released B). It must hold nothing back anywhere: no negation ("not", "don't"/"don’t"/"dont", "can't", "haven't"&hellip;, "όχι", "δεν"), no wait/hold/but/later/tomorrow, no condition ("if", "when", "after", "until", "before", "only", "provided", "όταν", "μετά", "αν") and no question mark (including "？" and the Greek ";"). Known residual: a Retry re-sends an earlier message as a new request; a hash of the parking message was tried and dropped, since the owner typing the same "delete &lt;id&gt;" twice could then never release it. A queued mid-turn owner message that holds back withdraws it. A plain "yes" or the task's title never approves, and one message releases only the gates it names. The web console's own click approves too. The park reply tells the model to ask the owner for "approve &lt;task id&gt;". "Later" is checked against the newest park event of that task (<code>human_gate_parked</code> / <code>human_gate_triggered</code>, read exactly with <code>ProjectStore.latest_task_event</code>), which carries the request id that put the gate to the owner. A close from a scheduled, sub-agent or probe request never approves. The park reply tells the model to ask the owner for "approve &lt;task id&gt;". A <code>postconditions</code> rewrite keeps the gate. <code>task_delete</code> removes the whole subtree, so every open gated task in it needs the same release (review r2: deleting the gated task's <em>parent</em> removed the gate); a refused delete puts the gate to the owner, and their next message naming it ("delete &lt;task id&gt;" — an approval word is not a delete) lets it go. A hard project <code>delete</code> is refused the same way while any task's gate is open (review r4); <code>archive</code> is not, since it keeps every task and <code>resume</code> undoes it. <code>action=update status=DONE</code> on the project is refused while any task's gate is open (review r3: it fired the sweep past the gate). A gated parent whose children finish (ALL, ANY or BEST) is parked rather than rolled up DONE; the park is logged like any other (<code>human_gate_triggered</code>, <code>via: roll-up</code>), its summary is the gate's own text, and it is listed in <code>not_closed</code> (review r2: it was silent, so the owner's yes found no park to approve).</li>
+    <li><strong>Refused closes are reported.</strong> A DONE close that the plan demoted (a postcondition not met &rarr; FAILED) or parked (a human gate &rarr; NEEDS_USER) is listed in <code>not_closed</code> (<code>{task_id, status, why}</code>), with <code>agent_instruction_not_closed</code>. For a parked task, the instruction says to ask the owner by name and stop. On a FAILED demotion, the deliverables that close registered are unregistered again (a gate park keeps them, so the owner's approval close does not lose them to the sweep). The <code>ledger</code> line is written only once the task really reaches DONE (audit B: a FAILED task left "FACT: summary complete" in the ledger).</li>
+    <li><strong>System text is not evidence.</strong> The visual and constraint DONE gates accept a stored <code>result_summary</code> only when the system did not write it. A hold ("&hellip; not closed unattended"), a gate park ("human gate: &hellip;"), "flagged for human review" or a model-experiment hold no longer counts (audit 2: a held "snake game canvas" task closed DONE with no result).</li>
+  </ul>
+
+  <h2 id="4su-p1">One close check, one reply shape (&sect;4SU Phase 1, 2026-11-02)</h2>
+  <p><code>task_update status=done</code> runs <a href="task_close.html">core.task_close.check_close</a> (<code>actor="model"</code>, in a worker thread) in place of its separate deliverable, dependency, experiment, visual and constraint-evidence blocks. A refused task is left as it was and listed in <code>refused: [{task_id, gate, reason, fix}]</code> with <code>agent_instruction_refused</code>; a refusal by the constraint audit (gate <code>constraints</code>) or the stale-close recheck (gate <code>recheck</code>) joins the same list. The old per-gate keys were derived from <code>refused</code> until Phase 4, which removed them (see <a href="#4su-p4">Phase 4</a>). A postcondition the result does not show is now <em>refused</em> (the task stays as it was) instead of closing and being demoted to FAILED. New parameter <code>override={gate: reason}</code> (a JSON string is read too): <code>postconditions</code> and <code>model_run</code> only; <code>not_model_data</code> is the old name for <code>override={"model_run": …}</code> (Phase 4: no longer in the schema, still accepted), and <code>CONSTRAINT-OVERRIDE:</code> in the result is the old form of <code>override={"constraints": …}</code>. Each waiver that ends in a real DONE is logged (<code>close_override</code>), written to the ledger and returned in <code>overrides</code>. A parent the roll-up refused is listed in <code>not_closed</code> (once per task, its last state). <code>agent_instruction_not_closed</code> asks the owner to "approve &lt;task id&gt;" only for a human-gate park (<code>why</code> starts "human gate:"); a roll-up refusal is to be fixed and closed again, not approved (review r4). A refused re-close of a task already DONE (by an earlier call, or by a child's roll-up earlier in this call) is listed only in <code>refused</code>, with "the task stays DONE: this re-close changed nothing" (none of the old keys, which would say "held"); the constraint audit's refusal of such a re-close too (r8), and <code>agent_instruction_refused</code> then says nothing changed rather than "NOT closed". &sect;4TX: the reply's <code>closed</code> lists the tasks this call really closed DONE (absent when none; a re-close of a task already DONE is not in it) &mdash; the mood's "finished a project task" counts these. A task that really closes in the call drops any <code>not_closed</code> entry a child's roll-up wrote for it earlier. <em>Known limit:</em> a bulk call that lists a parent <em>before</em> its children reports the parent's own refusal even if a child's roll-up closes it later in the call; a re-close then says it stays DONE, so it cannot loop. Reviews r5&ndash;r7 tried a reply filter, then children-first ordering with a skip; each broke something new (old keys disagreeing; a grandparent left waiting; edits dropped), and both were removed.</p>
+
+  <h2 id="4su-p4">The model-facing surface (&sect;4SU Phase 4, 2026-11-02)</h2>
+  <ul>
+    <li><strong>A smaller definition.</strong> The schema shows 28 actions (<code>_VISIBLE_ACTIONS</code>; the handler still accepts the rest, such as <code>task_next</code>, for old callers) and about 5.4k characters instead of 8.7k. Dropped parameters: <code>dependency_type</code>, <code>alternatives</code>, <code>max_topics</code>, <code>not_model_data</code> (now <code>override={"model_run": "&lt;why&gt;"}</code>; the old keyword is still accepted), <code>artifact_kind</code>, <code>limit</code>, <code>event_type</code>, <code>query</code>. The rules that survived in short form: create only on an explicit ask or multi-file, multi-turn work; past projects in memory are no reason to create; any list of 2+ tasks goes in one <code>task_decompose</code>; never split one file into N tasks; present a plan and stop; previews need the user's yes.</li>
+    <li><strong>Status names.</strong> The <code>status</code> enum is <code>PENDING</code>, <code>DONE</code>, <code>FAILED</code>, <code>WAITING</code>. <code>WAITING</code> is stored as <code>NEEDS_USER</code> (waiting on the owner) and <code>RUNNING</code> as <code>IN_PROGRESS</code>; the stored names are still accepted.</li>
+    <li><strong><code>replan</code></strong> (audit: the same topic was deleted and re-created 7&times;). It lays down a new plan for the SAME project. DONE tasks, and any open task with DONE work under it, are kept, along with their files and the research. The new <code>subtasks</code> are laid down first, as <code>task_decompose</code> does (without its duplicate filter: the new plan is the plan). Only then is every other open task deleted (a subtree goes with its root), so the project never rolls up to DONE mid-replan. Review r1 found that deleting first fired the workspace sweep and retired the owner's constraints, and any later refusal lost the old plan. A kept parent left with only DONE children is re-judged by the roll-up (<code>ProjectPlan.recheck_parents</code>). A task left IN_PROGRESS for over 900&nbsp;s is not treated as running, unless an unattended step is live on the project (it runs up to 45&nbsp;min without touching the row; r3). A replan takes no <code>task_id</code>: it replaces the whole open plan, and to re-plan one task you <code>task_decompose</code> it (r3: the id was ignored). An error while the new tasks are laid down removes the ones already created and changes nothing. Open residual: an owner build started from the web <code>/advance</code> that runs over 15&nbsp;min is not seen as running. The reply carries <code>replanned: {removed_open_tasks, kept_done_tasks}</code>, with event <code>project_replanned</code> and ledger line <code>REPLANNED: …</code>. Nothing changes when there are no subtasks or they are all blank, when the project is ARCHIVED (resume it first), when the project is a single-file deliverable and the plan has 2+ tasks, when the project is released, when a task is RUNNING, or when an open HUMAN_GATE task would go and the owner has not released it ("delete &lt;task id&gt;"; logged <code>human_gate_parked</code>).</li>
+    <li><strong><code>list</code> returns display lines</strong>: <code>display</code> (id first, status, title, <code>&lt;- ACTIVE</code>), <code>count</code>, <code>current</code> and <code>note</code>. The full rows hit the 4k result cap in 46 of 46 owner list calls. <code>metadata={"verbose": true}</code> adds <code>projects</code>.</li>
+    <li><strong>A plan hands the turn to the user.</strong> The <code>create</code> and <code>task_decompose</code> (and so <code>replan</code>) replies start with <code>"awaits_go_ahead": true</code>, as the FIRST key, so it is still read from a truncated stored result. The trailing-promise guard (<a href="../infrastructure/agent.html">core.agent</a> <code>_awaits_owner_go_ahead</code>) then lets "say go and I'll start" stand. The same applies to a release/delete preview (<code>confirmation_needed</code>) and its "already previewed" refusal (<code>confirm_dead_end</code>). The audit found that 7 of 11 delete previews looped, and every create paid 60&ndash;80&nbsp;s for the forced continuation.</li>
+    <li><strong>One <code>refused</code> list.</strong> The legacy per-gate reply keys are gone: <code>undelivered</code>, <code>waiting_on_dependencies</code>, <code>unrun_experiments</code>, <code>still_failing</code>, <code>constraint_violations</code>, <code>gated_constraints</code>, <code>gated_unverified</code> and their <code>agent_instruction_*</code> texts (operator: kept until Phase 4). Each refused close is one entry <code>{task_id, gate, reason, fix}</code> in <code>refused</code>, with one <code>agent_instruction_refused</code> (<a href="task_close.html">task_close.instruction_for</a>). That instruction now says to retry with <code>status=done</code> AND the result in the same call; the legacy texts carried this (the gate &rarr; result-only &rarr; gate spin). <code>_ok</code> rejects a payload with <code>refused</code> or <code>missing</code> and nothing updated.</li>
+  </ul>
+
+  <h2 id="4su-p3">Five states (&sect;4SU Phase 3, 2026-11-02)</h2>
+  <p>See <a href="task_wait.html">core.task_wait</a>. <code>task_list</code>'s slim rows carry <code>state</code> (<code>PENDING</code>, <code>RUNNING</code>, <code>DONE</code>, <code>FAILED</code>, <code>WAITING(on: why)</code>) instead of <code>status</code>, and <code>status_filter</code> takes <code>WAITING</code> / <code>RUNNING</code> (<code>READY</code> means PENDING). In <code>task_update</code>, each <code>not_closed</code> entry carries <code>waiting</code> (the wait code), and the human-gate instruction is chosen by <code>waiting == "human_gate"</code>. The autoadvance reply splits gates from holds by <code>wait_on == "owner_turn"</code>.</p>
+
+  <h2 id="4su-p2">A task declares its kind (&sect;4SU Phase 2, 2026-11-02)</h2>
+  <p><code>subtasks</code> items (on <code>create</code> and <code>task_decompose</code>) may be objects <code>{"description", "kind", "deliverable"}</code>; a JSON-string list of objects, or one JSON object per string item, is read too; a text that starts like a JSON list of objects (<code>[{</code>) and does not parse is an error (it used to become one task of JSON text); one JSON object on its own (<code>{"description": …}</code>) is read as a list of one; a string, or a string item, that parses to an object with a subtask key (description, task, title, kind, task_kind, deliverable) is judged as the object form (no description: an error); other text, such as "[draft] write {name}", stays text. <code>kind</code> is one of <code>build</code>, <code>write</code>, <code>research</code>, <code>model_run</code>, <code>owner</code> (aliases accepted, see <a href="task_kind.html">core.task_kind</a>); <code>deliverable</code> is appended as <code>&rarr; path</code>. A plain string stays undeclared. New parameter <code>task_kind</code> sets the kind on <code>task_add</code> and <code>task_update</code> (<code>"none"</code> clears it); it is not <code>kind</code>, which already names the project kind. An unknown kind is an error and nothing is written. The create instruction with no subtasks asks for objects. <code>task_decompose</code>'s reply and the slim task list carry <code>kind</code>.</p>
+
+  <h2 id="4st">A model run needs a kept transcript (&sect;4ST, 2026-11-02)</h2>
+  <p><code>task_update status=done</code> on a model experiment (by the task's words, or because a file it delivers reads like model output: a transcript heading or a <code>Transcript:</code> / <code>Model response:</code> label) is refused unless the result or a delivered file cites a <code>probe_model</code> transcript kept for the project. The refused ids are returned in <code>refused</code> with gate <code>model_run</code> (until &sect;4SU Phase 4: <code>unrun_experiments</code>). For a false trigger, re-call with <code>override={"model_run": "&lt;why, in a sentence&gt;"}</code> (formerly <code>not_model_data</code>) (at least 12 characters): the reason is stored with the task (<code>[not model data: …]</code>), and once the task has really closed DONE it is listed in <code>experiment_gate_waived</code> and in the work log. Request b45ec99f's three fake experiment write-ups closed DONE before this gate. See <a href="../coding/experiment_gate.html">core.experiment_gate</a>.</p>
+
+  <h2>Deliverables &amp; end-of-project cleanup</h2>
+  <p>When a project completes (transitions to DONE), its workspace is swept by
+  <a href="../coding/workspace_cleanup.html">core.workspace_cleanup</a>: registered
+  <code>file</code> artifacts are kept, everything else (screenshots, helper
+  scripts, temp files) is deleted. So <code>task_update status=DONE</code> takes
+  a <code>deliverables=[...]</code> argument — the project-relative paths the
+  user should keep. Each is registered via
+  <a href="project_store.html"><code>register_file_artifact</code></a>
+  (deduped) the moment the task is marked DONE; a legacy
+  <code>artifact_kind="file"</code>&nbsp;+&nbsp;<code>payload</code> pair is
+  registered the same way. The DONE-gate instruction now reminds the agent to
+  pass <code>deliverables</code> so nothing important is swept. Covered by
+  <code>tests/test_workspace_cleanup.py</code>.</p>
+
+  <h2>Per-project sandbox scoping</h2>
+  <p>When a project is active (<code>context.current_project_id</code> set on <code>create</code>/<code>switch</code>/<code>resume</code>), file&nbsp;ops and code execution are rooted at <code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code> instead of the sandbox root — so a whole project's scratch space cleans up with a single <code>rm -rf sandbox/projects/&lt;id&gt;</code>. The same path is what <a href="project_store.html"><code>ProjectStore._default_workspace()</code></a> records as a project's <code>workspace_dir</code>.</p>
+  <p><b>Single source of truth.</b> All scoping routes through <code>file_system.project_scoped_sandbox(context, stateful)</code> → <code>(host_dir, container_workdir)</code>. The registry's <code>_proj_ws</code> delegates to it, and so does every other file surface, so they can't drift: the tool registry, the <b>ambient sandbox-state listing</b> injected into each turn (<code>core/agent.py</code> — previously listed the root while file ops were scoped, which is what made the model insist "the file is at sandbox root"), the user-attached-image save, the <b><code>/api/upload</code></b> route, <code>knowledge_base</code>'s source-file reads, and the (dormant) Qwen-Agent <code>qwen_bridge</code> runtime.</p>
+  <p>The per-tool wiring threads that helper into the artefact-producing tools:</p>
+  <ul>
+    <li><b><code>file_system</code></b> + <b><code>report_pdf</code></b> + <b><code>image_generation</code></b> — <code>sandbox_dir</code> is the scoped host dir. <code>report_pdf</code> and <code>image_generation</code> emit a <em>root-relative</em> download link (<code>/api/download/projects/&lt;id&gt;/…</code>) via the shared <code>file_system.project_download_prefix()</code> helper, because the <code>/api/download/&lt;path&gt;</code> route resolves against the sandbox ROOT.</li>
+    <li><b><code>execute</code></b> — also receives <code>container_workdir = /workspace/projects/&lt;id&gt;</code>, threaded down to <code>DockerSandbox.execute(workdir=…)</code>, so a script written via <code>file_system</code> reads back when run by <code>execute</code> (the write-then-read symmetry invariant). The <code>workdir</code> kwarg is passed ONLY when scoping is active, so sandbox managers without the parameter are unaffected.</li>
+    <li><b><code>vision_analysis</code></b> — scoped to read images that the scoped <code>execute</code>/<code>image_generation</code> wrote (the <em>generate-plot → analyse</em> loop). As a read-only tool it additionally <b>falls back to the sandbox root</b> if the scoped path misses.</li>
+    <li><b><code>browser</code></b> — scoped too: it runs its in-container runner from <code>/workspace/projects/&lt;id&gt;</code> (via <code>container_workdir</code>), writes screenshots into the scoped dir (container path via <code>_to_container_path</code>), and <b>heals <code>file://</code> URLs</b> — a model-emitted <code>file:///workspace/page.html</code> <em>or</em> the host-root-relative <code>file:///sandbox/projects/&lt;id&gt;/page.html</code> is rewritten to <code>file:///workspace/projects/&lt;id&gt;/page.html</code> (with a root fallback), so the browser can open files the scoped <code>file_system</code> just wrote. The <code>sandbox/projects/&lt;id&gt;/</code> case was a live 404 loop fixed 2026-06-20 (see <a href="../coding/file_system.html">file_system path heal</a>). The persistent profile stays shared at <code>/workspace/.browser_profile</code>. The <code>create</code>/<code>switch</code> workspace note now also explicitly tells the model to use BARE names and never prefix with <code>/workspace/</code>, <code>sandbox/</code>, or <code>projects/&lt;id&gt;/</code>.</li>
+  </ul>
+  <p><b>Consistency across the handoff surface.</b> Because <code>execute</code> must be scoped (to preserve file_system↔execute symmetry), every tool it hands files to is scoped to match: a plot written by <code>execute</code> is found by <code>vision_analysis</code>; an image from <code>image_generation</code> is found by <code>vision_analysis</code> and downloadable. The <code>/api/download</code> route also <b>falls back to the active project dir</b> for a bare filename, so a model-emitted <code>/api/download/plot.png</code> link to a scoped file still resolves.</p>
+  <p><b>Switch-race handling.</b> The model often emits a <code>file_system</code> write <em>before</em> the <code>switch</code> tool call in the SAME turn, so the file lands at the root just before scoping turns on; a later <code>execute</code> then runs from the scoped cwd and can't see it. Two mitigations: the <code>create</code>/<code>switch</code>/<code>resume</code> result carries a <code>note</code> telling the model its working directory is now <code>projects/&lt;id&gt;/</code> (reference files by bare name) — <code>create</code> was <em>added</em> to this set on 2026-06-09 after a live run where the model wrote <code>index.html</code> expecting the sandbox root right after creating a project, then burned ~4 turns discovering the write had been project-scoped and "moving" it; and <code>execute</code>'s command path <b>retries once from the sandbox root</b> when a scoped run fails with a file-not-found signature (safe — that error means nothing executed). Net effect: the race recovers silently with zero strikes (verified live: a generate-plot-then-analyse prompt that previously burned 2 strikes now completes clean).</p>
+  <p>Guards: scoping activates only for a genuine <em>string</em> project id (a <code>MagicMock</code> context attribute can't trigger it); <code>_get_safe_path</code> heals the model's redundant <code>projects/&lt;id&gt;/</code> path prefix so it never double-nests, and <code>_to_container_path</code> un-scopes to the root before translating (the bind mount is at the root). <b>Stateful Jupyter-kernel sessions opt out</b> (<code>stateful=True</code>) and stay at <code>/workspace</code>, since the kernel's connection file is pinned to <code>/workspace/.kernel.json</code>.</p>
+  <p><b>Intentionally NOT scoped:</b> <code>create_skill</code>/<code>manage_skills</code> and acquired-skill execution stay at the root because skills are global, cross-project resources (the knowledge base's <em>storage</em> is the global memory system — only its source-file <em>reads</em> are scoped). The <code>browser</code> profile (<code>/workspace/.browser_profile</code>) is deliberately left shared across projects so session/cookie state persists. Self-play runs in its own throwaway sandbox and is explicitly project-less (see <a href="../memory/dream.html">dream</a>). Covered by <code>tests/test_project_sandbox_scoping.py</code> and <code>tests/test_dream_synthetic.py</code>.</p>
+
+  <h2 id="4sx-b0">Conversation focus: one row per conversation <span class="tag">2026-11-04 &sect;4SX B0</span></h2>
+  <p>Each conversation has its own <strong>focus project</strong>. It is a row in the project store, not a global slot. This replaced
+  the 2026-06-12 binding below and everything grown around it (guests, held conversations, request-only notes, the
+  "this message names the project" escape hatch, the member save/restore and the leaf-pin bypass: about 500 lines).</p>
+  <ul>
+    <li><b>Identity.</b> The conversation key is the client's <code>session_id</code>: <code>session:&lt;id&gt;</code>, or the
+    Slack bot's <code>slack:&lt;…&gt;</code> as-is (<code>core/request_scope.conversation_key_for_session</code>). Web, CLI, Slack and the
+    ClockworkPi client all send one.</li>
+    <li><b>The row.</b> Table <code>conversation_focus(conversation_key PK, project_id, bound_at, last_used_at)</code> in
+    <code>projects.db</code>. It survives restarts and is never evicted. Rows unused for 30 days are pruned on the next write.
+    A conversation has at most one focus. Many conversations may focus the same project. <code>switch</code> / <code>create</code> /
+    <code>resume</code> set <em>this</em> conversation's row, and <code>exit</code> clears it; no other conversation's row changes.
+    <code>archive</code> and <code>delete</code> (tool, <code>PATCH status=ARCHIVED</code>, <code>DELETE</code>) clear every row that
+    points at the project, and a hard delete cascades.</li>
+    <li><b>The request's project is a value.</b> <code>handle_chat</code> builds one <code>RequestScope(conversation_key, project_id,
+    origin, persist)</code> at request start and installs it in a ContextVar. <code>GhostContext.current_project_id</code> and
+    <code>conversation_key</code> are properties over it, so the ~110 readers are unchanged. A task the request creates (a gathered
+    tool call, a late verdict, spawn_bg) shares the scope object, so a switch inside a tool reaches the request. The next request
+    installs a new scope and never sees the old one. The streamed drain re-installs its request's scope. A copy of the context
+    (a leaf, a sub-agent) keeps the value at copy time as its own.</li>
+    <li><b>Who reads and writes a row.</b> Only an owner request that carries a session id (<code>persist=True</code>), and it reads
+    the row inside the turn lock (<code>begin_request_focus</code>). Everyone else gets a <em>request-only</em> scope: they may switch
+    for the request, but nothing is stored. That covers members, probes, unattended requests (<code>sched-</code>/<code>sub-</code>/<code>job-</code> and every non-<code>user</code>
+    population) and a client with no session id (keyed by its first-message hash for previews and late corrections only). (Until 2026-11-05 it also covered failure replays and regression runs, ids <code>probe-fr-</code> / <code>probe-rt-</code>; those requests no longer exist, §4SZ.)</li>
+    <li><b>Leaves.</b> <code>run_leaf_turn</code> passes <code>handle_chat(scope=RequestScope(project_id=pin, origin="leaf"))</code>,
+    and its after-turn check reads that object. <code>_leaf_pinned_project</code> is gone.</li>
+    <li><b>No activation by wording.</b> When a message names another project (id, 8-character id prefix, or whole-word title of 5+
+    characters; review r1: 3–4-character titles like "Test" fired on unrelated messages), the dynamic state gets one <code>PROJECT NAMED</code> line. The model switches with one call, and reads can pass
+    <code>project_id</code> without switching (<code>get</code>, <code>status</code>).</li>
+    <li><b>The shared scratchpad follows the request.</b> When its live write scope is another project's, that project's keys are
+    snapshotted and the incoming project's last snapshot is hydrated. Consecutive turns on the same project hydrate nothing.
+    A failed snapshot keeps the keys rather than dropping them. An emptied project records an empty snapshot (once, when the
+    latest one still held keys), so a key the owner deleted cannot be hydrated back (review r1). The keyspace is flat: the
+    namespace is only a tag, so the swap runs on <em>every</em> request whose project differs from the live scope, not only when
+    a conversation's focus changes (a deviation from UNIFIED_DESIGN §13 #9). A member turn swaps too: that is what hides the
+    owner's project keys from it (moving only the write scope, as before B0, left them readable). A key that left the
+    scratchpad by TTL expiry or the LRU cap counts as gone too: the empty snapshot follows the scratchpad's own rules.</li>
+    <li><b>Archived projects.</b> An archive clears every row on the project when it happens. A later explicit switch to an
+    archived project (console or tool) is kept: the read drops a row only when its project is gone (review r1: dropping archived
+    rows on read made the switch vanish on the next turn).</li>
+    <li><b>Outside a request</b> there is no current project. <code>/api/upload</code> and bare <code>/api/download</code> links resolve
+    the project from <code>?project_id=</code>, or from the focus of the conversation named by <code>?session_id=</code> /
+    <code>X-Ghost-Session</code>. The web client (uploads, and every <code>/api/download/</code> fetch via <code>X-Ghost-Session</code>), its
+    proxies, the CLI (<code>/upload</code>, <code>/download</code>), the ClockworkPi client's image fetch and the Slack bot (uploads
+    and reply-image downloads carry the thread's <code>slack:&lt;thread&gt;:&lt;user&gt;</code>, the same string as its chat
+    <code>session_id</code>) send it. The web client's authed-image cache is keyed by session + src, since the same bare
+    name can be a different file in another session's project (review r3). A file call on a
+    project deleted mid-turn still recreates an orphan <code>projects/&lt;id&gt;/</code> directory: review r2 rejected the r1
+    "work unscoped" fix, because unscoped is the sandbox <em>root</em>, where the turn would overwrite the owner's files.</li>
+    <li><b>A failed scope build</b> installs a request-only scope (review r2), so the request never falls back to the
+    context's process-global slot.</li>
+    <li><b>Migration (B4).</b> At startup <code>drop_legacy_binding</code> deletes the four old <code>__current_project*</code> keys
+    from <code>scratchpad.db</code>, with no mapping. The owner's next message starts unfocused.</li>
+  </ul>
+  <p>Pins: <code>tests/test_project_conversation_scope.py</code> (two sessions, rows, request-only scopes, the property, the scope
+  builder, the legacy drop), <code>tests/test_projects_api.py</code> (console routes), <code>tests/test_4fh_leaf_pin_survives_reconcile.py</code>,
+  <code>tests/test_requester_role.py</code> (members), <code>tests/test_scratchpad_scope_fixes.py</code>.</p>
+
+  <h2 id="4sx-d2">A project owns what it runs: one teardown <span class="tag">2026-11-04 &sect;4SX D2</span></h2>
+  <p>Before D2, <code>delete</code> and <code>archive</code> stopped the project's <em>services</em> only, and the console
+    <code>DELETE /api/projects/{pid}</code> was a second, shorter copy that also skipped the episode and changelog cleanup.
+    Runs (<a href="../coding/runs.html"><code>run</code></a>), labs and sandbox jobs of the project were left behind. Now one
+    <code>_teardown_project(context, pid, hard=, origin=)</code> serves the chat tool, <code>DELETE</code> and
+    <code>PATCH status=ARCHIVED</code>.</p>
+  <ul>
+    <li><b>Inventory</b> (<code>_project_inventory</code>): the project's live <code>run</code> rows, its service rows, its running
+      sandbox jobs and its lab inventory rows. It reads local records only and never probes. <code>status</code> shows it as
+      <code>inventory</code>.</li>
+    <li><b>delete</b> stops every run, stops the services, cancels the jobs, and destroys every lab of
+      <code>project:&lt;id&gt;</code> the labs host lists (kept ones with <code>include_kept=1</code>). It sends <code>drop_data=1</code> only when
+      no other kept lab shares the lineage; otherwise the data volume is kept and the result says which lab still uses it.</li>
+    <li><b>archive</b> stops job/server runs and destroys disposable labs. <code>app</code> runs and kept labs are production: they
+      stay up and the note lists them with a question.</li>
+    <li><b>Refusal:</b> the project row is deleted only if nothing LIVE is left that could not be stopped. A run the sandbox cannot
+      reach is recorded <code>lost</code> and does not block. A labs host that is down blocks only when the project has lab rows on
+      record. With none, the delete goes ahead with a note. The tool returns <code>NOT deleted: still running — …</code>;
+      the console returns <code>409 {error, live_left, teardown}</code>.</li>
+    <li><b>Origin:</b> the teardown takes the caller's origin explicitly (the console has no request scope, and the labs default
+      would be <code>autopilot</code>). The console maps it from the <code>X-Ghost-Origin</code> header. A probe may delete or archive only a
+      <code>probe_created</code> project (403 otherwise).</li>
+    <li><b>Preview:</b> the delete preview says <code>It would also stop/destroy: …</code> (<code>would_also_stop</code>) and stores the
+      inventory ids in the plan. A "yes" or token whose project has since gained a <b>kept lab</b> (<code>kept:&lt;id&gt;</code>, including
+      a lab that became kept) or an <b><code>app</code> run</b> (<code>app:&lt;id&gt;</code>) gets a fresh preview (design r1 M8). A new background
+      job, server run or disposable lab does not: a delete exists to remove those, and re-asking on churn would loop the owner.</li>
+    <li>The console hard delete now also runs the graph unlink, <code>_forget_project_episodes</code> and
+      <code>_remove_project_changelog</code>, as the tool does.</li>
+  </ul>
+  <p><b>Code review round 2</b> fixed eight problems:</p>
+  <ol>
+    <li>Two kept versions of one lineage in the same project: the list of other labs now forgets each lab once it is destroyed. The last
+      version therefore sends <code>drop_data</code>.</li>
+    <li>The chat tool had no origin check. Now a probe may delete or archive only a project it created, and
+      <code>unattended</code>/<code>leaf</code> work never may.</li>
+    <li>The delete preview now reads the labs host's own list of the project's labs (<code>_host_project_labs</code>). It
+      names kept labs with their lineage and lists labs the host has but the local record lacks. The digest gains a
+      <code>kept:&lt;id&gt;</code> entry, so a lab that became kept after the preview needs a new yes.</li>
+    <li>A job that ended, or was marked lost when the container was recreated, before the cancel is a note, not a block.</li>
+    <li>The refusal text now says what was already stopped.</li>
+    <li>One raising item no longer skips the next one. An item whose state cannot be read counts as still running.</li>
+    <li>The console <code>PATCH</code> archive returns <code>teardown</code>, <code>kept_up</code> and <code>live_left</code>.</li>
+    <li>"With its data" is reported only when the host's reply lists removed data volumes. Otherwise the host's own note
+      is shown.</li>
+  </ol>
+  <p><b>Code review round 3</b> fixed nine problems:</p>
+  <ul>
+    <li>A lab the host lists for the project but the local record lacks is <b>recorded at the preview</b>. A delete
+      that later cannot reach the host therefore refuses on it, instead of reading "no lab on record".</li>
+    <li>The re-preview rule above was narrowed to kept labs and <code>app</code> runs.</li>
+    <li>A job that was pruned between the list and the cancel is a note.</li>
+    <li>The teardown reads the run registry and the lab inventory with <code>rows(strict=True)</code>. An unreadable store blocks
+      the delete; the default <code>rows()</code> still answers <code>[]</code> on error.</li>
+    <li>A host reply of 200 with <code>leftovers</code> blocks the delete, and the operator clears them on the labs host.</li>
+    <li>A run <code>replaced</code> by a start outside <code>run</code> is a note; the services step stops that service.</li>
+    <li><code>PATCH</code> runs the teardown only after the update validated; a 400 no longer comes after runs were stopped. The
+      tool's <code>update status=ARCHIVED</code> checks the origin before changing any other field.</li>
+  </ul>
+  <p><b>Code review round 4</b> (the round-3 findings) fixed five problems:</p>
+  <ul>
+    <li>Retrying a delete after <code>leftovers</code> no longer reads the lab as gone. A lab the project's record has but the host no longer
+      lists gets one more <code>DELETE</code>, and the labs host now names the leftovers on a repeat delete too
+      (<code>ghost_labs/labs.py</code> <code>destroy</code>). The lab is recorded as destroyed only when that reply is clean.</li>
+    <li>A lab recorded on another labs host (<code>host_id</code> differs from the configured host's <code>/v1/health</code>) blocks the delete,
+      and nothing is sent to the wrong host.</li>
+    <li>The summary now carries <code>STILL RUNNING (could not be stopped)</code>. The archive note says so when anything could
+      not be stopped, and a soft console <code>DELETE</code> that left anything up answers 200 with the report instead of 204.</li>
+    <li>If the host does not answer at the "yes", the earlier preview never covers labs, since a lab may have turned kept.</li>
+    <li>The replaced-run test now runs the services step against a live replacement.</li>
+  </ul>
+  <p><b>Code review round 5</b> (the round-4 findings) fixed six problems:</p>
+  <ul>
+    <li>The labs host finds leftovers by docker label even after its 24&nbsp;h destroyed memory expired, so a retry the next day still
+      names them instead of answering <code>unknown_lab</code>.</li>
+    <li>A lab recorded with a <code>host_id</code> blocks while the configured host's identity is unknown (<code>/v1/health</code> not answering).
+      Labs recorded at the preview carry the host id.</li>
+    <li>The preview reads the host with the same timeout as the teardown.</li>
+    <li>The growth check runs after the owner's-yes check, so a same-turn token no longer drops the plan the owner's real yes needs.</li>
+    <li>A run registry or lab inventory that cannot be opened blocks, the same as one that cannot be read.</li>
+    <li><code>lab destroy</code> that reports leftovers keeps the lab on record (FAILED, <code>lab_leftovers</code>), so a later project delete
+      still sees it.</li>
+  </ul>
+  <p><b>Code review round 6:</b> an ordinary <code>lab list</code> retired a leftover lab's row as "expired", and a project delete then
+    missed it. The lab inventory now has a <code>leftovers</code> column (<code>mark_leftovers</code>, migrated in place). Every destroy that
+    reports leftovers sets it: the <code>lab</code> tool's and the teardown's. <code>lab list</code> shows such a row and never retires it. A
+    <code>lab destroy</code> of it skips the status read, which answers 404 once the host dropped its row, and asks the host with the DELETE
+    itself. A probe may do that only for its own row. The row is retired when the reply is clean. A row made on another labs host is not
+    asked about on the configured one (round 7: that host's 404 said "cleared"). It says where the leftovers are, and
+    <code>lab list</code> names that host.</p>
+  <p><b>Accepted residual:</b> a local lab row with no <code>host_id</code> (its create could not read the host's identity) that the
+    configured host answers <code>unknown_lab</code> for is read as gone, even if it carries a leftovers mark. After a host change,
+    such a lab, or its leftovers, on the old host would be missed. Only labs whose create could not read the host's identity are
+    affected.</p>
+  <p><b>Known residual:</b> "recorded as lost" applies only when the agent has no sandbox manager. When the sandbox
+    container is merely stopped, <code>run stop</code> cannot verify the run. The delete then refuses (fail closed) until the
+    sandbox is up.</p>
+  <p>Not in D2: scheduled tasks have no owner field yet (D4). Pinned by <code>tests/test_4sx_d2_inventory.py</code>.</p>
+
+  <h2 id="4sx-d3">Release with a kept app <span class="tag">2026-11-04 &sect;4SX D3</span></h2>
+  <p>If a project has a live <code>app</code> run, <code>release</code> runs <code>_release_app_gate</code> before the old rehearsal. Every app must be <strong>up</strong> on its serving lab (state running, app state up), or the release is refused with "must be UP". The dossier lists the apps with their URLs and lab ids. No twin rehearsal is started (design review r1 H5). A project without an app gets the old rehearsal. After the labs step, a hard delete re-probes the project's app runs, so an app whose kept lab is gone ends as <code>lost</code>.</p>
+
+  <h2>Conversation-scoped activation (2026-06-12) <span class="tag">replaced by &sect;4SX B0</span></h2>
+  <p><em>History. The fingerprint identity, the scratchpad sentinels and <code>reconcile_conversation</code> described here are gone; see above.</em></p>
+  <p><code>context.current_project_id</code> is <strong>process-global</strong>, and before this fix it was also <em>sticky across conversations</em>: a project activated in one chat stayed active for every other conversation hitting the same process, so an unrelated request's file writes silently landed in <code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code> (observed live: a "just give me the SQL" chat's <code>migration.sql</code> was written into a project created days earlier in a different conversation, then several turns were burned explaining and undoing it).</p>
+  <p>The activation is now <strong>bound to the conversation that asked for it</strong>:</p>
+  <ul>
+    <li><b>Identity.</b> The chat API ships the full message history and no conversation id, so <code>conversation_fingerprint(messages)</code> hashes the FIRST user message — constant for a conversation's lifetime, different across conversations. Returns <code>""</code> (owns nothing) when there is no user turn.</li>
+    <li><b>Binding.</b> <code>_set_current</code> writes a second sentinel, <code>__current_project_conv__</code>, next to <code>__current_project__</code>, recording the owning conversation's fingerprint (taken from <code>context.conversation_key</code>, which is set per-request).</li>
+    <li><b>Reconcile.</b> <code>reconcile_conversation(context, conv_key)</code> runs at request start in <code>handle_chat</code>, BEFORE the ambient sandbox listing or any file op. Owning conversation → (re)activate the bound project (returning to that chat resumes it, scratchpad hydrated). Any other conversation — including a legacy bare sentinel written before the conv sentinel existed, and an empty fingerprint — → deactivate for this request, snapshotting the project scratchpad and PRESERVING the binding so the owner gets it back.</li>
+  </ul>
+  <p>Autonomous flows (dream, project advancer) that activate a project outside a user request write an unbound (<code>""</code>) binding, so their activation can never capture the next user conversation. Covered by <code>tests/test_project_conversation_scope.py</code>.</p>
+
+  <h2>Explicit user constraints — capture, gate, correction detection (2026-07-02)</h2>
+  <p>Observed live (the chess-game incident): the user asked for <em>"a turn by turn game where YOU will play against me — don't come up with some random AI"</em>. The agent acknowledged the clause in its reasoning, then shipped a minimax engine anyway: a stale pending task from an earlier (pre-correction) decomposition, a 70×-reinforced "single-file HTML game" skill prior, and nothing re-surfacing the constraint after turn 1 combined to erase it. Three mechanisms now make explicit constraints durable and load-bearing:</p>
+  <ul>
+    <li><b>Capture.</b> <code>action=create</code> and <code>task_decompose</code> merge the model-passed <code>constraints=[…]</code> param with clauses extracted deterministically from <code>context.last_user_content</code> by <code>utils/constraints.py</code> (negations, "YOU will…" role assertions, CAPS emphasis — no LLM call). They persist in project <code>metadata.constraints</code> and per-task <code>constraints_json</code>, and are stamped on every task created in the same call. Operator-visible via the ⛓️ <code>Constraints</code> log line.</li>
+    <li><b>Re-surfacing.</b> <code>build_project_briefing</code> renders an <code>EXPLICIT USER CONSTRAINTS</code> section every turn (above the design ledger), and the agent injects the current request's extracted constraints into the dynamic state even without a project (see <a href="../infrastructure/agent.html">agent</a>).</li>
+    <li><b>DONE-gate.</b> <code>task_update status=DONE</code> on a task whose task-level or project-level constraint set is non-empty and that carries no <code>result</code> evidence is HELD (reported in <code>refused</code>, gate <code>evidence</code>; until &sect;4SU Phase 4 as <code>gated_constraints</code>, + an instruction to state, per constraint, how the work honors it — or fix the deliverable first). Judging whether the evidence is truthful stays the verifier's job: the agent prepends the active project's constraints to the verifier's request view, and constraint violation is the verifier prompt's highest-priority refute rule.</li>
+  </ul>
+  <h3>Delete-then-recreate = correction, reuse-with-new-constraints = correction</h3>
+  <p>Deleting a project and re-asking is a rejection signal, but a hard delete used to erase all evidence the project ever existed (FK cascade). <code>delete_project(hard=True)</code> now writes a <b>tombstone</b> (<code>deleted_projects</code> table: id/title/kind/goal/created_at/deleted_at) before the cascade. On the next <code>create</code>, <code>find_deleted_similar()</code> (stopword-insensitive title Jaccard ≥ 0.5, 24 h window) flags the recreate: the response instruction opens with <code>CORRECTION CONTEXT</code> ("plan from the CURRENT message only; do not reuse the remembered decomposition"), and <code>metadata.correction_of</code> records the tombstone id. Symmetrically, when the duplicate-title guard <em>reuses</em> an in-flight project and the new message carries constraints the project doesn't have yet, they are merged in and the response opens with <code>CORRECTION DETECTED</code> + an instruction to revise conflicting pending task descriptions before proceeding — the exact anchoring failure of the chess incident (the pending "AI opponent" task was read as "matches exactly what the user wants" after the user had excluded it).</p>
+  <p>Covered by <code>tests/test_project_constraints.py</code> and <code>tests/test_correction_detection.py</code>.</p>
+
+  <p>Persistence model: see <a href="project_store.html">memory.projects</a>.</p>
+
+  <h2>Constraint judgment gate on task_update→DONE (2026-07-08)</h2>
+  <p>The existing constraint DONE-gate is evidence-based — it only demands that result text <em>exists</em>. The chess session showed the model supplies compliant-sounding evidence while the artifact violates the constraint (it built a heuristic engine after restating "Ghost plays directly"). Marking a constrained task DONE now also runs <code>core/build_gates.constraint_gate</code> — one LLM audit of the project workspace files per call. A confirmed violation refuses the transition and returns <code>agent_instruction_violation</code> with the evidence; a user-approved exception can pass a <code>result</code> beginning with <code>CONSTRAINT-OVERRIDE:</code>. Fails open on infra errors.</p>
+
+  <h2>Constraint-gate sibling bypass (bug-hunt 2026-07-26b, HIGH)</h2>
+  <p><code>task_update</code>'s constraint JUDGMENT gate cached its verdict in a single per-CALL variable, so in a bulk close (<code>task_ids=[t1,t2,t3]</code>) every sibling reused the FIRST task's audit. A constraint-VIOLATING sibling with different files inherited the first (clean) task's pass and closed DONE UNAUDITED — the exact safety bypass the gate exists to stop (and conversely a clean sibling was refused with the first task's evidence). The audit is now cached by the task's FILE SET (<code>frozenset(files)</code>): identical file sets still cost one audit, but a sibling with distinct files is judged on its OWN artifact. The refusal message carries each violating task's own reason. Tests: <code>tests/test_projects_tool_review_fixes.py::test_bulk_violating_sibling_with_different_files_is_audited</code>.</p>
+
+  <h2>Ledger-integrity fixes — the "Mini AI" incident (2026-08-01)</h2>
+  <p>Request <code>b7e516b9</code> chained five defects into a corrupted build and a false
+  completion report (project FAILED in the store while the reply said "done", verifier
+  CONFIRMED 95%). The tool-side fixes:</p>
+  <ul>
+    <li><b>Decompose dedup no longer collapses generic type prefixes.</b>
+    <code>_feature_key</code> keyed on the text before the first colon, so
+    "Implement: core.py…", "Implement: train.py…" and "Implement: demo.py…" all keyed as
+    <code>implement</code> and the duplicate filter silently ate every implement-task after the
+    first (5 planned → 3 persisted; the agent then updated PHANTOM ids for a whole request).
+    A generic head (<code>implement</code>, <code>research</code>, <code>design</code>,
+    <code>build</code>, …) now keys on a longer slice of the full description; specific feature
+    heads ("Core Shell: …") dedup exactly as before.</li>
+    <li><b>Drops are reported, never silent.</b> <code>task_decompose</code> (and
+    <code>create</code>-with-subtasks) return <code>dropped_duplicates</code> +
+    <code>agent_instruction_dropped</code> so the presented plan can't diverge from the persisted
+    ledger without a signal.</li>
+    <li><b><code>task_update</code> with unknown ids names the real ledger.</b> A bare
+    <code>missing:[…]</code> beside <code>count:0</code> read as an empty success and the model
+    retried invented ids. The payload now carries <code>agent_instruction_missing</code> +
+    <code>valid_tasks</code> (id/status/description) so one round-trip breaks the illusion.</li>
+    <li><b>Stale mechanical failure evidence is re-checked LIVE on a DONE attempt.</b> When a
+    FAILED task's <code>failure_reason</code> is parse-shaped ("does NOT parse", "SYNTAX CHECK
+    FAILED", …), <code>task_update status=done</code> re-runs <code>file_system._syntax_feedback</code>
+    on the referenced file(s) as they are NOW (<code>_recheck_stale_parse_failure</code>). If they
+    parse, the re-check result satisfies the evidence gates and becomes the task's
+    <code>result_summary</code>; if a file still fails, the DONE is refused with the CURRENT
+    diagnostic (<code>refused</code> gate <code>recheck</code>; before &sect;4SU Phase 4 <code>still_failing</code> + instruction) — a persuasive <code>result</code> string
+    cannot talk past the mechanical check. Only file types the checker can actually verify count
+    (<code>.py</code>/<code>.json</code> in-process; <code>.js</code>/<code>.html</code> only when a
+    node binary exists) — an <em>uncheckable</em> file yields not-applicable, never a fabricated
+    pass. The incident's wedge — a rebuilt, verified core.py blocked forever by an
+    autoadvance-era verdict — closes in one call.</li>
+    <li><b>No more "project is done" over a FAILED ledger.</b> <code>autoadvance</code> on a
+    project whose ledger holds FAILED tasks stops with <code>stop_reason=project_failed</code>
+    (new blurb: do NOT report completion) and returns <code>failed_tasks</code>
+    (id/description/failure_reason) even when THIS batch advanced nothing. <code>task_next</code>
+    with no ready leaf now lists <code>parked_tasks</code> (FAILED/NEEDS_USER) with the revival
+    path instead of a bare "no READY/PENDING leaf".</li>
+  </ul>
+  <p>Companion fixes: the coding executor's Python append/overwrite guards
+  (<a href="../coding/coding_executor.html">coding_executor</a>), the advancer's
+  <code>project_failed</code> stop reason (<a href="project_advancer.html">project_advancer</a>),
+  <code>failure_reason</code> cleared on DONE (<a href="planning.html">planning</a>), and the
+  verifier's live project-ledger evidence (<a href="../reliability/verifier.html">verifier</a>).
+  Tests: <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
+
+  <h2>Constraint lifecycle — DONE retires, restating re-arms (2026-08-01, req 56221fad)</h2>
+  <p>Stored project constraints used to be immortal. One captured on 07-28 for a batch of
+  deliverables ("Start with: What it means to BE ghost") kept replaying into <em>every</em>
+  request bound to the project for four days after that work closed: new files got the phrase
+  jammed above their titles, ordinary chat replies drew verifier refutes for not opening with it,
+  and each refute filed follow-up tasks that reopened the project — a self-feeding loop the
+  operator found as a queue of six "Verifier follow-up" tasks.</p>
+  <ul>
+    <li><b>Project DONE retires all constraints</b> — <code>store.update_project</code>'s DONE
+    transition moves <code>metadata.constraints</code> into
+    <code>metadata.constraints_retired</code> (deduped, capped at 20, event
+    <code>constraints_retired</code> logged). Constraints bind work in flight, not the afterlife.</li>
+    <li><b>Reopens do not resurrect.</b> A verifier-refute follow-up (<code>add_task</code> on a
+    DONE project) reopens the project but the retired constraints stay retired.</li>
+    <li><b>The user restating one re-arms it</b> — the duplicate-create merge path already treats
+    re-issued constraints as corrections; it now also removes a matching entry from
+    <code>constraints_retired</code> so the lifecycle can never shadow live intent.</li>
+    <li><b>Explicit control: <code>action=constraint_retire</code></b> with
+    <code>payload</code> = exact text, 0-based index, or <code>all</code>. Errors list the active
+    constraints with indices. <code>store.retire_constraints(pid, reason, only=[…])</code> is the
+    underlying primitive.</li>
+  </ul>
+  <p>Companions shipped the same day: finalize-time start-with enforcement on the assembled reply
+  (the model had complied in its final turn; accumulation buried the opener at char 2253) and the
+  verifier claim-fairness work (<a href="../reliability/verifier.html">verifier</a>).
+  Tests: <code>tests/test_constraint_lifecycle_and_claim_fairness.py</code>.</p>
+
+  <h2 id="constraint-origins">Constraint provenance (§4FD, 2026-09-07)</h2>
+  <p>Every constraint written onto a project record is stamped with the population that wrote it: <code>metadata["constraint_origins"]</code> maps constraint text → <code>"user"</code> (the current turn is a real user request) or <code>"auto"</code> (a scheduled/job/sub-agent turn, or any simulated population — decided by <code>_constraint_origin(context)</code> from <code>turn_origin</code> plus the internal-request prefixes). <code>_stamp_constraint_origins</code> is the one writer of that key; it runs at the create and correction capture sites, and version/clone copy the map along with the inherited constraints. An AST enumeration in <code>tests/test_4fd_provenance.py</code> fails if a metadata write site ships unstamped.</p>
+  <p>Readers that treat constraints as <em>user-mandated</em> — the verifier's request view and the prompt-side merge, via <code>GhostAgent._project_constraints_for</code> — drop stamped <code>"auto"</code> rows. Legacy rows carry no stamp and stay (they predate any non-user writer of the field). Task-level constraints and the coding-leaf constraint gate are unaffected: a project's own builds honour its constraints whatever their origin.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="4lp">Projects review <span class="tag">2026-10-05 &sect;4LP</span></h2>
+  <p>Four labelled live probes on a throwaway project were all right: create, do and close the task, read the file back, delete. Your other projects were untouched. Three fresh-eye readers found these, all fixed:</p>
+  <ul>
+    <li><strong>Released means released.</strong>
+      <ul>
+        <li>The guard now checks the project a call will really touch. Before, a title passed as <code>project_id</code> skipped it, so <code>update … status=ACTIVE</code> un-released the app; and a task operation on another project's task guarded the active project instead.</li>
+        <li>Release never changes a file's permissions through a symlink (<code>_chmod_tree</code> keeps to the workspace). Before, a planted link made a host file read-only.</li>
+      </ul>
+    </li>
+    <li><strong>No unasked forks.</strong> Every "fork a new version" steer now says to fork only when the user asked for a change (<code>FORK_ONLY_IF_ASKED</code>). A probe had forked the released Chess Coach v3, and the idle advancer then built the fork.</li>
+    <li><strong>The idle advancer builds only what was asked.</strong> A task the verifier filed on its own ("Verifier follow-up: …") is skipped unless the owner runs the advance (<code>owner_requested=True</code> from the tool and the API). It had edited two shipped apps to "resolve" such complaints.</li>
+    <li><strong>Refusals say so.</strong> A <code>task_update</code> where nothing landed (unknown ids, the visual gate, the live re-check, a constraint violation) is a declared rejection, not <code>ok</code> with <code>updated: []</code>.</li>
+    <li><strong><code>status</code> answers about the project named</strong> (by id or title) without switching. 58% of such calls had answered "free_chat".</li>
+    <li><strong><code>exit</code></strong> with nothing active no longer deletes the binding another conversation owns.</li>
+  </ul>
+  <p><strong>Operator decisions, shipped</strong> (operator: "go with your recommendations"):</p>
+  <ul>
+    <li><strong><code>release</code>, <code>unrelease</code> and hard <code>delete</code> are the owner's call.</strong> From the model (<code>tool_manage_projects_for_model</code>, the registry's handler) the first call only returns a preview with a <code>confirm_token</code>. The action runs when the call is repeated with that token in the user's <em>next</em> turn — the same design as memory's forget (&sect;4KX). The same turn, a probe and a background run cannot confirm. A probe may drop a project it created itself (<code>probe_created</code>). Direct callers (API routes, tests) keep the immediate behaviour.
+      <ul>
+        <li>The gate resolves the target exactly once (<code>_lifecycle_target</code>): an id (any case), a title, or the current project. A name that matches nothing is refused — it used to fall through to the current project, and <code>unrelease</code>, which ignores <code>title</code>, un-released that one. The confirmed action runs on the project the preview named.</li>
+        <li>No preview for an action that will refuse anyway (releasing a project that is not DONE or has no directions; un-releasing one that is not RELEASED): the action's own error comes back.</li>
+        <li><code>probe_created</code> and <code>autopilot</code> are system-only metadata keys: the model's <code>metadata=</code> (object or JSON string) cannot set them. <code>probe_created</code> is dropped; <code>autopilot</code> is refused with a pointer to <code>action=autopilot</code>, so "turn it off" is never a silent no-op.</li>
+        <li><strong>Budget keys are system-only too</strong> (&sect;4MQ, <code>project_advancer.BUDGET_METADATA_KEYS</code>): the step, runtime and tool-call caps and counters, <code>checkpoint_every</code>, and the gates' state. The model's <code>metadata=</code> naming one is refused with a pointer to <code>action=budget</code>, because a background turn could otherwise raise its own cap.</li>
+        <li>A current project that no longer exists is refused, not previewed.</li>
+      </ul>
+    </li>
+    <li><strong>Idle autoadvance is opt-in.</strong> The idle loop advances only ACTIVE projects with <code>metadata.autopilot</code> (<code>project_advancer.idle_candidates</code>). Since &sect;4SU Phase 5 (operator 11-02) it is an explicit opt-in: <code>autoadvance</code> never turns it on (one "do the next task" after "stop all" had restarted overnight work). <code>action=autopilot enabled=true|false</code> turns it on or off for the project named by <code>project_id</code> or <code>title</code> (the current one only when neither is given), and without <code>enabled</code> reports it (so does <code>status</code>). Any other <code>enabled</code> value is refused. Only the owner's turn counts (<code>_owner_turn_now</code>): a probe, a scheduled task (<code>sched-</code>), a job or a sub-agent neither opts in nor counts as "asked" — their advances run under the unattended rules. At deploy no project had autopilot, so idle advancing stops until you opt a project in.</li>
+    <li><strong>Budgets, pauses and a kill switch</strong> (&sect;4MQ):
+      <ul>
+        <li><code>action=budget</code> with <code>metadata={steps_cap, runtime_cap_hours, checkpoint_every}</code> sets a project's unattended budget; only your own turn can do this. <code>runtime_cap_hours</code> is the unattended allowance between your looks (<code>unattended_runtime_cap_seconds</code>), not a lifetime cap on your own runs. Without metadata it reports the budget. Values are range-checked, and unknown keys are refused.</li>
+        <li><code>status</code>, <code>budget</code> and <code>autopilot</code> show the budget view: steps used/cap, unattended hours used/cap since your last look, the check-in cadence, the no-progress streak and the last pause.</li>
+        <li><code>action=autopilot project_id=all enabled=false</code> turns autopilot off on every project. It never turns them all on.</li>
+        <li>Turning autopilot on resets the gates: no pause, streak 0, check-in count 0, allowance 0; so does your own <code>autoadvance</code> on a project whose autopilot is already on. A step already running keeps its marker. On a project whose autopilot is off, your <code>autoadvance</code> leaves it off and says so in an <code>autopilot</code> field ("autopilot stays OFF: only this batch runs …"), keeping the last pause.</li>
+        <li>A batch has three new stop reasons: <code>deadline</code> (the request's time is nearly up), <code>autopilot_paused</code> (an unattended batch hit a gate) and <code>autopilot_off</code> (a background batch on a project without autopilot does not run).</li>
+      </ul></li>
+    <li><strong>No DONE on weak evidence while unattended.</strong> See <a href="project_advancer.html#4lp">project_advancer</a>.</li>
+    <li><strong>The digest counts only work nobody asked for.</strong> An owner-run step is logged with <code>owner_requested</code> and skipped by "While you were away"; with nothing advanced the header reads "project updates", never "advanced 0".</li>
+  </ul>
+  <p>Data repair (Chess Coach v4 and the false-DONE tasks) waits for the operator to confirm a list.</p>
+  <p>Pins: <code>tests/test_4lp_projects.py</code>.</p>
+  <h2 id="4lu">Confirming a preview with "yes" <span class="tag">2026-10-05 &sect;4LU</span></h2>
+  <p>forget, reset_all and manage_projects release/unrelease/delete are two steps: a preview with a token, then the user's confirmation in a LATER turn. The token lives in the preview's tool result, and the chat API / web history carry only reply text — so on the "yes" turn the model no longer had it, and the confirmation failed (found deleting the PostgreSQL manual). Each preview is now stamped with its conversation (<code>conversation_key_context</code>, the hash of the first user message, set by <code>reconcile_conversation</code>), and a confirm whose token is missing, unknown or just <code>'yes'</code> resolves to the newest live preview of that kind in THIS conversation, for the same target (<code>memory._resolve_plan</code>). Who may confirm is unchanged: <code>_confirm_allowed</code> still requires the user, in a later turn; member turns carry no conversation and get no fallback; another conversation's preview is never used. The preview instructions tell the model it may pass <code>'yes'</code>. Pins: <code>tests/test_4lu_confirm.py</code>.</p>
+
+  <h2 id="4nw">A binding to a deleted project is dropped <span class="tag">2026-10-12 &sect;4NW</span></h2>
+  <p><em>&sect;4SX B0 form: <code>forget_project_pointer</code> clears every conversation's focus row on the project, and a row
+  whose project is gone or archived is dropped when it is read.</em></p>
+  <p>Both delete paths (tool and API) cleared the binding only when the deleted project was the <em>live</em> current
+  project. After a restart the live pointer is empty, so the persisted <code>__current_project__</code> outlived its project
+  and was shown to the model on every request. Now <code>forget_project_pointer</code> clears the persisted binding too
+  (delete and archive), and the request-start reconcile drops a binding whose project the store has no row for (a store
+  that cannot answer drops nothing). Pins: <code>tests/test_4nw_webos_defects.py</code>.</p>
+
+<h2 id="4pe-review">Fresh-eye review: manage_projects <span class="tag">2026-10-15 &sect;4PE</span></h2>
+<p>One reader (4 MAJOR, 5 MINOR) plus the corpus: 37 owner calls, 16&nbsp;% error results, and the live defect that triggered the round — on 2026-10-12 the owner said "yes, delete it." and had to say yes twice more.</p>
+<ul>
+  <li><strong>The user's yes runs the preview they answered.</strong> In the confirming turn the model (which no longer sees the token) called <code>delete</code> without one; that minted a <em>second</em> preview in the same request, and its token then read "the user has not answered yet". Now a token-less lifecycle call first looks for an earlier preview of the same project in this conversation (<code>confirmed_earlier_preview</code>) and runs it when the user's own message confirms; the "yes" fallback (<code>_resolve_plan</code>) skips the preview this request minted, a token is bound to the conversation that previewed it, and a miss says why (<code>plan_miss_reason</code>: no preview here in the last hour / for another project). The standing rule is unchanged: preview, then the user's yes in a later turn.</li>
+  <li><strong>The yes lexicon:</strong> a message with a question mark or a semicolon never confirms ("ok what's the weather?"); a yes with a reservation ("sure — but keep the PDF") confirms only the items the call names.</li>
+  <li><strong>Title-addressed actions never fall back to the current project.</strong> <code>budget</code>, <code>constraint_retire</code>, <code>verify_release</code> and <code>unrelease</code> joined <code>_TITLE_RESOLVABLE</code>: <code>constraint_retire title="Other"</code> had retired the <em>current</em> project's constraint and answered as success (<code>verify_release</code> also resolves its title now). A conditional yes on a project ("yes, delete it but keep the backup") asks for a plain yes — a project action has no items to pick.</li>
+  <li><strong>A probe never rewrites the owner's binding.</strong> A probe's switch/create/resume wrote the one global sentinel pair; the owner's next turn parked their project. The probe keeps its selection for its own request only — and its close (<code>exit</code>, deleting its own throwaway project) no longer deletes the pair either (round 3 found the first cut covered only the set branch).</li>
+  <li><strong>Briefing events are previewed.</strong> The five newest events went into <code>get</code>/<code>switch</code>/<code>status</code> raw — a scratchpad snapshot carried 60&nbsp;KB. A snapshot becomes a key count; any payload over 400 chars becomes a preview with its length.</li>
+  <li><strong>A deleted id is named as deleted</strong> ("it was DELETED on …, do not look it up again") from the tombstone table, so ids arriving from recall stop the retry loop; a file artifact path is normalised like a deliverable or refused (<code>../../etc/hosts</code> had become a permanently MISSING deliverable).</li>
+  <li><strong>Pins:</strong> <code>tests/test_4pe_files_projects_review.py</code> (55 tests — the confirm-flow pins drive <code>handle_chat</code> itself); battery <code>scripts/mutate_4pe.py</code> — 51/51 mutants killed, controls behaved (run 2: 46 killed, 5 survivors were helper-level pins — passage splice, released-guard parts fold, local save fault, http-named download, briefing events — re-pinned at the hook and killed on rerun; M14 after a truncated anchor was fixed; the FIFO mutants re-run with a pin that cannot wedge the worker). Suite 24,398 passed. Deployed 2026-10-15, pid 39017; probes: download receipt with size/type, deleted-id note, services name-required, probe refused by the ledger.</li>
+</ul>
+
+<h2 id="4pf">Project events carry their origin; the digest shows only the agent's own work <span class="tag">2026-10-15 &sect;4PF</span></h2>
+<ul>
+  <li><code>log_event</code> stamps <code>payload.origin</code> for every writer (the probe stamp generalised; an unattended tick is <code>autopilot</code>, the owner's own <code>autoadvance</code> is <code>owner</code>, a probe's stays <code>probe</code>); "While you were away" skips <code>owner</code> and <code>probe</code> rows — the owner's own turns are not news. The advancer's <code>budget_exhausted</code> bound compares payloads minus the stamp.</li>
+  <li><code>update status=ARCHIVED</code> runs <code>action=archive</code> (services stopped, binding stashed, pointer forgotten) instead of flipping the status.</li>
+  <li>A bare "no" (no/nope/nah/cancel, not "stop") from the user withdraws every live preview of the conversation; a confirm attempt that finds no preview is a <code>confirm lookup</code> WARNING line naming its cause. <code>update status=ARCHIVED</code> applies the call's other fields first.</li>
+  <li><strong>Pins:</strong> <code>tests/test_4pf_open_items.py</code> (27 tests); battery <code>scripts/mutate_4pf.py</code> — 40/40 mutants killed, controls behaved (run 2: 39 killed; M11 survived as an expiry-only reaper pin → a sentinel-DONE pin through the real reaper, killed; M27 survived because the second in-thread check masked the first → the swap pin also requires that no temp file is ever created in the swapped directory, killed). Suite 24,441 passed. Deployed 2026-10-15, pid 26156; probes: a probe's project events carry <code>origin: probe</code>.</li>
+</ul>
+
+<h2 id="4qa">A task is DONE only with what it promised; experiments run for real <span class="tag">2026-10-18 &sect;4QA</span></h2>
+<p>From project <code>448d5afa86f0</code> (17 requests, "3-layer recursive thinking → self-awareness"). 33 tasks closed DONE, but the final report was never updated, the "experiments" were prose the agent wrote, and the creating conversation lost its own project.</p>
+<ul>
+  <li><strong>The declared deliverable gate.</strong> A decomposed task reads <code>Task 1.1: … → research/recursive-self-reference.md</code>. <code>task_update status=done</code> now refuses (since &sect;4SU Phase 4: <code>refused</code> gate <code>deliverable</code>; then <code>undelivered</code> + <code>agent_instruction_undelivered</code>) when that file is missing, empty or only a placeholder (<code>results/meta-reflection.md</code> was 3 bytes, <code>...</code>), or when it is a symlink. If a file of that name sits one folder off (the live <code>recursive-thinking-experiment/research/…</code>), the refusal names it and says to move it. A <code>description</code> rewritten in the same call is what gets judged, so a changed plan can name the file it really produced &mdash; but only one that ends with a path: a rewrite without "→ path" keeps the original promise (it used to skip the gate). Autoadvance's build path (<code>_finalize_coding</code>) applies the same check: a passing build that missed the promised file is FAILED. Helper: <code>core/task_deliverable.py</code>.</li>
+  <li><strong>Autoadvance searches the topic.</strong> The web query is <code>task_topic(description)</code>, with no "Task 1.3:" prefix and no "→ path" tail. Live, both went into the query, every result was off-topic, and task 1.3 FAILED. A brief for a declared <code>research/&lt;name&gt;.md</code> is written under that name, not <code>research/task-1-3-…md</code>.</li>
+  <li><strong>Project work is built, not researched</strong> (<code>_route_project_work</code>). A task the classifier called research becomes a build when it declares a deliverable the brief writer cannot produce, or a <code>research/</code> file that holds someone's work (its bytes are not a brief the writer made: <code>is_generated_brief</code>), or when it opens a clause with an edit/produce verb (replace, update, rewrite, revise, refactor, modify, extend, integrate, rework, convert, design, draft, implement). Live, "Update final report with actual quantitative data" and "Replace lexicon metrics with semantic embeddings" each closed DONE on a web summary, while <code>report/final-report.md</code> and <code>tools/recursive_harness.py</code> were never touched. Bare "introspection" is self-analysis only when no human subject is named. A self-analysis task that promises a file the brief writer cannot produce, or a <code>research/</code> file holding someone's work, is <em>built</em> instead. The analysis would have been saved as a brief somewhere else, and the deliverable gate then FAILED the task on every advance (r9). This also applies after the needs_user → self-analysis override. A promised path written as <code>/workspace/projects/&lt;id&gt;/…</code> is the project's own path.</li>
+  <li><strong>Experiments stop for the turn.</strong> In a GENERAL project whose goal names a model (or any of whose tasks names one, or <code>probe_model</code> &mdash; &sect;4SS), a task that runs, tests, probes, measures, replicates or repeats something (or names a control condition, falsification test, cross-model study or ablation) is not built. That includes an introspective task: since r9 there is no self-analysis exemption, because "Run Layer 3 … self-awareness" took the self-analysis path, which wrote the "responses" itself. The batch stops with <code>model_experiment</code>. The task stays PENDING, or NEEDS_USER if an unattended run already held it. The instruction tells the turn to decide first what the task's data are. A language model's <em>answers</em> (prompts, a control condition, a cross-model run) → run them with <a href="../coding/probe_model.html"><code>probe_model</code></a> and write the results from the transcript. Anything else (published facts, a measurement of something else, a build) → the normal way, and never ask a model for facts it should look up. The detector holds any experiment-shaped task in a model project (r6: "Measure market share of LLM vendors" was steered into asking the model). Unattended runs hold it NEEDS_USER for the owner instead.</li>
+  <li><strong>Brief ownership travels with the files.</strong> <code>create_version</code> and <code>clone</code> copy <code>research_index</code> and <code>research_brief_shas</code> with the workspace, so a copied, unchanged brief is still the writer's own in the new project. <code>list</code> and the no-active-project reply drop <code>research_brief_shas</code> from the metadata they show the model (<code>_model_view</code>, <code>_MODEL_HIDDEN_META</code>); the map has no cap.</li>
+  <li><strong>Self-analysis inside the owner's request is foreground.</strong> <code>_generate_self_analysis</code> hard-coded <code>is_background=True</code>. Live it parked 600&nbsp;s behind its own request (13:04:34 → 13:14:35), then fell back to web search. It now uses <code>_idle_invocation(context)</code>, like the research summariser.</li>
+  <li><em>(Replaced by &sect;4SX B0: there are no owners or guests; each conversation has its own focus row.)</em> <strong>A conversation that names a project becomes a guest, not the owner.</strong> The reference used to overwrite the owner sentinel, so after "show me the results of 448d5afa86f0" in a second chat, the creating chat got "belongs to another conversation". Guests (up to 8, in <code>__current_project_guests__</code>, tied to the bound pid) keep the project for their follow-ups. A switch or create clears the guest list. The owner re-switching to (or resuming) its own project keeps the guests; only a binding to a <em>different</em> project clears them (r9: every owner re-switch had dropped them). A guest's <code>exit</code> leaves the owner bound, and a guest's <code>switch</code>/<code>resume</code> to the project it is already a guest of keeps it a guest (it used to rewrite the owner sentinel, the same theft by another route). <strong>A guest can't take the binding from the owner</strong> (operator, 2026-10-18): a guest's <code>switch</code>/<code>create</code>/<code>resume</code> to a <em>different</em> project is for THIS request only (<code>_guest_leaving_owner</code>). The owner's sentinels stay, the guest leaves the owner's project (<code>_drop_project_guest</code>, so its next turn never lands back there) and is <strong>held</strong> (<code>__current_project_held__</code>, "pid|conv,&hellip;", <code>project_held</code>; never capped, because an evicted conversation would be free to take the binding (r16)). While that binding lasts, every project a held conversation opens lasts one request, and the model is told to open it again in each later message. r14: dropping the guest alone let its next switch, the one the note asked for, take the binding, and a second switch in the same request did the same. A guest's <code>exit</code> and a guest pushed out by the 8-guest cap are held too. Rejoining the owner's project (as a guest) ends the hold, and a new binding clears every hold, like the guests. Exiting a request-only project parks it (its keys are snapshotted); the owner's next reconcile snapshots one left in the shared context before hydrating its own. The console's <code>/switch</code> and <code>/resume</code> answer 409 "not switched" when the shared context's last chat is a guest or held (<code>_set_current_or_held</code>). The check runs <em>before</em> anything changes; r15: refusing after the switch had re-scoped the context and evicted that chat's guest seat. Every reconcile reads the guest and held lists along with the binding. A scratchpad read refreshes its 24&nbsp;h TTL, and the owner's turns read only the pid/conv pair, so the lists expired under a live binding (r15). Closing a project never deletes a binding that names a <em>different</em> project owned by another conversation (<code>_binding_is_anothers</code> in <code>_set_current(None)</code>). r17: a held guest that archived or deleted its request-only project went through <code>forget_project_pointer</code>, which wiped the owner's binding and the holds, and its next switch took the binding. A guest's <code>exit</code> parks the project like any leave, so its keys are not left readable to the next conversation. Known and accepted: a guest's advance that switches to a child version counts as leaving, so the guest is held, while the owner keeps the binding. A console switch made while the shared context has no conversation key (after a restart, or right after a member turn) still binds to no conversation; this predates &sect;4QA. A conversation that was never a guest still takes the binding as before. A probe turn never becomes a guest. Every protection site uses one <code>_BINDING_SENTINELS</code> tuple.</li>
+  <li><strong>"Proceed … on your own"</strong> (also "autonomously", "by yourself", "without asking") after a continue-verb is a go-ahead for the rest, unless a count or a task number is given, and only when what follows the verb is the project, the plan, the rest or nothing.</li>
+  <li><strong>Dates.</strong> <code>list</code> and <code>get</code> carry <code>created</code>/<code>updated</code> as local ISO time, and <code>display</code> shows "(created …)". The raw epoch had been rendered "~2026-04-16" for a project made that morning. <code>artifact_add</code> without <code>task_id</code> now names <code>describe_file</code> (file_path + description).</li>
+  <li>Pins: <code>tests/test_4qa_project_task_integrity.py</code>.</li>
+</ul>
+<p><strong>Reopened for real runs (&sect;4QA-c, operator 2026-10-18).</strong> <code>scripts/reopen_4qa_experiments.py</code> (dry run by default; <code>--apply</code> with the agent stopped, after a snapshot) moves the 16 files written without a model (the layer, start-condition, control, meta-experiment, falsification and cross-model results, <code>tools/cross_model_validation.py</code> and the harness scores) under <code>simulated/</code>. The path is kept, and artifact rows, manifest and research index follow the move. Nothing is deleted. The 13 experiment tasks and the harness run go back to PENDING with a <code>result_summary</code> that says to run the prompts with <code>probe_model</code> and write the deliverable from the transcript. The deliverable path is free again, so no task can close on the old text. A run stopped between a move and its re-point re-points on the next run. The briefing's open-task header now gives the total when it lists only some ("OPEN TASKS (8 of 16 &mdash; for all of them call manage_projects action=task_list)"). In the live probe after the reopen, "OPEN TASKS (8)" was answered as "the 8 pending tasks" when 16 were open. One ledger line records it, including that <code>results/meta-reflection.md</code> also rests on the old text and that the harness re-runs only after the experiments; the metadata marker <code>reopen_4qa_experiments_applied</code> makes a second run skip the reopen. <code>analysis/</code>, <code>theory/</code> and <code>report/</code> still rest on the old text until rewritten.</p>
+<p><strong>The work built on it, reopened in order (&sect;4QA-d, operator 2026-10-19).</strong> <code>scripts/reopen_4qa_downstream.py</code> (same dry-run / <code>--apply</code> rules, and it reuses the move of the script above) moves <code>analysis/</code> (4 files), <code>theory/</code> (3), <code>report/final-report.md</code>, <code>results/meta-reflection.md</code> and <code>tools/embedding_scores.json</code> under <code>simulated/</code>. The scores file held round numbers with no run behind them. It then reopens their 12 tasks with <code>depends_on</code> edges. Prose had not been enough: after &sect;4QA-c the autopilot ran the harness task while every experiment was still open, because its "once the experiments are done" was only text. The order is now experiments &rarr; harness &rarr; analysis &rarr; theory &rarr; report, and the meta-reflection waits for the meta-experiment. <code>next_ready_leaf</code> skips a task until every dependency is DONE. The experiment tasks themselves stay NEEDS_USER: the autopilot never runs a model experiment (&sect;4QA), and an owner turn runs them with <code>probe_model</code>. 43c19f8b7511 (embeddings) is reopened too: it had failed on the 12-file snapshot, which is fixed. The marker is <code>reopen_4qa_downstream_applied</code>. Tests: <code>tests/test_4qa_reopen_downstream.py</code>.</p>
+<p><strong>Every open task is listed (&sect;4QA-d).</strong> "OPEN TASKS (8 of 17 &mdash; call task_list)" did not change the answer: the model read the line and still said "8 pending". The briefing now lists every open task, up to 30. The first 8 are shown in full and the rest are cut to 60 characters. The header counts them by status, e.g. "OPEN TASKS (17: 14 NEEDS_USER, 3 PENDING)". Past 30 it says how many are listed and points at <code>task_list</code>.</p>
+<p><strong>Quotes are the model's words (&sect;4QA-e, operator 2026-10-19).</strong> The experiments were run for real, but six write-ups put reworded text in quote marks. A DONE close of a declared deliverable that cites a <code>probe_model</code> transcript now checks that it quotes the model's words &mdash; <strong>advisory</strong> (operator, after five review rounds of a blocking version): once the task has really closed DONE (not on a re-close), the payload carries <code>quote_warnings</code> and <code>agent_instruction_quote_check</code>, and one rolling line in the project ledger counts the flagged tasks (no transcript text). The check runs in a worker thread after every write of the call. It reads the transcript copy kept outside the sandbox, never the sandbox file, and names each reworded quote next to what the transcript says. Only a quote that rewords a transcript passage is flagged; quotes of other sources pass. Only the model's answers are judged, not the prompts. The stored description (not one rewritten in the closing call) and the project's title and goal are quote sources, and the originally declared file is checked too. See <a href="../coding/probe_transcripts.html">core.probe_transcripts</a>. In the same change, <code>probe_model</code>'s default <code>max_tokens</code> rose from 600 to 1,500, and cut answers are reported.</p>
+<p><strong>Dependencies hold everywhere (&sect;4QA-d review r19).</strong> <code>depends_on</code> used to be honoured only by the autopilot's picker. An owner turn could close the report while every experiment it rests on was open. <code>task_update status=done</code> now refuses a task whose known dependencies are not DONE (since &sect;4SU Phase 4: <code>refused</code> gate <code>dependencies</code>; then <code>waiting_on_dependencies</code> + <code>agent_instruction_waiting</code>, naming each dependency and its status). A dependency that itself depends on the task (a cycle, the same rule as <code>next_ready_leaf</code>) is not held. In a bulk close, dependencies are processed before their dependents (<code>_dependencies_first</code>), so one closed in the same call counts only if it really closed. Review r20 found that the first version, which counted any id in the call as met, let the report close while its experiment's own close was refused. A refusal with nothing updated is REJECTED, not ok. The undelivered-file refusal was also reported as ok until now and is REJECTED too. OPEN TASKS counts leaves only (a parent counted twice before) and marks <code>(PENDING · waits on N open task(s))</code>. An open parent whose children are all closed is listed again (r20). <strong>Parents and dependencies (r21&ndash;r23, kept as it was).</strong> A <code>depends_on</code> on a <em>parent</em> does not hold its children, and closing all the children rolls the parent up as before. This is a known limitation: a parent can reach DONE while its own dependency is open. Two attempts to change it were reverted. Holding every leaf to its ancestors' dependencies (r21) deadlocked plans that used to run. Holding the roll-up until the dependency closed (r22) stranded parents whenever that dependency closed by failure, was deleted, or FAILED, and it re-closed paused parents. The project this was for (448d5afa86f0) has no parent tasks. The picker and the gate now share one rule, <code>TaskTree.open_dependencies</code>. These are not held: an unknown id, a dependency inside the task's own subtree, the task's own ancestor (a step that "depends on" its phase, which used to deadlock the picker), and a dependency that waits back on the task (a cycle, followed through a leaf's <code>depends_on</code> and a parent's children, never a parent's own <code>depends_on</code>; r23/r24). In a bulk close, the steps of a dependency phase are closed first too, so the phase rolls up before its dependent is checked (r24). Before, the picker waived <em>every</em> open dependency of a task in a cycle, while the gate waived only the cyclic one. A task could be handed out and then refused. "waits on N unfinished task(s)" in OPEN TASKS uses the same rule. A bulk close with a repeated id keeps its order and meaning. A NEEDS_USER task the autopilot only held ("&hellip; not closed unattended") is shown as HELD, with a line saying the turn runs it (e.g. a model experiment with <code>probe_model</code>) and it is not waiting for the user. A batch that finds no ready leaf while PENDING/READY/BLOCKED/PAUSED tasks remain stops with <code>open_but_waiting</code> ("do NOT report the project as complete"). Before, a chain held behind a BLOCKED task was reported as <code>project_done</code>. The downstream script's graph was widened by the same review: the harness waits for the control and the embedding task, theory and report wait for cross-model validation and the falsification tests, the report also waits for the meta-experiment and meta-reflection, and existing edges are kept. A test checks the real graph: no cycle, and every &sect;4QA-c experiment is reachable from the last task. Tests: <code>tests/test_4qa_dependency_order.py</code>, <code>tests/test_4qa_reopen_downstream.py</code>.</p>
+</main>
+
+<h2 id="4mm">§4MM (2026-10-08): a project is created when the owner wants one</h2>
+<p><code>_create_not_requested</code> gates <code>action=create</code> on <em>interactive</em> turns (the owner's or a probe's); background runs are not gated. Rules, in order:</p>
+<ol>
+  <li>A negated <em>create</em> ("don't create/make/start a project", "without a project", "μην φτιάξεις πρότζεκτ") → refused. Only a negated create counts: "I have no project for this, please set one up" is an ask.</li>
+  <li>The message names a project ("project", "workspace", "initiative", "track this", "πρότζεκτ", "έργο", "εργασία") or asks to build something ("build", "make" but not "make sure", "create", "develop", "start", "set up", "φτιάξε", …) → allowed.</li>
+  <li>One of the conversation's last four user messages asked to <em>build</em> something → allowed. "Call it Snake" answers the agent's question after "create a project for a snake game". Turn 38's history ("show all projects", "delete projects …") never asked to build, so it does not count (<code>context.recent_user_contents</code>).</li>
+  <li>A short yes to the agent's own offer ("do it", "ok, proceed") → allowed.</li>
+  <li>Anything else → refused.</li>
+</ol>
+<p>The same gate covers <code>action=promote_from_context</code>. Measured on history: of 41 past owner creates, it refuses 3. Two are turns 34 and 38; the third reused an existing project.</p>
+<p>A refusal is a <em>designed stop</em> (<code>project_not_requested</code>): no strike and no turn failure. The model is told to do the task directly. Turns 34 and 38 had created a project from "Test the theory that 4-layer recursive thinking …", the second time minutes after the owner deleted the first. It took six retries before the owner got the answer.</p>
+<p>The hard-delete result now lists what was removed and what was <strong>kept</strong>: trajectories, general lessons, and vector entries until the next reconcile. It used to say "no trace remains", which was not true.</p>
+</body>
+</html>

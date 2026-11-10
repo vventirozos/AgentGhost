@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliability — Ghost Agent</title>
+<meta name="description" content="How the agent checks its own work, stops itself when it loops, fails closed on the network, and tells you what is broken.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a class="current" href="reliability.html">Reliability</a>
+    <div class="subnav">
+      <a href="../reference/reliability/audit_2026_05.html">Audit &amp; Hardening (2026-05)</a>
+      <a href="../reference/reliability/checking_and_learning.html">Checking and learning</a>
+      <a href="../reference/reliability/circuit_breaker.html">Circuit breaker</a>
+      <a href="../reference/reliability/claim_binding.html">Claim binding (core.claim_binding)</a>
+      <a href="../reference/reliability/claude_trainer.html">Claude Trainer</a>
+      <a href="../reference/reliability/evidence_gate.html">Evidence gate (core.evidence_gate)</a>
+      <a href="../reference/reliability/failure_dimension.html">Failure dimensions (core.failure_dimension)</a>
+      <a href="../reference/reliability/fallback_chains.html">Fallback chains (tools.fallback_chains)</a>
+      <a href="../reference/reliability/feedback.html">Feedback (thumbs) (core.feedback)</a>
+      <a href="../reference/reliability/logging.html">Logging &amp; Monitoring</a>
+      <a href="../reference/reliability/metacognition.html">Metacognition Uplift</a>
+      <a href="../reference/reliability/objection.html">Objections (core.objection)</a>
+      <a href="../reference/reliability/outcome.html">Turn outcome (tools.outcome)</a>
+      <a href="../reference/reliability/strikes.html">Strikes (core.strikes)</a>
+      <a href="../reference/reliability/system_tool.html">Health, weather and location (system tool) (tools.system)</a>
+      <a href="../reference/reliability/tool_failure.html">Tool failures (tools.tool_failure)</a>
+      <a href="../reference/reliability/verifier.html">Verifier (core.verifier)</a>
+    </div>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Reliability</h1>
+    <p class="subtitle">A language model will happily say “done” when it is not. The agent surrounds the model with plain program checks, brakes and logs, so claims are tested and failures are visible instead of silent.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: eva</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Reliability here means five things:</p>
+  <ul>
+    <li><strong>Checking delivered work.</strong> When the agent says it made a page, a file or a picture, a program checks: does the page load, does the file exist, does the image show what the reply claims? A claim about a number or a fact is compared with the tool output it came from.</li>
+    <li><strong>Guards and breakers.</strong> The agent notices when it repeats the same failing action, keeps editing the same file without progress, or works on with nothing to show. It stops or changes course instead of burning the hour. A circuit breaker stops calling a helper machine that keeps failing.</li>
+    <li><strong>Failing closed.</strong> If Tor is not running, nothing leaves the sandbox. The safe state is “no network”, not “direct network”.</li>
+    <li><strong>A health check.</strong> One command reports the machine, the stores, the services and the helper machines, with the problems listed.</li>
+    <li><strong>Measuring.</strong> A failure census counts which detectors fire on your real turns, your thumbs up or down are recorded as ground truth, and every step is logged.</li>
+  </ul>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say or do</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“Build Elena a one-page site for her bakery”</td><td>Before the reply says it is done, the page is loaded and checked. A page that does not load is reported, not announced as finished.</td></tr>
+      <tr><td>“Check your health”</td><td>The agent runs <code>check_health</code>: CPU, memory, disk, Docker, internet and Tor, then lines for models, memory stores, rules, projects and schedule, labs and sandbox, storage and safety, and a list of problems.</td></tr>
+      <tr><td>Tap 👎 on a reply (web) or react with 👎 on Slack</td><td>The label is stored against that request. A human label outranks any machine verdict.</td></tr>
+      <tr><td>Ask for something that keeps failing the same way</td><td>The loop guard sees the repeated failure, warns the model, and then stops it trying the same thing again.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Strikes during the turn</h4><p>A strike ledger keeps a signature of each failing action. The same failure twice is a loop; the same action with no progress is futile; repeated edits to one file without a passing run trip the edit-churn brake. Text files are treated more gently than code.</p></li>
+    <li><h4>Checks before the reply</h4><p>The verifier runs mechanical checks on what was delivered. Claim binding compares each figure in the draft with the evidence lines; a claim with no support is refuted first, and only confirmed when the evidence carries it.</p></li>
+    <li><h4>Breakers around the helpers</h4><p>Each helper node has a circuit breaker. After repeated faults it opens, and calls go to the main model until the node recovers.</p></li>
+    <li><h4>Egress that fails closed</h4><p>In the sandbox, firewall rules send every connection through Tor and reject everything else. The rules go in before Tor has started, so until Tor is up nothing leaves. The model, even as root in the container, cannot remove them.</p></li>
+    <li><h4>Record and count</h4><p>Each owner turn is stored with its tool results and verdicts. The failure census joins these with your thumbs and corrections to show which failure classes really happen now.</p></li>
+  </ol>
+
+  <h2 id="where">Where it runs</h2>
+  <p>All of it runs inside the agent on the Mac Studio <strong>eva</strong>: the verifier, the strike ledger, the breakers, the health check and the logs. Some claim checks use the helper model on <strong>nova</strong>. The agent itself is supervised by launchd and restarts if it dies. See <a href="infrastructure.html">Infrastructure</a>.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Program checks prove what they test (a page loads, a file exists), not that the work is good. Fuzzy judgements by a model are advisory, not gates.</li>
+    <li>The health check repairs nothing and probes nothing. It reads the agent's own records; it does not contact the lab machine or start a stopped container.</li>
+    <li>The failure census changes no reply and calls no model. It covers owner turns only: not members, probes, jobs or scheduled turns.</li>
+    <li>Thumbs only add labels; removing a reaction does not undo one.</li>
+    <li>The agent log mixes days; the dated system log is the one to search by date.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/reliability/audit_2026_05.html">Audit &amp; Hardening (2026-05)</a></li>
+    <li><a href="../reference/reliability/checking_and_learning.html">Checking and learning</a></li>
+    <li><a href="../reference/reliability/circuit_breaker.html">Circuit breaker</a></li>
+    <li><a href="../reference/reliability/claim_binding.html">Claim binding (core.claim_binding)</a></li>
+    <li><a href="../reference/reliability/claude_trainer.html">Claude Trainer</a></li>
+    <li><a href="../reference/reliability/evidence_gate.html">Evidence gate (core.evidence_gate)</a></li>
+    <li><a href="../reference/reliability/failure_dimension.html">Failure dimensions (core.failure_dimension)</a></li>
+    <li><a href="../reference/reliability/fallback_chains.html">Fallback chains (tools.fallback_chains)</a></li>
+    <li><a href="../reference/reliability/feedback.html">Feedback (thumbs) (core.feedback)</a></li>
+    <li><a href="../reference/reliability/logging.html">Logging &amp; Monitoring</a></li>
+    <li><a href="../reference/reliability/metacognition.html">Metacognition Uplift</a></li>
+    <li><a href="../reference/reliability/objection.html">Objections (core.objection)</a></li>
+    <li><a href="../reference/reliability/outcome.html">Turn outcome (tools.outcome)</a></li>
+    <li><a href="../reference/reliability/strikes.html">Strikes (core.strikes)</a></li>
+    <li><a href="../reference/reliability/system_tool.html">Health, weather and location (system tool) (tools.system)</a></li>
+    <li><a href="../reference/reliability/tool_failure.html">Tool failures (tools.tool_failure)</a></li>
+    <li><a href="../reference/reliability/verifier.html">Verifier (core.verifier)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

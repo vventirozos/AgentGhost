@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waiting tasks (core.task_wait) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a href="background_jobs.html">Background jobs</a>
+      <a href="cross_project_map.html">Cross-project map</a>
+      <a href="long_tasks.html">Long tasks</a>
+      <a href="planning.html">Planning (core.planning)</a>
+      <a href="project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a href="project_research.html">Project research (core.project_research)</a>
+      <a href="project_safety.html">Project safety (core.project_safety)</a>
+      <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="projects_routes.html">Projects API (api.projects_routes)</a>
+      <a href="projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="task_close.html">Closing tasks (core.task_close)</a>
+      <a href="task_kind.html">Task kinds (core.task_kind)</a>
+      <a class="current" href="task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / task_wait.py</h1>
+  <p class="subtitle">&sect;4SU Phase 3 (2026-11-02): why a task is waiting is stored in three fields, not in its summary text. The model and the briefing see five states.</p>
+
+  <h2 id="why">Why it exists</h2>
+  <p>Before this phase, the reason a task waited lived in its <code>result_summary</code>: "&hellip; &mdash; not closed unattended" (a hold), "human gate: &hellip;", "not closed: &lt;gate&gt;: &hellip;" (a roll-up refusal), "flagged for human review". Thirteen string checks read those marks. Most review MAJORs in Phases 0&ndash;2 were in them: a mark quoted as evidence, a mark restated, a mark that lost its prefix.</p>
+
+  <h2 id="fields">The fields</h2>
+  <p>A waiting task (stored status <code>NEEDS_USER</code> or <code>BLOCKED</code>) carries:</p>
+  <div class="scroll"><table>
+    <tr><th>column</th><th>values</th><th>meaning</th></tr>
+    <tr><td><code>wait_on</code></td><td><code>owner</code></td><td>the owner must decide, approve or do it; nothing runs it until they do</td></tr>
+    <tr><td></td><td><code>owner_turn</code></td><td>a <strong>hold</strong>: never run unattended; the owner's own run takes it back and runs it</td></tr>
+    <tr><td></td><td><code>dependency</code></td><td>another task (a failed child, an open <code>depends_on</code>)</td></tr>
+    <tr><td><code>wait_code</code></td><td><code>human_gate</code>, <code>review</code>, <code>rollup_&lt;gate&gt;</code>, a hold kind (<code>unverified_build</code>, <code>model_experiment</code>, <code>gate_form</code>, <code>refused_&lt;gate&gt;</code>, <code>held</code>&hellip;), <code>child_failed</code> (the failure cascade's block, the only one lifted automatically), <code>blocked</code> (any other block), <code>asked</code>, <code>paused</code></td><td>what kind of wait</td></tr>
+    <tr><td><code>wait_why</code></td><td>text, &le; 300 chars</td><td>the short reason the owner reads</td></tr>
+  </table></div>
+
+  <h2 id="rules">Rules</h2>
+  <ul>
+    <li><strong>Leaving a waiting status clears all three</strong>, for every writer: the store (<code>update_task</code>) and the tree (<code>TaskTree.update_status</code>, <code>settle_waits</code>).</li>
+    <li><strong>A status write sets a wait only from its own <code>wait=</code>.</strong> With none it gets the safe default from <code>default_wait</code>: <code>owner</code>/<code>asked</code>, or <code>dependency</code>/<code>blocked</code> for BLOCKED. Review r5 found that the earlier default, <code>child_failed</code>, made a parent the model blocked ("waiting on the API key") reopen when any child closed. It never keeps the row's earlier wait. A missed writer fails safe (the owner decides); it cannot turn a task into a hold that runs. Review r1 MAJOR: a kept wait turned the model's park "the owner must approve the wording" into a hold the owner's run then ran.</li>
+    <li><strong>The summary keeps its human text, and nothing reads it as state.</strong> The old marks are parsed in one place, <code>wait_from_marks</code>, used only by the one-off migration of old rows. The advancer's batch split reads the summary only when the task row is gone.</li>
+    <li><strong>Folded statuses.</strong> <code>READY</code> is stored as <code>PENDING</code>. A task-level <code>PAUSED</code> (a phase the owner paused; the system never sets it) is stored as <code>NEEDS_USER</code> with <code>owner</code>/<code>paused</code>, so a paused phase still holds its subtree back. The stored names <code>IN_PROGRESS</code> / <code>NEEDS_USER</code> / <code>BLOCKED</code> stay, so the web console, Slack and the database keep their vocabulary (operator 11-02).</li>
+  </ul>
+
+  <h2 id="claim">A claimed hold comes back (review r2)</h2>
+  <p>The owner's run takes a hold back by claiming it: IN_PROGRESS, which clears its fields. The claim logs <code>hold_claimed</code> {wait_on, wait_code, wait_why, summary}. If the run is stopped, runs out of time, crashes, is deferred for the owner's request or has no tool runner, the release goes through <code>ProjectStore.release_claim</code>. That method puts a claimed hold back as the same hold (same summary) and anything else to PENDING. The boot reaper (<code>reset_orphaned_in_progress</code>) does the same. The claim is logged before the task is claimed: a kill between the two writes must not leave an unclaimed IN_PROGRESS row (r3). It ends with <code>hold_claim_ended</code>, which <code>update_task</code> logs on any status write other than IN_PROGRESS while a claim is open, whoever writes it, so an old claim never comes back later with its old summary. That includes a claim whose own IN_PROGRESS write had failed (r3, r4). At boot, the reaper restores claimed holds first, through <code>update_task</code>. A restore that fails leaves the row IN_PROGRESS, never PENDING, and the next boot tries again. <code>claimed_hold(project_id, task_id)</code> is the open claim. Before this, a release wrote PENDING and the next unattended tick rebuilt the held build.</p>
+
+  <h2 id="parents">Parents that wait for the owner (review r2)</h2>
+  <p>A failed child no longer turns a parent that waits for the owner for its own reason (<code>_owner_own_wait</code>: NEEDS_USER, not a gate or roll-up park, no HUMAN_GATE postcondition) into BLOCKED. A gate or roll-up park over a failed child is blocked, so it cannot be approved with a FAILED child under it (r4). The cascade's block was later lifted to PENDING, and a paused or asked phase then ran with no release. The unblock lifts only the cascade's own block (code <code>child_failed</code>, the proof; r6 dropped an older test on <code>failure_reason</code> that kept a cascade block with a stale reason forever). The cascade never re-codes a parent the model blocked for its own reason (r6). A parent closed by its roll-up also lifts the cascade block on the parent above it (r7, a Phase 0 gap: the grandparent stayed BLOCKED, so its other children were never handed out). The migration codes an old BLOCKED row <code>child_failed</code> only when a child failed and no reason of its own was written, and <code>blocked</code> otherwise. A NEEDS_USER parent is not closed by its children finishing unless it is a roll-up refusal, a human-gate park, or carries a HUMAN_GATE (its roll-up parks it as the gate). The migration gives a held row that carries a HUMAN_GATE the gate's wait, not the hold's. When the owner releases such a parent (a write to PENDING from NEEDS_USER or PAUSED), it is judged at once (r3). A DONE parent that is reopened stays open: r4 found that it closed again at once and its dependants ran. A FAILED child closed DONE directly also lifts the block it caused (r4; older gap): it closes if its children are all DONE, and is BLOCKED if one failed. Before this it sat PENDING forever, because it is not a leaf.</p>
+
+  <h2 id="view">The five-state view</h2>
+  <p><code>view_state(task)</code> returns <code>{state, on?, why?}</code>, and <code>view_label(task)</code> returns one label: <code>PENDING</code>, <code>RUNNING</code>, <code>DONE</code>, <code>FAILED</code>, or <code>WAITING(on: why)</code>. The briefing's OPEN TASKS, <code>task_list</code> (field <code>state</code>, filter <code>WAITING</code>/<code>RUNNING</code>) and the tool's status enum use them. <code>task_update status="WAITING"</code> is stored as <code>NEEDS_USER</code> waiting on the owner, and <code>"RUNNING"</code> as <code>IN_PROGRESS</code>.</p>
+
+  <h2 id="api">Functions</h2>
+  <ul>
+    <li><code>fold_status(status)</code>: the stored name (READY &rarr; PENDING, PAUSED &rarr; NEEDS_USER). It accepts a <code>TaskStatus</code> enum.</li>
+    <li><code>default_wait(status)</code>: <code>(wait_on, wait_code)</code> for a waiting status written with none.</li>
+    <li><code>wait_from_marks(status, summary)</code>: the migration's reader.</li>
+    <li><code>is_hold(task)</code>: <code>wait_on == "owner_turn"</code> and the status is NEEDS_USER.</li>
+    <li><code>is_waiting_on_owner(task, code=, prefix=)</code>.</li>
+    <li><code>view_state</code>, <code>view_label</code>.</li>
+  </ul>
+
+  <h2 id="migration">Migration</h2>
+  <p><code>ProjectStore._migrate</code> adds the three columns. <code>_migrate_task_states</code> folds <code>READY</code> rows into <code>PENDING</code>, and gives each NEEDS_USER / BLOCKED / PAUSED row with an empty <code>wait_on</code> the result of <code>wait_from_marks</code> plus its folded status. It is idempotent. If the column add fails (for example, a locked database), <code>_has_wait_cols()</code> is false and task writes drop the <code>wait_*</code> fields instead of failing (review r1).</p>
+
+  <h2 id="4sx-d4">Lab holds are not a wait <span class="tag">2026-11-04 &sect;4SX D4</span></h2>
+  <p>A build that could not get a lab is <em>not</em> a waiting status. It stays PENDING, and the hold lives in the project's metadata (<code>core/lab_waits.py</code>, see <a href="project_advancer.html#4sx-d4">project_advancer</a>). The design's "auto-lifting wait_code" was not used, because a BLOCKED leaf sets off the failure cascade and a NEEDS_USER leaf stops the project's autopilot.</p>
+
+  <h2 id="where">Where it is read and written</h2>
+  <ul>
+    <li><a href="project_store.html#4su-p3">memory.projects</a>: the columns, the migration, and the clear and default rules in <code>add_task</code> / <code>update_task</code>.</li>
+    <li><a href="planning.html#4su-p3">planning</a>: <code>TaskNode.wait_*</code>, <code>set_wait</code>, <code>update_status(wait=)</code>, <code>settle_waits</code>, the human-gate park, the roll-up refusal (<code>rollup_&lt;gate&gt;</code>) and the failure cascade (<code>dependency</code>/<code>child_failed</code>).</li>
+    <li><a href="project_advancer.html#4su-p3">project_advancer</a>: every park or hold names its wait. The owner's take-back and the held pick read <code>wait_on == "owner_turn"</code>.</li>
+    <li><a href="projects_tool.html#4su-p3">tools.projects</a>: <code>not_closed[].waiting</code>, <code>task_list</code> state and filter, and the autoadvance gates/holds split.</li>
+    <li><a href="projects_routes.html#4su-p3">api.projects_routes</a>: the owner's click over a constraint hold reads <code>wait_code == "rollup_constraints"</code> and the reason from <code>wait_why</code>.</li>
+    <li><a href="../infrastructure/prompts.html#4su-p3">prompts</a>: the briefing's labels.</li>
+  </ul>
+
+  <h2 id="tests">Tests</h2>
+  <p><code>tests/test_4su_phase3.py</code>. Battery: <code>scripts/mutate_4su3.py</code> (Phases 3 and 4).</p>
+</main>
+</body>
+</html>

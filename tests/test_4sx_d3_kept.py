@@ -1,5 +1,5 @@
 """§4SX Phase D3: kept machines through the `lab` tool, `app` runs, the release gate, the down notice and the
-operator secrets route (docs/labs/PHASE_D.md D3-design + its review r1)."""
+operator secrets route (docs/reference/labs/PHASE_D.md D3-design + its review r1)."""
 from __future__ import annotations
 
 import base64

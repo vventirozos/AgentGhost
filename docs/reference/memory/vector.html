@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vector memory (memory.vector) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="owner_rules.html">Owner rules</a>
+      <a href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a class="current" href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>memory / vector.py — VectorMemory</h1>
+  <p class="subtitle">ChromaDB-backed semantic memory with adaptive spaced repetition, BM25 hybrid re-ranking, temporal decay, and document ingestion.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>ChromaDB <code>PersistentClient</code> at <code>memory_dir/</code> with collection <code>"agent_memory"</code>.</li>
+    <li>Library index JSON at <code>memory_dir/library_index.json</code> (atomic temp + <code>os.replace</code>).</li>
+    <li>Embedding via a local <code>SentenceTransformerEmbeddingFunction</code> — <strong><code>BAAI/bge-small-en-v1.5</code></strong> since 2026-07-13 (was <code>all-MiniLM-L6-v2</code>), overridable with <code>GHOST_EMBED_MODEL</code>.</li>
+  </ul>
+  <p class="note"><strong>Embedder swap (2026-07-13).</strong> MiniLM is trained for SYMMETRIC similarity with a 256-token window and is weak on technical/SQL text; document QA is ASYMMETRIC (short question vs long passage) — precisely its failure mode, which the retrieval code conceded by relaxing the document distance threshold to 1.25 "for Asymmetric QA". <code>bge-small-en-v1.5</code> is trained for that task, takes an optional query instruction (applied to QUERIES only, via <code>VectorMemory.embed_query</code> — Chroma's <code>query_texts=</code> path reuses the DOCUMENT embedder and cannot express the asymmetry, so the doc-QA path embeds the question itself and passes <code>query_embeddings=</code>), and is still 384-d — so the Chroma schema is unchanged.</p>
+  <p class="note"><strong>Embedder-fingerprint guard.</strong> Because both models are 384-d and L2-normalised, swapping them raises NOTHING: the vectors merely stop meaning anything, and retrieval returns plausible-looking garbage. The store therefore carries an <code>embedder.json</code> sidecar naming the model that embedded it; <code>__init__</code> refuses to boot on a mismatch (including a legacy store with no sidecar) and points at <code>scripts/reembed_memory.py</code>, which snapshots the store to JSONL, recreates the collection with the new embedder and re-adds every fragment (161 fragments re-embedded in 0.7 s on the live store). The guard fired for real during the migration — launchd's respawn hit the un-migrated store and was correctly refused.</p>
+  <p class="note"><strong>Conflict-recovery refuses a populated store (2026-07-22).</strong> The <code>delete_collection</code>+recreate recovery for an <em>"Embedding function conflict" / "already exists"</em> error lives in the <code>except</code> of the raising <code>get_or_create_collection</code> — so it runs BEFORE the fingerprint guard above can, and a chromadb upgrade or an embedding-function class change (both produce a matching message) would have silently wiped all ~7,368 fragments. It now counts the collection first and <code>sys.exit(1)</code>s with a re-embed instruction when it is non-empty; the auto drop-and-recreate fires ONLY for an EMPTY collection (nothing to lose). Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</p>
+  <p class="note"><strong>Boot self-check (2026-06-11):</strong> sentence-transformers does not raise when it can't resolve the model config (HF unreachable / not forced offline — common under default-on fail-closed Tor); it silently builds an untrained mean-pooling model that returns non-normalised 384-d vectors and poisons retrieval. <code>__init__</code> now probes the embedder once and <code>sys.exit(1)</code>s with a remediation message if the output isn't the trained, L2-normalised model (<code>_embedding_degradation_reason</code>). Fix on a cold install: pre-cache the model by booting once with <code>--no-mandatory-tor</code>.</p>
+  <p class="note"><strong>Leaked-semaphore fix (2026-07-15).</strong> transformers renders a "Loading weights" <code>tqdm</code> bar when the embedder loads, and tqdm's default <code>get_lock()</code> creates a <em>multiprocessing</em> RLock — a named posix semaphore the <code>resource_tracker</code> never reclaims, so every SIGTERM (a plain-kill deploy) printed <code>resource_tracker: There appear to be 1 leaked semaphore objects</code>. Traced to <code>tqdm/std.py get_lock</code>. <code>memory/vector.py</code> now calls <code>tqdm.tqdm.set_lock(threading.RLock())</code> at import (before any bar): we never drive tqdm bars ACROSS PROCESSES, so a thread lock is sufficient and the bars still render — the process-lock semaphore is simply never created. Verified: 0 leaked semaphores under SIGTERM (was 1). Pinned by <code>tests/test_embedder_semaphore_leak.py</code>.</p>
+
+  <h2>Document QA — ingest &amp; scoped retrieval (2026-07-13)</h2>
+  <p>Target: load the full PostgreSQL manual (15 MB, <strong>3,075 pages</strong>, ~10 M chars) and ask it questions. The old pipeline could not — it refused PDFs over 1,000 pages, then silently truncated at 5 M chars, held the whole text + chunk list + an enriched copy in RAM, and had <em>no document-scoped retrieval at all</em>: the only path to the model was ambient hydration, where doc chunks competed with episodes and skills for a shared 6–12 k-char budget.</p>
+  <ul>
+    <li><strong>Streaming ingest</strong> (<code>memory/pdf_ingest.py</code>): pages are read one at a time, accumulated per TOC <em>section</em>, chunked, and flushed to the store in 256-chunk batches — peak memory is one batch, not one document. Caps raised to 6,000 pages / 40 M chars; chunk size 600 → <strong>1,200</strong> (a 600-char chunk shredded parameter descriptions and syntax blocks).</li>
+    <li><strong>TOC breadcrumbs</strong> — the biggest single retrieval win on a reference manual. PDF text has no markdown headers, so <code>semantic_split_text</code>'s header-prepending never fired and a chunk about <code>wal_level</code> had no idea it lived under "19.5. Write Ahead Log". <code>build_page_breadcrumbs</code> walks PyMuPDF's outline with a level stack to map every page → <code>Part III › Chapter 19 › 19.5. Write Ahead Log › 19.5.1. Settings</code>, and that breadcrumb is stamped into the EMBEDDED text of every chunk.</li>
+    <li><strong>Scoped retrieval</strong>: <code>VectorMemory.search_document(filename, question)</code> → Chroma <code>where={"source": filename}</code>, 60-candidate pool, BM25 rerank, top-k. No priority tiers and no time decay (meaningless inside one document) and <em>no distance gate</em> — the user explicitly asked THIS document, so return the best k and let the model judge.</li>
+    <li><strong>Tool surface</strong>: <code>knowledge_base(action="query", filename=…, question=…)</code> returns the ranked passages as TOOL OUTPUT for the model to reason over and iterate on (search → read → refine → search again). The system prompt and <code>recall</code>'s description now both steer document questions here.</li>
+  </ul>
+  <p><strong>Measured live</strong>: manual ingested in 2 m 29 s → 3,075 pages, 1,897 sections, 7,131 chunks. A 6-question eval (<code>wal_level</code>, VACUUM vs VACUUM FULL, range partitioning syntax, <code>pg_stat_activity</code>, MVCC isolation levels, <code>shared_buffers</code>) retrieved the correct section <strong>6/6</strong>, with the agent citing breadcrumbs like <code>Chapter 27 › 27.2. The Cumulative Statistics System › 27.2.3. pg_stat_activity</code>. Unprompted routing verified: a plain "what does archive_command do?" made the agent choose the scoped tool on its own. Tests: <code>tests/test_rag_document_qa.py</code> (20).</p>
+
+  <h2>Document STRUCTURE — the outline route (2026-09-09)</h2>
+  <p><strong>Why it exists.</strong> "How many chapters does the PostgreSQL manual have?" ran for five
+  minutes across 20+ turns and was never answered (request <code>e0f4a8bd</code>). The question is about a
+  document's SHAPE, and the only retrieval on offer was semantic: <code>query</code> returned eight passages
+  at relevance 0.08 &mdash; text-search headline options, <code>EXPLAIN</code> output &mdash; under a footer
+  that said "if they do not contain the answer, query again with different wording". That instruction cannot
+  terminate for a structural question, and the model obeyed it ten times, each call adding ~10 KB of
+  irrelevant passages to a context that reached 170 K chars. <em>The structure was never missing.</em>
+  <code>build_page_breadcrumbs</code> reads the PDF's entire table of contents to build its breadcrumbs, and
+  the ingest then threw it away.</p>
+  <ul>
+    <li><strong>Kept at ingest.</strong> <code>IngestStats.outline</code> now carries the normalised
+    <code>[(level, title, page), …]</code>, and <code>tool_gain_knowledge</code> writes it to
+    <code>memory_dir/document_outlines.json</code> (its own sidecar, locked + atomic like the library index;
+    that index is a bare list of names with a dozen readers, so widening its shape would break every one).
+    One normaliser, <code>normalise_toc</code>, serves both the breadcrumbs and the record &mdash; two private
+    parsers of the same table is the &sect;4FN compound-age defect.</li>
+    <li><strong>Rebuilt for what was already ingested.</strong> The live manual was ingested on 2026-09-04, so
+    no record exists for it. <code>derive_document_outline</code> reconstructs one from the breadcrumbs the
+    chunks already carry: distinct paths &rarr; a tree, sorted by the titles' own numbering (Chapter 9 before
+    Chapter 10). It reads in pages of 400 chunks so peak memory is one page, not one 7.6 M-char manual, and
+    the result is cached, so the rebuild happens once per document, ever. The record says
+    <code>source: "breadcrumbs"</code> and the rendered output says so too &mdash; page numbers are absent and
+    the reader is told, rather than being handed a record that looks exact.</li>
+    <li><strong>Deleted with the document.</strong> <code>delete_document_by_name</code> drops the record: an
+    outline for a forgotten document is a claim about something that no longer exists.</li>
+  </ul>
+  <p><strong>Two defects the real store found that the unit tests could not.</strong> Run against a copy of
+  the live 8,279-chunk manual: (1) reading rows by <code>source</code> alone swept in the single
+  <code>document_summary</code> row the ingest writes under the same source, so "Reference document: 3083
+  pages, 1936 sections…" appeared in the outline as a top-level heading &mdash; a fabricated division in the
+  one output whose whole job is exactness; the query is now scoped to <code>type="document"</code> as well.
+  (2) The per-level count is <em>not</em> the chapter count: level 2 holds 91 entries &mdash; 70 chapters, 15
+  appendices, 6 front-matter headings &mdash; so the first draft would have answered 91 where the truth is 70.
+  The renderer now counts the divisions the document labels itself, and both numbers are printed with what
+  each one means. Verified against ground truth recomputed independently from the raw breadcrumbs: <strong>8
+  parts, 70 chapters, 15 appendices</strong>.</p>
+  <p>Read through <code>knowledge_base(action='outline', filename=…)</code>. Pins:
+  <code>tests/test_kb_document_outline.py</code> (31, over a real PyMuPDF-built PDF and the real store code);
+  battery 29/29.</p>
+
+  <h2>Audio ingest — talks, podcasts, recorded meetings (2026-08-02)</h2>
+  <p>The sibling of the PDF path, in <code>memory/audio_ingest.py</code>. Spoken material was previously <em>unreachable</em>: nothing in the stack could read a <code>.wav</code>/<code>.mp3</code>, so <code>gain_knowledge</code> fell through to the plain-text branch and decoded the container as replacement-char noise. A large slice of AI-research discourse is audio-first, so this closed a whole missing media class.</p>
+  <ul>
+    <li><strong>Windowed transcription.</strong> ffmpeg cuts 2-minute windows for the Whisper server (§4SL), or on the Gemma path windows of up to 8 minutes fitted to the node's slot (§4RR, see below) (<code>-ss</code> before <code>-i</code>, so seeking a 3-hour file is cheap), normalises each to 16 kHz mono PCM, and transcribes it on nova's Gemma 4 E4B audio node. Sizing is measured, not guessed: audio costs a constant <strong>25.0 tokens/second</strong>, and nova serves <code>--ctx-size 131072</code> across <code>-np 4</code> slots = <strong>32,768 tokens per slot</strong>, so 12 min ≈ 18 k audio tokens left room for the transcript. <strong>§4RR (2026-10-26):</strong> nova now serves 4 × 16,384-token slots, where a 12-minute window fails with HTTP 400; the window is fitted per recording to the slot <code>/props</code> reports (25 audio + 5 transcript tokens per second + 512 reserve) and the default cap is 480 s — see <a href="../documents/youtube_ingest.html#4rr">youtube_ingest §4RR</a>.</li>
+    <li><strong>Timestamp breadcrumbs</strong> — the audio analogue of TOC breadcrumbs, and for the same reason: a retrieved passage must be locatable. Every chunk is stamped <code>[talk.mp3] [12:00–24:00]</code> into its EMBEDDED text, so an answer can cite the moment in the recording. Per-sentence offsets are deliberately <em>not</em> claimed — the model returns text, not an alignment, and finer numbers would be fabricated precision.</li>
+    <li><strong>Overlapping windows.</strong> Windows advance by <code>window − 5 s</code> on Whisper (<code>window − 15 s</code> on Gemma) so a sentence spanning a seam survives in at least one of them. The cost is a little duplicated text at the boundaries, which retrieval tolerates far better than a truncated sentence. Note that this makes window durations sum to <em>more</em> than the recording, so <code>stats.seconds</code> reports timeline COVERAGE, not the sum of window lengths (summing reported a 6:17 file as "6.8 min").</li>
+    <li><strong>Failure isolation.</strong> One bad window is skipped and recorded in <code>stats.errors</code>; it never sinks the recording — the same policy <code>pdf_ingest</code> applies to an unreadable page. The one condition that <em>does</em> raise is empty content with <code>finish_reason="length"</code>: that is the measured silent-failure shape (Gemma 4's thinking blocks are stripped by its chat template, so an exhausted budget returns nothing rather than an error), and treating it as silence would delete a whole window of speech unnoticed.</li>
+    <li><strong>Video counts.</strong> <code>.mp4</code>/<code>.mov</code>/<code>.mkv</code>/<code>.webm</code> route here too — ffmpeg simply takes the audio track, and a recorded conference talk is more often an mp4 than a wav.</li>
+    <li><strong>Same store, same retrieval.</strong> Chunks stream into <code>ingest_document</code> in 256-chunk batches exactly like PDFs, so <code>knowledge_base(action="query", filename=…)</code> works unchanged.</li>
+  </ul>
+  <p><strong>Measured live</strong>: a 6:17 recording ingested as 3 overlapping windows (<code>0:00–3:00</code>, <code>2:45–5:45</code>, <code>5:30–6:17</code>) → 8 chunks, with marker words planted at the start, middle and very end all recovered. Single-shot transcription runs ~11× faster than real-time; windowed ingest is slower per minute because each window is a separate call and seams are transcribed twice. Practical scale on Gemma: a 45-minute talk is six windows (24 on Whisper, ~30&nbsp;s each). Tests: <code>tests/test_audio_ingest.py</code> (20). Since §4SL (2026-10-31) windows go to nova's Whisper server when <code>GHOST_STT_URL</code> is set in 120&nbsp;s windows with a 5&nbsp;s overlap (<code>GHOST_STT_WINDOW_S</code>, <code>GHOST_STT_WINDOW_OVERLAP_S</code>; no slot fitting — the whisper server serves one request at a time and push-to-talk shares it; see <a href="../voice/voice_loop.html#4sl">the voice page</a>). Config: <code>GHOST_STT_URL</code>, <code>GHOST_STT_LANGUAGE</code>, <code>GHOST_AUDIO_NODE_URL</code>, <code>GHOST_AUDIO_WINDOW_S</code>, <code>GHOST_AUDIO_WINDOW_OVERLAP_S</code>, <code>GHOST_AUDIO_MAX_S</code>, <code>GHOST_AUDIO_MAX_TOKENS</code>.</p>
+
+  <p><strong>§4KE (2026-09-24) — what the review changed in this path.</strong> Thinking is off for transcription (<code>GHOST_AUDIO_THINKING=1</code> re-enables it; measured: same text, 54 s instead of 90 s on a five-minute window, and the 8192-token cap no longer within reach of a dense Greek window); a window the node cuts short is <em>reported</em> as a gap instead of stored as complete; coverage is the union of transcribed windows and failed windows are listed as gaps with their cause in the reply and the summary row; one retry per window on a transient node fault, an abort after three consecutive failures (a starved node used to cost windows × 900 s inside one tool call), connect and read timeouts split; progress after every window; ingests serialised (nova is shared with the critic); the "(no speech)" sentinel is matched by shape and in several languages, and speech behind a stray sentinel is kept; ffmpeg takes the first audio stream explicitly and the probe requires one; a tail already inside the previous window is not transcribed again. The ordered transcript is kept beside the store (<code>set_document_text</code> / <code>get_document_text</code>, one JSON per document under the outline sidecar's directory, dropped with the document) and read by <code>knowledge_base(action='transcript')</code>; an outline record is written per window; the summary row carries the opening words. YouTube links take their own route: <a href="../documents/youtube_ingest.html">youtube_ingest</a>.</p>
+
+  <h2>Record schema</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Field</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>document</code></td><td>Raw text.</td></tr>
+      <tr><td><code>id</code></td><td>MD5 of text — or for documents <code>MD5(filename | chunk_idx | chunk_text)</code>.</td></tr>
+      <tr><td><code>metadata.timestamp</code></td><td>ISO-Z timestamp.</td></tr>
+      <tr><td><code>metadata.type</code></td><td>auto · document · document_summary · episode · skill · manual · identity · summary · name_memory.</td></tr>
+      <tr><td><code>metadata.retrieval_count</code> / <code>last_accessed</code></td><td>Drives spaced-repetition stretching.</td></tr>
+      <tr><td><code>metadata.source</code></td><td>Filename for document chunks.</td></tr>
+      <tr><td><code>metadata.trigger / domains / verified</code></td><td>Skill-only metadata.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Public methods</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Method</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>add(text, meta)</code></td><td>Insert. MD5 dedup; skip if &lt; 5 chars. Every <code>_PRUNE_CHECK_EVERY</code> (200) adds, triggers <code>_prune_if_needed</code>. <strong>id-exists REFRESHES metadata (2026-07-22)</strong> instead of a blanket early-return: skills twins are keyed on embedding text, so re-learning a lesson left the old <code>source_trajectory_id</code> and <code>retract_lessons_from_trajectory</code> silently missed — a discredited lesson stayed retrievable via the playbook's vector path. (<code>ingest_document</code> already upserted for this reason.) Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</td></tr>
+      <tr><td><code>_prune_if_needed()</code></td><td>Bounded growth: when the open-ended prunable tiers (<code>auto</code> / <code>manual</code> / <code>synthesis</code>) exceed <code>MAX_PRUNABLE_MEMORIES</code> (5000), evict the lowest-utility entries — fewest <code>retrieval_count</code>, then oldest <code>last_accessed</code> (the same spaced-repetition signal the ranker uses). <code>synthesis</code> (dream-consolidation output) joined the prunable set 2026-07-07 — it was written every REM cycle with no cap of its own. <code>identity</code> stays exempt on purpose (losing "user's name is X" to a sweep is worse than slow growth). Documents, skill twins and episodes are exempt (owned by their own capped stores). Amortised: the cap is probed once per 200 adds, not per write. Never raises.</td></tr>
+      <tr><td><code>smart_update(text, type_label)</code></td><td>Vector dedup with distance &lt; 0.50 → if existing similar memory, delete + re-add atomically under lock. <strong>Subject-key guard (2026-07-07):</strong> a delete only fires when the neighbour is the SAME fact, not merely the same <em>template</em>. <code>_subject_key</code> extracts the subject/attribute either side is about (<em>"User's favorite color is blue"</em> → <code>favorite color</code>); if both texts expose a key and the keys <em>disagree</em> (<code>favorite color</code> vs <code>favorite food</code>), the near-neighbour is kept — distance under 0.50 alone used to ERASE it. Texts with no copula (no extractable key) fall back to distance-only, so genuine paraphrases still collapse. <strong>Dedup is now SAME-TYPE-only (2026-07-22):</strong> the candidate query carries <code>where={"type": type_label}</code>, replacing the old <code>$nin</code> denylist that wasn't the complement of <code>_PRUNABLE_TYPES</code> — an incoming <code>identity</code> fact within 0.50 could DELETE a dream <code>synthesis</code> (prose, no copula → distance-only fallback), a user <code>manual</code> memory, etc. Same-type scoping removes the whole cross-type deletion class; distinct types coexist. Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</td></tr>
+      <tr><td><code>search(query, inject_identity, record_retrievals=True)</code></td><td>Hybrid search string renderer: <code>_search_selection</code> (dual-query → wide pool (30) → priority filter → BM25 re-rank → top-12) → labelled markdown. Bumps retrieval stats for the survivors unless <code>record_retrievals=False</code> (the bus selects again downstream, so it defers credit).</td></tr>
+      <tr><td><code>search_items(query, inject_identity)</code></td><td><strong>Per-item, side-effect-free</strong> variant for the MemoryBus: returns <code>[{id, text, score}]</code> (real Chroma id per item) and does <strong>not</strong> bump retrieval stats — the bus credits only the post-fusion survivors via <code>bump_retrievals</code>. Shares <code>_search_selection</code> with <code>search()</code> so ranking can't drift.</td></tr>
+      <tr><td><code>bump_retrievals(ids)</code></td><td>Public, deduplicating wrapper over <code>_bump_retrieval_stats</code> for deferred, select-then-credit callers.</td></tr>
+      <tr><td><code>bump_helpful(ids)</code></td><td><strong>2026-07-14:</strong> usefulness credit from the bus's post-turn hydration judge — increments <code>metadata.helpful_count</code> + refreshes <code>last_accessed</code>. Distinct from <code>bump_retrievals</code>: that credits SURFACING, this credits USE (the reply actually drew on the item). The ranking half-life becomes <code>30 · (1 + log1p(retrieval_count + 2·helpful_count))</code>, so judged-useful memories decay slowest. Tests: <code>tests/test_hydration_usefulness_loop.py</code>.</td></tr>
+      <tr><td><code>search_advanced(query, limit, where=None, record_retrievals=True)</code></td><td>Raw semantic search. <strong>Gained <code>where=</code> (type scoping) + <code>record_retrievals=</code> (2026-07-22):</strong> it used to bump retrieval stats UNCONDITIONALLY on every raw hit, so the episodic tier — which routes through here — credited ~5-8 document/identity rows per hydration that were never shown to the model, poisoning the prune-survival ranking and time decay it drives. The read-only façade forces the bump off. Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</td></tr>
+      <tr><td><code>ingest_document(filename, chunks) -&gt; (bool, str)</code></td><td>Batch upsert, library dedup; 25-chunk batches under a single lock.</td></tr>
+      <tr><td><code>delete_document_by_name(filename)</code></td><td>Drop all chunks of a source document.</td></tr>
+      <tr><td><code>delete_by_query(query)</code></td><td>Vector lookup; delete best match if distance &lt; 0.5.</td></tr>
+      <tr><td><code>get_library() -&gt; list[str]</code></td><td>List ingested filenames.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="retired-rows">Retired row types <span class="tag">2026-11-06 §4TD</span></h2>
+  <p><code>RETIRED_ROW_TYPES = ("skill",)</code>: the vector twins of the removed lesson store are purged at deploy (<code>scripts/lesson_purge_4td.py</code>); this filter stays as a defence, and such a row is never served. <code>search_advanced</code> and the ambient search narrow their <code>where</code> with <code>without_retired_rows</code> and drop such a row again after the query (<code>is_retired_row</code>; a row whose metadata cannot be read is not served). Nothing in the agent rewrites or deletes the rows. A row with no <code>type</code> stays visible: chromadb's <code>$nin</code> keeps it (measured on chromadb 1.5.5).</p>
+
+  <h2>Scoring</h2>
+  <p class="note"><strong>Not auto-loaded into prompts since 2026-10-08 (§4MJ).</strong> The memory bus's vector tier was switched off then and deleted on 2026-10-11 (§4NM, with <code>GHOST_BUS_VECTOR_TIER</code> and <code>GHOST_VECTOR_MATCH_FLOOR</code>); the hydration line shows <code>v=-</code>. The scoring below still serves <code>recall</code> and the other direct callers.</p>
+  <p>For each candidate:</p>
+  <pre><code>combined = (priority_score · _TIER_WEIGHT) + distance + time_penalty
+time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
+  <p>Then a cross-encoder re-rank subtracts up to 0.3 from <code>combined</code> based on BM25 keyword overlap (normalised 0-1).</p>
+  <p><strong>Prior weight, not absolute gate (2026-07-07):</strong> <code>_TIER_WEIGHT</code> was cut from <strong>10</strong> to <strong>0.3</strong>. At ×10 the category tiers sat ±10 apart while <code>distance + time_penalty</code> spans only ~2.3 and the BM25 rerank ±0.3 — so category priority was <em>absolute</em>: a barely-over-threshold name-memory (dist 1.4) could never lose to a dist-0.1 exact-match document, making cross-tier semantic relevance cosmetic. At 0.3 the prior still separates <em>distant</em> tiers (identity vs auto ≈ 3.3 apart) but a decisively closer match <em>can</em> cross an <em>adjacent</em> tier (manual↔auto = 0.3, document↔manual = 1.5).</p>
+
+  <h3>Priority scores</h3>
+  <p>Priority + threshold are now taken from <code>metadata.type</code>. The deliberately-written <code>identity</code> and <code>synthesis</code> types used to have no case in the scorer and fell into the generic <code>auto</code> else-branch (lowest priority, 0.55 threshold) unless their text happened to match the name-string heuristics — so the highest-curation tiers ranked <em>below</em> raw document chunks. Fixed 2026-07-07: <code>identity</code> scores with the identity tier, <code>synthesis</code> with the summary tier.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Type</th><th>Priority</th><th>Max distance</th></tr></thead>
+    <tbody>
+      <tr><td>name_memory</td><td>−20</td><td>1.00</td></tr>
+      <tr><td>summary · <strong>synthesis</strong></td><td>−15</td><td>0.75</td></tr>
+      <tr><td>episode</td><td>−12</td><td>0.70</td></tr>
+      <tr><td><strong>identity</strong> (typed) · identity-batch</td><td>−10</td><td>0.80 / 0.65</td></tr>
+      <tr><td>document</td><td>−5</td><td>1.25</td></tr>
+      <tr><td>manual</td><td>0</td><td>0.55</td></tr>
+      <tr><td>auto</td><td>1</td><td>0.55</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note"><strong>Ambient hydration EXCLUDES the document corpus (2026-07-22).</strong> <code>_search_selection</code> now queries with <code>where={"type": {"$ne": "document"}}</code>, so the <code>document</code> row above is reached only via the scoped <code>search_document</code> path — never ambient recall. After the 2026-07-13 manual ingest 96.8% of the live store (7,130 of 7,366 fragments) is document chunks, and the tiering worked <em>against</em> ambient recall on two compounding axes: (1) documents carry the 1.25 threshold (2× everything else) and <code>p_score=−5</code> (−1.5 after <code>_TIER_WEIGHT</code>), so — since lower <code>combined_score</code> wins — a barely-related chunk at dist 1.0 (−0.5) beat a strong <code>auto</code> memory at dist 0.30 (+0.60); (2) with 96.8% doc chunks the 30-candidate pool was essentially all documents, which the MemoryBus then rejected wholesale at its 0.42 match floor (vs doc distances of 0.8-1.2) — so the vector tier returned <code>[]</code> and ambient memory went DARK since the manual ingest. Measured after the fix: a personal query went from 30/30 documents to 18 episodes + 6 identity + 6 skills. Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</p>
+
+  <h2>Concurrency</h2>
+  <p><code>threading.RLock</code> guards Chroma mutations + library writes. Library JSON written via temp + <code>os.replace</code> for crash safety.</p>
+
+  <h2><code>correct_fragment(match, replacement)</code> — surgical text fix (2026-07-02)</h2>
+  <p>Built for correcting a <em>poisoned auto-memory</em>: the memory journal (then logged as hippocampus) consolidated the chess request as <em>"single-file, turn-based chess game…"</em> — "single-file" was the agent's own distortion, and the stored fragment would bias every future retry. There was no update-text API (ids are <code>md5(text)</code>, so text changes mean a new id), and the Chroma persist dir must never be opened by a second process (the HNSW segment files are mmap'd without cross-process locking), so the fix runs <b>in-process</b>, exposed as <code>POST /api/memory/correct</code>.</p>
+  <ul>
+    <li><code>match</code> is tried as the EXACT stored text (direct id lookup) first, then as a case-insensitive substring over the non-<code>document</code> fragments — deterministic, unlike a semantic query which can land on a neighbor. <strong>The <code>type != document</code> filter is pushed INTO the <code>collection.get</code> query (2026-07-22)</strong>; it used to run in Python <em>after</em> a full-collection fetch, materialising ~7k document chunks (~75 MB) into RAM on every substring correction. Identical semantics, a fraction of the cost; <code>delete_fragment</code> shares the same scoped scan.</li>
+    <li>Ambiguous (&gt;1 hit) or empty matches are REFUSED with previews rather than guessed at; the fuzzy multi-store <code>forget</code> sweep stays the wrong tool for this job.</li>
+    <li>Delete-then-<code>upsert</code> under the instance lock, preserving the original metadata (an <code>auto</code> memory stays <code>auto</code>, timestamp kept). 📝 <code>Memory Correct</code> log line.</li>
+    <li><strong>id-collision loss fixed (2026-07-07):</strong> ids are <code>md5(text)</code> and Chroma's <code>add()</code> <em>silently no-ops</em> on an id that already exists — so if the corrected text hashed to an id already in the collection, the old fragment was deleted and the new one never written: <b>the correction was lost</b>. The write now uses <code>upsert</code> (the same guarantee <code>ingest_document</code> relies on), so the replacement always lands.</li>
+  </ul>
+  <p>Covered by <code>tests/test_game_move_api.py::TestCorrectFragmentUnit</code> and <code>tests/test_vector_memory_dataloss.py</code>.</p>
+
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Name-memory rank pathology:</strong> the <code>is_name_memory</code> net also matched "user's" / "user is" — ordinary prose across ALL types (28 live rows incl. skill/synthesis/auto), each granted p_score −20 (absolute rank over a dist-0.1 exact match), the loosest gate, and a false <code>[MASTER SUMMARY]</code> label. The net is now genuine name statements only ("name is" / "call me"); identity prose still ranks via its type (−10). <strong>Off-topic gate vs identity probe:</strong> <code>search_items</code>' relevance gate took <code>min()</code> over ALL candidates, but identity-batch items carry distance to the canned profile probe, not the query — any query containing " i "/"my "/"who" defeated the 0.42 floor and injected the noise tail. Candidates now carry <code>from_identity_probe</code> and the gate mins over query-batch distances only. Also: <code>search_advanced</code> callers that are probes, not retrievals (belief-revision engine, project-lookup miss) pass <code>record_retrievals=False</code>, and the belief-revision engine's deletes are scoped by type AND restricted to the ids actually offered to the judge. Tests: <code>::TestIdentityProbeGate</code>.</p>
+
+  <h2 id="4gj">One reconciler for the store PAIRS <span class="tag">2026-09-13 &sect;4GJ</span></h2>
+  <p>Every single-file store in this substrate is atomic and fail-closed, and three audits (§4L, §4M, §4R) hardened them one at a time. What stayed broken lived <em>between</em> them: rows and the library catalogue, the catalogue and the §4FO outline sidecar, episodes and their vector twins — pairs whose only consistency mechanism was "call the other store's delete, best-effort, swallow". Five residuals, closed together:</p>
+  <ul>
+    <li><strong>Two-step mutations are now one critical section.</strong> <code>delete_document_by_name</code> took the lock three times (rows, catalogue, outline); a process death between them left a catalogue entry with no rows, which <code>ingest_document</code>'s dedup then refuses to re-ingest. <code>reset_all</code> (in <a href="memory_tools.html">tools/memory</a>) scanned, deleted in batches, and reset the catalogue <em>outside</em> the lock and after the batches, so a concurrent ingest survived the wipe with its rows but lost its catalogue line — the defect the §4L fix was believed to have closed. Both now hold one lock for the whole sequence, and <code>reset_all</code> clears the outline sidecar too. An AST enumeration (<code>_two_step_methods</code>) walks <code>vector.py</code> and fails on any method that mutates both the collection and a sidecar outside <code>with self._get_lock()</code>; it is shown to fire.</li>
+    <li><strong><code>forget_episode</code> reports.</strong> It returned <code>None</code> and logged at debug; the caller could not tell a failed twin-delete from a success, so orphaned vectors accumulated silently. It returns a bool and names the orphan at WARNING, and <code>record_episode</code> counts the failures.</li>
+    <li><strong><code>reconcile_indexes</code></strong> — four arms over the pair-invariants: catalogue ⊆ live sources (drop), sources ⊆ catalogue (<em>adopt</em>, never delete), outlines ⊆ catalogue (drop), episode vectors ⊆ live episode ids (delete). Bounded at <code>RECONCILE_MAX_REPAIRS</code> per arm with <code>bounded</code> in the report; it never raises. <strong>Every arm requires a successful read before it repairs</strong>: a failed scan appends to <code>report["skipped"]</code> and changes nothing, and a <code>live_episode_ids</code> that cannot be read returns <code>None</code> (not an empty set — that is a different, real answer) which skips the episode arm entirely rather than reading every twin as an orphan. The outline arm reads the catalogue <em>after</em> the document arm repaired it.</li>
+    <li><strong>Scheduled, and pinned as scheduled.</strong> <code>Dreamer._reconcile_memory_stores</code> runs it in the maintenance cycle beside the graph prune (since 2026-10-10, §4NC: from <code>Dreamer._store_maintenance</code>, at most every 6 h, also when REM is skipped), off-loop, reporting through the normal log channel and logging skipped invariants even when nothing was repaired — an invariant that is never checkable is the silent-inoperative shape. Two behavioural pins plus an AST pin cover the wiring: the battery showed that without them the call could be deleted and nothing would fail.</li>
+  </ul>
+  <p>Tests: <code>tests/test_memory_store_reconcile_4gj.py</code> (24). One existing pin was rewritten because it <em>pinned the defect</em> — <code>test_reset_all_holds_the_vector_lock_across_the_WHOLE_wipe</code> (<code>tests/test_forget_disk_sweep_scope.py</code>) asserted the lock was taken at least twice, i.e. it required the per-step acquisitions the fix removes. Mutation battery §4GJ: every arm, both fail-safe paths and both wiring points killed; one branch (<code>ep is None</code>) was proven equivalent — <code>int(None)</code> already raises into the guard below — and deleted.</p>
+  <footer><a href="../../index.html">← Back to index</a></footer>
+
+  <h2 id="4gk">Round 4: a corrupt catalogue was erased by the next write <span class="tag">2026-09-13 &sect;4GK</span></h2>
+  <p>The reconciler was taught this round to refuse to act on a catalogue it cannot read. That is worth nothing while the <em>writer</em> resets an unparseable catalogue to an empty list and carries on, because the very next ingest then overwrites it with a single-entry list and every other document becomes invisible to the library listing and undeletable by name. The writer now quarantines the bad bytes beside the file and then rebuilds from that write onward. Round 4's first attempt REFUSED the write instead, which preserved the bytes but blocked every future ingest with no recovery the agent could perform by itself &mdash; a worse failure than the one it fixed. Both halves are needed: copy the bytes aside, then start fresh.</p>
+
+  <h2 id="4gk-r6">Round 6: the reconciler's two readers, and what a refusal costs <span class="tag">2026-09-14 &sect;4GK round 6</span></h2>
+  <p><strong>The "two readers" were one reader asked twice.</strong> The type-scoped sweep and the per-document probe differ only in their filter KEY, so they cannot disagree when the Chroma rows are simply GONE while the plain-file sidecars beside them survive &mdash; a partial restore, a recreated collection, a re-embed that dropped rows. Both answer a well-formed "no rows", the corroboration passes, and one unattended dream cycle deletes the catalogue line and the outline together. The asymmetry decides the fix: the rows are recoverable by re-ingest, the outline is not (deriving it again needs the chunks that are gone). So while the sweep sees no documents at all the outline arm does not run, and an outline whose catalogue line was dropped by this same pass is deferred one cycle.</p>
+  <p><strong>A delete that precedes a refusal destroys what the refusal exists to protect.</strong> <code>smart_update</code> deleted the near neighbour and then delegated to <code>add()</code>, which refuses a write that would reclassify a row's type &mdash; and nothing undid the delete. Driven through the real profile update: the identity tier ended EMPTY while the user was told "retrieval may not reflect the change", which states the opposite of what happened. It now asks who owns the text BEFORE destroying anything. The same shape was found and fixed in the acquired-skill save, which deleted the old embedding and then lost the new one while logging "Permanently learned new tool".</p>
+  <p><strong>A refused write is not a silent one.</strong> <code>add()</code> returns which of four things happened, the bus reports a refusal as a failed leg rather than an "ok", and the partial-write breadcrumb &mdash; the only durable record, since nothing rolls back &mdash; now covers a refusal as well as an error. The quarantine sidecar keeps one copy per DISTINCT corruption instead of one ever, and reads the bytes it already holds rather than re-reading a file that just failed to decode, which used to make every later outline write fail the same way forever.</p>
+  <p><strong>Re-used ids after a store rebuild.</strong> When the episode database is deleted and the sequence restarts, an old twin can claim a live id and permanently masquerade as a new episode's twin, mapping semantic recall to the wrong row. The reconcile now validates the id-to-text pairing and only reaps a row that claims a live id, holds text that is not that episode's, and holds text no live episode has &mdash; and only when the episode read was not truncated.</p>
+  <h2 id="4kz">Ranking: the current owner fact first <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <ul>
+    <li>Tiers: identity (the profile's mirror rows) −15 above synthesis −10; the "name is" boost only for identity/manual rows
+    (a stale auto "wife's name is Elena" ranked as MASTER SUMMARY over the correction); labels name the row's TYPE.</li>
+    <li>Age counts from when the fact was STATED, not last read (a stale row read often looked fresher than a correction).</li>
+    <li>With an identity probe, the real query's batch is scored first — the probe batch claimed the rows and the bus gate then
+    saw nothing on "what is my name?"; the probe confers no tier.</li>
+  </ul>
+  <p class="note">&sect;4LA: an episode twin ranks with the facts (p_score 1, like auto), not above them — an old "I'm a
+  doctor" turn outranked the owner's correction at −12.</p>
+</main>
+
+<h2 id="4mn">§4MN (2026-10-08): one writer, a torn sidecar, compaction</h2>
+<ul>
+  <li><strong>Single writer.</strong> <code>VectorMemory.__init__</code> takes an exclusive, non-blocking <code>flock</code> on <code>&lt;memory&gt;/store.writer.lock</code> (<code>memory/store_lock.py</code>) before chroma opens. A second process gets <code>StoreLockedError</code>; the OS releases the lock on exit, crash or kill. The agent takes it at the top of <code>main()</code>, before any store is constructed and before the embedder loads, and exits 75 when a repair script holds it; KeepAlive retries. It never runs without memory, and a refused boot writes nothing. Repair scripts call <code>assert_no_other_writer</code>. Why: two processes writing chroma, the first then SIGTERMed (the deploy path), left a store that segfaulted on every open (4 of 7 runs). The agent then crash-looped with no Python error, and the recovery script crashed on the same read.</li>
+  <li><strong><code>embedder.json</code></strong> is written atomically and only when it changes; it used to be rewritten in place on every boot. A sidecar that exists but cannot be parsed is a torn write. The torn file is moved aside to <code>embedder.json.torn-&lt;ts&gt;</code> as evidence, a warning is logged and the sidecar is re-stamped, instead of refusing to boot forever with "re-embed everything".</li>
+  <li><strong>Compaction.</strong> The HNSW index keeps one slot per vector ever added: 35,087 slots for 423 live rows, 58 MB loaded into RAM whole, and two live vectors no longer found themselves. <code>scripts/compact_vector_store.py</code> runs with the agent stopped:
+    <ol>
+      <li>takes a verified snapshot;</li>
+      <li>rewrites the collection from its own stored embeddings, with no model call;</li>
+      <li>checks every id and sampled self-queries;</li>
+      <li>optimises the full-text index (97% of <code>chroma.sqlite3</code>, which nothing queries) and VACUUMs;</li>
+      <li>removes segment folders the segments table no longer names.</li>
+    </ol>
+    On a copy of the live store: 43 MB → 2.5 MB of SQLite, and 58 MB → 168 KB of index.</li>
+</ul>
+<h2 id="4mr">§4MR (2026-10-09): snapshots from a child process; every repair script takes the lock</h2>
+<ul>
+  <li><strong>The daily snapshot is taken from a child process</strong> (<code>memory.snapshot.take_snapshot_isolated</code>), while the dream holds <code>VectorMemory._get_lock()</code>. Taken inside the agent process, the copy of <code>chroma.sqlite3</code> tore while the agent wrote vectors: chroma writes through its own bundled SQLite, and POSIX file locks do not exclude within one process. A reviewer measured 6 of 6 copies torn. Verification refused every one, so the cost was a missed daily backup. Across processes the file locks hold (5 of 5 clean); holding the in-process lock also pauses the agent's own writers for the copy.</li>
+  <li><strong>Every repair script that writes stores under <code>--apply</code></strong> calls <code>assert_no_other_writer</code> before its main block. 26 older scripts did not, and three of them opened chroma on the live store directly, which is the two-writer case that left the store segfaulting. The pin enumerates the scripts from their AST (an <code>--apply</code> constant plus a store-opening call).</li>
+  <li><strong>Restore:</strong> move the live <code>memory/</code> folder aside, then copy the snapshot's folder into its place (<code>scripts/snapshot_stores.py</code>). Copying <em>into</em> a live folder left a crash's <code>-wal</code> there, and SQLite replayed it onto the restored database.</li>
+</ul>
+<h2 id="kb-review-1030">2026-10-30 review</h2>
+<ul>
+  <li><strong>The collection is cosine.</strong> A distance is 1 − cosine similarity (0 to 2). Recall's bands were rewritten for it; see <a href="memory_tools.html#kb-review-1030">the review</a>.</li>
+  <li><code>sync_owner_field(key, values, category="root", retire_legacy=False, legacy_values=())</code> writes <code>User &lt;category&gt;_&lt;key&gt; is …</code> for a non-root field; an old unqualified row is removed only for a value in the current or <code>legacy_values</code> set.</li>
+  <li><strong>ingesting.json</strong>: <code>mark_ingest_started</code> / <code>clear_ingest_marker</code> bracket an ingest; <code>_rollback_interrupted_ingests</code> runs at start-up and deletes documents whose writer pid is gone. <code>delete_document_by_name</code> clears the entry and deletes only <code>DOCUMENT_ROW_TYPES</code> rows.</li>
+</ul>
+
+</body>
+</html>

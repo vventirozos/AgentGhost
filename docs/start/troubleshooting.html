@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When something breaks — Ghost Agent</title>
+<meta name="description" content="Common Ghost Agent failures and what actually causes them: startup refusals, empty memory, dead background loops, sandbox surprises.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="getting-started.html">Getting started</a>
+    <a href="installation.html">Installation</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a class="current" href="troubleshooting.html">When something breaks</a>
+    <a href="glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../features/interfaces.html">Interfaces</a>
+    <a href="../features/voice.html">Voice</a>
+    <a href="../features/search.html">Search &amp; the web</a>
+    <a href="../features/darkweb.html">Dark-web search</a>
+    <a href="../features/pictures.html">Pictures</a>
+    <a href="../features/memory.html">Memory</a>
+    <a href="../features/documents.html">Documents (RAG)</a>
+    <a href="../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../features/labs.html">Labs</a>
+    <a href="../features/selfhood.html">Selfhood</a>
+    <a href="../features/performance.html">Performance</a>
+    <a href="../features/reliability.html">Reliability</a>
+    <a href="../features/personal.html">Personal services</a>
+    <a href="../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Running it</span>
+  <h1>When something breaks</h1>
+  <p class="subtitle">Sorted by what you'd notice, not by which component is at fault.</p>
+
+  <h2>Check these two things first</h2>
+  <p>Most confusing behaviour resolves into one of two states, and both are visible from one request:</p>
+
+  <pre class="shell">curl -s -H "X-Ghost-Key: $GHOST_API_KEY" \
+     http://127.0.0.1:8000/api/health | python -m json.tool</pre>
+
+  <dl class="kv">
+    <dt>memory_system_loaded</dt>
+    <dd><code>false</code> means Ghost booted <strong>degraded</strong>: HTTP answers normally, but there's no memory and every background pass is silently disabled. It will chat with you and remember nothing.</dd>
+    <dt>biological_watchdog_alive</dt>
+    <dd><code>false</code> means the background loop — the idle scheduler — died (the key keeps its old name). Ghost still answers, but it has stopped its idle work: the memory journal, maintenance, store hygiene and the workspace tidy. The web status chip shows <em>idle scheduler DEAD</em>; at boot a healthy one logs <code>Idle Scheduler — started; jobs: …</code>. Nothing will tell you this — it just goes quiet.</dd>
+  </dl>
+
+  <h3>Beyond the two fields: the live verification harnesses</h3>
+  <p>Health says <em>something</em> is serving. Three scripts under <code>scripts/</code> ask whether the parts work, against the running agent (all read the key from <code>~/Data/AI/.ghost_api_key</code>, all send their LLM turns as diagnostics that never teach, except the selfhood one, which tests the recording path itself):</p>
+  <ul>
+    <li><code>functional_live_test.py</code> — API, auth, malformed input, sessions, workspace save, then three live turns (<code>--core</code> skips the turns).</li>
+    <li><code>tool_probes_live.py</code> — one bounded "reply with only X" prompt per tool family, checked mechanically, with the tool that actually ran read back from the log.</li>
+    <li><code>selfhood_functional_test.py</code> — capture, tool-using turn, narrative, stress, unity (the section that drove the removed <code>self_state</code> tool is gone). Section G corrupts the live <code>state.json</code> and needs <code>--corrupt-live-state</code>.</li>
+  </ul>
+  <p>For the idle loops, <code>scripts/learning_health.py</code> (or <code>introspect action='learning'</code>) is the liveness screen: every registered phase, what its zero means, and a <code>✗ DEAD</code> only for a periodic loop whose heartbeat has not declined recently.</p>
+  <p>The <em>judgment</em> systems — the verifier, the claim binder, escalation — used to be scored against known truth by the night oracle benches (<code>night_bench_round.py</code>, <code>verify_bench*.py</code>, <code>if_bench.py</code>); those scripts and the bench banks were deleted on 2026-10-11 (§4NM). The owner's regression suite, which replaced them as the standing check from 2026-10-10, was removed on 2026-11-05 (§4SZ): it held no kept test. No standing automatic check of the judgment systems runs now; the failure census (<code>scripts/failure_census.py</code>) and its hand-graded sample are the measurement.</p>
+
+  <h2>It won't start</h2>
+
+  <h3>"REFUSING TO START … no API key configured"</h3>
+  <p>You bound to something other than localhost without deciding about authentication. Either set <code>GHOST_API_KEY</code>, or pass <code>--api-key ''</code> to knowingly turn auth off on a trusted network, or bind to <code>127.0.0.1</code>.</p>
+
+  <h3>It aborts complaining about Tor</h3>
+  <p>Mandatory Tor is on by default and Ghost probes it at boot. Check the daemon is running and listening:</p>
+  <pre class="shell">curl --socks5-hostname 127.0.0.1:9050 -s https://check.torproject.org | grep -o "Congratulations"</pre>
+  <p>If Tor is fine but Ghost still refuses, check <code>TOR_PROXY</code> points at the right port.</p>
+  <p>The boot probe is only a TCP connect to the SOCKS port — it does not wait for a bootstrapped circuit. So "the port answers" is the whole gate, and Tor being <em>slow to bootstrap</em> is never the cause of this abort. Tor being absent is.</p>
+
+  <h3>Nothing came back after a reboot</h3>
+  <p>Almost always dependency ordering rather than Ghost itself. Ghost boots fail-closed on Tor, so if Tor is not up yet Ghost aborts — and under <code>KeepAlive</code> that abort becomes a respawn loop that re-pays the full model-loading startup on every iteration. The giveaway is a service that reports as running while never holding a port:</p>
+  <pre class="shell">sudo launchctl print system/com.local.ghost-agent | grep -E "state|last exit"
+#   state = spawn scheduled      <-- looping, not stopped
+#   last exit code = 3</pre>
+  <p>Two things make this survivable, and both are worth checking if you are setting up a new host:</p>
+  <ul>
+    <li><strong>Run every dependency as a system daemon, not a login agent.</strong> A <code>LaunchAgent</code> starts at <em>login</em>. If Ghost is a system daemon and Tor is a login agent, a headless reboot leaves Ghost looping until somebody physically logs in.</li>
+    <li><strong>Wait for dependencies in the launcher, don't race them.</strong> launchd starts jobs concurrently, so "Tor also autostarts" is not by itself enough. <code>start-ghost-agent.sh</code> waits for port 9050 (bounded — after the timeout it proceeds and lets the fail-closed abort speak, rather than hanging silently forever).</li>
+  </ul>
+
+  <h3>A second Tor keeps appearing, or Tor rotation reports success but nothing changes</h3>
+  <p>If Tor is supervised by your own service definition rather than by Homebrew's, be careful with anything that "restarts Tor" by calling <code>brew services restart tor</code>. Homebrew owns its own label, so that call installs and starts a <em>second</em> Tor job — which cannot bind port 9050 because the real one already has it, and sits in <code>error</code> state forever. The Tor that is actually serving is never restarted.</p>
+  <p>Ghost's <code>request_new_tor_identity()</code> hit exactly this. It now restarts the supervising launchd job instead, and returns a truthful failure when it cannot (restarting a system daemon needs root, and Ghost runs unprivileged) rather than reporting a renewal that did not happen. Nothing is lost: exit-node rotation runs on per-circuit SOCKS isolation, which needs neither Tor's control port nor a daemon restart.</p>
+  <p>Check for a stray rival job with:</p>
+  <pre class="shell">ls ~/Library/LaunchAgents/ /Library/LaunchDaemons/ | grep -i tor
+lsof -nP -iTCP:9050 -sTCP:LISTEN</pre>
+
+  <h3>PostgreSQL won't start after an unclean shutdown</h3>
+  <p>If the log repeats <code>FATAL: lock file "postmaster.pid" already exists</code> naming a PID that is alive, check what that PID actually <em>is</em>:</p>
+  <pre class="shell">ps -p &lt;pid&gt; -o comm=</pre>
+  <p>Across a reboot the kernel reuses PID numbers, so the PID in a leftover lock file frequently belongs to some unrelated process. PostgreSQL can see the PID is alive but not that it belongs to something else, so it refuses forever — this does not heal on its own, and under <code>KeepAlive</code> it retries every few seconds indefinitely. Remove the lock file only once you have confirmed the PID is not a postmaster; if it <em>is</em> one, you have a real second instance and deleting the lock would be actively harmful.</p>
+
+  <h3>Docker/OrbStack: the app is running but the sandbox still fails</h3>
+  <p>On macOS the OrbStack app and the OrbStack <em>engine</em> are separate. The app can be up and idle in the background while the VM has not been spawned, and the app only starts it on demand — so seeing OrbStack in Activity Monitor tells you nothing about whether Docker works. Ask the engine directly:</p>
+  <pre class="shell">orb status          # "Running" is the answer that matters
+docker info --format '{{.ServerVersion}}'</pre>
+  <p>This is also the one dependency that cannot be made to start before login, because it is a GUI VM manager. On a headless reboot the sandbox tools stay unavailable until somebody logs in; everything else is a system daemon and comes back on its own.</p>
+  <p><strong>"Sandbox manager not initialized" from <code>execute</code>/<code>browser</code> (2026-08-26):</strong> this means boot-time sandbox construction failed — classically the agent daemon won the race against OrbStack's docker socket by a few seconds after a reboot (the log shows one <code>sandbox failed — Error while fetching server API version</code> line at boot). Since 2026-08-26 the agent <em>recovers on its own</em>: the next <code>execute</code>/<code>browser</code> call after docker comes back rebuilds the manager (backoff-gated, ~60&nbsp;s) and logs <code>Sandbox Recovered</code> — see <a href="../reference/coding/docker.html#lazy-reinit">sandbox → Lazy re-init</a>. If the error persists for minutes while <code>docker info</code> answers, that self-heal is what broke; before that date the only fix was restarting the agent.</p>
+
+  <h3>First-ever boot hangs or fails loading the embedder</h3>
+  <p>This one catches everybody. On a fresh install the embedding model hasn't been downloaded yet, and the Tor egress guard blocks that download because it's a direct connection to a public host. Boot once with <code>--no-mandatory-tor</code> to let it cache, then run normally from then on.</p>
+
+  <h3>It refuses to start and mentions re-embedding</h3>
+  <p>The embedding model doesn't match the one that built your vector store. Both models produce vectors of the same size, so nothing would crash — the stored vectors would simply stop meaning anything and retrieval would return plausible-looking garbage. Ghost refuses instead.</p>
+  <p>Either put <code>GHOST_EMBED_MODEL</code> back to what it was, or migrate deliberately:</p>
+  <pre class="shell">PYTHONPATH=src python scripts/reembed_memory.py</pre>
+
+  <h3>Port already in use</h3>
+  <p>Usually a previous instance that didn't shut down. If you run it under launchd with <code>KeepAlive</code>, remember that a plain <code>kill</code> restarts it — you need <code>launchctl bootout</code> to actually stop it.</p>
+
+  <h2>It started but acts like it has amnesia</h2>
+
+  <h3>It knows nothing about you at all</h3>
+  <p>Almost always <code>GHOST_HOME</code>. If it isn't set, Ghost uses <code>~/ghost_llamacpp</code> — so an agent started from a shell where you'd exported it and one started by a service manager where you hadn't are two different agents with two different memories.</p>
+  <p>Under launchd or systemd this is the default outcome, because a service doesn't inherit your shell profile. Set it inside the service definition. Confirm which path is live:</p>
+  <pre class="shell">ps -o command= -p $(pgrep -f ghost_agent.main | head -1)</pre>
+
+  <h3>It forgot one specific thing</h3>
+  <p>Two very different causes with opposite fixes. Ask it to search for the fact directly. If it <em>can</em> find it on request, the fact is stored fine and the retrieval ranking didn't surface it — that's a ranking problem, not a lost memory. If it can't find it at all, it was never stored.</p>
+  <p>Things mentioned in the last couple of minutes may genuinely not be searchable yet; the queue that files them drains after about two minutes of quiet. <a href="../features/memory.html">More on memory →</a></p>
+
+  <h3>It keeps repeating something wrong about you</h3>
+  <p>That entry is in your profile, which is injected into every conversation rather than searched. Correct it directly ("my wife is Maria, not Anna") or use the memory-correction control in the web UI.</p>
+
+  <h2>Tools don't work</h2>
+
+  <h3>Anything involving code or files fails</h3>
+  <p>Check Docker is running. Ghost needs the daemon up; without it, <code>execute</code>, <code>browser</code> and the file tools all fail. The very first container start also pulls a base image, so it's slow once and fast afterwards.</p>
+
+  <h3>"It can't reach my app on localhost:3000"</h3>
+  <p>Correct — and not a bug. The sandbox has its own network namespace, so its <code>127.0.0.1</code> is not yours. Ghost cannot see services you run on your machine, and cannot stop or restart your processes. If you need it to test a local app, have Ghost start that app itself inside the sandbox.</p>
+
+  <!-- 4KS:loopback -->
+  <h3>It says the app is running, but the link won't open</h3>
+  <p>The app is probably listening only on the sandbox's own loopback address. Ghost publishes a small range of sandbox ports to your machine, but a published port only reaches an app that listens on all interfaces. Many development servers — Flask's <code>app.run()</code> is the usual one — listen on <code>127.0.0.1</code> unless told otherwise, and inside the sandbox that address is the sandbox's, not yours. Everything Ghost checks from inside the sandbox still works, so from there the app looks healthy.</p>
+  <p>Ghost looks at the address the app actually bound and says so in the service report: the fix is for the app to bind <code>0.0.0.0</code> (the <code>HOST</code> and <code>PORT</code> variables are set for it) and to be restarted. If the report instead says the port is not published, ask for the service to be stopped and started again on one of the published ports — a restart keeps the port it had.</p>
+  <!-- /4KS:loopback -->
+
+  <h3>Web search returns nothing, repeatedly</h3>
+  <p>Often search operators. The scraper backends Ghost reaches over Tor don't support <code>site:</code>, quoted phrases, or <code>AND</code>/<code>OR</code>, so Ghost removes them before searching and keeps the words. When a <code>site:</code> filter is dropped this way the agent is told so in the search result, along with the query that actually ran — a <code>site:</code> search is not a restriction to that site. To aim at a site, name it as an ordinary keyword. Plain keywords work best.</p>
+  <p>For dark-web search specifically, zero results is normal. Onion search engines are unreliable and reachability varies by exit node; an empty result is not a reason to retry the same query.</p>
+
+  <h3>It won't do something, and explains why instead</h3>
+  <p>If the model declines rather than the tool failing, that's model alignment, not a bug. Ghost is developed against uncensored models; a standard aligned one will refuse operations that are routine for an agent on your own machine — wiping its sandbox, deleting files on request, searching Tor hidden services, handling security material.</p>
+  <p>Tell them apart in the log: a broken tool logs a failure with its own icon, while a refusal shows the model reasoning (💭) and then a normal <code>✅ turn outcome</code> with no tool line at all. The second one means nothing ran. The same applied to the verifier's LLM judge while it was on — an aligned judge can refuse a sound answer on subject matter alone, which surfaced as retries you couldn't otherwise explain.</p>
+
+  <h3>A tool that used to work now refuses to run</h3>
+  <p>The pre-flight guard is doing its job. When the same tool fails the same way on the same target repeatedly, Ghost stops re-running it and hands the model the previous error instead. Fix the underlying cause and it'll clear.</p>
+
+  <h2>It's slow</h2>
+
+  <h3>Every answer is slow</h3>
+  <p>Your model has one inference slot, and Ghost competes with itself for it: conversation compaction, background fact extraction and classification are all model calls. Moving them to a second machine with <code>--worker-nodes</code> is the highest-value change available — see <a href="configuration.html">Settings that matter</a>. (The self-check used to be the biggest of these calls; its LLM judge is off since §4OW, 2026-10-14, and the checks that remain are mechanical.)</p>
+
+  <h4>Finding out what a turn actually cost</h4>
+  <p>Every turn now records its real token cost, summed across each model call it made — the tool rounds and any work sent to a worker node. It lands in the turn's trajectory record and on the reply itself:</p>
+  <pre class="shell">curl -s -X POST http://127.0.0.1:8000/api/chat \
+  -H "X-Ghost-Key: $GHOST_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"'"$GHOST_MODEL"'","messages":[{"role":"user","content":"hello"}],"stream":false}' \
+  | python -c "import sys,json; print(json.load(sys.stdin).get('usage'))"</pre>
+  <p>The interesting field is <code>cached_tokens</code>. Ghost sends a large system prompt on every call and relies on the server's prefill cache to avoid re-processing it. If <code>cached_tokens</code> is near <code>prompt_tokens</code>, the cache is working and most of that prompt costs nothing. If it's near zero, you're re-prefilling the whole prompt every round — which is the difference between a fast turn and a slow one, and it's usually caused by something changing early in the prompt between calls.</p>
+  <p><code>ghost_llm_calls</code> tells you how many model calls the turn took. A simple question that made eight calls is doing more work than you asked for.</p>
+
+  <h3>One turn takes forever</h3>
+  <p>Watch the log panel in the web UI. A turn can use up to 40 passes through the tool loop, and something like deep research legitimately takes minutes because every page is fetched over Tor. If it's stuck on the same tool repeatedly with the same result, that's a loop and Ghost's own guards should break it after three identical attempts.</p>
+
+  <h3>A configured node stopped being used</h3>
+  <p>Look at <code>node_health</code> on the health endpoint. A node that keeps failing gets its circuit breaker opened and is taken out of rotation. The most common cause is an address that moved — point node flags at tailnet addresses or stable hostnames, not DHCP-assigned LAN IPs.</p>
+
+  <h2>The answers are wrong</h2>
+
+  <h3>It claims it did something it didn't</h3>
+  <p>The self-check catches only part of this, mechanically: a file the reply says it wrote that is not on disk, a page it built that throws on load, a reply that narrates instead of answering, a picture that does not show what the reply says. When the file, page or reply check fails within about 15 seconds, the reply gets one repair round before it is sent; otherwise the failure is recorded with the turn, and you are generally not shown a correction. Other false claims are not checked: the LLM judge that read answers against the evidence is off since §4OW (2026-10-14). Correct it, or give it a 👎.</p>
+  <p>If the mechanical checks seem not to run at all, confirm they are on: <code>--no-verifier</code> disables them.</p>
+
+  <h3>It answers a different question than the one asked</h3>
+  <p>Tell it. A correction marks the previous turn as failed, and that label is kept with the turn. A correction needs a recognisable correction phrase and real overlap with your previous message, so "no, I asked for the file paths, not the counts" registers where a fresh unrelated question doesn't. The label does not change later answers by itself (the loop that replayed failed turns and proposed a rule was removed on 2026-11-05). If the same mistake keeps coming back, state a rule: <em>"learn this rule: …"</em> puts your sentence into every prompt of yours (<a href="../reference/memory/owner_rules.html">Owner rules</a>).</p>
+
+  <h3>It got worse after learning something</h3>
+  <p>Only rules you stated change its behaviour now. Say <em>"show my rules"</em>, then <em>"forget rule N"</em> and <em>"confirm forget rule N"</em> for the one that hurts. <a href="../reference/memory/owner_rules.html">Owner rules →</a></p>
+
+  <h3>"Your rules file … so I left it exactly as it is"</h3>
+  <p>The rules file, <code>$GHOST_HOME/system/owner_rules.json</code>, is damaged or cannot be read. Ghost does not rename, replace or rewrite it. Until it reads again, no rule is in your prompts and every rule command answers with this line, which names what is wrong (for example "is not readable JSON", "holds two rules numbered 3", or "holds more than 10 rules" after an edit by hand). A directory in the file's place counts as damage too ("cannot be read (IsADirectoryError)"). So does a key written twice in the file ("is not readable JSON"), and a row with a blank rule text or a rule number above 999,999 ("holds a row that is not a rule"). The health check's <em>Learning</em> line says <code>owner rules file DAMAGED (…)</code>. Repair the file, or remove it to start with no rules. <a href="../reference/memory/owner_rules.html#damaged">A damaged rules file →</a></p>
+
+  <h3>"I could not write your rules file … so nothing was changed"</h3>
+  <p>The rules file reads fine, but Ghost could not save a change to it. The line names the error, for example <code>PermissionError</code> (the <code>system</code> folder is read-only) or <code>OSError</code> (the disk is full). The rules you had are intact and nothing was added or removed. Fix the folder or free space, then send the command again. <a href="../reference/memory/owner_rules.html#write-failure">When the file cannot be written →</a></p>
+
+  <h3>"delete rule 3" or "add rule: …" did nothing</h3>
+  <p>Those are not commands. Only the exact messages change a rule: <em>"learn this rule: …"</em>, <em>"forget rule N"</em> then <em>"confirm forget rule N"</em>, and <em>"forget all my rules"</em> then <em>"confirm forget all my rules"</em>. A short message about your rules that is none of these ("delete rule 3", "add rule: …", "new rule: …", "erase rule 2", "reset my rules") goes to the model, which is told that nothing was changed and which message to send. To change a rule, say <em>"show my rules"</em> to see its number, send the new one with <em>"learn this rule: …"</em> on one line, then <em>"forget rule N"</em> and <em>"confirm forget rule N"</em> for the old one (with ten rules, forget first). A message in Greek, or one longer than 20 words, reaches the model without that note, unless it starts with "learn this rule". The rules block itself always ends with a line saying the model cannot change a rule and must name the messages to send, which makes a reply with the commands likely for a long "edit this rule, …", though a prompt line cannot guarantee it. The old commands of the replay loop ("learn rule N", "dismiss rule N", "show me all proposed rules") are in the same group: they do nothing. <a href="../reference/memory/owner_rules.html#commands">The commands →</a></p>
+
+  <h3>"show all rules" did not list my rules</h3>
+  <p>The list command needs "my": <em>"show my rules"</em> (also "list my rules", "show all my rules"). "show all rules" and "list all rules" stopped being commands on 2026-11-05 (review r3), because that is also what one says about a firewall or a linter. They go to the model, which is told to answer with the message to send.</p>
+
+  <h3>"learn this rule …" was not stored</h3>
+  <p>A dictated rule needs a colon after "this rule" (not a comma, a full stop or a dash), has to be one line, the message may not open with a quote mark, and the rule may not hold a question mark anywhere (or end with ";"). A rule that quotes a question, such as "when I ask 'what's new?' give five headlines", is not taken: write it without the question mark. Otherwise the message goes to the model, which is told that nothing was stored. Send the rule alone: <em>"learn this rule: answer in English"</em>. <a href="../reference/memory/owner_rules.html#dictating">The four conditions →</a></p>
+
+  <h3>A rule holds more than I meant</h3>
+  <p>One line that states a rule and also asks for something else ("learn this rule: answer in English, and now tell me the weather") is stored whole, and the second request is not answered. The reply quotes what was stored. Say <em>"forget rule N"</em>, then <em>"confirm forget rule N"</em>, and dictate the rule alone.</p>
+
+  <h3>I said "yes" and the rule is still there</h3>
+  <p>A forget is confirmed only by the exact message Ghost asks for: <em>"confirm forget rule N"</em> (or <em>"confirm forget all my rules"</em>), within 15 minutes. A bare "yes" or "ok" removes nothing, because it may be answering something else; while the preview is still waiting, the model is told that nothing was removed and to answer with the message to send. <a href="../reference/memory/owner_rules.html#bare-yes">A bare "yes" confirms nothing →</a></p>
+
+  <h2>Reading the log</h2>
+
+  <p>The log is the primary debugging tool here, and it's built to be read by a person rather than parsed by one. Almost every question on this page is answered faster by looking at it than by guessing.</p>
+
+  <h3>There are two of them, and they're for different jobs</h3>
+
+  <dl class="kv terms">
+    <dt>The live stream</dt>
+    <dd>What the agent prints as it works — boxed per request, colour-coded, one icon per subsystem. This is for <strong>watching</strong>. The web UI shows it in a panel beside the conversation, which is the easiest way to see it. If you run Ghost under a service manager, that manager captures it (with <code>launchd</code>, whatever you set as <code>StandardOutPath</code>).</dd>
+
+    <dt>The durable file</dt>
+    <dd><code>$GHOST_HOME/system/ghost-agent.log</code>. Same events, one line each, timestamped and with a log level. This is for <strong>grepping</strong> — after the fact, when you know roughly what you're looking for.</dd>
+  </dl>
+
+  <h3>What one request looks like</h3>
+
+  <p>A request is framed top and bottom, so you can always see where one ends and the next begins. This is a real turn from 2026-08-04 — asking for the weather, which makes the agent call a tool. Back then an LLM judge also checked the answer (the <code>verify</code> and <code>verifier</code> lines); that judge is off since §4OW (2026-10-14), so a turn like this one now ends at the reply:</p>
+
+  <pre>┌─ 11 1165839c  request started  19:35:16 ─────────────────────────────────
+│  11  🧩  +0.08s  prefill cache       sys h=9ab1b534 chars=16757 · stable-prefix h=013475b7…
+│  11  💬  +0.08s  llm request         Turn 1 | Temp 0.20
+│  11  💭  +7.78s  thinking            The user is asking for the weather in Reykjavik. I need to
+                                       use the system_utility tool with action="check_weather".
+│  11  🧠  +7.78s  thought             reasoning: 37 tokens / 141 chars | content: 0 chars | 7.7s
+│  11  🌐  +7.79s  system weather      Location: Reykjavik
+│  11  🧩  +9.41s  prefill cache       sys h=9ab1b534 chars=16757 · stable-prefix h=013475b7…
+│  11  💬  +9.41s  llm request         Turn 2 | Temp 0.60
+│  11  💭  +12.2s  thinking            The result shows it's overcast, 12.5°C, wind 10.4 km/h,
+                                       humidity 70%. I can provide this directly to the user.
+│  11  🧠  +12.2s  thought             reasoning: 68 tokens / 241 chars | content: 115 chars | 2.8s
+│  11  🔧  +12.2s  worker compute      verify → Worker Node (worker-1)
+│  11  🧪  +26.0s  verifier            CONFIRMED (100%) — All facts in the claim are directly…
+│  11  ✅  +26.0s  turn outcome        verified · tools: system_utility · 115…
+└─ 11  request finished  +26.0s ───────────────────────────────────────────</pre>
+
+  <p>Reading a line left to right:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Part</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td><code>11</code></td><td>A short tag for this request, repeated on every line and given its own colour. When two requests overlap, this is how you tell their lines apart.</td></tr>
+      <tr><td><code>1165839c</code></td><td>The full request id, on the opening frame only. Grep the durable file for this to pull one turn out of everything.</td></tr>
+      <tr><td><code>🧩</code></td><td>Which subsystem produced the line. One glyph per subsystem, deliberately all distinct.</td></tr>
+      <tr><td><code>+7.78s</code></td><td>Elapsed since <em>this request</em> started — not wall-clock. This is what you read to find where the time went.</td></tr>
+      <tr><td><code>thinking</code></td><td>A short fixed label, aligned into a column so you can scan down it.</td></tr>
+      <tr><td>the rest</td><td>The detail, wrapped and indented to stay inside the column.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>In that turn the useful reading is the <strong>timing</strong>: 7.8 seconds of thinking before the tool call, the tool itself returning in 10 milliseconds, and then 14 seconds waiting on the verifier's judge (off today). If this felt slow, the model was the cost — not the weather lookup.</p>
+
+  <h3>The icons worth recognising</h3>
+
+  <p>There are 94 of them, all deliberately distinct. These carry most of the signal:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Icon</th><th>Means</th><th>Read it when</th></tr></thead>
+    <tbody>
+      <tr><td>🧩</td><td>Memory hydration — what it recalled before thinking</td><td>It "forgot" something</td></tr>
+      <tr><td>💭 🧠</td><td>Model reasoning, then a summary of it</td><td>Working out where time went</td></tr>
+      <tr><td>💬 🤖</td><td>A request to the model, and its reply</td><td>Turn count is climbing</td></tr>
+      <tr><td>🐍 🐚 💾 📖 🌐 🌎 🧅</td><td>Tools: Python, shell, file write, file read, web search, browser, onion search</td><td>Checking what it actually did</td></tr>
+      <tr><td>🔧</td><td>Work sent to a worker node</td><td>Confirming node offload is live</td></tr>
+      <tr><td>🧪</td><td>The verifier's verdict</td><td>It claimed something it didn't do</td></tr>
+      <tr><td>✅ ❌</td><td>How the turn ended</td><td>Always</td></tr>
+      <tr><td>🔶 🛑</td><td>Warning, and a hard stop</td><td>Always — these are rare by design</td></tr>
+      <tr><td>🔄</td><td>A retry</td><td>Something is flaky</td></tr>
+      <tr><td>🌙 📡</td><td>Maintenance cycle (tagged <code>maintenance</code>; <code>dream</code> before 2026-10-11), background activity</td><td>Checking the idle loop ran</td></tr>
+      <tr><td>🔒</td><td>A guard refused something</td><td>A tool won't fire</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The <a href="../reference/reliability/logging.html">logging reference</a> has the full catalog.</p>
+
+  <h3>A warning, and why they're worth reading</h3>
+
+  <p>Warnings are deliberately rare, so when one appears it usually says something real. This one is from the same session, from the LLM judge that is off today (§4OW) — you will not see this exact line in production:</p>
+
+  <pre>│  48  🔶  +37.1s  agent               Verifier escalation OVERTURNED a cheap-judge refute:
+                                       main model says CONFIRMED. Original issues:
+                                       Memory usage is 90.7%, not 91%.
+│  48  🧪  +37.1s  verifier            CONFIRMED (95%) — All suspects are false alarms; claim…</pre>
+
+  <p>Read that as: the cheap judge rejected the answer for rounding 90.7% to 91%, the main model was asked to re-examine, and it overruled the rejection. Nothing was broken — but lines like this showed the cheap judge was too strict. Measured on real turns, 9 of 17 of its refutes were false, which is why it was switched off.</p>
+
+  <h3>Grepping the durable file</h3>
+
+  <p>The file has one line per event, so ordinary tools work:</p>
+
+  <pre class="shell"># everything from one request
+grep 1165839c "$GHOST_HOME/system/ghost-agent.log"
+
+# just the warnings and errors
+grep -E "WARNING|ERROR" "$GHOST_HOME/system/ghost-agent.log" | tail -40
+
+# how did recent turns end?
+grep "turn outcome" "$GHOST_HOME/system/ghost-agent.log" | tail -20
+
+# did the background loop do anything last night?
+grep "\[SYSTEM\]" "$GHOST_HOME/system/ghost-agent.log" | tail -40</pre>
+
+  <p>Lines in that file look like this — same events, flattened for grep:</p>
+
+  <pre>2026-08-04 19:35:16 - GhostStream - INFO  - [1165839c +0.08s] llm request — Turn 1 | Temp 0.20
+2026-08-04 19:35:24 - GhostStream - DEBUG - [1165839c +7.78s] thinking — The user is asking for the…
+2026-08-04 19:35:24 - GhostStream - INFO  - [1165839c +7.79s] system weather — Location: Reykjavik
+2026-08-04 20:10:41 - GhostStream - INFO  - [SYSTEM] memory journal — read 1 memory</pre>
+
+  <p><code>[SYSTEM]</code> in place of a request id means the agent did that on its own — background work, not something you asked for. Filtering on it is the quickest way to see what the idle scheduler has been doing; each idle pass that did work leaves one <code>idle cycle — ran …</code> line.</p>
+
+  <div class="note warn">
+    <strong>The log is redacted by default.</strong> Secrets, API keys, <code>.onion</code> addresses, home directory paths and personal details are masked in both sinks, because the log is the thing you leave on screen. If you're chasing a bug and need to see the raw content, <code>--no-redact-logs</code> turns it off — and should be turned back on afterwards.
+  </div>
+
+  <h2>Working out where to look</h2>
+
+  <div class="diagram">
+    <ol class="flow tight">
+      <li>
+        <h4>Is it up and healthy?</h4>
+        <p><code>/api/health</code> — the two fields at the top of this page.</p>
+      </li>
+      <li>
+        <h4>What is it doing right now?</h4>
+        <p>The live log, in the web UI panel or <code>$GHOST_HOME/system/ghost-agent.log</code>.</p>
+      </li>
+      <li>
+        <h4>What has it been doing?</h4>
+        <p>Ask it: <em>"what did you do while I was away?"</em> That reads the real background activity ledger.</p>
+      </li>
+      <li>
+        <h4>Is the idle work alive?</h4>
+        <p>Ask it: <em>"is your learning working?"</em> (or run <code>scripts/learning_health.py</code>). That reports whether the idle passes are actually running and succeeding, which absence of errors will not tell you. Only maintenance is expected to leave a regular heartbeat; the other jobs record a row when they had something to do.</p>
+      </li>
+      <li>
+        <h4>What does it think is broken about itself?</h4>
+        <p>Ask "what did you do while I was away?" — the activity ledger lists every idle outcome, including failures. (The post-mortem queue that used to answer this was removed on 2026-10-11, §4NM.)</p>
+      </li>
+    </ol>
+  </div>
+
+  <div class="note">
+    <strong>A useful habit:</strong> when a subsystem seems to have stopped, check that it's <em>running</em> before you debug what it's doing. The characteristic bug in a system like this isn't a wrong answer — it's a component that silently stopped being called, which looks exactly like a component with nothing to do.
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="configuration.html">
+      <span class="dir">Previous</span>
+      <span class="to">Settings that matter</span>
+    </a>
+    <a class="next" href="glossary.html">
+      <span class="dir">Next</span>
+      <span class="to">Glossary</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Written against the code as of 2026-08-04. If a symptom here doesn't match what you're seeing, the <a href="../reference/reliability/logging.html">logging reference</a> explains how to read the stream in detail.</p>
+  </footer>
+</main>
+</body>
+</html>

@@ -1,4 +1,4 @@
-"""§4SX Phase C: the host-side run registry (UNIFIED_DESIGN §3.2, docs/labs/PHASE_C.md).
+"""§4SX Phase C: the host-side run registry (UNIFIED_DESIGN §3.2, docs/reference/labs/PHASE_C.md).
 
 One row per thing that keeps executing after a tool call returns, wherever it
 runs. It lives under ``<memory_dir>`` — NEVER on the sandbox bind mount, which

@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project research (core.project_research) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a href="background_jobs.html">Background jobs</a>
+      <a href="cross_project_map.html">Cross-project map</a>
+      <a href="long_tasks.html">Long tasks</a>
+      <a href="planning.html">Planning (core.planning)</a>
+      <a href="project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a class="current" href="project_research.html">Project research (core.project_research)</a>
+      <a href="project_safety.html">Project safety (core.project_safety)</a>
+      <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="projects_routes.html">Projects API (api.projects_routes)</a>
+      <a href="projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="task_close.html">Closing tasks (core.task_close)</a>
+      <a href="task_kind.html">Task kinds (core.task_kind)</a>
+      <a href="task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / project_research.py</h1>
+  <p class="subtitle">Auto-research for long-term projects (any domain, not just code): search → summarise → persist a Markdown brief in the project workspace → index it → surface it in the briefing.</p>
+
+  <h2>Why</h2>
+  <p>Projects are multi-session efforts of any kind. While working one — on demand or during background auto-advance — the agent should be able to research relevant topics, keep the <em>findings</em> (not just raw search dumps), and stay aware of what it has already looked into. This module turns a web search into a durable, summarised brief inside the project's own <code>workspace_dir</code>, and records it so every later turn sees it.</p>
+
+  <h2>Entry points</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>async research_topic(context, project_id, topic, *, tool_runner=None, llm_summarizer=None, queries=None, task_id=None)</code></td><td>Research ONE topic: run web search(es), summarise, persist the brief. Falls back to the tool registry for search and to <code>context.llm_client</code> for summarisation; with neither it still writes a (sourceless) brief so the topic is recorded.</td></tr>
+      <tr><td><code>async research_project(context, project_id, *, topics=None, max_topics=5, ...)</code></td><td>Research several topics. When <code>topics</code> is empty, auto-derives them via <code>propose_topics</code>.</td></tr>
+      <tr><td><code>async propose_topics(context, project_id, n=5, ...)</code></td><td>LLM-derive up to <em>n</em> distinct topics from the project goal + open tasks. Fallback when no LLM: the open task descriptions, then the goal.</td></tr>
+      <tr><td><code>async persist_research_from_output(context, project_id, topic, search_output, *, task_id=None)</code></td><td>Turn a search output already in hand into a brief — used by the autoadvancer so it doesn't search twice.</td></tr>
+      <tr><td><code>get_research_index(store, project_id) -&gt; list[dict]</code></td><td>The project's research index (read by the briefing).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>What a run produces</h2>
+  <ul>
+    <li><strong>A Markdown brief</strong> at <code>&lt;workspace&gt;/research/&lt;slug&gt;.md</code> — title, <code>## Summary</code> + <code>## Key findings</code> (LLM-written, or a heuristic title list when no LLM), a <code>## Sources</code> section parsed from the search tool's <code>[Source: url]</code> markers, and a timestamp. The slug is alphanumerics + dashes only, so a topic can never escape the research dir.</li>
+    <li><strong>A research index entry</strong> in project metadata (<code>metadata.research_index</code>): <code>{topic, slug, path, ts, summary_preview, sources_count}</code>, replace-by-slug (re-researching refreshes rather than duplicates), capped at 50 entries.</li>
+    <li><strong>A <code>research/INDEX.md</code></strong> human-readable mirror of the index.</li>
+    <li><strong>A <code>file</code> artifact</strong> (when tied to a task) + a <strong><code>research_added</code> event</strong> on the project log.</li>
+  </ul>
+
+  <h2>Triggers</h2>
+  <ul>
+    <li><strong>On demand</strong> — <a href="projects_tool.html"><code>manage_projects</code></a> <code>action=research</code> (a single <code>topic</code>, or omit it to auto-derive several from the goal) and <code>action=research_list</code>.</li>
+    <li><strong>Automatic during auto-advance</strong> — a research-classified task in <a href="project_advancer.html">advance_once</a> that ran a real <code>web_search</code> and got usable output calls <code>persist_research_from_output</code> on that output (no second search), so background ticks leave durable findings, not just a transient <code>tool_call</code> artifact. The synthesised summary becomes the task's <code>result_summary</code>; the brief path is added to the <code>autoadvance_step</code> event and the result summary.</li>
+  </ul>
+
+  <h2>Awareness</h2>
+  <p><a href="../infrastructure/prompts.html"><code>build_project_briefing</code></a> reads the metadata index (no file I/O) and appends a <strong>RESEARCH NOTES</strong> section listing recent topics → file paths with a one-line preview, so the agent sees what it has already researched on every turn it works the project — and is told to read a brief with <code>file_system</code> before re-researching it. The <code>manage_projects</code> create/switch/resume briefing dict carries a compact <code>research</code> list too.</p>
+
+  <h2>Directly-written briefs get indexed too (2026-06-22)</h2>
+  <p>The agent frequently saves a research brief with a bare <code>file_system</code>
+  write (during a "Research" task) instead of <code>action=research</code> — and
+  those direct writes never reached <code>metadata.research_index</code>, so the
+  briefing didn't surface them and the agent <em>never re-read its own
+  research</em> (observed live: <code>PetAI/research/transformer-from-scratch.md</code>
+  written once, then ignored while the model rebuilt everything from parametric
+  memory). <code>reconcile_research_dir(store, project_id)</code> walks the
+  project workspace for <code>**/research/*.md</code> briefs anywhere (the agent
+  may nest them under a self-named subdir, not just <code>&lt;workspace&gt;/research/</code>),
+  and indexes any not already present — keyed by <strong>path</strong> so a brief
+  the research tool already indexed isn't duplicated; the <code>topic</code> is
+  taken from the brief's first Markdown heading. It runs after every
+  <a href="projects_tool.html"><code>manage_projects</code></a>
+  <code>task_update</code> (closing a task is a natural "I produced something"
+  checkpoint), so the next turn's briefing advertises the brief. Entries carry
+  <code>origin: "direct_write"</code>. Covered by
+  <code>tests/test_research_reuse.py</code>.</p>
+
+  <h2>Research reaches the build (2026-06-22)</h2>
+  <p>Awareness alone wasn't enough — the <a href="../coding/coding_executor.html">coding
+  executor</a> never saw the research at all: <code>_gather_project_files</code>
+  skipped the whole <code>research/</code> tree, so build tasks rebuilt without
+  the design decisions the agent had researched. Now
+  <code>project_advancer._gather_research_briefs</code> reads the briefs (head
+  excerpts, bounded) and passes them to <code>build_coding_task</code> as
+  <code>research_context</code>, rendered in the spec prompt as <strong>PROJECT
+  RESEARCH (reference — build consistently with these; NOT files to edit)</strong>.
+  <code>_gather_project_files</code> now excludes <code>research/</code>
+  <em>anywhere</em> (not just the root) from the editable file set, so a brief is
+  never mistaken for a build target the model must grow.</p>
+
+  <h2>Robustness</h2>
+  <p>Every path degrades and never raises into the caller: missing LLM → heuristic summary (the top result titles); missing search runner → sourceless brief; missing workspace → a clean <code>ok=False</code> result. The autoadvance hook is wrapped so a research failure can't break a tick.</p>
+  <p>The summariser and topic-proposer issue a <strong>no-think</strong> utility completion (<code>_llm_complete</code>): a plain foreground <code>chat_completion</code> with thinking disabled — the <code>/no_think</code> soft-switch + <code>chat_template_kwargs:{enable_thinking:false}</code> hard-switch + a system nudge, mirroring <a href="../memory/dream.html">core.dream</a>. This matters because the upstream runs as a reasoning model (this note dates from <code>--deep-reason</code>, now a no-op, §4NN): a utility call with thinking left ON burns the entire token budget inside <code>&lt;think&gt;</code> and returns an <em>empty</em> <code>content</code> (verified live: <code>finish_reason=length</code>, all completion tokens spent on <code>reasoning_content</code>), which silently dropped the summary to the title-list fallback. Responses are still defensively cleaned — <code>_strip_think</code> removes any stray <code>&lt;think&gt;</code> block and <code>_message_text</code> salvages <code>reasoning_content</code> if <code>content</code> is empty. The index <code>summary_preview</code> skips Markdown headings so it reads as a real sentence. Covered by <code>tests/test_project_research.py</code> and <code>tests/test_project_advancer.py</code>. &sect;4SC-b (2026-10-29): on the user's turn the call is a side call on main (<code>side_main=not is_background, task_label="research-summary"</code>) &mdash; it does not open with the head, so the conversation in the main slot is saved to disk first (📼 "saved to disk before this request's research-summary call") and the turn's next head call restores it; before, it displaced the conversation unsaved. In the background (the idle summariser below) it parks behind the owner as before. &sect;4SC-c: the restore line names the call (📀 "restored the head before this request after its own research-summary call"; it said "picture look" for every side call). See <a href="../performance/head_saves.html#4sc-b">head_saves</a>; pins in <code>tests/test_4sc_cut_write_slot.py</code>.</p>
+
+  <h2>Idle summariser yields to the user <span class="tag">2026-07-22</span></h2>
+  <p><code>_llm_complete</code> (the research-brief summariser) was
+  foreground-marked, but it is reached from the idle autoadvance loop
+  (<code>advance_once</code> → <code>persist_research_from_output</code>) — so an
+  idle research summary contended on the main slot with a live user turn and
+  inflated <code>foreground_tasks</code>. It is now background-aware: the public
+  funnels take <code>background=None</code> (auto-detect) and resolve it once at
+  run start from <code>llm_client.foreground_requests</code> — <code>&gt; 0</code>
+  means an interactive turn is in flight (stay foreground, no self-stall),
+  <code>0</code> means idle/autoadvance (mark <code>is_background=True</code> so
+  it parks politely). A user-invoked <code>manage_projects action="research"</code>
+  therefore stays foreground; the idle backstop degrades. The call stays on the
+  main model (no <code>use_worker</code>), so <code>is_background</code> alone is
+  the fix. Test: <code>test_project_research_offmain.py</code>.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+
+  <h2 id="main-loop-writeback">Main-loop research write-back <span class="tag">2026-09-03 · §4EK</span></h2>
+  <p>
+    Live (request <code>463111ad</code>): the main loop ran six web searches about the active project and
+    threw the results away — only the conversation saw them, while the coding leaves read the
+    project's <code>research/</code> files and nothing else. They built from a 3&nbsp;KB brief that said
+    "talismans and stat allocation are not covered" and shipped wrong facts.
+  </p>
+  <p>
+    Every <em>relevant</em> main-loop <code>web_search</code> now lands in
+    <code>research/main-loop-findings.md</code> — newest first, the top 5 results of each search with a
+    200-char snippet and the source URL, a repeated query replaces its own entry, and only the newest
+    <code>MAIN_LOOP_FINDINGS_MAX_SEARCHES</code> (8) survive. Zero LLM calls: the raw results with their
+    URLs are the record. The research index (metadata + <code>INDEX.md</code>) carries a
+    <code>main-loop-findings</code> entry, and <code>_gather_research_briefs</code> — what the coding
+    executor reads — picks the file up unchanged (it sorts before <code>research-*.md</code> and its head
+    is the newest search). The tool output tells the model where the results now live.
+  </p>
+  <p>
+    <b>Who writes, who does not.</b> The hook sits in <code>tool_search</code>, which the registry now
+    calls with the live context; it writes only when <code>current_project_id</code> is set and the
+    context is not a pinned one — autonomous leaves (autoadvance, the <code>/advance</code> route, the
+    research leaf itself) build tools from <code>_PinnedProjectContext</code>, whose
+    <code>is_pinned_project_context</code> marker excludes them, since their research is already saved as
+    a brief. Error outputs and empty result sets are never recorded.
+  </p>
+  <p>
+    <b>One authority for "is this about the project".</b> The work-log gate's token-overlap check
+    (request vs. project title/description/task text, or a command naming the project dir) moved out
+    of <code>agent.py</code> into <code>request_relevant_to_project</code> here; the agent method now
+    delegates, and the recorder uses the same verdict — so "get me the news" in a project conversation
+    is neither journaled nor filed as research. Pins:
+    <code>tests/test_main_loop_research_writeback.py</code> (executed delegation, executed registry
+    wiring, the gatherer integration).
+  </p>
+
+  <h2 id="relevance">The relevance authority, sharpened (§4FD, 2026-09-07)</h2>
+  <p><code>request_relevant_to_project(store, project_id, request, cmds)</code> is the ONE authority for "is this request about the project" — it already gated the work-log and the research write-back, and it now also gates which project constraints reach the verifier and the prompt (<a href="../reliability/verifier.html#constraint-scoping">verifier</a>). Three changes, each earned by a measured case:</p>
+  <ul>
+    <li><strong>Continuations are relevant.</strong> A request whose content tokens are all <code>CONTINUATION_TOKENS</code> ("proceed", "continue with task 5", "do the next one") is about the bound project by virtue of the binding — the chess-session request that wrote the forbidden engine was the single word "proceed."</li>
+    <li><strong>Tokens are accent-folded, never stemmed.</strong> Both sides fold diacritics (NFD, combining marks dropped) so "δαπανες" equals "δαπάνες". Inflection is not matched on purpose: a 5-character prefix stem was measured on the request corpus × live projects (§4FH, 2,097 requests × 4 projects) and raised relevant pairs from 2,704 to 3,267 of 8,036 — "creatine" reached a project through "create", "confirm" through "config" — which is the off-topic constraint replay the gate exists to stop. Accent folding changed no verdict on that corpus and is kept because it cannot widen beyond accent-only spellings.</li>
+    <li><strong>No content tokens means a continuation.</strong> Tokens are Unicode words (a Greek request is not an empty request — the first version returned "not relevant" for 23 Greek requests and 11 short acks like "ok", dropping their constraints, §4FH); a request with no content token left after stopwords and continuation words ("ok", "do it", "ναι") is about the bound project.</li>
+    <li><strong>Function words are not overlap.</strong> Request tokens are filtered through <code>RELEVANCE_STOPWORDS</code> ("what", "with", "just", …) so a stored constraint "Start with: What it means to BE ghost" cannot make "what is 17 times 4?" relevant. The hay side is deliberately unfiltered — proven equivalent by mutation.</li>
+    <li><strong>The project's goal and constraints are part of what it is about.</strong> "make the AI opponent smarter" overlaps "don't come up with some random AI" even when the title never says "AI".</li>
+  </ul>
+  <p>Still fail-open on any store error. Tests: <code>tests/test_4fd_constraint_scoping.py</code>.</p>
+  <h2 id="4lp">Research notes never write through a link <span class="tag">2026-10-05 &sect;4LP &middot; CRIT</span></h2>
+  <p><code>research/</code> lives in the project workspace under the sandbox bind mount. A symlink planted at the directory or at a note's name redirected these HOST-side writes (the topic note, <code>INDEX.md</code>, the findings file) to any host file. <code>_research_dir</code> refuses a linked or escaping directory. Every write goes through <code>write_text_nofollow_in_dir</code>, and the findings read through <code>read_bytes_nofollow</code>.</p>
+
+  <h2 id="4qa">A brief never overwrites someone's work <span class="tag">2026-10-18 &sect;4QA</span></h2>
+  <p>Autoadvance writes a brief at the path a task declares (<code>persist_research_from_output(slug=…)</code>, <code>research_brief_slug</code>). So the writer must know whether the file already there is its own. The rule is decided on the <strong>bytes</strong>:</p>
+  <ul>
+    <li><code>_brief_state(store, pid, rel)</code> returns one of four states:
+      <ul>
+        <li><code>absent</code>;</li>
+        <li><code>ours</code>: the file's sha256 equals what the writer recorded in metadata <code>research_brief_shas</code>. That map is separate and uncapped; in the 50-entry, slug-keyed index a hash was lost to slug collisions and eviction;</li>
+        <li><code>other</code>: any other regular file, which is someone's work;</li>
+        <li><code>unsafe</code>: a link, a FIFO, unreadable or over 4&nbsp;MB, read with <code>O_NOFOLLOW</code>.</li>
+      </ul>
+      <code>is_generated_brief</code> is true for <code>absent</code> and <code>ours</code>.</li>
+    <li><code>_persist</code> records the sha after every write (<code>_record_brief_sha</code>, an atomic metadata update). When the path is <code>unsafe</code>, it refuses. When a <em>named</em> brief (the declared path) is <code>other</code>, it also refuses: "holds work that is not a generated research brief — not overwritten". A <em>derived</em> name moves to the next free <code>-N</code> name. "index" becomes "index-brief".</li>
+    <li>Rounds r2&ndash;r5 tried verb lists and then a heading check. The heading check let owner notes appended under our heading be overwritten, which is why the rule is now the hash.</li>
+    <li><strong>Old briefs</strong> (written before hashes) are not judged at runtime. A heading-and-footer rule let an owner's edit in the <em>middle</em> of an old brief be overwritten (r7 m1). <code>backfill_legacy_brief_shas(store, pid)</code> is a one-time migration, run for every project by <code>scripts/repair_4qa_448d5afa86f0.py --apply</code> with the agent stopped. It records the hash of each index entry with no <code>origin</code> whose regular file still has the writer's heading and footer. A direct write, a link or an already-hashed path is skipped. After the migration, any edit makes the file someone's work, and an unhashed file counts as someone's: the safe direction.</li>
+    <li><code>create_version</code> and <code>clone</code> copy the map with the workspace. The model never sees it in <code>list</code>, and it can never set it: <code>research_brief_shas</code> is one of the <code>_SYSTEM_METADATA_KEYS</code> stripped from <code>update metadata=</code>. A forged hash would make an owner's file "ours".</li>
+    <li>The repair's dry run prints exactly what <code>--apply</code> will record (<code>backfill_legacy_brief_shas(…, dry_run=True)</code>). The repair is safe to run again. Once applied (the metadata marker, or the ledger line from a run before the marker existed — r10: on the live store the autopilot had since closed a reopened task again), project metadata <code>repair_4qa_applied</code> is set, so the reopen, the ACTIVE status and the ledger line never run a second time; otherwise a task closed since would be reopened, and a finished project re-activated (r9). A finished move and a hashed brief are skipped. A moved file's research-index entry follows it to the new path.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4qa_project_task_integrity.py</code> (brief ownership and backfill section).</p>
+</main>
+</body>
+</html>

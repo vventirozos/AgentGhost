@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dark web search — Ghost Agent</title>
+<meta name="description" content="Ghost searches Tor hidden services through the onion search engines and treats what it finds as unverified.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a class="current" href="darkweb.html">Dark-web search</a>
+    <div class="subnav">
+      <a href="../reference/darkweb/darkweb_search.html">Dark-web search (tools.darkweb_search)</a>
+    </div>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Dark web search</h1>
+    <p class="subtitle">Ordinary search engines do not index <code>.onion</code> sites. Ghost has its own path that asks the onion search engines (Ahmia, Torch, Torgle), lists the hidden services they find, and can read them for you.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac Studio (eva)</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Two tools cover the hidden web:</p>
+  <ul>
+    <li><code>darkweb_search</code> returns a ranked list of onion services for a query, with titles and short descriptions.</li>
+    <li><code>darkweb_research</code> goes a step further: it fetches the pages behind the best results and writes up what they say.</li>
+  </ul>
+  <p>Everything found here is an unverified hidden service. Ghost is told to treat it as uncorroborated and to say so, rather than report it as fact.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“Find the onion address of a well-known news site.”</td><td><code>darkweb_search</code> lists matching services and says which engines found each one.</td></tr>
+      <tr><td>“What do onion forums say about privacy-focused phones?”</td><td><code>darkweb_research</code> reads a handful of results and summarises them, labelled as unverified.</td></tr>
+      <tr><td>“Open that onion link.”</td><td>The <a href="search.html">browser</a> opens it over Tor inside the sandbox.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Clean the query</h4><p>Google-style operators are removed, since the onion engines choke on them.</p></li>
+    <li><h4>Ask every engine</h4><p>The query goes to Ahmia (both its normal web address and its onion address), Torch and Torgle. Some engines need a hidden form token first, which Ghost fetches.</p></li>
+    <li><h4>Retry on a new route</h4><p>Whether an onion engine answers depends on which Tor exit you happen to use. Each retry forces Tor to build a fresh circuit instead of reusing the one that just failed.</p></li>
+    <li><h4>Count independent sources</h4><p>Ahmia's two addresses are two doors to the same index, so a result found by both counts as one source, not two. Only different indexes count as corroboration.</p></li>
+    <li><h4>Rank and report</h4><p>Results are merged, ranked, and returned with a clear “unverified” framing.</p></li>
+  </ol>
+
+  <h2 id="where">Where it runs</h2>
+  <p>On the Mac Studio (eva), inside the agent, through the same Tor client as web search. Nothing goes out over the normal internet. Ahmia also filters known abuse material at its index, which is one reason it is listed first.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Empty results are normal, not an error. They usually mean the engines were unreachable from the current exit. Repeating the same query word for word rarely helps; Ghost is told to try fewer keywords or fall back to ordinary search.</li>
+    <li>Onion sites appear and vanish often, and many pages are slow or dead.</li>
+    <li>Nothing returned is trustworthy by default. Treat names, prices and claims as leads, not facts.</li>
+    <li>The engine list is configuration, not code: set <code>GHOST_ONION_ENGINES</code> to a JSON list of <code>{"name", "url", "index"}</code> entries to change it.</li>
+    <li>Channel members in Slack may use <code>darkweb_search</code> (the list), but not <code>darkweb_research</code>.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/darkweb/darkweb_search.html">Dark-web search (tools.darkweb_search)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

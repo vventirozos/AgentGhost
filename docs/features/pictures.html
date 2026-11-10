@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pictures — Ghost Agent</title>
+<meta name="description" content="Ghost draws new pictures, edits your photos and describes images you show it.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a class="current" href="pictures.html">Pictures</a>
+    <div class="subnav">
+      <a href="../reference/pictures/image_gen.html">Image generation (tools.image_gen)</a>
+      <a href="../reference/pictures/image_gen_server.html">Image-gen server</a>
+      <a href="../reference/pictures/vision.html">Vision (tools.vision)</a>
+    </div>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Pictures</h1>
+    <p class="subtitle">Ghost can draw a picture from a sentence, edit a photo you give it, and put real people into a scene from their real photos. It also looks at pictures: it describes them, reads the text in them, and checks its own drawings before showing them to you.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: ghost (Jetson Orin) for drawing, nova (Mac mini) for looking</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>There are two tools, one for each direction.</p>
+  <ul>
+    <li><strong>image_generation</strong> makes pictures. It sends your request to an image model (Qwen-Image-2.1-Turbo) on its own machine. It can start from nothing, or from up to three pictures you give it. The finished image is saved in the agent's sandbox and shown in the reply, with one or two sentences saying what it drew.</li>
+    <li><strong>vision_analysis</strong> looks at pictures. It describes a photo, reads the text in a screenshot (OCR), pulls numbers out of a chart, reads the pages of a PDF, or answers one exact question about an image ("is the button green?").</li>
+  </ul>
+  <p>The interesting part is likeness. An image model cannot draw a real person from a name: ask for "Markos on a beach" with no photo and you get a stranger. So when you name a real, well-known subject, the tool itself goes and fetches a photo of that subject and uses it as the reference. The model never has to guess a face.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“Draw a red fox reading a newspaper in a café, watercolour.”</td><td>A new picture from text only. It appears in the reply with a short caption.</td></tr>
+      <tr><td>(upload <code>garden.jpg</code>) “Make it winter, with snow on the trees.”</td><td>An edit: your photo is the reference, and the scene changes while the layout stays.</td></tr>
+      <tr><td>“Now add a snowman on the left.”</td><td>Edits the picture it just made, keeping the rest of the scene.</td></tr>
+      <tr><td>(upload <code>elena.jpg</code> and <code>cover.png</code>) “Put the face from the left picture on the game cover on the right.”</td><td>Both files are joined side by side into one reference. “Edit the left, keep the right” style requests work this way, with up to three pictures.</td></tr>
+      <tr><td>“Show a famous scientist and a famous painter playing chess in a park.”</td><td>With named public figures, the tool searches for a portrait of each one, joins them into one reference and draws ONE scene. If a photo cannot be found it draws nothing and asks you for one.</td></tr>
+      <tr><td>(upload a screenshot) “What does this error say?”</td><td>vision_analysis reads the text in the picture and explains it.</td></tr>
+      <tr><td>“Describe the picture in this post” (a post link)</td><td>The agent opens the post, finds the image in it, and describes the image.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>The model writes a prompt</h4><p>The main model turns your words into a detailed description, a size, and the list of reference files or subjects.</p></li>
+    <li><h4>References are prepared</h4><p>One file is sent as it is. Two or three files are scaled to the same height and joined left to right into one strip, because the image node takes exactly one reference. For named subjects, the tool looks each one up on Wikipedia over Tor, downloads the portrait into <code>subject_photos/</code> and keeps a small record of where it came from.</p></li>
+    <li><h4>The image node draws</h4><p>The request goes to the image server on the Jetson, which runs the model through stable-diffusion.cpp and returns a PNG.</p></li>
+    <li><h4>Ghost looks at its own render</h4><p>Every finished picture is shown to the vision model before you see it. If a picture of several people came out as a two-panel collage, the tool tries once more with a new seed. What the agent says about the picture comes from what it saw, not from what it hoped to draw.</p></li>
+    <li><h4>The reply shows the image</h4><p>The picture is embedded in the reply as a download link. If the model forgets to show it, the system adds it.</p></li>
+  </ol>
+
+  <h2 id="where">Where it runs</h2>
+  <p>The agent on <strong>eva</strong> (Mac Studio) decides what to draw and keeps the files in its sandbox. Drawing happens on <strong>ghost</strong> (Jetson Orin), which runs the image server. Looking happens on <strong>nova</strong> (Mac mini), where the helper model Gemma E4B reads images. Photo lookups for subjects go out over Tor like all of the agent's web traffic.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>At most three reference pictures per call, joined into one strip. Several references can tempt the model to copy the side-by-side layout; the collage check catches most of these, not all.</li>
+    <li>Subjects must be findable on Wikipedia. Private people (Elena, your neighbour) need a photo you upload. A wrong photo means a more specific name is needed.</li>
+    <li>Because subject names are sent out in a public search, your own address and private details are removed from them.</li>
+    <li>vision_analysis reads only the first 10 pages of a PDF and refuses files over 50&nbsp;MB. For long documents use <a href="documents.html">Documents</a> instead.</li>
+    <li>If the Jetson is off, image requests fail with a clear error; nothing else in the agent is affected.</li>
+    <li>Switches: <code>--image-gen-nodes</code> points the agent at the image server; <code>GHOST_RENDER_LOOK</code> turns the look-at-every-render step on or off; <code>GHOST_VISION_TIMEOUT</code> bounds a vision call.</li>
+  </ul>
+  <p>Deep reference: <a href="../reference/pictures/image_gen.html">image_gen</a>, <a href="../reference/pictures/image_gen_server.html">image server</a>, <a href="../reference/pictures/vision.html">vision</a>.</p>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/pictures/image_gen.html">Image generation (tools.image_gen)</a></li>
+    <li><a href="../reference/pictures/image_gen_server.html">Image-gen server</a></li>
+    <li><a href="../reference/pictures/vision.html">Vision (tools.vision)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

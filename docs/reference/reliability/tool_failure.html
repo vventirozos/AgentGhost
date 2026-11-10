@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool failures (tools.tool_failure) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <div class="subnav">
+      <a href="audit_2026_05.html">Audit &amp; Hardening (2026-05)</a>
+      <a href="checking_and_learning.html">Checking and learning</a>
+      <a href="circuit_breaker.html">Circuit breaker</a>
+      <a href="claim_binding.html">Claim binding (core.claim_binding)</a>
+      <a href="claude_trainer.html">Claude Trainer</a>
+      <a href="evidence_gate.html">Evidence gate (core.evidence_gate)</a>
+      <a href="failure_dimension.html">Failure dimensions (core.failure_dimension)</a>
+      <a href="fallback_chains.html">Fallback chains (tools.fallback_chains)</a>
+      <a href="feedback.html">Feedback (thumbs) (core.feedback)</a>
+      <a href="logging.html">Logging &amp; Monitoring</a>
+      <a href="metacognition.html">Metacognition Uplift</a>
+      <a href="objection.html">Objections (core.objection)</a>
+      <a href="outcome.html">Turn outcome (tools.outcome)</a>
+      <a href="strikes.html">Strikes (core.strikes)</a>
+      <a href="system_tool.html">Health, weather and location (system tool) (tools.system)</a>
+      <a class="current" href="tool_failure.html">Tool failures (tools.tool_failure)</a>
+      <a href="verifier.html">Verifier (core.verifier)</a>
+    </div>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>tools / tool_failure.py</h1>
+  <p class="subtitle">Failure classification taxonomy. Decides what a failed tool call tells the model: try once more, stop repeating the call, or read the error and fix it.</p>
+
+  <h2>Classes</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Class</th><th>Patterns (regex)</th><th>Agent action</th></tr></thead>
+    <tbody>
+      <tr><td><strong>RETRYABLE</strong></td><td>timeout · rate-limit · connection reset · 502/503/504</td><td>Retry with exponential backoff up to <code>MAX_RETRIES = 3</code>.</td></tr>
+      <tr><td><strong>FATAL</strong></td><td>permission denied · access denied · tool not found · MANDATORY · invalid param · auth error · HTTP 401/403 (reason phrase or an <code>http</code>/<code>status</code> context — <strong>not</strong> a bare <code>403</code> substring, which used to misclassify byte counts / line numbers as fatal)</td><td>The model is told "PERMANENT ERROR — do NOT retry this tool call"; an argument error instead names the argument to correct. Nothing re-plans (this cell said "trigger replan" until 2026-11-05; the <code>replan</code> tool did nothing and was removed, &sect;4TB).</td></tr>
+      <tr><td><strong>DIAGNOSTIC</strong></td><td>AssertionError · RuntimeError · SyntaxError · Traceback · FileNotFoundError · ImportError · EXIT CODE: [1-9]</td><td>Inject the full error into context for LLM self-correction.</td></tr>
+      <tr><td><strong>UNKNOWN</strong></td><td>none of the above</td><td>Inject a short error notice.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="advisory-stripping">Classify the error, not the advice <span class="tag">2026-09-15</span></h2>
+  <p>
+    Tools append a <code>--- HINT ---</code> block to a failure for the model's benefit, and those hints <strong>enumerate failure modes by name</strong> — the browser's begins "If this is a navigation <em>timeout</em>, try <code>wait_until='domcontentloaded'</code>…". Patterns are scanned in order with first match winning, so the hint decided the class of the error it was attached to. Live: a deterministic
+  </p>
+  <pre><code>ValueError: selector '.frag_copy' did not match any element</code></pre>
+  <p>
+    was booked <code>RETRYABLE</code> on the word "timeout" three paragraphs below it, and charged to the transient strike budget (<code>Transient strike 1/4 (timeout)</code>) — a budget no retry can satisfy, because the selector will never match. Measured across the recorded trajectory corpus, <strong>31 of 53</strong> hinted tool errors (<strong>58.5%</strong>) changed class once the advice was excluded, every one of them <code>retryable</code> → <code>diagnostic</code>/<code>unknown</code>.
+  </p>
+  <p>
+    <code>strip_advisory_sections</code> now removes advisory blocks before classification — a dashed rule, a short label ending in <code>HINT</code>, a dashed rule — matched generically so <code>execute</code>'s <code>--- 💡 DIAGNOSTIC HINT ---</code> (different label, different rule length) is covered by the same implementation. It cuts to the block's closing rule rather than to end-of-text, so anything appended after a hint survives; text with no hint is returned unchanged; and a result that is <em>nothing but</em> advice classifies <code>UNKNOWN</code> rather than inventing a failure. <code>tests/test_tool_failure_hint_stripping.py</code> carries an <code>ast.parse</code> enumeration that walks every string constant in <code>src/</code> and fails if a producer ever invents a banner shape the stripper cannot see.
+  </p>
+
+  <h2>The exit code of an execute-shaped result &mdash; <code>exec_exit_code()</code> (2026-09-20, R4-1)</h2>
+<p>Five readers &mdash; <code>distill/outcome_heuristics._looks_like_tool_error</code>,
+<code>core/project_advancer._looks_like_failure</code> and
+<code>classify_verify_result</code>, <code>tools/registry._acquired_skill_result_class</code>,
+<code>tools/composed_skills._step_result_ok</code> (removed with the macro engine, &sect;4TA) &mdash; plus the turn loop's fallback-hint
+scan and <code>acquired_skills</code>' TDD gate each ran an <em>unanchored</em>
+<code>EXIT CODE:\s*(\d+)</code> over the whole body, while the turn loop's
+&ldquo;Process finished successfully.&rdquo; rule already demanded a line-anchored
+banner. Measured on the September 2026 corpus (2,331 calls replayed through every
+reader): a <code>manage_projects</code> status payload that <em>quotes</em> a past
+build &mdash; one JSON line holding <code>&hellip; --- EXECUTION RESULT --- EXIT CODE: 1
+STDOUT/STDERR: &hellip;</code> &mdash; was booked as a failed
+<code>manage_projects</code> call by the corpus readers (3 of 2,005 clean rows), a
+false failure fed to failure-distillation and the foresight index (both removed on 2026-10-11, §4NM).</p>
+<p><code>exec_exit_code(text)</code> is now the one implementation: it returns the
+integer code for the sandbox-job form <code>[sandbox job &hellip; EXIT CODE: N]</code> or
+an <code>EXIT CODE: N</code> banner at the <em>start of a line</em>, and
+<code>None</code> for anything else (a quoted banner mid-line, a sentence that
+mentions one). 711/711 genuine execute results in the same corpus are line-anchored,
+so no real exit code is lost; an execution-framing requirement was tried and dropped
+(a pasted log carries framing too, and eight existing pins say
+<code>"boom\nEXIT CODE: 127"</code> is a failure). After the change the replay reads
+326/326 recorded failures caught, 0/2,005 false failures.
+<code>tests/test_exec_exit_code_anchored_r41.py</code> pins each reader on one input
+(R5) and walks the package for any unanchored search outside the helper; the only
+sites allowed to search wide are guarded by an <code>== "execute"</code> name check,
+i.e. their input is execute's own output.</p>
+
+<h2>Retry delay</h2>
+  <pre><code>delay = min(base · 2^attempt, 30s)
+delay += 0.25 · delay · random()   # jitter</code></pre>
+
+  <h2>Per-tool hints</h2>
+  <p><code>_FALLBACK_HINTS</code> attaches a tool-specific suggestion when a known signature fires:</p>
+  <ul>
+    <li><code>execute</code> + <code>ModuleNotFoundError</code> → "pip install X first".</li>
+    <li><code>file_system</code> + "not found" → "run list_files first".</li>
+    <li><code>web_search</code> + CAPTCHA → "DuckDuckGo rate-limiting; shorter query".</li>
+  </ul>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="4ln">Same call, same result <span class="tag">2026-10-04 &sect;4LN</span></h2>
+  <p><code>_SAME_CALL_SAME_RESULT_PATTERNS</code> run before the retryable ones and class these as DIAGNOSTIC. Each said "timeout" or "connection refused", so the model was told "will retry", and the same-failure stop never ran.</p>
+  <ul>
+    <li>A selector that never appears (<code>waiting for locator</code>, <code>Page.click … Timeout</code>, "did not match any element").</li>
+    <li>The host memo's "will fail the same way" refusal.</li>
+    <li><code>ERR_CONNECTION_REFUSED</code> on the agent's own loopback.</li>
+  </ul>
+  <p>Vision hints: a URL 404 gets URL advice.</p>
+
+  <h2 id="4nw">The transient notice no longer promises a retry <span class="tag">2026-10-12 &sect;4NW</span></h2>
+  <p>A RETRYABLE failure was reported as "TRANSIENT ERROR (will retry)", but nothing retries it: the loop only counts a
+  transient strike. It now reads "a temporary failure; the same call may work if you issue it once more (nothing retries
+  it for you)".</p>
+
+  <h2 id="4ph">Program-output classes, third pass <span class="tag">2026-10-15 &sect;4PH</span></h2>
+  <p><strong>The job banner counts only at the start.</strong> <code>exec_exit_code</code> read a <code>[sandbox job … EXIT CODE: 0]</code> fragment ANYWHERE in a result before the line-anchored banner, so a failing result that merely quoted one read as 0 (the user-facing "Process finished successfully" head, the fallback-hint gate). The sandbox-job form is now LINE-anchored and the framing that comes first wins: a quoting execute result has its own <code>EXIT CODE:</code> line above the quote, while <code>jobs(action='collect')</code> puts the banner under a "Collected N finished job(s)" header and must still yield the job's code (the r3 reader found a start anchor blinded <code>_hint_code</code>, the fallback head and the new claim ledger to every collected job).</p>
+  <p><strong>The budget kill is a strike; the infra error is the transient.</strong> "timed out / killed after 600s" was RETRYABLE &mdash; counted only as a transient, never a structural strike, and formatted as "may work if you issue it once more" under a hint that said the opposite. It is diagnostic now. The two sandbox-layer results that ARE transient (<code>[SANDBOX INFRA ERROR — not your code] docker daemon wedged</code>, <code>[SANDBOX INFRA ERROR] the sandbox container stopped or restarted</code>) matched none of the words in <code>_SANDBOX_RETRYABLE_PATTERNS</code> (busy / unavailable / starting / not running) and were charged as execution strikes; the pattern now names the producers' own prefix.</p>
+</main>
+</body>
+</html>

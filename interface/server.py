@@ -1377,7 +1377,7 @@ async def _active_chat_tasks_janitor():
 # Reply-ready pushes for turns that finish while the phone is locked/away,
 # plus the agent's notify-severity ledger events. Transport lives in
 # webpush_notify.py; iOS prerequisites (installed PWA + trusted cert) are
-# documented in docs/interfaces/web_server.html.
+# documented in docs/reference/interfaces/web_server.html.
 
 def _push_ack_grace_s() -> float:
     return _env_num("GHOST_PUSH_ACK_GRACE", 12.0)

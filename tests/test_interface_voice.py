@@ -300,7 +300,7 @@ def test_docs_do_not_advertise_the_dead_voice_knob():
     reader who still has the old variable exported needs to find it.
     """
     first_cell = re.compile(r"<tr>\s*<td>\s*<code>(.*?)</code>")
-    for page in ("capabilities.html", "installation.html", "index.html"):
+    for page in ("start/installation.html", "start/configuration.html", "index.html"):
         text = (_ROOT / "docs" / page).read_text()
         for name in first_cell.findall(text):
             assert "PI_VOICE_URL" not in name, (

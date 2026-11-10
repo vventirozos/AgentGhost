@@ -1,59 +1,55 @@
 /* =========================================================================
-   Ghost Agent — documentation theme  ·  "night shift"
+   Ghost Agent — documentation theme  ·  the console's own look
    -------------------------------------------------------------------------
-   The agent runs on your own hardware, mostly while you're not watching.
-   The theme is that room: a cool dark desk, one warm lamp.
+   Taken from the web console (interface/static/style.css): a black room,
+   one violet accent (#7b62c4) with a blue second (#3a5fae), dark violet
+   glass panels with hairline borders, Inter for prose and JetBrains Mono
+   for system chrome. Dark only.
 
-   Design rules this file follows:
-     · One accent (ember). Everything else is neutral. Green/red are
-       reserved for on/off and safe/unsafe — never for decoration.
-     · Prose is never coloured. Links are body-coloured with an ember
-       underline, so a paragraph reads as a paragraph.
-     · Monospace is the "system chrome" face: step numbers, eyebrows,
-       table headings, captions. Sans is for prose. Nothing else.
-     · Zero external requests. No web fonts, no CDN. The docs fail closed
-       the same way the agent does.
-     · Body text is 17px / 1.7 at a ~68ch measure. Readability is the brief.
-
-   The signature is the CIRCUIT NODE: a small ring with a dark centre.
-   It's the logo mark, and it's every numbered step on every flow diagram.
+   Rules this file follows:
+     · One accent (violet). Green and red mean success and failure only.
+     · Prose is never coloured; links are body-coloured with a violet underline.
+     · Zero external requests: the fonts are named, never downloaded — a
+       machine without Inter / JetBrains Mono falls back to the system faces.
+     · Body text 17px / 1.7 at a ~70ch measure.
    ========================================================================= */
 
 :root {
-  /* ---- Surfaces: cool dark slate, never pure black (pure black + white
-         text haloes badly over long reading sessions). ---- */
-  --bg:         #16181f;
-  --bg-2:       #1c1f28;   /* cards, callouts, sidebar */
-  --bg-3:       #232733;   /* hover, inline code, raised chips */
-  --bg-code:    #11131a;   /* code blocks sit BELOW the page, not above */
-  --line:       #2b3040;
-  --line-soft:  #232732;
+  color-scheme: dark;
+  /* ---- Surfaces: the console's black room and violet glass ---- */
+  --bg:         #000000;
+  --bg-2:       rgba(14, 9, 24, 0.86);   /* panels: cards, callouts, sidebar */
+  --bg-3:       rgba(123, 98, 196, 0.12); /* hover, inline code, chips */
+  --bg-code:    #07050c;
+  --line:       rgba(123, 98, 196, 0.28);
+  --line-soft:  rgba(123, 98, 196, 0.14);
 
-  /* ---- Text: four steps, all of them legible. ---- */
-  --text:       #f2f4f9;   /* headings                    15.5:1 */
-  --body:       #c9cfdd;   /* body copy                   11.0:1 */
-  --muted:      #99a1b3;   /* captions, meta, sublabels    6.2:1 */
-  --faint:      #6d7488;   /* markers + rules only — not for text */
+  /* ---- Text ---- */
+  --text:       #f1f3f5;   /* headings */
+  --body:       #cfd2dc;   /* body copy */
+  --muted:      #9a97ab;   /* captions, meta */
+  --faint:      #5f5a73;   /* markers and rules only */
 
-  /* ---- Accent: one lamp. ---- */
-  --ember:      #ffa657;
-  --ember-lo:   rgba(255, 166, 87, 0.14);
-  --ember-mid:  rgba(255, 166, 87, 0.40);
+  /* ---- Accent: the console's violet, with its blue second ---- */
+  --ember:      #9d86e6;   /* violet, lifted for text on black (the console's #7b62c4 is the fill) */
+  --violet:     #7b62c4;
+  --blue:       #3a5fae;
+  --ember-lo:   rgba(123, 98, 196, 0.16);
+  --ember-mid:  rgba(123, 98, 196, 0.45);
 
-  /* ---- Semantics: on/off, safe/unsafe. Nothing else. ---- */
-  --mint:       #67d9a8;
-  --gold:       #f0c674;
-  --rose:       #ff8b8b;
+  /* ---- Semantics: success and failure (the console's colours, lifted for text) ---- */
+  --mint:       #4fbf86;
+  --gold:       #d9b45f;
+  --rose:       #e0566f;
 
-  /* ---- Type ---- */
-  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text",
-          "Segoe UI", system-ui, Roboto, Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "Cascadia Mono",
-          "Segoe UI Mono", "Roboto Mono", Consolas, monospace;
+  /* ---- Type: the console's faces ---- */
+  --sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 
   /* ---- Metrics ---- */
-  --measure: 68ch;
-  --rail:    2.15rem;      /* diameter of a circuit node */
+  --measure: 70ch;
+  --rail:    2.15rem;
   --ease:    cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
@@ -82,17 +78,17 @@ body {
   min-height: 100vh;
 }
 
-::selection { background: rgba(255, 166, 87, 0.26); color: #fff; }
+::selection { background: rgba(123, 98, 196, 0.26); color: #fff; }
 
 ::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: #2f3547;
+  background: rgba(123, 98, 196, 0.35);
   border-radius: 99px;
   border: 3px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background: #3d445a; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(123, 98, 196, 0.55); background-clip: padding-box; }
 
 
 /* =========================================================================
@@ -469,7 +465,7 @@ tbody tr.group:hover td { background: none; }
   top: calc(var(--rail) - 0.1rem);
   bottom: 0;
   width: 1px;
-  background: linear-gradient(to bottom, var(--ember-mid), rgba(255, 166, 87, 0.10));
+  background: linear-gradient(to bottom, var(--ember-mid), rgba(123, 98, 196, 0.10));
 }
 .flow > li:last-child { padding-bottom: 0; }
 .flow > li:last-child::after { display: none; }
@@ -577,9 +573,9 @@ tbody tr.group:hover td { background: none; }
 .diagram svg rect[stroke="#2a3245"] { stroke: var(--line); }
 .diagram svg rect[stroke="#7aa7ff"],
 .diagram svg rect[stroke="#b894ff"] { stroke: var(--ember-mid); }
-.diagram svg rect[stroke="#5dd39e"] { stroke: rgba(103, 217, 168, 0.5); }
-.diagram svg rect[stroke="#ffb454"] { stroke: rgba(240, 198, 116, 0.5); }
-.diagram svg rect[stroke="#ff6e6e"] { stroke: rgba(255, 139, 139, 0.5); }
+.diagram svg rect[stroke="#5dd39e"] { stroke: rgba(79, 191, 134, 0.5); }
+.diagram svg rect[stroke="#ffb454"] { stroke: rgba(217, 180, 95, 0.5); }
+.diagram svg rect[stroke="#ff6e6e"] { stroke: rgba(224, 86, 111, 0.5); }
 .diagram svg line { stroke-linecap: round; }
 .diagram svg marker path { fill: var(--faint); }
 
@@ -599,9 +595,9 @@ tbody tr.group:hover td { background: none; }
 }
 .diagram svg .card.blue   { stroke: var(--ember-mid); }
 .diagram svg .card.purple { stroke: var(--line); }
-.diagram svg .card.green  { stroke: rgba(103, 217, 168, 0.45); }
-.diagram svg .card.amber  { stroke: rgba(240, 198, 116, 0.45); }
-.diagram svg .card.red    { stroke: rgba(255, 139, 139, 0.45); }
+.diagram svg .card.green  { stroke: rgba(79, 191, 134, 0.45); }
+.diagram svg .card.amber  { stroke: rgba(217, 180, 95, 0.45); }
+.diagram svg .card.red    { stroke: rgba(224, 86, 111, 0.45); }
 /* Colour only — these legacy classes already carry their own font metrics. */
 .diagram svg .section-title { fill: var(--faint); }
 .diagram svg .label         { fill: var(--text); }
@@ -724,9 +720,9 @@ main h2 .card-count {
   vertical-align: middle;
   white-space: nowrap;
 }
-.badge.good { color: var(--mint); border-color: rgba(103, 217, 168, 0.32); background: rgba(103, 217, 168, 0.08); }
-.badge.warn { color: var(--gold); border-color: rgba(240, 198, 116, 0.32); background: rgba(240, 198, 116, 0.08); }
-.badge.bad  { color: var(--rose); border-color: rgba(255, 139, 139, 0.32); background: rgba(255, 139, 139, 0.08); }
+.badge.good { color: var(--mint); border-color: rgba(79, 191, 134, 0.32); background: rgba(79, 191, 134, 0.08); }
+.badge.warn { color: var(--gold); border-color: rgba(217, 180, 95, 0.32); background: rgba(217, 180, 95, 0.08); }
+.badge.bad  { color: var(--rose); border-color: rgba(224, 86, 111, 0.32); background: rgba(224, 86, 111, 0.08); }
 
 .note {
   border: 1px solid var(--line);
@@ -966,4 +962,94 @@ main .pager a:hover { border-color: var(--ember-mid); background: var(--bg-3); c
   main a { color: inherit; text-decoration: none; }
   .card, .note, .diagram, pre, .flow > li { break-inside: avoid; }
   pre, code { background: #f4f4f6 !important; color: #111 !important; border-color: #ddd !important; }
+}
+
+
+/* =========================================================================
+   Restructure 2026-11-10: brand, feature sub-navigation, feature cards,
+   reference lists, the console's glass
+   ========================================================================= */
+
+body {
+  background:
+    radial-gradient(1200px 700px at 85% -10%, rgba(123, 98, 196, 0.13), transparent 60%),
+    radial-gradient(900px 600px at -10% 110%, rgba(58, 95, 174, 0.10), transparent 60%),
+    #000;
+  background-attachment: fixed;
+}
+
+aside.sidebar {
+  background: rgba(11, 7, 19, 0.86);
+  border-right: 1px solid var(--line-soft);
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+}
+
+aside.sidebar .brand {
+  display: flex; align-items: center; gap: 0.6rem;
+  margin: 0.15rem 0.65rem 1.5rem;
+  font-size: 0.98rem; font-weight: 600; letter-spacing: -0.01em;
+  color: var(--text); text-decoration: none;
+}
+aside.sidebar .brand .mark {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid var(--violet);
+  background: #000;
+  box-shadow: 0 0 10px rgba(123, 98, 196, 0.8);
+}
+aside.sidebar nav .subnav {
+  margin: 0.1rem 0 0.5rem 0.9rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid var(--line);
+}
+aside.sidebar nav .subnav a { font-size: 0.8rem; padding-top: 0.18rem; padding-bottom: 0.18rem; }
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 0.9rem;
+  margin: 1.4rem 0 2.2rem;
+  max-width: none;
+}
+main a.feature {
+  display: block;
+  padding: 1rem 1.1rem 1.05rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 14px;
+  background: rgba(14, 9, 24, 0.6);
+  text-decoration: none;
+  color: var(--body);
+  transition: border-color 0.2s var(--ease), background 0.2s var(--ease), transform 0.2s var(--ease);
+}
+main a.feature:hover {
+  border-color: var(--ember-mid);
+  background: rgba(123, 98, 196, 0.10);
+  transform: translateY(-1px);
+}
+main a.feature .ft { display: block; color: var(--text); font-weight: 600; margin-bottom: 0.3rem; }
+main a.feature .fd { display: block; font-size: 0.9rem; line-height: 1.5; color: var(--muted); }
+main a.feature .fm { display: block; margin-top: 0.55rem; font-family: var(--mono); font-size: 0.7rem;
+                     letter-spacing: 0.04em; text-transform: uppercase; color: var(--ember); }
+
+.machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 0.9rem;
+            margin: 1.2rem 0 2rem; max-width: none; }
+.machine { border: 1px solid var(--line-soft); border-radius: 14px; padding: 0.95rem 1.1rem;
+           background: rgba(14, 9, 24, 0.6); }
+.machine h4 { margin: 0 0 0.1rem; color: var(--text); }
+.machine .spec { font-family: var(--mono); font-size: 0.72rem; color: var(--ember); letter-spacing: 0.03em; }
+.machine ul { margin: 0.55rem 0 0; padding-left: 1.1rem; font-size: 0.9rem; }
+
+ul.ref-list { columns: 2 260px; column-gap: 2rem; padding-left: 1.1rem; }
+ul.ref-list li { break-inside: avoid; }
+
+details.history {
+  border: 1px solid var(--line-soft); border-radius: 12px;
+  padding: 0.6rem 1rem; margin: 1.4rem 0; background: rgba(14, 9, 24, 0.5);
+  max-width: var(--measure);
+}
+details.history > summary { cursor: pointer; color: var(--muted); font-family: var(--mono); font-size: 0.8rem; }
+
+@media (max-width: 860px) {
+  body { display: block; }
+  aside.sidebar { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line-soft); }
 }

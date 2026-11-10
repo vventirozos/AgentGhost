@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI Reference — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <div class="subnav">
+      <a href="api_routes.html">HTTP API routes (api.routes)</a>
+      <a href="cli.html">Ghost CLI</a>
+      <a class="current" href="cli_reference.html">CLI Reference</a>
+      <a href="clockwork_ghost.html">Clockwork Ghost</a>
+      <a href="sessions.html">Sessions &amp; turn cancellation</a>
+      <a href="slack_bot.html">Slack bot</a>
+      <a href="web_server.html">Web server</a>
+    </div>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>CLI Reference</h1>
+  <p class="subtitle">Every flag accepted by <code>python -m src.ghost_agent.main</code>, sourced from <code>main.py</code> (66 flags checked 2026-10-10; the flags of the subsystems removed on 2026-10-11, §4NM — reflection, post-mortems, the router, the PRM, frontier self-play, the planner, bench banks — are gone from this page and from <code>main.py</code>).</p>
+
+  <h2>Networking &amp; identity</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--host</code></td><td>str</td><td><code>0.0.0.0</code></td><td>uvicorn bind address.</td></tr>
+      <tr><td><code>--port</code></td><td>int</td><td><code>8000</code></td><td>uvicorn listen port.</td></tr>
+      <tr><td><code>--upstream-url</code></td><td>str</td><td><code>http://127.0.0.1:8088</code></td><td>OpenAI-compatible LLM backend (llama.cpp / Ollama / vLLM).</td></tr>
+      <tr><td><code>--model</code></td><td>str</td><td><code>$GHOST_MODEL</code> or <code>qwen3.8-27b</code></td><td>Model identifier returned on Ollama compatibility routes (<code>/api/show</code>, <code>/api/tags</code>).</td></tr>
+      <tr><td><code>--api-key</code></td><td>str</td><td><code>$GHOST_API_KEY</code> (no fallback)</td><td>Value the agent expects in the <code>X-Ghost-Key</code> header. No hardcoded default: unset + loopback bind &rarr; auth disabled; unset + non-loopback bind &rarr; refuses to boot; explicit <code>''</code> &rarr; auth disabled with a warning. <strong>Prod since 2026-07-13:</strong> auth ENABLED — the launcher exports <code>GHOST_API_KEY</code> from the mode-600 secret file <code>~/Data/AI/.ghost_api_key</code> (env, not argv, so the secret stays out of <code>ps</code>); the same file feeds the web interface, Slack bot, <code>ghost</code> CLI, and uConsole client.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Logging &amp; verbosity</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>-d / --daemon</code></td><td>flag</td><td>Suppress stdout logging (file-only).</td></tr>
+      <tr><td><code>--debug</code></td><td>flag</td><td>Set log level to DEBUG.</td></tr>
+      <tr><td><code>-v / --verbose</code></td><td>flag</td><td>Disable per-line truncation; raises <code>LOG_TRUNCATE_LIMIT</code> from 60 chars to 1M.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Memory behaviour</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-memory</code></td><td>off</td><td>Skip vector / graph / profile / episodic / adaptive-threshold initialisation. (The contradiction log it also skipped was removed on 2026-10-11, §4NN.) Useful for regression tests.</td></tr>
+      <tr><td><code>--smart-memory</code></td><td><code>0.0</code></td><td>Initial value for the <code>AdaptiveThreshold</code> recall gate. The store self-tunes from observations once recording begins (window=100, MIN_OBSERVATIONS=20).</td></tr>
+      <tr><td><code>--max-context</code></td><td><code>65536</code></td><td>Maximum tokens before <code>ContextManager</code> escalates compression (L0..L4).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Tool surface</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--native-tools</code> / <code>--no-native-tools</code></td><td>on</td><td>Whether to advertise OpenAI-style <code>tools</code> array on outbound LLM calls. When on, the equivalent XML <code>&lt;tool_def&gt;</code> schema is suppressed from the prompt to avoid double-shipping the same definitions (~7,800 token saving per turn). The XML format scaffolding stays so the parser still accepts the legacy <code>&lt;tool_call&gt;</code> shape as fallback. Off forces XML-only tool dispatch (no native channel; full schema in prompt). See <a href="../infrastructure/agent.html#context-compaction">Context compaction</a> in <code>core.agent</code>.</td></tr>
+      <tr><td><code>--anonymous</code></td><td>on</td><td>Route web search through Tor / DuckDuckGo (with identity rotation on 401/403/503).</td></tr>
+      <tr><td><code>--mandatory-tor</code> / <code>--no-mandatory-tor</code></td><td><strong>on</strong></td><td>Fail-closed Tor, ON BY DEFAULT: probe Tor liveness at boot (abort if unreachable) and install a process-wide guard blocking any DIRECT connection to a public address. Anonymised traffic (loopback SOCKS) and loopback/LAN infra are unaffected — only Tor-bypassing public egress is blocked. Also forces HF offline, so on a cold install boot once with <code>--no-mandatory-tor</code> to cache the embedding model. Opt out with <code>--no-mandatory-tor</code> or <code>GHOST_MANDATORY_TOR=0</code>. See <a href="../infrastructure/mandatory_tor.html">Mandatory Tor</a>.</td></tr>
+      <tr><td><code>--no-redact-logs</code></td><td>off (redaction ON)</td><td>Redaction of the monitored log stream is ON by default — secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.</td></tr>
+      <tr><td><code>--labs-host</code></td><td>off (env <code>GHOST_LABS_HOST</code>)</td><td><code>host:port</code> of the ghost-labs service. Unset = the <code>lab</code> tool is hidden. See <a href="../labs/labs_tool.html">tools / labs</a>.</td></tr>
+      <tr><td><code>--sentiment-url</code><br><code>--sentiment-key-file</code></td><td>off (env <code>GHOST_SENTIMENT_URL</code>) · <code>~/Data/AI/.sentiment_service_key</code> (env <code>GHOST_SENTIMENT_KEY_FILE</code>)</td><td><code>http://host:port</code> of the sentiment service and the file holding its key. When set, each owner message is scored in the background and journalled, and a confident score nudges the mood a little (&sect;4TW). A flag wins over its environment variable. See <a href="../selfhood/selfhood.html#sentiment">selfhood: sentiment</a>.</td></tr>
+      <tr><td><code>--labs-key-file</code></td><td><code>~/Data/AI/.ghost_labs_key</code> (env <code>GHOST_LABS_KEY_FILE</code>)</td><td>File holding the labs API key (0600). Never pass the key itself: args are recorded in <code>last_config.json</code>.</td></tr>
+      <tr><td><code>--notify-webhook</code></td><td>off (env <code>GHOST_NOTIFY_WEBHOOK</code>)</td><td>Outbound push webhook — one JSON POST (<code>{title, body, severity, phase, ts}</code>) per notify-severity autonomous event (needs-user project tasks, scheduled-turn conclusions). Loopback/LAN/Tailscale targets connect directly; PUBLIC targets only ever via the Tor SOCKS proxy (fail-closed: skipped when Tor is unavailable). See <a href="../projects/autonomous_activity.html">core.autonomous_activity</a>.</td></tr>
+      <tr><td><code>--notify-ntfy</code></td><td>off (env <code>GHOST_NOTIFY_NTFY</code>)</td><td>ntfy topic URL for outbound push (plain-text POST with Title/Priority headers), e.g. <code>http://ghost.lan:8090/ghost-agent</code>. Same egress rules as <code>--notify-webhook</code>; both transports may be configured together.</td></tr>
+      <tr><td><code>--enable-preflight-guard</code> / <code>--no-enable-preflight-guard</code></td><td><b>on</b></td><td>Pre-flight repeat-failure guard (feature 1A): before dispatching a tool call, block it if the same <code>(tool, primary&nbsp;target)</code> already failed the same way ≥2× in the recent window, handing the model the prior error instead of re-running a known failure. Idempotent setters exempt. (It began as the live counterpart of the post-mortem engine&rsquo;s repeated-error fingerprint; that engine was removed on 2026-10-11, §4NM.) See <a href="../reliability/metacognition.html">algorithms / metacognition</a>.</td></tr>
+      <tr><td><code>--deep-reason</code></td><td>off</td><td><strong>Removed (§4NN, then dropped from the parser in §4NO): passing it is now an argparse error and the agent will not boot.</strong> The launcher no longer passes it (checked §4PV, 2026-10-17). It used to initialise <code>HypothesisTester</code> (parallel hypothesis testing after a failure); <code>core/hypothesis.py</code> was deleted on 2026-10-11. The MCTS lookahead it also used to initialise was removed in §4NM.</td></tr>
+      <tr><td><code>--perfect-it</code></td><td>off</td><td>Append a proactive optimisation pass after a session completes.</td></tr>
+      <tr><td><code>--principle-gate</code></td><td>off</td><td><strong>Removed (&sect;4TB, 2026-11-05): accepted and ignored.</strong> It ran an LLM check of each final response against the agent's own operating principles (<code>selfhood/values</code>). The principles had one writer, the <code>self_state</code> tool, which was removed; the gate went with them. The resolved configuration shows the flag as ignored.</td></tr>
+      <tr><td><code>--autoadvance-idle</code></td><td>off</td><td>Idle-scheduler job (phase 2.95): when idle, autonomously advance ONE ACTIVE project by a single <code>advance_once</code> tick (previously the autoadvancer was only reachable via the <code>manage_projects</code> tool / HTTP, so background project progress never happened). Runs on the existing hard per-project budgets + human gates; coding tasks generate+run real code instead of the old no-op stub. One project / one tick per 30-min cooldown. See <a href="../projects/project_advancer.html">project_advancer</a>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Trajectory logging and idle phases</h2>
+  <p>Local-only trajectory logging and the idle-time phases that read it. Trajectory logging is ON by default (opt-out shape) when <code>--no-memory</code> is not set; it feeds <code>introspect</code> and the failure census. Until 2026-11-05 it also fed the failure replay and the regression suite, which were removed that day (§4SZ, see <a href="../memory/owner_rules.html#removed">Owner rules</a>). The producer passes that used to sit here — reflection, post-mortems, the complexity router, the PRM, frontier self-play — were removed on 2026-10-11 (§4NM) together with their flags.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-trajectories</code></td><td>flag</td><td>off</td><td>Disable the JSONL trajectory log at <code>$GHOST_HOME/system/trajectories/</code>. <code>introspect</code> and the failure census then have no turns to read.</td></tr>
+      <tr><td><code>--no-dream</code></td><td>flag</td><td>off</td><td>Disable the idle maintenance phase (idle-scheduler phase 2, 10–60 min idle): store maintenance every ~6&nbsp;h (project digests, manifest backfill, forget-archive purges, graph prune/merge, trajectory archive) and the daily verified snapshot. The REM consolidation that this phase used to run was removed on 2026-10-11 (§4NM). See <a href="../memory/dream.html">core / dream</a>.</td></tr>
+      <tr><td><code>--no-self-play</code></td><td>&mdash;</td><td>&mdash;</td><td><strong>Removed.</strong> Not a flag any more: <code>main.py</code> does not define it. It disabled idle phase 3 (&gt;60 min idle), which was synthetic self-play, the counterfactual-replay slot and the evolve mutator until 2026-10-11 (§4NM) and then the failure-replay slot (<code>core/failure_replay.py</code>, with the regression suite, <code>core/regression.py</code>). That slot and both modules were removed on 2026-11-05 (§4SZ). The idle window restarts every hour on its own (&sect;4LF / §4SZ).</td></tr>
+      <tr><td><code>--calib-refit-cooldown</code></td><td>int (seconds)</td><td><code>3600</code></td><td><strong>Deprecated no-op.</strong> Was the cooldown for the idle-time confidence-calibration refit; the refit, the calibration corpus and the composite confidence score were removed in &sect;4PJ (2026-10-16). Still accepted so an older launcher boots, but ignored; the production launcher no longer passes it.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Other flags</h2>
+  <p>Flags not covered above. Defaults and meaning from their <code>help=</code> text in <code>main.py</code>.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-verifier</code></td><td>flag</td><td>off</td><td>Disable the post-response self-verification (critic) entirely. An ablation switch; not for production.</td></tr>
+      <tr><td><code>--bio-deterministic</code></td><td>flag</td><td>off</td><td>Ablation only: make the probabilistic idle phases fire every eligible tick instead of sampling. Pairs with <code>--bio-time-scale</code>.</td></tr>
+      <tr><td><code>--no-self-model</code></td><td>flag</td><td>off</td><td>Disable the selfhood module (autobiographical memory, self-state, narrative). Also off under <code>--no-memory</code>.</td></tr>
+      <tr><td><code>--self-narrative-cooldown</code></td><td>int (seconds)</td><td><code>3600</code></td><td>Seconds between idle narrative consolidations (phase 2.8). The live launcher passes <code>86400</code>.</td></tr>
+      <tr><td><code>--no-workspace-model</code></td><td>flag</td><td>off</td><td>Disable the workspace continuity module (file watcher, scheduled-task ledger, research dedup, command outcomes). Also off under <code>--no-memory</code>.</td></tr>
+      <tr><td><code>--workspace-narrative-cooldown</code></td><td>int (seconds)</td><td><code>3600</code></td><td>Seconds between idle workspace narrative consolidations (phase 2.9). The live launcher passes <code>21600</code>.</td></tr>
+      <tr><td><code>--enable-metacog</code></td><td>flag</td><td>off</td><td>Log each shell/SQL validator block as a <code>metacog valid</code> line and count it in the shutdown <code>metacog summary</code>. The validators run whether or not it is set. The live launcher passes it. (The host telemetry poller and the trigger bus + replan bridge it used to turn on were removed in &sect;4PT, 2026-10-17; the competence profile, entropy tracker, composite confidence and the dual-solver arbiter in &sect;4PJ, 2026-10-16.)</td></tr>
+      <tr><td><code>--metacog-cpu-high</code></td><td>float (%)</td><td>&mdash;</td><td><strong>Removed &sect;4PT &mdash; accepted and ignored.</strong> Was a host-telemetry setting. The launcher stopped passing it in &sect;4PV.</td></tr>
+      <tr><td><code>--metacog-mem-high</code></td><td>float (%)</td><td>&mdash;</td><td><strong>Removed &sect;4PT &mdash; accepted and ignored.</strong> Was a host-telemetry setting. The launcher stopped passing it in &sect;4PV.</td></tr>
+      <tr><td><code>--metacog-mem-floor-mb</code></td><td>float (MB)</td><td>&mdash;</td><td><strong>Removed &sect;4PT &mdash; accepted and ignored.</strong> Was a host-telemetry setting. The launcher stopped passing it in &sect;4PV.</td></tr>
+      <tr><td><code>--metacog-mem-warn-free-mb</code></td><td>float (MB)</td><td>&mdash;</td><td><strong>Removed &sect;4PT &mdash; accepted and ignored.</strong> Was a host-telemetry setting.</td></tr>
+      <tr><td><code>--metacog-disk-high</code></td><td>float (%)</td><td>&mdash;</td><td><strong>Removed &sect;4PT &mdash; accepted and ignored.</strong> Was a host-telemetry setting.</td></tr>
+      <tr><td><code>--metacog-host-heartbeat-s</code></td><td>float (seconds)</td><td>&mdash;</td><td><strong>Removed &sect;4PT &mdash; accepted and ignored.</strong> Was a host-telemetry setting.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Helper scripts</h2>
+  <p>Python entry points under <code>scripts/</code>. The optimizer, bench and arm-report scripts (<code>run_gepa</code>, <code>optimize_*</code>, <code>verify_bench*</code>, <code>leaf_bench</code>, <code>if_bench</code>, <code>experiment_report</code>, the router and foresight backtests) were deleted on 2026-10-11 (§4NM) with the subsystems they measured.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Script</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>scripts/eval_baseline.py freeze|compare</code></td><td>Run the offline eval suite (<code>--suite {default,post_learning}</code>) via a stub runner or HTTP against a running agent. Freeze the result as a baseline or diff a subsequent run. Flags: <code>--runner {stub,http}</code>, <code>--base-url</code>, <code>--api-key</code>, <code>--model</code>, <code>--timeout N</code> (default 300s — template tasks on a local Qwen-scale model commonly run 80–250s).</td></tr>
+      <tr><td><code>scripts/ghost_kill_sessions.py</code></td><td>Color curses TUI over the agent's in-flight turns: lists every turn from <code>GET /api/turns</code> (full request id, RUNNING/QUEUED state, age, session, message preview — the log's 8-char tags are prefixes of these ids) with auto-refresh, and cancels the selected one via <code>POST /api/turn/cancel</code> — <code>c</code> cooperative (stops at the next boundary, keeps partial work), <code>K</code> hard-kill with confirm (cancels the asyncio task; the guaranteed release for a turn wedged in a long upstream call). Each turn's session id is joined against <code>GET /api/sessions</code> to show the session title and message count in the table (enrichment only — a sessions-disabled agent just shows raw ids), and a pane under the table shows the selected turn in full: untruncated request id, start time, session title · message count · last activity, whole preview. Colors: RUNNING green / QUEUED yellow / CANCELLING red; the AGE column escalates yellow at 2m and red at 10m (turns are globally serialized — an old running turn is blocking every client). Mono terminals degrade to bold/dim; <code>$NO_COLOR</code> disables color. <code>--list</code> prints once without the TUI (same columns; ANSI color only on a TTY). Auth: non-empty <code>$GHOST_API_KEY</code>, else <code>--key-file</code> (default <code>~/Data/AI/.ghost_api_key</code>). Stdlib only. Tests: <code>tests/test_ghost_kill_sessions.py</code>.</td></tr>
+      <tr><td><code>scripts/build_sandbox_image.sh</code></td><td>Build <code>ghost-agent-base:latest</code> from <code>sandbox/Dockerfile</code> — bakes apt deps, Python stack, and Playwright Chromium (with <code>--with-deps</code>) into the image. Runs a Chromium smoke test at the end. One-shot per Ghost version; the runtime sandbox wrapper picks up the freshly-built image on next <code>ensure_running</code>.</td></tr>
+      <tr><td><code>scripts/ghostlog.py</code></td><td><b>The operator's lens on the agent log.</b> <code>$GHOST_HOME/system/ghost-agent.log</code> is deliberately a COMPLETE archive — every mirror line including DEBUG, so a turn survives a restart and instruments can count events. Right for an archive, wrong for monitoring: measured on a 4000-line window, <b>1652 lines (41%) were one repeated string</b> (<code>critic compute — Routing verification…</code>) while only <b>6 carried a verdict</b> — 275 announcements per outcome. This reads INFO+ with consecutive repeats collapsed to <code>×N</code>, so failures and outcomes stand out. <code>--req &lt;id&gt;</code> reconstructs <em>one request in full</em>, DEBUG included — the "how was this actually processed" view (mode switch, hydration, reasoning turns, monologue, prefill, tool calls, timings) without needing a TUI. Also <code>-f</code> follow, <code>--since N</code> minutes, <code>--all</code> (raw archive), <code>--width</code> (long hydration lines are truncated in the MIDDLE, so both the event and its outcome survive).</td></tr>
+      <tr><td><code>scripts/preflight_longrun.py</code></td><td><b>Gate for any run long enough to waste real time or compute.</b> Five preconditions, each traceable to a run that was actually wasted on this project: <b>OBSERVABLE</b> (progress readable while running), <b>BOUNDED</b> (item count PRINTED BY THE TOOL, never derived — a hand-computed denominator of 35 where the tool said 58 made every progress report wrong), <b>RESUMABLE</b> (a kill costs nothing), <b>DISCRIMINATING</b> (a smoke proved the config produces distinguishable output — the ~8h ablation whose two arms resolved to byte-identical flags passed every other check and still measured nothing), <b>MEASURED</b> (ETA from a timed slice, expressed as a RANGE). Any failure blocks. <code>--force</code> records an override <em>with a stated reason</em>, because an unexplained override is the same as no gate. Exit 1 = blocked.</td></tr>
+      <tr><td><code>scripts/runstatus.py PROGRESS.json</code></td><td>Reads a long run's own progress file — and does nothing else. No cache counting, no log parsing, no inferring position from side effects; every one of those was tried on a 90-minute bench and every one gave a wrong number. Reports four states, three of which are not a percentage: <code>running</code> (with a rate measured over a trailing window), <code>finished</code>, <code>STALLED</code> (the file stopped moving — do NOT read <code>done</code> as current), and <code>missing</code> (position <b>UNKNOWN, not zero</b>). Exit codes 0/2/3 let a script branch without parsing prose. Writers use <code>eval.runprogress.RunProgress</code>, which writes atomically and reports <code>None</code> for rate and percentage until there is evidence for them.</td></tr>
+      <tr><td><code>scripts/frames_fetch.py</code></td><td><b>The external scoreboard</b> — everything else here measures this agent against itself. Fetches Google's <b>FRAMES</b> (824 multi-hop Wikipedia questions) from the HF datasets-server <em>anonymously</em> and writes GAIA-shaped JSONL, so <code>gaia_eval.py --tasks-file</code> runs it unchanged. <b>Why not GAIA:</b> it is a <em>gated</em> dataset (measured: HTTP 401 vs FRAMES' 200) and the standing constraint is no keyed APIs and no accounts, ever — and the gate is a <em>licence agreement</em>, so an ungated mirror would breach terms rather than dodge a login. <b>Why not AssistantBench</b> (also open, closer to GAIA in spirit): its tasks need live browsing of arbitrary commercial sites, so under Tor-only egress the score measures Tor reachability, and its ground truth ages as real schedules change. FRAMES ships <b>gold document links</b>, which buys <code>--oracle</code> mode: naming the source articles removes the retrieval confound and measures the multi-hop reasoning actually under test (Wikipedia over Tor verified reachable, HTTP 200 in 3.2s, before this was relied on). <code>--limit</code> samples from the <em>full</em> set with a fixed seed — never a head slice, since the split is ordered. Writes a <code>.provenance.json</code> with a task digest so a run is reproducible. There is no code path that can send a credential, and that is enforced by a test.</td></tr>
+      <tr><td><code>scripts/frames_scorer.py</code></td><td>Grades FRAMES. <b>The vendored GAIA scorer was the first choice and the readiness smoke caught it reporting accuracy 0.0 on two answers that were both correct</b> (<code>"5:31"</code> vs <code>"5 minutes and 31 seconds"</code>; <code>"A, B"</code> vs <code>"A and B"</code>) — not a bug in it, but it assumes GAIA's <em>mandated answer format</em> on both sides, and FRAMES ground truth is natural language. FRAMES' own paper grades with an LLM judge, so exact match was never the protocol. Two tiers: a deterministic <code>strict_match</code> pre-pass, then a judge on the residual only. Exactly <b>one</b> normalisation beyond GAIA's is kept — treating " and " as the list separator — because rules invented by staring at your own agent's failures produce a scorer tuned to raise your own score. The judge is the <em>critic node</em> (Gemma 4 E4B), a different model family from the answerer (Qwen3.8-27B; Qwen3.6-35B when this was built), so this is not self-grading; it is told to answer NO when uncertain, and unparseable or errored replies count as NO, so the number errs <em>downward</em>. <b>Both no-think switches are load-bearing:</b> without them the node returns empty content with <code>finish_reason='length'</code> and every answer grades NO — which does not fail loudly, it silently reads as the agent regressing. Validated 16/16 against hand labels (0 FP / 0 FN) <em>with</em> the switches, versus 0.69 agreement without. <code>rescore_details()</code> re-grades a finished run without re-running the agent, because the answers are the expensive artifact and the grading has already been wrong once.</td></tr>
+      <tr><td><code>scripts/verify_core_math.py</code></td><td>Mechanized proof harness for the computational core: <code>--bio-time-scale</code> arithmetic, egress host classification, F8 episodic eviction ordering, the ablation delta metric, the anytime-valid confidence sequence, and a reconciliation pass against the live store. Every check is tagged with its rigour level — <b>EXHAUSTIVE</b> (the finite input space is enumerated, e.g. all 2390 <code>(constant, scale)</code> pairs), <b>DIFFERENTIAL</b> (a second independently-written implementation must agree, e.g. <code>is_allowed_host</code> over 8033 hosts), or <b>PROPERTY</b> (an algebraic invariant over randomized inputs). Exits non-zero on any failure; with no live store the last section SKIPs loudly and says so in the summary. Read-only — it writes only to temp dirs. Prints <code>26/26</code> against the live store, <code>21/21</code> offline.</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><b>The verdict instrument gets the heaviest treatment.</b> <code>asymp_cs_radius</code> — the
+  asymptotic anytime-valid confidence sequence of Waudby-Smith &amp; Ramdas — decides every
+  experiment verdict the agent reports, so a wrong formula there would silently invalidate every
+  A/B conclusion while still printing plausible-looking intervals. It is checked nine ways: the
+  variance estimator against an accumulator-free re-implementation; the radius against a
+  <em>different algebraic factoring</em> of the same expression (which is what catches a
+  transcription or precedence slip, where re-typing the formula would not); an enumerated 11-case
+  degenerate-input table (n&lt;2, NaN, ±inf, α outside (0,1), ρ≤0) that must all refuse rather than
+  return a zero-width interval; monotonicity in α and contraction in n; a seeded Monte-Carlo
+  <em>coverage</em> test under continuous monitoring (240 streams, n=30→80, measured 2.5%
+  miscoverage against a nominal 5%, independently reproducing the figure the source docstring
+  claims); a <em>negative control</em> proving that coverage test can fail (a quarter-width
+  interval miscovers 89.2%); a wiring check that the <code>n≥30</code> verdict gate actually gates;
+  and the full 12-case verdict decision table, which may name a winner only when the interval
+  excludes zero.</p>
+
+  <p><b>On trusting this harness.</b> A verifier that only ever passes proves nothing, so it is
+  itself mutation-tested: fifteen deliberate defects were injected into production code one at a
+  time — seven in the core sections (IPv6 tunnel prefixes unblocked, the scale-guard floor zeroed,
+  <code>_bio_cooldown</code> de-synced from <code>_bio_scaled</code>, F8 eviction reverted to pure
+  age, the F8 credit writer disabled, the delta metric reverted to absolute counts,
+  <code>resolve_egress_proxy</code> made fail-open) and eight in the confidence sequence (variance
+  denominator, dropped prior, dropped inner square root, n²→n, inverted α, removed NaN guard,
+  <code>_MIN_VERDICT_N</code> 30→2, strict zero-straddle) — and all fifteen must be caught. Two of
+  the first seven were MISSED by earlier drafts and the harness was hardened until they weren't:
+  one check derived its expected value from the constant under test (a tautology), and one proved
+  an outcome that two different fields could each produce on their own.
+  <code>tests/test_core_math_verifier.py</code> keeps the harness from being quietly gutted — it
+  fails if the check count drops, if a rigour level vanishes, or if a covered symbol is renamed
+  away.</p>
+
+  <h2>Swarm topology</h2>
+  <p>Each value is a comma-separated list of <code>url|model</code> pairs. Pools are independent and routed by <code>LLMClient</code>.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Used for</th><th>Selector</th></tr></thead>
+    <tbody>
+      <tr><td><code>--worker-nodes</code></td><td>Cheap classifier sub-tasks (failure tagging, summaries; query expansion was removed in §4NQ); also the verifier fallback when <code>--critic-nodes</code> is not set</td><td><code>route(task=...)</code> dispatch</td></tr>
+      <tr><td><code>--visual-nodes</code></td><td>Multimodal vision (PDF + image)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
+      <tr><td><code>--coding-nodes</code></td><td>Code generation specialists</td><td><code>chat_completion(use_coding=True)</code></td></tr>
+      <tr><td><code>--image-gen-nodes</code></td><td>Qwen-Image-2.1 image generation</td><td><code>generate_image()</code></td></tr>
+      <tr><td><code>--critic-nodes</code></td><td>Self-evaluation verifier on a dedicated (often slower, off-host) judge model — e.g. a spare Mac Mini running a 9B. Kept off the worker pool so a slow verdict never blocks fast routing chores, and off the foreground slot so it never competes with the main model for the KV-cache.</td><td><code>chat_completion(use_critic=True)</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="critic-gate">Non-blocking verifier gate</h2>
+  <p>The self-evaluation verifier normally runs <em>after</em> the answer is assembled and the turn blocks on its verdict. When <code>--critic-nodes</code> is set the verdict runs on that pool (a slower off-host model), so the gate goes <strong>non-blocking</strong>: the verdict is spawned as a background task and the response ships without waiting on it. A high-confidence <code>REFUTED</code> that lands late can no longer amend the (already-sent) response, but it still labels the turn and queues the correction (until §4TD it also scrubbed any lesson the turn produced, so the next query couldn't retrieve a poisoned lesson.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Env var</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_CRITIC_GATE_TIMEOUT</code></td><td>Seconds the gate waits inline for the verdict before releasing the response. <code>0</code> = pure async (never wait); a positive value gates inline up to that budget then falls through to async; unset defaults to <code>0</code> when <code>--critic-nodes</code> is configured and to "block forever" (legacy behaviour) when it is not.</td></tr>
+      <tr><td><code>GHOST_CRITIC_NO_THINK</code></td><td>Default <code>1</code>; the live launcher sets <code>0</code>. The verdict is a tiny JSON object, so the critic call disables the model's <code>&lt;think&gt;</code> prelude (the dominant latency on an off-host judge model — observed ~37s of pure thinking) via the <code>/no_think</code> soft-switch + <code>enable_thinking=False</code> hard-switch. Set <code>0</code> to restore a full reasoning verdict (slower, possibly more accurate on stylistic constraint checks).</td></tr>
+      <tr><td><code>GHOST_CRITIC_MAX_TOKENS</code></td><td>Default <code>512</code>. Token cap for the critic verdict. Small because there is no <code>&lt;think&gt;</code> prelude to budget for; raise it only if you re-enable thinking.</td></tr>
+      <tr><td><code>GHOST_CRITIC_CALL_TIMEOUT</code></td><td>Default <code>120</code>. Hard wall-clock cap (seconds) on a single critic-pool call; on timeout the verdict falls through to the worker/direct fallback instead of blocking the turn.</td></tr>
+      <tr><td><code>GHOST_CRITIC_ASYNC</code></td><td>Default <code>0</code> (off); the live launcher sets <code>1</code>. When <code>1</code>, the verifier never sits on the critical path: the in-loop repair-before-ship is skipped and the verdict runs purely <em>after</em> the response ships. A high-confidence REFUTED then labels the turn and queues a correction surfaced at the top of the <em>next</em> turn <strong>of the same conversation</strong> ("⚠️ Correction to my previous answer…"). Trades before-ship repair of the rare wrong answer for not paying the slow off-host verdict latency (~58s) on every turn. With this on, keep the accurate thinking verdict (<code>GHOST_CRITIC_NO_THINK=0</code>) — its latency no longer hurts. <strong>Conversation scoping (fix):</strong> the agent is a process-wide singleton, so a naive queue leaked one conversation's correction into the <em>next</em> turn of an <em>unrelated</em> conversation (or a different user). Each queued correction is now tagged with a <em>conversation fingerprint</em> (a hash of the conversation's first user message, stable across that conversation's turns) and a timestamp; a correction surfaces only when the incoming turn shares that fingerprint, is held for its own conversation otherwise, dropped after a TTL (<code>_CORRECTION_TTL</code>, 900&nbsp;s) if that conversation never returns, and the queue is capped (<code>_CORRECTION_MAX</code>, 3, newest win) so a busy multi-conversation process can't accumulate a runaway banner chain. Covered by <code>tests/test_critic_async.py</code>.</td></tr>
+      <tr><td><code>GHOST_PIN_TOOL_SCHEMAS</code></td><td>Default <code>0</code> (off); the live launcher sets <code>1</code>. When <code>1</code>, pins the byte-stable per-turn block (tool schemas + persona + hydrated memory + continuity) to the first user message — a fixed position — so the upstream KV-cache reuses it across the turns of one request instead of re-prefilling the ~23k-char block every turn (~15s). Only the volatile <code>dynamic_state</code> rides the moving last message. Native tool defs still travel in the payload <code>tools</code> field, so tool-calling is unaffected. Opt-in / reversible A/B for the per-turn prefill latency.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="utils">Utility modules</h2>
+  <p>The <code>src/ghost_agent/utils/</code> package centralises cross-cutting helpers:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Module</th><th>Highlights</th></tr></thead>
+    <tbody>
+      <tr><td><code>helpers.py</code></td><td><code>request_new_tor_identity()</code> rotates Tor circuits; <code>helper_fetch_url_content()</code> wraps curl_cffi/httpx with SSRF guards, 5 MB body cap, 20 s timeout, and 3 retry attempts; <code>recursive_split_text</code> + <code>semantic_split_text</code> chunk text for ingestion; <code>get_utc_timestamp</code> / <code>parse_utc_timestamp</code> for ISO timestamps.</td></tr>
+      <tr><td><code>logging.py</code></td><td><code>setup_logging</code> configures rotating file + stdout sinks; <code>pretty_log()</code> emits structured icons-and-tags log lines with per-request tagging via the <code>request_id_context</code> ContextVar; truncation defaults to 60 chars unless <code>--verbose</code>.</td></tr>
+      <tr><td><code>sanitizer.py</code></td><td><code>extract_code_from_markdown</code>, <code>fix_python_syntax</code> (AST-driven repair loop, max 20 retries), and <code>sanitize_code</code> chain that scrubs control characters and heals partial Python before exec.</td></tr>
+      <tr><td><code>token_counter.py</code></td><td><code>load_tokenizer</code> caches the Qwen3 tokenizer (<code>Qwen/Qwen3-30B-A3B</code>) locally with a 15 s download timeout fallback; <code>estimate_tokens</code> uses a bounded LRU cache; <code>check_budget</code> reports per-message token usage.</td></tr>
+    </tbody>
+  </table></div>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

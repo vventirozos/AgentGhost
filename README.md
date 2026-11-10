@@ -75,7 +75,7 @@ The agent is an HTTP service with no interface of its own. The web UI is a separ
 python interface/server.py     # then open http://localhost:8080
 ```
 
-Slack, voice, a desktop client and a CLI are also available — see [Interfaces](https://vventirozos.github.io/AgentGhost/interfaces.html).
+Slack, voice, a desktop client and a CLI are also available — see [Interfaces](https://vventirozos.github.io/AgentGhost/features/interfaces.html).
 
 ## Documentation
 
@@ -85,19 +85,28 @@ Two tiers. The **guide** is written for a beginner-to-intermediate reader:
 
 | Page | What's in it |
 | --- | --- |
-| [What Ghost Agent is](https://vventirozos.github.io/AgentGhost/) | The whole thing in five steps, and whether it's a good fit. |
-| [Install and run it](https://vventirozos.github.io/AgentGhost/getting-started.html) | Prerequisites in order, environment variables, verifying the install. |
-| [Interfaces](https://vventirozos.github.io/AgentGhost/interfaces.html) | Web UI, Slack, voice, desktop client, CLI, HTTP API. |
-| [One message, end to end](https://vventirozos.github.io/AgentGhost/how-it-works.html) | The turn loop, and which step to blame when it goes wrong. |
-| [What it remembers](https://vventirozos.github.io/AgentGhost/memory.html) | What's stored, what goes into every prompt, how to correct it. |
-| [What it can do](https://vventirozos.github.io/AgentGhost/tools.html) | The toolbox, and how Ghost chooses between tools. |
-| [Checking and learning](https://vventirozos.github.io/AgentGhost/self-improvement.html) | The after-reply checks, the learning loop you approve, and idle-time upkeep. |
-| [Safety and privacy](https://vventirozos.github.io/AgentGhost/safety.html) | What leaves your machine, what can't, how it's enforced. |
-| [Settings that matter](https://vventirozos.github.io/AgentGhost/configuration.html) | The twenty flags worth knowing, out of sixty-four. |
-| [When something breaks](https://vventirozos.github.io/AgentGhost/troubleshooting.html) | Sorted by symptom. |
-| [Glossary](https://vventirozos.github.io/AgentGhost/glossary.html) | Plain-English definitions for this project's shorthand. |
+| [What Ghost Agent can do](https://vventirozos.github.io/AgentGhost/) | Every feature on one page, the four machines, and whether it's a good fit. |
+| [Getting started](https://vventirozos.github.io/AgentGhost/start/getting-started.html) | Prerequisites in order, environment variables, verifying the install. |
+| [Interfaces](https://vventirozos.github.io/AgentGhost/features/interfaces.html) | Web console, Slack, the handheld, the CLI and the API. |
+| [Voice](https://vventirozos.github.io/AgentGhost/features/voice.html) | Talk to it and hear it answer: Whisper speech-to-text, Phonon (English) and macOS (Greek) voices. |
+| [Search & the web](https://vventirozos.github.io/AgentGhost/features/search.html) | Web search, deep research and the browser — over Tor only. |
+| [Dark-web search](https://vventirozos.github.io/AgentGhost/features/darkweb.html) | Search and research .onion sites through Ahmia, Torch and Torgle. |
+| [Pictures](https://vventirozos.github.io/AgentGhost/features/pictures.html) | Generate and edit images, likeness from real photos, and vision. |
+| [Memory](https://vventirozos.github.io/AgentGhost/features/memory.html) | What it remembers about you, how it recalls it, and the rules you teach it. |
+| [Documents (RAG)](https://vventirozos.github.io/AgentGhost/features/documents.html) | Ask questions over your PDFs, audio and videos; get PDF reports. |
+| [Coding & sandbox](https://vventirozos.github.io/AgentGhost/features/coding.html) | Writes and runs code in a Docker sandbox, with services and jobs. |
+| [Projects & autonomy](https://vventirozos.github.io/AgentGhost/features/projects.html) | Multi-step projects, scheduled tasks and an autopilot that works while idle. |
+| [Labs](https://vventirozos.github.io/AgentGhost/features/labs.html) | Throwaway real machines on a Raspberry Pi for experiments. |
+| [Selfhood](https://vventirozos.github.io/AgentGhost/features/selfhood.html) | Mood, tone, the self-image (Mirror), the sentiment model and the face. |
+| [Performance](https://vventirozos.github.io/AgentGhost/features/performance.html) | Head and slot saves, cache protection, MTP, node offload and time budgets. |
+| [Reliability](https://vventirozos.github.io/AgentGhost/features/reliability.html) | The verifier, guards and breakers, health checks and feedback. |
+| [Personal services](https://vventirozos.github.io/AgentGhost/features/personal.html) | Portfolio, weather and games. |
+| [Infrastructure](https://vventirozos.github.io/AgentGhost/features/infrastructure.html) | The four machines, Tor-only egress, isolation and supervision. |
+| [Settings that matter](https://vventirozos.github.io/AgentGhost/start/configuration.html) | The flags worth knowing. |
+| [When something breaks](https://vventirozos.github.io/AgentGhost/start/troubleshooting.html) | Sorted by symptom. |
+| [Glossary](https://vventirozos.github.io/AgentGhost/start/glossary.html) | Plain-English definitions for this project's shorthand. |
 
-The **[deep reference](https://vventirozos.github.io/AgentGhost/reference.html)** is a page per module for changing the code — dense, and explicit about which parts of `src/ghost_agent/` it doesn't yet cover.
+The **[reference pages](https://vventirozos.github.io/AgentGhost/reference/index.html)** go one level down, grouped by the same features: every mechanism, its settings and its history, for changing the code.
 
 ## Repository layout
 

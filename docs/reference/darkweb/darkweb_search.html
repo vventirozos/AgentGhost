@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dark-web search (tools.darkweb_search) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <div class="subnav">
+      <a class="current" href="darkweb_search.html">Dark-web search (tools.darkweb_search)</a>
+    </div>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>tools / darkweb_search.py</h1>
+  <p class="subtitle">Discovery of Tor hidden services (<code>.onion</code>) via dedicated <strong>onion search engines</strong>, with per-attempt circuit rotation, cross-engine corroboration ranking, and an optional deep-read research mode.</p>
+
+  <h2>Why a separate tool</h2>
+  <p>
+    The clearnet search tool (<a href="../search/search.html"><code>search.py</code></a>) queries scraper backends — DuckDuckGo, Yandex, Brave, Yahoo — that <strong>do not index Tor hidden services</strong>. Discovering <code>.onion</code> content requires querying <em>dedicated onion search engines</em> (Ahmia, Torch, Torgle, …) and parsing their result pages. The transport is the same Tor SOCKS proxy the rest of the agent already uses; what is new is the engine set and the result parsing.
+  </p>
+
+  <h2>Tools</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>darkweb_search</code></td><td>Fan a query across the onion-engine set over Tor, parse the <code>.onion</code> result links/titles/snippets, de-dup by onion host, rank by cross-engine corroboration, and return a ranked list. List-only — pair with <code>browser</code> / <code>darkweb_research</code> to actually read a result.</td></tr>
+      <tr><td><code>darkweb_research</code></td><td>The dark-web analogue of <code>deep_research</code>: runs <code>darkweb_search</code>, then fetches the top onion pages over Tor and distils each via the worker LLM into a synthesised report.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Onion-engine registry (<code>_ONION_ENGINES</code>)</h2>
+  <p>
+    Onion search-engine endpoints rotate and die far more often than clearnet ones, so the set is <strong>config-driven</strong> and intentionally <strong>wide</strong> — breadth plus circuit rotation wins, the same philosophy as <code>search.py</code>'s <code>_TOR_BACKENDS</code>. The built-in default is:
+  </p>
+  <ul>
+    <li><code>ahmia</code> — the clearnet mirror <code>ahmia.fi</code> (still fetched over Tor); indexes onion services and filters known-abuse material at the index level.</li>
+    <li><code>ahmia-onion</code> — Ahmia's own <code>.onion</code> endpoint. Listed alongside the clearnet mirror on purpose: the two have <em>independent</em> reachability, so one is often up when the other is blocked. They serve the <em>same</em> search index, though, so both carry <code>index:&nbsp;"ahmia"</code> — reaching Ahmia over two transports must not be mistaken for independent corroboration (see ranking below).</li>
+    <li><code>torch</code> — a broad unfiltered onion index, for reach. Re-pointed 2026-07-29 (see below); the fastest engine in the set at 1.6–6.6&nbsp;s.</li>
+    <li><code>torgle</code> — added 2026-07-29 as a third <em>independent</em> index. Slower (9–25&nbsp;s) and smaller, but its value is not its size: with only Ahmia and Torch alive, one engine having a bad day left corroboration ranking with nothing to corroborate against.</li>
+  </ul>
+  <p>
+    <strong>On dead endpoints:</strong> <code>haystak</code> was in the initial default set but was dropped after live functional testing — its v3 endpoint failed on <strong>every</strong> attempt across many rotated Tor circuits (SOCKS5 connect / timeout), i.e. the hidden service is down rather than exit-node blocked, and its retry could burn a full <code>_ONION_TIMEOUT</code> and inflate the tail latency of the whole (concurrent) call. It — or any replacement onion engine — can be re-added via <code>GHOST_ONION_ENGINES</code> once a live endpoint is known. This is the expected maintenance mode for onion engines, which rotate and die far more often than clearnet ones.
+  </p>
+
+  <h2 id="engine-survey-2026-07-29">Engine survey (2026-07-29): Torch was not dead, it had moved</h2>
+  <p>
+    Torch had been timing out on every search, costing the tool a full <code>_ONION_ENGINE_DEADLINE</code> (38&nbsp;s) on <em>every</em> call while contributing nothing. Probing the configured <code>torchdeed…</code> address across fresh circuits gave <strong>0/10, every one a 30&nbsp;s timeout</strong> — the same signature that got haystak dropped. But the service was not gone: it is alive at <code>xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion</code> under its <strong>Xapian Omega CGI path</strong>, <code>/cgi-bin/omega/omega?P={q}</code>. The old <code>/search?query=</code> path returns <strong>404 there</strong> — so at the right address with the wrong path it would still have looked dead. Adding <code>&amp;HITSPERPAGE=100</code> lifts one page from 7 unique onions to 28 (the parser de-dupes by host, so 100 hits collapse to 28 hosts). Measured 4/4 reachable at 1.6–6.6&nbsp;s.
+  </p>
+  <p>
+    Candidates were measured with <em>this module's own</em> <code>_fetch_raw_html</code> + <code>_parse_onion_results</code> + <code>_diagnose_empty_body</code>, over live Tor on rotated circuits — not by reading engine lists. A directory page saying an engine is up is not evidence that our fetch and our parser can get results out of it.
+  </p>
+  <div style="overflow-x:auto">
+  <div class="scroll"><table>
+    <tr><th>Engine</th><th>Reachable</th><th>Result</th></tr>
+    <tr><td><code>torch</code> (new address + Omega path)</td><td>4/4</td><td><strong>Adopted</strong> — 28 onions/page, 1.6–6.6&nbsp;s, fastest in the set</td></tr>
+    <tr><td><code>torgle</code></td><td>4/4</td><td><strong>Adopted</strong> — 19–20 onions, 9–25&nbsp;s, third independent index</td></tr>
+    <tr><td><code>tordex</code></td><td>1/6</td><td>Rejected — one 86-result hit, otherwise timeout; too flaky to pay a deadline for</td></tr>
+    <tr><td><code>torch</code> (old <code>torchdeed…</code>)</td><td>0/10</td><td>Removed — dead service</td></tr>
+    <tr><td><code>haystak</code>, <code>onionland</code>, <code>tor66</code></td><td>0/2 each</td><td>Rejected — timeout</td></tr>
+    <tr><td><code>phobos</code></td><td>0/2</td><td>Rejected — SOCKS "cannot complete", i.e. no descriptor</td></tr>
+  </table></div>
+  </div>
+  <p>
+    Net effect: three independent indexes instead of one, and a typical search dropped from <strong>38&nbsp;s</strong> (dominated by torch's timeout) to <strong>17–28&nbsp;s</strong>. The rejected addresses are recorded in a comment beside the registry so the next person re-measures rather than re-discovers them; all of them are re-addable via <code>GHOST_ONION_ENGINES</code> if they come back.
+  </p>
+  <p>
+    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"[,"index"][,"form_token_from"]}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). The optional <code>index</code> marks endpoints that share one underlying search index so they count once in corroboration ranking; omitted, it defaults to the entry's own <code>name</code> (treated as an independent index). The optional <code>form_token_from</code> names a page whose search form carries a hidden field the engine requires on the query string — see <a href="#ahmia-form-token">the form-token section</a>. A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search, and an individual entry whose URL carries a stray placeholder other than <code>{q}</code> (which would raise a <code>KeyError</code> in <code>.format</code> on every query and be silently skipped) is <strong>rejected at load with a warning</strong> instead.
+  </p>
+
+  <h2>Circuit rotation + timeouts (reused from search.py)</h2>
+  <p>
+    Onion <em>search engine</em> reachability is exit-node dependent in exactly the same way clearnet search is, so the same per-attempt circuit rotation applies: <code>_proxy_for_attempt</code> (imported from <code>search.py</code>) folds the attempt index into the SOCKS <code>username:password</code>, and Tor's <code>IsolateSOCKSAuth</code> hands each attempt a different exit node. Each engine is tried up to 2 times, each on a fresh circuit, and all engines are queried <strong>concurrently</strong>.
+  </p>
+  <p>
+    <strong>Timeouts are deliberately higher than clearnet search.</strong> Onion round-trips are materially slower: <code>_ONION_TIMEOUT = 30&nbsp;s</code> per engine request (a curl low-speed limit; the wall clock is the caller's <code>_ONION_ENGINE_DEADLINE</code> / page deadline, and since §4PD the form-token fetch has its own) (vs. <code>search.py</code>'s <code>_DDGS_TOR_TIMEOUT = 18&nbsp;s</code>), and <code>_ONION_PAGE_TIMEOUT = 35&nbsp;s</code> for each onion page fetch in the research phase. These clear a healthy onion service while still letting dead endpoints fail fast on connect error. Like the clearnet timeout, they are empirically tunable.
+  </p>
+  <p>
+    <strong>Per-engine deadline (dead-engine hardening).</strong> Unlike <code>search.py</code> — which hands its whole backend set to <code>ddgs</code> in a <em>single</em> call bounded by one shared timeout — this tool fans the engines out itself with <code>asyncio.gather</code>, so the search can only finish once the <em>slowest</em> engine returns. A dead or hung engine that burns its per-attempt timeout twice (~2&times;<code>_ONION_TIMEOUT</code>) would therefore dominate the gather and inflate <em>every</em> call's latency. To bound this structurally (not just by curating the engine list), each engine runs under an overall <code>_ONION_ENGINE_DEADLINE = _ONION_TIMEOUT + 8&nbsp;s</code> via <code>asyncio.wait_for</code>: it allows one full attempt (a slow-but-alive engine legitimately needs up to <code>_ONION_TIMEOUT</code>) plus a short window for a fast second circuit, then skips the engine so the gather proceeds. Since 2026-09-14 the fetch is an awaitable on the same loop, so cancelling the await aborts the transfer itself (it used to leave a worker thread running until curl's own timeout). This makes engine curation a tuning aid rather than the only thing standing between a newly-dead engine and a slow tool. Covered by <code>tests/test_darkweb_search.py::test_slow_engine_bounded_by_deadline</code>.
+  </p>
+
+  <h2><code>socks5h</code> — mandatory for .onion</h2>
+  <p>
+    <code>_normalize_tor_proxy</code> forces the proxy to <code>socks5h://</code> form (note the <em>h</em>), which routes DNS resolution <strong>through</strong> the proxy. This is mandatory: <code>.onion</code> has no clearnet DNS, so a plain <code>socks5://</code> proxy (local resolution) would fail to resolve every hidden service. The SSRF guard shared by the fetch helpers treats a DNS-resolution failure as <em>allow</em>, so <code>.onion</code> hosts pass it cleanly.
+  </p>
+
+  <h2>Result parsing &amp; ranking</h2>
+  <p>
+    Each engine renders results differently, so <code>_parse_onion_results</code> is deliberately tolerant: it walks anchors to harvest <code>(onion-url, title)</code> pairs with a nearby snippet, unwraps Ahmia-style <code>redirect_url=</code> wrappers, then does a regex sweep of the whole document to catch onion URLs that appeared as plain text. Addresses are matched as base32 v3 (56 chars) or legacy v2 (16 chars). Results are de-duped by onion host.
+  </p>
+  <p>
+    <strong>Self-link filtering.</strong> A tolerant whole-page harvest also picks up the nav/footer/sidebar links every engine page carries — including the engine's <em>own</em> onion address and those of sibling engines. Those are excluded (<code>_engine_onion_hosts</code>) so an engine's home link can't masquerade as a result and, worse, ride the corroboration ranking to the top.
+  </p>
+  <p>
+    <strong>Corroboration by independent index, not by endpoint.</strong> Onions surfaced by <strong>more than one independent index</strong> sort first — cross-engine corroboration is the only cheap relevance signal available for unindexed hidden services. Crucially the count is over distinct <code>index</code> tags, not engine names: Ahmia's clearnet and onion endpoints share <code>index:&nbsp;"ahmia"</code>, so a hit reached over both Ahmia transports counts as <em>one</em> source, not two. Counting endpoints instead would have let any Ahmia-only result outrank a genuinely Ahmia-plus-Torch-corroborated one — turning "corroboration" into "is it in Ahmia."
+  </p>
+
+  <h2>Raw-HTML fetch vs. text fetch</h2>
+  <p>
+    The search phase needs the <strong>raw result HTML</strong> to parse out links, so it uses a dedicated <code>_fetch_raw_html</code> (curl_cffi with TLS impersonation, falling back to httpx). The <em>research</em> phase wants page <em>text</em>, so it wraps the same fetch in <code>_fetch_onion_text</code>, which strips tags after the fact. It deliberately does <strong>not</strong> reuse the shared <code>helper_fetch_url_content</code>, for two reasons: (1) that helper ignores the passed proxy and reads <code>TOR_PROXY</code> from the environment, silently discarding both a caller-supplied proxy and the per-query anonymity identity tag; and (2) on any fetch error or <code>503</code> it calls <code>request_new_tor_identity</code>, which does a global <code>NEWNYM</code> or — if the control port is closed — a <code>tor</code> service restart. Since onion fetches fail often and research fans them out concurrently, that would re-circuit or restart Tor mid-run and sabotage the sibling fetches. <code>_fetch_onion_text</code> keeps the shared SSRF guard but honours the passed proxy and never re-circuits.
+  </p>
+  <p>
+    <strong>Untrusted-body cap.</strong> Onion engines are adversarial by this tool's own posture, so <code>_fetch_raw_html</code> caps every response at <code>_MAX_ONION_BODY_BYTES</code> (5&nbsp;MB): it refuses binary content-types and bodies whose declared <code>Content-Length</code> exceeds the ceiling, and truncates the decoded text as a backstop against a server that lied about its size or streamed chunked (mirroring the cap <code>helper_fetch_url_content</code> enforces on clearnet). <strong>Streaming enforcement (2026-07-07):</strong> the fetch now STREAMS the body (curl_cffi <code>aiter_content</code> / httpx <code>aiter_bytes</code>) and stops reading at the cap, so a chunked body with no (or a lying) <code>Content-Length</code> can no longer be materialised whole via <code>r.text</code> before the truncation backstop runs — the read itself is bounded, closing the OOM window a hostile engine could open by streaming a multi-GB body straight into memory.
+  </p>
+  <p>
+    <strong>Bounded on the loop, not on threads (2026-09-14).</strong> The fetch runs on the event loop through <code>curl_cffi</code>'s <code>AsyncSession</code>, with <code>_onion_gate()</code> — an <code>asyncio.Semaphore</code> rebuilt whenever the running loop changes — holding the same 16-way bound the old <code>_ONION_EXECUTOR</code> thread pool provided, so excess fetches queue instead of piling concurrent circuits onto Tor. It used to be a <em>synchronous</em> <code>Session</code> on that pool, and that <a href="#crash-4gm">aborted the whole process</a>. A second benefit of the move: when the per-engine deadline fires, <code>asyncio.wait_for</code> now really does abort the transfer, instead of cancelling the await and leaving a worker thread running on until curl's own timeout.
+  </p>
+
+  <h2>Anonymous mode</h2>
+  <p>
+    Under <code>--anonymous</code>, the same stylometric egress scrubbing as clearnet search applies: <code>darkweb_search</code> uses the deterministic <code>scrub_query</code> plus a per-query SOCKS identity tag; <code>darkweb_research</code> uses the stronger LLM-based <code>neutralize_query</code>. Tor anonymises the network; this anonymises the <em>content</em> fingerprint of the query before it leaves the box. Because the research deep-read now fetches onion pages through the caller's proxy (via <code>_fetch_onion_text</code>) rather than the environment default, the per-query identity tag actually reaches the page fetches too, instead of being discarded at the transport boundary.
+  </p>
+
+  <h2>Deep-read sizing &amp; caching</h2>
+  <p>
+    The per-source extract in <code>darkweb_research</code> is sized to the worker model's context window (<code>max_context</code>) rather than a fixed 40k chars: it reserves room for the prompt scaffold plus <code>max_tokens</code> and shrinks the source slice accordingly (≈4 chars/token, with a 4k-char floor and the 40k ceiling), so a small-context worker can't overflow on the distill call. The synthesised report is cached under an <code>onion-research::</code> key (distinct from the list search's <code>onion::</code>), so a repeated identical research request is served from cache instead of re-fetching every onion over Tor.
+  </p>
+
+  <h2>Safety posture</h2>
+  <p>
+    Hidden services are unverified and frequently malicious. The tools never auto-execute or auto-download anything — <code>darkweb_search</code> returns links only, and <code>darkweb_research</code> returns extracted text with an explicit instruction to treat all claims as unverified and corroborate before relying on them. Every reached onion host is logged to the operator's live stream via <code>pretty_log</code> with a distinct 🧅 icon.
+  </p>
+
+  <h2>Tests</h2>
+  <p>
+    Parsing (anchors, redirect unwrapping, plain-text sweep, de-dup), independent-index corroboration ranking (the two Ahmia endpoints are <em>not</em> double-counted), engine self-link filtering, the per-engine deadline, the untrusted-body size cap (<code>_cap_body</code>: binary refusal, declared-oversize refusal, truncation), the actionable zero-results error, anonymous-mode scrubbing, the <code>GHOST_ONION_ENGINES</code> override + malformed fallback + stray-placeholder rejection, <code>socks5h</code> normalisation, result caching, the research deep-read path honouring the passed proxy, research caching, and <code>max_context</code>-bounded extraction are covered by <code>tests/test_darkweb_search.py</code>.
+  </p>
+
+  <h2>Onion DNS-leak fix (2026-07-14)</h2>
+  <p><code>_fetch_onion_text</code> (the research-phase page fetch) validated the onion URL with the SSRF guard's default <code>resolve=True</code> — a host-side <code>getaddrinfo</code> on the <code>.onion</code> hostname. For a hidden service this is the sharpest form of the leak: it tells the host resolver <em>which hidden service is being visited</em> (and fails anyway, since <code>.onion</code> addressing lives at the Tor SOCKS layer, not the host resolver). Now passes <code>resolve=False</code> — this path is always over Tor. The literal-internal-IP string check still runs. Covered by <code>tests/test_fetch_dns_leak.py</code>.</p>
+
+
+  <h2>Dead-engine detection + charset (bug-hunt 2026-07-26b, HIGH)</h2>
+  <p>Both Ahmia endpoints stopped returning parseable results, silently degrading <code>darkweb_search</code> to torch-only (flaky) while the tool blamed the query ("transient downtime / too-specific"). Root mechanism was a SILENT empty-parse: a 200 that parses to zero results was indistinguishable from an unreachable engine — no log. Now a 200-with-zero-results logs a distinct diagnostic. Separately, <code>_fetch_raw_html</code> honoured the declared charset instead of force-utf-8 decoding (Cyrillic/CJK onion content — a large fraction of the darknet — came back as mojibake).</p>
+  <p class="note"><strong>The diagnosis in this section was wrong, and the correction is instructive</strong> — see <a href="#ahmia-form-token">the form-token entry</a> below. Ahmia was never serving a JS-only template. The "live-confirmed 4727-byte page with zero result links" was Ahmia's <em>homepage</em>, reached by a 302 the fetcher silently followed; the JS-only label came from a <code>display:none</code> notice on that homepage matching a bare <code>"javascript"</code> substring test. The engine was healthy the whole time.</p>
+
+  <h2 id="ahmia-form-token">Ahmia form token + honest empty-body diagnosis (2026-07-28)</h2>
+  <p>
+    Ahmia gates its search endpoint behind a <strong>hidden form field</strong>: <code>/search/?q=…</code> <strong>302-redirects to <code>/</code></strong> unless the query string also carries the <code>&lt;input type="hidden"&gt;</code> pair from its search form. Measured live over both the clearnet mirror and the onion endpoint — the redirect is not Tor-, exit-node-, user-agent-, cookie-, or referer-dependent; it is purely the missing parameter. With the token appended, the same endpoint returns a full results page (~1.1&nbsp;MB, ~2900 onion links).
+  </p>
+  <p>
+    An engine entry may now declare <code>form_token_from</code> (a URL whose search form carries the field); both Ahmia entries do. <code>_form_token</code> scrapes the pair via <code>_parse_form_token</code> — preferring a form whose action/id/class looks like a search endpoint, so an unrelated CSRF field on a newsletter box can't be mistaken for it — and caches it for <code>_FORM_TOKEN_TTL</code> (30&nbsp;min). The token is <strong>stateless</strong> (no cookie or session is involved), which is what makes caching it across circuits sound. <strong>Only a successful read is cached.</strong> A <code>None</code> from a page we actually fetched means "this engine needs no token" and is worth remembering; a <code>None</code> because Tor timed out or the page returned 503 means nothing, and caching it would turn one transient blip into 30 minutes of the engine querying without the token it requires — 30 minutes of zero results, the exact failure the token exists to end. Same discipline the rest of the project applies to measurement: never record a failed measurement as a neutral value. It is scraped rather than hard-coded because the entire point of such a token is that the operator can rotate it; if a query is still redirected away, the cached pair is dropped so the next (already circuit-rotated) attempt re-scrapes. The fetch <strong>fails open</strong> — on any error the engine is queried exactly as before — and runs under a tighter <code>_FORM_TOKEN_TIMEOUT = 12&nbsp;s</code> than the search itself, since it spends the same per-engine deadline the query needs.
+  </p>
+  <p>
+    <strong>Why the old diagnosis was confidently wrong.</strong> <code>_fetch_raw_html</code> follows redirects, so the status code alone cannot tell you whether the body came from the URL you asked for: a dead endpoint that 302s to a live homepage is indistinguishable from a live endpoint serving an unparseable page. The empty-body branch then tested for the bare substring <code>"javascript"</code> — present in almost every modern page — and Ahmia's homepage happens to carry a <code>display:none</code> notice reading "we have not deployd non-JavaScript version of Ahmia yet", intended for non-Tor-Browser visitors. Two independent weaknesses lined up to produce a specific, plausible, actionable, and entirely incorrect instruction to the operator: swap engines, when the real fix was one query parameter. That message stood in these docs for two days.
+  </p>
+  <p>
+    The fix is structural rather than a better guess. <code>_fetch_raw_html</code> accepts a <code>meta</code> dict and reports the <code>final_url</code> a body was actually served from, and <code>_diagnose_empty_body</code> ranks the possible explanations by <em>how much the evidence actually supports</em>, because each message ends in a different operator action:
+  </p>
+  <ol>
+    <li><code>redirected</code> — we were served a different location than we asked for. Whatever that page says is evidence about a page we never requested, so this has to win over anything read out of the body.</li>
+    <li><code>no-hits</code> — the engine explicitly says the query matched nothing (<code>_NO_HITS_RE</code>). This is the <em>ordinary</em> case and it is not breakage.</li>
+    <li><code>js-only</code> — requires <strong>both</strong> a needs-JavaScript sentence (<code>_JS_ONLY_RE</code>) <strong>and</strong> a body under <code>_JS_SHELL_MAX_BYTES</code> (32&nbsp;KB), since a page that genuinely cannot render without JS is a shell.</li>
+    <li><code>parser</code> — none of the above; the result format may have drifted.</li>
+  </ol>
+  <p class="note warn">
+    <strong>The first version of this fix did not go far enough, and the review that caught it is worth recording.</strong> Two independent reviewers found that the <code>js-only</code> branch still produced the original lie by a different route: Ahmia's no-JS banner is in its <strong>site-wide template</strong>, not just the homepage, so a perfectly healthy <em>zero-hit</em> search — token accepted, no redirect, engine fine — still matched the wording and still told the operator to replace the engine. Verified against a live zero-hit page. Three things were wrong: there was <em>no branch at all</em> for the most common cause (the query simply had no matches); the wording test was <strong>polarity-blind</strong>, so <code>"works without JavaScript"</code> and <code>"No JavaScript required"</code> — precisely the boasts privacy-focused onion engines put in their footers — matched as evidence of breakage; and the sentence alone was allowed to carry a conclusion it cannot support without the structural size check. The lesson generalises past this file: <em>tightening a heuristic is not the same as bounding what it is allowed to conclude.</em>
+  </p>
+  <p>
+    <code>_redirected_away</code> is likewise deliberately conservative, normalising host case, <code>www.</code>, default ports and path case before comparing — a false positive there is not merely a bad message, it evicts a good token and buys a wasted retry on every query. Token eviction is further gated on having actually <em>sent</em> a token and on being the first attempt, so a captcha or exit-ban page cannot throw away a working one. Redirect messages name host + path (the host is the load-bearing part — a foreign host and this site's homepage call for different responses) but never the query string, which carries the search terms; onion hostnames are scrubbed downstream by the log redactor.
+  </p>
+  <p>
+    <strong>Deadline accounting.</strong> A token engine spends an extra fetch inside the per-engine deadline, so <code>_ONION_ENGINE_DEADLINE</code> is extended by the token budget for those engines. Shrinking the <em>search</em> timeout instead would guillotine slow-but-alive engines — the failure mode <code>search.py</code>'s mojeek timeout already taught this project once.
+  </p>
+  <p>
+    The generalisable lesson for the next engine that breaks: <strong>check the redirect chain before believing an engine-health diagnosis</strong>, never anchor a health check on a substring ordinary pages contain, and make sure a diagnostic has a branch for "nothing is wrong". Covered by <code>tests/test_darkweb_form_token.py</code>, including the ordering regression, the live-verified zero-hit page, the polarity boasts, cosmetic redirects, fragment and duplicate-parameter URL assembly, and the deadline headroom.
+  </p>
+
+  <h2 id="crash-4gm">The fetch that killed the agent (2026-09-14, §4GM)</h2>
+  <p>
+    The agent died twice in twelve hours — <code>SIGABRT</code> at 2026-09-13 22:19:51 and again at 2026-09-14 09:07:40, the second time in the middle of a live investigation, one second after an onion engine's post-deadline fetch was still running. Both macOS crash reports carry the same stack, on a <em>worker</em> thread:
+  </p>
+  <pre><code>abort ← malloc_report ← ...POINTER_BEING_FREED_WAS_NOT_ALLOCATED
+      ← Curl_freeset ← curl_easy_reset        (libcurl-impersonate)
+      ← _cffi_f_curl_easy_reset               (curl_cffi)
+      ← ...Python frames... ← thread_run</code></pre>
+  <p>
+    <code>_fetch_raw_html</code> was the only <strong>synchronous</strong> <code>curl_cffi.requests.Session</code> left in the tree, and it ran on a thread pool. With <code>stream=True</code> that path duplicates the easy handle (<code>curl_easy_duphandle</code>), resets the parent immediately, performs the transfer on a thread pool of curl_cffi's own, and resets the <em>duplicate</em> from a done-callback on yet another thread. <code>libcurl-impersonate</code> does not deep-copy that option set, so the two resets free the same pointer and libmalloc aborts the process. It was reproduced locally in about forty seconds by replaying that exact call shape — impersonation, SOCKS proxies, <code>stream=True</code>, body abandoned at the byte cap — on eight threads: the same <code>curl_easy_reset</code> double free, plus a second crash reading <em>“memory corruption of free block”</em> inside <code>curl_slist_append</code>.
+  </p>
+  <p>
+    Nothing above libcurl can survive that: the process is gone with no traceback, the in-flight request is lost, and <code>launchd</code> restarts the agent a few milliseconds later — which is exactly what the operator saw as a restart mid-thought.
+  </p>
+  <p>
+    <strong>The fix is to stop using that shape.</strong> The fetch now runs on <code>AsyncSession</code>, the path every other fetch in this codebase already used: it takes a handle from a pool and resets it on the loop thread, and there is no <code>duphandle</code> in the async code at all. The 16-way bound the thread pool provided is kept as <code>_onion_gate()</code>. Cancellation improves as a side effect — the per-engine deadline now aborts the transfer instead of orphaning a thread. Pinned by <code>tests/test_4gm_onion_fetch_async.py</code>, whose last test drives 144 abandoned/failing fetches in a <em>child</em> process and fails on a non-zero exit, so the abort is a red test rather than a dead suite.
+  </p>
+  <p class="note">
+    The generalisable lesson: <strong>a C library's threading contract is part of your API surface.</strong> This call site had been correct Python for months — the cap, the charset, the SSRF guard, the redirect bookkeeping and the bounded pool were all carefully built on top of a primitive that could not be used from more than one thread. Nothing in the Python layer can detect that; only the crash report names it.
+  </p>
+
+  <h2 id="breadth-4gn">Breadth in one round: <code>extra_queries</code> <span class="tag">2026-09-14 &sect;4GN</span></h2>
+  <p>
+    A dark-web brief that enumerates ten phrasings and five target forums used to cost ten sequential tool calls — so in practice it got two. Measured twice on the same investigation: the original run (<code>cf45e352</code>) ran two queries, the re-run (<code>da4c17ba</code>) ran two again, against a brief naming BreachForums, Exploit, RaidForums mirrors, paste sites and leak indexes. Nothing was wrong with the model's judgement; each extra phrasing carried a whole round-trip's latency, and it was spending that budget on the clearnet instead.
+  </p>
+  <p>
+    <code>darkweb_search</code> now takes up to three <strong>additional phrasings</strong> in <code>extra_queries</code> and runs them in the SAME round. Four phrasings × four engines is sixteen onion fetches — exactly the bound <a href="#crash-4gm"><code>_onion_gate</code></a> already enforces — inside one per-engine deadline instead of four. Results merge on the onion host and keep the signal the single-query merge already prizes (a service surfaced by MORE INDEPENDENT INDEXES ranks higher), extended with the phrasing that surfaced it: each row is tagged <code>(via ahmia, torch; matched: revolut government email; revolut breach sender domain)</code>, so a broad hit is distinguishable from a lucky one. In anonymous mode each phrasing keeps its OWN identity-tagged SOCKS circuit — running the set over one circuit would relink precisely what the per-query tag exists to separate.
+  </p>
+  <p>
+    Two details that are load-bearing rather than cosmetic. <strong>Deduplication happens before the cap</strong>: the cap bounds fetch cost, and a repeated or whitespace-variant phrasing costs nothing to drop, so letting it consume a slot would silently narrow a brief that listed five wordings of which two normalise the same. And a <strong>single-query call is byte-identical</strong> to what it always was — no phrasing header, no <code>matched:</code> tag — because the result text is what the 5-minute cache stores and what every caller downstream parses.
+  </p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+
+  <h2 id="4hb-omega">"No documents match your query" is a zero-hit answer <span class="tag">2026-09-15 &sect;4HB</span></h2>
+  <p>
+    torch runs Xapian Omega, whose zero-hit page reads <em>No documents match your query</em>. <code>_NO_HITS_RE</code> knew "no results", "no matches", "nothing found" — not that — so every torch miss fell through to the last branch and was reported at WARNING as "the engine's result format may have drifted". Fetched over Tor on 2026-09-15: every "empty" torch response in the log (1.7–1.9&nbsp;KB) is that page. The phrasing is now in the pattern; <code>tests/fixtures/torch_zero_hits_2026-09-15.html</code> is the real body (form token scrubbed) and <code>tests/test_darkweb_no_hits_phrasings.py</code> pins it, together with the requirement that a genuinely unparseable page still reaches the <code>parser</code> branch — that <em>is</em> the drift signal.
+  </p>
+
+<h2 id="4lg">Titles are not pages; read the on-topic ones <span class="tag">2026-10-04 &sect;4LG</span></h2>
+<ul>
+  <li><code>darkweb_search</code>'s header says its results are titles and snippets only — no page was opened (a reply had
+  described "active MH370 threads" from directory titles).</li>
+  <li><code>darkweb_research</code> fetches 3× the candidates and opens on-topic results with a path first
+  (<code>rank_for_reading</code>, the web search's own topic check): ranked by engine agreement alone, 32 of 36 pages read
+  yielded nothing, 25 of them homepages.</li>
+</ul>
+<h2 id="4lh">Torch is a fallback <span class="tag">2026-10-04 &sect;4LH</span></h2>
+<p>Over 3 weeks torch was useful in 22% of searches (78 "no matches", 34 timeouts at the 38 s deadline). It now carries
+<code>"tier": "fallback"</code>, and an engine in <code>GHOST_ONION_ENGINES</code> may carry the same.
+<code>_darkweb_search_raw</code> asks the first-tier engines, and only when they found fewer than
+<code>_FALLBACK_MIN_HOSTS</code> (5) distinct onions does it ask the fallback tier, with its own short deadline
+<code>_FALLBACK_DEADLINE_S</code> (12 s; torch answers in 2–6 s when it answers). The skip and denominator arithmetic
+counts the engines actually asked. A search with zero results always reaches the fallback, so "asked N of M" stays
+whole. <code>GHOST_ONION_FALLBACK_TIER=0</code> puts every engine back in one wave.</p>
+<p>&sect;4LI: a fallback engine cut by the 12 s deadline is recorded as a failure by the circuit breaker (the cut
+cancelled <code>_query_engine</code> before its own timeout could record anything, so a dead torch was paid for on
+every thin search), using <code>utils.aio.wait_for</code>.</p>
+  <h2 id="4lv">Small-tools review <span class="tag">2026-10-05 &sect;4LV</span></h2>
+  <ul>
+    <li><strong>darkweb_research:</strong> a fetch that throws now reads <code>Error: reading … failed</code> — "Error reading …" matched no failure check, so it was summarised as page text, booked OK and cached for 300 s.</li>
+    <li><strong>system_utility:</strong> every HTTPS call verifies TLS (8 calls had <code>verify=False</code> — any Tor exit could fake the weather or "Tor: Connected"); the wttr.in fallback is one bounded, control-free line; the full WMO table names drizzle, showers and snow (moderate rain is "Rain"); the place is shown with region and country. The health check gives the internet probe and the Tor check 10 s, never forces a new Tor identity on a timeout (it did, process-wide, 3×), and a failed probe over Tor says it is not proof the host is offline.</li>
+    <li><strong>Unknown tool:</strong> the reply lists every tool (it cut at 40 — <code>web_search</code> fell off) and, for a member, only member tools; a member is never told to use <code>execute</code>.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4lv_small_tools.py</code>.</p>
+  <h2 id="4nk">Research yield on onion sites <span class="tag">2026-10-11 &sect;4NK</span></h2>
+  <p><code>darkweb_research</code> now shares the clearnet research helpers (§4NJ; <code>search.run_research_slots</code>, <code>slot_coverage</code>, <code>research_no_facts</code>). Of 58 stored onion sources, 45 came back "nothing relevant" and 11 had facts. Bare homepages yielded 0 facts in 25 reads; pages with a path yielded facts in 11 of 29.</p>
+  <ul>
+    <li><strong>What is opened:</strong> <code>is_onion_reading_candidate(url, on_topic)</code> skips off-topic bare homepages, script/style/image/font files and a site's own search-results pages while another candidate exists. An on-topic homepage is still read (§4LG: topic beats path), and so are <code>.txt</code>/<code>.json</code>/<code>.xml</code> files: on onion sites a paste or canary is the content. If nothing qualifies, the ranked list is read as before.</li>
+    <li><strong>A DDoS-guard interstitial is a failed fetch</strong> (<code>search.is_bot_check_page</code>).</li>
+    <li><strong>A failed onion hands its slot to the next result</strong> (up to 7 reserves, 2 per slot, inside the phase deadline). Coverage is counted in slots, and replaced services get their own line. A reserve that the deadline stopped marks the run as truncated, so it is not cached.</li>
+    <li><strong>No relevant facts:</strong> the <code>[⚠ NO RELEVANT FACTS: …]</code> banner and reason code <code>darkweb_research_no_relevant_facts</code>, also on a cache hit. The evidence gate reads it as empty.</li>
+    <li><strong>The extractor recheck</strong> works as in <code>deep_research</code>: see <a href="../search/search.html#4nk">search §4NK</a>.</li>
+  </ul>
+  <p><code>darkweb_search</code> (the listing) fetches only engine result pages, so none of these source fixes apply to it. There is no recorded case of an engine bot-check page being misread as format drift. Tests: <code>tests/test_4nk_darkweb_research.py</code>.</p>
+  <h2 id="4nl">Downloading a file from a hidden service <span class="tag">2026-10-11 &sect;4NL</span></h2>
+  <p>A file found by onion research is fetched with <code>file_system(operation='download', url=…)</code>, which sends dark-web URLs to <a href="../coding/quarantine.html">the quarantine</a>, not the workspace. See that page for what is kept, how it is inspected, and the retention and access rules.</p>
+<h2 id="4pu">§4PU (2026-10-17): a past year next to "today" is dropped</h2>
+<p>The model's training ends in 2025, so it sometimes adds "2025" to a question about today. This happens even though every turn shows it <code>CURRENT TIME</code> (live request 3c527b55 searched "VUAA Vanguard S&amp;P 500 ETF price today 2025" on 2026-10-17). Before searching, <code>search.drop_stale_year</code> removes a year only when <strong>all</strong> of these hold:</p>
+<ul>
+  <li>The year comes <strong>right after a point-in-time word</strong>: <em>today, tonight, now, currently, this week/month</em>, or the Greek <em>σήμερα, τώρα, φέτος</em>. "Price today 2025" says two different dates at once. A year <em>before</em> the word is left alone, because it is usually a product, model or edition ("Hyundai Tucson 2025 now recall", "ISO 27001 2022 currently"). Only the copy right after the word is removed, so "Camry 2025 price today 2025" keeps the model year. "Current" and "latest" are not enough, because they describe a noun that can carry a real year: "SQL Server 2025 latest update", "current F1 season 2025", "Office 2024 current price".</li>
+  <li>The year is a bare token before this one. <code>2024-10</code>, <code>v2025</code>, <code>$2025</code> and <code>2025's</code> are left as they are, and so is a date like "October 2025".</li>
+  <li>None of your recent messages (the last four, this one included) contains that year, even as "…of 2025." or "FY2025". "What version of postgres was released in 2023?" keeps 2023.</li>
+  <li>Nothing makes the year the subject of the search. The word right before it isn't a period or comparison word (for example <em>since, in, of, for, from, until, vs, FY, tax, Q1–Q4</em>, a month name, or Greek <em>από, μέχρι</em>), and the query has no comparison or period word anywhere (for example <em>vs, versus, compared, annual, report, fiscal, tax, earnings, YTD, 10-K, results, season, edition, since</em>). The full lists are <code>_YEAR_ANCHOR_BEFORE</code> and <code>_YEAR_ANCHOR_ANY_RE</code> in <code>tools/search.py</code>.</li>
+  <li>The query does not also name this year.</li>
+</ul>
+<p>The rule is narrow on purpose. Two review rounds showed that a wider list of "now" words dropped years that mattered (product names, comparisons, seasons), while each patch for those missed real stale years. A year it misses is searched as before, but a year it drops by mistake gives a wrong search. A replay over the 3,828 logged search calls since August changes exactly one query: 3c527b55.</p>
+<p>The log prints <code>Search Year — web_search: dropped past year 2025 from a query about now ‹…› → ‹…›</code>. The result ends with "(Searched without '2025': the query asks about now, and today is 2026-10-17. If you meant that year itself, say so in the query — 'since 2025' or 'in 2025' keeps it.)". The check covers <code>web_search</code> and <code>deep_research</code> (and <code>fact_check</code>, which uses it). It also covers <code>darkweb_search</code> (every query, including <code>extra_queries</code>) and <code>darkweb_research</code>. Both research tools run it again after the anonymising rewrite.</p>
+</main>
+
+  <h2 id="4pd-review">Fresh-eye review: the dark-web tools <span class="tag">2026-10-14 &sect;4PD</span></h2>
+  <ul>
+    <li><strong>CRIT fixed — the parser froze the event loop.</strong> <code>_parse_onion_results</code> called <code>block.get_text()</code> once per anchor (quadratic: 8,000 anchors in a 1.1 MB page = 40 s with every owner turn, Slack and the heartbeat stalled) and ran synchronously. It now computes one text per block, reads at most <code>_PARSE_MAX_ANCHORS</code> (1,500) anchors, and runs under <code>asyncio.to_thread</code>.</li>
+    <li><strong>A redirect to another host is not the onion.</strong> <code>_fetch_onion_text</code> records the final URL and refuses (naming the host) a body served from a different host — an onion bouncing to the clearnet was read and attributed to the onion. An engine answering from another host is logged on every response.</li>
+    <li><strong>Result rows cannot forge rows or banners.</strong> Titles and snippets are one line with no <code>[</code>/<code>]</code> and no <code>###</code> run, so an engine's HTML cannot add a <code>### 2. … [Onion: …] (via …)</code> row or a <code>[⚠ SYSTEM …]</code> line.</li>
+    <li><strong>An honest "no documents match" page does not trip the breaker</strong> (three exotic queries on a small index used to put the engine in cooldown and the next search was told the engine had failed). The breaker still advances on empty bodies, redirects and errors.</li>
+    <li>A fetch failure is the fetcher's <em>type</em> (<code>FetchError</code>), not the page's first word; v2 (16-char) onions are no longer harvested (dead since 2021); a model-passed <code>max_results</code>/<code>max_sources</code> is coerced to an int in range instead of raising inside <code>gather()</code> and reading as "zero results".</li>
+    <li><strong>Anonymity note:</strong> the per-query SOCKS identity tag reaches page fetches only under <code>--anonymous</code>; in the default mode page fetches ride the shared default circuit (the search phase re-tags per engine and attempt either way). <code>NO_PROXY</code>/<code>no_proxy</code> in the environment would bypass an explicit proxy under libcurl — not set by the launcher or the LaunchDaemon; keep it so.</li>
+    <li><strong>Pins:</strong> <code>tests/test_4pd_search_review.py</code> (dark-web section); battery <code>scripts/mutate_4pd.py</code>.</li>
+  </ul>
+</body>
+</html>

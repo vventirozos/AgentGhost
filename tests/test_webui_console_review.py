@@ -400,7 +400,7 @@ class TestHttpErrorsKeepTheirDiagnosis:
 
 
 class TestResumeAdoptsRatherThanAppends:
-    """M13. docs/interfaces/web_server.html claimed the reconcile path
+    """M13. docs/reference/interfaces/web_server.html claimed the reconcile path
     "ADOPTS the session's server-side history wholesale — never appends,
     which would recreate the merge_history doubling case", and cited
     tests/test_interface_silent_resume.py as the pin. That file pins the

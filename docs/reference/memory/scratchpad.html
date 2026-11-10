@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scratchpad (memory.scratchpad) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="owner_rules.html">Owner rules</a>
+      <a href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a class="current" href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>memory / scratchpad.py — Scratchpad</h1>
+  <p class="subtitle">In-memory LRU + optional SQLite persistence with per-entry TTL (default 24 h).</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>OrderedDict in process memory (LRU).</li>
+    <li>Optional SQLite at <code>persist_path</code> (the DB file itself; prod passes <code>…/system/memory/scratchpad.db</code>) with table <code>scratchpad(key PK, value JSON, created_at REAL, accessed_at REAL, namespace TEXT)</code>. The <code>namespace</code> column (2026-07-22) is added to pre-scope DBs in place via <code>ALTER TABLE</code> at construction, so the per-entry scope tags survive restarts.</li>
+    <li><strong>Prod is persistent since 2026-07-14</strong>: <code>main()</code> builds the context scratchpad with <code>persist_path=$GHOST_HOME/system/memory/scratchpad.db</code>, so working state (the old <code>__current_project__</code> sentinel is gone since &sect;4SX B0 — each conversation's focus is a project-store row, and startup deletes the old keys) survives the plain-<code>kill</code> deploy path. <code>--no-memory</code> keeps it purely in-memory; self-play isolation contexts (<code>core/dream.py</code>) still build ephemeral <code>Scratchpad()</code>s.</li>
+    <li>A corrupt/unreadable DB at construction degrades to in-memory with a warning instead of raising (an unguarded raise at boot would respawn-loop the launchd supervisor).</li>
+    <li>Every SQLite connection is wrapped in <code>contextlib.closing</code> — <code>with sqlite3.connect(...)</code> alone only scopes the transaction, never closes the handle.</li>
+  </ul>
+
+  <h2>API</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(max_entries=50, persist_path=None, ttl=86400, max_echo_chars=500)</code></td><td>LRU + TTL config; <code>max_echo_chars</code> bounds the <code>set()</code> ack only.</td></tr>
+      <tr><td><code>set(key, value, namespace=_UNSET) -&gt; str</code></td><td>Store; LRU evict if over capacity. Tags the entry with <code>namespace</code> (or inherits <code>active_namespace</code>); <code>namespace=None</code> pins it to the global scope. The returned ack is echo-bounded — the STORED value is never truncated.</td></tr>
+      <tr><td><code>get(key) -&gt; Optional[Any]</code></td><td>Retrieve; TTL check; refresh <code>accessed_at</code> (sliding-window TTL).</td></tr>
+      <tr><td><code>list_all(namespace=_UNSET) / count() / delete(key) / clear()</code></td><td>Standard helpers; <code>list_all</code> can render one scope.</td></tr>
+      <tr><td><code>clear_namespace(ns, protect=None) / keys_in_namespace(ns) / namespaces() / namespace_of(key) / keys()</code></td><td>Scope operations (2026-07-22). <code>clear_namespace</code> deletes exactly ONE scope, sparing <code>protect</code>ed keys.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Eviction model</h2>
+  <ul>
+    <li>Age-based: any read computes <code>cutoff = now − ttl</code>; expired entries are deleted lazily.</li>
+    <li>Capacity-based: oldest LRU entry evicted when capacity exceeded.</li>
+    <li>Initial load on startup re-reads only non-expired entries.</li>
+  </ul>
+
+  <p><code>threading.RLock</code> guards in-memory dict + SQLite.</p>
+
+  <h2>Namespace scopes &amp; durability (2026-07-22)</h2>
+  <p>Covered by <code>tests/test_scratchpad_scope_fixes.py</code>.</p>
+
+  <h3>Per-entry namespace scope</h3>
+  <p>One process-wide scratchpad is shared by every conversation, project and background job, and it used to be a single flat namespace. So <code>tools/projects.py::_hydrate_scratchpad</code>'s "clear the previous project's keys" meant "delete every key that isn't a <code>proj::</code> key or a sentinel" — and it runs at REQUEST START for any conversation that doesn't own the bound project, so one unrelated chat message wiped in-flight swarm results owned by another conversation. Verified in prod: the live DB had been reduced to its 2 sentinel rows (the detached worker then re-created the key in whatever scope was live, and <code>jobs(action='collect')</code>'s bare <code>get(output_key)</code> returned <code>None</code> — an empty result with no error).</p>
+  <p><strong>Turn checkpoints are request-scoped and purged at load (§4IC, 2026-09-17).</strong> The turn loop writes <code>_checkpoint_t15</code> / <code>_checkpoint_t30</code> (the last five tool/assistant snippets) so earlier context can be pruned. They were written with no namespace — global, SQLite-persisted, and rendered by <code>list_all()</code> into <em>every</em> later request's DYNAMIC SYSTEM STATE. Request <code>21b295ef</code>'s 30-turn eckit checkpoints were still in the prompt an hour later when the same ask was re-sent: the model opened with "let me pick up where I left off … the checkpoint mentions eckit.grid" (<code>3cb143fc</code>, <code>3a2afac2</code>) and ignored its own working script in /workspace. Now the write is scoped <code>req:&lt;request id&gt;</code> (<code>agent.request_checkpoint_namespace</code>), <code>handle_chat</code>'s <code>finally</code> clears that scope through <code>GhostAgent._clear_request_checkpoints(req_id)</code> (a helper so the behaviour is testable and cannot be fenced off inside the <code>finally</code> — battery round 25 caught exactly that mutant surviving the AST-only pin), and <code>_load_from_db</code> deletes every key matching <code>TURN_CHECKPOINT_RE</code> (<code>^_checkpoint_t\d+$</code>) whatever its scope — no request survives a boot. Pins: <code>tests/test_scratchpad_request_checkpoints.py</code>.</p>
+  <p>Each entry now carries a NAMESPACE tag in a <code>_scopes</code> dict parallel to <code>_data</code> (<code>None</code> == global/free-chat). <code>set()</code> tags writes with <code>active_namespace</code> unless a <code>namespace=</code> is passed. The tag is metadata, NOT folded into the key, so every cross-subsystem bare-key lookup still resolves (swarm <code>output_key</code>, the job registry's resolver, <code>recall</code>, the <code>proj::</code>/sentinel conventions). New <code>clear_namespace(ns, protect=...)</code> deletes exactly ONE scope, so a project switch (<code>_clear_other_project_scopes</code>) now clears only OTHER projects' scopes and spares: the incoming project's scope, the global scope, sentinels, <code>proj::</code> keys, and in-flight background-job keys — a job's <code>output_key</code> and its <code>_swarm_task_id::</code> marker are NEVER dropped (the worker writes them minutes later, in whatever scope is live). Per-project isolation is preserved.</p>
+  <p>A park whose reversibility snapshot FAILED (<code>_snapshot_scratchpad</code> returned False) does NOT clear the outgoing project's keys: leaking is recoverable, deleting is not, and this runs at request start for conversations that merely share the process. The keys are left tagged with the old project (the next successful switch clears them) and only the write scope is reset, with a <code>warning</code>.</p>
+
+  <h3>Persistence-failure visibility &amp; bounded echo</h3>
+  <p><code>_persist_entry</code> now logs at <code>warning</code> (was <code>debug</code>) when the DB write fails while <code>set()</code> keeps serving the value from memory — a locked or full DB was silently making swarm results memory-only, a loss that surfaced only after the next restart. The operator watches the live stream, so this must be visible the moment it starts.</p>
+  <p>Separately, the string <code>set()</code> echoes back is bounded by <code>max_echo_chars</code> (default 500): the ack is handed straight to the model, so echoing a multi-KB swarm result doubled it into context for nothing (the model just wrote it). The STORED value is never truncated — only the acknowledgement is capped.</p>
+
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>LRU eviction is sentinel-aware:</strong> a busy project writing <code>max_entries</code>+ keys could durably evict <code>__current_project__</code> or another conversation's pending swarm <code>output_key</code> — dunder-named keys are now skipped (evict-anything only when nothing else remains). <strong>Session export/restore:</strong> new <code>export_state()</code> / <code>restore_state()</code> — the API route read <code>_data</code> without the lock (RuntimeError under concurrent mutation) and dropped namespace tags, so restore re-tagged every key into whatever namespace was active; legacy flat exports restore into the GLOBAL scope. The dream self-play report now passes <code>namespace=None</code> explicitly (it inherited the active project's namespace and got wiped by that project's <code>clear_namespace</code>). Tests: <code>::TestScratchpadHardening</code>.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+
+  <h2 id="4nw">Runtime keys are not shown to the model <span class="tag">2026-10-12 &sect;4NW</span></h2>
+  <p><code>list_all(hide_internal=True)</code> leaves out the runtime's own keys (<code>__current_project__</code>,
+  <code>__current_project_conv__</code>, <code>_session_*</code>, <code>_promotion_*</code>). The dynamic state block and the
+  scratchpad tool's <code>list</code> use it. Live request 6b3e22a6 read <code>__current_project__: e6f85dfb94f8</code> as its
+  current project — a pointer to a project deleted days earlier; the active project is shown by the CURRENT PROJECT block.
+  Pins: <code>tests/test_4nw_webos_defects.py</code>.</p>
+</main>
+</body>
+</html>

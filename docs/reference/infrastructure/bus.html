@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event bus (core.bus) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <div class="subnav">
+      <a href="agent.html">The agent core (core.agent)</a>
+      <a href="architecture.html">System Architecture</a>
+      <a class="current" href="bus.html">Event bus (core.bus)</a>
+      <a href="how_it_works.html">One message, end to end</a>
+      <a href="isolation.html">Isolation (core.isolation)</a>
+      <a href="mandatory_tor.html">Mandatory Tor (fail-closed egress)</a>
+      <a href="prompts.html">Prompts (core.prompts)</a>
+      <a href="request_lifecycle.html">Request lifecycle</a>
+      <a href="request_scope.html">Request scope (core.request_scope)</a>
+      <a href="safety.html">Safety and privacy</a>
+      <a href="tool_registry.html">Tool registry (tools.registry)</a>
+    </div>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / bus.py — MemoryBus</h1>
+  <p class="subtitle">In-memory pub/sub façade over Vector / Graph / Profile / Episodic stores. Hydrates context with Reciprocal Rank Fusion over a fixed weight table; publishes facts in parallel. Three tiers feed a prompt: the owner's facts (graph), experience and history. The owner's rules are read from <code>system/owner_rules.json</code> into their own <code>### OWNER RULES</code> block, outside the bus. The skill tier was removed with the lesson store on 2026-11-06 (&sect;4TD). The other stores are searched only through <code>recall</code>.</p>
+
+  <h2>Public surface</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Member</th><th>Signature</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__</code></td><td><code>(vector_memory, graph_memory, profile_memory, episodic_memory, session_store)</code></td><td>All tiers are optional — missing ones are skipped at fan-out time.</td></tr>
+      <tr><td><code>async hydrate_context</code></td><td><code>(query, *, max_chars=6000, rrf_k=0 (→ _RRF_K=10), context_budget=0, turn_id="", raw_user_text="", exclude_session_id="") -&gt; str</code></td><td>Fetch the live hydration tiers (owner facts + skill, since &sect;4NM) in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
+      <tr><td><code>async publish_fact</code></td><td><code>(event_type, fact_data) -&gt; Dict[str, Any]</code></td><td>Fan-out write to vector, graph, profile, skill stores in parallel. Dedup-LRU gate prevents replays.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>RRF (Reciprocal Rank Fusion)</h2>
+  <p>For each ranker the bus computes (three rankers feed a prompt: <code>graph</code> — the owner's facts, on a question about the owner — and the request-level <code>experience</code> and <code>history</code>; the <code>skill</code> ranker went with the lesson store, §4TD):</p>
+  <pre><code>score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)</code></pre>
+  <p><code>k = rrf_k</code>: <code>_reciprocal_rank_fusion</code> keeps <strong>60</strong> as its classmethod default, but the hydration path now passes <code>_RRF_K = 10</code> (2026-07-22, see the review section below). Per-source weights depend on a keyword-based query intent classification. <code>MemoryBus._INTENT_WEIGHTS</code> is the <strong>only</strong> table — hand-tuned, and listing just the two live hydration sources; a source not listed fuses at weight 1.0:</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Intent</th><th>graph (owner facts)</th><th>experience</th><th>history</th></tr></thead>
+    <tbody>
+      <tr><td>factual</td><td>2.03</td><td>1.0</td><td>1.0</td></tr>
+      <tr><td>procedural</td><td>0.464</td><td>1.0</td><td>1.0</td></tr>
+      <tr><td>contextual</td><td>0.927</td><td>1.0</td><td>1.0</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note"><strong>Learned weights removed (2026-10-11, §4NN).</strong> <code>core/rrf_weights.py</code> is gone: <code>system/rrf/weights.json</code> is no longer read, the boot line <code>RRF Weights — loaded learned intent→source weights</code> no longer prints, <code>context.intent_weights</code> and <code>MemoryBus(intent_weights=…)</code> are gone, and the liveness probe <code>rrf.observations</code> went with them. <code>_reciprocal_rank_fusion</code> still accepts a <code>weight_overrides</code> matrix for direct callers; production passes none. The vector, episodic and session columns the table used to carry left with those tiers in §4NM; <code>recall</code> still searches every store. The boot line said what hydrates (<code>Memory Bus Init</code>).</p>
+
+  <h2>Global budget + per-item emission (2026-07-07)</h2>
+  <p>There are <strong>no</strong> fixed per-source budgets. <code>_format_markdown_with_survivors</code> emits items <strong>strictly in descending fused-score order</strong> under one global <code>max_chars</code> (headers printed lazily on first sight of a source), with a <code>_PER_SOURCE_CAP</code> (6) so one tier can't monopolise the budget. An earlier redesign moved off the old 25/40/20/15 % section split because fixed quotas discarded the fused ranking; this section previously still documented the dead quotas.</p>
+  <p><strong>Per-item, not per-tier.</strong> <em>(History: the skill fetcher, the episodic fetcher and <code>_credit_surfaced</code> below are gone, §4NM and §4TD.)</em> The skill and episodic fetchers then return <strong>one RRF item per lesson / per episode</strong> (<code>SkillMemory.get_playbook_items</code>, <code>EpisodicMemory.format_episode</code>) instead of a single whole-tier blob. A blob was always rank 1 in its ranker regardless of any individual lesson's relevance, so the per-item relevance floor and <code>_PER_SOURCE_CAP</code> were no-ops on it, and under sub-query fan-out several near-identical multi-KB blobs each consumed the global budget. Per-item, each lesson/episode is ranked, gated, capped, and deduped on its own.</p>
+  <p class="note warn"><strong>Removed from prompts (switched off 2026-10-10 §4NG, tier code removed 2026-10-11 §4NM):</strong> the session tier's items were raw, undated past replies ("All Systems Operational ✅", old weather, day-old headlines) on 143 of 778 hydrations. Past sessions are no longer injected into any prompt; <code>recall</code> searches them on request instead, dated and excluding the active conversation.</p>
+  <p><strong>Session tier — raw conversations (2026-07-14).</strong> <code>_fetch_session</code> is the fifth fetcher: <code>SessionStore.search_messages</code> keyword-searches the 50 most-recently-updated stored sessions (mtime-cached parses; a 2-second summaries memo shares one scan across the sub-query fan-out; multi-term queries must match ≥2 distinct non-stopword terms). One RRF item per matching message, rendered <code>[session title] role: snippet</code> under a <code>### PAST CONVERSATIONS</code> header with the same reference-only framing as episodes. Intent weights: factual 0.8 / procedural 0.5 / contextual 1.2 — conversations answer "what did we discuss/decide" queries, not how-to ones. This closes the raw-layer gap: sessions were durable (2026-07-11) but replay-only, unreachable by every retrieval path. Tests: <code>tests/test_session_hydration_tier.py</code>.</p>
+  <p class="note"><em>History (2026-10-11, §4NM).</em> The bus's vector, episodic and session fetchers, the topical graph fetch and the off-topic vector gate described in the next paragraphs were deleted: hydration now fuses the owner's facts (graph tier, on a question about the owner) and the lessons (skill tier, until §4TD) only. The paragraphs are the record of how the retired tiers worked; <code>recall</code> still searches every store.</p>
+  <p><strong>Episodic semantic recall is wired.</strong> <code>_fetch_episodic</code> passes the bus's vector store to <code>search_similar</code>, so the embedding-based episode retrieval path fires (previously it always fell back to substring matching over the 100 most-recent episodes, leaving ~half the collection unreachable). Stubs with a 2-arg <code>search_similar</code> still work (the bus catches the <code>TypeError</code> and retries without the kwarg).</p>
+  <p><strong>Recall regression eval (2026-07-14).</strong> <code>tests/test_recall_regression_eval.py</code> seeds a golden corpus across all five tiers and asserts end-to-end hit-rates through the REAL pipeline (real BGE embeddings + Chroma + fusion) — the guard the retrieval stack never had (the embedder fingerprint catches a <em>wrong model</em>, nothing caught <em>worse retrieval</em>). Measured 2026-07-14: paraphrase recall 100% (floors set at 75% headroom); every tier-specific case passes.</p>
+  <p><strong>Off-topic gate (2026-07-15).</strong> The recall eval's former <code>xfail</code> — an off-topic query hydrating a small store — is now fixed and asserted. The fix is <em>not</em> the RRF <code>_RELEVANCE_FLOOR</code>: measured that it CANNOT reject an off-topic query, because RRF scores are a function of (rank, tier weight, intent) and discard the underlying embedding distance, so normalising against the top item makes the best match 1.0 whether the query is on- or off-topic (off-topic scores are in fact <em>flatter</em>). The real signal is the best match's <strong>absolute distance</strong>: on BGE-small a genuine match lands &lt; 0.40 while an off-topic query's closest item is ≥ 0.44. So <code>_fetch_vector</code> now passes <code>_VECTOR_MATCH_FLOOR</code> (0.42, env <code>GHOST_VECTOR_MATCH_FLOOR</code>) to <code>VectorMemory.search_items</code>: if the closest candidate exceeds it, the vector tier injects nothing. On-topic hydration is untouched (its true match is always well under the gate) so recall cannot regress; the gate is on the <em>hydration</em> path only — the recall tool stays best-effort for an explicit "what do you know about X".</p>
+  <p><strong>Usefulness feedback loop (2026-07-14).</strong> <em>History — the judge, the observations ledger and the refit no longer exist (the learned weights were removed in §4NN).</em> <em>Off by default since 2026-10-10 (&sect;4ND): the judge is spawned only with <code>GHOST_HYDRATION_JUDGE=1</code> (one model call per hydrated turn; 878 of 904 refits moved the weights by &le;0.07). With it off, no observations are written and the RRF refit has nothing new to fit.</em> Surfaced-credit alone is circular — items get credit for entering the prompt, so popular memories only get more popular. <code>hydrate_context</code> then stashed the turn's survivors (+ intent + timestamp) on <code>bus.last_hydration</code> (removed in §4TD: nothing read it); after the reply is final both agent finalization paths spawn <code>judge_hydration_usefulness</code> (fire-and-forget via <code>spawn_bg</code>, worker-hosted, 60&nbsp;s cap): one JSON call marks which snippets the reply <em>actually drew on</em> ("on-topic is NOT enough; when unsure, exclude"). Used vector items get <code>VectorMemory.bump_helpful</code> (helpful_count weighs 2× a plain retrieval in the spaced-repetition half-life), used skills get <code>record_helpful_retrieval</code>, and EVERY survivor — used or not — appends an <code>(intent, source, used)</code> line to <code>$GHOST_HOME/system/rrf/observations.jsonl</code>. The dream cycle's <code>_refit_rrf_weights</code> fits <code>fit_intent_weights</code> on ≥30 observations, persists <code>rrf/weights.json</code> (loaded at boot), hot-swaps the live matrix, and trims the ledger — turning the learned fusion weights from a static offline artifact into an online loop keyed to real usefulness. Stale stashes (&gt;10&nbsp;min, from turns that never finalized) are discarded; a worker failure or unparseable verdict credits nothing and writes nothing. Since 2026-07-16 the judge's spawn is <em>staggered</em> behind any in-flight deferred verifier verdict (bounded 90&nbsp;s wait — see <a href="../reliability/verifier.html">verifier</a> "Finalize-burst stagger"): the two used to hit the single worker node in the same second and the loser blew the route timeout. Tests: <code>tests/test_hydration_usefulness_loop.py</code>, <code>tests/test_finalize_stagger.py</code>.</p>
+  <p><strong>Retrieval credit was deferred to post-fusion</strong> <em>(history: removed with the lesson store, §4TD; hydration credits nothing now)</em>. The fetchers use side-effect-free reads (<code>search_items</code>, <code>get_playbook_items</code>); <code>_credit_surfaced</code> then bumps reinforcement counters exactly once per turn, only for the items that actually entered the prompt, via <code>VectorMemory.bump_retrievals(ids)</code> + <code>SkillMemory.record_retrievals_bulk(triggers)</code>. Previously every candidate of every sub-query was credited inside the search call — inflating <code>retrievals</code> ~4× per turn while <code>helpful_retrievals</code> credits at most once per window, which structurally crushed <code>hit_rate</code> and mis-flagged useful lessons as stale-and-prunable, at a cost of up to ~20 full <code>skills_playbook.json</code> rewrites per turn.</p>
+
+  <h2>Memory-substrate review fixes (2026-07-22)</h2>
+  <p><strong>RRF intent-weight fit is now relative + multiplicative on the prior (CRIT).</strong> <em>(History: <code>core/rrf_weights.py</code> was removed in §4NN; the next paragraph's estimator went with it.)</em> <code>rrf_weights.fit_intent_weights</code> computes <code>weight = prior * clamp(lift ** (GAMMA * shrink))</code>, where <code>lift</code> is the cell's usefulness relative to its OWN empirical base rate (the observed judged-used rate, not an assumed 0.5), <code>shrink = n / (n + PRIOR_STRENGTH)</code> makes the pull evidence-proportional, and a hard <code>MAX_DEVIATION = 2.0</code> band keeps a 2.0-prior cell inside [1.0, 3.0] — so a learned matrix can re-order tiers only mildly, never INVERT them. <code>lift == 1</code> (the cell performs exactly like the average injected item) reproduces the prior exactly; a degenerate all-fail or all-success sample carries no cross-tier contrast and is refused outright (the priors stand). The old fit calibrated "rate 0.5 → base weight", but the real judged-used rate is ~0.14, so every well-sampled cell landed on the lower branch and was crushed toward <code>WEIGHT_MIN</code> — the live <code>weights.json</code> had factual/graph at 0.1 (a 6.6x inversion of its 2.0 prior) and the whole intent matrix had collapsed into noise, leaving intent routing silently inert. The collapsed live <code>weights.json</code> was removed on deploy; it regenerates healthily on the next dream refit, which anchors on <code>DEFAULT_INTENT_WEIGHTS</code>.</p>
+  <p><strong>Turn-normalised lift kills the items-per-turn confound.</strong> <code>_per_turn_lift</code> credits each tier's SHARE of a turn's judged-used set (turn-normalised) rather than a raw per-item used-rate. Measured live 2026-07-22 over 130 turn-batches, hydration injects ~11.6 items/turn but the per-tier counts are wildly uneven (vector 4.55/turn, graph 1.09, skill 0.92), so a raw per-item rate mechanically capped a verbose tier near 1.65/4.55 ≈ 0.36 while a sparse tier could reach 1.0 — the old fit measured tier VERBOSITY, not usefulness. Shares are immune to that. <code>dream.py</code>'s <code>_refit_rrf_weights</code> now forwards the ledger's <code>turn</code> id so the turn-aware estimator activates; a legacy line without a turn id degrades to the pooled estimator (<code>fit_intent_weights</code> handles both shapes).</p>
+  <p><strong>Consensus normalisation + lower fusion <code>k</code>.</strong> <code>_reciprocal_rank_fusion</code> gained <code>normalize_consensus</code>: it divides each source's accumulated scores by that source's REDUNDANCY (emissions ÷ distinct items) across the sub-query lists, so a keyword-stable graph edge returned identically by 4 sub-queries no longer banks 4x the reciprocal rank while vector — which by design returns different items per sub-query — banks 1x. INTRA-tier ordering (the genuine cross-sub-query consensus reward) is untouched; the flag is off for direct classmethod callers and on for <code>hydrate_context</code>. Separately, the hydration path's fusion <code>k</code> dropped to <code>_RRF_K = 10</code>: at 60 the intra-tier spread flattened to ~19% over the 5-15 item lists this bus fuses, collapsing fused order to tier_weight × consensus and discarding the vector store's own distance ranking; <code>_reciprocal_rank_fusion</code> keeps 60 as its own default for back-compat.</p>
+  <p><strong>Adaptive budget honours the caller's <code>context_budget</code> as a base.</strong> A simple query gets it as-is; a medium query (&gt;15 words) gets 2x it capped at 9000; a complex one (&gt;30 words) 3x capped at 12000. The old form <code>min(max(context_budget, 6000), cap)</code> evaluated to 6000 in all three branches for the sole prod caller's <code>context_budget=4000</code> — the adaptive path was dead code, the 12000 ceiling unreachable, and the operator's deliberate 4000 silently overridden.</p>
+  <p><strong>Budget emission loop continues past an oversized item.</strong> When an item can't fit the remaining budget (and something is already emitted), <code>_format_markdown_with_survivors</code> now <code>continue</code>s to the next item instead of <code>break</code>ing. Items are ordered by fused score, NOT length, so the old break was simply wrong: a 900-char vector item at rank 3 discarded a 23-char SKILL LESSON and a 6-char graph edge that both fit trivially in the remaining ~277 chars — and because headers are emitted lazily on first sight, the entire SKILL PLAYBOOK and TOPOLOGICAL KNOWLEDGE GRAPH sections (headers included) vanished from the prompt silently.</p>
+  <p><strong>Intent is classified on the raw user text.</strong> <code>hydrate_context</code> gained a <code>raw_user_text</code> kwarg (agent.py passes <code>last_user_content</code>); <code>_intent_source_text</code> classifies it when supplied. The old path classified the whole expanded query — <code>Context: &lt;~200 chars of the PREVIOUS assistant reply&gt; | User intent: &lt;query&gt;</code> — so on a short follow-up the assistant's own prose (dense in classifier keywords) drove the tier weighting instead of the user's actual question. The <code>_EXPANSION_MARKER</code> tail-split remains as the fallback for call sites that don't pass the kwarg yet.</p>
+  <p><strong>Off-topic vector gate no longer self-disables on an unrelated <code>TypeError</code>.</strong> The blanket <code>except TypeError</code> that used to catch a stub's missing <code>min_relevance_dist</code> also swallowed any TypeError raised INSIDE a real <code>search_items</code> and retried without the gate — silently injecting the weakly-related tail with no log at all. <code>_accepts_relevance_floor</code> now decides by signature introspection whether the callable takes the parameter; a genuine arity mismatch on an introspectable callable drops the gate with a WARNING instead of masking a real error. (Distinct from the 2026-07-15 <code>_VECTOR_MATCH_FLOOR</code> distance gate above — this fixes how that gate is passed, not the gate itself.)</p>
+  <p><strong>Per-hydration instrumentation.</strong> <code>_log_hydration</code> emits one INFO line per hydration with per-tier candidate counts, per-tier survivor counts, survivor total, intent and budget — e.g. <code>Hydration tiers: v=4 g=0 s=2 e=3 sess=1 -&gt; 7 survivors (v2 g0 s2 e2 sess1) — the <code>x=N</code> fields count FETCHED candidates, the bracket the INJECTED ones intent=contextual budget=4000</code>. A wired-but-empty tier reads as <code>x=0</code> and an unwired (<code>None</code>) store as <code>x=-</code>, distinguishing "dead for weeks" from "not configured" — the cheap guard that would have surfaced this whole finding class months earlier. INFO so it lands in the file log without touching the WARNING+ console/pretty stream.</p>
+  <p>Tests: <code>tests/test_bus_rrf_fixes.py</code>.</p>
+
+  <h2>Dedup LRU</h2>
+  <p><code>_DEDUP_LRU_MAX = 256</code>. Each <code>publish_fact</code> hashes <code>(event_type, fact_data)</code> with MD5 before the fan-out — a recently-seen signature short-circuits and writes nothing. Prevents re-emission storms when the LLM repeats itself.</p>
+
+  <h2>Fan-out diagram</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" font-size="12">
+      <rect width="900" height="360" fill="#131822"/>
+      <defs><marker id="bus1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/></marker></defs>
+
+      <rect x="350" y="20" width="200" height="50" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="450" y="50" text-anchor="middle" fill="#e6e9ef">user query</text>
+
+      <rect x="300" y="100" width="300" height="50" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="450" y="130" text-anchor="middle" fill="#e6e9ef">"and also" keyword split (§4NQ)</text>
+
+      <rect x="60" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="140" y="220" text-anchor="middle" fill="#e6e9ef">VectorMemory</text>
+      <rect x="240" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="320" y="220" text-anchor="middle" fill="#e6e9ef">GraphMemory</text>
+      <rect x="420" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="220" text-anchor="middle" fill="#e6e9ef">SkillMemory (removed)</text>
+      <rect x="600" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="680" y="220" text-anchor="middle" fill="#e6e9ef">EpisodicMemory</text>
+
+      <rect x="300" y="280" width="300" height="50" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="450" y="310" text-anchor="middle" fill="#e6e9ef">RRF fusion + hand-tuned intent weights → markdown</text>
+
+      <line x1="450" y1="70" x2="450" y2="100" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="380" y1="150" x2="140" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="410" y1="150" x2="320" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="490" y1="150" x2="500" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="520" y1="150" x2="680" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="140" y1="240" x2="380" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="320" y1="240" x2="410" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="500" y1="240" x2="490" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="680" y1="240" x2="520" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+    </svg>
+    <p class="caption">Figure 5 — Memory-bus hydration as designed: parallel fetch across tiers, RRF fusion at the end. Since &sect;4NM the VectorMemory and EpisodicMemory branches no longer feed hydration; and since &sect;4TD SkillMemory does not exist; GraphMemory (owner facts), experience and history feed it.</p>
+  </div>
+
+  <h2>Concurrency</h2>
+  <p><code>asyncio.gather</code> drives the parallel fetches; sync-only memory stores are wrapped via <code>asyncio.to_thread</code>.</p>
+
+  <p>Detailed RRF derivation in <a href="../memory/memory_hydration.html">algorithms / memory hydration</a>.</p>
+
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Identity facts REPLACE, not stack:</strong> <code>publish_fact</code>'s vector leg was a plain <code>add()</code>, which left <code>smart_update</code> (and its whole subject/attribute conflict guard) with no production caller once the bus was always wired — every profile change minted a new row and stale values kept being served (live: duplicate <code>home_lab_worker_node</code> facts, 5 coexisting paraphrases of one activity fact). Identity-typed facts now route through <code>smart_update</code>. <strong>Fail-open reporting closed:</strong> the bus swallows subsystem exceptions into its report dict by design, but the memory tools discarded the report — a total write failure returned "SUCCESS". <code>remember</code>/<code>update_profile</code> now surface <code>PARTIAL:</code> with the failing subsystems (restores the legacy path's contract). <strong>Stash clobber:</strong> a survivor-less hydration only clears its OWN turn's <code>last_hydration</code> stash now (blind None destroyed an overlapping turn's stash before its judge consumed it; the stash itself was removed 2026-11-06, §4TD). Profile leg requires category+key (junk-key guard). Tests: <code>::TestBusIdentitySmartUpdate</code>, <code>::TestBusPartialReporting</code>.</p>
+
+  <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="4lb">What hydration no longer repeats <span class="tag">2026-10-03 &sect;4LB</span></h2>
+  <p>The vector tier drops the profile's mirror rows (identity — 42% of vector slots repeated the profile, on-demand fields
+  included) and episode twins (the episodic tier carries them). The graph tier drops chains through the agent's own nodes
+  (ai/assistant/system — 49% of graph items). Episodes are credited only post-fusion (§4LA).</p>
+  <h3>r2 (the review of the fixes)</h3>
+  <ul>
+    <li>The dropped types (<code>_VECTOR_DROPPED_TYPES</code>: skill, identity, episode) are passed to
+    <code>search_items(exclude_types=)</code> and removed BEFORE the off-topic gate — an identity row at 0.20 opened the
+    gate for "where do I live", was then dropped, and a 0.56 off-topic memory went in.</li>
+    <li>Episode twins: the vector tier admitted them at distance &lt; 0.70; the episodic tier keeps relevance ≥ 0.70
+    (distance ≤ 0.30). Episodes in between were the noise §4LA measured (nonsense queries scored 0.53–0.68), so they are
+    deliberately no longer injected — not "carried by the episodic tier".</li>
+    <li>The owner-fact lookup runs only on a question ABOUT the owner (first person and a question form, English or
+    Greek); request verbs (know, want, show, view, requested…) never name a fact. "What do you know about the database
+    view" filled every graph slot with <code>User KNOWS …</code>.</li>
+    <li>The agent-node filter drops a chain only where the agent is the SUBJECT (its own log lines); "user HAS_INTEREST
+    ai", "ghost IS_A framework" and a database named "agent" stay.</li>
+    <li>The episodic call is chosen by the stub's SIGNATURE; a TypeError raised inside the real search is an error, not a
+    retry without <code>credit=False</code> (which credited every candidate twice).</li>
+  </ul>
+
+  <h2 id="4le">Query split only on the user's words <span class="tag">2026-10-04 &sect;4LE</span></h2>
+  <p><code>_decompose_query(query, llm_client, basis=raw_user_text)</code>: the 8-word gate reads the user's own words,
+  and no split runs when the query was already rewritten by the expansion (one worker call before the reply is enough);
+  the route call gives up after 4 s (the keyword split is the fallback).</p>
+  <h2 id="4nq">No model call before retrieval <span class="tag">2026-10-11 &sect;4NQ</span></h2>
+  <p><code>hydrate_context</code> no longer takes <code>llm_client</code>: the Nova decomposition (RAG-Fusion, <code>_decompose_query</code>) is gone, and so is the agent's Nova rewrite of short follow-ups. <code>_split_query</code> keeps the free keyword split ("and also" / "as well as", each part 4+ words) and the <em>memory bus sub-queries</em> log line.</p>
+  <p>Measured before removal, on a copy of the live stores with Nova called live: of 166 real owner follow-ups the rewrite changed the hydrated block on 16 — it lost the owner's own fact on "what is my dogs name ?" (rewritten to "What is the name of the user's dog?", which no longer reads as a question about the owner), lost the exact lesson for "show me all projects", and turned "do a healthcheck" into "France fiscal crisis health check"; it helped on about three. Of 118 multi-part requests the decomposition changed 20, mostly by adding off-topic lessons (a "verify the write" lesson on a scripted tool test, an idiom lesson on a service restart). Each call cost 1-2 s before the first token. Data: <code>system/eval/census/4nq_rewrite/</code>.</p>
+
+  <h2 id="4nc">Graph links and episodes are no longer auto-loaded <span class="tag">2026-10-10 &sect;4NC · tiers removed 2026-10-11 &sect;4NM</span></h2>
+  <p>Operator decision ("Off in prompts, keep recall"), measured on 86 real owner requests.</p>
+  <ul>
+    <li><strong>The graph tier</strong> was 20% relevant and 16% harmful when loaded (about 53 tokens a turn). One image request's subject surfaced on 7 unrelated turns, and riddle details were stored as world facts.</li>
+    <li><strong>The episodic tier</strong> was 15% relevant and 19% harmful (about 59 tokens a turn). A two-month-old "all systems green" greeting episode surfaced on 12 requests.</li>
+    <li><strong>The removal:</strong> the topical graph and episodic prompt tiers (and their <code>GHOST_BUS_GRAPH_TIER</code> / <code>GHOST_BUS_EPISODIC_TIER</code> switches) were removed on 2026-10-11 (§4NM); <code>_fetch_graph</code> now injects only the owner's facts asked for by kind, and the tier instrumentation shows the removed tiers as "-".</li>
+    <li><strong>Nothing is deleted:</strong> the stores are still written and stay searchable by <code>recall</code>, which does not go through these fetchers. The skill, session and profile tiers are unchanged.</li>
+  </ul>
+</main>
+
+<h2 id="4mj">§4MJ (2026-10-08) — what each tier may inject</h2>
+<p>Measured by replaying 80 real owner requests through the real bus on a copy of the live stores: 12.8% of injected tokens were relevant and 8.6% misleading. Changes:</p>
+<ul>
+  <li><strong>Episodes:</strong> a FAILED episode with no lesson is not hydrated (it rendered as the failed reply's own text — 2 of 87 relevant); recall still returns it. A mostly non-Latin query needs two shared content words with the episode's trigger, because the English embedder places any two Greek sentences ~0.1 apart. Stored tool-call/think markup is stripped from a rendered episode.</li>
+  <li><strong>Graph:</strong> hydration seeds no fuzzy matches (<code>get_neighborhood(..., fuzzy=False)</code>; 91 items, 0 relevant) and no generic hub words (<code>project</code>, <code>sandbox</code>, <code>task</code>, <code>file</code> …) — the <code>project</code> node holds every project's title, which put one project's chains into 16% of unrelated turns. The <code>recall</code> tool keeps the fuzzy tier.</li>
+  <li><strong>Sessions:</strong> a message matches only where the query terms sit together — the hit is the 240-character window holding the most distinct terms, and the ≥2-term floor is counted inside it (two 5.9 KB replies used to match 23 of 80 unrelated requests and inject their opening).</li>
+  <li><strong>Budget</strong> scales on the user's own words, not the expanded follow-up string.</li>
+  <li><strong>No per-tier timeout (tried and reverted):</strong> a timed-out tier abandons its worker thread, which stays blocked on the store lock; under a held lock eight turns filled the default executor and every threaded call in the process stalled. Unbounded, only the turn waiting on the lock waits.</li>
+  <li><strong>Ranking-weight refit</strong> (removed with the learned weights, §4NN) read only usefulness rows written after the probe/member gates (<code>RRF_OBSERVATIONS_CLEAN_SINCE</code>, 2026-09-24 18:31): the earlier rows were 17% probe/member.</li>
+  <li><strong>Public channel:</strong> an owner turn in a public channel is not written to the autobiography (episodes already refused it).</li>
+</ul>
+
+
+<h3 id="4mj-decisions">§4MJ — operator decisions (2026-10-08)</h3>
+<ul>
+  <li><strong>The vector "memory context" tier is retired from hydration.</strong> Every type it may admit is a twin of another tier (episodes, lessons, identity) or excluded for planted-content risk (documents); it injected 0 items on 80 replayed real turns and cost an embedding + a Chroma query per turn. The fetcher returned nothing without touching the store and the instrumentation line shows <code>v=-</code>. <code>recall</code> keeps vector search. <em>2026-10-11 (§4NM): the fetcher, <code>GHOST_BUS_VECTOR_TIER</code>, <code>GHOST_VECTOR_MATCH_FLOOR</code> and the test-suite re-enable were deleted; the line still prints <code>v=-</code>.</em></li>
+  <li><strong>A hard-deleted project's episodes are forgotten with it.</strong> <code>EpisodicMemory.forget_project(id, title, live_titles)</code> deletes (archived to <code>episodes_forgotten.jsonl</code>) the episodes whose OWN text — trigger, context, outcome, lesson, not tool results (a project list names every project) — names the project id, or its title when the title is distinctive: ≥2 words or ≥8 characters, and no live project's title contains it or is contained in it (a deleted "Chess Coach" vs the live "Chess Coach v3"). Called by <code>manage_projects(action='delete')</code> after the graph unlink. The existing episodes were repaired by <code>scripts/memory_repair_4mj_episodes.py</code> (54 episodes of 17 deleted projects, from the store's <code>deleted_projects</code> table).</li>
+</ul>
+
+<h2 id="kb-review-1030">2026-10-30: Greek questions about the owner</h2>
+<p><code>_asks_about_owner</code> now reads Greek: the first-person pronouns με / μένα / εμένα, first-person verb endings (-ω, -ομαι, -ηκα…, with common adverbs excluded), the Greek question words (ποιος, πόσο, πού, πώς) and a trailing <code>;</code>. Before, most Greek owner questions got no owner facts. Measured on the 10-30 snapshot: 10.6% of the owner's hydrations inject anything, at a median of about 0.4 s. See <a href="../memory/memory_tools.html#kb-review-1030">the review</a>.</p>
+
+</body>
+</html>

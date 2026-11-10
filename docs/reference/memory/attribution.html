@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attribution (memory.attribution) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <div class="subnav">
+      <a href="adaptive_threshold.html">Adaptive recall threshold (memory.adaptive_threshold)</a>
+      <a class="current" href="attribution.html">Attribution (memory.attribution)</a>
+      <a href="dream.html">Maintenance (dream) (core.dream (maintenance))</a>
+      <a href="dream_cycle.html">Maintenance cycle</a>
+      <a href="episodes.html">Episodes (memory.episodes)</a>
+      <a href="experience.html">Experience (memory.experience)</a>
+      <a href="fact_ledger.html">Fact ledger (memory.fact_ledger)</a>
+      <a href="failclosed.html">Fail-closed stores (memory.failclosed)</a>
+      <a href="frontier.html">Frontier (memory.frontier)</a>
+      <a href="graph.html">Knowledge graph (memory.graph)</a>
+      <a href="journal.html">Journal (memory.journal)</a>
+      <a href="memory_hydration.html">Memory hydration (RRF)</a>
+      <a href="memory_tools.html">Memory tools (tools.memory)</a>
+      <a href="owner_rules.html">Owner rules</a>
+      <a href="profile.html">Owner profile (memory.profile)</a>
+      <a href="readonly.html">Read-only memory (memory.readonly)</a>
+      <a href="scratchpad.html">Scratchpad (memory.scratchpad)</a>
+      <a href="temporal.html">Temporal facts (memory.temporal)</a>
+      <a href="vector.html">Vector memory (memory.vector)</a>
+    </div>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory.attribution — who said it <span class="tag">2026-10-03 &sect;4KY</span></h1>
+  <p>The background fact extractor (<code>GhostAgent.run_smart_memory_task</code>) used to write facts ABOUT THE OWNER from
+  anything in an episode. Live: the owner's QUESTION "i'm a doctor/medicine denialist, is this male privilege?" became
+  <code>user HAS_PROFESSION doctor</code>, a vector fact and (via dream) a synthesis; a role-play replaced the owner's wife and
+  home; a pasted bio replaced the employer; the agent's own stats, tasks and files became "the user has…"; a channel member's
+  words in the owner's thread reached the owner's graph.</p>
+  <h2>The rule</h2>
+  <p>A fact about the owner — a graph triplet with <code>user</code> at either end, a profile value, a vector fact naming the
+  user — is written only when the OWNER STATED it: in the owner's own <code>USER:</code> lines (never one carrying the bot's
+  other-member label), in a sentence that is first-person or an instruction ("Always use UTC"), and that is not a question, not
+  role-play or a hypothetical ("pretend", "imagine", "suppose"…, Greek "φαντάσου"), and not inside quotes or code.
+  §4QN (2026-10-22) narrowed three cues the r4 probe caught on real sentences: "you're my assistant/agent/helper/AI,
+  remember …" instructs the agent and casts no role; "character" followed by designer/artist/animator/… is a job; and
+  "can't / cannot / couldn't imagine" states. Two more shapes from the same probe: a sentence typed WITHOUT accents that
+  opens with που/πως/γιατι is a question (with accents present, unaccented "που" stays the relative "that"; "που λες, …"
+  is a filler), and when the head before a colon names the ACT of reading, pasting or quoting, or a document that "says"
+  ("I'm reading a bio: Maria lives in London", "the article says: …"), the tail after the colon is someone else's — the
+  head must name the act, not a thing: "My email: …", "My bio: …", "I read your email: … I live in Athens" stay the
+  owner's own (review r1 of §4QN).</p>
+  <ul>
+    <li><code>owner_statements(episode)</code> → <code>(sentence, negated)</code> for each such sentence (folded, any script).</li>
+    <li><code>owner_said(value, statements)</code> → <code>"stated"</code> / <code>"negated"</code> / None. Triplets and profile values
+    need half the value's words in one affirmative sentence; a vector fact needs one shared word (it paraphrases — the check is
+    WHO said it).</li>
+    <li>A value the owner NEGATED ("im not a doctor") is a correction: <code>GraphMemory.owner_edges_naming</code> finds the
+    owner edges whose other end IS it and they are deleted (archived); nothing "not a doctor" is stored.</li>
+    <li>Predicates naming the agent's or a project's state (PROJECT, SKILL, TASK, SANDBOX, FILES, STAT, LEARNING, CODENAME,
+    REQUESTED…) are never owner facts (<code>is_agent_state_predicate</code>); decay no longer protects them either.</li>
+  </ul>
+  <h2>Around it</h2>
+  <ul>
+    <li>The extractor's pre-filter passes "im"/"not" and Greek first-person words — the owner's correction never reached it.</li>
+    <li>The extractor is given the CURRENT TIME its temporal rule refers to.</li>
+    <li>HAS_PROFESSION / HAS_OCCUPATION / WORKS_AS / HAS_JOB are single-valued: a new profession replaces the old.</li>
+    <li>"is not a" / "isn't a" / "am not a" are negation phrases: such a fact is never stored as identity.</li>
+    <li><code>update_profile</code> and <code>insert_fact</code> refuse probe (<code>probe-</code>) and background
+    (<code>job-</code>/<code>sched-</code>/<code>sub-</code>) turns; the journal gate also names sim and bench.</li>
+    <li>The smart-memory arc and the compaction archive skip another person's labelled thread messages
+    (<code>FOREIGN_MESSAGE_LABELS</code>).</li>
+  </ul>
+  <p>Tests: <code>tests/test_4ky_writers_review.py</code>; the sentence cases in <code>tests/test_4qm_fact_ledger.py</code>
+  and <code>tests/test_4qn_operator_items.py</code>; mutants A/R/Q in <code>scripts/mutate_4qm.py</code>.</p>
+  <h2 id="4kz">Tightened <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <ul>
+    <li>A turn that sets up role-play ANYWHERE contributes no owner statement ("Let's play a game. You are my wife Maria. We
+    live in London." passed sentence by sentence).</li>
+    <li>Negation is per clause: "spelled Έλενα, not Elena" states Έλενα and corrects Elena.</li>
+    <li><code>PREDICATE_CUES</code>: a single-valued owner fact needs a statement of its KIND (home needs live/moved/home…;
+    a shared word "Paralia" is not enough).</li>
+    <li>Checked on the RAW value, before temporal anchoring ("is now 10" → "born ~…" made every age update fail).</li>
+    <li>Every PERSONAL fact is gated (one without "user" skipped it); "we/our" and Greek plural verbs pass the pre-filter;
+    "sold" is a removal.</li>
+  </ul>
+
+  <h2 id="4qm">A question is never a statement <span class="tag">2026-10-22 &sect;4QM</span></h2>
+  <p>Before §4QM only a trailing "?" made a sentence a question, so "do you remember my wife elena" and "is my wife elena
+  a doctor" were the owner's STATEMENTS — attributed in the fact ledger and, through this gate, written as facts. The rule
+  now (narrowed after four review rounds, not widened — a lexical gate grown round by round flip-flops):</p>
+  <ul>
+    <li>A greeting or filler is stripped first ("hi, …", "hey Ghost, …", "λοιπόν, …"), at the sentence level.</li>
+    <li>The sentence asks when it opens with a wh-word not followed by I/we/my/our ("When I was 20 I lived in Patras" states);
+    with a plain auxiliary + you ("do you remember …" always asks); with a modal + you unless a RETENTION verb follows
+    ("can you also remember that I live in Athens" / "could you make a note that …" instruct; "can you remind me where my
+    wife works" / "can you forget my ex-wife" do not state); with an auxiliary + I/we unless a TELLING verb follows ("did I
+    mention …", "have I told you …", "may I remind you …" state); with an auxiliary before a noun phrase ("is my wife elena
+    a doctor", "was my previous car the audi"); with "tell/remind/show me", "any idea"; with a tag ("…, right"); with the
+    Greek question words τι/ποιος…, and πότε/πού/πώς/γιατί read WITH their accent on the raw sentence (folded "που" is the
+    relative "that"); or when a Greek sentence ends in ";" (the Greek question mark).</li>
+    <li>A clause asks on its own only in the auxiliary/modal shapes and the indirect question ("I wonder if you remember my
+    wife elena") — never on a wh-word: after a comma "who/which/where" is a relative pronoun ("My wife, who is called
+    Elena, is a doctor" states Elena).</li>
+    <li>"Don't forget …" / "never forget …" states; it is not a negation.</li>
+    <li>Greek states person in the verb: μετακόμισα/-αμε, παντρεύτηκα, γεννήθηκα, αγόρασα, θέλω, προτιμώ and the plural
+    είμαστε/έχουμε/μένουμε/δουλεύουμε/ζούμε count as first person.</li>
+    <li><code>owner_clause_for(value, episode, cue)</code> returns the owner's RAW clause (case and accents kept) that states a
+    value, for the ledger's "you said": the clause with the field's predicate cue first, then the widest coverage of the
+    value's words (digits count; stop words never decide).</li>
+  </ul>
+  <p>Known residue after §4QN (reported, not gated further): "could you remember my wife's name, elena" states (by
+  design — a request to remember is an instruction); the contrived "Imagine my surprise, we just moved to Patras" is
+  dropped as role-play; "by the way do you remember …" states (the lead-in list is fixed); a role-play cue anywhere
+  still empties the turn (§4KZ). The r4 102-sentence probe went 35 → 9 (r4 patch) → 2 wrong (§4QN).</p>
+  <h2 id="4sn">Corrections, cessation and the newest message (2026-10-31, §4SN)</h2>
+  <ul>
+    <li><code>field_kind(category, key)</code> returns the single-valued kind a profile field holds (<code>LIVES_IN</code> for location/address, <code>MARRIED_TO</code>, <code>HAS_PROFESSION</code> …), or "" for a field with no kind (vehicles, a pet). <code>predicate_kind(p)</code> returns the kind an extractor predicate states (<code>IS_A</code> → <code>HAS_PROFESSION</code>; <code>TRAVELING_TO</code> and <code>SELLING</code> → none).</li>
+    <li><strong><code>_apply_owner_corrections</code> (core/agent.py):</strong> the graph leg already honoured the predicate, but the profile leg deleted <em>any</em> field whose value matched. A negated statement now removes only a field of the same kind. "I'm not a doctor" still removes <code>root.role</code> = doctor. A field with no kind is removed only by a <em>removal</em>.</li>
+    <li><strong>A removal</strong> is a removal triplet the owner stated affirmatively ("we sold the BMW", "I gave away the BMW"). "I never sold the BMW" and "I'm not selling the BMW after all" are not removals. A negated statement of a kinded fact still corrects that kind ("I don't live in Patras anymore" removes <code>root.location</code> Patras, not <code>root.birthplace</code> Patras).</li>
+    <li><strong>Built and removed: a "stopped" rule.</strong> Rounds 1–3 tried a rule that read "I don't have the BMW anymore" as a removal of a possession. Every round found it deleting the wrong fact: a cessation about the son or wife, the reason half of a sentence ("…because I have the BMW", "…since we moved to Athens"), the wife's own fields. It is gone. A possession leaves the profile by a removal or the owner's <code>forget</code>, never by a negation. Do not rebuild it.</li>
+    <li><strong>A reason is its own clause.</strong> <code>_CLAUSE_SPLIT</code> also splits at because, since, γιατί, επειδή and αφού, so "I don't live in Patras anymore since we moved to Athens" negates Patras, not Athens.</li>
+    <li><strong><code>field_subject(category, key)</code></strong> says who a field is about beyond the owner (spouse, pet, child, parent, sibling, other: office, school, friend …). <code>field_kind</code> gives such a field no owner kind (review r2: <code>wife_employer</code> read as WORKS_AT, every <code>*_name</code> as HAS_NAME), except a spouse's name (MARRIED_TO). A field whose words name two kinds (<code>work_location</code>) has none.</li>
+    <li><code>latest_owner_episode(episode)</code> returns the episode cut to its last <code>USER:</code> message plus its continuation lines. A legacy item without speaker marks comes back unchanged; one whose last owner message carries another person's label comes back as "".</li>
+  </ul>
+
+</main>
+</body>
+</html>

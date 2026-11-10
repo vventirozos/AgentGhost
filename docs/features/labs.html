@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Labs — Ghost Agent</title>
+<meta name="description" content="Throwaway machines on demand: real database servers, clusters and web apps the agent creates, tests on, and destroys.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a class="current" href="labs.html">Labs</a>
+    <div class="subnav">
+      <a href="../reference/labs/labs_tool.html">The lab tool (tools.labs)</a>
+    </div>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Labs</h1>
+    <p class="subtitle">When a task needs a real PostgreSQL server, a three-node cluster or a running web app, the agent does not fake it. It asks a separate small machine for disposable containers, works on them, and throws them away.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Raspberry Pi 5 (disorder)</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>The agent's own sandbox is one container with no root, no extra ports and no network faults. That suits writing and running code. It does not suit "start PostgreSQL 18 with two replicas, cut the leader off the network and watch who takes over".</p>
+  <p>For that there are <strong>labs</strong>. A lab is a set of Docker containers (its <em>members</em>) on a private network of their own, built from a template. The labs host has no AI in it: the agent asks for something, and the service either does exactly that or answers with an error and a hint.</p>
+  <p>The rule is simple: <strong>build in the workspace, run the system under test in a lab</strong>. Code, SQL files and reports stay in the sandbox workspace, because labs disappear. Files move between the two, and a lab's recipe can be saved so the same setup can be rebuilt later.</p>
+
+  <h3>The templates</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Template</th><th>Members</th><th>Internet</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td><code>pg-single</code></td><td>pg1 (PostgreSQL 18)</td><td>none</td><td>running SQL, testing a migration, a query plan</td></tr>
+      <tr><td><code>patroni-3</code></td><td>pg1, pg2, pg3 (Patroni + etcd)</td><td>none</td><td>failover, replication, split-brain experiments</td></tr>
+      <tr><td><code>mysql-single</code></td><td>db1 (MySQL 8.0)</td><td>Tor</td><td>MySQL work</td></tr>
+      <tr><td><code>python-app</code></td><td>app (Flask + gunicorn, port 8080)</td><td>Tor</td><td>a web app; the usual start for a kept app</td></tr>
+      <tr><td><code>web</code></td><td>web1 (nginx, port 80)</td><td>Tor</td><td>static sites</td></tr>
+      <tr><td><code>blank-dev</code></td><td>dev (Debian)</td><td>Tor</td><td>anything else</td></tr>
+    </tbody>
+  </table></div>
+  <p>"Tor" means the lab reaches the internet only through the labs host's Tor gateway, as the agent itself does. "None" means no route out at all. A lab never reaches the agent's Mac or the home network.</p>
+
+  <h2 id="try">Try it</h2>
+  <p>You never have to name the tool. Just describe what you want run.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>“Check what <code>SELECT 41+1;</code> returns on PostgreSQL 18.”</td><td>A <code>pg-single</code> lab is created, the query runs with <code>psql</code>, the answer (42) comes back, and the lab is destroyed.</td></tr>
+      <tr><td>“Write a schema for Kosmas's library app, load it into a fresh database and save a dump.”</td><td>The schema is written in the workspace, copied into a lab, loaded, dumped, and the dump is copied back to the workspace.</td></tr>
+      <tr><td>“Start a three-node Patroni cluster, isolate the leader, and tell me who takes over and how long it took.”</td><td>A <code>patroni-3</code> lab; the leader is taken off the lab network without stopping it; the agent reads the new leader and the time, rejoins the node, and can save the recipe for a rerun.</td></tr>
+      <tr><td>“Run a 10-minute pgbench on the lab and tell me the TPS.”</td><td>A long job starts on a lab member. The agent collects it when it ends, and grades it by how it really ended, not by what it printed.</td></tr>
+      <tr><td>“In my chess project, put the app online and keep it running.”</td><td>A <code>python-app</code> lab is made a <em>kept</em> app: stable address, daily backups, a supervisor that restarts it, and a notice to you if it goes down twice in a row.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Create</h4><p>The agent asks for a template and waits until the lab's readiness check passes (at most five minutes, never past the turn's own deadline). The lab is recorded in the agent's lab inventory: who made it, for which conversation or project.</p></li>
+    <li><h4>Use</h4><p>Run commands on a member, copy files in and out, read logs, call a member's HTTP port, start a long job, or inject faults: stop, start, restart, kill, pause, unpause, isolate, rejoin.</p></li>
+    <li><h4>End</h4><p>The agent destroys the lab when done. If it forgets, the host's reaper removes an idle lab: after 4 hours for an ad-hoc lab, 12 hours inside a project, 2 hours for an autopilot build's lab, 30 minutes for a test probe, or once it reaches its maximum age.</p></li>
+  </ol>
+  <h3>Kept apps</h3>
+  <p>A lab made inside a project can be <strong>kept</strong>. It then runs one app under a stable address with no expiry. A new version is a second lab of the same app: you deploy it, rehearse it on a throw-away twin with empty data and fake secrets, then switch the address over. A failed check reverses the switch, and you can roll back. App secrets are never tool arguments; the host masks them in every output.</p>
+  <h3>Who may do what</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Caller</th><th>Disposable labs</th><th>Kept apps</th></tr></thead>
+    <tbody>
+      <tr><td>You, in your own chat</td><td>everything</td><td>everything: keep, deploy, switch, rollback, backup, restore</td></tr>
+      <tr><td>Autopilot</td><td>only its own project's; destroyed when the build step ends</td><td>read status only</td></tr>
+      <tr><td>Test probes</td><td>only labs a probe made</td><td>only inside a probe's own project</td></tr>
+      <tr><td>Channel members (other people in Slack)</td><td>no lab tool at all</td><td>none</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="where">Where it runs</h2>
+  <p>The labs service runs on a Raspberry Pi 5 called <strong>disorder</strong>. It holds the templates, the reaper that removes idle labs, the kept-app supervisor, a Tor gateway for labs that may go online, and a read-only Apps page listing kept apps. The agent on the Mac Studio (eva) talks to it over the private network with a key. A host firewall stops labs from reaching the agent or the home network.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Space is limited: a RAM budget, at most four disposable labs at once, and a separate allowance for kept labs. When the pool is full, your create evicts the oldest autopilot lab, never one of your own.</li>
+    <li>Autopilot cannot destroy a lab you used in the last 30 minutes.</li>
+    <li>The agent's browser cannot open a lab's ports; it uses the lab tool's HTTP call instead.</li>
+    <li>The tool appears only when a labs host and its key are configured. With neither, it is simply not offered.</li>
+    <li>Common refusals say what to do: the host did not answer, the lab limit is reached, not enough memory, an action only you may take, or an unknown (expired) lab.</li>
+    <li>The agent's old local PostgreSQL is gone. A database request runs in a lab.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/labs/labs_tool.html">The lab tool (tools.labs)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

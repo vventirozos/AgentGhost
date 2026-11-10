@@ -1549,7 +1549,7 @@ async def tool_browser(
         # inside — 5 live rows where EVERY action failed were booked a clean
         # success, and 24 more where some did. The per-action results are
         # right here; the envelope just never used them.
-        # §4RJ: a throw inside the model's own `evaluate` is that step's RESULT, not a failed action (43fe95a2; a timed-out evaluate stays one) — see docs/tools/browser.html
+        # §4RJ: a throw inside the model's own `evaluate` is that step's RESULT, not a failed action (43fe95a2; a timed-out evaluate stays one) — see docs/reference/search/browser.html
         _script_errs = [r for r in action_results if not r.get("ok") and r.get("action") == "evaluate" and "timed out" not in str(r.get("error") or "")]
         _own_script_only = bool(err_count) and len(_script_errs) == err_count and ok_count > 0
         _interact_status = "ok" if _own_script_only else "failed" if (err_count and not ok_count) else "partial" if err_count else "ok"

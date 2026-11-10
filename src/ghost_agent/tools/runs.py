@@ -1,5 +1,5 @@
 """§4SX Phase C: the `run` tool — everything that keeps running, anywhere (UNIFIED_DESIGN §3.2/§4,
-docs/labs/PHASE_C.md).
+docs/reference/labs/PHASE_C.md).
 
 Built ALONGSIDE `manage_services` / `jobs`, which are unchanged. It is NOT advertised to the model in
 Phase C (design r1 M2: a different tool list re-prefills the head); the Phase D switch advertises it,

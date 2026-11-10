@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice — Ghost Agent</title>
+<meta name="description" content="Speak to Ghost in Greek or English and hear the reply, with speech handled on your own machines.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a class="current" href="voice.html">Voice</a>
+    <div class="subnav">
+      <a href="../reference/voice/voice_loop.html">Voice loop</a>
+    </div>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a href="documents.html">Documents (RAG)</a>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Voice</h1>
+    <p class="subtitle">Hold the mic, speak in Greek or English, and Ghost answers out loud. You can even talk over a reply to stop it or change course, and your voice never leaves your own network.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: Mac mini (nova) + Mac Studio (eva)</span>
+      <span class="badge good">No cloud speech service</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>Voice is built into the web console, not a separate app. Hold the mic button and speak; when you let go, the clip is turned into text and sent as an ordinary message. The language is detected per clip, so you can switch between Greek and English freely.</p>
+  <p>Replies can be read aloud. English is spoken by a natural-sounding voice (Phonon) on the Mac mini; Greek is spoken by the macOS Greek voice, because the Phonon voice reads English only.</p>
+  <p>The interesting part is that nothing here uses a hosted speech API. No account, no key, no recordings sent to a company. That is a hard rule for the agent, and the reason it is built this way.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You do</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>Hold the mic and say “Τι καιρό θα κάνει αύριο στη Θεσσαλονίκη;”</td><td>Whisper writes it down in Greek, Ghost checks the weather, and the answer is spoken in Greek.</td></tr>
+      <tr><td>While the answer is being spoken, say “actually, make it Athens”</td><td>The reply pauses, your words are sent to the running turn, and Ghost carries on with the new place.</td></tr>
+      <tr><td>Say only “stop” during a reply</td><td>The speech ends and no new turn starts.</td></tr>
+      <tr><td>Cough while it talks</td><td>The reply pauses, finds no words, and carries on.</td></tr>
+      <tr><td>Tap the speaker button beside the mic</td><td>Spoken replies turn on or off for typed messages too. The browser remembers your choice.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Record</h4><p>The browser records while you hold the mic. Its face “breathes” with your voice.</p></li>
+    <li><h4>Transcribe</h4><p>The clip goes through the console server to Whisper large-v3 on the Mac mini. Voice-activity detection cuts the silence before and after you speak, because Whisper tends to invent a phrase on silence.</p></li>
+    <li><h4>Answer</h4><p>The text is sent as a normal chat message, so everything Ghost can do in text it can do by voice.</p></li>
+    <li><h4>Speak</h4><p>The reply is split into chunks. Chunks written mostly in Greek letters go to the macOS Greek voice; the rest go to Phonon on the Mac mini. If the Mac mini does not answer, the macOS English voice takes over so the reply is never silent.</p></li>
+  </ol>
+  <h3 id="talk-over">Talking over a reply</h3>
+  <p>After a message you sent from the mic, the microphone keeps listening while the reply is spoken and for three seconds after. The mic button shows a ring while it does. A typed message never opens it. When it hears you, the reply pauses: real words stop it and are sent, noise or an empty transcript lets it continue. With loudspeakers the mic may hear the reply itself; after three false starts it stops listening for that reply and says so. A headset avoids this. Turn the feature off with <em>Toggle voice interrupt</em> in the command palette (⌘K).</p>
+  <h3 id="speaker">The speaker button</h3>
+  <p>A message sent from the mic is always spoken, even with the button off, and the button stays lit until your next typed message. Turning it on during a reply starts speech with the next reply. Reloading the page does not read out a reply already running.</p>
+
+  <h2 id="where">Where it runs</h2>
+  <p>The web console server on the Mac Studio (eva) receives the audio and passes it on. Speech-to-text (Whisper) and English speech (Phonon) run as services on the Mac mini (nova). The macOS <code>say</code> voices used for Greek and as the fallback run on the machine with the console server. Everything travels only over your private network.</p>
+  <p>The separate sentiment service on the Mac mini reads the tone of what you say (in English) and nudges Ghost's mood a little. It does not change the answer itself.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>Measured on read speech, Whisper gets about 1 word in 8 wrong in Greek and 1 in 20 in English, in about 3 seconds per clip. Noisy rooms do worse.</li>
+    <li>There is no fallback for speech-to-text: if Whisper is down, voice input fails rather than handing Ghost wrong words.</li>
+    <li>Phonon has no emotion or style control; tone is not carried into the voice.</li>
+    <li>Talk-over has been tested in the web browser; real rooms and iPhones are less tested.</li>
+    <li>Switches: <code>GHOST_STT_URL</code> (Whisper service), <code>GHOST_TTS_URL</code> (Phonon; empty means macOS <code>say</code> for everything), <code>GHOST_TTS_VOICE</code> and <code>GHOST_TTS_VOICE_EL</code> (the English and Greek <code>say</code> voices), <code>GHOST_TTS_RATE</code>.</li>
+  </ul>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/voice/voice_loop.html">Voice loop</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

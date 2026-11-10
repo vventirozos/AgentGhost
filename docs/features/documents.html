@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documents — Ghost Agent</title>
+<meta name="description" content="Ghost reads PDFs, recordings and YouTube videos for you, answers questions about them, and writes PDF reports.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../start/getting-started.html">Getting started</a>
+    <a href="../start/installation.html">Installation</a>
+    <a href="../start/configuration.html">Settings that matter</a>
+    <a href="../start/troubleshooting.html">When something breaks</a>
+    <a href="../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="interfaces.html">Interfaces</a>
+    <a href="voice.html">Voice</a>
+    <a href="search.html">Search &amp; the web</a>
+    <a href="darkweb.html">Dark-web search</a>
+    <a href="pictures.html">Pictures</a>
+    <a href="memory.html">Memory</a>
+    <a class="current" href="documents.html">Documents (RAG)</a>
+    <div class="subnav">
+      <a href="../reference/documents/report_pdf.html">PDF reports (tools.report_pdf)</a>
+      <a href="../reference/documents/youtube_ingest.html">YouTube ingest (memory.youtube_ingest)</a>
+    </div>
+    <a href="coding.html">Coding &amp; sandbox</a>
+    <a href="projects.html">Projects &amp; autonomy</a>
+    <a href="labs.html">Labs</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a href="performance.html">Performance</a>
+    <a href="reliability.html">Reliability</a>
+    <a href="personal.html">Personal services</a>
+    <a href="infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../reference/index.html">All reference pages</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">Feature</span>
+    <h1>Documents</h1>
+    <p class="subtitle">Hand Ghost a 400-page manual, a two-hour recording or a YouTube link, and it reads or transcribes it once, then answers questions with the section or timestamp the answer came from. It can also write its findings up as a clean PDF report.</p>
+    <div class="hero-meta">
+      <span class="badge">Runs on: eva (Mac Studio), nova (Mac mini) for speech</span>
+      <span class="badge good">Tor-only</span>
+    </div>
+  </section>
+
+  <h2 id="what">What it does</h2>
+  <p>The <strong>knowledge_base</strong> tool is Ghost's document library. It takes text files, PDFs, web pages, audio and video files, and YouTube links. Each document is split into passages, each passage keeps its heading or its time range, and the whole thing is stored on eva.</p>
+  <p>Later, you ask about <em>that</em> document and only that document is searched. This matters: searching all of memory for an answer buried in a big manual works badly, because the manual competes with everything else. A document-scoped question returns more passages, with the section headings they came from.</p>
+  <p>Going the other way, <strong>report_pdf</strong> turns research into a styled, multi-page A4 PDF that you can download from the reply.</p>
+
+  <h2 id="try">Try it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>(upload <code>router-manual.pdf</code>) “Read this.”</td><td>The PDF is ingested: text extracted, split by section, indexed.</td></tr>
+      <tr><td>“In the router manual, how do I reset the admin password?”</td><td><code>query</code> searches only that manual and answers with the section path.</td></tr>
+      <tr><td>“How many chapters does it have?”</td><td><code>outline</code> gives the structure and exact counts; a search could never count.</td></tr>
+      <tr><td>(upload <code>meeting.m4a</code>) “Transcribe this.”</td><td>The recording is transcribed on nova's speech service and indexed with timestamps.</td></tr>
+      <tr><td>“Summarise this talk: <em>a YouTube link</em>”</td><td>Ghost fetches the captions over Tor (or the audio if there are none), transcribes, and summarises from the full ordered transcript.</td></tr>
+      <tr><td>“Keep that transcript.”</td><td>YouTube transcripts are temporary unless you ask to keep them.</td></tr>
+      <tr><td>“Research the top 5 home-battery options and give me a PDF report.”</td><td>Ghost researches, then one <code>report_pdf</code> call makes the PDF; the reply has a download card.</td></tr>
+      <tr><td>“What documents do you have?” / “forget the router manual”</td><td><code>list_docs</code>; forgetting shows a preview first and waits for your yes.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="how">How it works</h2>
+  <ol class="flow">
+    <li><h4>Recognise the input</h4><p>Text and PDFs are read directly. Audio and video (.mp3, .m4a, .wav, .mp4, .mkv and more) go to transcription. YouTube links (watch, youtu.be, shorts) take the video route; other web pages are fetched as HTML.</p></li>
+    <li><h4>Transcribe</h4><p>Long recordings are cut into overlapping windows and sent to the private speech service on nova. Silence is noted, and any part that failed is reported as a gap rather than hidden.</p></li>
+    <li><h4>YouTube over Tor</h4><p>YouTube blocks most Tor traffic. Ghost uses yt-dlp with a locally made proof-of-origin token and tries several fresh Tor circuits. It prefers manual captions, then the original-language automatic ones (never a machine translation), and falls back to the audio. A small canary checks now and then that this still works.</p></li>
+    <li><h4>Index and answer</h4><p>Passages are stored with their headings or times, plus an outline and, for recordings, the ordered transcript. Questions use <code>query</code> (passages), <code>outline</code> (structure) or <code>transcript</code> (the whole text, page by page).</p></li>
+    <li><h4>Write a report</h4><p><code>report_pdf</code> takes a title and markdown sections (or existing files the agent wrote) and lays them out with PyMuPDF. No network, no GPU.</p></li>
+  </ol>
+
+  <h2 id="where">Where it runs</h2>
+  <p>The library, ingestion and PDF writing run on <strong>eva</strong>. Speech-to-text runs on <strong>nova</strong> (Whisper). YouTube fetching goes over Tor from eva, helped by a local token service. Nothing is sent to a keyed outside API.</p>
+
+  <h2 id="limits">Limits and switches</h2>
+  <ul>
+    <li>An ingested document is stored as text, not as a file. The original may be gone; the tool's actions are the only way back to it.</li>
+    <li>Recordings longer than <code>GHOST_AUDIO_MAX_S</code> are refused with the reason. Live streams are refused.</li>
+    <li>YouTube can change its bot check at any time; then every circuit is refused until the tools are updated. The canary reports this.</li>
+    <li>Reports are capped at 200 pages; a cut or partial report says so.</li>
+    <li>Switches: <code>GHOST_STT_URL</code> (speech service), <code>GHOST_YT_FETCH_BUDGET_S</code> (time for one YouTube fetch), <code>GHOST_KB_DIST_STRONG</code> / <code>GHOST_KB_DIST_WEAK</code> (how close a passage must be).</li>
+  </ul>
+  <p>Deep reference: <a href="../reference/documents/youtube_ingest.html">YouTube ingest</a>, <a href="../reference/documents/report_pdf.html">report_pdf</a>, <a href="../reference/memory/memory_tools.html">memory tools</a>.</p>
+
+  <!-- refs -->
+<h2 id="reference">How it works: the reference pages</h2>
+<p>Written for maintainers: every mechanism, its settings and its history.</p>
+<ul class="ref-list">
+    <li><a href="../reference/documents/report_pdf.html">PDF reports (tools.report_pdf)</a></li>
+    <li><a href="../reference/documents/youtube_ingest.html">YouTube ingest (memory.youtube_ingest)</a></li>
+</ul>
+<!-- /refs -->
+
+  <footer><p>Ghost Agent documentation.</p></footer>
+</main>
+</body>
+</html>

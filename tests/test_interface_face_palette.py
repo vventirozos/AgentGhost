@@ -106,7 +106,7 @@ def test_per_node_and_per_line_hue_attributes_wired(graph_js):
 def test_cache_bust_versions_move_together(app_js):
     # index.html loads app.js?v=N and app.js imports matrix_graph.js?v=N.
     # Editing the module without bumping both leaves one browser-cached —
-    # the doc'd cache-bust discipline (docs/interfaces/web_server.html).
+    # the doc'd cache-bust discipline (docs/reference/interfaces/web_server.html).
     html = (_STATIC / "index.html").read_text(encoding="utf-8")
     app_v = re.search(r"app\.js\?v=([\d.]+)", html)
     graph_v = re.search(r"matrix_graph\.js\?v=([\d.]+)", app_js)
