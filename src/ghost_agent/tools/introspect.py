@@ -1332,7 +1332,12 @@ def _render_mood(self_model) -> str:
         lines.append("Today: " + (f"(+{more} earlier) " if more > 0 else "") + " → ".join(steps))
     elif not public:
         lines.append("Today: no change so far.")
-    lines.append(mood_tone_text(view, audience=("public" if public else "owner")))
+    # §4UB (evaluation: the quote showed a bored line no reply ever hears): the tone as a REPLY hears it
+    try:
+        heard = state.mood(for_reply=True, audience=("public" if public else "owner"))
+    except Exception:  # noqa: BLE001
+        heard = view
+    lines.append(mood_tone_text(heard, audience=("public" if public else "owner")))
     if not public:
         rest = resting_point_text(state)
         if rest:
@@ -1360,8 +1365,8 @@ def resting_point_text(state) -> str:
 
 
 #: what the mood view says when the replies get no tone line
-TONE_NONE = ("Tone at this reading: none — a neutral mood and no manner, so my replies are told "
-             "nothing about tone.")
+TONE_NONE = ("Tone at this reading: none — no mood a reply hears (neutral, or the boredom of a quiet, which "
+             "replies never hear) and no manner, so my replies are told nothing about tone.")
 #: the quote is a SNAPSHOT (review): written as an order and kept in the
 #: conversation, it would outlive the mood — a manner fades, and a neutral
 #: mood sends no line to contradict it. Only the current state block applies.

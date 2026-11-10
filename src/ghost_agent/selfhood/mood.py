@@ -29,8 +29,9 @@ What moves the pair is a closed list of EVENTS, each with a named size:
 what happened in an owner's turn (``turn_events``), the owner's thumbs, a
 correction, thanks, and the owner saying so in chat (``anchor_for`` —
 ``introspect(action="set_mood")``). A long quiet moves nothing: boredom is
-what a reader other than the owner sees over a neutral mood
-(``boredom_level``), never a value in the pair.
+read over a neutral mood (``boredom_level``) — the face, ``introspect`` and
+the health line show it; no reply hears it (§4TX: ``for_reply``) — and it is
+never a value in the pair.
 
 This module is pure: numbers in, numbers and text out, no I/O and no clock
 read. ``SelfStateThread`` (state.py) owns the stored pair, the journal and
@@ -228,9 +229,11 @@ def read_off(p: float, e: float, *, held_label: str = "", held_intensity: int = 
 
 # ── quiet → boredom (read-time only) ────────────────────────────────────────
 #
-# Boredom is never stored into the pair. A READER that is not the owner sees
-# "bored" while the owner has been quiet long enough AND the stored, decayed
-# mood is neutral — a real mood that has not worn off is not replaced. When
+# Boredom is never stored into the pair. A reader sees "bored" while the
+# owner has been quiet long enough AND the stored, decayed mood is neutral — a
+# real mood that has not worn off is not replaced. The face, introspect and
+# the health line show it; a REPLY never hears it (§4TX ``for_reply``: a quiet
+# is not taken out on whoever writes next). When
 # the owner returns, the quiet simply ends. (The first rule pulled the energy
 # down after 3 quiet hours and wrote it into the pair at the owner's return:
 # replayed over a month of the owner's real turns it left 13 % of his turns
@@ -307,6 +310,9 @@ TROUBLE_SHARE_FLOOR = 0.25
 #: most ``CLEAN_TURN_MAX``), shrinks with the failed share, and a long turn keeps it
 EV_CLEAN_TURN = (+0.08, 0.0)
 CLEAN_TURN_MIN_CALLS = 3
+#: §4UB (evaluation 11-10: 29 owner turns of 0–1 calls moved nothing, so the mood was a thumbs-up counter): a
+#: clean turn of 1 or 2 calls earns this share of the reward its calls would — small, but the work counts
+CLEAN_TURN_SMALL_SHARE = 0.5
 CLEAN_TURN_BASE = 0.04
 CLEAN_TURN_PER_CALL = 0.02
 CLEAN_TURN_MAX = 0.16
@@ -339,6 +345,12 @@ EV_PRAISE = (+0.10, 0.0)
 EV_SENTIMENT_POSITIVE = (+0.08, +0.02)
 EV_SENTIMENT_NEGATIVE = (-0.08, -0.02)
 SENTIMENT_MIN_SCORE = 0.85
+#: §4UB (evaluation 11-10: sarcasm read +0.94, "delete the failed jobs" −0.87, three bad-news messages made the
+#: agent "down"): what the sentiment of the owner's messages has put in the pair, decayed, never exceeds this on
+#: either side — clearly under the first bound and its hold-down (0.20 − 0.04 = 0.16; review r3: at exactly 0.16
+#: a steady tone held a level 1 it did not make, by floating point), so sentiment alone never makes or keeps a
+#: mood anyone hears; it only adds to one the agent's work or the owner's reactions made
+SENTIMENT_SHARE_MAX = 0.12
 
 
 @dataclass(frozen=True)
@@ -361,9 +373,10 @@ def _n(count: int, one: str, many: str) -> str:
 
 
 def _clean_reward(calls: int, share: float) -> float:
-    if calls < CLEAN_TURN_MIN_CALLS or share > CLEAN_TURN_MAX_SHARE:
+    if calls < 1 or share > CLEAN_TURN_MAX_SHARE:
         return 0.0
-    return round(min(CLEAN_TURN_MAX, CLEAN_TURN_BASE + CLEAN_TURN_PER_CALL * calls) * (1.0 - share), 4)
+    full = min(CLEAN_TURN_MAX, CLEAN_TURN_BASE + CLEAN_TURN_PER_CALL * calls) * (1.0 - share)
+    return round(full if calls >= CLEAN_TURN_MIN_CALLS else full * CLEAN_TURN_SMALL_SHARE, 4)
 
 
 def turn_events(sig: TurnSignals) -> List[Event]:
@@ -420,6 +433,10 @@ def turn_events(sig: TurnSignals) -> List[Event]:
         # §4TX review r2: a long clean turn earns the full reward whatever its call count (a 20-minute
         # turn of 2 good calls is not a slog)
         reward = round(CLEAN_TURN_MAX * (1.0 - share), 4)
+    if not long_clean:
+        # §4UB: a turn of mostly excused calls earns nothing, long or short (with the small-turn reward, 30
+        # calls of which 29 were excused earned "a turn of 1 tool call went through")
+        reward = 0.0
     if long_turn:
         ev = EV_LONG_CLEAN_TURN if long_clean else EV_LONG_TURN
         out.append(Event(ev[0], ev[1],
@@ -427,8 +444,8 @@ def turn_events(sig: TurnSignals) -> List[Event]:
                          KIND_TURN))
     if reward > 0:
         out.append(Event(reward, EV_CLEAN_TURN[1],
-                         (f"a turn of {calls} tool calls went through without a failure" if not failures else
-                          f"a turn of {calls} tool calls went through, {failures} of them failed"), KIND_TURN))
+                         (f"a turn of {_n(calls, 'tool call', 'tool calls')} went through without a failure" if not failures
+                          else f"a turn of {calls} tool calls went through, {failures} of them failed"), KIND_TURN))
     return out
 
 
@@ -491,13 +508,18 @@ PRAISE_WORDS = frozenset({"thanks", "thx", "ty", "cheers", "great", "perfect", "
 PRAISE_PAIRS = frozenset({("thank", "you"), ("thank", "u"), ("many", "thanks"), ("well", "done"),
                           ("good", "job"), ("great", "job"), ("nice", "work"), ("great", "work"),
                           ("good", "work"), ("nice", "one"), ("good", "stuff"),
+                          # §4UB (evaluation: "good job today…", "love it" fell through)
+                          ("love", "it"), ("love", "this"), ("love", "that"), ("nailed", "it"),
                           ("καλη", "δουλεια"), ("ωραια", "δουλεια")})
 #: words that may stand beside them. "is", "it's" and "that" are NOT among
 #: them ("is that so great", "is that perfect" are questions, not praise).
 PRAISE_FILLER = frozenset({"ok", "okay", "ghost", "mate", "that's", "thats", "very", "so",
-                           "much", "a", "lot", "really", "πολυ", "σε", "σου", "ρε", "σ"})
+                           "much", "a", "lot", "really", "πολυ", "σε", "σου", "ρε", "σ",
+                           # §4UB: time words and address — "good job today", "thanks again, man"
+                           "today", "tonight", "again", "as", "always", "man", "dude", "buddy",
+                           "σημερα", "παλι"})
 #: §4TX: a message that is nothing but these emoji is thanks too
-PRAISE_EMOJI = frozenset({"👍", "🙏", "👏", "🙌", "❤", "💯", "🔥"})
+PRAISE_EMOJI = frozenset({"👍", "🙏", "👏", "🙌", "❤", "💯", "🔥", "👌", "😊", "🥳", "💪"})
 _PRAISE_TOKEN_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*")
 #: a message that ENDS with one of these is a question (";" is also what the
 #: Greek question mark normalises to)
@@ -646,6 +668,12 @@ MANNER_LEVEL_SENTENCE = {
     2: "At 2 it is clearly noticeable, with a remark or two in character.",
     3: "At 3 it is strong throughout.",
 }
+#: §4UB (evaluation: the manner line kept "a remark or two" on every reply — the tic §4TX fixed for moods)
+MANNER_REMARKED_SENTENCE = {
+    2: "At 2 it is clearly noticeable in the wording; it already showed earlier in this conversation, so no "
+       "remark about it.",
+    3: "At 3 it is strong throughout; it already showed in this conversation, so do not announce it.",
+}
 #: §4TX: a remark about the mood is made once per conversation — the next replies of the same mood keep the
 #: tint without saying it again (review: "a remark or two" every reply became a verbal tic)
 REMARKED_LEVEL_SENTENCE = {
@@ -653,8 +681,9 @@ REMARKED_LEVEL_SENTENCE = {
        "remark about it.",
     3: "At 3 it is strong; you already let it show in this conversation, so do not announce it again.",
 }
-_LIMITS = ("WHAT you say stays exactly as it would be: the same facts, numbers, tool use and completeness, "
-           "no new topics or asides; the mood changes no answer and no refusal. Code, file contents, tool "
+_LIMITS = ("WHAT you say stays exactly as it would be: the same facts, numbers, tool use and every point "
+           "the answer needs (a manner trims only padding), no new topics or asides; "
+           "the mood changes no answer and no refusal. Code, file contents, tool "
            "arguments and commands carry no tone. Precedence: the owner's rules, then correctness, then the "
            "manner, then the mood. This applies to every reply, serious ones included.")
 #: §4TX: who asks why — the owner is pointed at the real cause, anyone else is told it is not about them
@@ -662,6 +691,15 @@ WHY_OWNER = 'Asked why, call introspect(action="mood") first - never guess a cau
 WHY_OTHERS = "It is not about the person you are talking to; never invent a cause."
 #: §4TX review r2: the owner on a public surface — others read the reply, and the owner may be its cause
 WHY_PUBLIC = "Others read this reply: never explain the mood or invent a cause here."
+#: §4UB (evaluation: a member heard "MANNER (set by the owner)" with no rule for "why", so the owner's private
+#: instruction could be quoted to a stranger): who set a manner is said to the owner only
+MANNER_WHY_OWNER = "Asked why, it is the manner the owner asked for today."
+MANNER_WHY_OTHERS = "If asked why, it is just how you are talking today; never say who chose it or why."
+
+
+def _manner_head(man: str, mn: int, gloss: str, audience: str) -> str:
+    return (f"MANNER (set by the owner): {man}, {mn} of 3.{gloss}" if audience == "owner"
+            else f"MANNER: {man}, {mn} of 3.{gloss}")
 
 
 def tone_line(label: str, intensity: int, manner: str = "", manner_intensity: int = 0, *,
@@ -689,15 +727,20 @@ def tone_line(label: str, intensity: int, manner: str = "", manner_intensity: in
         level = REMARKED_LEVEL_SENTENCE.get(n, LEVEL_SENTENCE[n]) if remarked else LEVEL_SENTENCE[n]
         why = {"others": WHY_OTHERS, "public": WHY_PUBLIC}.get(audience, WHY_OWNER)
         return (f"YOUR MOOD RIGHT NOW: {label}, {n} of 3."
-                + (f" MANNER (set by the owner): {man}, {mn} of 3.{gloss}" if man else "")
+                + (" " + _manner_head(man, mn, gloss, audience) if man else "")
                 + " Speak in that mood: it must be audible in HOW you phrase this reply - "
                   "word choice, rhythm - the way a person in that mood would say the same thing. "
-                + level + " " + why + " " + _LIMITS)
+                + level + " " + why
+                + ((" " + (MANNER_WHY_OWNER if audience == "owner" else MANNER_WHY_OTHERS)) if man else "")
+                + " " + _LIMITS)
     if man:
-        return (f"MANNER (set by the owner): {man}, {mn} of 3.{gloss}"
-                " Speak in that manner: it must be audible in HOW you phrase this reply - "
-                "word choice, rhythm - the way a person with that manner would say the same thing. "
-                + MANNER_LEVEL_SENTENCE[mn] + " " + _LIMITS)
+        level = (MANNER_REMARKED_SENTENCE.get(mn, MANNER_LEVEL_SENTENCE[mn]) if remarked
+                 else MANNER_LEVEL_SENTENCE[mn])
+        why = MANNER_WHY_OWNER if audience == "owner" else MANNER_WHY_OTHERS
+        return (_manner_head(man, mn, gloss, audience)
+                + " Speak in that manner: it must be audible in HOW you phrase this reply - "
+                  "word choice, rhythm - the way a person with that manner would say the same thing. "
+                + level + " " + why + " " + _LIMITS)
     return ""
 
 

@@ -95,6 +95,18 @@ _CORRECTION_PHRASES = (
     # Polite forms — same intent.
     r"actually,?\s+",
     r"hmm,?\s+(?:no|not)",
+    # §4UB (evaluation: "όχι, λάθος" was no candidate — the gate read English only). Greek, with or without
+    # the accents: no / wrong / that's not it / I didn't mean / try again / it doesn't work
+    r"[όο]χι\b",
+    r"λ[άα]θος\b(?!\s+μου)",                   # review r2: "λάθος μου" is the owner owning up
+    r"δεν\s+[εέ][ίι]ναι\s+(?:αυτ[όο]|σωστ[όο]|[έε]τσι)\b",
+    # review r1: "δεν είπα στη μαμά" (I didn't tell mom) is no correction — the bare verb needs "αυτό"/"έτσι"
+    r"δεν\s+(?:εννοο[ύυ]σα|(?:ζ[ήη]τησα|ρ[ώω]τησα|ε[ίι]πα)\s+(?:αυτ[όο]|[έε]τσι)\b)",
+    r"(?:ξανα|ξαν[άα]\s+)προσπ[άα]θησε",
+    r"ξαν[άα]\s+απ[όο]\s+την\s+αρχ[ήη]",
+    # review r1: "δεν δουλεύει το wifi, βρες μου τεχνικό" is a new problem — only "it doesn't work" said about
+    # what was just done (the end of the message, or ακόμα/πάλι/ακόμη after it); "μάλλον δεν" is gone
+    r"δεν\s+(?:δουλε[ύυ]ει|λειτουργε[ίι]|δο[ύυ]λεψε|λειτο[ύυ]ργησε)\s*(?:(?:ακ[όο]μα|ακ[όο]μη|π[άα]λι)\s*)?(?:$|[.!;,])",
 )
 
 _CORRECTION_RE = re.compile(

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from ghost_agent.selfhood import mood as M
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "interface" / "sentiment-service"))
@@ -459,13 +460,14 @@ def test_the_nudge_is_smaller_than_a_thumb_and_no_bigger_than_thanks():
     assert abs(M.EV_SENTIMENT_NEGATIVE[0]) < abs(M.EV_THUMB_DOWN[0])
 
 
-async def test_three_upbeat_messages_lift_a_neutral_mood_to_a_label(client, tmp_path):
+async def test_upbeat_messages_tint_the_mood_up_to_the_sentiment_share(client, tmp_path):
+    """§4UB: the owner's tone alone takes the pair no further than SENTIMENT_SHARE_MAX (under level 1)."""
     sm = _model(tmp_path)
     for _ in range(3):
         await C.score_message("finally got the promotion today!", sm.root, self_model=sm)
     v = sm.mood()
-    assert v.p == pytest.approx(0.24) and v.intensity >= 1
-    assert "the owner's message sounded upbeat" in v.cause
+    assert v.p == pytest.approx(M.SENTIMENT_SHARE_MAX) and v.intensity == 0
+    assert v.recent[-1]["cause"] == "the owner's message sounded upbeat"
 
 
 # ── the health line ─────────────────────────────────────────────────────────

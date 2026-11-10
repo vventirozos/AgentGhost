@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.19';
+import * as matrixGraphFace from './matrix_graph.js?v=19.20';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -1864,6 +1864,7 @@ function _stampReqId(div, id, unlabelable) {
 // sidecar, turning this turn's outcome=unknown into a real label for the
 // learning stack. Fire-and-forget with a visual latch on the tapped thumb.
 let _ruleHintShown = false;   // §4SZ: the 👎 hint speaks once per page load
+let _moodNoteShown = false;   // §4UB: "your set mood holds" speaks once per page load
 
 async function sendFeedback(div, signal, retryReqId) {
     const reqId = div.dataset.reqId;
@@ -1954,6 +1955,11 @@ async function sendFeedback(div, signal, retryReqId) {
         if (done && typeof done.hint === 'string' && done.hint && !_ruleHintShown) {
             _ruleHintShown = true;
             addMessage('system', done.hint);
+        }
+        // §4UB: a thumb while the owner's set mood holds is saved but does not move the mood — said once
+        if (done && typeof done.mood_note === 'string' && done.mood_note && !_moodNoteShown) {
+            _moodNoteShown = true;
+            addMessage('system', done.mood_note);
         }
     } catch (e) {
         console.warn('feedback failed:', e);

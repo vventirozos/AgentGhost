@@ -12496,6 +12496,64 @@ def mood_moves_on_this_request(context) -> bool:
         return False
 
 
+def _is_foreign_row(content) -> bool:
+    """§4UB: a user row the bot labelled as another person's (a channel
+    member's message in the owner's thread). Never raises."""
+    try:
+        from ..utils.logging import FOREIGN_MESSAGE_LABELS
+        if isinstance(content, list):
+            content = next((str(p.get("text") or "") for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"), "")
+        return isinstance(content, str) and content.lstrip().startswith(FOREIGN_MESSAGE_LABELS)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: §4UB review r1: queued messages read for the mood and then HANDED BACK unanswered (§4SB) — (conversation,
+#: words) → when. The request that re-sends one does not read it again. Bounded; in memory.
+_MOOD_QUEUED_READ: "collections.OrderedDict[Tuple[str, str], float]" = collections.OrderedDict()
+_MOOD_QUEUED_READ_S = 3600.0
+
+
+def _mood_queued_read(conv: str, content, *, queued: bool = False, handed_back: bool = False,
+                      now: Optional[float] = None) -> bool:
+    """§4UB: may this message be read for the mood? A queued one is read. A request's own message that was
+    read as a queued one and handed back (``handed_back=True`` records it, from ``_hand_back_unread``) in the
+    same conversation within the hour is not — once."""
+    if queued:
+        return True
+    try:
+        text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, default=str)
+    except Exception:  # noqa: BLE001
+        return True
+    key = (str(conv or ""), str(text or "").strip())
+    if not key[1]:
+        return True
+    t = time.time() if now is None else float(now)
+    with _MOOD_MEMO_LOCK:
+        for k in [k for k, at in _MOOD_QUEUED_READ.items() if t - at > _MOOD_QUEUED_READ_S]:
+            _MOOD_QUEUED_READ.pop(k, None)
+        if handed_back:
+            _MOOD_QUEUED_READ[key] = t
+            _MOOD_QUEUED_READ.move_to_end(key)
+            while len(_MOOD_QUEUED_READ) > _MOOD_MEMO_MAX:
+                _MOOD_QUEUED_READ.popitem(last=False)
+            return True
+        return _MOOD_QUEUED_READ.pop(key, None) is None
+
+
+def mood_job_tasks_count(context) -> bool:
+    """§4UB: may project tasks this request closed count for the mood? Only
+    the wake-up of a job the OWNER started (``request_kind`` "job": a job a
+    scheduled task, sub-agent, self-play or test started wakes as ``sub-``),
+    never a contained run."""
+    try:
+        from ..utils.logging import request_kind as _rk
+        return _rk() == "job" and not _mood_run_is_contained(context)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def mood_is_heard_on_this_request(context) -> bool:
     """Does this request's reply carry the tone line? Every main-loop reply
     to somebody: the owner (private or public surface), a channel member, a
@@ -12658,7 +12716,19 @@ def _mood_tone_block(context) -> str:
         view = sm.mood(for_reply=True, audience=audience)
         req_id = str(request_id_context.get() or "")
         conv = _mood_conversation()
+        if not conv:
+            # §4UB (evaluation: every scheduled report remarked on the mood — a run has no conversation key):
+            # scheduled runs are one conversation, job wake-ups another, so the remark is made once. Not a
+            # probe or an owner request with no key: each must read what a first turn reads
+            from ..utils.logging import request_kind as _rk
+            _kind = _rk()
+            if _kind in ("background", "job"):
+                conv = "kind:" + _kind
         if view.neutral and not view.manner:
+            # §4UB: an earlier step of this request heard a mood that has since gone — the record says what
+            # the REPLY heard (the last step), so it goes too
+            with _MOOD_MEMO_LOCK:
+                _MOOD_TONE_BY_REQ.pop(req_id, None)
             return ""
         remarked = _mood_remarked(conv, view.signature(), req_id)
         line = view.tone(remarked=remarked, audience=audience)
@@ -17359,6 +17429,13 @@ class GhostAgent:
             if not unread:
                 return 0
             texts = [str(m.get("text") or "") for m in unread]
+            try:
+                # §4UB review r1: the mood already read them at the drain — the re-send is not a second reading
+                # (any request: the memo only ever skips an owner's reading of the same words)
+                for t in texts:
+                    _mood_queued_read(_mood_conversation(), t, handed_back=True)
+            except Exception:  # noqa: BLE001
+                pass
             if isinstance(delivered_rows, list):
                 # the persisted rows: drop the unread ones from the END, by text
                 for t in reversed(texts):
@@ -30582,6 +30659,46 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001 — the mood never breaks a request
             logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
 
+    def _mood_read_owner_words(self, content, *, queued: bool = False) -> None:
+        """§4TC / §4TW / §4UB: what the owner's own words say to the mood —
+        thanks or praise (one praise reaction), and their tone, scored by the
+        sentiment service in the background (not when the praise counted it).
+        A real owner request only (`mood_moves_on_this_request`), and never a
+        row the bot labelled as another person's. Called for the request's
+        message and (§4UB, evaluation: they were never read) for each message
+        the owner sent while the turn ran. Never raises.
+
+        Review r1: a queued message the turn never got to answer (a cancel,
+        an upstream error) is handed back and re-sent (§4SB) — the request
+        that re-sends it does not read it a second time (`_mood_queued_read`)."""
+        try:
+            if not mood_moves_on_this_request(self.context) or _is_foreign_row(content):
+                return
+            if not _mood_queued_read(_mood_conversation(), content, queued=queued):
+                return
+        except Exception:  # noqa: BLE001
+            return
+        praised = False
+        try:
+            from ..selfhood.mood import KIND_PRAISE as _kp, has_praise as _hp
+            if _hp(content):
+                praised = True
+                self._mood_owner_reaction(_kp)
+        except Exception as e:  # noqa: BLE001 — the mood never breaks a turn
+            logger.debug("mood praise skipped: %s: %s", type(e).__name__, e)
+        try:
+            from ..selfhood import sentiment as _sentiment
+            if _sentiment.settings()[0]:
+                sm = _mood_model(self.context)
+                if sm is not None:
+                    from ..utils.logging import spawn_bg as _spawn_bg
+                    _spawn_bg(_sentiment.score_message(
+                        content, sm.root, request_id=str(request_id_context.get() or ""),
+                        tor_proxy=getattr(self.context, "tor_proxy", None),
+                        self_model=sm, praised=praised), name="sentiment")
+        except Exception as e:  # noqa: BLE001 — never breaks a turn
+            logger.debug("sentiment scoring not started: %s: %s", type(e).__name__, e)
+
     def _mood_owner_reaction(self, kind: str) -> None:
         """§4TC: the owner's reaction in chat (a correction of the last
         reply, thanks) moves the mood — an owner request only. Never raises."""
@@ -31137,35 +31254,10 @@ class GhostAgent:
                     # _note_defect_on_done_project.
                     self._note_defect_on_done_project(lc)
 
-                # §4TC: thanks / praise in the owner's message lifts the mood
-                # a little — once per request (this block runs once), for a
-                # real owner request only (`mood_moves_on_this_request`).
-                _mood_praised = False
-                try:
-                    from ..selfhood.mood import (KIND_PRAISE as _MOOD_KIND_PRAISE,
-                                                 has_praise as _mood_has_praise)
-                    if _mood_has_praise(last_user_content):
-                        _mood_praised = True
-                        self._mood_owner_reaction(_MOOD_KIND_PRAISE)
-                except Exception as e:  # noqa: BLE001 — the mood never breaks a turn
-                    logger.debug("mood praise skipped: %s: %s", type(e).__name__, e)
-
-                # §4TW: the owner's message is scored by the sentiment service in
-                # the background; a confident score is a small mood event (not
-                # when the praise above already counted it). Same owner-only
-                # predicate as the praise above.
-                try:
-                    from ..selfhood import sentiment as _sentiment
-                    if _sentiment.settings()[0] and mood_moves_on_this_request(self.context):
-                        _sm_sent = _mood_model(self.context)
-                        if _sm_sent is not None:
-                            from ..utils.logging import request_id_context as _rid_ctx, spawn_bg as _spawn_bg
-                            _spawn_bg(_sentiment.score_message(
-                                last_user_content, _sm_sent.root, request_id=str(_rid_ctx.get() or ""),
-                                tor_proxy=getattr(self.context, "tor_proxy", None),
-                                self_model=_sm_sent, praised=_mood_praised), name="sentiment")
-                except Exception as e:  # noqa: BLE001 — never breaks a turn
-                    logger.debug("sentiment scoring not started: %s: %s", type(e).__name__, e)
+                # §4TC / §4TW: thanks or praise in the owner's message, and its
+                # tone (the sentiment service, in the background) — once per
+                # request, a real owner request only (`_mood_read_owner_words`).
+                self._mood_read_owner_words(last_user_content)
 
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the
@@ -31180,8 +31272,9 @@ class GhostAgent:
                     # OWNER's turn, rewrote the autobiography and filed an
                     # owner calibration negative).
                     from ..utils.logging import is_probe_request_id as _ipr
-                    if requester_is_member() or _ipr(req_id):
-                        # §4MW r1: nor a probe's (a failure replay's) message
+                    if requester_is_member() or _ipr(req_id) or _is_foreign_row(last_user_content):
+                        # §4MW r1: nor a probe's (a failure replay's) message;
+                        # §4UB: nor a row the bot labelled as another person's
                         raise _SkipMemberCorrection()
                     # §4NF: the judge (up to 20 s, critic → worker → main)
                     # only relabels the PRIOR turn — nothing in this reply
@@ -36613,6 +36706,9 @@ class GhostAgent:
             note_added_user_message(t, req_id)
         except Exception:  # noqa: BLE001
             pass
+        # §4UB: the owner's words reach the mood here too (praise, tone) — not the correction judge: it relabels
+        # the PRIOR turn, and a mid-turn "no" is about this one
+        self._mood_read_owner_words(t, queued=True)
         try:
             from ..tools.memory import retire_declined_previews as _rdp
             _rdp(t)
@@ -37362,6 +37458,15 @@ class GhostAgent:
                             msgs, user_request, req_id,
                             duration_s=float(traj_kwargs.get("duration_s") or 0.0),
                             lockdown=bool(_plock)))
+            elif (not aborted and mood_job_tasks_count(self.context)):
+                # §4UB (evaluation: project work a job finished never registered): the wake-up of a job the
+                # OWNER started that closed project tasks DONE — that event only; the job's own failures and
+                # length are not the owner's turn (`SelfModel.note_job_tasks_done`)
+                _sm_mood = _mood_model(self.context)
+                if _sm_mood is not None:
+                    _done = self._mood_turn_signals(msgs, user_request, req_id).tasks_done
+                    if _done:
+                        _sm_mood.note_job_tasks_done(_done)
         except Exception as e:
             logger.debug(
                 "mood turn update skipped: %s: %s",

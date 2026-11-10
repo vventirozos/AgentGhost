@@ -134,7 +134,7 @@ def test_a_clean_turn_of_several_calls_lifts_it_a_little(tmp_path, owner):
     assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.10), 0.0)          # §4TX: 0.04 + 0.02 x 3
     two = _traj_agent(tmp_path / "two")
     _record(two, _turn([("execute", OK)] * 2))
-    assert _mood(two).p == 0.0
+    assert _mood(two).p == pytest.approx(0.04)                                      # §4UB: half of 0.08
 
 
 def test_a_designed_stop_is_not_a_failure(tmp_path, owner):

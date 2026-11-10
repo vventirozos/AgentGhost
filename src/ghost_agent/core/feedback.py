@@ -270,6 +270,7 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
             return {"ok": False, "error": "sidecar write failed",
                     "code": "unavailable"}
         unchanged = wrote == "unchanged"
+        mood_note = ""
 
         # The label is COMMITTED from here — post-write side effects must
         # not convert success into a 503 (R2 review: a pretty_log failure
@@ -321,6 +322,8 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     if (not unchanged and is_owner_label_source(source)
                             and turn_is_recent_enough(traj)):
                         from ..selfhood.mood import KIND_THUMB_DOWN, KIND_THUMB_UP
+                        # §4UB: said to the owner when their own set mood keeps the thumb out
+                        mood_note = _sm.reaction_hold_note()
                         _sm.note_owner_reaction(KIND_THUMB_UP if positive else KIND_THUMB_DOWN,
                                                 reply_id=str(rid or ""))
             except Exception as _sfe:  # noqa: BLE001 — label already committed
@@ -365,6 +368,8 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
         result = {"ok": True, "trajectory_id": traj.id, "outcome": outcome}
         if unchanged:
             result["unchanged"] = True
+        if mood_note:
+            result["mood_note"] = mood_note
         return result
     except Exception as e:  # noqa: BLE001 — a label must never 500 uncontrolled
         logger.warning("apply_human_label failed: %s", e)

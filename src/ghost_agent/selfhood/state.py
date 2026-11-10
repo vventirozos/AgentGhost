@@ -140,6 +140,9 @@ class MoodView:
     #: deviation; ``p``/``e`` above are rest + deviation, clamped) — set on
     #: ``nudge``'s after-view only; the reaction ledger books this
     moved: Tuple[float, float] = field(default=(0.0, 0.0), compare=False, repr=False)
+    #: §4UB review r6: what the sentiment-share cap took out of the pair in that same event (included in
+    #: ``moved``) — the share it removed belongs to the tones the ledger booked, not to the event's reply
+    capped: Tuple[float, float] = field(default=(0.0, 0.0), compare=False, repr=False)
 
     @property
     def neutral(self) -> bool:
@@ -511,6 +514,28 @@ class SelfStateThread:
         except Exception as e:  # noqa: BLE001
             logger.warning("mood events append failed: %s", e)
 
+    @staticmethod
+    def _cap_share_locked(owner: Dict[str, object], p: float, e: float) -> Tuple[float, float]:
+        """§4UB: keep the stored private share within ±``mood.SENTIMENT_SHARE_MAX`` (energy: the same fraction
+        of the tone's own energy), taking the excess out of the pair with it. Returns the pair."""
+        cap_p = M.SENTIMENT_SHARE_MAX
+        cap_e = M.SENTIMENT_SHARE_MAX * abs(M.EV_SENTIMENT_POSITIVE[1] / M.EV_SENTIMENT_POSITIVE[0])
+        x = float(owner.get("private_p") or 0.0)
+        if abs(x) > cap_p:
+            over = x - (cap_p if x > 0 else -cap_p)
+            p, owner["private_p"] = M.clamp(p - over), (cap_p if x > 0 else -cap_p)
+        y = float(owner.get("private_e") or 0.0)
+        if abs(y) > cap_e:
+            over = y - (cap_e if y > 0 else -cap_e)
+            e, owner["private_e"] = M.clamp(e - over), (cap_e if y > 0 else -cap_e)
+        return p, e
+
+    def private_share(self, *, now: Optional[datetime.datetime] = None) -> Tuple[float, float]:
+        """§4UB: what the owner's message sentiment has in the pair now (decayed, stored — a restart keeps it;
+        the reaction ledger takes it back out when a stronger reaction replaces a tone)."""
+        with self._lock:
+            return self._private_now(self._state.mood, now)
+
     def note_held(self, kind: str, cause: str, dp: float, de: float, why: str, *,
                   now: Optional[datetime.datetime] = None) -> None:
         """§4TX: an event that was not applied, with why — one events-log row."""
@@ -750,6 +775,13 @@ class SelfStateThread:
                 # §4TX: the share the owner's sentiment put in — what was really added, after the clamp
                 owner.update(private_p=M.clamp(owner["private_p"] + (p - base.p)),
                              private_e=M.clamp(owner["private_e"] + (e - base.e)))
+            # §4UB review r5: THE cap on what the owner's message sentiment holds in the pair, kept at the one place
+            # the share is written. Five review rounds found a ledger path around each cap placed before it
+            # (a restart, a second tone on one reply, a changed thumb, a tone that stopped counting); here no path
+            # gets around it: whatever exceeds ±SENTIMENT_SHARE_MAX leaves the share AND the pair together
+            p0, e0 = p, e
+            p, e = self._cap_share_locked(owner, p, e)
+            capped = (round(p0 - p, 4), round(e0 - e, 4))
             # the novelty tag belongs to the move that set it: a later event
             # that is not itself a research event clears it (review r2 —
             # research, then three thumbs, read "curious, 3 of 3: the owner
@@ -771,7 +803,8 @@ class SelfStateThread:
             self._append_event_locked(kind=kind, cause=cause, dp=dp, de=de, after=self._describe(new), now=now)
             if changed:
                 self._append_history_locked(new, str(kind or ""), prev=before.describe())
-            return before, self._view_of(new, now, rest, moved=(round(p - base.p, 4), round(e - base.e, 4)))
+            return before, self._view_of(new, now, rest, moved=(round(p - base.p, 4), round(e - base.e, 4)),
+                                         capped=capped)
 
     @staticmethod
     def _describe(m: Mood) -> str:
@@ -819,11 +852,11 @@ class SelfStateThread:
                     manner_steps=ahead)
 
     def _view_of(self, m: Mood, now: Optional[datetime.datetime] = None, rest=None,
-                 moved: Tuple[float, float] = (0.0, 0.0)) -> MoodView:
+                 moved: Tuple[float, float] = (0.0, 0.0), capped: Tuple[float, float] = (0.0, 0.0)) -> MoodView:
         cls = type(self)
         rp, re_ = self.rest() if rest is None else rest   # §4UA: a reader sees rest + deviation
         return MoodView(
-            label=m.label, intensity=m.intensity, p=_shown(m.p, rp), e=_shown(m.e, re_), moved=moved,
+            label=m.label, intensity=m.intensity, p=_shown(m.p, rp), e=_shown(m.e, re_), moved=moved, capped=capped,
             source=(m.source if m.intensity else M.SOURCE_AUTO), set_at=m.set_at,
             cause=(m.cause if m.intensity else ""),
             recent=tuple(dict(r) for r in m.recent),
@@ -882,11 +915,15 @@ class SelfStateThread:
             return dict(private_p=0.0, private_e=0.0)
         pp, pe = cls._private_now(base, now)
 
-        def _part(share: float, old: float, new: float) -> float:
+        def _part(share: float, old: float, new: float, cap: float) -> float:
             if not share or not old or share * old <= 0 or old * new <= 0:
                 return 0.0
-            return max(-abs(new), min(abs(new), share * (new / old)))
-        return dict(private_p=round(_part(pp, base.p, p), 4), private_e=round(_part(pe, base.e, e), 4))
+            # §4UB review r6: never more than the cap (an anchor larger than the pair on an axis grew it past)
+            bound = min(abs(new), abs(share), cap)
+            return max(-bound, min(bound, share * (new / old)))
+        cap_p = M.SENTIMENT_SHARE_MAX
+        cap_e = M.SENTIMENT_SHARE_MAX * abs(M.EV_SENTIMENT_POSITIVE[1] / M.EV_SENTIMENT_POSITIVE[0])
+        return dict(private_p=round(_part(pp, base.p, p, cap_p), 4), private_e=round(_part(pe, base.e, e, cap_e), 4))
 
     @staticmethod
     def _hold_end(at: str) -> str:

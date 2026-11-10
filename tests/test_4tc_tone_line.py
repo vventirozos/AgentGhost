@@ -38,8 +38,8 @@ ASK = "how old is Bruno?"
 
 HOW = (" Speak in that mood: it must be audible in HOW you phrase this reply - word choice, rhythm - "
        "the way a person in that mood would say the same thing. ")
-LIMITS = ("WHAT you say stays exactly as it would be: the same facts, numbers, tool use and completeness, "
-          "no new topics or asides; the mood changes no answer and no refusal. Code, file contents, tool "
+LIMITS = ("WHAT you say stays exactly as it would be: the same facts, numbers, tool use and every point "
+          "the answer needs (a manner trims only padding), no new topics or asides; the mood changes no answer and no refusal. Code, file contents, tool "
           "arguments and commands carry no tone. Precedence: the owner's rules, then correctness, then the "
           "manner, then the mood. This applies to every reply, serious ones included.")
 #: §4TX: the owner is pointed at the real cause; anyone else is told it is not about them
@@ -82,7 +82,7 @@ def test_level_one_is_a_tint_and_only_level_three_may_name_the_mood():
 def test_the_line_with_a_manner_names_it_between_the_mood_and_the_instruction():
     line = M.tone_line("cheerful", 2, "sarcastic", 3)
     assert line == ("YOUR MOOD RIGHT NOW: cheerful, 2 of 3. MANNER (set by the owner): sarcastic, 3 of 3."
-                    + HOW + LEVEL[2] + " " + WHY + " " + LIMITS)  # the level sentence is the MOOD's
+                    + HOW + LEVEL[2] + " " + WHY + " " + M.MANNER_WHY_OWNER + " " + LIMITS)  # the level sentence is the MOOD's
 
 
 @pytest.mark.parametrize("m,level", [
@@ -94,7 +94,7 @@ def test_the_line_for_a_manner_alone(m, level):
     line = M.tone_line("neutral", 0, "formal", m)
     assert line == (f"MANNER (set by the owner): formal, {m} of 3. Speak in that manner: it must be audible in "
                     "HOW you phrase this reply - word choice, rhythm - the way a person with that manner would "
-                    "say the same thing. " + level + " " + LIMITS)
+                    "say the same thing. " + level + " " + M.MANNER_WHY_OWNER + " " + LIMITS)
     assert "MOOD" not in line and "in this mood" not in line
 
 
@@ -119,7 +119,10 @@ def test_every_line_is_one_line_with_the_limits_and_no_number_of_the_pair():
                 assert "\n" not in line and line.endswith(LIMITS)
                 assert not re.search(r"\d\.\d|\d:\d\d|ago|because|since", line), line
     # §4TX: + the "why" sentence, no tone in code / tool arguments, the precedence (was < 600)
-    assert len(M.tone_line("irritable", 3, "sarcastic", 3)) < 800
+    # §4UB review r1: + the manner's "why" for the owner too (was < 800)
+    assert len(M.tone_line("irritable", 3, "sarcastic", 3)) < 850
+    # §4UB: a member's line also carries the manner's "why" rule
+    assert len(M.tone_line("irritable", 3, "sarcastic", 3, audience="others")) < 900
 
 
 def test_the_line_depends_on_the_label_the_intensity_and_the_manner_only(tmp_path):

@@ -106,6 +106,9 @@ class SelfModel:
         #: reply → the part of ``_applied`` the owner's message sentiment put in (same shape): it is the
         #: "private share" others do not hear, and it comes back out when a stronger reaction replaces it
         self._private_booked: Dict[str, Tuple[float, float, datetime.datetime, str]] = {}
+        #: §4UB: when the agent last had trouble the owner saw — a turn that lowered the mood, a thumbs-down, a
+        #: correction (in memory). An upbeat tone right after it may be sarcasm (``sentiment.doubtful``)
+        self._trouble_at: Optional[datetime.datetime] = None
         #: an owner message (its request id) → the reply it answers (the owner's previous request id)
         self._answers: "OrderedDict[str, str]" = OrderedDict()
         #: conversation → its last owner reply (review r2: one global "last reply" booked a Slack correction
@@ -307,6 +310,43 @@ class SelfModel:
         except Exception as e:
             logger.debug("mood turn events skipped: %s: %s", type(e).__name__, e)
             return None
+        if ev is not None and ev.dp <= self.TROUBLE_MIN_DP:
+            self._trouble_at = self._now_of(now)
+        elif ev is not None and ev.dp > 0:
+            self._trouble_at = None          # review r3: a good turn after it — the trouble is over
+        return self._apply(ev, now=now)
+
+    #: §4UB: how long after the agent's trouble an upbeat message is doubted
+    TROUBLE_RECENT_S = 1800.0
+    #: review r2: a turn is trouble the owner saw when it lowered the mood this much (one full failure); 1 failed
+    #: call of 6 in a good turn (−0.04 net) is not
+    TROUBLE_MIN_DP = -0.10
+
+    def recent_trouble(self, now=None) -> bool:
+        """§4UB: did the agent have trouble the owner saw (a turn that lowered the mood, a thumbs-down, a
+        correction) in the last ``TROUBLE_RECENT_S``? In memory: a restart forgets it."""
+        at = self._trouble_at
+        if at is None:
+            return False
+        try:
+            age = (self._now_of(now) - at).total_seconds()
+        except Exception:  # noqa: BLE001
+            return False
+        return -60.0 <= age <= self.TROUBLE_RECENT_S
+
+    def note_job_tasks_done(self, done: int, *, now=None) -> Optional[MoodView]:
+        """§4UB (evaluation: project work a background job finished never registered): project tasks a job the
+        OWNER started closed DONE — the task-done event only, nothing else of the job's run (its failures are
+        not the owner's turn). The caller decides that the job is the owner's."""
+        try:
+            n = int(done or 0)
+        except (TypeError, ValueError):
+            return None
+        if n <= 0:
+            return None
+        ev = M.merge_events(M.turn_events(M.TurnSignals(tasks_done=n)))
+        if ev is not None:
+            ev = M.Event(ev.dp, ev.de, ev.cause + " (in a background job)", ev.kind, novelty=ev.novelty)
         return self._apply(ev, now=now)
 
     #: how many replies the ledger remembers (in memory: a restart forgets it, and a later reaction counts in full)
@@ -314,6 +354,8 @@ class SelfModel:
     #: why a reaction moved nothing
     HELD_ALREADY_COUNTED = "already counted for this reply"
     HELD_AT_LIMIT = "the mood is already at its limit"
+    #: §4UB
+    HELD_SENTIMENT_FULL = "sentiment's share of the mood is full"
 
     @property
     def _last_reply_id(self) -> str:
@@ -372,15 +414,91 @@ class SelfModel:
         correction of the last reply or thanks (``request_id``: the owner's
         message that said it) — ``mood.KIND_*``. The caller decides that it
         was the OWNER's. Through the reaction ledger (``_react``)."""
+        if kind in (M.KIND_THUMB_DOWN, M.KIND_CORRECTION):
+            self._trouble_at = self._now_of(now)
+        elif kind in (M.KIND_THUMB_UP, M.KIND_PRAISE):
+            self._trouble_at = None
         return self._react(M.reaction_event(str(kind or "")), now=now, request_id=request_id,
                            reply_id=reply_id)[0]
+
+    #: §4UB (evaluation: a thumb given while the owner's set mood held was dropped without a word)
+    HOLD_NOTE = "Your set mood holds until {until} — this thumb is saved but doesn't move the mood."
+
+    def reaction_hold_note(self, *, now=None) -> str:
+        """§4UB: what to tell the owner when a reaction they give right now would not move the mood because
+        their own set mood holds ("" when it would move it). Never raises."""
+        try:
+            if not self.enabled or self.state is None:
+                return ""
+            if self.state.hold_reason(now=now) != self.state.HELD_OWNER_HOLD:
+                return ""
+            end = self.state._held_until(self.state._state.mood, now)
+            until = end.astimezone().strftime("%H:%M") if end is not None else "the day ends"
+            return self.HOLD_NOTE.format(until=until)
+        except Exception:  # noqa: BLE001
+            return ""
 
     def note_owner_sentiment(self, label: str, score: float, *, now=None, request_id: str = "",
                              arrived: str = "") -> Tuple[Optional[MoodView], float, str]:
         """§4TW: the tone of an owner's message (``mood.sentiment_event``). The caller decides that it was the
         OWNER's message. ``(mood after or None, pleasantness applied, why none)`` — §4TX: through the reaction
-        ledger, and held (not applied) when the owner set the mood after the message ``arrived``."""
-        return self._react(M.sentiment_event(label, score), now=now, request_id=request_id, arrived=arrived)
+        ledger, and held (not applied) when the owner set the mood after the message ``arrived``.
+
+        §4UB: what sentiment has in the pair (the state's decayed private share) stays under
+        ``mood.SENTIMENT_SHARE_MAX`` on its side —
+        an event is cut to the room left, and held when there is none: sentiment alone never makes a heard mood."""
+        ev = M.sentiment_event(label, score)
+        if ev is None or not self.enabled or self.state is None:
+            return self._react(ev, now=now, request_id=request_id, arrived=arrived)
+        # review r1: the share the STATE keeps (``private_p``: stored, so a restart keeps it, and rebuilt by the
+        # ledger when a thumb or a correction replaces a tone) — not a list of this process's own moves
+        share = self.state.private_share(now=now)[0]
+        # review r2: the tone REPLACES what this reply's earlier tone booked (a queued message answers the same
+        # reply as the request's own) — the room is what the OTHER replies' tones leave, and the cut never takes
+        # this reply's slot below what it already holds on the same side (that moved the mood the wrong way)
+        at = self._now_of(now)
+        with self._ledger_lock:
+            target = self._target(request_id, "")
+            mine = self._booked_now(self._private_booked.get(target), at, self._owner_word())[0] if target else 0.0
+        sign = 1.0 if ev.dp > 0 else -1.0
+        others = (share - mine) * sign                   # the others' share on this event's side (may be < 0)
+        room = round(M.SENTIMENT_SHARE_MAX - max(0.0, others), 4)
+        floor = max(0.0, mine * sign)                    # what this reply already holds on this side
+        size = max(min(abs(ev.dp), room), min(floor, abs(ev.dp)))
+        if size <= 0.0:
+            self.state.note_held(ev.kind, ev.cause, ev.dp, ev.de, self.HELD_SENTIMENT_FULL, now=now)
+            return None, 0.0, self.HELD_SENTIMENT_FULL
+        if size < abs(ev.dp):
+            k = size / abs(ev.dp)
+            ev = M.Event(round(ev.dp * k, 4), round(ev.de * k, 4), ev.cause, ev.kind, novelty=ev.novelty)
+        return self._react(ev, now=now, request_id=request_id, arrived=arrived)
+
+    def _charge_cap_cut(self, cp: float, ce: float, at: datetime.datetime, word: int) -> None:
+        """§4UB review r6: the state's cap took ``(cp, ce)`` of the owner's tone out of the pair. That share
+        belongs to the replies whose tones the ledger booked on that side — each gives up its part, in
+        proportion, from what it holds privately and from what it moved, so the ledger's share stays the
+        state's (a thumbs-down that stopped one tone counting exposed two others: the cut was booked against
+        the thumbed reply, and members later heard part of the owner's tone). Called under the ledger lock."""
+        for axis, cut in ((0, cp), (1, ce)):
+            if not cut:
+                continue
+            held = {}
+            for rid, entry in self._private_booked.items():
+                v = self._booked_now(entry, at, word)[axis]
+                if v * cut > 0:
+                    held[rid] = v
+            total = sum(held.values())
+            if not total:
+                continue
+            k = min(1.0, cut / total)
+            for rid, v in held.items():
+                take = v * k
+                pb = list(self._booked_now(self._private_booked.get(rid), at, word))
+                ap = list(self._booked_now(self._applied.get(rid), at, word))
+                pb[axis] -= take
+                ap[axis] -= take
+                self._private_booked[rid] = (pb[0], pb[1], at, word)
+                self._applied[rid] = (ap[0], ap[1], at, word)
 
     def _target(self, request_id: str, reply_id: str) -> str:
         if reply_id:
@@ -400,6 +518,25 @@ class SelfModel:
         up = max(ups, key=lambda v: v[0]) if ups else (0.0, 0.0)
         down = min(downs, key=lambda v: v[0]) if downs else (0.0, 0.0)
         return up[0] + down[0], up[1] + down[1]
+
+    def _fit_returning_tone(self, entries: dict, target: str, at: datetime.datetime, word: int, now) -> None:
+        """§4UB review r4: a thumb changed can make a reply's replaced tone count again — it comes back no
+        bigger than the room the OTHER replies' tones leave under ``mood.SENTIMENT_SHARE_MAX`` (the cap of
+        ``note_owner_sentiment``; a thumb flip put the share at +0.196 and the owner heard "content, 1").
+        The slot is cut in place. Called under the ledger lock."""
+        sent = entries.get(M.KIND_SENTIMENT)
+        if not sent:
+            return
+        d = self._standing_now({"s": sent}, at, word).get("s", (0.0, 0.0))[0]
+        if not d:
+            return
+        mine = self._booked_now(self._private_booked.get(target), at, word)[0]
+        share = self.state.private_share(now=now)[0]
+        sign = 1.0 if d > 0 else -1.0
+        room = max(0.0, M.SENTIMENT_SHARE_MAX - max(0.0, (share - mine) * sign))
+        if abs(d) > room:
+            k = room / abs(d)
+            entries[M.KIND_SENTIMENT] = (round(sent[0] * k, 4), round(sent[1] * k, 4), sent[2], sent[3])
 
     def _react(self, ev: Optional["M.Event"], *, now=None, request_id: str = "", reply_id: str = "",
                arrived: str = "") -> Tuple[Optional[MoodView], float, str]:
@@ -428,6 +565,8 @@ class SelfModel:
                     slot = "thumb" if ev.kind in (M.KIND_THUMB_UP, M.KIND_THUMB_DOWN) else ev.kind
                     entries = dict(self._standing.get(target) or {})
                     entries[slot] = (ev.dp, ev.de, at, word)
+                    if ev.kind != M.KIND_SENTIMENT:
+                        self._fit_returning_tone(entries, target, at, word, now)
                     standing = self._standing_now(entries, at, word)
                     total = self._total(standing)
                     was = self._booked_now(self._applied.get(target), at, word)
@@ -444,7 +583,8 @@ class SelfModel:
                         old, _ = self._standing.popitem(last=False)
                         self._applied.pop(old, None)
                         self._private_booked.pop(old, None)
-                if dp == 0.0 and de == 0.0:
+                if abs(dp) < 0.0005 and abs(de) < 0.0005:
+                    # (review r3: a re-booked slot of about the same size moved ±0.0001 the wrong way by rounding)
                     self.state.note_held(ev.kind, ev.cause, ev.dp, ev.de, self.HELD_ALREADY_COUNTED, now=now)
                     return None, 0.0, self.HELD_ALREADY_COUNTED
                 before, after = self.state.nudge(dp, de, ev.cause, ev.kind, novelty=ev.novelty, now=now,
@@ -455,17 +595,23 @@ class SelfModel:
                                        or self.HELD_ALREADY_COUNTED)
                 # §4UA review r2: the STORED move, not the views' (rest + deviation clamps at ±1)
                 ap, ae = after.moved
+                # §4UB review r6: what the sentiment-share cap took out is booked against the tones that held
+                # that share (below), not against this reply — the event's own move is the move before the cap
+                cp, ce = getattr(after, "capped", (0.0, 0.0)) or (0.0, 0.0)
+                rap, rae = ap + cp, ae + ce
                 if ev.kind == M.KIND_SENTIMENT:
                     # review r5/r6: book what the state really stored — the change scaled by what the clamp
                     # let through, on top of what was booked
-                    rp = max(0.0, min(1.0, ap / dp)) if dp else 0.0
-                    re_ = max(0.0, min(1.0, ae / de)) if de else 0.0
+                    rp = max(0.0, min(1.0, rap / dp)) if dp else 0.0
+                    re_ = max(0.0, min(1.0, rae / de)) if de else 0.0
                     private = (booked[0] + (private[0] - booked[0]) * rp,
                                booked[1] + (private[1] - booked[1]) * re_)
                 if target:
                     # review r2: what REALLY moved (the clamp may have absorbed it), not the event's size
-                    self._applied[target] = (was[0] + ap, was[1] + ae, at, word)
+                    self._applied[target] = (was[0] + rap, was[1] + rae, at, word)
                     self._private_booked[target] = (private[0], private[1], at, word)
+                if cp or ce:
+                    self._charge_cap_cut(cp, ce, at, word)
                 if ap == 0.0 and ae == 0.0:
                     return after, 0.0, self.HELD_AT_LIMIT
                 return after, ap, ""

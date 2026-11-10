@@ -149,8 +149,9 @@ def test_a_turn_that_closed_a_task_lifts_the_mood(tmp_path, owner):
     assert agent._mood_turn_signals(msgs, ASK, OWNER_RID).tasks_done == 1
     _record(agent, msgs)
     v = agent.context.self_model.mood()
-    assert (v.p, v.e) == (pytest.approx(0.15), pytest.approx(0.10))
-    assert v.recent[-1]["cause"] == "finished 1 project task"
+    # §4UB: the one clean call earns the small-turn reward (half of 0.06) next to the task
+    assert (v.p, v.e) == (pytest.approx(0.15 + 0.03), pytest.approx(0.10))
+    assert v.recent[-1]["cause"].startswith("finished 1 project task")
 
 
 # ── B. the reaction ledger ──────────────────────────────────────────────────
@@ -292,26 +293,31 @@ def test_a_turn_held_by_the_owners_word_is_in_the_events_log_not_the_history(tmp
 
 def test_the_owners_sentiment_is_left_out_of_what_others_hear(tmp_path):
     s = SelfStateThread(tmp_path)
-    s.nudge(0.10, 0.02, "a clean turn", M.KIND_TURN, now=T0)
-    s.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
-    s.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
-    s.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
-    s.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
+    # §4UB review r5: the share is capped at ±SENTIMENT_SHARE_MAX where it is written, so a heard level needs
+    # something besides the owner's tone
+    s.nudge(-0.12, 0.02, "1 tool call failed in this turn", M.KIND_TURN, now=T0)
+    for _ in range(4):
+        s.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
     own = s.mood(now=_at(minutes=1))
     assert (own.label, own.intensity) == ("down", 1)
-    assert (s.state.mood.private_p, s.state.mood.private_e) == (pytest.approx(-0.32), pytest.approx(-0.08))
+    assert (s.state.mood.private_p, s.state.mood.private_e) == (pytest.approx(-M.SENTIMENT_SHARE_MAX),
+                                                                pytest.approx(-M.SENTIMENT_SHARE_MAX / 4))
     others = s.mood(now=_at(minutes=1), audience="others")
+    assert others.label == "neutral" and others.cause == "" and others.recent == ()
     # review r2: the share comes out only toward zero — others never hear a mood the agent does not have
-    assert (others.label, others.p) == ("neutral", 0.0)
-    assert others.cause == "" and others.recent == ()
+    s2 = SelfStateThread(tmp_path / "two")
+    s2.nudge(0.05, 0.0, "a clean turn", M.KIND_TURN, now=T0)
+    s2.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
+    s2.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT, now=T0)
+    assert s2.state.mood.p < 0 and s2.mood(now=T0, audience="others").p == 0.0
 
 
 def test_the_private_share_decays_with_the_pair_and_the_owners_word_clears_it(tmp_path):
     s = SelfStateThread(tmp_path)
-    s.nudge(-0.5, -0.2, "unhappy", M.KIND_SENTIMENT, now=T0)
-    assert SelfStateThread._private_now(s.state.mood, _at(hours=2))[0] == pytest.approx(-0.25)
+    s.nudge(-0.10, -0.02, "unhappy", M.KIND_SENTIMENT, now=T0)
+    assert SelfStateThread._private_now(s.state.mood, _at(hours=2))[0] == pytest.approx(-0.05)
     s.nudge(0.0, 0.1, "a turn", M.KIND_TURN, now=_at(hours=2))                # carried, decayed
-    assert s.state.mood.private_p == pytest.approx(-0.25, abs=1e-3)
+    assert s.state.mood.private_p == pytest.approx(-0.05, abs=1e-3)
     s.set_owner_mood("calm", M.ANCHOR_DIRECTION["calm"], 1, now=_at(hours=2))
     assert (s.state.mood.private_p, s.state.mood.private_e) == (0.0, 0.0)
 
@@ -325,6 +331,7 @@ def test_the_private_share_is_what_was_really_added_after_the_clamp(tmp_path):
 
 def test_a_member_hears_the_mood_without_the_owners_sentiment_and_is_told_it_is_not_about_them(tmp_path):
     sm = _sm(tmp_path)
+    sm.state.nudge(-0.12, 0.0, "1 tool call failed in this turn", M.KIND_TURN)
     for _ in range(5):
         sm.state.nudge(*M.EV_SENTIMENT_NEGATIVE, "unhappy", M.KIND_SENTIMENT)
     ctx = _ctx(sm)
@@ -752,6 +759,7 @@ def test_a_long_turn_of_mostly_excused_calls_is_a_slog():
 
 async def test_introspect_on_a_public_surface_shows_the_public_mood(tmp_path, owner):
     sm = _sm(tmp_path)
+    sm.state.nudge(-0.12, 0.0, "1 tool call failed in this turn", M.KIND_TURN)
     for _ in range(3):
         sm.state.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT)
     assert (sm.mood().label, sm.mood().intensity) == ("down", 1)
@@ -965,15 +973,16 @@ def test_a_second_tone_on_one_reply_at_the_clamp_is_booked_as_the_state_stored_i
 
 async def test_a_step_down_does_not_hand_others_a_mood_the_owners_share_made(tmp_path, owner):
     sm = _sm(tmp_path)
-    sm.state.nudge(-0.12, 0.08, "1 tool call failed in this turn", M.KIND_TURN)
+    # §4UB review r5: the share is capped, so the owner's level 2 is others' level 1 here
+    sm.state.nudge(-0.36, 0.08, "3 tool calls failed in this turn", M.KIND_TURN)
     for _ in range(6):
         sm.state.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT)
     assert (sm.mood().label, sm.mood().intensity) == ("down", 2)
-    assert sm.mood(audience="others").neutral
+    assert (sm.mood(audience="others").label, sm.mood(audience="others").intensity) == ("down", 1)
     old_p, old_share = sm.state._state.mood.p, sm.state._state.mood.private_p
     await _set(sm, mood="down", step=-1)                                 # "don't be so down"
     assert (sm.mood().label, sm.mood().intensity) == ("down", 1)
-    assert sm.mood(audience="others").neutral                            # not raised by the step
+    assert sm.mood(audience="others").intensity <= 1                     # not raised by the step
     new_p = sm.state._state.mood.p
     assert sm.state._state.mood.private_p == pytest.approx(old_share * new_p / old_p, abs=2e-3)   # the same PART
 

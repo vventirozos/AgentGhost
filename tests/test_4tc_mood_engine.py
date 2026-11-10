@@ -281,7 +281,9 @@ def _one(sig) -> M.Event:
 
 def test_a_plain_chat_turn_changes_nothing(tmp_path):
     assert M.turn_events(M.TurnSignals()) == []
-    assert M.turn_events(M.TurnSignals(tool_calls=2, duration_s=40.0)) == []
+    # §4UB: a turn WITH tool calls is no plain chat turn — under CLEAN_TURN_MIN_CALLS it earns half
+    # (test_4ub); one with none still changes nothing
+    assert M.turn_events(M.TurnSignals(tool_calls=0, duration_s=40.0)) == []
     sm = SelfModel(root=tmp_path)
     assert sm.note_owner_turn(M.TurnSignals(), now=T0) is None
     assert not sm.state.path.exists() and not sm.state.mood_history_path.exists()
@@ -321,14 +323,14 @@ def test_a_guard_event_counts_like_a_failure_and_is_named():
 
 def test_a_turn_that_ended_under_context_pressure_is_named_as_that():
     """Review: it was journalled as "a loop guard stepped in"."""
-    ev = _one(M.TurnSignals(tool_calls=2, pressure=True))
+    ev = _one(M.TurnSignals(tool_calls=0, pressure=True))
     assert (ev.dp, ev.de) == M.EV_TROUBLE
     assert ev.cause == "the context ran out of room (context pressure) in this turn" and "guard" not in ev.cause
     ev = _one(M.TurnSignals(tool_calls=2, failures=2, guards=1, pressure=True))
     assert (ev.dp, ev.de) == (pytest.approx(-0.48), pytest.approx(0.32))
     assert ev.cause == ("2 tool calls failed and a loop guard stepped in once and the context ran out of room "
                         "(context pressure) in this turn")
-    assert M.turn_events(M.TurnSignals(tool_calls=2, pressure=False)) == []
+    assert M.turn_events(M.TurnSignals(tool_calls=0, pressure=False)) == []
 
 
 def test_a_turn_in_which_the_owner_set_the_mood_gives_no_event():
@@ -353,7 +355,9 @@ def test_a_clean_multi_tool_turn_lifts_pleasantness_a_little():
     assert (ev.dp, ev.de) == (pytest.approx(0.10), 0.0) and M.EV_CLEAN_TURN[1] == 0.0
     assert ev.cause == "a turn of 3 tool calls went through without a failure"
     assert M.CLEAN_TURN_MIN_CALLS == 3
-    assert M.turn_events(M.TurnSignals(tool_calls=2)) == []                         # too few calls
+    # §4UB: under CLEAN_TURN_MIN_CALLS it earns half (most owner turns use 0–1 calls)
+    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=2))] == [pytest.approx(0.08 * 0.5)]
+    assert M.turn_events(M.TurnSignals(tool_calls=1))[0].cause == "a turn of 1 tool call went through without a failure"
     assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, failures=1))] == [pytest.approx(-0.048)]
     assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, guards=1))] == [-0.12]        # a guard
     assert M.turn_events(M.TurnSignals(tool_calls=5, completed=False)) == []        # it was cut off
@@ -375,10 +379,10 @@ def test_the_clean_reward_grows_with_the_work_and_shrinks_with_the_failed_share(
 
 def test_a_research_turn_lifts_both_and_carries_the_novelty_tag():
     assert M.RESEARCH_MIN_SOURCES == 3
-    evs = M.turn_events(M.TurnSignals(tool_calls=2, sources=3))
+    evs = M.turn_events(M.TurnSignals(tool_calls=0, sources=3))
     assert [(e.dp, e.de, e.novelty) for e in evs] == [(0.15, 0.20, True)] and M.EV_RESEARCH == (0.15, 0.20)
     assert evs[0].cause == "read 3 sources in a research turn"
-    assert M.turn_events(M.TurnSignals(tool_calls=2, sources=2)) == []
+    assert M.turn_events(M.TurnSignals(tool_calls=0, sources=2)) == []
     # it does not need a clean turn
     kinds = [(e.dp, e.novelty) for e in M.turn_events(M.TurnSignals(tool_calls=6, failures=1, sources=5))]
     assert kinds == [(pytest.approx(-0.12 * 2 / 6), False), (0.15, True)]
@@ -390,7 +394,7 @@ def test_a_very_long_turn_lowers_energy_and_is_tired_not_bored(tmp_path):
     ev = _one(M.TurnSignals(tool_calls=0, duration_s=900.0))
     assert (ev.dp, ev.de) == M.EV_LONG_TURN == (-0.15, -0.30)
     assert ev.cause == "a very long turn (15 min, 0 tool calls)"
-    assert M.turn_events(M.TurnSignals(tool_calls=2, duration_s=899.0)) == []
+    assert M.turn_events(M.TurnSignals(tool_calls=0, duration_s=899.0)) == []
     assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=24, duration_s=60.0))] == [pytest.approx(0.16)]
     # a long turn with failures in it: a slog, tired
     sm = SelfModel(root=tmp_path / "slog")
@@ -424,9 +428,9 @@ def test_one_turns_events_are_one_move_with_the_causes_joined(tmp_path):
 def test_a_finished_project_task_is_its_own_event():
     """§4TX: manage_projects closed a task DONE in the owner's turn — once per turn, whatever the count."""
     assert M.EV_TASK_DONE == (0.15, 0.10)
-    evs = M.turn_events(M.TurnSignals(tool_calls=2, tasks_done=1))
+    evs = M.turn_events(M.TurnSignals(tool_calls=0, tasks_done=1))
     assert [(e.dp, e.de, e.cause) for e in evs] == [(0.15, 0.10, "finished 1 project task")]
-    assert M.turn_events(M.TurnSignals(tool_calls=2, tasks_done=3))[0].cause == "finished 3 project tasks"
+    assert M.turn_events(M.TurnSignals(tool_calls=0, tasks_done=3))[0].cause == "finished 3 project tasks"
     assert M.turn_events(M.TurnSignals(tool_calls=2, tasks_done=1, owner_set=True)) == []
 
 

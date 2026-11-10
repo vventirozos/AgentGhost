@@ -102,9 +102,11 @@ STRONG_MOOD_MIN = 2
 #: the last ``LASTING_WINDOW_DAYS`` local days; then the look is told so
 LASTING_WINDOW_DAYS = 7
 LASTING_MIN_DAYS = 3
-#: journal kinds that are not the agent's own reaction: the owner's word, a
-#: manner row, a step down by decay, the quiet's rows
-_NOT_OWN_KINDS = frozenset({"owner", "manner", "decay", "quiet", "quiet_end"})
+#: §4UB: the journal kinds that ARE the agent's own reaction — what happened in
+#: its own turns. An allow-list (was a deny-list of owner/manner/decay/quiet):
+#: the evaluation found 👍-driven "content" counted as the agent's character,
+#: so the owner's thumbs, words, praise and tone are the owner's, not its own
+_OWN_KINDS = frozenset({"turn"})
 #: the resting point: each unit the model gives is this much of the pair;
 #: at most ``REST_UNITS`` units per axis (= ``mood.REST_MAX``), and a look
 #: moves it at most ONE unit per axis
@@ -246,6 +248,14 @@ def pick_replies(home, now: Optional[datetime.datetime] = None,
     Trajectory day folders are UTC dates (review m3: a local-date window
     covered ~1 UTC day just after local midnight), so the folders are read in
     UTC with one day to spare and the turns are kept by their own timestamp."""
+    pool = [{"text": text, "at": str(t.get("timestamp") or "")}
+            for t, text in _replies_since(home, now, after) if not written_under_strong_mood(t)]
+    return (rng or random).sample(pool, min(REPLIES_PER_LOOK, len(pool)))
+
+
+def _replies_since(home, now: Optional[datetime.datetime], after) -> List[Tuple[dict, str]]:
+    """The owner's delivered replies written since the previous look and inside the window, with their text
+    — every one a look could show, before the strong-mood filter. (turn, text) pairs; [] when unreadable."""
     try:
         from ..core.failure_census import _owner_turns, _window, _epoch
     except Exception:  # noqa: BLE001
@@ -259,17 +269,22 @@ def pick_replies(home, now: Optional[datetime.datetime] = None,
     except Exception as e:  # noqa: BLE001
         logger.debug("mirror: owner turns unreadable: %s", e)
         return []
-    pool = []
+    out = []
     for t in good:
         text = str(t.get("final_response") or "").strip()
         if len(text) < MIN_REPLY_CHARS or _ABORT_RE.search(text):
             continue
-        if written_under_strong_mood(t):                     # §4UA: the mood talking, not the character
-            continue
         if not (since < _epoch(t.get("timestamp")) <= now_utc.timestamp() + 60):
             continue
-        pool.append({"text": text, "at": str(t.get("timestamp") or "")})
-    return (rng or random).sample(pool, min(REPLIES_PER_LOOK, len(pool)))
+        out.append((t, text))
+    return out
+
+
+def strong_mood_replies_since(home, now: Optional[datetime.datetime] = None, after="") -> int:
+    """§4UB: how many of the replies a look could show were left out as written under a strong mood or a
+    manner — so a look with nothing to read says why (the evaluation found "no reply of yours" said over
+    replies that were all filtered)."""
+    return sum(1 for t, _ in _replies_since(home, now, after) if written_under_strong_mood(t))
 
 
 def written_under_strong_mood(turn: dict) -> bool:
@@ -295,8 +310,9 @@ def lasting_mood_note(home, now: Optional[datetime.datetime] = None) -> str:
     least ``LASTING_MIN_DAYS`` of the last ``LASTING_WINDOW_DAYS`` local days
     (today included). The journal writes a row only on a change, so a mood
     that held at 2 across midnight counts for the day it began (review r1
-    m4: an undercount, never an overcount). Owner-set moods, manners, decay steps and the
-    quiet's boredom are not the agent's own reaction and do not count. ""
+    m4: an undercount, never an overcount). Only rows of the agent's own turns
+    count (§4UB ``_OWN_KINDS``): the owner's thumbs, words, praise, tone and
+    set moods, manners, decay steps and the quiet's boredom do not. ""
     when nothing lasted or the journal cannot be read. Never raises."""
     try:
         from .state import MOOD_HISTORY_FILENAME
@@ -316,7 +332,7 @@ def lasting_mood_note(home, now: Optional[datetime.datetime] = None) -> str:
         except Exception:  # noqa: BLE001 — a torn or hand-edited row
             continue
         label, kind = str(row.get("label") or ""), str(row.get("kind") or "")
-        if n < STRONG_MOOD_MIN or kind in _NOT_OWN_KINDS or label not in _M.LABELS or label == _M.BORED:
+        if n < STRONG_MOOD_MIN or kind not in _OWN_KINDS or label not in _M.LABELS or label == _M.BORED:
             continue
         at = _M.parse_iso_utc(str(row.get("at") or ""))
         if at is None:
@@ -459,6 +475,11 @@ async def look(home, llm_client: Any, now: Optional[datetime.datetime] = None,
     after = rows[-1].get("at") if rows else ""
     picked = await asyncio.to_thread(pick_replies, home, now, rng, after)
     if not picked:
+        # §4UB (evaluation: "no reply of yours" was said when there were replies, all under a strong mood)
+        n = await asyncio.to_thread(strong_mood_replies_since, home, now, after)
+        if n:
+            return (f"skipped — {'the 1 reply' if n == 1 else f'all {n} replies'} of yours since the last look "
+                    "were written under a strong mood or a manner (the mood talking, not the character)")
         return "skipped — no reply of yours since the last look (2 days back at most)"
     shown = current_rows(rows)
     prev = str(shown[-1]["sentence"]) if shown else SEED_SENTENCE

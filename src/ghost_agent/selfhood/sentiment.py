@@ -81,19 +81,25 @@ class _Breaker:
         self.last_ok = 0.0
         self.last_fail = 0.0
         self.last_fail_why = ""
+        #: §4UB (evaluation: an outage was logged at DEBUG only): the log was told the service is down
+        self.down = False
 
     def may_ask(self, now: float) -> bool:
         with self.lock:
             return now >= self.paused_until
 
-    def ok(self, now: float) -> None:
+    def ok(self, now: float) -> bool:
+        """True when this answer ends an outage the log was told about (§4UB)."""
         with self.lock:
             self.fails = 0
             self.paused_until = 0.0
             self.scored += 1
             self.last_ok = now
+            back, self.down = self.down, False
+            return back
 
-    def failed(self, why: str, now: float) -> None:
+    def failed(self, why: str, now: float) -> bool:
+        """True when this failure pauses the asking (§4UB: said once, at WARNING)."""
         with self.lock:
             self.fails += 1
             self.last_fail = now
@@ -101,6 +107,9 @@ class _Breaker:
             if self.fails >= BREAKER_FAILS:
                 self.paused_until = now + BREAKER_PAUSE_S
                 self.fails = 0           # the next round after the pause gets its own BREAKER_FAILS tries
+                opened, self.down = not self.down, True
+                return opened
+            return False
 
 
 BREAKER = _Breaker()
@@ -133,7 +142,7 @@ async def classify(text: str, *, tor_proxy: Optional[str] = None,
         return None
     key = _read_key(key_file)
     if not key:       # review r2: said on the health line, not silently nothing
-        BREAKER.failed("no key in the key file", now_fn())
+        _failed("no key in the key file", now_fn())
         return None
     try:
         import httpx
@@ -150,11 +159,20 @@ async def classify(text: str, *, tor_proxy: Optional[str] = None,
     except Exception as exc:  # noqa: BLE001 — the type only: a message could quote the text
         answer, why = None, type(exc).__name__
     if answer is None:
-        BREAKER.failed(why or "unreadable answer", now_fn())
+        _failed(why or "unreadable answer", now_fn())
         logger.debug("sentiment: no answer (%s)", why or "unreadable answer")
         return None
-    BREAKER.ok(now_fn())
+    if BREAKER.ok(now_fn()):
+        logger.info("sentiment service answering again; the owner's tone feeds the mood again")
     return answer
+
+
+def _failed(why: str, now: float) -> None:
+    """One failed call. The pause it starts is said ONCE, at WARNING — never the text."""
+    if BREAKER.failed(why, now):
+        logger.warning("sentiment service: %d calls in a row failed (last: %s); not asked for %d min, then "
+                       "retried by itself — the mood runs without the owner's tone meanwhile",
+                       BREAKER_FAILS, why, int(BREAKER_PAUSE_S // 60))
 
 
 #: what the clients add to the owner's message: the Slack bot's file notes, the web client's upload line, a Slack
@@ -183,6 +201,49 @@ def message_text(content) -> str:
     return content.strip()
 
 
+#: §4UB (evaluation: a pasted log, code or an article was scored as the owner's tone): what is not the owner's
+#: own words. A fenced block (an unclosed fence runs to the end), a quoted line, a log or traceback line
+_FENCE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
+_PASTED_LINE = re.compile(
+    r"^\s*(?:>|\$ |>>> |Traceback \(most recent call last\)|File \"[^\"]+\", line \d|at [\w$<>]+(?:\.[\w$<>]+)+\(|"
+    # review r2: a level word opens a log line in its log forms only ("[ERROR] x", "ERROR:root:x", "ERROR 12:"),
+    # not "ERROR: nothing works and I'm furious" or "DEBUG this please"
+    r"\[(?:ERROR|WARN|WARNING|INFO|DEBUG|FATAL|CRITICAL|TRACE)\]|"
+    r"(?:ERROR|WARN|WARNING|INFO|DEBUG|FATAL|CRITICAL|TRACE)(?::[\w.]+:|\s+\d{4}-\d\d-\d\d|\s+\d\d:\d\d:\d\d)|"
+    # review r1: a time of day ("10:30 works for me", "2026-11-10 10:00 sounds perfect") is the owner's;
+    # a log stamp has seconds AND a level, a fraction or a bracket after it
+    r"(?:\d{4}-\d\d-\d\d[T ])?\d\d:\d\d:\d\d(?:[.,]\d+|\S*\s+\[?(?:ERROR|WARN|WARNING|INFO|DEBUG|FATAL|"
+    r"CRITICAL|TRACE)\b|Z?\s*\[)|[A-Za-z_][\w.]*(?:Error|Exception|Warning):)")
+#: "summarise this: <an article>" — what follows the colon is somebody else's text. Review r1: only verbs that
+#: hand text over to be worked on ("check this out: amazing news" and "I read your summary: brilliant" are the
+#: owner's own words)
+_PASTE_AFTER = re.compile(
+    # review r2: a short lead ("hey ghost, can you"), up to 80 characters of instruction, then a colon — or a
+    # line break ("summarise this\n\n<article>")
+    r"^(.{0,30}?\b(?:summari[sz]e|translate|proofread|rewrite|rephrase|paraphrase|tl;?dr)\b[^:\n]{0,80})"
+    r"(?::\s*\S|[ \t]*\n[ \t]*\n\s*\S)", re.IGNORECASE | re.DOTALL)
+#: all capitals read as shouting: the service answered "language unclear" for "WHY IS THIS STILL BROKEN"
+_SHOUT_MIN_LETTERS = 8
+_SHOUT_SHARE = 0.7
+
+
+def prepare_text(text: str) -> str:
+    """§4UB: the part of an owner message that is the owner's own tone — pasted code, logs, quoted lines and
+    text handed over to work on ("summarise this: …") are taken out, and a message in capitals is read in
+    lower case (shouting is a tone the model reads; capitals it could not). "" when nothing is left."""
+    if not isinstance(text, str):
+        return ""
+    text = _FENCE.sub("\n", text)
+    text = "\n".join(line for line in text.splitlines() if not _PASTED_LINE.match(line))
+    m = _PASTE_AFTER.match(text)
+    if m:
+        text = m.group(1)
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) >= _SHOUT_MIN_LETTERS and sum(c.isupper() for c in letters) >= _SHOUT_SHARE * len(letters):
+        text = text.lower()
+    return re.sub(r"\n{2,}", "\n", re.sub(r"[ \t]+", " ", text)).strip()
+
+
 _JOURNAL_LOCK = threading.Lock()
 
 
@@ -208,10 +269,60 @@ def _append_locked(path: Path, row: Dict[str, object]) -> None:
 
 HELD_PRAISED = "the praise check counted it"
 HELD_NO_MOOD = "no mood to move"
+#: §4UB (evaluation: "great, you broke it again" scored positive 0.94; "delete the failed jobs" negative 0.87)
+HELD_SARCASM = "upbeat words about trouble (it may be sarcasm)"
+HELD_TASK = "the wording of a task, not a feeling"
+#: words that turn an upbeat score next to them into a doubtful one
+_TROUBLE_WORDS = re.compile(
+    r"\b(?:broke|broken|breaks?|breaking|crash\w*|wrong|fail\w*|ruin\w*|wasted?|worse|worst|useless|"
+    r"mess(?:ed)?|bug(?:s|gy)?|errors?)\b", re.IGNORECASE)
+#: review r1: good news about a problem gone ("you fixed the bug, awesome", "no errors this time, perfect")
+_RESOLVED = re.compile(
+    r"\b(?:fixed|fixes|fixing|found|solved|gone|went away|no longer|it works|it'?s working|everything works|"
+    r"works like|(?:tests?|build|checks?) pass(?:es|ed)?(?: now)?|clearer|nothing (?:went wrong|failed|broke)|resolved|sorted|no (?:more )?(?:errors?|bugs?|crash\w*|failures?|problems?|"
+    r"issues?)|not (?:broken|failing) any ?more|"
+    r"works? (?:now|again|fine|great)|working (?:now|again|fine|great))\b", re.IGNORECASE)
+#: review r1: a message that corrects the reply while sounding upbeat ("nice try, but that's not what I asked")
+#: — the correction judge marks the trouble only after the score arrives
+_CORRECTING = re.compile(
+    r"(?:\b(?:not what i (?:asked|meant|wanted|said)|that'?s not (?:it|right|correct|true)|nice try)|"
+    r"(?:^|[.!,;]\s*)(?:no,?\s*)?try again\b(?!\s+(?:later|tomorrow|soon)))|(?:"
+    r"\byou missed|\byou misunderstood|\bnot quite)\b", re.IGNORECASE)
+#: a message that opens with an instruction: its words are the task's ("kill the failed jobs"). Review r1: the
+#: verb must lead into its object — "Look, this is awful" and "Stop, this is terrible" are interjections
+_TASK_OPENING = re.compile(
+    r"^\W*(?:(?:please|pls|ok|okay|now|so|then|and|also|can you|could you|would you|will you|go ahead and|"
+    r"just)[\s,]+)*(?:delete|kill|fix|remove|clean|check|terminate|find|debug|purge|write|stop|cancel|drop|"
+    r"reset|restart|clear|undo|revert|run|retry|list|show|search|look|block|ban|abort)\b(?!\s*[,.!?;:—-])",
+    re.IGNORECASE)
+#: … and an instruction that carries a feeling of its own is the owner's feeling ("check the date, it is wrong
+#: again, I am fed up")
+_FEELING = re.compile(
+    r"\b(?:hate|awful|terrible|horrible|fed up|sick of|tired of|annoy\w*|frustrat\w*|ugh+|wtf|ridiculous|"
+    r"furious|angry|upset\w*|disappoint\w*|useless|sucks?|sad|heartbreak\w*|stress\w*|worr\w*|depress\w*|"
+    r"scar(?:y|ed)|afraid|mess|ruin\w*|desperate|losing|nothing works|keeps? (?:crash|fail|break)\w*|"
+    r"again\W*$)", re.IGNORECASE)
+
+def doubtful(label: str, text: str, *, after_trouble: bool = False) -> str:
+    """§4UB: why a confident score is NOT the owner's feeling, or "". An upbeat score on a message that talks
+    about trouble that is not gone, that corrects the reply, or that comes right after the agent's own trouble
+    may be sarcasm; an unhappy score on a message that opens with an instruction and carries no feeling of its
+    own is the task's wording."""
+    text = text or ""
+    if label == "positive":
+        if _CORRECTING.search(text):
+            return HELD_SARCASM
+        # review r2: good news about a problem gone counts, even right after the agent's trouble (a bug-fixing
+        # turn usually has a failed call in it)
+        if not _RESOLVED.search(text) and (after_trouble or _TROUBLE_WORDS.search(text)):
+            return HELD_SARCASM
+    if label == "negative" and _TASK_OPENING.match(text) and not _FEELING.search(text):
+        return HELD_TASK
+    return ""
 
 
 def _feed_mood(answer: Dict[str, object], self_model, praised: bool, arrived: Optional[datetime.datetime] = None,
-               request_id: str = ""):
+               request_id: str = "", text: str = ""):
     """(the pleasantness nudge applied, or 0.0; why none, or ""). Never raises.
 
     §4TX: through the reaction ledger (``SelfModel.note_owner_sentiment``) — the unhappy tone of a message that
@@ -231,6 +342,15 @@ def _feed_mood(answer: Dict[str, object], self_model, praised: bool, arrived: Op
             return 0.0, HELD_PRAISED
         if self_model is None:
             return 0.0, HELD_NO_MOOD
+        after_trouble = False
+        if answer.get("label") == "positive":
+            try:
+                after_trouble = bool(self_model.recent_trouble(arrived))
+            except Exception:  # noqa: BLE001
+                after_trouble = False
+        doubt = doubtful(str(answer.get("label") or ""), text, after_trouble=after_trouble)
+        if doubt:
+            return 0.0, doubt
         after, dp, why = self_model.note_owner_sentiment(
             answer["label"], answer["score"], request_id=str(request_id or ""),
             arrived=(arrived.isoformat().replace("+00:00", "Z") if arrived is not None else ""))
@@ -252,13 +372,13 @@ async def score_message(content, root, *, request_id: str = "", tor_proxy: Optio
     ``praised``: the praise check already counted this message. True when a row was written. Never raises."""
     try:
         arrived = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
-        text = message_text(content).strip()
+        text = prepare_text(message_text(content))
         if not text:
             return False
         answer = await classify(text, tor_proxy=tor_proxy)
         if answer is None:
             return False
-        nudge, held = _feed_mood(answer, self_model, praised, arrived, request_id)
+        nudge, held = _feed_mood(answer, self_model, praised, arrived, request_id, text)
         row = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                "request_id": str(request_id or "")[:64], **answer, "nudge": nudge, "held": held,
                "chars": len(text), "text": text[:JOURNAL_TEXT_CHARS]}
