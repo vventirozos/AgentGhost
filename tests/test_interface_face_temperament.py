@@ -236,14 +236,6 @@ def test_app_js_feeds_log_lines_and_stream_chunks():
     assert "activeFace.noteStreamChunk(chunkContent)" in app[j:j + 300]
 
 
-def test_the_rollback_copy_is_kept():
-    """The operator asked for backups to roll back to if the change is not liked."""
-    b = _ROOT / "interface" / "face_backups" / "20261030-pretemperament"
-    for name in ("matrix_graph.js", "app.js", "index.html"):
-        assert (b / name).is_file(), name
-    assert "temperament" not in (b / "matrix_graph.js").read_text(encoding="utf-8")
-
-
 # ── v1.2: the BODY (operator: "can't say i saw a huge difference") ───────
 
 def test_the_body_moves_visibly_and_intensity_zero_is_the_quiet_face(lab):

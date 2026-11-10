@@ -1,8 +1,7 @@
 """Face 2026-11-09 (§4TV): the kernel is a hypercube, more pronounced.
 
 Operator: "can this cube be a bit more pronounced and instead of a plain cube
-have a hypercube animating ? (keep a backup before any change)". Backup:
-interface/face_backups/20261109-prehypercube/.
+have a hypercube animating ? (keep a backup before any change)".
 
 Same day, operator after seeing it: the 4D shape and the newborn frames look
 like "2 completely separate animations, this needs to be more organic", and

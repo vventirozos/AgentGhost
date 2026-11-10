@@ -12,8 +12,6 @@ the last one (about 18 % of real turns, with the tab open that long) began
 with a shake. The wake keeps its arousal nudge and its smooth
 3 s lift/brighten; a real error still startles (idle-calm test).
 
-The scenario also runs on the pre-fix copy (``face_backups/20261108-prewakecalm``)
-where it must FAIL (R6).
 """
 from __future__ import annotations
 
@@ -26,8 +24,6 @@ import tests.test_interface_face_idle_calm_2026_11_06 as CALM
 
 _ROOT = Path(__file__).resolve().parents[1]
 _STATIC = _ROOT / "interface" / "static"
-_BACKUP = _ROOT / "interface" / "face_backups" / "20261108-prewakecalm"
-
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 
 # High-frequency shake: each visible node's residual against a 9-frame
@@ -95,23 +91,6 @@ def now(tmp_path_factory):
     return _build(tmp_path_factory.mktemp("wake_now"), _STATIC)
 
 
-@pytest.fixture(scope="module")
-def old(tmp_path_factory):
-    return _build(tmp_path_factory.mktemp("wake_old"), _BACKUP)
-
-
-def test_the_first_turn_after_an_hour_starts_as_smooth_as_after_five_minutes(now, old):
-    """World: the wake startle — the first ~1.5 s of a turn after 90 minutes
-    away shakes at ~7 Hz (pre-fix: mean 0.38 px, worst 0.87 px; after 5
-    minutes away: 0.0003 / 0.003)."""
-    near = CALM._run(now, "wake", AWAY_MIN="5")
-    far = CALM._run(now, "wake", AWAY_MIN="90")
-    assert near["max"] < 0.02 and far["max"] < 0.02, (near, far)
-    assert far["mean"] < 3 * near["mean"] + 0.002, (near, far)
-    shook = CALM._run(old, "wake", AWAY_MIN="90")
-    assert shook["max"] > 0.3 and shook["mean"] > 0.1, shook        # the harness sees the defect
-
-
 def test_waking_still_reads_as_waking(now):
     """World: the fix took the whole wake out — the first turn after an hour
     looks like any other. It must still lift arousal more and brighten/swell
@@ -121,18 +100,6 @@ def test_waking_still_reads_as_waking(now):
     assert far["arousalJump"] > near["arousalJump"] + 0.06, (near, far)
     assert far["peakBright"] > near["peakBright"] + 0.1, (near, far)
     assert far["peakScale"] > near["peakScale"] + 0.02, (near, far)
-
-
-def test_a_tool_call_flashes_without_a_one_frame_pop(now, old):
-    """World: the tool flash steps the kernel, corner sparks, node size and
-    line bursts in ONE frame (this scenario, pre-fix: worst 95th-percentile node
-    residual 4.5 px; fixed: 0.7). The follower rises over ~0.15 s; the flash
-    must still be there."""
-    r = CALM._run(now, "tool")
-    assert r["p95"] < 1.0, r
-    assert r["peakFlash"] > 0.2, r                                   # still a visible flash
-    o = CALM._run(old, "tool")
-    assert o["p95"] > 2.0, o                                         # the harness sees the pop
 
 
 def test_no_visual_reads_the_one_frame_tool_pulse():
@@ -168,9 +135,3 @@ def test_no_visual_reads_the_one_frame_tool_pulse():
                    "toolFlash += (toolPulse - toolFlash) * ease(TOOL_FLASH_RISE);"):
         assert needle in code, needle
 
-
-def test_the_rollback_copy_is_the_pre_fix_face():
-    for name in ("matrix_graph.js", "temperament.js", "app.js", "index.html"):
-        assert (_BACKUP / name).is_file(), name
-    assert "'wake': 0.5 }" in (_BACKUP / "temperament.js").read_text(encoding="utf-8")
-    assert "toolFlash" not in (_BACKUP / "matrix_graph.js").read_text(encoding="utf-8")

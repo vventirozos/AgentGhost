@@ -60161,3 +60161,11 @@ Tests: local clockwork tests plus the device probe; no full suite (operator: loc
 - **Reverted in review:** the "eased" record (a "cheerful, 1" row may still carry the failure that eased it from 2); a public-surface introspect change (§4TX pins "set by the owner" there — pre-existing, the operator's earlier design).
 - **Known limits:** a handed-back queued message the owner drops from the tray makes the next identical message within the hour unread once; `recent_trouble` is one timestamp (a sarcastic "thanks" clears it); a steady tone can lengthen a mood something else made (option 1).
 
+
+### §4UB-b — the suite's failing tests fixed (2026-11-10, operator: "fix the bad tests")
+- `interface/face_backups/` (8 rollback copies the face tests compare against) had vanished from the tree. Restored byte-identical copies: the 4 older ones from `~/Data/AI/.battery_cov/tree-0`, the 4 from 11-08/11-09 from an earlier session's battery tree (two independent copies agreed).
+- Pin ratchet: `test_4ub_mood_fixes.py`'s app.js text check is now behavioural (the §4SZ node harness runs `sendFeedback`); `test_interface_face_moods_green_2026_11_09.py`'s noteLogLine/noteVerdict text checks run in node (pass starts a full-strength front, refute none) and the handheld sync uses `filecmp`. Baseline re-written downward (856 textual pins), digest updated.
+- Full suite: 31460 passed, 0 failed; lint gate OK.
+
+### §4UB-c — face rollback copies removed (2026-11-10, operator: "delete the face backups and delete the tests that depend on them")
+- `interface/face_backups/` deleted (all 8 copies). Removed the tests that read them: the rollback-copy checks (temperament, idle-calm, wake-calm, green-path) and the old-vs-new comparisons (idle-calm 6, wake-calm 2, mood-tesseract "faces that stayed"). Rollback/pre-fix mentions dropped from test docstrings, `matrix_graph.js` comments (static + handheld copy, still identical) and `docs/interfaces/web_server.html`. There is no face rollback any more. matrix_graph.js comment edits → app.js 19.21 / matrix_graph.js 19.21, cachebust manifest re-recorded.

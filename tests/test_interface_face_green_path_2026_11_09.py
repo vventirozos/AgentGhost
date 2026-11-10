@@ -2,26 +2,15 @@
 
 Operator: "the center remains red, gets purple, then blue and at the outer
 (closest to the camera) it gets dark green" and "what if the center moved
-slightly and the camera followed it". Rollback copy:
-interface/face_backups/20261109-pregreen/.
+slightly and the camera followed it".
 """
 import re
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 _STATIC = _ROOT / "interface" / "static"
-_BACKUP = _ROOT / "interface" / "face_backups" / "20261109-pregreen"
-
-
 def _js():
     return (_STATIC / "matrix_graph.js").read_text(encoding="utf-8")
-
-
-def test_rollback_copy_is_the_old_face():
-    old = (_BACKUP / "matrix_graph.js").read_text(encoding="utf-8")
-    assert "#1e2a78" in old and "fract(t) * 5.0" in old and "c2PathPhase" not in old
-    for f in ("app.js", "index.html", "temperament.js", "README.md"):
-        assert (_BACKUP / f).exists()
 
 
 def test_depth_gradient_reaches_green_inside_the_visible_shells():

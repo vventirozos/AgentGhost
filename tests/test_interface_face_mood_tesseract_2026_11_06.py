@@ -25,11 +25,8 @@ import interface.externals.clockwork_ghost.facestate as fs
 
 _ROOT = Path(__file__).resolve().parents[1]
 _STATIC = _ROOT / "interface" / "static"
-_BEFORE = _ROOT / "interface" / "face_backups" / "20261106-premoodonly"
 # 2026-11-09 the face itself changed on purpose (green rim, wandering centre);
 # the removal check below compares the last face before that, kept here.
-_PREGREEN = _ROOT / "interface" / "face_backups" / "20261109-pregreen"
-
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 
 _ROW = "│  **  12:00:00  ❌  +1.0s  sandbox exec   exit 1"
@@ -185,59 +182,8 @@ def now(tmp_path_factory):
     return _build(tmp_path_factory.mktemp("mood_now"), _STATIC)
 
 
-@pytest.fixture(scope="module")
-def pregreen(tmp_path_factory):
-    return _build(tmp_path_factory.mktemp("mood_pregreen"), _PREGREEN)
-
-
-@pytest.fixture(scope="module")
-def before(tmp_path_factory):
-    root = _build(tmp_path_factory.mktemp("mood_before"), _BEFORE)
-    # The dive's motes went with the forms that dived. They were invisible here, but
-    # drawing their random numbers at start shifted every node's jitter after them.
-    f = next(p for p in root.rglob("matrix_graph.js") if "node_modules" not in str(p))
-    src = f.read_text(encoding="utf-8")
-    for old, new in (("const u = Math.random(), v = Math.random();", "const u = 0.5, v = 0.5;"),
-                     ("Math.pow(Math.random(), 0.55); // inward bias", "0.5; // inward bias"),
-                     ("moteSeeds[i] = Math.random();", "moteSeeds[i] = 0.5;"),
-                     # §4TQ (2026-11-08): the tool flash's visuals read an eased
-                     # follower; the same change is applied here so every OTHER
-                     # channel is still compared frame for frame.
-                     ("let toolPulse = 0.0;", "let toolPulse = 0.0; let toolFlash = 0.0;"),
-                     ("    if (toolPulse < 0.003) toolPulse = 0;\n",
-                      "    if (toolPulse < 0.003) toolPulse = 0;\n"
-                      "    toolFlash += (toolPulse - toolFlash) * ease(0.15);\n"
-                      "    if (toolFlash < 0.003 && toolPulse === 0) toolFlash = 0;\n"),
-                     ("gaitFlash = DIAL.tool === 'flash' ? toolPulse : 0;", "gaitFlash = DIAL.tool === 'flash' ? toolFlash : 0;"),
-                     ("pulseT + 0.6 * toolPulse + 0.15 * c2n", "pulseT + 0.6 * toolFlash + 0.15 * c2n"),
-                     ("TUNE.toolKick * toolPulse : 0", "TUNE.toolKick * toolFlash : 0"),
-                     ("+ 0.20 * toolPulse + 0.25 * recallSpark", "+ 0.20 * toolFlash + 0.25 * recallSpark")):
-        assert src.count(old) == 1, old
-        src = src.replace(old, new)
-    f.write_text(src, encoding="utf-8")
-    return root
-
-
 def _run(root, scenario, form="moodtesseract", **env):
     return CALM._run(root, scenario, form=form, **env)
-
-
-@pytest.mark.parametrize("form,mood", [("moodtesseract", ""), ("moodtesseract", "irritable"),
-                                       ("moodtesseract", "cheerful"), ("moodtesseract", "tired"),
-                                       ("empty", ""), ("empty", "irritable")])
-def test_the_faces_that_stayed_are_frame_for_frame_what_they_were(pregreen, before, form, mood):
-    """World: taking cube, tesseract, vortex and descent out moved something the
-    two faces that stayed rely on. Everything is summed, not only the nodes:
-    uniforms, colours, lines drawn, bloom, the scene and the inner state, through
-    a stretch with real events."""
-    env = dict(form=form, ROW=_ROW)
-    if mood:
-        env.update(LIVE="1", MOOD=mood)
-    a = _run(before, "digest", **env)
-    b = _run(pregreen, "digest", **env)
-    assert a["form"] == b["form"] == form
-    assert a["parts"]["drawn"] == b["parts"]["drawn"]
-    assert {k: v for k, v in b["parts"].items()} == {k: v for k, v in a["parts"].items()}
 
 
 def test_each_mood_reads_differently_on_every_channel(now):

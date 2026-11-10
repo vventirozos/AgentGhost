@@ -40,8 +40,7 @@ export const COLORS = {
     // wrapping, so the drift can never blend the red kernel straight into
     // the green rim (a red↔green mix is mud). Seeds run kernel 0.6 (red)
     // → 0.0 (green) with depth; the plum stop past the red is only touched
-    // by heat pulses and the drift. The thermal ring before this is in
-    // interface/face_backups/20261109-pregreen/.
+    // by heat pulses and the drift.
     palette: [
         new THREE.Color('#0d4429'),  // dark green: the rim, nearest the camera
         new THREE.Color('#0c1c50'),  // deep ocean blue
@@ -289,7 +288,7 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 // lattice, stream and roll, showing the agent's mood through MOOD_LOOKS, and
 // `empty`, no face. The header's button (the handheld's too) switches between them:
 // animations enabled / disabled (operator, 2026-11-06, who removed cube,
-// tesseract, vortex and descent; rollback in interface/face_backups/20261106-premoodonly).
+// tesseract, vortex and descent).
 // The internals keep their cube2/C2 names. Ids stay [a-z]: the server's prefs and
 // the handheld's form state refuse anything else.
 const FORMS = ['moodtesseract', 'empty'];
@@ -418,7 +417,7 @@ let gazeX = 0.0, gazeY = 0.0, targetGazeX = 0.0, targetGazeY = 0.0;
 let errorKind = null, errorKindEnv = 0.0;
 // The inner state (temperament.js, 2026-10-30): events nudge its drives
 // and every kick below is scaled by the gain it returns; `animate` reads
-// its outputs (`TS`) once per frame. Rollback: interface/face_backups/.
+// its outputs (`TS`) once per frame.
 // Its clock is FRAME-INTEGRATED on the true frame time (deterministic under
 // the node harness, which seeds Math.random) and re-syncs FORWARD to the wall
 // clock only after a real absence: a gap too long to be rendering between two
@@ -931,8 +930,8 @@ const C2_SHELLS = IS_MOBILE ? 12 : 24;
 const C2_NODE_EVERY = 2;                          // corner nodes on every Nth shell
 const C2_RULINGS = !IS_MOBILE;                    // the face "+" rulings
 // The kernel is a HYPERCUBE (2026-11-09, operator: "a bit more pronounced and
-// instead of a plain cube have a hypercube animating"; the 3×3×3 lattice before
-// it is in interface/face_backups/20261109-prehypercube/). 16 vertices (±1)^4,
+// instead of a plain cube have a hypercube animating"; it replaced a 3×3×3
+// lattice). 16 vertices (±1)^4,
 // 32 edges (pairs differing in one coordinate), turned in the XW and ZW planes
 // on the integrated kernel spin and projected 4D → 3D in perspective, so the
 // inner cube flows out through the outer one; the old 3D tumble rides on top.

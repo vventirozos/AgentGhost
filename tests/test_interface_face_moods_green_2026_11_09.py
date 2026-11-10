@@ -9,9 +9,9 @@ Operator, picking from the face ideas: "do 1 and 2 and also clean up (7)".
    or a verifier pass sends a green front from the rim to the kernel;
 7  the idle twitch (guard `!FORM === …`, always false) and the 'kick' tool
    dialect (only the empty form, which draws nothing) are removed.
-Rollback copy: interface/face_backups/20261109-premoodlooks/.
 """
 import ast
+import filecmp
 import json
 import os
 import re
@@ -123,7 +123,13 @@ const end = st().success;
 face.noteLogLine(ROW_VER); tick(1);
 const ver = st().success;
 const stronger = face.noteSuccess(0.6);        // a weaker one while the verified front runs: ignored
-emit({ pure, idle, afterFail, startedOk, again, fronts, envs, end, ver, stronger,
+tick(300);                                      // let it clear
+const cleared = st().success;
+face.noteVerdict('refute'); tick(1);
+const refuted = st().success;
+face.noteVerdict('pass'); tick(1);
+const passed = st().success;
+emit({ pure, idle, afterFail, startedOk, again, fronts, envs, end, ver, stronger, cleared, refuted, passed,
        debugKeys: Object.keys(face.getDebugState()) });
 """.replace("ROW_OK", json.dumps(_ROW_OK)).replace("ROW_VER", json.dumps(_ROW_VER)).replace("ROW_FAIL", json.dumps(_ROW_FAIL))
 
@@ -168,12 +174,12 @@ def test_the_dead_code_is_gone(green):
         assert gone not in _JS, gone
 
 
-def test_both_routes_feed_the_front():
+def test_both_routes_feed_the_front(green):
     # the log route lives in matrix_graph (so the handheld, which feeds the same
-    # lines through noteLogLine, gets it too); a verifier pass also starts it
-    i = _JS.index("export function noteLogLine(content)")
-    assert "turnOutcomeOf(content)" in _JS[i:i + 400]
-    i = _JS.index("export function noteVerdict(kind)")
-    assert "noteSuccess(SUCCESS_VERIFIED)" in _JS[i:i + 500]
+    # lines through noteLogLine, gets it too — startedOk above); a verifier pass
+    # also starts it, at full strength, and a refute does not
+    assert green["cleared"]["t"] < 0
+    assert green["refuted"]["t"] < 0
+    assert green["passed"]["t"] >= 0 and green["passed"]["amp"] == 1
     hand = _STATIC.parent / "externals" / "clockwork_ghost" / "webface" / "matrix_graph.js"
-    assert hand.read_bytes() == (_STATIC / "matrix_graph.js").read_bytes()
+    assert filecmp.cmp(hand, _STATIC / "matrix_graph.js", shallow=False)   # the handheld runs the same face

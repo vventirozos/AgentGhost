@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.20';
+import * as matrixGraphFace from './matrix_graph.js?v=19.21';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
