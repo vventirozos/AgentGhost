@@ -302,16 +302,25 @@ def reference_index_body(page_rel: str) -> str:
 
 def features_grid(page_rel: str) -> str:
     cards = "".join(
-        f'  <a class="feature" href="{rel(page_rel, f"features/{slug}.html")}"><span class="ft">{html.escape(t)}</span>'
-        f'<span class="fd">{html.escape(summary)}</span>'
+        f'  <a class="feature" href="{rel(page_rel, f"features/{slug}.html")}"><span class="ft">{html.escape(t)}</span>\n    '
+        f'<span class="fd">{html.escape(summary)}</span>\n    '
         f'<span class="fm">{len(ref_pages(slug))} reference page{"s" if len(ref_pages(slug)) != 1 else ""}</span></a>\n'
         for slug, t, summary in FEATURES)
     return f'<!-- features -->\n<div class="feature-grid">\n{cards}</div>\n<!-- /features -->'
 
 
+def css_version() -> str:
+    """A short hash of the theme: every page links ``style.css?v=<hash>``, so a browser that cached an older
+    theme fetches the new one (2026-11-10: a cached pre-restructure stylesheet ran the home cards together)."""
+    import hashlib
+    return hashlib.sha256((DOCS / "assets" / "style.css").read_bytes()).hexdigest()[:10]
+
+
 def render(page: Path) -> str:
     r = page.relative_to(DOCS).as_posix()
     s = page.read_text(encoding="utf-8")
+    s = re.sub(r'href="((?:\.\./)*assets/style\.css)(?:\?v=[0-9a-f]*)?"',
+               lambda m: f'href="{m.group(1)}?v={css_version()}"', s)
     s = SIDEBAR_RE.sub(lambda m: sidebar(r), s, count=1)
     if r.startswith("features/"):
         s = REFS_RE.sub(lambda m: refs_block(Path(r).stem, r), s, count=1)

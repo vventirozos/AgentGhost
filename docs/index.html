@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ghost Agent — a self-hosted AI agent</title>
 <meta name="description" content="Ghost Agent is a self-hosted AI agent on four machines at home: it talks, listens, searches the web and the dark web over Tor, draws, remembers, codes in a sandbox, runs its own labs and has a mood.">
-<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/style.css?v=ab96635d7c">
 </head>
 <body>
 <aside class="sidebar">
@@ -60,21 +60,51 @@
 
   <!-- features -->
 <div class="feature-grid">
-  <a class="feature" href="features/interfaces.html"><span class="ft">Interfaces</span><span class="fd">Web console, Slack, the handheld, the CLI and the API.</span><span class="fm">7 reference pages</span></a>
-  <a class="feature" href="features/voice.html"><span class="ft">Voice</span><span class="fd">Talk to it and hear it answer: Whisper speech-to-text, Phonon (English) and macOS (Greek) voices.</span><span class="fm">1 reference page</span></a>
-  <a class="feature" href="features/search.html"><span class="ft">Search &amp; the web</span><span class="fd">Web search, deep research and the browser — over Tor only.</span><span class="fm">2 reference pages</span></a>
-  <a class="feature" href="features/darkweb.html"><span class="ft">Dark-web search</span><span class="fd">Search and research .onion sites through Ahmia, Torch and Torgle.</span><span class="fm">1 reference page</span></a>
-  <a class="feature" href="features/pictures.html"><span class="ft">Pictures</span><span class="fd">Generate and edit images, likeness from real photos, and vision.</span><span class="fm">3 reference pages</span></a>
-  <a class="feature" href="features/memory.html"><span class="ft">Memory</span><span class="fd">What it remembers about you, how it recalls it, and the rules you teach it.</span><span class="fm">19 reference pages</span></a>
-  <a class="feature" href="features/documents.html"><span class="ft">Documents (RAG)</span><span class="fd">Ask questions over your PDFs, audio and videos; get PDF reports.</span><span class="fm">2 reference pages</span></a>
-  <a class="feature" href="features/coding.html"><span class="ft">Coding &amp; sandbox</span><span class="fd">Writes and runs code in a Docker sandbox, with services and jobs.</span><span class="fm">19 reference pages</span></a>
-  <a class="feature" href="features/projects.html"><span class="ft">Projects &amp; autonomy</span><span class="fd">Multi-step projects, scheduled tasks and an autopilot that works while idle.</span><span class="fm">16 reference pages</span></a>
-  <a class="feature" href="features/labs.html"><span class="ft">Labs</span><span class="fd">Throwaway real machines on a Raspberry Pi for experiments.</span><span class="fm">1 reference page</span></a>
-  <a class="feature" href="features/selfhood.html"><span class="ft">Selfhood</span><span class="fd">Mood, tone, the self-image (Mirror), the sentiment model and the face.</span><span class="fm">3 reference pages</span></a>
-  <a class="feature" href="features/performance.html"><span class="ft">Performance</span><span class="fd">Head and slot saves, cache protection, MTP, node offload and time budgets.</span><span class="fm">5 reference pages</span></a>
-  <a class="feature" href="features/reliability.html"><span class="ft">Reliability</span><span class="fd">The verifier, guards and breakers, health checks and feedback.</span><span class="fm">17 reference pages</span></a>
-  <a class="feature" href="features/personal.html"><span class="ft">Personal services</span><span class="fd">Portfolio, weather and games.</span><span class="fm">2 reference pages</span></a>
-  <a class="feature" href="features/infrastructure.html"><span class="ft">Infrastructure</span><span class="fd">The four machines, Tor-only egress, isolation and supervision.</span><span class="fm">11 reference pages</span></a>
+  <a class="feature" href="features/interfaces.html"><span class="ft">Interfaces</span>
+    <span class="fd">Web console, Slack, the handheld, the CLI and the API.</span>
+    <span class="fm">7 reference pages</span></a>
+  <a class="feature" href="features/voice.html"><span class="ft">Voice</span>
+    <span class="fd">Talk to it and hear it answer: Whisper speech-to-text, Phonon (English) and macOS (Greek) voices.</span>
+    <span class="fm">1 reference page</span></a>
+  <a class="feature" href="features/search.html"><span class="ft">Search &amp; the web</span>
+    <span class="fd">Web search, deep research and the browser — over Tor only.</span>
+    <span class="fm">2 reference pages</span></a>
+  <a class="feature" href="features/darkweb.html"><span class="ft">Dark-web search</span>
+    <span class="fd">Search and research .onion sites through Ahmia, Torch and Torgle.</span>
+    <span class="fm">1 reference page</span></a>
+  <a class="feature" href="features/pictures.html"><span class="ft">Pictures</span>
+    <span class="fd">Generate and edit images, likeness from real photos, and vision.</span>
+    <span class="fm">3 reference pages</span></a>
+  <a class="feature" href="features/memory.html"><span class="ft">Memory</span>
+    <span class="fd">What it remembers about you, how it recalls it, and the rules you teach it.</span>
+    <span class="fm">19 reference pages</span></a>
+  <a class="feature" href="features/documents.html"><span class="ft">Documents (RAG)</span>
+    <span class="fd">Ask questions over your PDFs, audio and videos; get PDF reports.</span>
+    <span class="fm">2 reference pages</span></a>
+  <a class="feature" href="features/coding.html"><span class="ft">Coding &amp; sandbox</span>
+    <span class="fd">Writes and runs code in a Docker sandbox, with services and jobs.</span>
+    <span class="fm">19 reference pages</span></a>
+  <a class="feature" href="features/projects.html"><span class="ft">Projects &amp; autonomy</span>
+    <span class="fd">Multi-step projects, scheduled tasks and an autopilot that works while idle.</span>
+    <span class="fm">16 reference pages</span></a>
+  <a class="feature" href="features/labs.html"><span class="ft">Labs</span>
+    <span class="fd">Throwaway real machines on a Raspberry Pi for experiments.</span>
+    <span class="fm">1 reference page</span></a>
+  <a class="feature" href="features/selfhood.html"><span class="ft">Selfhood</span>
+    <span class="fd">Mood, tone, the self-image (Mirror), the sentiment model and the face.</span>
+    <span class="fm">3 reference pages</span></a>
+  <a class="feature" href="features/performance.html"><span class="ft">Performance</span>
+    <span class="fd">Head and slot saves, cache protection, MTP, node offload and time budgets.</span>
+    <span class="fm">5 reference pages</span></a>
+  <a class="feature" href="features/reliability.html"><span class="ft">Reliability</span>
+    <span class="fd">The verifier, guards and breakers, health checks and feedback.</span>
+    <span class="fm">17 reference pages</span></a>
+  <a class="feature" href="features/personal.html"><span class="ft">Personal services</span>
+    <span class="fd">Portfolio, weather and games.</span>
+    <span class="fm">2 reference pages</span></a>
+  <a class="feature" href="features/infrastructure.html"><span class="ft">Infrastructure</span>
+    <span class="fd">The four machines, Tor-only egress, isolation and supervision.</span>
+    <span class="fm">11 reference pages</span></a>
 </div>
 <!-- /features -->
 

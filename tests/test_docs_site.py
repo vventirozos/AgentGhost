@@ -60,7 +60,7 @@ def test_no_broken_internal_links():
         for href in re.findall(r'href="([^"#][^"]*)"', body):
             if href.startswith(("http://", "https://", "mailto:", "//")):
                 continue
-            target = href.split("#")[0]
+            target = href.split("#")[0].split("?")[0]   # ?v= cache-bust on the stylesheet
             if not target:
                 continue
             if not (page.parent / target).resolve().exists():
