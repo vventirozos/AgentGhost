@@ -82,25 +82,6 @@ async def _batches(batches, tools, rid="web-4pn-1"):
     return ts
 
 
-async def test_preview_then_confirm_in_one_turn_gets_the_fixed_question(real_kb):
-    ts = await _batches([[("knowledge_base", {"action": "forget", "target": "yt-x.captions.en"})],
-                         lambda: [("knowledge_base", {"action": "forget", "confirm": real_kb.seen["tok"],
-                                                      "items": "all"})]],
-                        {"knowledge_base": real_kb})
-    assert ts.force_stop is True
-    r = ts.final_ai_content
-    assert r.startswith("Nothing has been deleted yet.")
-    assert "1. document `yt-x.captions.en`" in r and "Reply **yes** to delete item 1" in r
-    assert "knowledge_base(" not in r and "Show this list" not in r and "an hour" in r
-
-
-async def test_a_confirm_by_yes_in_the_same_turn_also_gets_it(real_kb):
-    ts = await _batches([[("knowledge_base", {"action": "forget", "target": "yt-x.captions.en"})],
-                         [("knowledge_base", {"action": "forget", "confirm": "yes", "items": "all"})]],
-                        {"knowledge_base": real_kb})
-    assert ts.force_stop is True and ts.final_ai_content.startswith("Nothing has been deleted yet.")
-
-
 @pytest.mark.parametrize("refusal", [
     "NOT deleted: only the user can confirm a deletion, in their own turn.",
     "NOT deleted: that preview was made outside a conversation with the user — run the preview again in one."])
@@ -210,19 +191,6 @@ def test_a_token_naming_another_preview_hands_back():
     assert _confirm_wait_reply(WAIT, [_row(a)], {"confirm": "cccc3333"}) == ""
 
 
-def test_a_reset_refusal_never_shows_a_forget_list():
-    from unittest.mock import MagicMock
-    ms = MagicMock()
-    ms.collection.count.return_value = 12
-    reset = M._reset_preview(ms, MagicMock(count_edges=MagicMock(return_value=3)))
-    rows = [_row(_pv()), _row(reset)]
-    r = _confirm_wait_reply("NOT executed: the user has not answered yet", rows, {"confirm": "yes"},
-                            "reset_not_confirmed")
-    assert r.startswith("Nothing has been deleted yet.") and "Resetting the memory would erase" in r
-    assert "Forgetting" not in r and "knowledge_base(" not in r
-    assert _confirm_wait_reply(WAIT, [_row(reset)], {"confirm": "yes"}, "forget_not_confirmed") == ""
-
-
 def test_a_cut_off_preview_hands_back():
     assert _confirm_wait_reply(WAIT, [_row(_pv(main=("fact 'a' [TRUNCATED]",)))], {"confirm": "tok1"}) == ""
 
@@ -268,23 +236,6 @@ async def test_two_previews_in_the_loop_hand_back():
                          [("knowledge_base", {"action": "forget", "confirm": "aaaa1111", "items": "all"})]],
                         {"knowledge_base": kb})
     assert not ts.force_stop and not str(ts.final_ai_content).startswith("Nothing has been")   # r3 M1
-
-
-async def test_a_reset_refusal_in_the_loop_shows_the_reset_question():
-    """The loop passes the refusal's own code (battery r2 P20)."""
-    from unittest.mock import MagicMock
-    ms = MagicMock()
-    ms.collection.count.return_value = 12
-    reset = M._reset_preview(ms, MagicMock(count_edges=MagicMock(return_value=3)))
-
-    async def kb(**kw):
-        if kw.get("confirm"):
-            return TO.rejected("NOT executed: the user has not answered yet.", reason_code="reset_not_confirmed")
-        return reset
-    ts = await _batches([[("knowledge_base", {"action": "reset_all"})],
-                         [("knowledge_base", {"action": "reset_all", "confirm": "yes"})]],
-                        {"knowledge_base": kb})
-    assert ts.force_stop is True and "Resetting the memory would erase" in ts.final_ai_content
 
 
 def test_a_refused_call_of_another_tool_hands_back():

@@ -149,7 +149,8 @@ class Kept:
     def _app(self, lab_id: str) -> Dict[str, Any]:
         row = self.mgr.get(lab_id)
         if row["lifetime"] != "kept" or not row["app_json"]:
-            raise LabError("not_kept", f"lab {lab_id} is not kept", hint="POST /v1/labs/{id}/keep first")
+            raise LabError("not_kept", f"lab {lab_id} is not kept",
+                           hint="keep it first (lab keep with params.app {name, member, port, cmd})")
         return loads(row["app_json"])
 
     def _log_text(self, text: str, n: int = 200) -> str:
@@ -595,7 +596,24 @@ class Kept:
         except OSError as e:
             out["error"] = f"{type(e).__name__}: {e}"[:200]
         out["ok"] = bool(out["ok"] and out["alive"])
+        if not out["ok"]:
+            out["why"] = self._why(app, out)
         return out
+
+    @staticmethod
+    def _why(app: Dict[str, Any], res: Dict[str, Any]) -> str:
+        """One line naming the cause of a failed probe (req a3514318: "alive False, http_status 200" sent the
+        agent guessing for 8 turns — the app had no cmd, so there was no process to be alive)."""
+        if not res.get("alive"):
+            if not str(app.get("cmd") or "").strip():
+                return ("the app has no cmd: nothing runs, so it is never up — a kept app is the process labs "
+                        "starts in its workdir; another server answering the port does not count")
+            return "the app process is not running (it exited or never started) — see the app log (lab logs)"
+        if res.get("error"):
+            return f"the app runs but its port does not answer: {res['error']}"
+        if res.get("http_status") is not None:
+            return f"the app runs but the health path answered HTTP {res['http_status']}"
+        return "the app runs but the health check failed"
 
     def wait_up(self, lab_id: str, app: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
         deadline = time.time() + timeout_s
@@ -608,7 +626,7 @@ class Kept:
             if not res["alive"]:
                 break
             time.sleep(2)
-        app.update(last_probe_at=time.time(), last_error=res.get("error") or f"probe failed: {res}")
+        app.update(last_probe_at=time.time(), last_error=res.get("why") or res.get("error") or f"probe failed: {res}")
         return res
 
     def _record_crash(self, lab_id: str, app: Dict[str, Any], why: str) -> None:
@@ -671,7 +689,7 @@ class Kept:
                         app["fails"] = int(app.get("fails") or 0) + 1
                         if app["fails"] >= FAILS_TO_RESTART:
                             self._stop_proc(lab_id, app)
-                            self._record_crash(lab_id, app, res.get("error") or "health probe failing after start")
+                            self._record_crash(lab_id, app, res.get("why") or res.get("error") or "health probe failing after start")
                 elif st == "up" and not self._alive(lab_id, app):
                     app["last_probe_at"] = now
                     self._exited(lab_id, app, "app exited")
@@ -686,7 +704,7 @@ class Kept:
                         app["fails"] = int(app.get("fails") or 0) + 1
                         if app["fails"] >= FAILS_TO_RESTART:
                             self._stop_proc(lab_id, app)
-                            self._record_crash(lab_id, app, res.get("error") or f"health probe failed {FAILS_TO_RESTART}×")
+                            self._record_crash(lab_id, app, res.get("why") or res.get("error") or f"health probe failed {FAILS_TO_RESTART}×")
                 if app.get("mounted") and now - float(app.get("last_backup_at") or 0) > 86400 \
                         and now - float(app.get("last_backup_attempt_at") or 0) > BACKUP_RETRY_S:
                     app["last_backup_attempt_at"] = now

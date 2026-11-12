@@ -231,14 +231,6 @@ async def test_a_declared_owner_task_waits_for_the_owner(store):
     assert not calls and not searches and store.get_task(tid)["status"] == "NEEDS_USER"
 
 
-async def test_the_gate_words_still_hold_a_declared_build(store):
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    tid = store.add_task(pid, "Publish the site to the public blog", kind="build")
-    res, calls, _, _ = await _advance(store, pid, owner=False)
-    assert not calls and store.get_task(tid)["status"] == "NEEDS_USER"
-
-
 async def test_an_undeclared_task_is_routed_by_the_classifier_as_before(store):
     pid = store.create_project("P")
     store.update_project(pid, status="ACTIVE")
@@ -253,29 +245,6 @@ async def test_a_kind_never_removes_the_experiment_hold(store):
     pid = store.create_project("P", goal="Evaluate Qwen on GSM8K")
     store.update_project(pid, status="ACTIVE")
     tid = store.add_task(pid, "Run the 50 GSM8K prompts on Qwen and record its answers", kind="build")
-    res, calls, _, _ = await _advance(store, pid, owner=False)
-    assert not calls and store.get_task(tid)["status"] == "NEEDS_USER"
-
-
-@pytest.mark.parametrize("desc", ["Publish my own self-analysis to the public blog",
-                                  "Send my introspection report to the mailing list"])
-async def test_an_introspective_gate_task_is_not_built(store, desc):
-    # r1 MAJOR 1: the introspective exemption sent a declared build back to the executor
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    tid = store.add_task(pid, desc, kind="build")
-    res, calls, searches, _ = await _advance(store, pid, owner=False)
-    # r4 MAJOR: nor closed DONE by a brief — held for the owner's run
-    assert not calls and not searches and store.get_task(tid)["status"] == "NEEDS_USER"
-
-
-@pytest.mark.parametrize("desc", ["Wait for the owner's approval, then release v2",
-                                  "Once the client has approved it, push the build live"])
-async def test_a_gate_word_in_another_form_holds_a_declared_build(store, desc):
-    # r1 MAJOR 3: no classifier runs for a declared task — gate_form is the floor
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    tid = store.add_task(pid, desc, kind="build")
     res, calls, _, _ = await _advance(store, pid, owner=False)
     assert not calls and store.get_task(tid)["status"] == "NEEDS_USER"
 
@@ -349,19 +318,6 @@ def test_the_briefing_shows_a_declared_kind(store):
     assert "] Plain task" in b
 
 
-@pytest.mark.parametrize("desc", ["Build the approval form", "Implement the confirmation dialog",
-                                  "Implement the email sending queue"])
-async def test_a_gate_word_form_hold_is_taken_back_by_the_owner(store, desc):
-    # r2 MAJOR: as a park it jammed ordinary builds for good — it is a HOLD
-    pid = store.create_project("P", kind="CODING")
-    store.update_project(pid, status="ACTIVE")
-    tid = store.add_task(pid, desc, kind="build")
-    res, calls, _, _ = await _advance(store, pid, owner=False)
-    assert not calls and store.get_task(tid)["status"] == "NEEDS_USER"
-    res, calls, _, _ = await _advance(store, pid, owner=True)
-    assert calls and store.get_task(tid)["status"] == "DONE"
-
-
 async def test_the_owner_s_run_builds_a_gate_word_form_task(store):
     pid = store.create_project("P", kind="CODING")
     store.update_project(pid, status="ACTIVE")
@@ -395,17 +351,6 @@ def test_a_bare_object_is_read_and_a_shapeless_one_refused():
         split(['{"name": "Build parser", "kind": "build"}'])
 
 
-@pytest.mark.parametrize("desc", ["Post my self-reflection essay to the blog once the owner has approved it",
-                                  "Email my self-analysis to the team after approval"])
-async def test_an_introspective_gate_form_task_is_held_too(store, desc):
-    # r3 MAJOR: the introspective exemption built these unattended
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    tid = store.add_task(pid, desc, kind="write")
-    res, calls, _, _ = await _advance(store, pid, owner=False)
-    assert not calls and store.get_task(tid)["status"] == "NEEDS_USER"
-
-
 async def test_decompose_under_a_task_keeps_the_kinds(tmp_path, owner_turn):
     # battery P3: the under-a-task path (plan.decompose kinds=)
     owner_turn("a1b2c3d4")
@@ -418,26 +363,6 @@ async def test_decompose_under_a_task_keeps_the_kinds(tmp_path, owner_turn):
         {"description": "Probe the prompts", "kind": "model_run"}, "Write it up"])
     kids = {t["description"]: t["kind"] for t in store.list_tasks(pid) if t.get("parent_id") == root}
     assert kids == {"Probe the prompts": "model_run", "Write it up": ""}
-
-
-@pytest.mark.parametrize("kind", ["build", "research"])
-async def test_the_owner_s_run_still_parks_a_whole_gate_word(store, kind):
-    # battery A2: the whole-word park is the owner's-run floor (no hold there)
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    tid = store.add_task(pid, "Publish the site to the public blog", kind=kind)
-    res, calls, searches, _ = await _advance(store, pid, owner=True)
-    assert not calls and not searches and store.get_task(tid)["status"] == "NEEDS_USER"
-    assert store.get_task(tid)["result_summary"] == "flagged for human review"
-
-
-async def test_the_owner_s_run_of_an_introspective_declared_build_is_not_built(store):
-    # battery A9: the owner's run takes the undeclared route, not the executor
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    store.add_task(pid, "Evaluate whether I truly choose my own responses", kind="build")
-    res, calls, _, _ = await _advance(store, pid, owner=True)
-    assert not calls and res.classification == "research"
 
 
 async def test_the_owner_s_run_keeps_an_introspective_model_run_a_model_run(store):

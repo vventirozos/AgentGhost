@@ -53,11 +53,19 @@ _WORD_RE = re.compile(r"[^\W\d_]{2,}")
 _INDENTED_BULLET_RE = re.compile(r"[ \t]+(?:[-+•]|\d{1,3}[.)])[^\S\r\n]+(?=\S)(?![^\s:]+:(?:\s|$))")
 
 
+#: §4UI (req afe8a49d, an SQL migration drafted in thinking): a line opening
+#: with a code-comment marker is code, not prose — a drafted script repeats
+#: its comment lines ("-- Step …", "# verify", "// TODO") as code repeats lines
+_COMMENT_LEAD = ("--", "//", "#", "/*", "<!--", ";")
+
+
 def _is_text_line(raw_line: str) -> bool:
     """True for an unindented line (or an indented markdown bullet) with
     ``TEXT_LINE_MIN_WORDS``+ words of letters — reasoning prose; False for an
-    indented code line, a separator, a blank line."""
+    indented code line, a comment line, a separator, a blank line."""
     if raw_line[:1] in (" ", "\t") and not _INDENTED_BULLET_RE.match(raw_line):
+        return False
+    if raw_line.lstrip().startswith(_COMMENT_LEAD):
         return False
     return len(_WORD_RE.findall(raw_line)) >= TEXT_LINE_MIN_WORDS
 
@@ -137,7 +145,15 @@ def _detect_paragraph_loop(reasoning_buf: str) -> bool:
     # repeated code lines and separators are not a loop. A line that does not
     # count is skipped, not a run-breaker: a loop interleaved with code still
     # shows its text lines.
-    _stripped = [l.strip() if _is_text_line(l) else "" for l in lines[:-1]]
+    # §4UI: a line inside a ``` fence is the drafted file, not prose (an SQL
+    # draft's verify statement six times is not a loop)
+    _stripped, _fence = [], False
+    for l in lines[:-1]:
+        if l.lstrip().startswith("```"):
+            _fence = not _fence
+            _stripped.append("")
+            continue
+        _stripped.append(l.strip() if not _fence and _is_text_line(l) else "")
     _counts: dict = {}
     for _s in _stripped:
         if len(_s) >= PARAGRAPH_LOOP_MIN_LINE:

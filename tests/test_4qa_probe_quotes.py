@@ -277,7 +277,6 @@ def test_quotes_from_any_kept_transcript_of_the_project_pass(tmp_path):
     assert _problem(tmp_path, doc) is None
 
 
-
 def test_a_one_word_piece_must_be_in_the_transcript_too(tmp_path):
     # r29: one-word pieces were dropped, so "… suffering" added a word unseen
     why = _problem(tmp_path, 'control-transcript.md: "My identity is not a static entity … suffering"')
@@ -348,7 +347,6 @@ def test_judging_stops_at_the_quote_and_time_caps(tmp_path, monkeypatch):
     monkeypatch.setattr(PT, "_MAX_JUDGED", 200)
     monkeypatch.setattr(PT, "_MAX_JUDGE_S", -1.0)
     assert _problem(tmp_path, bad) is None
-
 
 
 # ------------------------------------------------------ r30 fresh-eye fixes
@@ -642,7 +640,6 @@ async def test_note_misquotes_quotes_the_project_goal_as_a_source(tmp_path):
     assert "— t2 —" in store.get_ledger(pid) and "t1" not in store.get_ledger(pid)
 
 
-
 # ---------------------------------------------------- r32: the advisory plumbing
 
 async def test_the_ledger_line_is_short_once_per_task_and_carries_no_transcript_text(tmp_path):
@@ -670,25 +667,6 @@ async def test_the_ledger_line_is_short_once_per_task_and_carries_no_transcript_
     assert led.count("quote check") == 1 and "13 closed task(s) — t9, t10, t11, t12, t13 (+8 earlier)" in led
     assert "owner design line 0" in led
     assert led.splitlines()[-1].startswith("§4QA-e quote check")
-
-
-async def test_a_close_parked_by_its_gate_is_not_noted(tmp_path):
-    # r32 MAJOR-2: a close that did not end DONE — here a HUMAN_GATE parks it
-    # NEEDS_USER inside update_status — was noted as "closed"
-    store, ctx = _tu_ctx(tmp_path)
-    await tool_manage_projects(ctx, action="create", title="R")
-    pid = ctx.current_project_id
-    b = json.loads(await tool_manage_projects(
-        ctx, action="task_decompose", subtasks=["B → results/c.md"]))["created"][0]
-    await tool_manage_projects(ctx, action="task_update", task_id=b,
-                               postconditions=["HUMAN_GATE: operator sign-off"])
-    ws = Path(store.ensure_workspace(pid))
-    PT.record(store.memory_dir, pid, "results/control-transcript.md", LIVE)
-    (ws / "results").mkdir()
-    (ws / "results" / "c.md").write_text('# C\n\nresults/control-transcript.md: "the aggregate of attention patterns, reconstructed anew".\n')
-    out = json.loads(await tool_manage_projects(ctx, action="task_update", task_id=b, status="done", result="x"))
-    assert store.get_task(b)["status"] != "DONE" and "quote_warnings" not in out
-    assert "quote check" not in (store.get_ledger(pid) or "")
 
 
 async def test_a_re_close_of_a_done_task_runs_no_check(tmp_path, monkeypatch):
@@ -774,7 +752,6 @@ async def test_the_quote_check_payload_is_bounded(tmp_path):
     assert sum(t in ins for t in ids) == 3
 
 
-
 # ------------------------------------------------- r32: battery survivors
 
 def test_a_long_quote_sharing_a_few_words_is_not_a_rewording(tmp_path):
@@ -842,7 +819,6 @@ def test_the_line_cut_by_the_1_mb_read_is_dropped(tmp_path):
     (ws / "results" / "c.md").write_text(doc)
     from ghost_agent.core.task_deliverable import quote_problem_of
     assert quote_problem_of(ws, "C → results/c.md", tmp_path / "mem") is None
-
 
 
 def test_the_clock_bounds_the_verbatim_scans_too(tmp_path, monkeypatch):

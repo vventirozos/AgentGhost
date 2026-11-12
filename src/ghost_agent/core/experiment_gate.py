@@ -114,6 +114,37 @@ def _named_text_files(ws: Path, texts: Iterable[str]) -> List[str]:
     return out
 
 
+#: §4UI: a task the PLAN declared one of these is not judged a model
+#: experiment by its words (a methods write-up, a research brief about
+#: experiments) when it declares a PROSE deliverable — what it WRITES is still
+#: judged (transcript-shaped files). A non-prose or missing file keeps the words.
+#: Not "build": a declared build that runs prompts on a model is the fake the
+#: gate exists for (r1 MAJOR 2's pin)
+NOT_EXPERIMENT_KINDS = frozenset({"write", "research"})
+#: the plain-text deliverables that exemption needs (not .html: tags hide the
+#: label lines the shape check reads)
+_EXEMPT_PROSE_SUFFIXES = (".md", ".txt", ".rst", ".tex")
+#: a file path in a result text: a name with a slash or an extension of 2–8
+#: letters/digits ("results/answers.jsonl", "out.csv")
+_RESULT_PATH_RE = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*[\w-]+\.[A-Za-z][A-Za-z0-9]{1,7})(?![\w/])")
+
+
+def planned_kind(store, project_id: str, task_id: str, kind: str) -> str:
+    """The task's kind as the gate may trust it: a kind the plan declared, or
+    ``model_run`` however it was set. A non-experiment kind set LATER by
+    task_update (a ``kind_changed`` event) is not trusted — r1 MAJOR 2: a
+    retype must never remove the gate. Never raises ("" on error)."""
+    k = str(kind or "").strip()
+    if not k or k == "model_run":
+        return k
+    try:
+        if store.latest_task_event(project_id, task_id, ("kind_changed",)):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return k
+
+
 def unrun_experiment_problem(store, project_id: str, description: str, *,
                              files: Sequence[str] = (), result_text: str = "",
                              kind: str = "") -> Optional[str]:
@@ -162,8 +193,25 @@ def unrun_experiment_check(store, project_id: str, description: str, *,
         # words; another kind is still judged by them (r1 MAJOR 2: a kind
         # that removed the gate let task_update task_kind="build" skip it —
         # a false trigger has the waiver, recorded)
+        # §4UI: a kind the plan declared not-an-experiment (see planned_kind —
+        # callers pass the trusted kind) is not judged by its words
+        # — but only when what it delivers is PROSE, where the transcript-shape
+        # check below still reads it (§4UI r1 MAJOR 1: a "write" task that
+        # records model answers into results/answers.json, or into nothing
+        # but its result text, skipped every check)
+        # (r2 m1: not .html — tags hide the line-anchored labels from the shape
+        # check — and every candidate, also a file the result text names)
+        _decl = _norm(declared_deliverable(desc) or "")
+        # (r3 m1: and any path the result text names, whatever its suffix —
+        # `_named_text_files` only collects known text suffixes that exist,
+        # so "answers in results/answers.jsonl" never reached `cand`)
+        _named_any = _RESULT_PATH_RE.findall(str(result_text or ""))
+        _prose_only = bool(_decl) and all(
+            r.lower().endswith(_EXEMPT_PROSE_SUFFIXES) for r in ([_decl] + cand + _named_any))
+        _trusted_not_exp = kind in NOT_EXPERIMENT_KINDS and _prose_only
         by_words = (kind == "model_run"
-                    or is_model_experiment(desc, proj.get("goal"), _project_task_texts(store, project_id)))
+                    or (not _trusted_not_exp
+                        and is_model_experiment(desc, proj.get("goal"), _project_task_texts(store, project_id))))
         # r1 C1: a transcript heading/label is a MODEL's output only in a
         # file that names a model or probe_model (meeting, interview, podcast
         # and court transcripts are ordinary work); prose files only

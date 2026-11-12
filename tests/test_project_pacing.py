@@ -49,13 +49,14 @@ def test_briefing_directs_one_task_at_a_time(store):
 
     briefing = build_project_briefing(store, pid)
 
-    # The new pacing directive is present and unambiguous.
-    assert "ONE TASK AT A TIME" in briefing
+    # §4UI: ONE pacing rule, with the go-ahead case spelled out — a message
+    # that asks for the project AND the work is itself the go-ahead
+    assert "*** PACING (the one rule; tool results defer to it)" in briefing
+    assert "that message IS the go-ahead" in briefing
+    assert "If it asked ONLY for a project or a plan, show the task list and stop" in briefing
+    assert "no 'shall I start?'" in briefing   # §4UK: no asking for a go-ahead
     assert "context window" in briefing
-    # It tells the agent to stop and await direction.
-    assert "STOP" in briefing
-    low = briefing.lower()
-    assert "go-ahead" in low or "proceed" in low or "wait for" in low
+    assert "HARD RULE" not in briefing and "honor any pacing" not in briefing
 
 
 def test_briefing_drops_old_parallel_directive(store):
@@ -84,9 +85,11 @@ def test_briefing_suppresses_next_task_after_a_close(store):
     plan.add_task("first task")
     plan.add_task("second task")
     briefing = build_project_briefing(store, pid, suppress_next_task=True)
-    assert "NEXT TASK:" not in briefing
-    assert "completed a task this turn" in briefing
-    assert "STOP" in briefing
+    # §4UI: advice, not a stop — the next task stays visible for a user who
+    # asked for more than one
+    assert "You closed a task this turn. If the user asked for more" in briefing
+    assert "NEXT TASK:" in briefing
+    assert "STOP now" not in briefing
     # the pending tasks are still listed (situational awareness), just not
     # advertised as the thing to start now
     assert "OPEN TASKS" in briefing
@@ -135,14 +138,15 @@ async def test_create_then_decompose_does_not_duplicate_tasks(context):
     store = context.project_store
     out = json.loads(await tool_manage_projects(
         context, action="create", title="OS", goal="a multi-module desktop app",
-        subtasks=["Core Shell: skeleton", "File Explorer: vfs"]))
+        subtasks=["Core Shell: skeleton → index.html", "File Explorer: vfs → js/files.js"]))
     pid = out["created"]
     assert len(store.list_tasks(pid)) == 2
-    # agent now decomposes again with dup descriptions + one genuinely new task
+    # agent now decomposes again with the same deliverables + one genuinely new
+    # task (§4UI: duplicates are keyed on the declared file, not the head words)
     await tool_manage_projects(
         context, action="task_decompose",
-        subtasks=["Core Shell: HTML structure", "File Explorer: folders",
-                  "Terminal: shell"])
+        subtasks=["Core Shell: HTML structure → index.html", "File Explorer: folders → js/files.js",
+                  "Terminal: shell → js/term.js"])
     descs = [t["description"] for t in store.list_tasks(pid)]
     assert len(descs) == 3                      # only Terminal added
     assert sum("core shell" in d.lower() for d in descs) == 1
@@ -150,35 +154,26 @@ async def test_create_then_decompose_does_not_duplicate_tasks(context):
 
 
 @pytest.mark.asyncio
-async def test_single_file_goal_collapses_to_one_task(context):
-    """A cohesive single-file deliverable must NOT be split into per-feature
-    tasks (they'd merge into one file and collide — observed live as a page
-    that throws on load). create collapses subtasks to ONE build task and
-    steers to a one-turn build."""
+async def test_a_goal_that_says_one_file_keeps_its_plan(context):
+    """§4UI regression (req 8646c6c8): the model's own goal said "adding a new
+    app = one registry entry + one file"; a goal-text regex collapsed the
+    7-file webOS to ONE task, told the model to STOP, and refused every later
+    split. The classifier is gone: the plan is what the model asked for."""
     store = context.project_store
     out = json.loads(await tool_manage_projects(
-        context, action="create", title="Browser OS",
-        goal="Create a single-file browser OS with desktop, taskbar, 5 apps",
-        subtasks=["Core Shell", "File Explorer", "Snake", "Terminal"]))
-    pid = out["created"]
-    assert len(out["tasks_created"]) == 1                      # collapsed
-    assert "single-file" in store.list_tasks(pid)[0]["description"].lower()
-    assert "SINGLE-FILE" in out["agent_instruction"]
-    assert "do NOT call autoadvance" in out["agent_instruction"]
-
-
-@pytest.mark.asyncio
-async def test_single_file_project_refuses_decompose_split(context):
-    store = context.project_store
-    await tool_manage_projects(
-        context, action="create", title="OS",
-        goal="a single-file browser OS in one index.html")
-    pid = context.current_project_id
-    before = len(store.list_tasks(pid))
+        context, action="create", title="webOS",
+        goal="Build a modular webOS: each app lives in its own JS file under js/apps/, "
+             "so adding a new app = one registry entry + one file.",
+        subtasks=["Core shell: index.html + css/style.css + js/core.js",
+                  "Apps: js/apps/notes.js + js/apps/calculator.js"]))
+    assert len(out["tasks_created"]) == 2
+    assert "SINGLE-FILE" not in out["agent_instruction"]
     dec = json.loads(await tool_manage_projects(
-        context, action="task_decompose", subtasks=["App A", "App B", "App C"]))
-    assert dec.get("refused") is True
-    assert len(store.list_tasks(pid)) == before               # nothing fanned out
+        context, action="task_decompose", subtasks=["js/apps/terminal.js", "js/apps/settings.js"]))
+    assert not dec.get("refused") and len(dec["created"]) == 2
+    rp = str(await tool_manage_projects(context, action="replan",
+                                        subtasks=["Shell", "Apps", "Polish"]))
+    assert "SINGLE-FILE" not in rp and "NOT replanned" not in rp
 
 
 @pytest.mark.asyncio
@@ -206,10 +201,9 @@ async def test_create_returns_stop_and_await_instruction(context):
         await tool_manage_projects(context, action="create", title="New Effort")
     )
     instr = out.get("agent_instruction", "")
-    assert "STOP" in instr
-    assert "ONE task" in instr or "one task" in instr.lower()
-    # explicitly steers away from auto-executing
-    assert "DO NOT begin executing" in instr or "do not begin executing" in instr.lower()
+    # §4UI: the result defers to the ONE pacing rule instead of its own STOP
+    assert "follow the PACING rule in the CURRENT PROJECT block" in instr
+    assert "STOP" not in instr and "DO NOT begin executing" not in instr
 
 
 @pytest.mark.asyncio
@@ -224,6 +218,8 @@ async def test_decompose_returns_stop_and_await_instruction(context):
     # the created list is unchanged (additive return key)
     assert len(out["created"]) == 3
     instr = out.get("agent_instruction", "")
-    assert "STOP" in instr
     assert "3 task" in instr  # mentions the count
-    assert "proceed to next task" in instr.lower()
+    # §4UI: defers to the one pacing rule (a split mid-work is not a new plan
+    # to stop on)
+    assert "follow the PACING rule in the CURRENT" in instr
+    assert "STOP here" not in instr

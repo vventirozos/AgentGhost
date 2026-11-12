@@ -83,7 +83,8 @@ async def _three_batches(calls):
         ts.request_state = shared
         await agent._dispatch_and_process_tool_batch(ts)
         steers += [str(m.get("content")) for m in ts.messages
-                   if m.get("role") == "user" and "you have now edited" in str(m.get("content"))]
+                   if m.get("role") == "user" and ("you have now edited" in str(m.get("content"))
+                                                   or "edit-churn check" in str(m.get("content")))]
     return steers
 
 
@@ -97,8 +98,9 @@ async def test_the_churn_brake_lets_a_file_be_written_in_parts():
 
 
 async def test_the_churn_brake_still_catches_three_blind_edits():
-    """The control: three real edits of one file, no run between them, steer."""
-    edits = [("file_system", {"operation": "edit", "path": "app.py", "content": "a", "replace_with": "b"})] * 3
+    """The control: real edits of one file, no run between them, steer
+    (§4UI: from the 6th edit — _EDIT_CHURN_STEER_AFTER)."""
+    edits = [("file_system", {"operation": "edit", "path": "app.py", "content": "a", "replace_with": "b"})] * 6
     steers = await _three_batches(edits)
     assert steers and "app.py" in steers[0]
 

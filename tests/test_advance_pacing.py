@@ -70,7 +70,8 @@ def test_batch_instruction_on_failure_says_stop_not_rebuild():
 def test_batch_instruction_on_completion_is_plain_summary():
     b = AdvanceManyResult([{"status": "DONE"}, {"status": "DONE"}], "project_done", None)
     instr = _advance_batch_instruction(b, None)
-    assert "Summarize" in instr
+    assert "Report to the user what was built" in instr
+    assert "STOP" not in instr and "failed" not in instr.lower()   # §4UI: one instruction, no failure talk
     assert "Do NOT keep building" not in instr
 
 

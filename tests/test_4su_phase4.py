@@ -57,7 +57,7 @@ async def test_replan_keeps_done_work_and_replaces_the_open_plan(tmp_path):
     out = _j(await tool_manage_projects(ctx, action="replan",
                                         subtasks=["Pick vegetables", "Draw the layout"]))
     assert out["replanned"] == {"removed_open_tasks": 3, "kept_done_tasks": 1}
-    assert next(iter(out)) == "awaits_go_ahead"
+    assert next(iter(out)) == "plan_shown"
     left = {t["description"]: t["status"] for t in store.list_tasks(pid)}
     assert left == {"Measure the beds": "DONE", "Pick vegetables": "PENDING", "Draw the layout": "PENDING"}
     assert "REPLANNED" in store.get_ledger(pid)
@@ -84,15 +84,6 @@ async def test_replan_refuses_while_a_task_runs_and_changes_nothing(tmp_path):
     assert [r["id"] for r in store.list_tasks(pid)] == [t]
 
 
-async def test_replan_never_drops_a_human_gate_without_the_owner(tmp_path):
-    ctx, store, pid = await _proj(tmp_path)
-    g = store.add_task(pid, "Deploy", postconditions=["HUMAN_GATE: cto approval"])
-    out = str(await tool_manage_projects(ctx, action="replan", subtasks=["x"]))
-    assert "NOT replanned" in out and g in out
-    assert store.get_task(g) is not None
-    assert store.latest_task_event(pid, g, ("human_gate_parked",))
-
-
 async def test_a_blank_new_plan_deletes_nothing(tmp_path):
     ctx, store, pid = await _proj(tmp_path)
     keep = store.add_task(pid, "Buy seeds")
@@ -101,13 +92,15 @@ async def test_a_blank_new_plan_deletes_nothing(tmp_path):
     assert store.get_task(keep) is not None
 
 
-async def test_replan_of_a_single_file_deliverable_deletes_nothing(tmp_path):
+async def test_replan_of_a_single_file_goal_is_a_normal_replan(tmp_path):
+    # §4UI: the goal-text single-file refusal is gone — the model's plan stands
     ctx, store, pid = await _proj(tmp_path, title="Tetris clone",
                                   goal="a single-file HTML tetris game in one index.html")
-    keep = store.add_task(pid, "Build it")
+    store.add_task(pid, "Build it")
     out = str(await tool_manage_projects(ctx, action="replan", subtasks=["Board", "Pieces"]))
-    assert "NOT replanned" in out and "SINGLE-FILE" in out
-    assert store.get_task(keep) is not None
+    assert "NOT replanned" not in out and "SINGLE-FILE" not in out
+    descs = [t["description"] for t in store.list_tasks(pid)]
+    assert "Board" in descs and "Pieces" in descs
 
 
 async def test_replan_never_finishes_the_project_midway(tmp_path):
@@ -207,22 +200,25 @@ async def test_create_and_decompose_hand_the_turn_to_the_user(tmp_path):
 def test_only_the_tool_s_own_first_key_counts():
     from ghost_agent.core.agent import _awaits_owner_go_ahead
     assert _awaits_owner_go_ahead({"name": "manage_projects",
-                                   "content": 'OK: {"confirmation_needed": true, "x": 1}'})
+                                   "content": 'OK: {"plan_shown": true, "x": 1}'})
+    # §4UK: lifecycle previews are gone — their keys no longer count
+    assert not _awaits_owner_go_ahead({"name": "manage_projects",
+                                       "content": 'OK: {"confirmation_needed": true, "x": 1}'})
     # the marker quoted inside a field is not the payload's first key
     assert not _awaits_owner_go_ahead({"name": "manage_projects",
-                                       "content": '{"note": "{\\"awaits_go_ahead\\": true"}'})
+                                       "content": '{"note": "{\\"plan_shown\\": true"}'})
     # a later key is not the marker either
     assert not _awaits_owner_go_ahead({"name": "manage_projects",
-                                       "content": '{"created": [], "awaits_go_ahead": true}'})
+                                       "content": '{"created": [], "plan_shown": true}'})
     assert not _awaits_owner_go_ahead({"name": "file_system",
-                                       "content": '{"awaits_go_ahead": true}'})
-    assert _awaits_owner_go_ahead({"name": "manage_projects",
-                                   "content": SimpleNamespace(reason_code="confirm_dead_end", text="")})
+                                       "content": '{"plan_shown": true}'})
+    assert not _awaits_owner_go_ahead({"name": "manage_projects",
+                                       "content": SimpleNamespace(reason_code="confirm_dead_end", text="")})
 
 
 def test_the_guard_exemption_reads_the_latest_row(monkeypatch):
     from ghost_agent.core.agent import _awaits_new_message_confirm
-    plan = {"name": "manage_projects", "content": '{"awaits_go_ahead": true}'}
+    plan = {"name": "manage_projects", "content": '{"plan_shown": true}'}
     other = {"name": "web_search", "content": "results"}
     assert _awaits_new_message_confirm([other, plan])
     assert not _awaits_new_message_confirm([plan, other])

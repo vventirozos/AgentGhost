@@ -138,14 +138,6 @@ def test_the_tree_carries_and_persists_the_wait(store):
     assert _wait(store, tid) == ("NEEDS_USER", "owner", "asked")
 
 
-def test_a_human_gate_park_is_a_human_gate_wait(store):
-    pid = store.create_project("P")
-    plan = ProjectPlan(store, pid)
-    tid = plan.add_task("Deploy", postconditions=["HUMAN_GATE: cto approval"])
-    plan.update_status(tid, TaskStatus.DONE, result="deployed")
-    assert _wait(store, tid) == ("NEEDS_USER", "owner", "human_gate")
-
-
 def test_a_rollup_refusal_is_a_rollup_wait_and_clears_on_done(store):
     pid = store.create_project("P")
     plan = ProjectPlan(store, pid)
@@ -217,31 +209,6 @@ async def test_an_unattended_hold_writes_its_field(store):
     calls = []
     await PA.advance_once(_actx(store), pid, tool_runner=_runner, coding_executor=_exe(calls), owner_requested=False)
     assert _wait(store, tid) == ("NEEDS_USER", "owner_turn", "verify_task")
-
-
-async def test_the_needs_user_park_and_the_human_gate_write_their_fields(store):
-    pid = store.create_project("P")
-    store.update_project(pid, status="ACTIVE")
-    a = store.add_task(pid, "Approve the budget")
-    await PA.advance_once(_actx(store), pid, tool_runner=_runner, owner_requested=False)
-    assert _wait(store, a) == ("NEEDS_USER", "owner", "review")
-    b = store.add_task(pid, "Write the notes", postconditions=["HUMAN_GATE: legal sign"])
-    store.update_project(pid, status="ACTIVE")
-    await PA.advance_once(_actx(store), pid, tool_runner=_runner, owner_requested=False)
-    assert _wait(store, b) == ("NEEDS_USER", "owner", "human_gate")
-
-
-async def test_the_human_gate_instruction_reads_the_field(tmp_path, owner_turn):
-    owner_turn("a1b2c3d4")
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "s")
-    ctx = _tool_ctx(store, tmp_path)
-    await tool_manage_projects(ctx, action="create", title="P", goal="g")
-    pid = ctx.current_project_id
-    tid = store.add_task(pid, "Deploy", postconditions=["HUMAN_GATE: cto approval"])
-    out = json.loads(str(await tool_manage_projects(ctx, action="task_update", task_id=tid,
-                                                    status="done", result="deployed it")))
-    assert out["not_closed"][0]["waiting"] == "human_gate"
-    assert "approve <task id>" in out["agent_instruction_not_closed"]
 
 
 async def test_the_owner_click_over_a_constraint_hold_reads_the_field(store, monkeypatch):
@@ -324,38 +291,12 @@ def test_a_hold_that_is_blocked_then_asked_is_not_a_hold_again(store):
     assert _wait(store, tid) == ("NEEDS_USER", "owner", "asked")
 
 
-def test_a_gated_parent_blocked_by_a_failed_child_waits_on_the_dependency(store):
-    pid = store.create_project("P")
-    plan = ProjectPlan(store, pid)
-    parent = plan.add_task("Ship", postconditions=["HUMAN_GATE: cto approval"])
-    child = plan.add_task("build", parent_id=parent)
-    plan.update_status(child, TaskStatus.DONE, result="built")
-    assert _wait(store, parent)[2] == "human_gate"
-    plan = ProjectPlan(store, pid)
-    plan.update_status(child, TaskStatus.PENDING)
-    plan.update_status(child, TaskStatus.FAILED, failure_reason="broke")
-    st, on, code = _wait(store, parent)
-    assert st != "BLOCKED" or (on, code) == ("dependency", "child_failed")
-
-
 def test_the_boot_reaper_writes_pending_not_ready(store):
     pid = store.create_project("P")
     tid = store.add_task(pid, "x")
     store.update_task(tid, status="IN_PROGRESS")
     store.reset_orphaned_in_progress(older_than_seconds=-1)
     assert store.get_task(tid)["status"] == "PENDING"
-
-
-def test_a_paused_gated_phase_is_parked_as_the_gate(store):
-    pid = store.create_project("P")
-    plan = ProjectPlan(store, pid)
-    parent = plan.add_task("Phase 2", postconditions=["HUMAN_GATE: legal sign"])
-    child = plan.add_task("draft", parent_id=parent)
-    store.update_task(parent, status="PAUSED")
-    plan = ProjectPlan(store, pid)
-    plan.update_status(child, TaskStatus.DONE, result="drafted")
-    assert _wait(store, parent) == ("NEEDS_USER", "owner", "human_gate")
-    assert store.latest_task_event(pid, parent, ("human_gate_triggered",))
 
 
 def test_a_store_without_the_wait_columns_still_writes(tmp_path, monkeypatch):
@@ -446,22 +387,6 @@ def test_a_failed_child_does_not_overwrite_an_owner_wait_on_its_parent(store):
     plan.update_status(a, TaskStatus.DONE, result="done a")
     plan.update_status(b, TaskStatus.DONE, result="done b")
     assert store.get_task(ph)["status"] == "NEEDS_USER"
-
-
-def test_a_held_row_later_gated_migrates_as_the_gate(tmp_path):
-    s = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    pid = s.create_project("P")
-    tid = s.add_task(pid, "Deploy", postconditions=["HUMAN_GATE: cto approval"])
-    db = next(Path(tmp_path / "m").rglob("*.db"))
-    con = sqlite3.connect(db)
-    for col in ("wait_on", "wait_code", "wait_why"):
-        con.execute(f"ALTER TABLE tasks DROP COLUMN {col}")
-    con.execute("UPDATE tasks SET status = 'NEEDS_USER', result_summary = ? WHERE id = ?",
-                ("built — not closed unattended", tid))
-    con.commit()
-    con.close()
-    s2 = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    assert _wait(s2, tid) == ("NEEDS_USER", "owner", "human_gate")
 
 
 # ───────────────────────────── battery pins ─────────────────────────────
@@ -606,15 +531,6 @@ def test_a_running_or_failed_dependency_is_not_closed_by_the_model(store, dep_st
 
 # ───────────────────────────── review r4 (2) ─────────────────────────────
 
-def test_a_gate_park_over_a_failed_child_blocks(store):
-    plan = ProjectPlan(store, store.create_project("P"))
-    ph = plan.add_task("Deploy phase", postconditions=["HUMAN_GATE: cto approval"])
-    a = plan.add_task("step", parent_id=ph)
-    plan.update_status(a, TaskStatus.DONE, result="done, checked")
-    assert _wait(store, ph) == ("NEEDS_USER", "owner", "human_gate")
-    plan.update_status(a, TaskStatus.FAILED, failure_reason="broke")
-    assert store.get_task(ph)["status"] == "BLOCKED"
-
 
 def test_a_failed_child_closed_done_lifts_its_block(store):
     plan = ProjectPlan(store, store.create_project("P"))
@@ -692,7 +608,6 @@ def test_a_refusal_text_does_not_survive_as_the_done_record(store):
     plan.update_status(a, TaskStatus.DONE, result="fixed, checked")
     row = store.get_task(ph)
     assert row["status"] == "DONE" and not row["result_summary"].startswith("not closed:")
-
 
 
 # ───────────────────────────── review r6 ─────────────────────────────
@@ -800,7 +715,6 @@ def test_a_failed_parent_with_open_subtasks_is_replanned_not_revived(store):
     plan.tree.nodes[p].status = TaskStatus.FAILED
     fix = gate_dependencies(plan.tree, rep).fix
     assert "replan it" in fix and "status=PENDING" not in fix
-
 
 
 def test_a_failed_middle_parent_whose_subtasks_stand_is_not_revived(store):

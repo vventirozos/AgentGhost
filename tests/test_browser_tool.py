@@ -723,21 +723,23 @@ async def test_tool_browser_surfaces_last_url_error_cleanly(tmp_path):
 def test_prompt_mentions_native_browser_tool():
     """The user-facing prompt should advertise the `browser(...)` tool
     as the preferred path, not raw Playwright."""
-    prompt_path = Path(__file__).parent.parent / "src/ghost_agent/core/prompts.py"
-    content = prompt_path.read_text()
-    # Native tool mentioned
-    assert "browser(operation=" in content
-    # Raw Playwright is still documented but secondary
-    assert "RAW-PLAYWRIGHT FALLBACK" in content
+    # §4UI: the coding persona that carried this is gone — the tool
+    # descriptions carry it: browser says prefer me, execute the fallback
+    from ghost_agent.tools.registry import TOOL_DEFINITIONS
+    d = {t["function"]["name"]: t["function"]["description"] for t in TOOL_DEFINITIONS}
+    assert "PREFER THIS over writing raw Playwright" in d["browser"]
+    assert "RAW-PLAYWRIGHT FALLBACK" in d["execute"]
 
 
 def test_prompt_contains_dns_leak_guard():
     """The raw-Playwright fallback in the prompt must now teach the
     --host-resolver-rules DNS-over-proxy flag, not just the proxy URL."""
-    prompt_path = Path(__file__).parent.parent / "src/ghost_agent/core/prompts.py"
-    content = prompt_path.read_text()
-    assert "--host-resolver-rules" in content
-    assert "MAP * ~NOTFOUND" in content
+    # §4UI: in the execute description the model always sees (it was in the
+    # keyword-chosen coding persona, removed)
+    from ghost_agent.tools.registry import TOOL_DEFINITIONS
+    d = next(t["function"]["description"] for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")
+    assert "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE 127.0.0.1" in d
+    assert "TOR_PROXY" in d
 
 
 # --- 8. web_automation template --------------------------------------------

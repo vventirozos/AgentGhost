@@ -1,4 +1,5 @@
-"""§4KX r8 (2026-10-03): forget is PREVIEW → CONFIRM, reset_all likewise,
+"""§4KX r8 (2026-10-03): forget is PREVIEW → CONFIRM, reset_all likewise (§4UK 11-12: both now run in
+the call that asks — what stays pinned here is the sweep's list, the executor and the walls),
 and the matching fixes from the re-review of the §4KX deploy. Each test names
 the world it fails in."""
 import asyncio
@@ -17,6 +18,12 @@ from tests.test_memory_producers_rereview import _Vec, _edges, _forget, _owner
 
 
 def _kb(pm, gm, ep=None, sandbox=None, vec=None, **kw):
+    """§4UK: the model-facing forget deletes at once (tests/test_4uj_no_confirmations_memory.py). These tests
+    pin the sweep's LIST and the executor behind a token, so a forget with a target and no token runs the
+    list step alone (`forget_preview`); everything else goes through the tool."""
+    if kw.get("action") == "forget" and kw.get("target") and not kw.get("confirm"):
+        return asyncio.run(M.forget_preview(M._norm_doc_name(kw["target"]), sandbox, vec or _Vec(), pm, gm,
+                                            episodic_memory=ep))
     return asyncio.run(M.tool_knowledge_base(memory_system=vec or _Vec(), sandbox_dir=sandbox, profile_memory=pm,
                                              graph_memory=gm, episodic_memory=ep, **kw))
 
@@ -66,17 +73,17 @@ def test_the_preview_deletes_nothing_and_numbers_what_it_would(tmp_path):
     ep.record_episode("what did Elena say", context="", outcome="ok", lesson="")
     before_e, before_p = _edges(gm), pm.load()
     out = _kb(pm, gm, ep, sb, action="forget", target="Elena")
-    assert str(out).startswith("PREVIEW") and "1. " in out and "confirm='" in out
+    assert str(out).startswith("LIST") and "1. " in out and "confirm='" in out
     assert _edges(gm) == before_e and pm.load() == before_p and (sb / "elena.txt").exists()
     assert ep.count_mentions("elena") == 1
 
 
-def test_the_turn_that_previewed_cannot_confirm(tmp_path):
-    """Fails in the world where the model previews and confirms in one breath."""
+def test_the_turn_that_listed_may_delete(tmp_path):
+    """§4UK (operator 11-12: no confirmations): the token works in the turn that made the list."""
     pm, gm = _family(tmp_path)
     tok = _token(_kb(pm, gm, action="forget", target="ektoras"))
     out = _kb(pm, gm, action="forget", confirm=tok)
-    assert "NOT deleted" in str(out) and ("ektoras", "WORKS_AT", "acme") in _edges(gm)
+    assert "✅" in str(out) and ("ektoras", "WORKS_AT", "acme") not in _edges(gm)
 
 
 def test_the_users_next_turn_deletes_exactly_the_default_items(tmp_path):
@@ -179,32 +186,11 @@ def _wipe_store():
     return vec
 
 
-def test_reset_all_is_two_steps(tmp_path):
-    """Fails in the world where one reset_all call wiped every store, or the
-    old wording gate opened on "Don't wipe all your memory!"."""
+def test_reset_all_wipes_in_the_call_that_asks(tmp_path):
+    """§4UK: one call in the user's request wipes; no preview, no token."""
     vec, gm = _wipe_store(), MagicMock()
-    out = _kb(None, gm, vec=vec, action="reset_all")
-    assert str(out).startswith("PREVIEW") and not vec.collection.delete.called and not gm.wipe_all.called
-    tok = _token(out)
-    assert "NOT executed" in str(_kb(None, gm, vec=vec, action="reset_all", confirm=tok))
-    t = _as_request("req-next")
-    try:
-        done = _kb(None, gm, vec=vec, action="reset_all", confirm=tok)
-    finally:
-        request_id_context.reset(t)
+    done = _kb(None, gm, vec=vec, action="reset_all")
     assert "Wiped" in str(done) and vec.collection.delete.called and gm.wipe_all.called
-
-
-def test_a_forget_token_cannot_confirm_a_wipe(tmp_path):
-    pm, gm = _family(tmp_path)
-    tok = _token(_kb(pm, gm, action="forget", target="ektoras"))
-    vec = _wipe_store()
-    t = _as_request("req-next")
-    try:
-        out = _kb(pm, gm, vec=vec, action="reset_all", confirm=tok)
-    finally:
-        request_id_context.reset(t)
-    assert "NOT executed" in str(out) and not vec.collection.delete.called
 
 
 # ── matching ─────────────────────────────────────────────────────────────────

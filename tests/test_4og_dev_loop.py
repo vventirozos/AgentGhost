@@ -56,11 +56,11 @@ def test_two_green_suite_runs_are_not_a_stall_but_a_green_countless_rerun_is():
     assert futility_tier({"app.py": rec}, True, False)[0] == ""
     note_run_outcome(rec, ok=False, output="===== 2 failed, 21 passed in 0.4s =====")
     note_run_outcome(rec, ok=False, output="===== 2 failed, 21 passed in 0.4s =====")
-    assert futility_tier({"app.py": rec}, True, False)[0] == "report"        # failing and stalled: reported
+    assert rec["progress"] is False                                          # failing and stalled (§4UI: the steer reads it; no report tier)
     x = {"writes": FUTILITY_REPORT_WRITES, "runs": FUTILITY_REPORT_RUNS}
     note_run_outcome(x, ok=True, output="counts: 12 sprites (expected 300)")
     note_run_outcome(x, ok=True, output="counts: 12 sprites (expected 300)")
-    assert x["counted"] is False and futility_tier({"extract.py": x}, True, False)[0] == "report"
+    assert x["counted"] is False and x["progress"] is False
 
 
 # ── (i) program output is deterministic ─────────────────────────────────── #
@@ -257,13 +257,14 @@ def test_the_prompt_states_one_working_directory_and_a_reachable_pypi():
     """Fails where the prompt said the shell ALWAYS starts in /workspace two
     lines after saying it starts in the project dir, and that the sandbox has
     no package network while pip works over Tor (§4OF)."""
-    from ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT
-    p = SPECIALIST_SYSTEM_PROMPT
+    # §4UI: the coding persona is gone; the sandbox facts ride the
+    # `execute` tool description, which every coding turn is sent.
+    from ghost_agent.tools.registry import TOOL_DEFINITIONS
+    p = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")["function"]["description"]
     assert "Shell ALWAYS starts in `/workspace`" not in p
-    assert "the shell starts in the active project directory" in p
-    assert "SAME working directory for every command" in p
+    assert "The shell starts in the active project's folder (else /workspace)" in p
     assert "has no package network" not in p
-    assert "works over Tor" in p
+    assert "`pip install` (slow, over Tor)" in p
 
 
 def test_task_state_gives_each_written_file_its_download_link_last():

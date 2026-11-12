@@ -646,13 +646,6 @@ async def test_a_refused_delete_keeps_the_projects_schedules(tasks, monkeypatch)
     assert T.project_schedules("p1") and any("kept — the delete is refused" in n for n in rep["notes"])
 
 
-def test_a_new_schedule_since_the_preview_asks_again(monkeypatch):
-    """r2 #12."""
-    from ghost_agent.tools import projects as P
-    monkeypatch.setattr(P, "_labs_host_configured", lambda c: False)
-    monkeypatch.setattr(P, "_project_inventory", lambda c, rid, hl=None: {
-        "services": [], "runs": [], "labs": [], "jobs": [], "schedules": [{"id": "task_1", "name": "n"}]})
-    assert P._grew_since_preview(SimpleNamespace(), "delete", "p1", {"inventory": []}) == ["sched:task_1"]
 
 
 # ------------------------------------------------------------------ review r4 + battery survivors

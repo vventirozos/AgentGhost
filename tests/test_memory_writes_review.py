@@ -180,10 +180,11 @@ def test_the_dedup_check_reads_the_canonical_field(tmp_path):
 
 # ── reset_all ────────────────────────────────────────────────────────────────
 # (§4KX r8) the request-wording gate opened on negations and questions and
-# refused "yes": reset_all is now preview → confirm in a later turn
+# §4UK: reset_all wipes at once in the user's own request — a call with NO
+# request (background, no user) is refused and wipes nothing
 @pytest.mark.parametrize("request_text", ["wipe all your memory", "Don't wipe all your memory!", "clean up the sandbox"])
-def test_reset_all_never_wipes_in_the_call_that_asks(request_text):
-    """Fails in the world where one model call wiped every store."""
+def test_reset_all_never_wipes_outside_a_user_request(request_text):
+    """Fails in the world where a call with no user request wiped every store."""
     from ghost_agent.memory.request_text import current_request
     vec = MagicMock()
     vec.collection.get.return_value = {"ids": ["a"]}
@@ -192,7 +193,7 @@ def test_reset_all_never_wipes_in_the_call_that_asks(request_text):
         out = asyncio.run(M.tool_knowledge_base(action="reset_all", memory_system=vec, graph_memory=MagicMock()))
     finally:
         current_request.reset(tok)
-    assert str(out).startswith("PREVIEW") and not vec.collection.delete.called
+    assert str(out).startswith("NOT executed") and not vec.collection.delete.called
 
 
 # ── episodes ─────────────────────────────────────────────────────────────────

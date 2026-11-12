@@ -56,7 +56,7 @@ MUT = [
     ('A6 exp-hold-owner', PA, '                               wait=("owner_turn", "model_experiment", _why))', '                               wait=("owner", "model_experiment", _why))'),
     # ── briefing / tool / web
     ('B1 briefing-raw-status', PR, '                return f"WAITING({v[\'on\']})" if v["state"] == "WAITING" else v["state"]', '                return n.status.value'),
-    ('B2 finished-shows-active', PR, '    if not _finished:\n        lines.append(\n            f"*** A project is ALREADY ACTIVE', '    if True:\n        lines.append(\n            f"*** A project is ALREADY ACTIVE'),
+    ('B2 finished-shows-active', PR, '    if not _finished:\n        # §4UI r1 M2', '    if True:\n        lines.append(\n            f"*** A project is ALREADY ACTIVE'),
     ('B3 finished-no-line', PR, '    if _finished:\n        _arch', '    if False:\n        _arch'),
     ('T1 waiting-not-alias', TP, '                    _su = {"WAITING": "NEEDS_USER", "RUNNING": "IN_PROGRESS"}.get(', '                    _su = {}.get('),
     ('T2 list-full-rows', TP, '            _out = {} if not bool((metadata or {}).get("verbose")) else {"projects": projs}', '            _out = {"projects": projs}'),
@@ -65,14 +65,14 @@ MUT = [
     ('T5 replan-drops-done', TP, '            _drop = [t for t in _all if str(t.get("status") or "").upper() != "DONE" and not _has_done(t["id"])]', '            _drop = [t for t in _all if str(t.get("status") or "").upper() != "DONE"]'),
     ('T6 replan-ignores-running', TP, '            if _running:\n                return _err(f"NOT replanned', '            if False:\n                return _err(f"NOT replanned'),
     ('T7 replan-drops-gate', TP, '            if _gated:\n                for _t in _gated:', '            if False:\n                for _t in _gated:'),
-    ('T8 replan-cohesive-late', TP, '            if len(_new) > 1 and _is_cohesive_single_file(_rp.get("title"), _rp.get("goal")):', '            if False:'),
+    # T8 (replan-cohesive-late) retired §4UI: the single-file collapse was removed
     ('T9 replan-no-ledger', TP, '                    store.append_ledger(project_id, f"REPLANNED: {len(_replan[\'drop_ids\'])} open task(s) "', '                    (lambda *a: None)(project_id, f"REPLANNED: {len(_replan[\'drop_ids\'])} open task(s) "'),
-    ('T10 no-go-ahead-key', TP, '            return _ok({"awaits_go_ahead": True,      # §4SU Phase 4: a plan for the user — the turn ends\n                        "created": ids,', '            return _ok({"awaits_go_ahead": False,\n                        "created": ids,'),
+    ('T10 no-go-ahead-key', TP, '                        # FIRST key: the trailing-promise steer reads it from a truncated result\n                        "created": ids,', '                        # FIRST key: the trailing-promise steer reads it from a truncated result\n                        "plan_shown": False, "created": ids,'),
     ('T11 sniffer-ignores-refused', TP, '        _held = any(payload.get(k) for k in ("refused", "missing"))', '        _held = any(payload.get(k) for k in ("missing",))'),
     ('T12 gate-not-by-field', TP, '                                           "waiting": plan.tree.nodes[tid].wait_code})        # §4SU Phase 3', '                                           "waiting": ""})'),
     ('T13 autoadv-holds-by-status', TP, '                _holds = [_row(t) for t in _rows if t.get("wait_on") == "owner_turn"][:10]', '                _holds = []'),
     ('C1 no-retry-clause', TC, '"When a fix is yours to do, do it, then retry with status=done AND the result in the same call; "', '""'),
-    ('G1 guard-any-row', AG, "    return raw.startswith(('{\"confirmation_needed\": true', '{\"awaits_go_ahead\": true'))", "    return '\"awaits_go_ahead\": true' in raw or '\"confirmation_needed\": true' in raw"),
+    ('G1 guard-any-row', AG, "    return raw.startswith(('{\"confirmation_needed\": true', '{\"plan_shown\": true'))", "    return '\"plan_shown\": true' in raw or '\"confirmation_needed\": true' in raw"),
     ('G2 guard-any-tool', AG, '        if str(row.get("name") or "") != "manage_projects":\n            return False\n        content = row.get("content")', '        content = row.get("content")'),
     ('R1 web-click-by-text', RT, '            if existing.get("wait_code") == "rollup_constraints":', '            if str(existing.get("result_summary") or "").startswith("not closed: constraints"):'),
     # ── review r1/r2 fixes

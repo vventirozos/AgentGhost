@@ -29,52 +29,19 @@ async def test_handle_chat_basic_flow(agent):
     assert "Ghost" in messages[0]["content"]
 
 @pytest.mark.asyncio
-async def test_mode_switching_python_specialist(agent):
-    # Mock LLM response
+async def test_a_coding_request_gets_no_persona_but_the_sandbox(agent):
+    # §4UI (2026-11-12): the coding persona ("Specialist") was removed — the
+    # base prompt carries the coding rules; a coding request gets the sandbox
     agent.context.llm_client.chat_completion = AsyncMock(return_value={
         "choices": [{"message": {"content": "Code", "tool_calls": []}}]
     })
-    
-    # User asks for python code -> Should trigger specialist mode
     body = {"messages": [{"role": "user", "content": "Write a python script to count numbers"}], "model": "Qwen-Test"}
     await agent.handle_chat(body, background_tasks=MagicMock())
-    
-    call_args = agent.context.llm_client.chat_completion.call_args[0][0]
-    messages = call_args["messages"]
-    
-    # Base system prompt at messages[0]
+    messages = agent.context.llm_client.chat_completion.call_args[0][0]["messages"]
     assert "Ghost" in messages[0]["content"]
-    
-    # Transient injection with specialized persona at messages[-1]
-    transient_injection = messages[-1]["content"]
-    assert "Ghost Advanced Engineering and Database Subsystem" in transient_injection
-    assert "RAW, EXECUTABLE CODE" in transient_injection
-
-@pytest.mark.asyncio
-async def test_system_prompt_additive_logic(agent):
-    # Verify that the base SYSTEM_PROMPT is still present when a specialized prompt is added
-    
-    agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {"content": "Code", "tool_calls": []}}]
-    })
-    
-    # Trigger Python Specialist
-    body = {"messages": [{"role": "user", "content": "Write a python script to count numbers"}], "model": "Qwen-Test"}
-    await agent.handle_chat(body, background_tasks=MagicMock())
-    
-    call_args = agent.context.llm_client.chat_completion.call_args[0][0]
-    messages = call_args["messages"]
-    
-    # Core prompt is at messages[0]
-    assert "You are Ghost" in messages[0]["content"] or "Ghost" in messages[0]["content"]
-    
-    # Specialized prompt is in the transient injection at messages[-1]
-    transient_injection = messages[-1]["content"]
-    assert "Ghost Advanced Engineering and Database Subsystem" in transient_injection
-    
-    # Combined they provide the full instruction set
-    full_prompt = messages[0]["content"] + transient_injection
-    assert len(full_prompt) > 1000 # Should be substantial
+    blob = "\n".join(str(m.get("content")) for m in messages)
+    assert "Ghost Advanced Engineering and Database Subsystem" not in blob
+    assert "CURRENT SANDBOX STATE" in blob
 
 @pytest.mark.asyncio
 async def test_history_truncation(agent):

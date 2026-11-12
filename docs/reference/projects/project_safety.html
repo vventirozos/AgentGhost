@@ -61,6 +61,15 @@
   <h1>core / project_safety.py</h1>
   <p class="subtitle">Budget enforcement, human-gate postconditions, contradiction detection, and chat→project promotion heuristics.</p>
 
+  <h2 id="no-confirmations">No confirmations <span class="tag">2026-11-12 &sect;4UJ</span></h2>
+  <p class="note">Operator: "i want all confirmations, everywhere to be removed. i don't wanna be asked for anything. that's why everything is sandboxed" (clarifying questions stay). This supersedes the preview/confirm_token, human-gate and gate-word sections further down.</p>
+  <ul>
+    <li><code>manage_projects</code> release / unrelease / delete run in the call; <code>confirm_token</code> is accepted and ignored. <code>_lifecycle_confirmation</code> only refuses a non-user turn (background, scheduled, probe — a probe may still act on its own probe-created project) and a request that read outside content.</li>
+    <li><code>project_safety.HUMAN_GATES_ENABLED = False</code>: a <code>HUMAN_GATE:</code> postcondition never parks a task; <code>is_human_gate_text</code> keeps it out of text grading.</li>
+    <li>Gate words ("approve", "publish", "send", "confirm") no longer hold or park a task; the classifier answers only coding / research.</li>
+    <li>A constraint override (<code>override={"constraints": "&lt;why&gt;"}</code>) goes through in the owner's own turn and is recorded (<code>constraint_override</code> event + ledger line); an unattended turn still cannot go over a constraint.</li>
+    <li>Kept: an explicit <code>kind: owner</code> task (it needs something only the owner has), and the unattended verify / model-experiment holds (they are not approvals).</li>
+  </ul>
   <h2>Functions</h2>
   <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>

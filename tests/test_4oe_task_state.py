@@ -252,12 +252,12 @@ async def test_the_futility_breaker_lets_a_converging_test_fix_loop_run(monkeypa
     assert not getattr(agent.context, "_futility_report_done", False)
     assert not getattr(agent.context, "_breaker_forced_final", False)   # the converging loop ran to its own end
     assert ctx.llm_client.chat_completion.await_count == 2 * len(falling) + 1
-    # the same cycle with NO progress (every run the same) is ended by a breaker — the futility
-    # report, or the no-progress breaker that sees identical runs first — and the progress flag is False
+    # the same cycle with NO progress: §4UI — the futility breaker steers once and no
+    # longer forces a report; the progress flag is False (what the steer reads)
     # production shape: a failing pytest EXITS 1 → the tool result is a declared failure
     stuck = [ToolOutcome.failed(f"=== 9 failed, 3 passed in 0.{i}s ===") for i in range(1, 8)]
     agent2, ctx2 = await _run_build(monkeypatch, tmp_path, stuck)
-    assert getattr(agent2.context, "_breaker_forced_final", False)
+    assert not getattr(agent2.context, "_futility_report_done", False)
     rec = (getattr(agent2.context, "_script_iter", None) or {}).get("app.py") or {}
     assert rec.get("progress") is False and rec.get("fails") == 9
 

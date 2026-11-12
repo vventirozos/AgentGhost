@@ -544,9 +544,16 @@ def test_another_project_lists_whole_and_retires_the_old_one():
     anchor, h = {}, _start()
     _turn(h, _secs(**{"sandbox_state:p1": _listing(*_MANY, "notes_old.md")}), anchor)
     _tool_turn(h, 1)
-    last = _turn(h, _secs(**{"sandbox_state:p2": _listing(*_MANY, "new.py")}), anchor)[-1]["content"]
-    assert "Removed" not in last and "old/f7.txt" in last
+    msgs = _turn(h, _secs(**{"sandbox_state:p2": _listing(*_MANY, "new.py")}), anchor)
+    last, kept = msgs[-1]["content"], msgs[-2]["content"]
+    # §4UI r1 m1: the new project's listing goes whole, as a KEPT block
+    assert "Removed" not in kept and "old/f7.txt" in kept and "new.py" in kept
+    assert "old/f7.txt" not in last
     assert '"CURRENT SANDBOX STATE:" section no longer applies' in last
+    _tool_turn(h, 2)
+    again = _turn(h, _secs(**{"sandbox_state:p2": _listing(*_MANY, "new.py")}), anchor)
+    assert A._STATE_NO_CHANGE in again[-1]["content"] or "old/f7.txt" not in again[-1]["content"]
+    assert sum("new.py" in str(m.get("content")) for m in again) == 1      # shown once, kept
 
 
 def test_the_state_block_keys_the_listing_by_project():
@@ -563,7 +570,7 @@ def test_the_state_block_keys_the_listing_by_project():
             if str(head).startswith("sandbox_state"):
                 keys.append(k)
     assert len(keys) == 1 and isinstance(keys[0], ast.JoinedStr)
-    assert "current_project_id" in ast.unparse(keys[0])
+    assert "_sb_project" in ast.unparse(keys[0])       # §4UI r1 m6: the project, unless hidden
 
 
 def test_a_project_keyed_listing_is_diffed():

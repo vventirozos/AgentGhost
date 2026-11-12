@@ -104,16 +104,16 @@ def _steer_count(plog):
 # Edit-churn brake
 # --------------------------------------------------------------------------
 
-async def test_three_unverified_edits_same_file_get_steered(agent):
-    writes = [f"SUCCESS: wrote {n} chars to 'index.html'." for n in (10, 20, 30)]
+async def test_six_unverified_edits_same_file_get_steered(agent):
+    # §4UI: the steer comes after 6 edits (was 3) and is advice
+    from ghost_agent.core.agent import _EDIT_CHURN_STEER_AFTER as N
+    writes = [f"SUCCESS: wrote {n} chars to 'index.html'." for n in range(10, 10 * (N + 1), 10)]
     agent.available_tools["file_system"] = AsyncMock(side_effect=writes)
     agent.available_tools["execute"] = AsyncMock(return_value="OUTPUT: clean")
 
     calls, plog = await _run_spying(agent, "fix the calendar", [
-        _write_call("index.html", "v1", "t1"),
-        _write_call("index.html", "v2", "t2"),
-        _write_call("index.html", "v3", "t3"),
-        _exec_call("t4"),               # verification after the steer
+        *[_write_call("index.html", f"v{i}", f"t{i}") for i in range(1, N + 1)],
+        _exec_call("t99"),              # verification after the steer
         _final("Done, verified."),
     ])
 

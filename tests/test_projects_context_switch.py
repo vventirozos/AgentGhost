@@ -82,8 +82,26 @@ def test_briefing_tells_model_not_to_re_read_original_prompt(store):
     directive that tells it to stop."""
     pid = store.create_project("X")
     b = build_project_briefing(store, pid)
-    assert "DO NOT re-read the user's original" in b
-    assert "start a new project" in b
+    assert "DO NOT call manage_projects action=create" in b
+    # §4UI r1 M2: on a LATER request the original message is fulfilled history
+    assert "has been fulfilled" in b
+    assert "Creating it is done" not in b
+
+
+def test_briefing_in_the_creating_request_says_the_rest_is_still_to_do(store):
+    """§4UI: in the request that created it, the create part is done and the
+    REST of that message (\"create and build X\") is not."""
+    from ghost_agent.utils.logging import request_id_context
+    tok = request_id_context.set("c0ffee01")
+    try:
+        pid = store.create_project("X")
+        b = build_project_briefing(store, pid)
+        assert "Creating it is done; anything else the user asked for" in b
+        assert "has been fulfilled" not in b
+        request_id_context.set("c0ffee02")              # the next request
+        assert "has been fulfilled" in build_project_briefing(store, pid)
+    finally:
+        request_id_context.reset(tok)
 
 
 def test_briefing_points_to_batch_path(store):
@@ -255,7 +273,7 @@ def test_briefing_says_where_files_live(store):
     assert "FILES: this project's folder IS your working directory" in b
     assert f"never '{pid}/…'" in b and f"'projects/{pid}/…'" in b
     # every turn: right under the ALREADY ACTIVE line, not after the task list
-    assert b.index("FILES:") < b.index("ONE TASK AT A TIME")
+    assert b.index("FILES:") < b.index("*** PACING")
 
 
 def test_released_briefing_says_where_files_live_too(store, monkeypatch):

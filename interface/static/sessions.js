@@ -302,15 +302,14 @@ export function initSessions(ctx) {
             toast('Wait for the current turn to finish first', 'error');
             return;
         }
-        const title = s.title || 'untitled session';
-        if (!window.confirm(`Delete "${title}"? The stored conversation is removed from the agent.`)) return;
+        // §4UK (operator 11-12): no confirmation dialogs — the click is the decision
         try {
             const res = await fetch(`/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
             if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
             sessions = sessions.filter(x => x.id !== s.id);
             if (s.id === currentId) {
                 // RE-CHECK after the await. The entry gate above ran before
-                // window.confirm() and the DELETE round trip — a turn started
+                // the click and the DELETE round trip — a turn started
                 // in between, and clearing here detaches its streaming bubble
                 // and orphans the reply into an emptied history, which the
                 // agent then persists under a session it just deleted (R2

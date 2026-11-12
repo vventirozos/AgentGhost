@@ -131,9 +131,11 @@ async def test_a_postcondition_waiver_closes_and_is_recorded(tmp_path, owner_tur
 async def test_an_override_on_a_gate_that_cannot_be_waived_is_ignored(tmp_path, owner_turn):
     owner_turn("a1b2c3d4")
     ctx, store, pid = await _project(tmp_path)
-    tid = store.add_task(pid, "Write the report → report.md")
-    out = await _done(ctx, tid, result="wrote it", override={"deliverable": "the plan changed, no file"})
-    assert store.get_task(tid)["status"] == "PENDING" and out["refused"][0]["gate"] == "deliverable"
+    # §4UI: "deliverable" became waivable — a dependency still is not
+    dep = store.add_task(pid, "Gather the data")
+    tid = store.add_task(pid, "Write the report", depends_on=[dep])
+    out = await _done(ctx, tid, result="wrote it", override={"dependencies": "the data is not needed"})
+    assert store.get_task(tid)["status"] == "PENDING" and out["refused"][0]["gate"] == "dependencies"
 
 
 async def test_an_override_given_as_json_text_is_read(tmp_path, owner_turn):
@@ -273,18 +275,6 @@ def test_a_done_parent_is_not_re_judged_by_a_child_re_close(tmp_path):
     ProjectPlan(store, pid).update_status(c1, TaskStatus.DONE, result="did a, re-verified")
     t = store.get_task(par)
     assert t["status"] == "DONE" and t["result_summary"] == "owner says done"
-
-
-def test_an_approved_gated_parent_is_not_parked_again(tmp_path):
-    from tests.test_4su_phase0 import GATE
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "s")
-    pid = store.create_project("P")
-    par = store.add_task(pid, "Release", postconditions=GATE)
-    c1 = store.add_task(pid, "Build", parent_id=par)
-    ProjectPlan(store, pid).update_status(c1, TaskStatus.DONE, result="built")
-    ProjectPlan(store, pid).update_status(par, TaskStatus.DONE, result="released", human_approved=True)
-    ProjectPlan(store, pid).update_status(c1, TaskStatus.DONE, result="built again")
-    assert store.get_task(par)["status"] == "DONE"
 
 
 def test_a_roll_up_refusal_is_in_the_digest(tmp_path):
@@ -456,16 +446,6 @@ def test_the_same_refusal_is_not_logged_twice(tmp_path):
     ProjectPlan(store, pid).update_status(k2, TaskStatus.DONE, result="checked")
     ProjectPlan(store, pid).update_status(k2, TaskStatus.DONE, result="checked again")
     assert len(store.list_events(pid, event_type="rollup_refused")) == 1
-
-
-def test_a_gate_park_is_not_rewritten_as_a_refusal():
-    from tests.test_4su_phase0 import GATE
-    tree = TaskTree()
-    top = tree.add_task("Release → dist.zip", postconditions=GATE)
-    a = tree.add_task("Build", parent_id=top)
-    tree.close_checker = lambda n, t: "deliverable: missing"
-    tree.update_status(a, TaskStatus.DONE, result="built")
-    assert tree.nodes[top].result_summary.startswith("human gate:")
 
 
 async def test_the_owner_s_override_records_are_written_with_the_close(tmp_path, monkeypatch):

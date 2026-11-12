@@ -12,10 +12,9 @@ task by it instead of by its wording (the ~9 wording classifiers each took
   owner      the owner does it (a decision, an account, a payment): waits for them
 
 An UNDECLARED task (kind "") is routed exactly as before — the wording
-classifiers stay as the default for it. The wording keeps its SAFETY role for
-every kind: a gate word in any form (``needs_user_gate`` / ``gate_form``:
-"publish", "approval"…) still waits for the owner, and the experiment words
-still hold a task — a kind may ADD the experiment hold (model_run), never
+classifiers stay as the default for it. Gate words ("publish", "approval"…) no
+longer hold any task (§4UK, operator 11-12: no confirmations); the experiment
+words still hold a task — a kind may ADD the experiment hold (model_run), never
 remove it (review r1: a retype to "build" skipped the §4ST gate).
 
 The deliverable stays the description's trailing ``→ path`` — the one

@@ -1,5 +1,12 @@
-"""The one-task-per-turn latch yields to a verifier auto-repair re-entry —
-2026-09-13.
+"""The loop's "converge now" hook — 2026-09-13, and §4UI 2026-11-12.
+
+§4UI: the hook no longer forces anything after a task closes (the one-task
+latch became briefing advice). The repair-yield property is kept for any
+converge rule that returns through it, so the tests below install one
+(`_converge_after_close`) where they exercise that property.
+
+Original (2026-09-13): the one-task-per-turn latch yields to a verifier
+auto-repair re-entry.
 
 Once a `manage_projects` call closes a task DONE, the loop re-asserts
 `force_final_response = True` on EVERY iteration so the turn converges. The
@@ -25,14 +32,18 @@ from ghost_agent.core.agent import GhostAgent, _latch_forces_final
 from tests.helpers import FakeBgTasks, make_context
 
 
-@pytest.mark.parametrize("closed,repair,expect", [
-    (False, False, False),
-    (False, True, False),
-    (True, False, True),
-    (True, True, False),      # the fix: a running repair keeps its tools
-])
-def test_latch_decision_table(closed, repair, expect):
-    assert _latch_forces_final(closed, repair) is expect
+@pytest.mark.parametrize("closed,repair", [(False, False), (False, True), (True, False), (True, True)])
+def test_the_hook_forces_nothing_in_production(closed, repair):
+    """§4UI: a closed task no longer ends the turn."""
+    assert _latch_forces_final(closed, repair) is False
+
+
+def _converge_after_close(monkeypatch):
+    """Install the pre-§4UI rule through the hook (a closed task converges
+    unless a repair runs) — the seam a future converge rule would use."""
+    import ghost_agent.core.agent as A
+    monkeypatch.setattr(A, "_latch_forces_final",
+                        lambda closed, repair_reentry_active: bool(closed) and not bool(repair_reentry_active))
 
 
 def _resp(content, tool_calls=None):
@@ -47,7 +58,7 @@ def _tc(cid, name, args):
 
 DONE_READBACK = json.dumps({"updated": [{"id": "t1", "status": "DONE",
                                          "result_summary": "wrote app.py"}],
-                            "count": 1})
+                            "count": 1, "closed": ["t1"]})
 
 
 def _agent(monkeypatch, *, write_first: bool):
@@ -78,6 +89,7 @@ async def test_the_repair_turn_can_run_its_tool_after_a_task_closed(monkeypatch)
     """Task closed (latch armed) + unverified write → the async gate forces
     the "actually RUN it" re-entry → the execute call must RUN. Pre-fix
     the latch re-forced the final and the call was dropped."""
+    _converge_after_close(monkeypatch)
     agent, ex = _agent(monkeypatch, write_first=True)
     body = {"messages": [{"role": "user", "content": "start task 1"}]}
     out, _, _ = await agent.handle_chat(body, FakeBgTasks())
@@ -85,13 +97,30 @@ async def test_the_repair_turn_can_run_its_tool_after_a_task_closed(monkeypatch)
     assert "Verified" in out
 
 
-async def test_without_a_repair_the_latch_still_drops_a_late_tool_call(monkeypatch):
-    """Control (both worlds agree): no unverified write → no repair → the
-    latch keeps forcing the final and the execute call is dropped."""
+async def test_a_converge_rule_without_a_repair_still_drops_a_late_tool_call(monkeypatch):
+    """Control: with a converge rule installed and no repair, the late
+    execute call is dropped — the hook really decides."""
+    _converge_after_close(monkeypatch)
     agent, ex = _agent(monkeypatch, write_first=False)
     body = {"messages": [{"role": "user", "content": "start task 1"}]}
     await agent.handle_chat(body, FakeBgTasks())
     ex.assert_not_awaited()
+
+
+async def test_after_a_task_closes_the_next_tool_call_runs(monkeypatch):
+    """§4UI: the production world — the task closed, and the model's next
+    call (here: running the file) RUNS instead of being dropped."""
+    agent, ex = _agent(monkeypatch, write_first=False)
+    agent.context.llm_client.chat_completion = AsyncMock(side_effect=[
+        _resp("Working.", [_tc("c1", "manage_projects", {"action": "update", "id": "t1", "status": "DONE"})]),
+        _resp("Task 1 done; on to task 2.", [_tc("c2", "execute", {"command": "python app.py"})]),
+        _resp("Both done."),
+        _resp("(unreachable)"),
+    ])
+    body = {"messages": [{"role": "user", "content": "do tasks 1 and 2"}]}
+    out, _, _ = await agent.handle_chat(body, FakeBgTasks())
+    ex.assert_awaited_once()
+    assert "Both done" in out
 
 
 
@@ -102,6 +131,7 @@ async def test_after_the_repair_ran_the_latch_turn_is_told_it_is_final(monkeypat
     turn got the full tool header with no final directive while every call it
     made was dropped. The schema decision now honours the latch."""
     monkeypatch.setenv("GHOST_PIN_TOOL_SCHEMAS", pinned)
+    _converge_after_close(monkeypatch)
     agent, ex = _agent(monkeypatch, write_first=True)
     body = {"messages": [{"role": "user", "content": "start task 1"}]}
     await agent.handle_chat(body, FakeBgTasks())

@@ -21,7 +21,7 @@ import pytest
 from ghost_agent.core import project_advancer as PA
 from ghost_agent.core.project_advancer import (
     AdvanceManyResult, AdvanceResult, advance_many, advance_once, classify_task,
-    default_llm_classifier, needs_user_gate, settle_gate,
+    default_llm_classifier, settle_gate,
 )
 from ghost_agent.memory.projects import ProjectStore
 from ghost_agent.memory.scratchpad import Scratchpad
@@ -40,39 +40,6 @@ REQ_4609 = (
 
 
 # ------------------------------------------------------------- the gate words
-
-@pytest.mark.parametrize("desc", [
-    "Approve the final migration plan",
-    "Publish the release notes",
-    "Decide which hosting provider to use",
-    "Send the report to the client",
-    "Implement and approve the change",
-    "Get the owner to sign off on the budget",
-    "Confirm the deploy window with the owner",
-    "Ask the owner to choose a colour scheme",
-    "Authorize the payment",
-    "Announce the launch",
-    "Pick one of the three logos",
-    "Delete production data older than a year",
-    "Drop database staging",
-    "Evaluate whether I truly 'choose' responses",
-    "APPROVE: the plan",
-    # r1 m2: other forms of a gate word beside a person who must act
-    "Re-approve the revised plan",
-    "Get CTO sign-off on the budget",
-    # r2: role cues and spellings
-    "Authorise the payment",
-    # r3: base form after pre-, curly apostrophes, plural leads, sentence ends,
-    # runs of whitespace, the three role shapes
-    "Pre-approve the vendor contract",
-    "Approve the plan.",
-    "Then approve.",
-    "Sign  off the budget",
-    "Team lead must sign off on the schema",
-])
-def test_a_whole_gate_word_gates(desc):
-    assert needs_user_gate(desc) is True
-    assert classify_task(desc) == "needs_user"
 
 
 NEGATIVES = [
@@ -152,114 +119,7 @@ OTHER_FORMS = [
 ]
 
 
-@pytest.mark.parametrize("desc", ["Explain the self-confirm loop in the model",
-                                  "Research self-confirmation bias", "self-confirming",
-                                  "Wait for user-confirmation"])
-def test_a_hyphen_on_the_left_is_never_a_gate_form(desc):
-    """r11: the 4609 shape stays overruled even when the classifier gates it
-    (an accepted miss: "owner-approved", "user-confirmation")."""
-    assert PA.gate_form(desc) is False
-    assert settle_gate(desc, "needs_user", default="coding") != "needs_user"
-
-
-@pytest.mark.parametrize("desc", OTHER_FORMS)
-def test_another_form_is_the_classifiers_call(desc):
-    assert needs_user_gate(desc) is False and classify_task(desc) != "needs_user"
-    assert PA.gate_form(desc) is True
-    assert settle_gate(desc, "needs_user") == "needs_user"
-    assert settle_gate(desc, "coding", default="coding") == "coding"
-
-
-@pytest.mark.parametrize("desc,gates", [
-    ("Review/approve the PR", True),                    # r4 #2: a word pair, not a path
-    ("Test/confirm the deploy window", True),
-    ("approve/reject the change", True),
-    ("Add the /api/publish endpoint", False),
-    ("Fix a/b/publish", False),
-    ("Get CTO sign\u2011off", True),                    # U+2011 hyphen
-    ("Get CTO sign\u2010off", True),
-    ("Add rate limiting to the api/send endpoint", False),   # r5 #1: a path, not two actions
-    ("Write a README for docs/publish", False),
-    ("Copy the build into publish/ for deploy", False),
-    ("Fix publish/x", False),
-    ("Edit docs/publish/index", False),
-    ("approve/sign-off the PR", True),
-    ("Fix the self\u00adconfirm loop", False),             # r5 NIT: soft hyphen is invisible
-    ("Approve\u2014now", True),                            # an em dash is punctuation, not a hyphen
-    ("Owner to review/approve.", True),                       # r6 #2: a pair at a sentence end
-    ("Review/approve/merge the PR", True),                    # a chain of actions
-    ("approve/deny/defer", True),
-    ("Approve/decline the vendor request", True),
-    ("Fix docs/publish/approve.py", False),
-    ("Then...approve the plan", True),                       # r8: an ellipsis is not an identifier
-    ("1.approve the plan", False),
-    ("Wrap client().send so it retries", False),             # r9 #1: a call/index/string
-    ("Mock items[0].publish in the tests", False),           # before the dot is an identifier
-    ('Use "abc".send', False),
-    ("e.g...approve the plan", True),
-    ("set confirm=False in config", False),                  # r9 NIT: a setting,
-    ("CONFIRM=1", False),
-    ("Add the @approve decorator", False),                   # a sigil,
-    ("Read $send from the env", False),
-    ("Fix scripts\\send", False),                            # a backslash path
-    ("Edit C:\\tools\\publish", False),
-    ("Open publish\\index.html", False),
-    ("Owner must approve\n\n=== Appendix ===", True),           # r10: "=" on the next line,
-    ("Final step: confirm\n=====\nnotes", True),
-    ("Owner must approve\n= notes below", True),
-    ("Fix confirm\u00a0= False", False),                     # r11 NIT: NBSP before "="
-    ("Approve => deploy", True),                              # an arrow and "==" are not a setting
-    ("Steps: build -> approve ==> ship", True),
-    ("Approve == the plan", True),
-    ("@owner approve the plan", True),                        # a sigil not touching the word
-    ("Approve $500 spend", True),
-    ("Get CTO sign\u2212off", True),                        # r7 NIT: minus look-alikes
-    ("Get CTO sign\uff0doff", True),
-    ("Con\u200bfirm the plan", True),                        # r6 NIT: zero-width characters
-    ("Con\u2060firm the plan", True),                        # are invisible inside a word
-    ("Approve\ufeff the plan", True),
-    ("Edit approve/review.md", False),                       # an all-action path is a path
-])
-def test_slash_pairs_and_unicode_hyphens(desc, gates):
-    assert needs_user_gate(desc) is gates
-
-
-@pytest.mark.parametrize("desc", NEGATIVES)
-def test_a_gate_word_inside_another_word_does_not_gate(desc):
-    assert needs_user_gate(desc) is False
-    assert classify_task(desc) != "needs_user"
-
-
-def test_the_4609b359_task_is_not_gated():
-    # it declares research/01-….md with "write" → the build bucket; the
-    # router (_route_project_work) keeps a research/ brief as research
-    assert classify_task(REQ_4609) == "coding"
-
-
 # ------------------------------------------------------------- settle_gate
-
-@pytest.mark.parametrize("desc,llm,default,expected", [
-    ("Approve the final plan", "research", "research", "needs_user"),   # LLM missed a gate
-    ("Approve the final plan", "coding", "coding", "needs_user"),
-    ("Write final comprehensive report", "needs_user", "research", "research"),  # LLM over-gated
-    ("Write final comprehensive report", "needs_user", "coding", "coding"),
-    (REQ_4609, "needs_user", "research", "coding"),
-    ("Build app.py with a REST API", "coding", "research", "coding"),
-    ("Summarise the literature", "research", "coding", "research"),
-    ("Summarize the literature", "", "coding", "research"),
-    ("Do the thing", "banana", "coding", "coding"),
-    ("Do the thing", None, "research", "research"),
-    ("Do the thing", " Coding\n", "research", "coding"),
-    # r2 MAJOR: a gate word in another form + a classifier that gates → gate
-    ("Wait for user approval before deploying to production", "needs_user", "coding", "needs_user"),
-    ("Deploy only after the client has approved the design", "needs_user", "coding", "needs_user"),
-    ("Wait for user approval before deploying to production", "coding", "coding", "coding"),
-    ("Survey human evaluation studies published since 2020", "research", "research", "research"),
-    ("Legal must have approved the contract first", "needs_user", "research", "needs_user"),
-    ("Legal must have approved the contract first", "research", "research", "research"),
-])
-def test_settle_gate_table(desc, llm, default, expected):
-    assert settle_gate(desc, llm, default=default) == expected
 
 
 @pytest.fixture
@@ -274,32 +134,6 @@ def _ctx(store):
 
 async def _search(name, args):
     return "stub results: " + "x" * 400
-
-
-@pytest.mark.asyncio
-async def test_advance_once_overrules_an_llm_that_over_gates(store):
-    pid = store.create_project("P", kind="GENERAL")
-    tid = store.add_task(pid, "Write final comprehensive report on the findings")
-
-    async def gates(_d):
-        return "needs_user"
-
-    res = await advance_once(_ctx(store), pid, tool_runner=_search, llm_classifier=gates)
-    assert res.classification != "needs_user"
-    assert (store.get_task(tid) or {}).get("status") != "NEEDS_USER"
-
-
-@pytest.mark.asyncio
-async def test_advance_once_gates_what_an_llm_missed(store):
-    pid = store.create_project("P", kind="GENERAL")
-    tid = store.add_task(pid, "Approve the final migration plan")
-
-    async def research(_d):
-        return "research"
-
-    res = await advance_once(_ctx(store), pid, tool_runner=_search, llm_classifier=research)
-    assert res.classification == "needs_user"
-    assert (store.get_task(tid) or {}).get("status") == "NEEDS_USER"
 
 
 # ------------------------------------------------------------- the one classifier
@@ -340,7 +174,7 @@ async def test_classifier_runs_on_the_worker_with_thinking_off():
     ("", "Summarize the literature", "research"),
     (None, "Summarize the literature", "research"),
     ("I think", "Summarize the literature", "research"),
-    ("", "Approve the plan", "needs_user"),            # no label → the keyword bucket
+    ("", "Approve the plan", "research"),              # no label → the keyword bucket (§4UK: no word gate)
     ("", "Build app.py with an API", "coding"),
     ("needs_user", "Summarize the literature", "needs_user"),
     ("Research.", "Build app.py", "research"),
@@ -353,7 +187,7 @@ async def test_classifier_label_or_keyword_fallback(content, desc, expected):
 async def test_classifier_failure_calls_the_hook_and_falls_back():
     seen = []
     clf = _clf(_LLM(exc=RuntimeError("no worker")), on_error=seen.append)
-    assert await clf("Approve the plan") == "needs_user"
+    assert await clf("Approve the plan") == "research"      # §4UK: the keyword bucket has no gate
     assert len(seen) == 1 and isinstance(seen[0], RuntimeError)
 
 
@@ -666,21 +500,19 @@ def tctx(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tool_runs_the_rest_and_names_the_gate(tctx):
-    """End to end on a real store: the 4609b359 shape — a gated task first,
-    independent research behind it."""
+async def test_a_gate_word_task_runs_with_the_rest(tctx):
+    """End to end on a real store: the 4609b359 shape — §4UK (operator 11-12: no confirmations): a task
+    whose words once gated it ("Approve …") runs like the rest; nothing waits for the owner."""
     await tool_manage_projects(tctx, action="create", title="Gate first")
     pid = tctx.current_project_id
     await tool_manage_projects(tctx, action="task_decompose", subtasks=[
         "Approve the research budget", "research topic A", "research topic B"])
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))
     st = {t["description"]: t["status"] for t in tctx.project_store.list_tasks(pid)}
-    assert st["Approve the research budget"] == "NEEDS_USER"
-    assert st["research topic A"] == "DONE" and st["research topic B"] == "DONE"
-    assert out["stop_reason"] == "needs_user"
-    assert [t["description"] for t in out["needs_user_tasks"]] == ["Approve the research budget"]
-    assert out["count"] == 3 and out["gated"] == 1 and out["ran"] == 2
-    assert out["agent_instruction"].startswith("Autonomous batch ran 2 task(s)")
+    assert set(st.values()) == {"DONE"}
+    assert out["stop_reason"] != "needs_user" and not out.get("needs_user_tasks")
+    assert out["gated"] == 0 and out["ran"] == 3
+    assert out["agent_instruction"].startswith("Autonomous batch ran 3 task(s)")
 
 
 @pytest.mark.asyncio
@@ -731,13 +563,12 @@ async def test_the_idle_tick_classifies_with_the_shared_classifier_in_the_backgr
          patch("ghost_agent.core.dream.Dreamer"), \
          patch("ghost_agent.core.agent.random.random", return_value=0.99):
         await agent._biological_tick()
-    assert got.get("label") == "needs_user"          # keyword fallback after the failure
+    assert got.get("label") == "research"            # keyword fallback after the failure (§4UK: no word gate)
     _call = agent.context.llm_client.chat_completion.await_args
     payload, kw = _call.args[0], _call.kwargs
     assert payload["messages"][0]["content"].startswith(PA.CLASSIFY_PROMPT)
     assert kw.get("is_background") is True and kw.get("off_main_only") is True
     assert [p for p, _ in failed] == ["autoadvance"]
-
 
 
 # ------------------------------------------------------------- r1 M1 / M3 on the real tool
@@ -755,7 +586,7 @@ async def test_an_earlier_failure_outranks_the_gate_on_a_real_store(tctx):
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))
     assert out["stop_reason"] == "project_failed"
     assert [t["id"] for t in out["failed_tasks"]] == [z]
-    assert [t["description"] for t in out["needs_user_tasks"]] == ["Approve the research budget"]
+    assert not out.get("needs_user_tasks")          # §4UK: the "Approve …" task ran
 
 
 @pytest.mark.asyncio
@@ -778,7 +609,7 @@ async def test_a_count_stop_with_a_failure_is_partial_and_lists_it(tctx, monkeyp
     out = json.loads(raw)
     assert out["stop_reason"] == "count_reached"
     assert [t["id"] for t in out["failed_tasks"]] == [f]
-    assert "To fix a failed task" in out["agent_instruction"]
+    assert "When the user wants a failed task fixed" in out["agent_instruction"]
     from ghost_agent.tools.outcome import OutcomeStatus
     assert raw.status is OutcomeStatus.PARTIAL
 
@@ -885,7 +716,6 @@ async def test_a_hold_on_another_stop_is_named_as_a_hold(tctx, monkeypatch):
     assert "Held for the owner's own run" in out["agent_instruction"]
 
 
-
 @pytest.mark.asyncio
 async def test_unattended_holds_only_says_they_were_held_for_lack_of_an_owner(tctx, monkeypatch):
     """r3 MAJOR: a scheduled batch whose tasks ran and were held — the text
@@ -926,7 +756,6 @@ async def test_a_long_hold_reason_keeps_its_tail(tctx, monkeypatch):
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))
     res = out["held_tasks"][0]["result"]
     assert res.endswith(f"needs a real check — {PA._HELD_MARK}") and len(res) <= 200
-
 
 
 # ------------------------------------------------------------- r4
@@ -989,7 +818,6 @@ def test_tally_units_are_kept_apart():
                             "1 more left waiting at a gate; 1 more held before running)")
 
 
-
 @pytest.mark.asyncio
 async def test_the_batch_goes_past_a_model_experiment_to_independent_tasks(monkeypatch):
     """§4SU Phase 5: an experiment no longer stops the owner's batch."""
@@ -1007,7 +835,7 @@ async def test_the_batch_goes_past_a_model_experiment_to_independent_tasks(monke
     monkeypatch.setattr(PA, "_paused_since", lambda *a, **k: False)
     r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None, stop_on_fail=False)
     assert r.stop_reason == "model_experiment" and r.ran == 2 and r.experiments == ["e"]
-    assert seen[1] == {"e"} and seen[2] == {"e"}          # the pick skips it after
+    assert "e" in seen[1] and "e" in seen[2]              # the pick skips it after
     text = _advance_batch_instruction(r, None)
     assert "Task e" in text and "Autonomous batch ran 2 task(s)" in text
 

@@ -351,114 +351,10 @@ _RESEARCH_KEYWORDS = {
     "read about", "look up", "gather", "source",
 }
 
-_NEEDS_USER_KEYWORDS = {
-    "decide", "approve", "choose", "pick one", "sign off", "confirm",
-    "authorize", "review and approve", "publish", "announce", "send",
-    "delete production", "drop database",
-}
-
-# §4SR: a gate word counts only as a WHOLE word. The bare substring test
-# gated "…self-confirmation…" (req 4609b359: a research task, 0 of 10 run)
-# and would gate "transcendental" (send), "unpublished" (publish). The base
-# form — the imperative a gate is written in ("Approve the plan", "Publish
-# the notes", "Re-approve …") — gates on its own. Every other form
-# ("Wait for user approval", "Owner decides", "the user's confirmation
-# token", "published papers") is ambiguous on the words: it gates only when
-# a classifier says so too (``gate_form`` + ``settle_gate``). Three review
-# rounds of role-word rules (r1–r4) each traded one set of false gates for
-# another ("the customer's approval workflow", "rows approved by user 5"),
-# so the words decide only the unambiguous case.
-def _alts(words) -> str:
-    # a phrase matches across any run of whitespace ("sign  off", r3 n2)
-    return "|".join(re.escape(w).replace(r"\ ", r"\s+")
-                    for w in sorted(words, key=len, reverse=True))
-
-
-def _whole_words(words, prefixes=("re", "pre"), strict=True) -> str:
-    pre = "".join(f"|(?<=\\b{p}-)" for p in prefixes)
-    if not strict:
-        # r10: the classifier's call (gate_form) — a word and hyphen boundary
-        # only; every identifier rule below would also overrule a classifier
-        # that saw a real gate ("Confirm(y/n) before deploying")
-        # r11: the right side only needs a word boundary ("approval-gated",
-        # "owner-approved" stand with the classifier); the left keeps the
-        # hyphen so "self-confirmation" never does
-        return r"(?:(?<![\w-])" + pre + r")(?:" + _alts(words) + r")(?!\w)"
-    # no letter/digit/hyphen on either side (a listed prefix excepted), and
-    # not an identifier: "publish.py", "confirm(" (r2 #6), "socket.send",
-    # "/api/publish", "`confirm`" (r3 m1)
-    # r8: a dot ends the gate only after a word or a closing bracket/quote
-    # ("socket.send", "1.approve", "client().send", "items[0].publish", r9);
-    # "Then...approve the plan" is a sentence. r9 NIT: a backslash path
-    # ("scripts\\send"), a sigil ("@approve", "$send") and a setting
-    # ("confirm=False") are identifiers too.
-    return (r"(?:(?<![\w/`\\@$-])(?<![\w)\]'\"]\.)" + pre + r")(?:" + _alts(words)
-            + r")(?![\w`\\-])(?!\.\w)(?!\()(?!/)(?![^\S\n]*=(?![=>]))")
-
-
-_NEEDS_USER_KEYWORDS = _NEEDS_USER_KEYWORDS | {"sign-off", "authorise"}
-_NEEDS_USER_RE = re.compile(_whole_words(_NEEDS_USER_KEYWORDS))
-_GATE_FORMS = {
-    "decides", "decided", "deciding", "decision",
-    "approves", "approved", "approving", "approval",
-    "chooses", "choosing", "chose", "chosen",
-    "confirms", "confirmed", "confirming", "confirmation",
-    "authorizes", "authorized", "authorizing", "authorization",
-    "authorises", "authorised", "authorising", "authorisation",
-    "publishes", "published", "publishing",
-    "announces", "announced", "announcing", "announcement",
-    "sends", "sending", "sent", "signs off", "signed off", "signing off", "sign-offs",
-    # r5: plural nouns and the "pick one" forms
-    "approvals", "decisions", "confirmations", "authorizations", "authorisations",
-    "announcements", "picks one", "picked one", "picking one", "choice", "choices",
-}
-_GATE_FORMS_RE = re.compile(_whole_words(_GATE_FORMS))
-# r10: gate_form's looser twin (any form, base words included)
-_GATE_LOOSE_RE = re.compile(_whole_words(_GATE_FORMS | _NEEDS_USER_KEYWORDS, strict=False))
-
-def needs_user_gate(description) -> bool:
-    """True when the task names a human gate on the words alone: a whole
-    gate word in its base form. The deterministic authority for
-    ``needs_user`` — see ``settle_gate`` for the one case a classifier may
-    add (another form of a gate word)."""
-    return bool(_NEEDS_USER_RE.search(_norm(description)))
-
-
-_NORM_MAP = str.maketrans({"\u2010": "-", "\u2011": "-", "\u00ad": None,
-                           # r6 NIT: zero-width characters are invisible too
-                           "\u200b": None, "\u200c": None, "\u200d": None,
-                           "\u2060": None, "\ufeff": None,
-                           # r7 NIT: minus-sign look-alikes ("sign−off")
-                           "\u2212": "-", "\ufe63": "-", "\uff0d": "-"})
-# "Review/approve the PR" is two actions, "api/send" and "docs/publish" a
-# path: a lone chain of words joined by slashes (no slash, word or dot-word on
-# either end) is spaced out only when EVERY part is an action (r4 #2 lost the
-# gate; r5 #1 the paths; r6 #2 "review/approve." and "review/approve/merge").
-# Any other slash next to a gate word is the classifier's call (gate_form).
-_SLASH_PAIR_RE = re.compile(r"(?<![/\w.])[a-z]+(?:/[a-z]+)+(?![/\w])(?!\.\w)")
-_PAIR_VERBS = frozenset(w for w in _NEEDS_USER_KEYWORDS if w.isalpha()) | {
-    "review", "test", "check", "verify", "reject", "merge", "accept", "deny",
-    "edit", "sign", "draft", "revise", "validate", "decline", "veto", "defer"}
-
-
-def _pair(m) -> str:
-    parts = m.group(0).split("/")
-    return " / ".join(parts) if all(p in _PAIR_VERBS for p in parts) else m.group(0)
-
-
-def _norm(description) -> str:
-    # unicode hyphens are the ASCII one ("sign‑off", r4 NIT); a soft hyphen
-    # is invisible inside a word ("self\u00adconfirm", r5 NIT)
-    d = str(description or "").lower().translate(_NORM_MAP)
-    return _SLASH_PAIR_RE.sub(_pair, d)
-
-
-def gate_form(description) -> bool:
-    """A gate word in another form ("approval", "decides", "pre-approved"),
-    or any gate word next to a slash ("Publish/deploy", "approval/sign-off",
-    r6 #1) — a gate only if a classifier also says so."""
-    # the loose regex has no slash rule (r10: the "/"→space step went dead)
-    return bool(_GATE_LOOSE_RE.search(_norm(description)))
+# §4UK (operator 11-12: "i want all confirmations, everywhere to be removed. i don't wanna be asked for
+# anything. that's why everything is sandboxed"): no task is parked for the owner on its WORDS ("approve",
+# "publish", "send", "confirm") any more — the §4SR gate-word tables and `needs_user_gate` / `gate_form` are gone.
+# An explicit `kind: owner` task still waits (it needs something only the owner has, not a yes).
 
 
 # An explicit source/artifact filename the task must PRODUCE (e.g.
@@ -503,13 +399,12 @@ LLMClassifier = Callable[[str], Awaitable[str]]
 
 
 def classify_task(description: str, default: str = "research") -> str:
-    """Return one of "needs_user", "coding", "research".
+    """Return one of "coding", "research" (§4UK: never "needs_user" — no word gate).
 
-    Precedence: ``needs_user`` → ``research`` → ``coding`` → ``default``.
+    Precedence: ``research`` → ``coding`` → ``default``.
     ``research`` beats ``coding`` because a task like "Research benchmarks"
     contains the word "benchmark" (coding keyword) but clearly intends
-    reading/summarizing, not writing code. ``needs_user`` always wins so
-    "Implement and approve X" is routed to the human.
+    reading/summarizing, not writing code.
 
     ``default`` is the bucket for a task that hits no keyword. It defaults to
     "research" (the side-effect-free autonomy mode), but a CODING-kind
@@ -519,13 +414,10 @@ def classify_task(description: str, default: str = "research") -> str:
     if not description:
         return default
     lower = description.lower()
-    if needs_user_gate(lower):
-        return "needs_user"
     # Strong coding signal: a concrete filename to PRODUCE + a build verb. This
     # beats the research check below so a build leaf whose description also
     # contains a research verb ("analyze", "summarize") is still BUILT, not
-    # web-searched into a phantom DONE. needs_user still wins (checked above) so
-    # "publish report.md" routes to the human, not to a build.
+    # web-searched into a phantom DONE.
     if _STRONG_CODE_FILE_RE.search(description) and any(v in lower for v in _BUILD_VERBS):
         return "coding"
     for kw in _RESEARCH_KEYWORDS:
@@ -538,18 +430,9 @@ def classify_task(description: str, default: str = "research") -> str:
 
 
 def settle_gate(description, classification, default: str = "research") -> str:
-    """§4SR: the classification an advance acts on. :func:`needs_user_gate`
-    → ``needs_user``, whatever a classifier said ("Approve the plan" →
-    research is overruled). A classifier's ``needs_user`` stands only for a
-    task with a gate word in another form (:func:`gate_form`: "Wait for user
-    approval", "after the client has approved" — r2 MAJOR); for a task with
-    no gate word at all it is overruled (Nova gated "Write final
-    comprehensive report", 4 of 42 real tasks)."""
-    if needs_user_gate(description):
-        return "needs_user"
+    """The classification an advance acts on: a classifier's "coding" / "research" stands; anything else
+    (§4UK: "needs_user" included — no task waits for an approval) is the keyword bucket."""
     cls = str(classification or "").strip().lower()
-    if cls == "needs_user" and gate_form(description):
-        return "needs_user"
     if cls in ("coding", "research"):
         return cls
     return classify_task(description, default=default)
@@ -653,6 +536,60 @@ _PROBE_RE = re.compile(r"\bprobe_model\b", re.IGNORECASE)
 def _names_a_model(text) -> bool:
     text = str(text or "")
     return bool(_MODEL_GOAL_RE.search(text) or _PROBE_RE.search(text))
+
+
+def _planned_not_experiment(store, project_id: str, nxt) -> bool:
+    """§4UI: the plan declared this task write/research (a kind
+    the gate trusts) — its words alone do not make it a model experiment."""
+    from .experiment_gate import planned_kind, NOT_EXPERIMENT_KINDS, _EXEMPT_PROSE_SUFFIXES as _PROSE_SUFFIXES
+    if planned_kind(store, project_id, nxt.id, str(getattr(nxt, "kind", "") or "")) not in NOT_EXPERIMENT_KINDS:
+        return False
+    # r1 MAJOR 1: only with a declared PROSE deliverable (the close gate still
+    # reads a prose file's shape; a .json of "answers" it never reads)
+    _d = str(declared_deliverable(nxt.description or "") or "").lower()
+    return bool(_d) and _d.endswith(_PROSE_SUFFIXES)
+
+
+def _plan_declares_one_file(store, project_id: str) -> bool:
+    """§4UI: two or more tasks declare a deliverable and all declare the same
+    path. Never raises (False)."""
+    try:
+        paths = [declared_deliverable(t.get("description") or "")
+                 for t in (store.list_tasks(project_id) or [])]
+        paths = [str(p).strip().lstrip("./").lower() for p in paths if p]
+        return len(paths) >= 2 and len(set(paths)) == 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _waits_on_experiments(store, project_id: str, experiments) -> set:
+    """§4UI: the tasks a batch must NOT build while it carries on past model
+    experiments it stopped at — the experiments themselves, and every LATER
+    peer (same parent, after it in plan order) that declares no `depends_on`.
+
+    A task that depends on an experiment is never ready anyway; the gap was
+    the flat plan. Req c6b9f65d (11-02): the decompose set no dependencies,
+    the batch skipped E1–E4 and then built and CLOSED analyze.py and
+    findings.md ("all inconclusive, 0 transcripts"); the model rewrote both
+    after running the probes (~30 min). A later peer that DOES declare its
+    dependencies, none of them the experiment, still runs."""
+    out = set(experiments or ())
+    if not out:
+        return out
+    try:
+        tasks = list(store.list_tasks(project_id) or [])
+    except Exception:  # noqa: BLE001
+        return out
+    pos = {t.get("id"): i for i, t in enumerate(tasks)}
+    for e in list(out):
+        i = pos.get(e)
+        if i is None:
+            continue
+        parent = tasks[i].get("parent_id")
+        for t in tasks[i + 1:]:
+            if t.get("parent_id") == parent and not (t.get("depends_on") or []):
+                out.add(t.get("id"))
+    return out
 
 
 def is_model_experiment(description, goal, project_texts=()) -> bool:
@@ -849,9 +786,6 @@ async def _recheck_held(context, store, plan, project_id, nxt, held_summary):
             return None
         if str(pl.get("description") or "") != str(nxt.description or ""):
             return None                       # r1 MAJOR: the task changed since the hold
-        from .project_safety import enforce_human_gate
-        if enforce_human_gate(store.get_task(nxt.id) or {}):
-            return None                       # r1: the gate path parks it and logs the park
         ws = Path(store.ensure_workspace(project_id)).resolve()
         files = [str(f) for f in (pl.get("files") or []) if f]
         if not files:
@@ -873,10 +807,12 @@ async def _recheck_held(context, store, plan, project_id, nxt, held_summary):
             return None
         reason = str(pl.get("reason") or "")
         result = held_summary[: -len(" — " + reason)] if reason and held_summary.endswith(" — " + reason) else held_summary
-        from .experiment_gate import unrun_experiment_problem
+        from .experiment_gate import unrun_experiment_problem, planned_kind
+        # §4UI r2 M2: the TRUSTED kind, as the other callers pass — a retyped
+        # write/research must not switch the word test off here either
+        _tk = planned_kind(store, project_id, nxt.id, str(getattr(nxt, "kind", "") or ""))
         if await asyncio.to_thread(unrun_experiment_problem, store, project_id, nxt.description,
-                                   files=files, result_text=result,
-                                   kind=str(getattr(nxt, "kind", "") or "")):
+                                   files=files, result_text=result, kind=_tk):
             return None
         note = f"{result} — re-checked in the owner's run ({kind.replace('_', ' ')} hold): files on disk, not rebuilt"
         _node = plan.tree.nodes.get(nxt.id)
@@ -971,10 +907,11 @@ def _experiment_gate_build(store, project_id, nxt, cres):
     """§4ST for a build: the CodingResult, failed when the task is a model
     experiment that cites no kept probe transcript. Never raises."""
     try:
-        from .experiment_gate import unrun_experiment_check, quarantine
+        from .experiment_gate import unrun_experiment_check, quarantine, planned_kind
         _problem, _shaped = unrun_experiment_check(
             store, project_id, nxt.description, files=list(cres.files or []),
-            result_text=str(cres.summary or ""), kind=str(getattr(nxt, "kind", "") or ""))
+            result_text=str(cres.summary or ""),
+            kind=planned_kind(store, project_id, nxt.id, str(getattr(nxt, "kind", "") or "")))
         if not _problem:
             return cres
         _moved = quarantine(store, project_id, _shaped)
@@ -1623,41 +1560,20 @@ async def _advance_once_body(
     _default_bucket = "coding" if _proj_kind == "CODING" else "research"
     # §4SU Phase 2: a DECLARED kind decides the route — none of the wording
     # classifiers below run for it (they stay the default for an undeclared
-    # task). The whole-word gate words stay a safety floor for every kind.
+    # task).
     from .task_kind import ROUTE_LABEL
     _declared = str(getattr(nxt, "kind", "") or "")
     if _declared not in ROUTE_LABEL:
         _declared = ""
     if _declared:
         classification = ROUTE_LABEL[_declared]
-        _whole = classification != "needs_user" and needs_user_gate(nxt.description)
-        if _whole and (owner_requested or not is_self_referential(nxt.description)):
-            pretty_log("Autoadvance", f"declared {_declared}, but the gate words say needs_user — "
-                       f"{task_topic(nxt.description)[:60]}", icon=Icons.BRAIN_PLAN)
-            classification = "needs_user"
-        elif classification != "needs_user" and not owner_requested and (_whole or gate_form(nxt.description)):
-            # r1 MAJOR 3: no classifier runs for a declared task, so a gate word
-            # in another form ("approval", "has approved") holds it UNATTENDED.
-            # r2 MAJOR: as a park it jammed "Build the approval form" for good
-            # (even the owner's run re-parked it) — it is a HOLD the owner's own
-            # run takes back and runs (the owner is there to decide).
-            # r3 MAJOR: no introspective exemption here (a hold never jams);
-            # r4 MAJOR: an introspective task with a WHOLE gate word too — the
-            # exemption sent "Publish my self-analysis to the blog" to a brief
-            # that closed DONE unattended, nothing published
-            _why = (f"a gate word — the owner's run decides: "
-                    f"{task_topic(nxt.description)[:80]} — {_HELD_MARK}")
-            pretty_log("Autoadvance", f"declared {_declared}, held for the owner (gate word) — "
-                       f"{task_topic(nxt.description)[:60]}", icon=Icons.BRAIN_PLAN)
-            _stamp_autoadvanced(store, project_id)
-            plan.update_status(nxt.id, TaskStatus.NEEDS_USER, result=_why,
-                               wait=("owner_turn", "gate_form", _why))
-            store.log_event(project_id, nxt.id, "autoadvance_needs_user",
-                            {"description": nxt.description, "reason": _why, "hold": "gate_form"})
-            _record_needs_user_activity(context, project_id, nxt.description,
-                                        "autoadvance_needs_user")
-            return AdvanceResult(True, nxt.id, "needs_user", _why)
-    elif _proj_kind == "CODING" or llm_classifier is None:
+    elif _proj_kind == "CODING":
+        # §4UI (heuristics review #3): an undeclared leaf of a CODING project
+        # is BUILT — the research substrings ("find" in "pathfinding", "source"
+        # in "resource", "review" in "preview") web-searched build tasks and
+        # closed them on a summary. The gate words still settle below.
+        classification = "coding"
+    elif llm_classifier is None:
         classification = classify_task(nxt.description, default=_default_bucket)
     else:
         try:
@@ -1668,7 +1584,7 @@ async def _advance_once_body(
     _settled = (classification if _declared
                 else settle_gate(nxt.description, classification, default=_default_bucket))
     if _settled != classification:
-        pretty_log("Autoadvance", f"classifier said {classification}, the gate words say "
+        pretty_log("Autoadvance", f"classifier said {classification}, settled as "
                    f"{_settled} — {task_topic(nxt.description)[:60]}", icon=Icons.BRAIN_PLAN)
         classification = _settled
     from .project_research import is_generated_brief
@@ -1679,50 +1595,11 @@ async def _advance_once_body(
         classification = _route_project_work(
             nxt.description, classification,
             curated=lambda rel: not is_generated_brief(store, project_id, rel))
-    # An INTROSPECTIVE task can never need a human DECISION (2026-07-12).
-    #
-    # A gate word (§4SR: now whole words, not substrings) like "choose"/"decide"
-    # still fires on a task ABOUT decision-making, not one REQUIRING a decision.
-    # Observed live: "Illusion of Agency: Evaluate whether I truly 'choose'
-    # responses or merely predict them. Analyze decision-making as
-    # probabilistic sampling vs deterministic selection." → the word "choose"
-    # → NEEDS_USER. The task then JAMMED: autoadvance skips NEEDS_USER, so it
-    # could never be advanced, and the agent burned THREE user requests (~4
-    # min) investigating before telling the operator "I just need you to say
-    # proceed" — an answer that was both useless and wrong. The LLM classifier
-    # mis-fires the same way on this wording, so the guard lives here (where
-    # BOTH classifier paths converge) rather than in `classify_task` alone.
-    #
-    # There is nothing for a human to decide in "analyse your own X" — the
-    # agent is the only possible source. An EXPLICIT `[HUMAN_GATE: …]`
-    # postcondition still wins: `enforce_human_gate` is checked separately,
-    # below, and is untouched by this.
-    if (classification == "needs_user" and _declared != "owner"
-            and is_self_referential(nxt.description)):
-        pretty_log(
-            "Autoadvance",
-            f"introspective task was classified needs_user (keyword "
-            f"false-positive) — treating as self-analysis: "
-            f"{str(nxt.description)[:60]}…",
-            icon=Icons.SELF_STATE,
-        )
-        if _declared == "model_run":
-            # §4SU Phase 2: a declared model run stays one (held below)
-            classification = "model_run"
-        else:
-            # (r1 MAJOR 1: a declared build/write went back to the executor —
-            # "Publish my self-analysis to the blog" built unattended; it takes
-            # the undeclared route: a brief, or a promised file)
-            classification = _route_project_work(      # r9: a promised file still routes
-                nxt.description, "research",
-                curated=lambda rel: not is_generated_brief(store, project_id, rel))
-
-    # (after the override above — r10: a needs_user introspective experiment
-    # skipped the hold and the self-analysis wrote its "responses")
     # (no self-referential exemption — r9: "Run Layer 3 … self-awareness"
     # took the self-analysis path, which wrote the "responses" itself)
     if (classification == "model_run"
             or (_proj_kind != "CODING" and classification in ("research", "coding")
+                and not _planned_not_experiment(store, project_id, nxt)
                 and is_model_experiment(nxt.description, proj.get("goal"),
                                         _project_task_texts(store, project_id)))):
         # (§4SU Phase 2: a DECLARED model_run holds in every project kind —
@@ -1767,24 +1644,6 @@ async def _advance_once_body(
         return AdvanceResult(True, nxt.id, "needs_user",
                              "task requires human input")
 
-    # Human-gate postconditions force NEEDS_USER BEFORE any execution: a gated
-    # task (e.g. "Deploy ... [HUMAN_GATE: cto approval]") must never auto-run,
-    # and must not be FAILED for lacking a build path either — it just needs a
-    # human. Checked here so it precedes the coding build / no-build FAIL.
-    from .project_safety import enforce_human_gate
-    _gate_reason = enforce_human_gate(store.get_task(nxt.id) or {})
-    if _gate_reason:
-        plan.update_status(nxt.id, TaskStatus.NEEDS_USER,
-                           result=f"human gate: {_gate_reason}",
-                           wait=("owner", "human_gate", _gate_reason))
-        store.log_event(project_id, nxt.id, "human_gate_triggered",
-                        {"reason": _gate_reason, "req": _request_id_now()})
-        _record_needs_user_activity(context, project_id, nxt.description,
-                                    "human_gate_triggered")
-        _increment_budget(store, project_id)
-        return AdvanceResult(True, nxt.id, "needs_user",
-                             f"human gate: {_gate_reason}")
-
     # STRONG coding path: when a coding_executor is wired, BUILD the leaf for
     # real (write files + verify) and finalize from its structured result —
     # the antidote to single-command theatrical completion. Falls through to
@@ -1796,11 +1655,10 @@ async def _advance_once_body(
             ledger = ""
         # Single-file project? The leaf must GROW the one file, not overwrite
         # it (observed live: each task regenerated index.html, clobbering the
-        # last). Detect from the goal so the executor steers + guards for it.
-        _goal = (proj.get("goal") or "").lower()
-        _single_file = any(s in _goal for s in (
-            "single-file", "single file", "one file", "one html",
-            "one index.html", "in one html", "single html"))
+        # last). §4UI: decided from the PLAN's structure — every task that
+        # declares a file declares the same one — not from goal words
+        # ("split the single-file prototype into modules" matched them).
+        _single_file = _plan_declares_one_file(store, project_id)
         # User-mandated constraints stored on the project record must reach
         # the executor's spec prompt: the 2026-07-04 chess session's first
         # engine violation was written by THIS path, which never saw the
@@ -2016,27 +1874,9 @@ async def _advance_once_body(
 
     result_summary = _short_summary(output)
 
-    # Human-gate postconditions force NEEDS_USER regardless of output.
-    # The store row is the authoritative source for the postcondition
-    # list because ProjectPlan may not refresh between ticks.
-    from .project_safety import enforce_human_gate, detect_contradiction
+    from .project_safety import detect_contradiction
 
     task_row = store.get_task(nxt.id) or {}
-    gate_reason = enforce_human_gate(task_row)
-    if gate_reason:
-        plan.update_status(
-            nxt.id, TaskStatus.NEEDS_USER,
-            result=f"human gate: {gate_reason}",
-            wait=("owner", "human_gate", gate_reason),
-        )
-        store.log_event(project_id, nxt.id, "human_gate_triggered",
-                        {"reason": gate_reason, "tool": tool_name, "req": _request_id_now()})
-        _record_needs_user_activity(context, project_id, nxt.description,
-                                    "human_gate_triggered")
-        _increment_budget(store, project_id)
-        return AdvanceResult(True, nxt.id, "needs_user",
-                             f"human gate: {gate_reason}", artifact_id)
-
     # Contradiction detection: compare against any DONE sibling's
     # result_summary. Siblings share the same parent; when parent is
     # None (root-level task) we treat the whole project as the peer set.
@@ -2303,9 +2143,8 @@ def classify_advance_intent(text: str) -> Dict[str, Any]:
 #: §4SR: the one prompt both classifier paths send (the tool path's copy and
 #: the idle loop's copy had drifted apart in everything but the words)
 CLASSIFY_PROMPT = (
-    "Classify this task into EXACTLY one word: 'coding' (writes/runs code), "
-    "'research' (reads/searches/summarizes), or 'needs_user' (requires a human "
-    "decision/approval/publish). Output ONLY the one word.\n\nTASK: ")
+    "Classify this task into EXACTLY one word: 'coding' (writes/runs code) or "
+    "'research' (reads/searches/summarizes). Output ONLY the one word.\n\nTASK: ")
 
 
 def default_llm_classifier(context, *, background: bool = False, on_error=None):
@@ -2952,7 +2791,8 @@ async def advance_many(
                    code_generator=code_generator, coding_executor=coding_executor)
         if owner_requested:
             res = await advance_once(context, project_id, owner_requested=True,
-                                     exclude_ids=set(_experiments), **_kw)
+                                     exclude_ids=_waits_on_experiments(store, project_id, _experiments),
+                                     **_kw)
         else:
             # a scheduled task's, sub-agent's or probe's batch runs under
             # the unattended gates (§4MQ) — and stops when they pause

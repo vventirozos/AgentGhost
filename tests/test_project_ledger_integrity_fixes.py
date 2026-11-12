@@ -127,9 +127,13 @@ def test_feature_key_generic_head_does_not_collapse():
 
 
 def test_feature_key_specific_head_still_dedups():
-    # The original intent survives: same FEATURE, different wording → same key.
-    assert _feature_key("Core Shell: HTML structure") == \
-        _feature_key("Core Shell: index.html skeleton")
+    # §4UI: the key is the declared deliverable, else the exact text — a
+    # shared head ("App: Notes" / "App: Calculator") no longer collides.
+    assert _feature_key("Core Shell: HTML structure → index.html") == \
+        _feature_key("Core Shell: skeleton → index.html")
+    assert _feature_key("App: Notes (apps/notes.js)") != \
+        _feature_key("App: Calculator (apps/calc.js)")
+    assert _feature_key("Core shell.") == _feature_key("core  shell")
 
 
 def test_filter_returns_kept_and_dropped(context):

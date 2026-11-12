@@ -76,11 +76,11 @@ def test_the_futility_breaker_does_not_report_a_loop_that_is_making_progress():
     note_run_outcome(rec, ok=False, output="=== 5 failed, 7 passed ===")
     assert rec["progress"] is True                                          # review 5: a first result is not "stalled"
     note_run_outcome(rec, ok=False, output="=== 5 failed, 7 passed ===")
-    assert futility_tier({"app.py": rec}, True, False)[0] == "report"      # no progress: still reported
+    assert rec["progress"] is False                                          # no progress (§4UI: no report tier)
     note_run_outcome(rec, ok=False, output="=== 3 failed, 7 passed, 2 errors ===")   # fewer failures, same passes
     assert rec["progress"] is True and futility_tier({"app.py": rec}, True, False)[0] == ""   # failures falling
     note_run_outcome(rec, ok=False, output="=== 3 failed, 7 passed, 2 errors ===")
-    assert futility_tier({"app.py": rec}, True, False)[0] == "report"      # stalled again: the same counts
+    assert rec["progress"] is False                                          # stalled again: the same counts
     note_run_outcome(rec, ok=True, output="12 passed")                    # 3 failed → 0: progress
     assert futility_tier({"app.py": rec}, True, False)[0] == ""
     note_run_outcome(rec, ok=True, output="=== 9 failed, 3 passed ===")   # the shell said ok, pytest did not
@@ -102,7 +102,7 @@ def test_the_futility_breaker_does_not_report_a_loop_that_is_making_progress():
     assert r2["progress"] is False                                        # same count, only the timing moved
     r3 = {"writes": 6, "runs": 4}
     note_run_outcome(r3, ok=True, output="rows: 1200 (took 0.4s)"); note_run_outcome(r3, ok=True, output="rows: 1200 (took 0.5s)")
-    assert r3["progress"] is False and futility_tier({"gen.py": r3}, True, False)[0] == "report"
+    assert r3["progress"] is False                                       # §4UI: no report tier
     note_run_outcome(r3, ok=True, output="rows: 1337 (took 0.4s)")
     assert r3["progress"] is True
     # review 6: one transient count-less failure between converging runs is not a stall …
@@ -112,7 +112,7 @@ def test_the_futility_breaker_does_not_report_a_loop_that_is_making_progress():
     assert r4["progress"] is True and futility_tier({"app.py": r4}, True, False)[0] == ""
     # … the same failure twice in a row is
     note_run_outcome(r4, ok=False, output="Timeout: the command ran past 120 s")
-    assert r4["progress"] is False and futility_tier({"app.py": r4}, True, False)[0] == "report"
+    assert r4["progress"] is False                                       # §4UI: no report tier
     # the "repeat" needs the PREVIOUS run to have failed too: a green run then the same text failing is new
     r6 = {"writes": 6, "runs": 4}
     note_run_outcome(r6, ok=True, output="rows 12"); note_run_outcome(r6, ok=False, output="rows 12")
@@ -144,11 +144,13 @@ def test_the_strike_preview_names_the_failing_tests():
 
 
 def test_the_prompt_tells_the_truth_about_the_sandbox():
-    from ghost_agent.core import prompts
-    text = str(prompts.SPECIALIST_SYSTEM_PROMPT)            # the prompt the model is sent, not the source file
-    assert "SANDBOX RUNTIME: Python 3.11" in text and "pytest, pytest-asyncio" in text and "Do NOT `pip install` these" in text
+    # §4UI: the sandbox facts moved to the `execute` description (the
+    # definition the model is sent, not the source file)
+    from ghost_agent.tools.registry import TOOL_DEFINITIONS
+    text = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")["function"]["description"]
+    assert "SANDBOX: Python 3.11" in text and "pytest" in text and "python-chess" in text and "already installed" in text
     assert "`pip install python-chess` in the sandbox if missing" not in text
-    assert "/workspace/projects/<project-id>/<name>/" in text and "Keep projects as flat `.py` files in `/workspace/<name>/`" not in text
+    assert "--import-mode=importlib" in text
 
 
 def test_the_other_whole_file_paths_honour_the_gate_and_the_right_reads_stamp(tmp_path):

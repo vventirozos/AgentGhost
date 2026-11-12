@@ -102,6 +102,14 @@
   <p><code>tests/test_4su_phase1.py</code> (the verdict, T, H, R); A in <code>tests/test_4pg_autopilot_review.py</code> and <code>tests/test_4su_phase5.py</code>. Battery: <code>scripts/mutate_4su1.py</code>.</p>
   <h2 id="4su-p4">One refused list (&sect;4SU Phase 4, 2026-11-02)</h2>
   <p><code>task_update</code> no longer returns the legacy per-gate keys. Every refusal is an entry in <code>refused</code>, and <code>instruction_for(refused)</code> is the only instruction. Its header now says: when a fix is yours to do, do it, then retry with status=done AND the result in the same call (a result-only call never closes); when the fix says stop, stop. A dependency that is itself waiting (NEEDS_USER or BLOCKED) gets the fix "tell the owner what it waits on and stop": "close it first" had pushed the model to force-close an owner wait (r3). Since r4 the fix names every open dependency by kind, one line each: failed, or BLOCKED by a failed child, i.e. the cascade's <code>child_failed</code> (it names the FAILED leaves to redo with status=PENDING and the BLOCKED leaves to raise with the owner, or says replan; a failed or blocked parent with no such leaf to name gets "replan it", never status=PENDING, which strands a non-leaf (r6&ndash;r8); r5: reviving a failed or nested-blocked parent stranded the work, since it is not a leaf); blocked for its own reason ("tell the owner and stop"); a hold ("held for the owner's own run"); an owner wait ("tell the owner and stop"); running ("wait for it"); open ("do it first"). The visual-evidence fix names a browser <code>RENDER_CHECK</code> line as evidence.</p>
+  <h2 id="deliverable-waiver-4ui">The deliverable gate is waivable, with a reason (§4UI, 2026-11-12)</h2>
+  <ul>
+    <li><code>MODEL_WAIVABLE = {"deliverable", "model_run", "postconditions"}</code>. A <code>deliverable</code> or <code>model_run</code> waiver needs a reason of at least <code>MIN_WAIVER_CHARS</code> (12) characters and covers one task. The refusal text shows <code>override={"deliverable": "&lt;why, in a sentence&gt;"}</code>; the waiver is recorded with the other close overrides.</li>
+    <li>A rewrite that drops the declared path no longer re-appends "→ old path" when a deliverable waiver of 12+ characters is given <em>in the call that first closes the task and uses the waiver</em> (the waiver is recorded there); in any other call, or when the file exists and no waiver was needed, the old path is kept (review r1 MAJOR 2, r2 m2).</li>
+    <li><code>gate_model_run</code> reads the kind through <code>_trusted_kind</code> (<code>planned_kind</code>).</li>
+    <li>The visual-evidence gate applies only to code: with a declared deliverable, only a code suffix (<code>_VISUAL_CODE_SUFFIXES</code>) needs a screenshot; with none, research and write tasks are exempt.</li>
+  </ul>
+
 </main>
 </body>
 </html>

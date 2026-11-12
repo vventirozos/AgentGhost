@@ -214,7 +214,8 @@ def is_same_error_signature(sig: str) -> bool:
 
 #: Soft steer after this many same-error runs of one command head …
 EXECUTE_SAME_ERROR_STEER = 3
-#: … and a forced report (not an abort marker) after this many.
+#: … and from this many the class is past its steer: §4UI made it advice only
+#: (it forced a report; it also keeps the generic abort from firing on it).
 EXECUTE_SAME_ERROR_HARD_STOP = 5
 
 

@@ -182,25 +182,23 @@ def test_consumer_uses_the_execute_hard_stop_tier():
     assert len(guards) == 1
 
 
-def test_consumer_has_the_steer_and_the_report_branches():
+def test_consumer_steers_and_its_hard_tier_is_advice_only():
+    """§4UI: the class steers at 3; from 5 on it does nothing more (it forced
+    a report — a working pipeline logging one benign error line was ended)."""
     fn = _handle_chat()
     texts = [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    assert any("STOP trying variations. Write your FINAL answer now" in t for t in texts)
+    assert not any("STOP trying variations" in t for t in texts)
     assert any("Re-running variations of the same call is not progress" in t for t in texts)
-    # the hard branch forces a final generation (a report), never an abort marker
     for n in ast.walk(fn):
         if (isinstance(n, ast.If) and isinstance(n.test, ast.BoolOp)
                 and any(isinstance(v, ast.Name) and v.id == "_exec_same_err" for v in n.test.values)
                 and any(isinstance(v, ast.Compare) for v in n.test.values)):
-            # the BODY of this branch only — `ast.walk(n)` would also walk the
-            # `orelse` chain, i.e. the generic abort branch below it
             body = ast.Module(body=n.body, type_ignores=[])
             assigned = [t.id for s in ast.walk(body) if isinstance(s, ast.Assign)
                         for t in s.targets if isinstance(t, ast.Name)]
-            body_consts = [c.value for c in ast.walk(body) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
-            if any("STOP trying variations" in c for c in body_consts):
-                assert "force_final_response" in assigned
-                assert not any("ATTEMPT_ABORTED" in c for c in body_consts)
-                break
+            consts = [c.value for c in ast.walk(body) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+            assert "force_final_response" not in assigned
+            assert not any("ATTEMPT_ABORTED" in c for c in consts)   # nor the generic abort
+            break
     else:
-        raise AssertionError("hard-stop branch for the execute same-error class not found")
+        raise AssertionError("hard branch for the execute same-error class not found")

@@ -1,5 +1,5 @@
 name: python-app
-description: One Python app box (/opt/venv with flask + gunicorn), port 8080 published, Tor egress. The app must listen on 0.0.0.0:8080 (a server bound to 127.0.0.1 is not reachable from outside the member)
+description: "One Python app box (/opt/venv with flask + gunicorn), port 8080 published, Tor egress. The app must listen on 0.0.0.0:8080 (a server bound to 127.0.0.1 is not reachable from outside the member). Also the box for a KEPT static site (HTML/JS/CSS): keep with cmd python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app, then deploy the folder"
 egress: tor
 members:
   - {name: app, image: "ghost-lab/python-app:1", mem_mb: 512, cpus: 1.0, ports: [8080]}

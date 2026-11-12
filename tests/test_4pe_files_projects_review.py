@@ -58,77 +58,6 @@ async def _drive(agent, ctx, hist, user, calls, tool):
     hist.append({"role": "assistant", "content": "reply"})
 
 
-async def test_a_bare_delete_in_the_users_yes_turn_runs_the_answered_preview(tmp_path, monkeypatch):
-    """Live 07:28 (06bbc35b): "yes, delete it." → the model called delete WITHOUT
-    the token → a second preview; its token then read "the user has not
-    answered yet"; the user said yes three times. Now the bare call runs the
-    preview the user answered, and nothing new is minted."""
-    from tests.helpers import make_context
-    from ghost_agent.memory.projects import ProjectStore
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1"); monkeypatch.setenv("GHOST_CRITIC_REPAIR_BUDGET", "0")
-    monkeypatch.setenv("GHOST_EVIDENCE_GATE", "0")
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    pid = store.create_project("Minecraft Voxel Game", goal="a game")
-    ctx = make_context(); ctx.project_store = store
-    agent = _handle_chat_harness(ctx)
-    seen = []
-
-    async def _mp(**kw):
-        r = await tool_manage_projects_for_model(ctx, **kw); seen.append((kw, str(r))); return r
-    agent.available_tools = {"manage_projects": _mp}
-    hist = [{"role": "user", "content": "show all projects"}, {"role": "assistant", "content": "One project."}]
-    await _drive(agent, ctx, hist, f"delete project {pid}", [{"action": "delete", "project_id": pid}], "manage_projects")
-    assert "confirmation_needed" in seen[-1][1] and store.get_project(pid)
-    n_plans = len(KB._FORGET_PLANS)
-    await _drive(agent, ctx, hist, "yes, delete it.", [{"action": "delete", "project_id": "minecraft voxel game"}],
-                 "manage_projects")
-    assert '"deleted": true' in seen[-1][1], seen[-1][1]
-    assert not store.get_project(pid)
-    assert len(KB._FORGET_PLANS) < n_plans                       # consumed, nothing new minted
-
-
-async def test_a_same_turn_confirm_is_still_refused_and_says_why(tmp_path):
-    """The standing rule (preview → the user's yes in a LATER turn) holds; the
-    refusal for an unknown token now carries the cause (live 09:06:10 got a
-    bare "unknown, expired or mismatched")."""
-    from ghost_agent.memory.projects import ProjectStore
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    ctx = SimpleNamespace(project_store=store, scratchpad=None, graph_memory=None, workspace_model=None,
-                          current_project_id=None, last_user_content="")
-    pid = store.create_project("Old app")
-    t = _turn("req-40", "convQ")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(ctx, action="delete", project_id=pid))
-        tok = prev["confirm_token"]
-        same = str(await tool_manage_projects_for_model(ctx, action="delete", project_id=pid, confirm_token=tok))
-        bogus = str(await tool_manage_projects_for_model(ctx, action="delete", project_id=pid, confirm_token="nope"))
-    finally:
-        _end(t)
-    assert "has not answered yet" in same
-    assert "has not answered yet" in bogus                       # a bogus token in the preview's own turn: the designed stop
-    assert store.get_project(pid)
-
-
-def test_the_yes_fallback_skips_the_preview_this_request_minted():
-    """P1's mechanism: with an earlier (answerable) preview and one minted in
-    THIS request, "yes" resolves to the earlier one."""
-    t = _turn("req-50", "convS")
-    try:
-        early = _plan("forget", "req-49", target="x", items=[])
-        late = _plan("forget", "req-50", target="x", items=[])
-        tok, plan = KB._resolve_plan("yes", "forget")
-    finally:
-        _end(t)
-    assert tok == early and plan["rid"] == "req-49"
-    t = _turn("req-51", "convS2")
-    try:
-        only = _plan("forget", "req-51", target="y", items=[])
-        tok2, plan2 = KB._resolve_plan("yes", "forget")
-    finally:
-        _end(t)
-    assert tok2 == only and plan2["rid"] == "req-51"              # its own preview comes back → "has not answered yet"
 
 
 def test_a_token_is_bound_to_the_conversation_that_previewed_it():
@@ -152,77 +81,6 @@ def test_a_token_is_bound_to_the_conversation_that_previewed_it():
     assert plan_a is not None and plan_a["rid"] == "req-60"
 
 
-def test_the_miss_reason_names_an_empty_conversation_and_an_absent_preview():
-    t = _turn("req-70", "")
-    try:
-        assert KB._resolve_plan("yes", "forget")[1] is None
-        assert "no conversation identity" in KB.plan_miss_reason()
-    finally:
-        _end(t)
-    t = _turn("req-71", "conv-empty-" + str(time.time()))
-    try:
-        assert KB._resolve_plan("yes", "reset_all")[1] is None
-        assert "no reset all preview" in KB.plan_miss_reason()
-    finally:
-        _end(t)
-
-
-@pytest.mark.parametrize("msg,ok", [
-    ("yes, delete it.", True), ("Yes", True), ("ναι", True), ("ok", True), ("go ahead", True),
-    ("ok what's the weather?", False), ("sure, go ahead — but keep the PDF", False),
-    ("yes; also search the web", False), ("yes but only item 2", False), ("remove the duplicates", False),
-    ("yes I don't need them anymore", True),
-])
-def test_the_yes_lexicon_rejects_questions_and_reservations(msg, ok):
-    """K9: "ok what's the weather" opened with a yes-word and confirmed a delete."""
-    assert KB.user_confirms(msg) is ok
-
-
-def test_a_reservation_confirms_only_when_the_call_names_the_items():
-    assert KB.user_confirms("yes but only item 2", narrowed=True)
-    assert not KB.user_confirms("yes but only item 2", narrowed=False)
-
-
-async def test_a_bare_forget_in_the_users_yes_turn_executes_the_earlier_preview(tmp_path):
-    """The knowledge_base side of C1: forget(target=…) without a token, in the
-    turn where the user said yes to that target's preview, deletes."""
-    f = tmp_path / "notes.txt"; f.write_text("x")
-    item = {"kind": "file", "ref": {"path": str(f), "root": str(tmp_path)}, "label": "file notes.txt",
-            "default": True, "key": ("file", ())}
-    t = _turn("req-80", "convF")
-    try:
-        _plan("forget", "req-80", target="notes.txt", items=[item])
-    finally:
-        _end(t)
-    t = _turn("req-81", "convF")
-    try:
-        note_user_message("yes", "req-81")
-        out = await KB.tool_knowledge_base(action="forget", target="notes.txt", sandbox_dir=tmp_path,
-                                          memory_system=MagicMock())
-    finally:
-        _end(t)
-    assert "Deleted" in str(out) and not f.exists(), out
-
-
-async def test_a_bare_reset_all_in_the_users_yes_turn_does_not_re_preview(monkeypatch):
-    """Same for reset_all: the yes turn's token-less call proceeds to the
-    confirm path (here it reaches the wipe, which we stub) instead of minting
-    a second preview."""
-    t = _turn("req-90", "convR")
-    try:
-        _plan("reset_all", "req-90")
-    finally:
-        _end(t)
-    calls = []
-    monkeypatch.setattr(KB, "_reset_preview", lambda *a, **k: calls.append("preview") or "PREVIEW")
-    t = _turn("req-91", "convR")
-    try:
-        note_user_message("yes", "req-91")
-        ms = MagicMock(); ms._get_lock = lambda: KB._NullCM()
-        out = await KB.tool_knowledge_base(action="reset_all", sandbox_dir=None, memory_system=ms)
-    finally:
-        _end(t)
-    assert "preview" not in calls and "PREVIEW" not in str(out)
 
 
 def test_kb_non_read_actions_are_the_tools_real_action_names():
@@ -735,32 +593,6 @@ def test_a_missing_service_name_says_missing_not_invalid():
 # Round 3 — defects the diff reader found inside the first cut
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def test_a_selection_reply_never_runs_the_whole_list_through_a_bare_forget(tmp_path):
-    """r3 CRIT: the user answers the preview with "1"; the model comes back
-    without the token and without items → the first cut deleted the whole
-    default list. Now: a selection reply + no items → preview again; with
-    items='1' → exactly item 1."""
-    a = tmp_path / "a.txt"; b = tmp_path / "b.txt"; a.write_text("a"); b.write_text("b")
-    items = [{"kind": "file", "ref": {"path": str(p), "root": str(tmp_path)}, "label": f"file {p.name}",
-              "default": True, "key": ("file", (p.name,))} for p in (a, b)]
-    t = _turn("req-110", "convSel")
-    try:
-        _plan("forget", "req-110", target="notes", items=items)
-    finally:
-        _end(t)
-    t = _turn("req-111", "convSel")
-    try:
-        note_user_message("1", "req-111")
-        out = await KB.tool_knowledge_base(action="forget", target="notes", sandbox_dir=tmp_path, memory_system=MagicMock())
-        assert a.exists() and b.exists() and "Deleted" not in str(out), out      # re-previewed, nothing ran
-        out2 = await KB.tool_knowledge_base(action="forget", target="notes", items="1", sandbox_dir=tmp_path,
-                                           memory_system=MagicMock())
-    finally:
-        _end(t)
-    assert not a.exists() and b.exists(), out2
-
-
-
 async def test_untrack_takes_the_spelling_track_echoes_and_files_shows_it(tmp_path):
     """r3 MAJOR: `track` echoed /workspace/… but `untrack` only knew the host path."""
     from ghost_agent.tools.workspace_track import tool_workspace_track
@@ -823,26 +655,6 @@ def test_a_suspect_download_receipt_is_partial_not_success(tmp_path):
     assert getattr(empty, "status", None) is OutcomeStatus.PARTIAL and "EMPTY" in str(empty)
     from ghost_agent.core import agent as A
     assert A._FS_DEST_RE.match(str(sus)) is None             # the verifier never books it as delivered
-
-
-async def test_a_conditional_yes_on_a_project_asks_for_a_plain_yes(tmp_path):
-    from ghost_agent.memory.projects import ProjectStore
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    pid = store.create_project("Cond App")
-    ctx = _ctx(store)
-    t = _turn("web-400", "convC")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(ctx, action="delete", project_id=pid))
-    finally:
-        _end(t)
-    t = _turn("web-401", "convC")
-    try:
-        note_user_message("yes, delete it but keep the backup", "web-401")
-        out = str(await tool_manage_projects_for_model(ctx, action="delete", project_id=pid, confirm_token=prev["confirm_token"]))
-    finally:
-        _end(t)
-    assert "plain yes" in out and "items" not in out and store.get_project(pid)
 
 
 async def test_a_query_passage_cannot_add_a_passage_or_the_no_answer_marker_at_the_hook():

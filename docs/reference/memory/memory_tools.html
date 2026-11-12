@@ -650,6 +650,14 @@
     preview then confirm; what it erases is unchanged.</em></li>
     <li><strong>update_profile</strong> tells the model what a single-value write replaced ("(was: …)"); "none"/"N/A" are real answers.</li>
   </ul>
+  <h2 id="no-confirm">forget and reset_all run at once <span class="tag">2026-11-12 &sect;4UJ</span></h2>
+  <p class="note"><strong>Supersedes</strong> <a href="#confirm">preview, then confirm</a> below. Operator: "i want all confirmations, everywhere to be removed … that's why everything is sandboxed".</p>
+  <ul>
+    <li><code>knowledge_base(action='forget', target=X)</code> runs the same sweep and deletes the default list (or <code>items</code>) in the same call. The result lists related items it KEPT with a token; <code>confirm='&lt;token&gt;', items='1,3'</code> removes some of those too, in this turn or a later one.</li>
+    <li><code>reset_all</code> wipes at once when called.</li>
+    <li>Only the walls on WHO may act remain (<code>_confirm_allowed</code>): no background, scheduled or probe turn, and no request that read outside content (a page cannot order a deletion).</li>
+    <li>Owner rules: “forget rule N” and “forget all my rules” remove at once; the old “confirm forget …” phrases still work.</li>
+  </ul>
   <h2 id="confirm">forget and reset_all: preview, then confirm <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
   <p class="note"><strong>Supersedes</strong> the reset_all wording gate and the "listed, re-issue by exact name" route in the two
   sections above. Three rounds of reviews kept finding wrong deletions in a forget that <em>guessed</em> what the user meant, so the

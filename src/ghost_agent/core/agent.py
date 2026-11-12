@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from itertools import zip_longest
 
-from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
+from .prompts import SYSTEM_PROMPT, SMART_MEMORY_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 # Shared "what did this call operate on" helper — same definition the
 # in-run no-progress loop-breaker and the pre-flight guard agree on what
 # "the same target" means.
@@ -294,16 +294,6 @@ def _owner_context_hidden(context=None) -> bool:
     (§4LB r2)."""
     return (requester_is_member() or reply_is_public()
             or getattr(context, "owner_memory_isolated", False) is True)
-
-
-def _specialist_profile(context, fallback: str) -> str:
-    pm = getattr(context, "profile_memory", None)
-    if _owner_context_hidden(context):
-        return "(none)"
-    try:
-        return (pm.get_context_string(only={"preferences"}) or "(none)") if pm is not None else "(none)"
-    except Exception:  # noqa: BLE001
-        return "(none)"
 
 
 _MEMBER_PROFILE_PLACEHOLDER = (
@@ -748,7 +738,10 @@ _DEFECT_REOPEN_WINDOW_S = 86_400.0
 # _EDIT_CHURN_MAX_STEERS injections per request so an ignoring model
 # doesn't get an ever-growing message tail. A .md/.txt target is never
 # counted (§4QB-c, EDIT_CHURN_EXEMPT_SUFFIXES: prose has nothing to run).
-_EDIT_CHURN_STEER_AFTER = 3
+# §4UI (operator 11-12, dense model): steer after 6 (was 3) — the edit tool
+# asks for one call per region, so a refactor of one file is several edits;
+# and the steer is ADVICE only: the forced blocker report is gone.
+_EDIT_CHURN_STEER_AFTER = 6
 _EDIT_CHURN_MAX_STEERS = 2
 _EDIT_CHURN_VERIFY_TOOLS = frozenset({
     "execute", "browser", "manage_services", "managed_services",
@@ -1777,18 +1770,24 @@ def _browser_loaded_but_never_extracted(tools_run, target: str) -> bool:
     return navigated and not extracted
 
 
+#: §4UI (2026-11-12): a task close no longer ends the turn, so the "task
+#: closed — I stopped here" wordings (forced-final notes, scrub fallbacks, the
+#: loop reply, the no-answer opener) are OFF: with the latch gone they read a
+#: final forced by anything else (budget, loop breaker, deadline) as a designed
+#: stop and hid the dropped call. Every such site reads this one switch.
+_CLOSE_ENDS_TURN = False
+
+
 def _latch_forces_final(task_closed_this_req: bool,
                         repair_reentry_active: bool) -> bool:
-    """The ONE rule for every "converge now" signal the loop re-asks each
-    iteration — the one-task-per-turn latch (a project task closed DONE
-    this request; the inline planner's DONE plan used it too until §4NM
-    deleted the planner): the turn must converge to a final answer —
-    UNLESS a verifier auto-repair re-entry is running (2026-09-13). The
-    repair directive ("actually RUN it", or "fix the refuted claim") needs
-    tools; re-forcing the final while it runs issued that directive into a
-    `tool_choice: none` turn whose every emitted call was dropped. Pinned
-    as a table in `tests/test_repair_reentry_latch.py`."""
-    return bool(task_closed_this_req) and not bool(repair_reentry_active)
+    """The loop's per-iteration "converge now" hook.
+
+    §4UI (2026-11-12): it no longer forces anything. It was the
+    one-task-per-turn latch (a project task closed DONE → the turn must
+    end); the dense model paces itself and the briefing advises instead.
+    Kept as the single seam the loop asks every iteration (tests drive a
+    forced final through it), so a future converge rule has one place."""
+    return False
 
 
 _SELF_REPORT_TOOLS = frozenset({"introspect"})   # §4TB: `self_state` removed; §4TD: `list_lessons` removed
@@ -5303,6 +5302,24 @@ def _estimate_messages_tokens(messages) -> int:
     return total
 
 
+#: §4UI: tools whose use means the request is working in the sandbox.
+#: tools that act IN the sandbox (r1 m1: not `browser` — web research — nor
+#: `workspace`, a read-only activity ledger; `lab` writes the workspace)
+_SANDBOX_TOOLS = frozenset({"file_system", "execute", "run", "lab"})
+
+
+def _request_touches_sandbox(has_coding_intent: bool, project_id, tools_run) -> bool:
+    """Show the sandbox listing + cwd pin when the request works in the
+    sandbox: coding keywords, a bound project, or any sandbox tool already
+    run this request (a refused/synthetic row counts too — the model tried)."""
+    if has_coding_intent or project_id:
+        return True
+    for t in tools_run or ():
+        if isinstance(t, dict) and t.get("name") in _SANDBOX_TOOLS:
+            return True
+    return False
+
+
 def _render_cwd_pin(project_id: Optional[str]) -> str:
     """The top-of-dynamic-state CWD pin for coding turns.
 
@@ -6613,6 +6630,30 @@ def turn_room_fits_time(ceiling_s, elapsed_s) -> bool:
     return ceil - spent >= TURN_ROOM_MIN_TIME_LEFT_S
 
 
+#: §4UI (log review: Slack coding turns still cut at 16k — slack-0c a GW-BASIC
+#: engine cut at 15.5k after 753 s): with a finite limit a turn gets what the
+#: time LEFT can hold at the rate the floor rule assumes (64k ≈ 73 min), less
+#: the report's grace — 16k at least, the room at most. A 30-min Slack request
+#: starts at ~22k instead of 16k, and the hard limit still stops a long turn.
+TURN_TOKENS_PER_S = TOOL_TURN_MAX_TOKENS_CEIL / TURN_ROOM_MIN_TIME_LEFT_S
+TURN_TIME_REPORT_SHARE_S = 300.0
+
+
+def turn_tokens_for_time(ceiling_s, elapsed_s) -> Optional[int]:
+    """§4UI: the most tokens a tool turn may take for the time its request
+    has left — None when the time sets no limit (no deadline, no ceiling, or
+    enough left for a room-sized turn), else between the 16k floor and the
+    ceiling."""
+    if turn_room_fits_time(ceiling_s, elapsed_s):
+        return None
+    try:
+        left = float(ceiling_s) - max(0.0, float(elapsed_s or 0.0)) - TURN_TIME_REPORT_SHARE_S
+    except (TypeError, ValueError):
+        return DEFAULT_TOOL_TURN_MAX_TOKENS
+    return int(max(DEFAULT_TOOL_TURN_MAX_TOKENS,
+                   min(TOOL_TURN_MAX_TOKENS_CEIL, left * TURN_TOKENS_PER_S)))
+
+
 #: §4SD: how often the hard-limit watch reads the request's clock (seconds)
 HARD_LIMIT_POLL_S = 5.0
 #: §4SD: the cancel reason a hard limit stops a turn with (the reply's note)
@@ -7347,10 +7388,9 @@ def _is_parts_continuation(args) -> bool:
 
 def edit_churn_decision(churn: dict, target: str) -> str:
     """Count one more unverified edit of `target` and say what the loop
-    does about it: "" (nothing yet), "steer" (a verify nudge — at most
-    `_EDIT_CHURN_MAX_STEERS` per request) or "report" (§4IC second tier:
-    the steers are spent and the blind edits continue — once). Mutates
-    `churn` (`counts`, `steers`, `reported`) exactly as the loop did.
+    does about it: "" (nothing yet) or "steer" (a verify nudge — at most
+    `_EDIT_CHURN_MAX_STEERS` per request). §4UI removed the "report" tier
+    (§4IC's forced blocker report). Mutates `churn` (`counts`, `steers`).
     A .md/.txt target is never counted (:data:`EDIT_CHURN_EXEMPT_SUFFIXES`)."""
     if str(target or "").strip().lower().endswith(EDIT_CHURN_EXEMPT_SUFFIXES):
         return ""
@@ -7358,11 +7398,7 @@ def edit_churn_decision(churn: dict, target: str) -> str:
     counts[target] = counts.get(target, 0) + 1
     if counts[target] < _EDIT_CHURN_STEER_AFTER:
         return ""
-    if churn.get("steers", 0) >= EDIT_CHURN_REPORT_AFTER_STEERS:
-        if churn.get("reported"):
-            return ""
-        churn["reported"] = True
-        return "report"
+    # (§4UI: no "report" tier — the steers are advice; the model decides)
     if churn.get("steers", 0) < _EDIT_CHURN_MAX_STEERS and churn.get("total_steers", 0) < EDIT_CHURN_TOTAL_STEERS:
         counts[target] = 0
         churn["steers"] = churn.get("steers", 0) + 1
@@ -7493,18 +7529,11 @@ def note_run_outcome(rec: dict, *, ok: bool, output: str = "") -> None:
 def futility_tier(script_iter: dict, steer_done: bool, report_done: bool):
     """Which futility tier fires for the rewrite/rerun counters, if any:
     ("steer", name, rec) on the 3rd rewrite + 2nd rerun of one code file
-    (once), ("report", name, rec) once the steer was given and the cycle
-    reached `FUTILITY_REPORT_WRITES`/`FUTILITY_REPORT_RUNS` (once) AND the
-    last run made no progress (§4OE-2), else ("", None, None). Pure."""
+    (once), else ("", None, None). §4UI removed the forced "report" tier.
+    Pure."""
     items = list((script_iter or {}).items())
-    if steer_done and not report_done:
-        for bn, rec in items:
-            if (rec.get("writes", 0) >= FUTILITY_REPORT_WRITES
-                    and rec.get("runs", 0) >= FUTILITY_REPORT_RUNS
-                    and not rec.get("progress")
-                    and not (rec.get("ok") and rec.get("counted"))):   # §4OG-1 (a): two green suite runs are not a stall
-                                                                        # (a count-less green run with unchanged output still is: xrick)
-                return ("report", bn, rec)
+    # (§4UI: no "report" tier — the steer is advice once; the model decides
+    # when to stop. `report_done` is accepted and ignored.)
     if not steer_done:
         for bn, rec in items:
             if rec.get("writes", 0) >= 3 and rec.get("runs", 0) >= 2 and not rec.get("progress"):
@@ -7746,17 +7775,17 @@ def _manage_projects_closed_a_task(tool_name: str, result_text: str) -> bool:
     if tool_name != "manage_projects" or not result_text:
         return False
     # Cheap pre-check before paying for a JSON parse.
-    if '"status": "DONE"' not in result_text:
+    if '"closed"' not in result_text:
         return False
     try:
         payload = json.loads(result_text)
     except Exception:
         return False
-    updated = payload.get("updated") if isinstance(payload, dict) else None
-    if not isinstance(updated, list):
-        return False
-    return any(isinstance(u, dict) and str(u.get("status", "")).upper() == "DONE"
-               for u in updated)
+    # §4UI: the tool's own `closed` list — the tasks that went to DONE in
+    # THIS call. `updated[].status == DONE` also matched a description-only
+    # update of an already-DONE task and a re-close.
+    closed = payload.get("closed") if isinstance(payload, dict) else None
+    return isinstance(closed, list) and any(str(c).strip() for c in closed)
 
 
 def _scrub_host_sandbox_paths(text: str, sandbox_root) -> str:
@@ -10154,8 +10183,9 @@ def _awaits_owner_go_ahead(row) -> bool:
     create paid 60–80 s for "say proceed and I'll start"): the latest row is a
     manage_projects result that hands the decision to the user — a
     release/unrelease/delete PREVIEW (``confirmation_needed``), its "already
-    previewed — STOP" refusal, or a plan just presented (``awaits_go_ahead``:
-    create / task_decompose). "Reply yes and I'll …" is then the right ending.
+    previewed — STOP" refusal, or a plan just presented (``plan_shown``, §4UI;
+    was ``awaits_go_ahead``: create / task_decompose). "Reply yes and I'll …"
+    may then be the right ending (the PACING rule decides, not this key).
     The keys are the tool's own output, not the model's text."""
     try:
         if str(row.get("name") or "") != "manage_projects":
@@ -10163,14 +10193,77 @@ def _awaits_owner_go_ahead(row) -> bool:
         content = row.get("content")
     except AttributeError:
         return False
-    if getattr(content, "reason_code", None) == "confirm_dead_end":
-        return True
     raw = str(getattr(content, "text", None) or content or "").lstrip()
     if raw.startswith("OK:"):
         raw = raw[3:].lstrip()
     # the FIRST key of the payload (a long create result is truncated before
-    # it is stored; a key quoted inside a field is escaped, never first)
-    return raw.startswith(('{"confirmation_needed": true', '{"awaits_go_ahead": true'))
+    # it is stored; a key quoted inside a field is escaped, never first).
+    # §4UK: release/unrelease/delete no longer preview (no `confirmation_needed`
+    # / `confirm_dead_end`), so only a plan just shown remains.
+    return raw.startswith('{"plan_shown": true')
+
+
+def _output_ends(text, limit: int) -> str:
+    """§4UI: the first and last ``limit``/2 chars of a tool output (all of it
+    when shorter) — an error is usually at the end of a long output. (Not
+    ``_head_and_tail``: that name is the audit pack's file cut, above.)"""
+    t = str(text or "")
+    if len(t) <= limit:
+        return t
+    h = limit // 2
+    return t[:h] + "\n...[middle cut]...\n" + t[-h:]
+
+
+def _program_failed_on_its_own(tool_name, exit_code, result_text, is_rejection) -> bool:
+    """§4UI: an `execute` that RAN the program and the program failed — a
+    non-zero exit with its own output, not a refusal (three execute refusals
+    carry `EXIT CODE: 1`), not the sandbox's time/memory kill (124/137)."""
+    if tool_name != "execute" or is_rejection:
+        return False
+    try:
+        code = int(exit_code)
+    except (TypeError, ValueError):
+        return False
+    text = str(result_text or "")
+    return (code not in (0, 124, 137) and "STDOUT/STDERR:" in text
+            and "timed out / killed" not in text)
+
+
+_DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:s|ms|sec|secs|seconds)\b|\(\d+:\d\d:\d\d(?:\.\d+)?\)")
+
+
+#: §4UI r1 MAJOR 3: how many recent program-failure outputs a new one is
+#: compared with (an A, B, A, B flip-flop is not progress), and how many free
+#: program failures one request gets before they count again (a loop whose
+#: output varies by a random value or seed must still reach the strike cap)
+_PROGRAM_FAIL_WINDOW = 8
+_PROGRAM_FAIL_FREE_MAX = 12
+
+
+def _program_fail_repeats(strikes, failure_text) -> bool:
+    """§4UI: does this program failure count as a repeat — its output (volatile
+    tokens normalised) matches one of the last ``_PROGRAM_FAIL_WINDOW``
+    program failures, or the request already had ``_PROGRAM_FAIL_FREE_MAX``
+    free ones? Remembers this one on ``strikes``. A changed output is progress
+    in a debugging loop; a recurring one, or an endless stream, is not."""
+    try:
+        from .strikes import normalise_volatile
+        fp = normalise_volatile(str(failure_text or ""))
+    except Exception:  # noqa: BLE001
+        fp = str(failure_text or "")
+    # durations ("in 0.44s", "(0:00:01)", "12.3 seconds") change every run
+    fp = _DURATION_RE.sub("<t>", fp)[-2000:]
+    seen = list(getattr(strikes, "_last_program_fails", None) or [])
+    free = int(getattr(strikes, "_program_fails_free", 0) or 0)
+    repeat = fp in seen or free >= _PROGRAM_FAIL_FREE_MAX
+    try:
+        strikes._last_program_fails = (seen + [fp])[-_PROGRAM_FAIL_WINDOW:]
+        strikes._last_program_fail = fp
+        if not repeat:
+            strikes._program_fails_free = free + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return repeat
 
 
 def _ends_with_action_promise(text) -> str:
@@ -10184,8 +10277,26 @@ def _ends_with_action_promise(text) -> str:
     if not last_sentence or len(last_sentence) > 120:
         return ""
     if _ACTION_PROMISE_RE.search(last_sentence):
+        # §4UI (log review: 14 fires / 7 requests after the model switch, mostly
+        # "Say **yes** and I'll delete it"): an action CONDITIONAL on the
+        # user's answer is an offer that ends the turn, not a pending promise
+        # (judged on the whole sentence: a per-clause split cut "If you
+        # confirm — I'll delete it" from its condition — review r2 M1; a
+        # promise that shares a sentence with an offer is taken as the offer)
+        if _PERMISSION_OFFER_RE.search(last_sentence) or _FILLER_OFFER_RE.search(last_sentence):
+            return ""
         return last_sentence
     return ""
+
+
+#: §4UI: "say yes / tell me which / confirm … and I'll …", "if / once you …,
+#: I'll …" — the action waits on the user's reply
+_PERMISSION_OFFER_RE = re.compile(
+    r"\b(?:say|reply|answer|tell\s+me|let\s+me\s+know|confirm|give\s+me|send\s+me|pick|choose|approve)"
+    r"\b[^.!?]{0,80}?\b(?:and|then)\s*,?\s*(?:i['’]ll|i\s+will)\b"
+    r"|\b(?:if|once|when|after|as\s+soon\s+as)\s+you\b[^.!?]{0,80}?\b(?:i['’]ll|i\s+will)\b",
+    re.IGNORECASE,
+)
 
 
 #: Intent markers for the filler guard ("I'll", "let me", "running" …) —
@@ -17730,11 +17841,12 @@ class GhostAgent:
 
     async def _tool_turn_room(self, payload) -> int:
         """§4SD: ``output_cap_for_tool_turn`` for this payload — its messages and
-        tool schemas counted with the agent's tokenizer, off the event loop. The
-        16k floor when the request's time could not hold a room-sized turn."""
+        tool schemas counted with the agent's tokenizer, off the event loop, and
+        no more than the request's time left can hold (§4UI ``turn_tokens_for_time``)."""
         try:
             rid = request_id_context.get() or ""
-            if not turn_room_fits_time(_glog.extension_ceiling_s(rid), _glog.request_elapsed_s(rid)):
+            _tcap = turn_tokens_for_time(_glog.extension_ceiling_s(rid), _glog.request_elapsed_s(rid))
+            if _tcap is not None and _tcap <= DEFAULT_TOOL_TURN_MAX_TOKENS:
                 return DEFAULT_TOOL_TURN_MAX_TOKENS
             win = await self._main_window_tokens()
             if win <= 0:
@@ -17746,7 +17858,8 @@ class GhostAgent:
                 if tools:
                     n += estimate_tokens(json.dumps(tools, ensure_ascii=False))
                 return n
-            return output_cap_for_tool_turn(await asyncio.to_thread(_count), win)
+            _cap = output_cap_for_tool_turn(await asyncio.to_thread(_count), win)
+            return _cap if _tcap is None else max(DEFAULT_TOOL_TURN_MAX_TOKENS, min(_cap, _tcap))
         except Exception:  # noqa: BLE001
             return DEFAULT_TOOL_TURN_MAX_TOKENS
 
@@ -20569,8 +20682,21 @@ class GhostAgent:
         held = bool(blocks) and all(
             0 < pos <= n and _msg_fingerprint(req_messages[:pos]) == fp for pos, fp, _t in blocks)
         if held:
+            # §4UI r1 m1: a sandbox listing that first appears mid-request
+            # (the request began touching the sandbox) is KEPT once, as its
+            # own block where it appeared — else, absent from the base, it
+            # went whole in every later turn's changes and was never kept
+            _base = anchor.get("base") or {}
+            _new = {k: t for k, t in sections.items()
+                    if t and k.startswith("sandbox_state") and k not in _base}
+            _new_fp = _msg_fingerprint(req_messages) if _new else ""
             for i, (pos, _fp, text) in enumerate(blocks):
                 req_messages.insert(pos + i, {"role": "user", "content": text})
+            if _new:
+                _nt = "".join(_new.values())
+                req_messages.append({"role": "user", "content": _nt})
+                anchor["blocks"] = list(blocks) + [(n, _new_fp, _nt)]
+                anchor["base"] = {**_base, **_new}
             sent = _render_volatile_block(_state_changes(anchor.get("base") or {}, sections),
                                           pending_request)
             anchor["last"] = "delta"
@@ -25034,6 +25160,9 @@ class GhostAgent:
                 # same-failure repeat counter fragmented and the ≥3 breaker
                 # fired late or never. Captured at the failure site instead.
                 failed_fname = ""
+                # §4UI: the failure is the PROGRAM's own (a red test, a
+                # traceback) — debugging, not a broken call; no strike
+                failure_was_program = False
 
                 # Per-call outcomes for this turn. A multi-id command
                 # ("delete A and B") is N separate tool calls; tracking
@@ -25443,18 +25572,17 @@ class GhostAgent:
                             "the user plainly what was refused and why: "
                             + str(_outcome)[:300])})
 
-                    # One-task-per-turn gate: a manage_projects call that
-                    # actually closed a task to DONE ends the interactive
-                    # turn, so a single "start task 1" advances exactly
-                    # one task and stops. Skipped when the user asked for
-                    # a batch ("do the next 3" / "finish the project").
-                    if (not _proj_task_closed_this_req and not _user_batch_intent
+                    # §4UI (2026-11-12): a task closed this request. ADVICE
+                    # only — the briefing says so and lets the model go on when
+                    # the user asked for more. It used to force the final and
+                    # drop the next call (built for the MoE model, "one go-ahead
+                    # built 8 tasks"); with the dense model it cut work the
+                    # owner had asked for and made it argue the rule (13 of 35
+                    # project requests after 10-25).
+                    if (not _proj_task_closed_this_req
                             and _manage_projects_closed_a_task(fname, str_res)):
                         _proj_task_closed_this_req = True
-                        force_final_response = True
-                        logger.info(
-                            "one-task-per-turn: project task closed DONE "
-                            "— forcing turn to wrap up and wait for the user")
+                        logger.info("project task closed DONE this request — the briefing now advises")
 
                     # One-shot constraint check after the FIRST
                     # successful artifact write of a constrained
@@ -25533,43 +25661,19 @@ class GhostAgent:
                                 pass
                         _churn_t = str(ptarget or "?")
                         _churn_verdict = edit_churn_decision(_churn, _churn_t)
-                        if _churn_verdict == "report":
-                            # §4IC second tier: both steers spent and the
-                            # blind edits continue — stop and report.
-                            force_final_response = True
-                            self.context._breaker_forced_final = True  # §4ID
-                            self.context._breaker_reason = (          # §4OA: the fallback names it
-                                f"'{_churn_t}' was edited again and again without being run, after "
-                                f"{_churn['steers']} reminders to test it")
-                            note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "edit_churn")   # §4TC
-                            pretty_log(
-                                "Edit Churn Stop",
-                                f"'{_churn_t}' edited {_EDIT_CHURN_STEER_AFTER}x more "
-                                f"after {_churn['steers']} verify steers — forcing a "
-                                "blocker report as the final answer",
-                                icon=Icons.STOP, level="WARNING",
-                            )
-                            messages.append({"role": "user", "content": blocker_report_alert(
-                                "edit churn",
-                                f"you kept editing '{_churn_t}' without verifying "
-                                f"after {_churn['steers']} warnings",
-                                last_user_content)})
-                        elif _churn_verdict == "steer":
+                        if _churn_verdict == "steer":
                             messages.append({
                                 "role": "user",
                                 "content": (
-                                    "SYSTEM ALERT (edit-churn check): "
-                                    f"you have now edited '{_churn_t}' "
+                                    "SYSTEM NOTE (edit-churn check): "
+                                    f"'{_churn_t}' has been edited "
                                     f"{_EDIT_CHURN_STEER_AFTER} times in a "
-                                    "row without running or rendering "
-                                    "ANYTHING. Blind edit stacks ship "
-                                    "broken code. STOP editing and VERIFY "
-                                    "now: execute the file or its tests — "
-                                    "or, for a web page, load it in the "
-                                    "browser (use its running service URL "
-                                    "if it calls fetch/api) and check for "
-                                    "errors. Continue only from what the "
-                                    "verification shows."
+                                    "row with nothing run or rendered. If "
+                                    "the change is at a point where it can "
+                                    "run, check it now — execute the file "
+                                    "or its tests, or load the page in the "
+                                    "browser — before more edits. If you "
+                                    "are mid-change, finish it first."
                                 ),
                             })
                             note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "edit_churn")   # §4TC
@@ -25594,8 +25698,12 @@ class GhostAgent:
                             _churn["steers"] = 0
 
                     shield_limit = max(16000, int(char_budget * 0.1))
+                    # §4UI (coding review B2): not `execute` — the summariser
+                    # read only the head, and a test run's failures and a
+                    # traceback sit at the TAIL; the head+tail cut below keeps both
                     if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base",
-                                                                 "youtube_transcribe"]:   # §4TA: the same result as knowledge_base's
+                                                                 "youtube_transcribe",   # §4TA: the same result as knowledge_base's
+                                                                 "execute"]:
                         # Use a DISTINCT variable, not `payload`: the
                         # outer `payload` is reused later (e.g. the
                         # Perfect-It optimization call), and rebinding
@@ -25603,7 +25711,7 @@ class GhostAgent:
                         # capped that later generation's max_tokens.
                         shield_payload = {
                             "model": model,
-                            "messages": [{"role": "user", "content": f"The user asked: '{_queued_current_ask(last_user_content, added_max=2000)}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {str_res[:15000]}"}],
+                            "messages": [{"role": "user", "content": f"The user asked: '{_queued_current_ask(last_user_content, added_max=2000)}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {_output_ends(str_res, 15000)}"}],
                             "temperature": 0.0,
                             "max_tokens": 300
                         }
@@ -26069,27 +26177,6 @@ class GhostAgent:
                                 _si,
                                 getattr(self.context, "_futility_steer_done", False),
                                 getattr(self.context, "_futility_report_done", False))
-                            if _ft_kind == "report":
-                                self.context._futility_report_done = True
-                                # §4ID: a breaker closed this loop — the
-                                # verifier gate must not re-open it for
-                                # "an untested write" (the write IS the churn).
-                                self.context._breaker_forced_final = True
-                                self.context._breaker_reason = "the same script kept being rewritten and rerun without a result"   # §4OA: named in the fallback
-                                force_final_response = True
-                                note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "futility")   # §4TC
-                                pretty_log(
-                                    "Futility Breaker",
-                                    f"'{_bn}' rewritten {_rec['writes']}x / rerun "
-                                    f"{_rec['runs']}x after the strategy-shift steer — "
-                                    "forcing a blocker report as the final answer",
-                                    level="WARNING", icon=Icons.STOP,
-                                )
-                                messages.append({"role": "user", "content": blocker_report_alert(
-                                    "futility",
-                                    f"'{_bn}' has been rewritten {_rec['writes']} times and "
-                                    f"rerun {_rec['runs']} times without reaching the goal",
-                                    last_user_content)})
                             if _ft_kind == "steer":
                                 if _bn is not None:
                                     if _rec is not None:
@@ -26315,6 +26402,8 @@ class GhostAgent:
                             failure_was_rejection = _outcome.is_rejection
                             failure_was_partial = (
                                 _outcome.status is _OutcomeStatus.PARTIAL)
+                            failure_was_program = _program_failed_on_its_own(
+                                fname, exit_code_val, str_res, _outcome.is_rejection)
                             if "STDOUT/STDERR:" in str_res:
                                 # §4IB: the line that NAMES the failure, else
                                 # the tail — not the head (an `ls` listing
@@ -26466,6 +26555,10 @@ class GhostAgent:
                         last_error_res = str_res
                         failed_fname = fname
                         failure_was_rejection = _outcome.is_rejection
+                        # §4UI: the latest failure decides; a syntax-guard
+                        # rollback is a fix-and-resend step like a red test
+                        failure_was_program = (str(getattr(_outcome, "reason_code", "") or "")
+                                               == "syntax_regression_rolled_back")
                         failure_was_partial = (
                             _outcome.status is _OutcomeStatus.PARTIAL)
                         last_error_preview = str_res.replace("Error:", "").strip()
@@ -26656,28 +26749,10 @@ class GhostAgent:
                             "you already have; say plainly what you could not read."
                         )})
                     elif _exec_same_err and _acnt >= _hard_n:
-                        # §4IB hard stop: give up AND report. The model
-                        # writes its final answer naming the blocker — a
-                        # clear "this is what fails and why" is a valid
-                        # deliverable; twenty more variations are not.
-                        force_final_response = True
-                        self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
-                        self.context._breaker_reason = "the same tool call kept repeating with no new information"   # §4OA: named in the fallback
-                        pretty_log(
-                            "Loop Breaker",
-                            f"Same error {_acnt}x from {_exec_heads} — forcing a "
-                            "blocker report as the final answer.",
-                            level="WARNING", icon=Icons.STOP,
-                        )
-                        messages.append({"role": "user", "content": (
-                            f"SYSTEM ALERT: {_acnt} `execute` runs ({_exec_heads}) all ended in the "
-                            f"same error: {_exec_err_line or '(see the tool outputs above)'}. "
-                            "STOP trying variations. Write your FINAL answer now: state "
-                            "plainly what you were trying to do, the exact error, what "
-                            "you tried, and what would unblock it (a different library, "
-                            "a version, information from the user). Deliver whatever "
-                            "partial result you have. Do not call any more tools."
-                        )})
+                        # §4UI (coding review A5): ADVICE only — the steer at 3
+                        # said it once. A working pipeline that logs the same
+                        # benign error line every run was force-ended at 5.
+                        pass
                     elif _exec_same_err and _asig not in repeated_action_steered:
                         repeated_action_steered.add(_asig)
                         pretty_log(
@@ -26698,8 +26773,7 @@ class GhostAgent:
                             "tool/library; or "
                             "(b) STOP and report the blocker to the user as your "
                             "final answer (what fails, the exact error, what you tried). "
-                            f"If you hit the same error again after {getattr(_strk, 'EXECUTE_SAME_ERROR_HARD_STOP', 5) - _acnt} "
-                            "more runs, you will be asked to write that report."
+                            "If that line is expected output of a working program, carry on."
                         )})
                     elif _acnt >= _hard_n:
                         pretty_log(
@@ -26876,6 +26950,17 @@ class GhostAgent:
                                    f"{_fail_fname} — site refused the fetch (not a strike) -> "
                                    f"{last_error_preview[:100]}",
                                    icon=Icons.VERDICT_NOTE, level="INFO")
+                        diagnostic_msg = format_failure_context(failure_text, failure_class)
+                    elif (failure_was_program and _fail_fname in ("execute", "file_system")
+                          and not _program_fail_repeats(strikes, failure_text)):
+                        # §4UI (coding review A1): a write-and-run batch whose
+                        # test is still red is how debugging goes — counting it
+                        # ended a test-driven turn after 6–8 iterations. Only a
+                        # failure whose output CHANGED is free: the same output
+                        # again (nothing moved) still strikes, and the
+                        # no-progress breaker and futility steer still watch.
+                        pretty_log("Program Fail", f"{_fail_fname}: a fix-and-retry step (not a strike) -> "
+                                   f"{last_error_preview[:120]}", icon=Icons.WARN, level="INFO")
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
                     elif failure_class == FailureClass.RETRYABLE:
                         transient_failure_count += 1
@@ -29641,11 +29726,11 @@ class GhostAgent:
                             # output, and a bleed phrase in either lets finalize
                             # cut the trailing marker (§4KM R5 review).
                             stamp_loop_breaker(self.context, req_id, "cross_turn")
-                            final_ai_content = (_task_closed_loop_reply if _proj_task_closed_this_req
+                            final_ai_content = (_task_closed_loop_reply if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req)
                                                 else cross_turn_loop_fallback)(
                                 _no_answer_fallback_reply(tools_run_this_turn, ask=last_user_content,
                                                           head_key="no_answer_loop",
-                                                          task_closed=bool(_proj_task_closed_this_req)))
+                                                          task_closed=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req)))
                             force_stop = True
                             return "break"
                     else:
@@ -29678,8 +29763,8 @@ class GhostAgent:
                     )
                     _qa_fb = _no_answer_fallback_reply(tools_run_this_turn, ask=last_user_content,
                                                        stopped_by=str(getattr(self.context, "_breaker_reason", "") or ""),
-                                                       task_closed=bool(_proj_task_closed_this_req))
-                    final_ai_content = (_task_closed_loop_reply(_qa_fb, flood=tool_call_flood_detected) if _proj_task_closed_this_req
+                                                       task_closed=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
+                    final_ai_content = (_task_closed_loop_reply(_qa_fb, flood=tool_call_flood_detected) if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req)
                                         else forced_final_loop_fallback(_qa_fb, flood=tool_call_flood_detected))
                     force_stop = True
                     return "break"
@@ -29748,8 +29833,8 @@ class GhostAgent:
                         )
                         _qa_fb = _no_answer_fallback_reply(tools_run_this_turn, ask=last_user_content,
                                                            stopped_by=str(getattr(self.context, "_breaker_reason", "") or ""),
-                                                           task_closed=bool(_proj_task_closed_this_req))
-                        final_ai_content = (_task_closed_loop_reply(_qa_fb, flood=tool_call_flood_detected) if _proj_task_closed_this_req
+                                                           task_closed=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
+                        final_ai_content = (_task_closed_loop_reply(_qa_fb, flood=tool_call_flood_detected) if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req)
                                             else forced_final_loop_fallback(_qa_fb, flood=tool_call_flood_detected))
                         force_stop = True
                         return "break"
@@ -30107,8 +30192,8 @@ class GhostAgent:
                 # (the task had just closed DONE). A dropped FILE write is
                 # different: the reply may say "Saved …" (fresh-eye MAJOR-4),
                 # so its not-applied note and pending ledger stay.
-                _tc_quiet = bool(_proj_task_closed_this_req) and not _dropped_write_paths(tool_calls)
-                if _proj_task_closed_this_req:
+                _tc_quiet = bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req) and not _dropped_write_paths(tool_calls)
+                if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req):
                     _nt = _unparsed_call_note(True)
                     if _nt not in (ui_content or ""):
                         ui_content = ((ui_content or "").rstrip() + "\n\n" + _nt).lstrip()
@@ -30257,7 +30342,7 @@ class GhostAgent:
                         tools_run_this_turn, ask=last_user_content,
                         stopped_by=str(getattr(self.context, "_breaker_reason", "") or ""),   # §4OA
                         # §4QA r3: a closed task is finished — "NOT finished" was false
-                        task_closed=bool(_proj_task_closed_this_req))
+                        task_closed=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
                     clean_ui = ui_content.strip("` \n\r")
                     # §4PO r3 M2: an answer the loop carried is still the answer
                     _pc = _po_carry(self.context, request_id_context.get())
@@ -31959,28 +32044,9 @@ class GhostAgent:
                 # Tool schemas are now generated dynamically inside the turn loop
                 # base_prompt is kept clean here
 
+                # §4UI: the coding persona is gone (see prompts.py). The name
+                # stays, empty, for the injection layout that still takes it.
                 active_persona = ""
-                if has_coding_intent and not is_meta_task:
-                    pretty_log("Mode Switch", "Ghost Specialist Activated", icon=Icons.MODE_GHOST)
-                    # Tool-XML guidance is path-split (2026-08-01): the
-                    # attribute-dialect examples + CDATA rule are the LEGACY
-                    # path's contract; on the native path they were the one
-                    # dialect-teaching block the 07-31 header split missed —
-                    # riding every coding turn, the exact prompt class the
-                    # ablation showed corrupts stacked calls.
-                    _specialist_native = bool(getattr(
-                        getattr(self.context, "args", None), "native_tools", False))
-                    active_persona = (
-                        SPECIALIST_SYSTEM_PROMPT
-                        # the PREFERENCES only (§4LB: the whole profile rode the
-                        # coding persona a second time — address, family)
-                        .replace('{{PROFILE}}', _specialist_profile(self.context, profile_context))
-                        .replace(
-                            '{{TOOL_XML_GUIDANCE}}',
-                            SPECIALIST_TOOL_XML_NATIVE if _specialist_native
-                            else SPECIALIST_TOOL_XML_LEGACY,
-                        )
-                    ) + "\n\n"
 
                 # base_prompt += active_persona  <-- RELOCATED to user message for cache efficacy
 
@@ -32190,13 +32256,10 @@ class GhostAgent:
                 # for a batch ("do the next 3", "finish the project"), which the
                 # prompt routes to manage_projects autoadvance instead.
                 _proj_task_closed_this_req = False
-                try:
-                    from .project_advancer import classify_advance_intent as _cai
-                    _user_batch_intent = (_cai(
-                        getattr(self.context, "last_user_content", "") or ""
-                    ).get("mode") in ("all", "n"))
-                except Exception:
-                    _user_batch_intent = False
+                # §4UI: the batch-intent regex ("all" anywhere in the message)
+                # decided the latch; the latch is advice now and the model
+                # reads the user's pacing itself. Kept for the state plumbing.
+                _user_batch_intent = False
 
                 # --- VERIFIER-GATE AUTO-REPAIR state (bounded) ---
                 # When the verifier REFUTES the final answer (or the turn
@@ -32522,7 +32585,18 @@ class GhostAgent:
                     _SCRATCH_INJECT_CAP = 6000
                     if isinstance(scratch_data, str) and len(scratch_data) > _SCRATCH_INJECT_CAP:
                         scratch_data = scratch_data[:_SCRATCH_INJECT_CAP] + "\n...[SCRATCHPAD TRUNCATED — recall a specific key for the full value]"
-                    if has_coding_intent:
+                    # §4UI: the sandbox listing and the cwd pin follow what the
+                    # request DOES (a project is bound, or it touched the
+                    # sandbox) as well as the coding keywords — the keywords
+                    # alone missed 57% of the requests that wrote or ran code.
+                    # r1 m6: a member's turn, or an owner turn with a PUBLIC
+                    # reply, gets neither the bound project's
+                    # listing nor its id in the cwd pin
+                    _sb_hidden = requester_is_member() or reply_is_public()
+                    _sb_project = None if _sb_hidden else getattr(self.context, "current_project_id", None)
+                    _sandbox_ctx = _request_touches_sandbox(
+                        has_coding_intent, _sb_project, tools_run_this_turn)
+                    if _sandbox_ctx:
                         # Per-request sandbox state cache. The previous
                         # process-global cache (`context.cached_sandbox_state`)
                         # leaked across concurrent requests and could serve
@@ -32534,7 +32608,7 @@ class GhostAgent:
                                 "sandbox_dir": project_scoped_sandbox(self.context)[0],
                                 "memory_system": self.context.memory_system
                             }
-                            request_sandbox_state = ("(not available for this channel)" if requester_is_member()
+                            request_sandbox_state = ("(not available for this channel)" if _sb_hidden
                                                      else await tool_list_files(**params))
                         sandbox_state = request_sandbox_state
                     else:
@@ -32707,7 +32781,7 @@ class GhostAgent:
                     _pin_stable = os.getenv("GHOST_PIN_TOOL_SCHEMAS", "0").strip().lower() not in ("0", "false", "no")
                     _is_final_generation_for_schema = (
                         force_final_response
-                        or _latch_forces_final(_proj_task_closed_this_req, _repair_reentry_active)   # R4: the latch, decided HERE too
+                        or _latch_forces_final(_proj_task_closed_this_req, _repair_reentry_active)
                     )
                     _native_tools_active = bool(
                         getattr(self.context.args, "native_tools", False)
@@ -32804,12 +32878,11 @@ class GhostAgent:
                     # §4RC: built as named sections (joined, the text is what it always was) so an
                     # anchored request can append only the sections that changed
                     _ds_parts = []
-                    if has_coding_intent:
+                    if _sandbox_ctx:
                         # Project-aware since 2026-07-18: the static
                         # "/workspace" wording taught the model to `cd`
                         # OUT of its project scope (see _render_cwd_pin).
-                        _ds_parts.append(("cwd_pin", _render_cwd_pin(
-                            getattr(self.context, "current_project_id", None))))
+                        _ds_parts.append(("cwd_pin", _render_cwd_pin(_sb_project)))
                     # Minute precision (not seconds): a second-precision
                     # timestamp changes on every turn of the same request,
                     # busting the upstream prefix KV-cache for everything that
@@ -32913,23 +32986,15 @@ class GhostAgent:
                     # (§4NN: the §4FD EVIDENCE CHECK steer rode the
                     # `evidence_gate` experiment arm, disabled since §4ND —
                     # it left with the experiments registry.)
-                    # Re-assert the wrap-up gate every iteration: once a project
-                    # task was closed this request, the turn must converge to a
-                    # final answer (no further tool calls / no next task) —
-                    # EXCEPT while a verifier repair re-entry is running the
-                    # tools its directive demands (`_repair_reentry_active`).
-                    # Accepted residual: during that window the model could
-                    # close a SECOND task (the dispatch-side latch only sets
-                    # the flag once); the repair is one bounded round and the
-                    # NEXT TASK pointer stays suppressed (`suppress_next_task`
-                    # keys on the flag, not on the forced final).
+                    # §4UI: the converge hook (no longer a task-close latch —
+                    # the briefing advises instead, `suppress_next_task`)
                     if _latch_forces_final(_proj_task_closed_this_req,
                                            _repair_reentry_active):
                         force_final_response = True
-                    if has_coding_intent:
+                    if _sandbox_ctx:
                         # §4RW-d (review): keyed by project — a switch mid-request lists
                         # another root, which goes whole, not as a diff against the old one
-                        _ds_parts.append((f"sandbox_state:{getattr(self.context, 'current_project_id', None) or ''}",
+                        _ds_parts.append((f"sandbox_state:{_sb_project or ''}",
                                           f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"))
 
                     # Rewrite any leaked HOST-absolute sandbox path (from a
@@ -33728,7 +33793,7 @@ class GhostAgent:
                     _verifier_verdict_cache=_verifier_verdict_cache,
                     turn_budget_exhausted=locals().get(
                         "_turn_budget_exhausted", False),
-                    task_closed_this_req=bool(_proj_task_closed_this_req),
+                    task_closed_this_req=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req),
                 ))
 
         except TurnCancelled as _tc:
@@ -35182,7 +35247,7 @@ class GhostAgent:
                     # has OPENED a tool call (the next task's write) — every
                     # byte from here is eaten by the scrub; live it generated
                     # 17k hidden chars (~70 s) before the reply could end.
-                    if _proj_task_closed_this_req and _scrub_tail_open:
+                    if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req) and _scrub_tail_open:
                         from .reply_smoothing import unparsed_call_markup_present as _qa_ucm
                         if _qa_ucm(full_content[len(stream_prefix or ""):]):
                             pretty_log("One Task / Turn",
@@ -35379,7 +35444,7 @@ class GhostAgent:
                 # rather than telling the user to "rephrase" a
                 # request that already succeeded.
                 _fallback_text = _scrub_fallback_message(
-                    _intended, _proj_task_closed_this_req)
+                    _intended, (_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
                 # Record the fallback sentence as the turn's answer (what the
                 # user saw), not the stripped tool-XML in full_content.
                 _stream_effective_content = (stream_prefix + _fallback_text) if stream_prefix else _fallback_text
@@ -35394,7 +35459,7 @@ class GhostAgent:
                         "finish_reason": None,
                     }],
                 }
-                if _proj_task_closed_this_req:
+                if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req):
                     yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
                     # Expected: the one-task gate finalized the
                     # turn and dropped the model's attempt to
@@ -35445,7 +35510,7 @@ class GhostAgent:
                 _note_chunk = None
                 if (_stream_scrub_active and not _scrub_fallback_emitted
                         and _ucm_present((full_content or "")[len(stream_prefix or ""):])):
-                    _tc_note = _unparsed_call_note(bool(_proj_task_closed_this_req))
+                    _tc_note = _unparsed_call_note(bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
                     _note_chunk = {
                         "id": f"chatcmpl-{req_id}",
                         "object": "chat.completion.chunk",
@@ -35457,7 +35522,7 @@ class GhostAgent:
                             "finish_reason": None,
                         }],
                     }
-                    if _proj_task_closed_this_req:
+                    if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req):
                         pretty_log("One Task / Turn",
                                    "stopped after a task closed; dropped the next-task call the "
                                    "model wrote in its reply — awaiting the user's go-ahead",
@@ -35605,7 +35670,7 @@ class GhostAgent:
                         _ff_retry_text = _no_answer_fallback_reply(
                             stream_tools_snapshot, ask=last_user_content,
                             stopped_by=str(ff_breaker_reason or ""),   # §4OA
-                            task_closed=bool(_proj_task_closed_this_req))
+                            task_closed=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
             except Exception as _ff_exc:  # noqa: BLE001 — the retry must never cost the stream
                 logger.warning("streamed forced-final retry skipped: %s", _ff_exc)
                 _ff_retry_text = ""
@@ -35616,7 +35681,7 @@ class GhostAgent:
                         _ff_retry_text = _no_answer_fallback_reply(
                             stream_tools_snapshot, ask=last_user_content,
                             stopped_by=str(ff_breaker_reason or ""),
-                            task_closed=bool(_proj_task_closed_this_req))
+                            task_closed=bool(_CLOSE_ENDS_TURN and _proj_task_closed_this_req))
                     except Exception:  # noqa: BLE001
                         _ff_retry_text = ""
             if _ff_retry_text and not requester_is_member():
@@ -35904,7 +35969,7 @@ class GhostAgent:
                         n_real_tools=_tr_count(stream_tools_snapshot))
                     # §4QA: the record says what the stream said after a
                     # one-task stop (treat_reply appends the generic note)
-                    if _proj_task_closed_this_req and isinstance(_treated_content, str):
+                    if (_CLOSE_ENDS_TURN and _proj_task_closed_this_req) and isinstance(_treated_content, str):
                         from .reply_smoothing import UNPARSED_TOOL_CALL_NOTE as _tr_tcn
                         # once: a task-closed fallback after the cut already says it (r9)
                         _treated_content = _treated_content.replace(

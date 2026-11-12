@@ -235,9 +235,9 @@ def test_the_turn_loop_hands_the_guards_reason_to_the_fallback():
              and getattr(c.func, "id", "") == "_no_answer_fallback_reply"]
     assert calls and any(any(k.arg == "stopped_by" and "_breaker_reason" in ast.unparse(k.value)
                              for k in c.keywords) for c in calls)
+    # (§4UI: the edit-churn stop that recorded "edited again and again" is gone)
     sets = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
-            and any("_breaker_reason" in ast.unparse(t) for t in n.targets)
-            and isinstance(n.value, (ast.JoinedStr, ast.Constant)) and "edited" in ast.unparse(n.value)]
+            and any("_breaker_reason" in ast.unparse(t) for t in n.targets)]
     assert sets
 
 

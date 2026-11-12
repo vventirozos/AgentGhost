@@ -83,9 +83,10 @@
   <div class="scroll"><table>
     <thead><tr><th>You say</th><th>What happens</th></tr></thead>
     <tbody>
-      <tr><td>“Start a project: a Flask app for Bruno's bakery orders, with login, SQLite and pytest. Plan it first.”</td><td>A project is created, the goal is split into ordered tasks, and the plan is shown. The agent then <em>stops and waits</em> for your go-ahead.</td></tr>
-      <tr><td>“Proceed with the next task.”</td><td>Exactly one task is done in a full turn: files written, tests run, and the task is closed only if its promised file exists and is not empty.</td></tr>
-      <tr><td>“Do the next three.” / “Finish the project.”</td><td>A bounded loop runs one checkpointed task at a time and stops at the first task that is done, fails, needs you, or hits the budget. Then it reports.</td></tr>
+      <tr><td>“Start a project: a Flask app for Bruno's bakery orders, with login, SQLite and pytest. Plan it first.”</td><td>A project is created, the goal is split into ordered tasks, and the plan is shown. You asked to plan first, so the agent then <em>waits</em> for your go-ahead.</td></tr>
+      <tr><td>“Create a project for a webOS and build it, with a couple of apps.”</td><td>The same message asks for the work, so it is the go-ahead: the plan is shown in a line or two and the first task starts in the same turn.</td></tr>
+      <tr><td>“Proceed with the next task.”</td><td>The next task is done in a full turn: files written, tests run, and the task is closed only if its promised file exists and is not empty. Then the agent reports and waits.</td></tr>
+      <tr><td>“Do the next three.” / “Finish the project.”</td><td>The agent does them in the same turn one after another, or, on a big project, hands them to a bounded loop that runs one checkpointed task at a time and stops at the first task that fails, needs you, or hits the budget. Then it reports.</td></tr>
       <tr><td>“Research payment providers for the bakery project.”</td><td>Searches run over Tor, and a Markdown brief with sources is saved in the project's <code>research/</code> folder. Later turns see it in the briefing.</td></tr>
       <tr><td>“Turn on autopilot for the bakery project.”</td><td>While you are idle, the agent advances that project one task per idle window. Waiting tasks stay waiting.</td></tr>
       <tr><td>“Where are we on the bakery project?”</td><td>A status read from the store: done, running, waiting (and on what), failed.</td></tr>
@@ -98,15 +99,15 @@
   <h2 id="how">How it works</h2>
   <ol class="flow">
     <li><h4>Plan</h4><p>The goal is decomposed into tasks. Each task can depend on others, and a task never starts until everything it depends on is DONE. A task also says what kind it is (coding, research, or one that needs you).</p></li>
-    <li><h4>Advance, one task at a time</h4><p>By default the agent does one task per go-ahead from you. "Do all" becomes a loop of small, separate ticks, so the context window stays small however long the project is.</p></li>
+    <li><h4>Advance at your pace</h4><p>One rule decides the pace: a go-ahead covers what you asked for. "Proceed" is the next task; "do the next three" or "finish it" is that many. A message that asks for a project <em>and</em> the work is itself the go-ahead. It is advice the model follows, not a stop the code forces: after a task closes, the agent may go on when you asked for more. On a big project it hands long runs to a loop of small, separate ticks, so the context window stays small.</p></li>
     <li><h4>Close only on evidence</h4><p>A task is DONE only when the file it promised exists and is not hollow, its dependencies are closed, and its result passes the task's check. Otherwise it stays open and the reply says why.</p></li>
-    <li><h4>Wait honestly</h4><p>A task that cannot go on is shown as <em>WAITING</em> with a reason: waiting on you (a decision, an approval), on another task, or held until you run it yourself. The five states you see are PENDING, RUNNING, DONE, FAILED and WAITING.</p></li>
+    <li><h4>Wait honestly</h4><p>A task that cannot go on is shown as <em>WAITING</em> with a reason: waiting on you (something only you have, such as a file or a login), on another task, or held until you run it yourself. The five states you see are PENDING, RUNNING, DONE, FAILED and WAITING.</p></li>
     <li><h4>Autopilot while idle</h4><p>When you have been away for a while, the idle scheduler picks one active project that has autopilot on and runs a single tick, with a cool-down between ticks. If every open task is stuck behind a failed one, autopilot pauses and tells you once which task to retry.</p></li>
   </ol>
   <h3>The safety check</h3>
   <ul>
     <li><strong>Budgets.</strong> A project can cap its steps, its runtime and its tool calls. A batch stops when a cap is reached.</li>
-    <li><strong>Human gates.</strong> A task marked as needing human approval (deleting real data, sending something to a customer) can never be closed by the agent. It goes to WAITING on you.</li>
+    <li><strong>No confirmations (§4UK, 2026-11-12).</strong> Nothing waits for your yes: release, unrelease and delete run when you ask, a <code>HUMAN_GATE</code> line on a task is a note (never graded, never a park), words like "approve", "publish" or "send" in a task no longer hold it, and a stated exception to a project constraint goes through in your own turn and is written to the ledger. Who may act still matters: a background, scheduled or test turn cannot delete or release your project, and a request that read a web page cannot either.</li>
     <li><strong>Holds.</strong> Some tasks are never run unattended, for example a model experiment. Autopilot leaves them for your own turn.</li>
     <li><strong>Contradictions.</strong> If a new result plainly contradicts an earlier one, the project records it.</li>
     <li><strong>Opt-in only.</strong> Only your own message turns autopilot on. A scheduled task, a background job or a test cannot.</li>

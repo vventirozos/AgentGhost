@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.26';
+import * as matrixGraphFace from './matrix_graph.js?v=19.28';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -4997,10 +4997,7 @@ function updateWorkspaceBtnState() {
 if (workspaceLoadBtn && workspaceUploadInput) {
     workspaceLoadBtn.addEventListener('click', () => {
         if (isProcessingRequest) return;
-        if (chatHistory.length > 0 && !confirm(
-            'Load a workspace into a NEW session? The current chat stays in the sessions list.')) {
-            return;
-        }
+        // §4UK (operator 11-12): no confirmation dialog — loading opens a NEW session; this chat stays listed
         workspaceUploadInput.click();
     });
 }
@@ -7537,7 +7534,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.12').catch(e => {
+import('./workspace.js?v=9.14').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

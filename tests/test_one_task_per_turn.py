@@ -1,4 +1,8 @@
-"""One-task-per-turn enforcement for the interactive agent loop.
+"""One-task-per-turn for the interactive agent loop.
+
+§4UI (2026-11-12): ADVICE now, not enforcement — a close sets the flag the
+briefing reads (`suppress_next_task`); the turn is no longer forced to end.
+The close detector reads the tool's own `closed` list.
 
 A single user go-ahead ("start task 1", "proceed", "next") must advance EXACTLY
 one project task and then stop — not grind the whole tree in one request
@@ -33,15 +37,25 @@ from ghost_agent.core.project_advancer import classify_advance_intent
 def test_detects_done_close_from_readback():
     out = json.dumps({"updated": [{"id": "abc", "status": "DONE",
                                    "result_summary": "wrote parser.py"}],
-                      "count": 1})
+                      "count": 1, "closed": ["abc"]})
     assert _manage_projects_closed_a_task("manage_projects", out) is True
 
 
 def test_multi_id_update_with_one_done_trips():
     out = json.dumps({"updated": [
         {"id": "a", "status": "IN_PROGRESS"},
-        {"id": "b", "status": "DONE"}], "count": 2})
+        {"id": "b", "status": "DONE"}], "count": 2, "closed": ["b"]})
     assert _manage_projects_closed_a_task("manage_projects", out) is True
+
+
+@pytest.mark.parametrize("out", [
+    # a description-only update of an already-DONE task, and a re-close:
+    # the read-back says DONE but nothing closed in THIS call (§4UI)
+    {"updated": [{"id": "a", "status": "DONE"}], "count": 1},
+    {"updated": [{"id": "a", "status": "DONE"}], "count": 1, "closed": []},
+])
+def test_a_done_readback_without_a_close_does_not_trip(out):
+    assert _manage_projects_closed_a_task("manage_projects", json.dumps(out)) is False
 
 
 def test_held_gated_update_does_not_trip():

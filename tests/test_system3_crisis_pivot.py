@@ -171,7 +171,9 @@ async def test_failures_that_continue_still_reach_the_hard_limit():
 
     async def mock_llm(payload, **kwargs):
         seen.append([str(m.get("content", "")) for m in payload.get("messages", [])])
-        return exec_call if len(seen) <= 8 else _llm_ok("Giving up.")
+        # §4UI: the FIRST program failure is free (a changed output is a
+        # debugging step); the identical ones after it strike — one call more
+        return exec_call if len(seen) <= 9 else _llm_ok("Giving up.")
 
     agent = _make_agent()
     agent.context.llm_client.chat_completion = mock_llm

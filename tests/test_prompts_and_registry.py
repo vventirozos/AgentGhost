@@ -1,8 +1,5 @@
 import pytest
-from src.ghost_agent.core.prompts import (
-    SYSTEM_PROMPT,
-    SPECIALIST_SYSTEM_PROMPT,
-)
+from src.ghost_agent.core.prompts import SYSTEM_PROMPT
 from src.ghost_agent.tools.registry import TOOL_DEFINITIONS
 
 def test_system_prompt_json_tools_constraint():
@@ -18,18 +15,12 @@ def test_system_prompt_json_tools_constraint():
     # Guarantee we removed the previous hallucination-causing suggestion
     assert "import knowledge_base" not in SYSTEM_PROMPT
     
-def test_code_system_prompt_positive_isolation():
-    """Verify SPECIALIST_SYSTEM_PROMPT frames tool access via isolation instead of negative import suggestions."""
-    assert "NATIVE TOOLS FIRST" in SPECIALIST_SYSTEM_PROMPT
-    assert "Do NOT write Python scripts for tasks that can be handled natively" in SPECIALIST_SYSTEM_PROMPT
-    assert "SANDBOX ISOLATION:" in SPECIALIST_SYSTEM_PROMPT
-    assert "You cannot trigger agent tools from within Python" in SPECIALIST_SYSTEM_PROMPT
-    
-def test_code_system_prompt_stateful():
-    """Verify SPECIALIST_SYSTEM_PROMPT explicitly advertises stateful execution."""
-    assert "STATEFUL EXECUTION:" in SPECIALIST_SYSTEM_PROMPT
-    assert "If you are doing Exploratory Data Analysis" in SPECIALIST_SYSTEM_PROMPT
-    assert "persistent background Jupyter Kernel" in SPECIALIST_SYSTEM_PROMPT
+def test_execute_states_the_sandbox_isolation_and_stateful_runs():
+    """§4UI: what the coding persona said about isolation and stateful runs
+    is carried by the `execute` tool definition the model is always sent."""
+    ex = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")["function"]
+    assert "Native tools CANNOT be imported in Python" in ex["description"]
+    assert "Jupyter Notebook cell" in ex["parameters"]["properties"]["stateful"]["description"]
     
 def test_tool_registry_negative_constraints():
     """Verify that critical native tools contain explicit negative execution constraints."""

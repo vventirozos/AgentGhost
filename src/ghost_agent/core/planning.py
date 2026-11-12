@@ -57,18 +57,6 @@ def _coerce_str_list(val: Any) -> List[str]:
     return [s] if s else []
 
 
-def _human_gate_reason(postconditions: Any) -> Optional[str]:
-    """First HUMAN_GATE reason on a postcondition list, or None.
-
-    Delegates to ``project_safety.enforce_human_gate`` (the documented
-    contract) reshaped to a bare list so TaskTree stays store-free.
-    """
-    from .project_safety import enforce_human_gate
-    return enforce_human_gate(
-        {"postconditions": _coerce_str_list(postconditions)}
-    )
-
-
 #: §4HZ — how alike two descriptions must be for a reused task id to count
 #: as the SAME task. Token-set Jaccard: a planner rewording ("check GRIB
 #: tooling" → "check GRIB tooling is installed") stays the same task and
@@ -205,27 +193,8 @@ class TaskTree:
             if actual_tool:
                 node.actual_tool_used = actual_tool
             if status == TaskStatus.DONE:
-                # HUMAN_GATE contract (project_safety.enforce_human_gate):
-                # a gated task is closed by a human, never by result-text
-                # similarity. Park the first close attempt at NEEDS_USER
-                # instead of textually grading the gate to FAILED (which
-                # cascaded a spurious failure up the tree and made an
-                # approved gated task almost impossible to close). A close
-                # on a task already parked NEEDS_USER (the user has been
-                # asked and the close path is now being taken) or already
-                # DONE, or an explicit human_approved=True, is the
-                # approval and proceeds to the normal postcondition gate.
-                gate_reason = _human_gate_reason(node.postconditions)
-                # §4SU Phase 0 (audit A): approval is EXPLICIT only — a close
-                # of a task already parked NEEDS_USER is no longer approval
-                # (a second identical close in the same turn passed the gate)
-                if (gate_reason is not None and not human_approved
-                        and prior_status != TaskStatus.DONE):
-                    node.status = TaskStatus.NEEDS_USER
-                    node.set_wait("owner", "human_gate", gate_reason)
-                    if not node.result_summary:
-                        node.result_summary = f"human gate: {gate_reason}"
-                    return
+                # §4UK: a HUMAN_GATE postcondition no longer parks the close (no approvals); it is
+                # still never graded as text (below).
                 # Postcondition gate: if the task declared postconditions,
                 # evaluate them against the result summary. Any unsatisfied
                 # postcondition flips the task back to FAILED so the
@@ -294,12 +263,11 @@ class TaskTree:
         # outside load_from_json can still carry a bare-string
         # postconditions field, and iterating it raw grades per-char.
         for pc_str in _coerce_str_list(node.postconditions):
-            if _human_gate_reason([pc_str]) is not None:
-                # Never textually scored: human gates are enforced as a
-                # status transition (→ NEEDS_USER) in update_status, per
-                # project_safety.enforce_human_gate. Grading them here
-                # either failed a gated task (result never echoes the
-                # gate) or let echoed text satisfy a human approval.
+            from .project_safety import is_human_gate_text as _ihg
+            if _ihg(pc_str):
+                # Never textually scored (§4UK: a HUMAN_GATE line is a note,
+                # not a park): grading it would fail every task that carries
+                # one — a result never echoes the gate.
                 continue
             if checker is not None:
                 try:
@@ -424,31 +392,9 @@ class TaskTree:
             elif n.wait_on or n.wait_code or n.wait_why:
                 n.set_wait("", "", "")
 
-    def _park_gated(self, parent) -> bool:
-        """§4SU r1 M1: a roll-up never closes a HUMAN_GATE parent — it parks
-        NEEDS_USER (the owner approves it like any gated task); the project
-        then cannot roll DONE (and sweep) past the owner."""
-        reason = _human_gate_reason(parent.postconditions)
-        if reason is None:
-            return False
-        # (§4SU Phase 3 r1: a PAUSED phase is now NEEDS_USER too — any wait
-        # that is not this gate is re-parked AS the gate, so it is logged)
-        if parent.status != TaskStatus.NEEDS_USER or parent.wait_code != "human_gate":
-            parent.status = TaskStatus.NEEDS_USER
-            # r2 minor: the gate's own text (a BEST parent copied the child's
-            # summary first, which then read as close evidence)
-            parent.result_summary = f"human gate: {reason}"
-            parent.set_wait("owner", "human_gate", reason)
-            # r2 M1: recorded so ProjectPlan logs the park (the owner's later
-            # yes needs it; the digest reports it)
-            if not hasattr(self, "rollup_parked"):
-                self.rollup_parked = []
-            self.rollup_parked.append(parent.id)
-        return True
-
     def _rollup_held(self, parent, result_text: str = "") -> bool:
         """§4SU Phase 1: the roll-up closes a parent through the same close
-        check as every path. A HUMAN_GATE parks it (Phase 0); a refusal of
+        check as every path. A refusal of
         the check ProjectPlan installs (``close_checker`` — the declared
         file, a model run with no transcript (§4ST: the roll-up bypass), the
         postconditions, judged against what the children reported) makes it
@@ -457,8 +403,6 @@ class TaskTree:
             # r1 M2: a parent already DONE (the owner's click over a gate, a
             # waiver, an approval) is never re-judged by a later child close
             return False
-        if self._park_gated(parent):
-            return True
         chk = getattr(self, "close_checker", None)
         if chk is None:
             return False
@@ -512,8 +456,7 @@ class TaskTree:
         (paused, asked, review…) — not a park the system makes and re-judges
         (a roll-up refusal, a human-gate park, a parent that carries a gate)."""
         return (parent.status == TaskStatus.NEEDS_USER and parent.wait_code != "human_gate"
-                and not parent.wait_code.startswith("rollup")
-                and _human_gate_reason(parent.postconditions) is None)
+                and not parent.wait_code.startswith("rollup"))
 
     def _check_parent_completion(self, parent_id: str, visited: set = None):
         if visited is None: visited = set()
@@ -1218,22 +1161,14 @@ class ProjectPlan:
                     depends_on=node.depends_on,
                     wait_on=node.wait_on, wait_code=node.wait_code, wait_why=node.wait_why,
                 )
-        # §4SU r2 M1: a gated parent the roll-up parked is put to the owner
-        # like any gated task — the event the owner's later yes is checked
-        # against, and the digest's record of it
+        # §4SU Phase 1: a parent the close check refused at roll-up is recorded (the digest reports it)
         for _pid_parked in list(getattr(self.tree, "rollup_parked", []) or []):
             try:
                 from ..utils.logging import request_id_context
                 _n = self.tree.nodes.get(_pid_parked)
-                _gr = _human_gate_reason(_n.postconditions) if _n else None
-                if _gr is not None:
-                    self.store.log_event(self.project_id, _pid_parked, "human_gate_triggered",
-                                         {"reason": _gr, "via": "roll-up", "req": str(request_id_context.get() or "")})
-                else:
-                    # §4SU Phase 1: the close check refused the roll-up
-                    self.store.log_event(self.project_id, _pid_parked, "rollup_refused",
-                                         {"reason": str(_n.result_summary or "")[:300] if _n else "",
-                                          "req": str(request_id_context.get() or "")})
+                self.store.log_event(self.project_id, _pid_parked, "rollup_refused",
+                                     {"reason": str(_n.result_summary or "")[:300] if _n else "",
+                                      "req": str(request_id_context.get() or "")})
             except Exception:  # noqa: BLE001
                 import logging as _lg
                 _lg.getLogger("GhostAgent").warning("roll-up park not recorded", exc_info=True)

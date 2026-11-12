@@ -2,7 +2,7 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock
 from ghost_agent.core.agent import GhostAgent, GhostContext
-from ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT, SYSTEM_PROMPT
+from ghost_agent.core.prompts import SYSTEM_PROMPT
 
 @pytest.fixture
 def mock_context():
@@ -27,7 +27,7 @@ def mock_context():
     return context
 
 @pytest.mark.asyncio
-async def test_specialist_persona_activation_dba(mock_context):
+async def test_no_persona_for_a_dba_request(mock_context):
     """Test that DBA/Specialist persona is activated when Postgres keywords are present."""
     agent = GhostAgent(mock_context)
     agent.available_tools = {}
@@ -52,13 +52,13 @@ async def test_specialist_persona_activation_dba(mock_context):
     assert messages[0]["role"] == "system"
     assert "You are Ghost" in messages[0]["content"]
     
-    # Specialized persona should be in the LAST message (appended)
-    last_msg = messages[-1]
-    assert "Ghost Advanced Engineering and Database Subsystem" in last_msg["content"]
-    assert "ENGINEERING & DBA STANDARDS" in last_msg["content"]
+    # §4UI: no coding persona is injected any more — anywhere
+    blob = "\n".join(str(m.get("content")) for m in messages)
+    assert "Ghost Advanced Engineering and Database Subsystem" not in blob
+    assert "ENGINEERING & DBA STANDARDS" not in blob
 
 @pytest.mark.asyncio
-async def test_specialist_persona_activation_python(mock_context):
+async def test_no_persona_for_a_python_request_but_the_sandbox_listing(mock_context):
     """Test that Python/Specialist persona is activated for coding requests."""
     agent = GhostAgent(mock_context)
     agent.available_tools = {}
@@ -76,9 +76,11 @@ async def test_specialist_persona_activation_python(mock_context):
     payload = call_args[0][0]
     messages = payload["messages"]
     
-    # Specialized persona should be in the LAST message (appended)
-    last_msg = messages[-1]
-    assert "Ghost Advanced Engineering and Database Subsystem" in last_msg["content"]
+    # §4UI: no coding persona — but a coding request still gets the
+    # sandbox listing in the state block
+    blob = "\n".join(str(m.get("content")) for m in messages)
+    assert "Ghost Advanced Engineering and Database Subsystem" not in blob
+    assert "CURRENT SANDBOX STATE" in blob
 
 @pytest.mark.asyncio
 async def test_default_persona_activation(mock_context):

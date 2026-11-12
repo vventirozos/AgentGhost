@@ -5199,6 +5199,18 @@ def _would_be_snippet(new_content: str, regression: str,
         for i in range(lo, hi + 1))
 
 
+def _current_snippet(prev_content: str, new_content: str, context: int = 2, span: int = 8) -> str:
+    """§4UI: numbered lines of the CURRENT file (unchanged on disk) where the
+    rejected edit began to differ — so the retry needs no re-read."""
+    a = (prev_content or "").split("\n")
+    b = (new_content or "").split("\n")
+    i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+    if i >= len(a):
+        return ""
+    lo, hi = max(0, i - context), min(len(a), i + span)
+    return "\n".join(f"{n + 1:6d} | {a[n][:160]}" for n in range(lo, hi))
+
+
 async def _write_replace_guarded(path: Path, prev_content: str, new_content: str,
                                  filename: str, success_msg: str, *,
                                  marker_guard: bool = True,
@@ -5258,15 +5270,18 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
         # that corrupted the file. Seeing its own broken output makes the
         # mistake self-evident.
         _snippet = _would_be_snippet(new_content, regression)
+        _now = _current_snippet(prev_content, new_content)
         return (
             ToolOutcome.rejected(f"REJECTED: that replace would introduce a syntax error and was "
             f"NOT applied — '{filename}' is unchanged on disk: {regression}."
             + (f"\nThe REJECTED result around that line would have read:\n"
                f"{_snippet}\n" if _snippet else " ")
-            + f"Your replacement's indentation or structure is off. "
-            f"Re-read those lines, then make the change with operation='edit' "
-            f"(old_string = the exact current lines, new_string = the corrected "
-            f"lines, same indentation). Do NOT rewrite the whole file.", reason_code="syntax_regression_rolled_back")
+            + (f"The file NOW reads, where your edit began (no re-read needed — "
+               f"your old_string still matches):\n{_now}\n" if _now else "")
+            + f"Fix the indentation or structure and send the edit again with operation='edit'. "
+            f"A change that only parses once several pieces are in (a block opened here, "
+            f"closed further down) goes in ONE edit spanning that region. "
+            f"Do NOT rewrite the whole file.", reason_code="syntax_regression_rolled_back")
         )
     # errors="surrogateescape": new_content is the replace result, which splices
     # the LLM's (clean) replacement into the untouched file body — that body may

@@ -66,7 +66,7 @@
       <tr><td><code>patroni-3</code></td><td>pg1, pg2, pg3 (Patroni + etcd)</td><td>none</td><td>failover, replication, split-brain experiments</td></tr>
       <tr><td><code>mysql-single</code></td><td>db1 (MySQL 8.0)</td><td>Tor</td><td>MySQL work</td></tr>
       <tr><td><code>python-app</code></td><td>app (Flask + gunicorn, port 8080)</td><td>Tor</td><td>a web app; the usual start for a kept app</td></tr>
-      <tr><td><code>web</code></td><td>web1 (nginx, port 80)</td><td>Tor</td><td>static sites</td></tr>
+      <tr><td><code>web</code></td><td>web1 (nginx, port 80)</td><td>Tor</td><td>static sites (disposable; a kept site uses <code>python-app</code>)</td></tr>
       <tr><td><code>blank-dev</code></td><td>dev (Debian)</td><td>Tor</td><td>anything else</td></tr>
     </tbody>
   </table></div>

@@ -20,7 +20,7 @@ import re
 
 import pytest
 
-from ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT, SYSTEM_PROMPT
+from ghost_agent.core.prompts import SYSTEM_PROMPT
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -56,14 +56,6 @@ def test_prohibition_is_kept_beside_the_instruction():
 def test_the_rule_reads_the_tool_output_as_the_trigger():
     rule = _rule(SYSTEM_PROMPT)
     assert "Saved plot ->" in rule and "file_system write" in rule
-
-
-def test_specialist_prompt_keeps_its_own_affirmative_line():
-    """Where the instruction lived before: the SPECIALIST prompt (coding
-    subsystem turns) — which a main conversational turn never sees. It must
-    keep saying it; the main prompt now says it too."""
-    assert "![Image](/api/download/" in SPECIALIST_SYSTEM_PROMPT
-    assert "PLOTTING & IMAGES" in SPECIALIST_SYSTEM_PROMPT
 
 
 def test_compiled_variant_is_gone_so_the_rule_lives_in_the_main_prompt():

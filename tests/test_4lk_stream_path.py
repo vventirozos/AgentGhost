@@ -304,14 +304,9 @@ def test_reset_all_through_the_tool_clears_the_agents_queue(tmp_path):
     vec.library_file = None
     kb = lambda **kw: asyncio.run(M.tool_knowledge_base(memory_system=vec, graph_memory=MagicMock(),
                                                         owner_agent=owner, **kw))
-    t = request_id_context.set("req-preview")
+    t = request_id_context.set("req-the-user")              # §4UK: one call wipes
     try:
-        tok = str(kb(action="reset_all")).split("confirm='")[1].split("'")[0]
-    finally:
-        request_id_context.reset(t)
-    t = request_id_context.set("req-next")
-    try:
-        kb(action="reset_all", confirm=tok)
+        kb(action="reset_all")
     finally:
         request_id_context.reset(t)
     assert owner.clear_pending_corrections.called

@@ -1,4 +1,7 @@
-"""§4IC — a breaker's second trip forces a report.
+"""§4IC — a breaker's second trip forced a report. §4UI (2026-11-12, operator:
+"don't restrict the model too much while it's coding") REMOVED the report
+tiers of the edit-churn and futility breakers: the steers are advice. These
+pins now say the second tier stays gone.
 
 Request 3a2afac2: `edit churn` steered twice and the futility breaker once
 ("probe.py rewritten 6× and rerun 2× — steering strategy shift"); the
@@ -23,13 +26,11 @@ from ghost_agent.core.agent import (EDIT_CHURN_REPORT_AFTER_STEERS, FUTILITY_REP
 
 # --- edit churn ---------------------------------------------------------------
 
-def test_live_sequence_steers_twice_then_reports_once():
+def test_live_sequence_steers_twice_and_never_reports():
     churn = {"counts": {}, "steers": 0}
-    seq = [edit_churn_decision(churn, "probe.py") for _ in range(4 * _EDIT_CHURN_STEER_AFTER)]
+    seq = [edit_churn_decision(churn, "probe.py") for _ in range(6 * _EDIT_CHURN_STEER_AFTER)]
     assert seq.count("steer") == _EDIT_CHURN_MAX_STEERS
-    assert seq.count("report") == 1
-    assert seq.index("report") > max(i for i, v in enumerate(seq) if v == "steer")
-    assert churn["reported"] is True
+    assert "report" not in seq
 
 
 def test_steer_resets_the_count_and_report_does_not_fire_early():
@@ -56,14 +57,12 @@ def test_report_tier_sits_after_the_steers():
 
 # --- futility -----------------------------------------------------------------
 
-def test_futility_steer_then_report_then_silence():
+def test_futility_steers_once_and_never_reports():
     si = {"probe.py": {"writes": 3, "runs": 2}}
     assert futility_tier(si, False, False)[0] == "steer"
-    assert futility_tier(si, True, False)[0] == ""            # not yet the report tier
-    si["probe.py"] = {"writes": FUTILITY_REPORT_WRITES, "runs": FUTILITY_REPORT_RUNS}
-    kind, bn, rec = futility_tier(si, True, False)
-    assert (kind, bn) == ("report", "probe.py") and rec["writes"] == FUTILITY_REPORT_WRITES
-    assert futility_tier(si, True, True)[0] == ""              # once
+    si["probe.py"] = {"writes": FUTILITY_REPORT_WRITES * 3, "runs": FUTILITY_REPORT_RUNS * 3}
+    assert futility_tier(si, True, False)[0] == ""
+    assert futility_tier(si, True, True)[0] == ""
 
 
 def test_report_tier_never_precedes_the_steer():
@@ -95,21 +94,12 @@ def _alert_kinds(node):
             and c.args and isinstance(c.args[0], ast.Constant)]
 
 
-def test_sites_route_through_the_decisions_and_force_a_final():
+def test_sites_route_through_the_decisions_and_force_no_report():
     fn = _dispatch()
     calls = {getattr(c.func, "id", ""): c for c in ast.walk(fn) if isinstance(c, ast.Call)}
     assert "edit_churn_decision" in calls and "futility_tier" in calls
     kinds = _alert_kinds(fn)
-    assert kinds.count("edit churn") == 1 and kinds.count("futility") == 1
-    # each report branch sets force_final_response = True
-    for kind in ("edit churn", "futility"):
-        owners = [n for n in ast.walk(fn) if isinstance(n, ast.If)
-                  and kind in _alert_kinds(ast.Module(body=n.body, type_ignores=[]))]
-        assert owners, kind
-        inner = min(owners, key=lambda n: len(ast.unparse(n)))
-        assigned = [t.id for s in ast.walk(ast.Module(body=inner.body, type_ignores=[]))
-                    if isinstance(s, ast.Assign) for t in s.targets if isinstance(t, ast.Name)]
-        assert "force_final_response" in assigned, kind
+    assert "edit churn" not in kinds and "futility" not in kinds
 
 
 @pytest.mark.parametrize("target", ["results/a.md", "notes.txt", " report.MD ", "dir/x.Txt"])
@@ -129,8 +119,8 @@ def test_other_targets_still_count(target):
 
 def test_prose_edits_do_not_reset_a_code_files_count():
     churn = {"counts": {}, "steers": 0}
-    edit_churn_decision(churn, "app.py")
-    edit_churn_decision(churn, "notes.md")
-    edit_churn_decision(churn, "app.py")
+    for _ in range(_EDIT_CHURN_STEER_AFTER - 1):
+        edit_churn_decision(churn, "app.py")
+        edit_churn_decision(churn, "notes.md")
     assert "notes.md" not in churn["counts"]
     assert edit_churn_decision(churn, "app.py") == "steer"

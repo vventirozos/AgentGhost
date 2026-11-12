@@ -38,6 +38,14 @@ def store(tmp_path):
     return ProjectStore(tmp_path / "mem", sandbox_root=tmp_path / "sb")
 
 
+@pytest.fixture
+def close_ends_turn(monkeypatch):
+    """§4UI: the one-task-per-turn stop is OFF (agent._CLOSE_ENDS_TURN); these
+    pin its wordings, dormant behind the switch, with the switch ON."""
+    from ghost_agent.core import agent as _A
+    monkeypatch.setattr(_A, "_CLOSE_ENDS_TURN", True)
+
+
 def _ctx(store, tmp_path, llm=None):
     return SimpleNamespace(
         project_store=store, scratchpad=Scratchpad(persist_path=tmp_path / "sp.db"),
@@ -506,6 +514,7 @@ async def _drive_one_task_final(task_closed):
     return text, "".join(out), len(pulled), len(body), durable
 
 
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_a_designed_stop_says_how_to_continue_and_stops_generating():
     text, raw, pulled, total, durable = await _drive_one_task_final(True)
     assert "say *proceed*" in durable and "NOT executed" not in durable   # the record says what the stream said
@@ -754,13 +763,25 @@ async def test_autoadvance_pauses_at_an_experiment_and_says_how_to_run_it(tmp_pa
     assert "probe_model" in msg and t1 in msg and "never write a model response yourself" in msg
 
 
+def _converge_after_close(monkeypatch):
+    """§4UI: a closed task no longer ends the turn. These tests pin how the
+    reply READS when a final is forced right after a close (a deadline or a
+    breaker still does that), so they install that converge rule through
+    the loop's hook."""
+    import ghost_agent.core.agent as _A
+    monkeypatch.setattr(_A, "_latch_forces_final",
+                        lambda closed, repair_reentry_active: bool(closed) and not bool(repair_reentry_active))
+
+
 @pytest.mark.parametrize("call_text", [
     # parsed → dropped by the final-generation guard
     "<tool_call>\n<function=manage_projects>\n<parameter=action>\ntask_next\n</parameter>\n</function>\n</tool_call>",
     # unclosed → unparseable → scrubbed at finalize (FinalizeState.task_closed_this_req)
     "<tool_call>\n<function=file_system>\n<parameter=content>\n# Next task notes, cut off mid-write",
 ])
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_the_one_task_stop_reaches_the_non_stream_reply_through_handle_chat(tmp_path, monkeypatch, call_text):
+    _converge_after_close(monkeypatch)
     # FinalizeState must carry the gate: live the reply ended "[A tool call … NOT executed]"
     from unittest.mock import AsyncMock
     from tests.helpers import make_context, FakeBgTasks
@@ -1047,7 +1068,9 @@ def test_existence_only_is_one_plain_line(cmd, exist_only):
     assert bool(_EXISTENCE_ONLY_VERIFY_RE.match(cmd)) is exist_only
 
 
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_a_dropped_write_after_a_closed_task_keeps_its_note(tmp_path, monkeypatch):
+    _converge_after_close(monkeypatch)
     # MAJOR-4: "Saved …" + a dropped file_system write read "✅ Task complete"
     from unittest.mock import AsyncMock
     from tests.helpers import make_context, FakeBgTasks
@@ -1247,6 +1270,7 @@ def test_the_turn_loop_tells_finalize_whether_a_task_closed():
 # ------------------------------------------------------- r2 fresh-eye fixes
 
 async def _closed_then(tmp_path, monkeypatch, first_text, later):
+    _converge_after_close(monkeypatch)
     from unittest.mock import AsyncMock
     from tests.helpers import make_context, FakeBgTasks
     from tests.test_4ji_request_echo_narration import _resp, _tc
@@ -1277,6 +1301,7 @@ async def _closed_then(tmp_path, monkeypatch, first_text, later):
     return (out[0] if isinstance(out, tuple) else str(out)), ctx.llm_client.chat_completion.await_count
 
 
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_a_bare_next_task_call_after_a_close_is_the_designed_stop(tmp_path, monkeypatch):
     # r2 MAJOR-2: empty text + a dropped task_next call → retry → "ran out of budget"
     first = "The notes are collected: 12 items saved to notes.md, grouped by topic."
@@ -1288,6 +1313,7 @@ async def test_a_bare_next_task_call_after_a_close_is_the_designed_stop(tmp_path
 
 
 @pytest.mark.parametrize("first", ["", "Let me close task 1."])
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_a_closed_task_never_reads_not_finished(tmp_path, monkeypatch, first):
     # r2 MAJOR-2 / r3 MAJOR-2: nothing (or only narration), then a bare next-task
     # call twice → one retry, then the digest said "the task is NOT finished"
@@ -1471,6 +1497,7 @@ async def test_autoadvance_does_not_overwrite_a_curated_research_file(store, tmp
     assert (ws / "research" / "lit.md").read_text().startswith("# Literature review")
 
 
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_the_stream_never_says_task_complete_twice(monkeypatch):
     # r4 m1: narration + a next-task call after a close, the retry misses too —
     # the fallback carries the note, and the scrub's note chunk repeated it
@@ -1943,7 +1970,9 @@ def test_every_loop_fallback_after_a_closed_task_skips_the_abort_wrapper():
     from ghost_agent.core import agent as A
     picks = []
     for n in ast.walk(ast.parse(Path(A.__file__).read_text())):
-        if isinstance(n, ast.IfExp) and getattr(n.test, "id", "") == "_proj_task_closed_this_req":
+        # §4UI: each reads the switch first (`_CLOSE_ENDS_TURN and <flag>`)
+        if isinstance(n, ast.IfExp) and isinstance(n.test, ast.BoolOp) and \
+                [getattr(v, "id", "") for v in n.test.values] == ["_CLOSE_ENDS_TURN", "_proj_task_closed_this_req"]:
             names = lambda e: {getattr(x, "id", "") for x in ast.walk(e)}
             picks.append(("_task_closed_loop_reply" in names(n.body),
                           bool(names(n.orelse) & {"cross_turn_loop_fallback", "forced_final_loop_fallback"})))
@@ -2108,6 +2137,7 @@ async def test_an_introspective_experiment_flagged_needs_user_is_held(tmp_path):
     assert store.get_task(t1)["status"] == "PENDING"
 
 
+@pytest.mark.usefixtures("close_ends_turn")
 async def test_the_record_keeps_the_retry_when_quote_markers_preceded_the_cut(monkeypatch):
     # r11 MAJOR: the record-time close matched the RAW prefix, but quote
     # markers are stripped from full_content after the loop — no match, and
@@ -2233,33 +2263,3 @@ async def test_the_project_list_hides_the_brief_hash_map(store, tmp_path):
     assert "research_brief_shas" not in out and "f" * 64 not in out
 
 
-async def test_a_needs_user_introspective_task_with_a_promised_file_is_built_at_the_override(tmp_path):
-    """§4QA S6b: the wording here KEEPS needs_user through the gate (a
-    "choose" task about decision-making), so the self-analysis override is
-    what routes it — and a promised theory/ file is built, never briefed."""
-    store = ProjectStore(tmp_path / "m11", sandbox_root=tmp_path / "s11")
-    pid = store.create_project("Agency", goal="Study agency")
-    desc = ("Illusion of Agency: Evaluate whether I truly choose responses or merely predict them. "
-            "Analyze decision-making → theory/agency.md")
-    from ghost_agent.core.project_advancer import settle_gate
-    assert settle_gate(desc, "needs_user", default="research") == "needs_user"   # the override's world
-    t1 = store.add_task(pid, desc)
-    calls = []
-
-    async def builder(*_a, **_k):
-        calls.append("build")
-        ws = Path(store.ensure_workspace(pid))
-        (ws / "theory").mkdir(exist_ok=True)
-        (ws / "theory" / "agency.md").write_text("# Agency\n\n" + "A real paragraph of analysis text. " * 20)
-        return CodingResult(ok=True, summary="wrote it", files=["theory/agency.md"], verified=True)
-
-    async def cls(_d):
-        return "needs_user"
-
-    async def runner(name, args):
-        calls.append(name)
-        return "OK"
-
-    await pa.advance_many(_ctx(store, tmp_path), pid, max_tasks=1, tool_runner=runner,
-                          llm_classifier=cls, coding_executor=builder, owner_requested=True)
-    assert calls == ["build"] and store.get_task(t1)["status"] == "DONE"

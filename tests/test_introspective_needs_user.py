@@ -53,11 +53,6 @@ def _ctx(analysis="## Agency\nSampling is not choosing."):
 
 
 class TestKeywordFalsePositive:
-    def test_the_bare_keyword_still_matches(self):
-        # classify_task itself is unchanged — it DOES see "choose". The guard
-        # lives where BOTH classifier paths converge (advance_once), because
-        # the LLM classifier mis-fires on this wording too.
-        assert classify_task(JAMMED) == "needs_user"
 
     def test_but_the_task_is_recognised_as_introspective(self):
         assert is_self_referential(JAMMED) is True
@@ -93,55 +88,12 @@ class TestAdvanceOnceOverride:
         assert res.classification != "needs_user"
         assert store.list_tasks(pid)[0]["status"] == "DONE"
 
-    def test_genuine_human_decision_still_needs_user(self, store):
-        # Not self-referential ⇒ the keyword is a TRUE positive. Don't
-        # over-correct: a real approval task must still route to the human.
-        ctx = _ctx()
-        pid, res = self._run(
-            store, ctx, "Choose the production database vendor and approve it")
-        assert res.classification == "needs_user"
-        assert store.list_tasks(pid)[0]["status"] == "NEEDS_USER"
-
-    def test_explicit_human_gate_still_wins(self, store):
-        """An introspective task carrying an EXPLICIT gate must still stop —
-        enforce_human_gate is separate and must not be defeated."""
-        ctx = _ctx()
-        pid = store.create_project("Meta", kind="GENERAL")
-        store.add_task(
-            pid,
-            "Analyze your own reasoning, then publish it "
-            "[HUMAN_GATE: operator sign-off]",
-            postconditions=["HUMAN_GATE: operator sign-off"],
-        )
-        ctx.project_store = store
-        res = asyncio.run(advance_once(ctx, pid,
-                                       tool_runner=AsyncMock(return_value="x")))
-        assert res.classification == "needs_user"
-        assert store.list_tasks(pid)[0]["status"] == "NEEDS_USER"
-
 
 class TestDeclaredKind:
     """§4SU Phase 2: a declared kind meets the gate-word floor — an
     introspective task must not jam on it (this replaces a source-order pin;
     the order itself is pinned by TestAdvanceOnceOverride)."""
 
-    def test_a_declared_introspective_task_does_not_jam(self, store):
-        # unattended it is HELD (§4SU Phase 2 r4: a whole gate word on an
-        # introspective declared task was a brief closed DONE unattended);
-        # the owner's run takes the hold back and runs it — never a park
-        ctx = _ctx()
-        pid = store.create_project("Meta", kind="GENERAL")
-        store.add_task(pid, JAMMED, kind="research")
-        ctx.project_store = store
-        run = lambda owner: asyncio.run(advance_once(
-            ctx, pid, tool_runner=AsyncMock(return_value="web results"),
-            llm_classifier=None, owner_requested=owner))
-        run(False)
-        t = store.list_tasks(pid)[0]
-        assert t["status"] == "NEEDS_USER" and t["result_summary"].endswith("not closed unattended")
-        res = run(True)
-        assert res.classification == "research"
-        assert store.list_tasks(pid)[0]["status"] != "NEEDS_USER"
 
     def test_a_declared_owner_task_still_waits(self, store):
         ctx = _ctx()

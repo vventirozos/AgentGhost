@@ -3,9 +3,9 @@
 Four concerns live here:
   1. Budget enforcement (runtime + tool-call caps on top of the
      step-count cap already implemented in ``project_advancer``).
-  2. Human-gate postconditions — postconditions prefixed with
-     ``HUMAN_GATE:`` force the task into ``NEEDS_USER`` instead of
-     ``DONE`` regardless of the advancer's own judgement.
+  2. Human-gate postconditions — since §4UK (no confirmations) a
+     ``HUMAN_GATE:`` line is a note: never a park, never graded as text
+     (``is_human_gate_text``).
   3. Contradiction detection — when a new artifact for a task disagrees
      with a DONE sibling's result, the advancer records a
      ``contradiction_detected`` project event (§4NN: the separate
@@ -111,20 +111,15 @@ def record_runtime(
 
 HUMAN_GATE_PREFIX = "HUMAN_GATE:"
 
+#: §4UK (operator 11-12: "i want all confirmations, everywhere to be removed. i don't wanna be asked for
+#: anything. that's why everything is sandboxed"): a HUMAN_GATE postcondition no longer parks a task for the
+#: owner's approval (`enforce_human_gate` is gone) — it is a note, never graded as text, and the task closes
+#: like any other.
 
-def enforce_human_gate(task: Dict[str, Any]) -> Optional[str]:
-    """Return the first HUMAN_GATE reason found on a task, or None.
 
-    Callers check the return value BEFORE marking DONE; a non-None
-    result means the task must transition to NEEDS_USER instead.
-    """
-    for pc in (task or {}).get("postconditions") or []:
-        if not pc:
-            continue
-        s = str(pc).strip()
-        if s.upper().startswith(HUMAN_GATE_PREFIX):
-            return s[len(HUMAN_GATE_PREFIX):].strip() or "human approval required"
-    return None
+def is_human_gate_text(pc: Any) -> bool:
+    """The postcondition is a ``HUMAN_GATE:`` line (kept out of text grading whether or not gates park)."""
+    return str(pc or "").strip().upper().startswith(HUMAN_GATE_PREFIX)
 
 
 # ------------------------------------------------------------------ contradictions

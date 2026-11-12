@@ -79,9 +79,9 @@ class TestWiring:
         assert "workspaceLoadBtn.addEventListener('click'" in js
         assert "workspaceSaveBtn.addEventListener('click'" in js
         assert "workspaceBtn.addEventListener" not in js
-        # Load into an open chat asks first; save with nothing to save is inert.
+        # §4UK: load never asks (it opens a NEW session); save with nothing to save is inert.
         load = js[js.index("workspaceLoadBtn.addEventListener('click'"):js.index("if (workspaceSaveBtn) {")]
-        assert "chatHistory.length > 0 && !confirm(" in load
+        assert "confirm(" not in load
         assert "workspaceUploadInput.click();" in load
         save = js[js.index("workspaceSaveBtn.addEventListener('click'"):]
         save = save[:save.index("fetch('/api/workspace/save'")]

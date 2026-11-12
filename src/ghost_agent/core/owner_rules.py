@@ -13,8 +13,9 @@ that fed it: the owner says the rule, and it is a rule.
     learn this rule: <text>      (also: remember this rule: <text>)
     show my rules                (also: list my rules, show all my rules)
     show rule N
-    forget rule N                → asks for "confirm forget rule N"
-    forget all my rules          → asks for "confirm forget all my rules"
+    forget rule N                → removes it at once (§4UK: no confirmation)
+    forget all my rules          → removes them all at once
+    ("confirm forget rule N" / "confirm forget all my rules" still work: the same removal)
 
 A dictated rule is ONE line after a colon, and it holds no question mark — a
 message with one is a question, not a rule (review r2: "learn this rule: if
@@ -66,7 +67,6 @@ import json
 import logging
 import re
 import threading
-import time
 import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -77,7 +77,6 @@ STORE_NAME = "owner_rules.json"
 RULES_MAX = 10
 RULE_MIN_CHARS = 8
 RULE_MAX_CHARS = 400
-FORGET_CONFIRM_S = 15 * 60
 
 _LOCK = threading.RLock()
 
@@ -168,8 +167,7 @@ HINT_MAX_WORDS = 20
 RULE_HINT = ("If the owner means their own standing rules (the ### OWNER RULES block), this message is none of "
              "the commands that change them, so NOTHING was changed. Only these exact messages show or change a "
              "rule, and the system runs them itself: “learn this rule: <the rule>” (the rule on one line after "
-             "the colon, with no question mark), “show my rules”, “show rule N”, “forget rule N” (it then asks for “confirm forget "
-             "rule N”). To change a rule: “show my rules” gives its number; the owner sends the new rule, on one line "
+             "the colon, with no question mark), “show my rules”, “show rule N”, “forget rule N” (removes it at once). To change a rule: “show my rules” gives its number; the owner sends the new rule, on one line "
              "(a list of steps written as one sentence), with “learn this rule: <the rule>”, then “forget rule N” "
              "for the old one (with a full list, forget first). You have no tool that changes a rule, and a "
              "profile entry is not a rule. There are no proposed or candidate rules any more "
@@ -178,47 +176,11 @@ RULE_HINT = ("If the owner means their own standing rules (the ### OWNER RULES b
              "two sentences the exact message to send. If the message is about some other kind of rule, ignore "
              "this note.")
 
-# The owner answers a forget preview with "yes": nothing confirms but the exact
-# phrase (a bare yes may be answering something else), so the model is told
-# that nothing was removed and which message does it.
-_AFFIRM_RE = re.compile(r"^\W*(?:y|yes|yep|yup|yeah|ok|okay|sure|absolutely|proceed|i\s+confirm|confirm(?:ed)?|"
-                        r"do\s+it|go\s+ahead|please\s+do|(?:forget|delete|remove)\s+it|ναι|εντάξει|οκ)\b", re.I)
-AFFIRM_MAX_WORDS = 6
-PENDING_HINT = ("The system showed the owner a preview of forgetting {what} and is waiting for the exact message "
-                "“{phrase}”. This message is not it, so NOTHING was removed and you cannot remove it. If the "
-                "owner is confirming, tell them in one sentence to send exactly: {phrase}. If they are talking "
-                "about something else, ignore this note.")
-
-
-def _waiting_hint(home) -> str:
-    """The note for a preview that is STILL waiting: fresh, and what it showed
-    is still there. (Review r3: the preview stays in the file after its
-    confirmation, so for 15 minutes "ok thanks" told the model that rule 2 —
-    already forgotten — was waiting to be confirmed.)"""
-    if _path(home) is None:
-        return ""
-    d = _read(home)[0]
-    pend, have = d["pending"], sorted(r["n"] for r in d["rules"])
-    if not pend or not _fresh(pend):
-        return ""
-    if isinstance(pend.get("all"), list):
-        if pend["all"] != have:
-            return ""
-        return PENDING_HINT.format(what="all their rules", phrase="confirm forget all my rules")
-    if type(pend.get("n")) is int and pend["n"] in have:
-        return PENDING_HINT.format(what=f"rule {pend['n']}", phrase=f"confirm forget rule {pend['n']}")
-    return ""
-
-
 def rule_command_hint(text: str, home=None) -> str:
     t = str(text or "")
     if is_rule_command(t):
         return ""
     words = len(t.split())
-    if words <= AFFIRM_MAX_WORDS and _AFFIRM_RE.match(t):
-        waiting = _waiting_hint(home)
-        if waiting:
-            return waiting             # else it may still be about the rules ("ok, delete rule 2": review r3)
     if _ADD_START_RE.match(t):
         return RULE_HINT               # a dictation the command did not take, whatever its length
     if words > HINT_MAX_WORDS:
@@ -292,15 +254,6 @@ def _read(home) -> Tuple[dict, str]:
     if type(d.get("next_n")) is not int or d["next_n"] <= highest:
         d["next_n"] = highest + 1                      # a number is never reused
     return d, ""
-
-
-def _fresh(pend: dict) -> bool:
-    """A preview confirms for 15 minutes from when it was shown — not before
-    (a time in the future or a NaN in a hand-edited file confirmed for ever)."""
-    try:
-        return 0 <= time.time() - pend["at"] <= FORGET_CONFIRM_S
-    except OverflowError:              # an integer too large for a clock
-        return False
 
 
 def damaged(home) -> str:
@@ -428,9 +381,9 @@ def _preview_forget(home, n: int) -> RuleNote:
         r = next((r for r in d["rules"] if r["n"] == n), None)
         if r is None:
             return _note(f"There is no rule {n} — nothing to forget. Say “show my rules” to see the ones you have.")
-        d["pending"] = {"n": n, "at": time.time()}
+        d["rules"] = [x for x in d["rules"] if x["n"] != n]      # §4UK: at once, no confirmation
         _save(home, d)
-    return _note(f"Forget this rule?\n\n> {_clean(r['rule'])}\n\nSay “confirm forget rule {n}” within 15 minutes to remove it.")
+    return _note(f"✓ Rule {n} forgotten. I am no longer shown it:\n\n> {_clean(r['rule'])}")
 
 
 def _confirm_forget(home, n: int) -> RuleNote:
@@ -438,12 +391,9 @@ def _confirm_forget(home, n: int) -> RuleNote:
         d, why = _read(home)
         if why:
             return _refusal(why)
-        pend = d["pending"]
         r = next((r for r in d["rules"] if r["n"] == n), None)
         if r is None:
             return _note(f"There is no rule {n} — nothing was removed.")
-        if pend.get("n") != n or not _fresh(pend):
-            return _note(f"Say “forget rule {n}” first, to see what will be removed; then confirm within 15 minutes.")
         d["rules"] = [x for x in d["rules"] if x["n"] != n]
         _save(home, d)             # the preview stays in the file: it names a number that is never reused
     return _note(f"✓ Rule {n} forgotten. I am no longer shown it:\n\n> {_clean(r['rule'])}")
@@ -457,13 +407,10 @@ def _preview_forget_all(home) -> RuleNote:
         if not d["rules"]:
             return _note("You have no rules — nothing to forget.")
         rs = sorted(d["rules"], key=lambda r: r["n"])
-        # the numbers SHOWN: the confirmation removes these and only if they
-        # are still all there is (review r1: a rule added after the preview
-        # was removed with the two that were shown)
-        d["pending"] = {"all": [r["n"] for r in rs], "at": time.time()}
+        d["rules"] = []                                          # §4UK: at once, no confirmation
         _save(home, d)
-    return _note(f"Forget all {len(rs)} of your rules?\n\n" + "\n".join(f"- {_fmt(r)}" for r in rs)
-                 + "\n\nSay “confirm forget all my rules” within 15 minutes to remove them.")
+    return _note(f"✓ All {len(rs)} rules forgotten. I am no longer shown any:\n\n"
+                 + "\n".join(f"- {_fmt(r)}" for r in rs))
 
 
 def _confirm_forget_all(home) -> RuleNote:
@@ -471,11 +418,8 @@ def _confirm_forget_all(home) -> RuleNote:
         d, why = _read(home)
         if why:
             return _refusal(why)
-        pend = d["pending"]
         if not d["rules"]:
             return _note("You have no rules — nothing was removed.")
-        if pend.get("all") != sorted(r["n"] for r in d["rules"]) or not _fresh(pend):
-            return _note("Say “forget all my rules” first, to see what will be removed; then confirm within 15 minutes.")
         n = len(d["rules"])
         d["rules"] = []
         _save(home, d)
@@ -536,8 +480,7 @@ def rules_withheld() -> bool:
 #: deciding which long message is an edit failed three reviews in a row (it hinted "fix my lint rule…" and
 #: missed "can you edit my rule…"), so the operator chose this fixed line: no guess, any wording, any language.
 RULES_FIXED_LINE = ("These rules change only by the owner's own commands: “learn this rule: <the rule>” adds one; "
-                    "“show my rules” gives the numbers (not the order above); “forget rule N”, then “confirm forget "
-                    "rule N”, removes one (with ten rules, forget first). You have no tool that changes them, and a "
+                    "“show my rules” gives the numbers (not the order above); “forget rule N” removes one at once (with ten rules, forget first). You have no tool that changes them, and a "
                     "profile entry is not a rule. Asked to change one, tell the owner which messages to send; never "
                     "say it is changed.")
 

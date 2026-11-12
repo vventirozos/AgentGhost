@@ -188,7 +188,8 @@ def test_every_loop_call_site_passes_the_request():
 # ── executed: the forced final that echoes the request gets its retry ─
 
 DONE_READBACK = json.dumps({"updated": [{"id": "t1", "status": "DONE",
-                                         "result_summary": "found the law"}], "count": 1})
+                                         "result_summary": "found the law"}], "count": 1,
+                            "closed": ["t1"]})
 SEARCH_RESULT = ("### 1. Ν. 2408/1996\nΤο κατώφλι των 23.125.000 δρχ ορίστηκε με τον Ν. 2408/1996.\n"
                  "[Source: https://laws.example/2408]\n")
 
@@ -226,6 +227,10 @@ async def test_the_echoing_forced_final_is_retried_and_the_retry_ships(monkeypat
     off — is the e69cab30 sentence with a dropped search. Pre-§4JI the
     echoed figures made it an answer and it shipped; now the directive
     fires once and the answer ships."""
+    # §4UI: a closed task no longer ends the turn; the forced final this
+    # test needs comes through the loop's converge hook
+    monkeypatch.setattr(ag, "_latch_forces_final",
+                        lambda closed, repair_reentry_active: bool(closed) and not bool(repair_reentry_active))
     agent, ctx = _scripted_agent(monkeypatch, [
         _resp("Ας ψάξω το κατώφλι.", FIRST),
         _resp(SHIPPED_GR, [_tc("c2", "web_search", {"query": "more"})]),
@@ -303,12 +308,11 @@ def test_every_breaker_force_final_arms_the_flag():
             else:
                 bare.append(test_src)
     assert bare == [], f"force-final site(s) that neither arm the flag nor are a named non-breaker: {bare}"
-    assert len(exempt) == 6                                   # +2 on 2026-09-22: §4JR/§4JS; +1 2026-10-05 §4LW dead-end refusal; −1 §4MO: the no-tool disclaimer no longer forces a final; +2 §4MO designed stop, project refused twice; −2 §4NM: the planner's two sites went with it
-    assert len(armed) == 16                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL); +1 2026-10-05 §4LZ duplicate-setter budget; +1 §4MO owner blocked batches; +1 2026-10-13 §4OE-1b report-written answer turn
+    assert len(exempt) == 5                                   # −1 §4UI: a task close no longer forces the final; +2 on 2026-09-22: §4JR/§4JS; +1 2026-10-05 §4LW dead-end refusal; −1 §4MO: the no-tool disclaimer no longer forces a final; +2 §4MO designed stop, project refused twice; −2 §4NM: the planner's two sites went with it
+    assert len(armed) == 13                                   # −3 §4UI: edit churn, futility, same-error reports are advice now; +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL); +1 2026-10-05 §4LZ duplicate-setter budget; +1 §4MO owner blocked batches; +1 2026-10-13 §4OE-1b report-written answer turn
     # the six §4JI sites, by their enclosing condition
     for marker in ("execution_failure_count >= 6 or total_fail >= 8",     # Failure Cap
                    "_acnt >= _hard_n and _nav_case",                    # never-extracted navigate
-                   "_exec_same_err and _acnt >= _hard_n",               # §4IB same-error report
                    "preflight_blocks_this_request >= 2",                # blocked preflight
                    "_readwrite_loop",                                   # no-progress hard stop (its else)
                    "deadline_needs_report(",                            # §4JP client-deadline report

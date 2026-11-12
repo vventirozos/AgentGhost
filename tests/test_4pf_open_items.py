@@ -215,15 +215,6 @@ async def test_the_chat_handler_withdraws_previews_on_a_no(monkeypatch):
     assert tok not in KB._FORGET_PLANS
 
 
-def test_a_miss_is_logged_with_its_reason(monkeypatch):
-    logged = []
-    monkeypatch.setattr(KB, "pretty_log", lambda title, msg, **kw: logged.append((title, msg)))
-    t = (request_id_context.set("req-520"), conversation_key_context.set("conv-none-" + str(time.time())))
-    try:
-        assert KB._resolve_plan("yes", "forget")[1] is None
-    finally:
-        request_id_context.reset(t[0]); conversation_key_context.reset(t[1])
-    assert any(ti == "Confirm Lookup" and "no forget preview" in m for ti, m in logged)
 
 
 # ── K12, K13 ───────────────────────────────────────────────────────────────
@@ -409,17 +400,6 @@ def test_a_bare_stop_is_not_a_decline():
         assert KB.retire_declined_previews("nah") == 1
     finally:
         request_id_context.reset(t[0]); conversation_key_context.reset(t[1])
-
-
-def test_a_token_less_lookup_before_the_first_preview_is_silent(monkeypatch):
-    logged = []
-    monkeypatch.setattr(KB, "pretty_log", lambda title, msg, **kw: logged.append((title, msg)))
-    t = (request_id_context.set("req-610"), conversation_key_context.set("conv-quiet-" + str(time.time())))
-    try:
-        assert KB.confirmed_earlier_preview("forget") == (None, None)
-    finally:
-        request_id_context.reset(t[0]); conversation_key_context.reset(t[1])
-    assert not [m for ti, m in logged if ti == "Confirm Lookup"]
 
 
 async def test_an_archived_update_keeps_its_other_fields(tmp_path):

@@ -1104,51 +1104,31 @@ _CODING_PROJECT_RE = re.compile(
 )
 
 
-# A goal asking for ONE cohesive file. Such a deliverable is built best in a
-# single turn (one-shot generation) — splitting it into per-feature tasks that
-# must merge into one file produces global collisions and a broken page
-# (observed live). Detected so create/decompose keep it as one task.
-_SINGLE_FILE_RE = re.compile(
-    r"\b(single[ -]file|one[ -]file|single (html|page|file)|"
-    r"one (html|index\.html|page|html file)|in (a |one )?single (html|file|page)|"
-    r"all[ -]in[ -]one (file|html|page)|self[ -]contained (html|file|page))\b",
-    re.I,
-)
-
-
-def _is_cohesive_single_file(title: str, goal: str) -> bool:
-    return bool(_SINGLE_FILE_RE.search(f"{title or ''} {goal or ''}"))
-
-
-# Generic TYPE prefixes are not feature identities. A decompose shaped
-# "Implement: core.py…" / "Implement: train.py…" / "Implement: demo.py…"
-# collapsed onto the single key "implement", so the dedup filter silently ate
-# every implement-task after the first — observed live 2026-08-01 (project
-# 85a350ee099c "Mini AI": 5 planned tasks → 3 persisted, and the next request
-# burned turns updating phantom train.py/demo.py task ids that never existed).
-# When the colon-head is one of these, identity must come from a longer slice
-# of the whole description instead.
-_GENERIC_FEATURE_HEADS = frozenset({
-    "research", "design", "implement", "implementation", "build", "create",
-    "add", "write", "code", "fix", "test", "tests", "verify", "update",
-    "refactor", "document", "documentation", "docs", "deploy", "setup",
-    "set up", "plan", "review", "analyze", "analyse", "investigate",
-    "task", "step", "phase", "todo", "feature", "integrate",
-})
+# §4UI (2026-11-12, req 8646c6c8): the goal-text single-file classifier
+# (_SINGLE_FILE_RE) is GONE. It matched "one file" inside "adding a new
+# app = one registry entry + one file", collapsed a 7-file modular webOS to
+# one task, told the model to STOP a second time, and locked the project
+# against every later decompose/replan. The real rule — never split ONE
+# file into N tasks — lives in the `subtasks` parameter description.
 
 
 def _feature_key(desc: str) -> str:
-    """A coarse identity for a task — the feature name before the first colon
-    (or the first few words). 'Core Shell: HTML structure…' and 'Core Shell:
-    index.html skeleton…' share the key 'core shell', so they dedup. A GENERIC
-    head ('Implement: …', 'Research: …') identifies a task TYPE, not a
-    feature — those key on a longer slice of the full description so distinct
-    deliverables never collapse onto one key."""
-    d = " ".join((desc or "").strip().lower().split())
-    head = d.split(":", 1)[0].strip()
-    if head and head not in _GENERIC_FEATURE_HEADS:
-        return head[:40]
-    return d[:80]
+    """A task's identity for dedup — §4UI (heuristics review #4): its declared
+    deliverable path when it has one, else its whole normalized text. The
+    feature-head key ("App: Notes" vs "App: Calculator" → both `app`,
+    "Backend: user API" vs "Backend: payments API") dropped the natural
+    webOS / app plan shape; the replay it was for (create-with-subtasks AND
+    task_decompose of the same plan) repeats the text verbatim."""
+    from ..core.task_deliverable import declared_deliverable
+    path = declared_deliverable(desc or "")
+    if path:
+        return "→" + str(path).strip().lower()
+    return _text_key(desc)
+
+
+def _text_key(desc: str) -> str:
+    """The whole normalized text (case, spacing, a trailing period)."""
+    return " ".join((desc or "").strip().lower().split()).rstrip(" .")
 
 
 def _filter_duplicate_subtasks(store, project_id: str, subtasks):
@@ -1166,18 +1146,22 @@ def _filter_duplicate_subtasks(store, project_id: str, subtasks):
     except Exception:
         existing = []
     terminal = {"DONE", "FAILED", "BLOCKED", "ARCHIVED"}
-    seen = {_feature_key(t.get("description")) for t in existing
-            if str(t.get("status", "")).upper() not in terminal}
+    live = [t.get("description") or "" for t in existing
+            if str(t.get("status", "")).upper() not in terminal]
+    # against the EXISTING plan: same declared file or same text (the replay);
+    # within ONE list only the same text — §4UI r1 m4: a plan that stages one
+    # file over several tasks ("markup → index.html", "game logic →
+    # index.html") is the model's choice, not a duplicate
+    seen = {_feature_key(d) for d in live} | {_text_key(d) for d in live}
     kept = []
     dropped = []
     for d in (subtasks or []):
         if not d or not d.strip():
             continue
-        k = _feature_key(d)
-        if k in seen:
+        if _feature_key(d) in seen or _text_key(d) in seen:
             dropped.append(d.strip())
             continue
-        seen.add(k)
+        seen.add(_text_key(d))
         kept.append(d)
     return kept, dropped
 
@@ -1217,20 +1201,19 @@ _ADVANCE_STOP_BLURB = {
                       "runnable until a failed task is fixed. Do NOT report "
                       "the project as complete.",
     "completed_with_failures": "Advanced every task it could; some FAILED and "
-                               "were skipped (listed below) — retry those.",
+                               "were skipped (listed below).",
     "count_reached": "Advanced the requested number of tasks; more remain.",
     # §4SR r3: the tool's own wording for an unattended needs_user stop where
     # only holds wait (never a batch stop reason)
     "held_unattended": "Stopped: the task(s) in held_tasks were held because this run is "
                        "unattended; any other open task waits on another task or on the "
                        "owner's own run (see task_list).",
-    "hard_cap": "Hit the safety cap mid-run — call autoadvance again to continue.",
+    "hard_cap": "Hit the safety cap mid-run; the rest is still open.",
     "repeated_failures": "Stopped: several tasks failed in a row — likely a "
-                         "systemic problem (e.g. a broken foundation). Fix it, "
-                         "then re-run autoadvance.",
+                         "systemic problem (e.g. a broken foundation).",
     "needs_user": "Stopped: nothing else can run — the task(s) in needs_user_tasks "
-                  "wait for the owner (a decision, approval or publish only they can "
-                  "give); autoadvance does not run them.",
+                  "wait for the owner (something only they have — a file, a login, an "
+                  "answer); autoadvance does not run them.",
     "budget_or_inactive": "Paused: the project's step budget is exhausted "
                           "(the owner raises it with action=budget) or it is not ACTIVE.",
     "deadline": "Stopped before the next task: this request's time is nearly up and "
@@ -1369,11 +1352,21 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
             f"answered (or the fix is in), calling autoadvance again is how to "
             f"continue — it picks up from where this run stopped. {no_reload}"
         )
+    # §4UI: one instruction per stop — "hard_cap" said "call autoadvance
+    # again" AND "STOP"; a failure stop said "retry those" AND "STOP"
+    if batch.stop_reason == "hard_cap":
+        return (
+            f"Autonomous batch ran {ran} task(s) ({done} DONE{tail}{gated}). "
+            f"{blurb}{fail_list} If the user asked for the whole project, call "
+            f"autoadvance again now — it picks up where this run stopped; "
+            f"otherwise report what was built and wait. {no_reload}"
+        )
     return (
         f"Autonomous batch ran {ran} task(s) ({done} DONE{tail}{gated}). "
-        f"{blurb}{fail_list} Summarize for the user what was built (and any "
-        f"failed tasks they may want to retry) and STOP — wait for their next "
-        f"direction. {no_reload}"
+        f"{blurb}{fail_list} Report to the user what was built"
+        + (" and which task(s) failed, and ask whether to retry or fix them"
+           if failed_ids else "")
+        + f", then wait for their next direction. {no_reload}"
     )
 
 
@@ -1730,19 +1723,10 @@ def _probe_turn_now() -> bool:
         return False
 
 
-#: §4MM: the owner's own words asking for a PROJECT (EN + GR). Turns 34/38:
-#: "Test the theory that 4-layer recursive thinking…" created a project
-#: twice (once minutes after the owner deleted it), offered a plan and
-#: stopped — the owner asked for the test, not a project, and had to add
-#: "don't create a project" before getting the answer (six retries).
-_PROJECT_ASK_RE = re.compile(
-    r"(?<!\w)(?:projects?|workspace|initiative|track (?:it|this|that)|as a tracked|"
-    r"πρότζεκτ|προτζεκτ|έργο|εργο|έργα|εργα|εργασία|εργασια)(?!\w)", re.IGNORECASE)
-
-
-#: …and the owner's words REFUSING one ("don't create a project, just do
-#: it" — turns 40/43, after the two unasked creates). Checked first: the
-#: word "project" is in it.
+#: §4MM: the owner's words REFUSING a project ("don't create a project, just do
+#: it" — turns 40/43, after two unasked creates). §4UI: the ONE create check
+#: left — the ask/build word lists that tried to tell an asked-for project
+#: from an unasked one were removed (the model decides).
 # r2: only a negated CREATE ("don't create/make/start a project") or
 # "without a project" — "I have no project for this, please set one up",
 # "don't stop until the project is finished" are asks, not refusals
@@ -1752,14 +1736,6 @@ _NO_PROJECT_RE = re.compile(
     r"|without\s+(?:creating\s+|making\s+)?(?:a\s+|any\s+)?(?:new\s+)?projects?"
     r"|(?:μην|μη)\s+(?:φτιάξεις|φτιαξεις|δημιουργήσεις|δημιουργησεις|ανοίξεις|ανοιξεις)\s+(?:\w+\s+)?(?:πρότζεκτ|προτζεκτ|έργο|εργο)"
     r"|χωρίς\s+(?:\w+\s+)?(?:πρότζεκτ|προτζεκτ|έργο|εργο))(?!\w)", re.IGNORECASE)
-#: a request to BUILD something is project work without the word ("build the
-#: pipeline", "delete it and make something else"): 0 of 77 past owner
-#: build requests without "project" created one, so allowing them costs nothing
-_BUILD_ASK_RE = re.compile(
-    r"(?<!\w)(?:build|make(?!\s+sure)|create|develop|implement|set\s+up|scaffold|deploy|start|"
-    r"φτιάξε|φτιαξε|δημιούργησε|δημιουργησε|στήσε|στησε|ανάπτυξε|αναπτυξε)(?!\w)", re.IGNORECASE)
-
-
 def _create_not_requested(context) -> str:
     """The refusal text when an INTERACTIVE turn (the owner's or a probe's)
     creates a project the request did not ask for, else "". Background
@@ -1785,23 +1761,11 @@ def _create_not_requested(context) -> str:
     if any(_NO_PROJECT_RE.search(_t) for _t in _texts):
         return ("NOT created: the owner said not to create a project. Do the task directly in this "
                 "conversation now.")
-    # this message, or the conversation's last few (r2: "call it Snake"
-    # answers the agent's question about a project asked for a turn before)
-    if _PROJECT_ASK_RE.search(ask) or _BUILD_ASK_RE.search(ask):
-        return ""
-    # an EARLIER message counts only when it asked to BUILD something: turn
-    # 38's history held "show all projects" and "delete projects …"
-    recent = [m for m in (getattr(context, "recent_user_contents", None) or []) if isinstance(m, str)]
-    if any(_BUILD_ASK_RE.search(m) for m in recent[-4:]):
-        return ""
-    # a short yes to the agent's own offer ("do it", "ok, proceed") — 3 of
-    # the 5 past creates whose request never said "project" were exactly that
-    from .memory import user_confirms
-    if user_confirms(ask):
-        return ""
-    return ("NOT created: the request did not ask for a project. Do the task directly in this "
-            "conversation now — answer, run, or build what was asked. Offer a project only if the work "
-            "clearly needs one, and create it when the owner says so.")
+    # §4UI (heuristics review #5): otherwise the MODEL decides. The verb lists
+    # that tried to tell an asked-for project from an unasked one missed "write
+    # me a snake game", "I need a webOS with apps" and every Greek ask
+    # ("θέλω…", "γράψε μου…", "κάνε…"); a second refusal closed the tools.
+    return ""
 
 
 def _stored_evidence(summary) -> str:
@@ -1831,124 +1795,15 @@ def _current_request_id() -> str:
         return ""
 
 
-#: §4SU r3/r4 (operator 11-02: "name it", then "task id only"): chat approval
-#: of a human gate is an approval word plus the TASK ID, never a plain yes (r3:
-#: "go ahead, tell me the weather" released an overnight deploy gate) and never
-#: title words (r4: the model could rename a gated task to match whatever the
-#: owner typed, and "server"/"production" named unrelated gates)
-_APPROVE_WORD_RE = re.compile(r"(?<!\w)(?:approve[sd]?|approving|lgtm|sign(?:ed)?\s+off|"
-                              r"εγκριν\w*|εγκρινα|εγκεκριμεν\w*)(?!\w)", re.IGNORECASE)
-_DELETE_WORD_RE = re.compile(r"(?<!\w)(?:delete[sd]?|remove[sd]?|σβησ\w*|διεγραψ\w*|διαγραψ\w*)(?!\w)",
-                             re.IGNORECASE)
-#: anywhere in the message — a release that holds back, asks or sets a
-#: condition is no release (r4: "I haven't approved…", "Δεν εγκρίνω…",
-#: "should I approve…?", "approve … only if the tests pass")
-_HOLD_BACK_RE = re.compile(r"(?:(?<!\w)(?:do|does|did|ca|can|wo|is|are|was|were|have|has|had|should|"
-                           r"would|could|must|need|ai)n'?t(?!\w)|[?;;？¿]|(?<!\w)(?:not|no|never|wait|hold(?:\s+(?:on|off))?|stop|"
-                           r"cancel|but|except|unless|if|once|yet|later|tomorrow|first|when|whenever|after|"
-                           r"until|till|before|only|provided|assuming|"
-                           r"οχι|δεν|μη|μην|ουτε|περιμενε|σταματα|αλλα|εκτος|αν|εαν|αυριο|πρωτα|οταν|μολις|"
-                           r"αφου|μετα|πριν|μονο)(?!\w))", re.IGNORECASE)
-_TASK_REF_RE = re.compile(r"(?<![0-9a-z])[0-9a-f]{6,32}(?![0-9a-z])")
-#: r5: the id directly after ITS verb ("approve 3f2a9c", "εγκρίνω το 3f2a9c",
-#: "approved: task #3f2a9c") — "approve A, leave B parked" named B too
-_AFTER_VERB_RE = re.compile(r"[\s:,\-–—]*(?:(?:the|task|id|το|την|task\s+id)\s+)*[#\"'“«(]?"
-                            r"([0-9a-f]{6,32})(?![0-9a-z])")
-
-
-def _gate_text(msg) -> str:
-    from ..memory.profile import _fold
-    return _fold(str(msg or "")).replace("\u2019", "'").replace("\u2018", "'").replace("\u02bc", "'")
-
-
-def _owner_message_now(context) -> str:
-    """r5: the owner's message of THIS request as provenance recorded it (the
-    context's ``last_user_content`` outlives its turn); "" when none."""
+def _record_constraint_override(store, project_id: str, tid: str, why: str, violation: str) -> None:
+    """§4UK: the agent went over a constraint with a stated reason — on the record, never a wait."""
     try:
-        from ..utils.provenance import user_message
-        return str(user_message() or "")
+        store.log_event(project_id, tid, "constraint_override",
+                        {"req": _current_request_id(), "reason": str(why)[:300],
+                         "violation": str(violation or "")[:300]})
+        store.append_ledger(project_id, f"WENT OVER a constraint on task {tid}: {str(why)[:200]}")
     except Exception:  # noqa: BLE001
-        return ""
-
-
-def _gate_park_payload(reason: str) -> dict:
-    """A park event's payload: the reason and this request's id. (r5 residual,
-    documented: a Retry re-sends an earlier message as a NEW request; a hash
-    of the parking message was tried and dropped — the owner typing the same
-    "delete <id>" again could then never release it.)"""
-    return {"reason": str(reason)[:200], "req": _current_request_id()}
-
-
-def _message_names_task(msg: str, task: dict, rivals, verbs=()) -> bool:
-    """The owner's message names THIS task, and only it: every id-like token
-    that is a prefix (6+ characters, a whole word) of a task of the project
-    points at this one task, and the id follows its verb directly."""
-    tid = str(task.get("id") or "").lower()
-    if not tid:
-        return False
-    ask = _gate_text(msg)
-    ids = [str(r.get("id") or "").lower() for r in rivals] + [tid]
-    named = set()
-    for ref in _TASK_REF_RE.findall(ask):
-        named |= {i for i in ids if i.startswith(ref)}
-    if named != {tid}:                        # another task, or an ambiguous prefix
-        return False
-    for v in verbs:
-        for m in v.finditer(ask):
-            mm = _AFTER_VERB_RE.match(ask, m.end())
-            if mm and tid.startswith(mm.group(1)):
-                return True
-    return False
-
-
-def _owner_names_release(context, task: dict, rivals, verbs=(_APPROVE_WORD_RE,)) -> bool:
-    """§4SU r3–r5 (operator): the owner's OWN message of this request releases
-    THIS gate — the verb (an approval word; for a delete, a delete word)
-    directly followed by the task's id, no other task named, and nothing held
-    back anywhere in it. A message the owner queued mid-turn (§4RZ) that holds
-    back withdraws it."""
-    try:
-        ask = _gate_text(_owner_message_now(context))
-        if not ask.strip() or _HOLD_BACK_RE.search(ask):
-            return False
-        if not _message_names_task(ask, task, rivals, verbs):
-            return False
-        try:
-            from ..utils.provenance import added_user_messages
-            if any(_HOLD_BACK_RE.search(_gate_text(later)) for later in (added_user_messages() or [])):
-                return False
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _owner_released(store, project_id: str, tid: str, context, verbs=(_APPROVE_WORD_RE,)) -> bool:
-    """§4SU Phase 0: the OWNER, in their own turn, releases THIS task's gate by
-    name, and the gate was put to them by an EARLIER request (its newest
-    ``human_gate_parked`` / ``human_gate_triggered`` event carries that
-    request's id). Never raises (False)."""
-    try:
-        if not _owner_turn_now():
-            return False
-        task = store.get_task(tid) or {}
-        rivals = store.list_tasks(project_id) or []
-        if not _owner_names_release(context, task, rivals, verbs):
-            return False
-        ev = store.latest_task_event(project_id, tid, ("human_gate_parked", "human_gate_triggered"))
-        if ev is None:
-            return False
-        return str((ev.get("payload") or {}).get("req") or "") != _current_request_id()
-    except Exception:  # noqa: BLE001
-        logger.warning("human gate approval check failed (not approved)", exc_info=True)
-        return False
-
-
-def _human_gate_approved(store, project_id: str, tid: str, status_now, context=None) -> bool:
-    """A parked HUMAN_GATE task's close is the owner's approval (see
-    `_owner_released`)."""
-    return status_now == TaskStatus.NEEDS_USER and _owner_released(store, project_id, tid, context)
+        logger.warning("constraint override not recorded", exc_info=True)
 
 
 def _owner_turn_now() -> bool:
@@ -2052,10 +1907,13 @@ def _lifecycle_target(context, store, project_id, title):
     return (_canon_pid(cur) if cur else None), None
 
 
-def _lifecycle_would_refuse(store, act, rid, kwargs) -> bool:
+def _lifecycle_would_refuse(store, act, rid, kwargs, context=None) -> bool:
     """The action will refuse on its own and change nothing — no preview to
     confirm (review m4: a preview for an ACTIVE project's release ended in
-    the owner's "yes" hitting "not DONE")."""
+    the owner's "yes" hitting "not DONE"). §4UI: a delete that an unreleased
+    human gate will refuse — the preview's token was spent before the gate
+    refused, so the owner's next "delete <task>" got a fresh preview and the
+    "yes" after it named no task: a loop."""
     st = str((store.get_project(rid) or {}).get("status") or "").upper()
     if act == "unrelease":
         return st != "RELEASED"
@@ -2063,24 +1921,6 @@ def _lifecycle_would_refuse(store, act, rid, kwargs) -> bool:
         return (st != "DONE"
                 or len(" ".join(str(kwargs.get("directions") or "").split())) < 30)
     return False
-
-
-#: (request id, action, project) previews already shown in that request
-_PREVIEWED_THIS_REQUEST: set = set()
-
-
-def _grew_since_preview(context, act, rid, plan, host_labs=None) -> List[str]:
-    """§4SX D2 (review r1 M8): what a delete would now ALSO stop/destroy that the owner's preview did not list
-    (a lab turned kept since counts: its id gains a ``kept:`` entry — review r2 #3a)."""
-    if act != "delete" or context is None or not isinstance(plan, dict) or "inventory" not in plan:
-        return []
-    if host_labs is None and _labs_host_configured(context) and _project_inventory(context, rid)["labs"]:
-        # the host did not answer this time: whether a lab turned kept is unknown — never covered (review r3 m2)
-        return ["labs (the labs host did not answer, so their kind could not be checked)"]
-    # only what the design asks a new yes for (r1 M8): a kept lab or an `app` run — a new background job or a
-    # disposable lab is what a delete is for, and re-asking on churn loops the owner (review r3 #2)
-    return sorted(i for i in set(_inventory_ids(_project_inventory(context, rid, host_labs)))
-                  - set(plan.get("inventory") or []) if i.startswith(("kept:", "app:", "sched:")))   # D4 r2 #12
 
 
 async def _host_project_labs(context, project_id: str) -> Optional[list]:
@@ -2120,88 +1960,29 @@ async def _host_project_labs(context, project_id: str) -> Optional[list]:
 
 
 def _lifecycle_confirmation(store, act, rid, token, context=None, host_labs=None):
-    """None when the action may run now on ``rid``; otherwise the preview (no
-    token) or the refusal (bad token / not the user / same turn)."""
-    import time as _time
-    from .memory import _store_plan, _resolve_plan, _drop_plan, _confirm_allowed
+    """None when ``act`` may run now on ``rid``; otherwise a refusal.
+
+    §4UK (operator 11-12: "i want all confirmations, everywhere to be removed … that's why everything is
+    sandboxed"): no preview, no token, no "ask the user first". Only the walls on WHO may act stay: a background,
+    scheduled or probe turn cannot release, unrelease or delete an owner project (a probe its own throwaway one,
+    yes), and neither can a request that read outside content (a page could say "delete project X")."""
+    from .memory import _not_the_user
     from ..utils.logging import request_id_context
     proj = store.get_project(rid) or {}
     if _probe_turn_now() and (proj.get("metadata") or {}).get("probe_created"):
         return None                       # a probe's own throwaway project
-    kind = f"project_{act}"
     _rid_now = str(request_id_context.get() or "")
-    _stop = (f"STOP calling {act} in this turn. Reply to the user now: say what it would do and ask "
-             f"them to confirm in their next message.")
-    if not str(token or "").strip():
-        # §4PE (live 07:28 "yes, delete it."): the user answered an EARLIER
-        # preview of this project and the model came back without the token
-        # — a fresh preview here shadowed the answered one and the turn's
-        # own token then read "the user has not answered yet"
-        from .memory import confirmed_earlier_preview
-        _tok0, _plan0 = confirmed_earlier_preview(kind, match=lambda p: p.get("project_id") == rid)
-        if _plan0 is not None and not _grew_since_preview(context, act, rid, _plan0, host_labs):
-            pretty_log("Confirm Lookup", f"{act} {rid}: the user's yes answers the earlier preview {_tok0} — "
-                       f"running it", icon=Icons.BRAIN_PLAN)
-            _drop_plan(_tok0)
-            return None
-        if _plan0 is not None:
-            _drop_plan(_tok0)                   # it no longer describes what would go: preview again below
-        # one preview per request: the live probe re-previewed eight times in
-        # one turn, taking each refusal as a cue to try again (§4LQ)
-        _key = (_rid_now, kind, rid)
-        if _key in _PREVIEWED_THIS_REQUEST:
-            from .outcome import ToolOutcome as _TO
-            return _TO.rejected(f"Error: already previewed in this turn — {_stop}",
-                                world_changed=False, reason_code="confirm_dead_end")
-        if len(_PREVIEWED_THIS_REQUEST) > 256:
-            _PREVIEWED_THIS_REQUEST.clear()
-        _plan_new = {"kind": kind, "rid": _rid_now, "ts": _time.time(), "project_id": rid}
-        _also = ""
-        if act == "delete" and context is not None:
-            _inv = _project_inventory(context, rid, host_labs)
-            _plan_new["inventory"] = _inventory_ids(_inv)
-            _txt = _inventory_text(_inv, hard=True)
-            _also = f" It would also stop/destroy: {_txt}." if _txt else ""
-            if host_labs is None and _labs_host_configured(context):
-                _also += (" (The labs host did not answer, so only the labs on local record are listed; the delete "
-                          "itself refuses while it cannot reach them.)")
-        tok = _store_plan(_plan_new)
-        _PREVIEWED_THIS_REQUEST.add(_key)
-        return _ok({
-            "confirmation_needed": True, "action": act, "project": rid,
-            "title": proj.get("title"), "confirm_token": tok,
-            **({"would_also_stop": _also.strip()} if _also else {}),
-            "agent_instruction": (
-                f"NOT done yet. This would {_CONFIRMED_ACTIONS[act]} ('{proj.get('title')}').{_also} Ask the "
-                f"user to confirm. ONLY after they say yes, in their next message, call "
-                f"manage_projects action={act} project_id={rid} confirm_token={tok} (or "
-                f"confirm_token=yes if you no longer see the token). Never confirm "
-                f"on their behalf, and do not call it again in this turn."),
-        })
-    token, plan = _resolve_plan(token, kind, match=lambda p: p.get("project_id") == rid)
-    if plan is None or plan.get("project_id") != rid:
-        from .memory import plan_miss_reason
-        _why = (plan_miss_reason() if plan is None
-                else f"that token belongs to the preview of another project, {plan.get('project_id')}")
-        return _err("unknown, expired or mismatched confirm_token"
-                    + (f" ({_why})" if _why else "")
-                    + " — call the action again without it to get a new preview for the user")
-    why = _confirm_allowed(plan)
-    if why:
-        from .outcome import ToolOutcome as _TO
-        if "names WHICH items" in why:                   # §4PE r3: a project has no items to pick
-            why = ("the user's yes carries a condition — a project action is all or nothing; ask them for a "
-                   "plain yes (or do what they asked instead)")
-        return _TO.rejected(f"Error: NOT done: {why}. {_stop}", world_changed=False,
-                            reason_code="confirm_dead_end")
-    # after the owner's-yes check (review r4 m2: a same-turn token dropped the plan the real yes needed)
-    _grew = _grew_since_preview(context, act, rid, plan, host_labs)
-    if _grew:
-        _drop_plan(token)
-        return _err(f"NOT deleted: since the owner's preview the project gained {', '.join(_grew[:6])} — the "
-                    f"yes does not cover them. Call action={act} again WITHOUT a token for a new preview, and ask "
-                    "the owner again.")
-    _drop_plan(token)
+    if _rid_now and _not_the_user(_rid_now):
+        return _err(f"NOT done: only the user's own conversation can {act} a project — a background, scheduled "
+                    f"or test turn cannot. Nothing changed.")
+    try:
+        from ..utils.provenance import untrusted_seen
+        _src = untrusted_seen(_rid_now) if _rid_now else []
+    except Exception:  # noqa: BLE001
+        _src = []
+    if _src:
+        return _err(f"NOT done: this request read outside content ({', '.join(_src[:3])}) — a {act} runs only "
+                    f"in a request that did not, so a page cannot order it. Nothing changed.")
     return None
 
 
@@ -2219,16 +2000,10 @@ from ..core.project_advancer import BUDGET_METADATA_KEYS as _BUDGET_KEYS  # noqa
 
 
 async def tool_manage_projects_for_model(context, **kwargs):
-    """The MODEL-facing manage_projects (the registry's). §4LP (operator: "go
-    with your recommendations"): release, unrelease and hard delete are the
-    OWNER's decisions — a preview, then the user confirms in a later turn (the
-    forget/reset_all design, §4KX). The model had released an untested
-    project nobody asked to release, and the guard against unrelease was only
-    description text. The confirmed action runs on the project the preview
-    named. Direct callers (tests, API routes) keep the immediate behaviour,
-    as forget's do."""
+    """The MODEL-facing manage_projects (the registry's). Release, unrelease and hard delete run at once in the
+    user's own conversation (§4UK: no confirmations); the walls in `_lifecycle_confirmation` decide who may."""
     act = str(kwargs.get("action") or "").strip().lower()
-    token = kwargs.pop("confirm_token", "") or ""
+    token = kwargs.pop("confirm_token", "") or ""      # §4UK: accepted and ignored (no previews)
     _md = kwargs.get("metadata")
     if isinstance(_md, str):
         try:
@@ -2255,7 +2030,7 @@ async def tool_manage_projects_for_model(context, **kwargs):
             rid, rerr = _lifecycle_target(context, store, kwargs.get("project_id"), kwargs.get("title") or "")
             if rerr:
                 return _err(rerr)
-            if rid and not _lifecycle_would_refuse(store, act, rid, kwargs):
+            if rid and not _lifecycle_would_refuse(store, act, rid, kwargs, context):
                 _hl = await _host_project_labs(context, rid) if act == "delete" else None
                 _gate = _lifecycle_confirmation(store, act, rid, token, context, _hl)
                 if _gate is not None:
@@ -3146,8 +2921,24 @@ _VISUAL_ARTIFACT_RE = re.compile(
 )
 
 
-def _is_visual_artifact_task(description: str) -> bool:
-    return bool(_VISUAL_ARTIFACT_RE.search((description or "").lower()))
+#: §4UI (heuristics review #11): what makes a visual task's DELIVERABLE code
+_VISUAL_CODE_SUFFIXES = (".html", ".htm", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".css", ".py",
+                         ".glsl", ".frag", ".vert", ".wgsl", ".svg", ".vue", ".svelte")
+
+
+def _is_visual_artifact_task(description: str, kind: str = "") -> bool:
+    """A visual / runnable artifact whose close needs verification evidence.
+    §4UI: only when what it MAKES is code — a declared deliverable with a code
+    suffix, or (none declared) any task not declared research/write. "Write
+    the HUD design doc → docs/hud.md" and "Research canvas fingerprinting
+    defences" were refused a close for want of a screenshot."""
+    if not _VISUAL_ARTIFACT_RE.search((description or "").lower()):
+        return False
+    from ..core.task_deliverable import declared_deliverable
+    path = declared_deliverable(description or "")
+    if path:
+        return str(path).strip().lower().endswith(_VISUAL_CODE_SUFFIXES)
+    return str(kind or "").strip().lower() not in ("research", "write")
 
 
 # ------------------------------------------------------------------ handler
@@ -3611,34 +3402,7 @@ async def tool_manage_projects(
             # later "proceed" found "no plan" and the whole flow derailed
             # (observed live, twice). Top-level fan-out, sequential when asked.
             created_task_ids: List[str] = []
-            if _is_cohesive_single_file(title, goal):
-                # A cohesive SINGLE FILE is built best in ONE turn (one-shot
-                # generation), NOT split into per-feature tasks that must merge
-                # into one file and collide (duplicate globals → the page threw
-                # on load; observed live). Collapse to ONE build task so the
-                # "proceed" path is a single full agent turn — the path that
-                # worked before the per-turn split.
-                plan = ProjectPlan(store, pid)
-                _desc = ("Build the complete single-file deliverable: "
-                         f"{(goal or title).strip()}")[:400]
-                one = plan.add_task(_desc, constraints=req_constraints or None)
-                created_task_ids = [one]
-                _link_task_in_graph(context, pid, one, _desc)
-                instruction = (
-                    "SINGLE-FILE build: a cohesive single file is built best in "
-                    "ONE focused turn, so this is ONE task — do NOT split it "
-                    "into per-feature tasks (they would have to merge into one "
-                    "file, which collides and breaks). Present this one-task "
-                    "plan and STOP. When the user says proceed, BUILD THE WHOLE "
-                    "FILE YOURSELF in that turn (write it directly, growing it "
-                    "with file_system as needed) — do NOT call autoadvance for "
-                    "it; the autonomous loop builds fragments unfit for a single "
-                    "cohesive file. The project workspace is ALREADY set up: "
-                    "write to the BARE filename (e.g. 'index.html') — do NOT "
-                    "invent or prefix a 'projects/<name>/' directory, and do "
-                    "NOT write the file before this create call has run."
-                )
-            elif subtasks:
+            if subtasks:
                 subtasks, _create_dropped = _filter_duplicate_subtasks(
                     store, pid, subtasks)
                 plan = ProjectPlan(store, pid)
@@ -3658,10 +3422,8 @@ async def tool_manage_projects(
                     _link_task_in_graph(context, pid, tid, desc)
                 instruction = (
                     f"Project created WITH {len(created_task_ids)} task(s) from "
-                    "your subtasks. Present the plan and STOP — do NOT begin "
-                    "executing. Advance ONE task at a time, only when the user "
-                    "directs you ('proceed to next task'); for a multi-task "
-                    "go-ahead use autoadvance count=<N|all>."
+                    "your subtasks. Pacing: follow the PACING rule "
+                    "in the CURRENT PROJECT block."
                 )
                 if _create_dropped:
                     instruction += (
@@ -3678,10 +3440,9 @@ async def tool_manage_projects(
                     "file per feature behind a thin shell), NOT N tasks that "
                     "all edit the same file. Give each task as an object "
                     "{description, kind, deliverable} (kind: build | write | "
-                    "research | model_run | owner). Then STOP and present the plan. "
-                    "DO NOT begin executing tasks now — advance ONE task at a "
-                    "time, and only when the user directs you (e.g. 'proceed to "
-                    "next task'). As you work, record durable facts (file "
+                    "research | model_run | owner). Pacing: follow the PACING "
+                    "rule in the CURRENT PROJECT block. As you work, "
+                    "record durable facts (file "
                     "layout, key APIs) with action=ledger so later turns don't "
                     "re-derive them."
                 )
@@ -3714,8 +3475,11 @@ async def tool_manage_projects(
                     store.update_project(pid, metadata={"probe_created": True})   # merges (§4LZ C2)
                 except Exception:  # noqa: BLE001
                     pass
-            return _ok({"awaits_go_ahead": True,      # §4SU Phase 4: a plan for the user — the turn ends
-                        "created": pid,               # here (FIRST key: read from a truncated result)
+            return _ok({"plan_shown": True,           # §4SU Phase 4 / §4UI r1 M3: a plan was made; the
+                        # PACING rule decides whether the turn ends (a neutral key: "awaits_go_ahead"
+                        # told the model to stop when the message also asked for the work).
+                        # FIRST key: the trailing-promise steer reads it from a truncated result
+                        "created": pid,
                         "tasks_created": created_task_ids,
                         "workspace": f"projects/{pid}",
                         "constraints": req_constraints,
@@ -3868,19 +3632,6 @@ async def tool_manage_projects(
                     if _other:
                         store.update_project(project_id, **_other)
                     return await tool_manage_projects_for_model(context, action="archive", project_id=project_id)
-                if str(status).upper() == "DONE":
-                    # §4SU r3: a project DONE fires the sweep and retires the
-                    # constraints — never past an open task's human gate
-                    from ..core.planning import _human_gate_reason as _hgr
-                    _open_gated = [t for t in (store.list_tasks(project_id) or [])
-                                   if str(t.get("status") or "").upper() != "DONE"
-                                   and _hgr(t.get("postconditions") or []) is not None]
-                    if _open_gated:
-                        return _err("NOT updated: the project cannot be set DONE while "
-                                    + "; ".join(f"task {t['id']} waits for the owner's approval "
-                                                f"({_hgr(t.get('postconditions') or [])})"
-                                                for t in _open_gated[:3])
-                                    + ". Ask the owner and stop.")
                 fields["status"] = status
             if kind:
                 fields["kind"] = kind
@@ -3979,21 +3730,6 @@ async def tool_manage_projects(
             # rmtree under a running service left orphaned processes +
             # registry entries (review H6). Hard delete also purges their
             # writable state dirs ("no files left behind").
-            # §4SU r4: a hard delete removes every task — an open human gate
-            # goes only with the owner's own "delete <task id>" for it
-            from ..core.planning import _human_gate_reason as _hgr
-            _held_g = [t for t in (store.list_tasks(rid) or [])
-                       if str(t.get("status") or "").upper() != "DONE"
-                       and _hgr(t.get("postconditions") or []) is not None
-                       and not _owner_released(store, rid, t["id"], context, verbs=(_DELETE_WORD_RE,))]
-            if _held_g:
-                for t in _held_g:
-                    store.log_event(rid, t["id"], "human_gate_parked",
-                                    _gate_park_payload(f"project delete requested: {_hgr(t.get('postconditions') or [])}"))
-                return _err("NOT deleted: " + "; ".join(
-                    f"task {t['id']} waits for the owner's approval ({_hgr(t.get('postconditions') or [])})"
-                    for t in _held_g[:3]) + ". Ask the owner now and stop. The project goes only when the "
-                    "owner's next message names each such task by id: \"delete <task id>\".")
             _tr = _teardown_refusal(context, store.get_project(rid) or {}, "delete")
             if _tr:
                 return _err(_tr)
@@ -4397,6 +4133,7 @@ async def tool_manage_projects(
                 _done_before = plan.tree.nodes[tid].status == TaskStatus.DONE
                 _waive_note = ""
                 _post_waiver = ""
+                _deliv_waiver = ""
                 _quote_desc = None
                 # Stale-evidence invalidation (2026-08-01): closing a FAILED
                 # task whose recorded failure is a MECHANICAL check (a parse/
@@ -4493,6 +4230,7 @@ async def tool_manage_projects(
                         continue
                     _waive_note = _verdict.waived.get("model_run", "")[:300]
                     _post_waiver = _verdict.waived.get("postconditions", "")
+                    _deliv_waiver = _verdict.waived.get("deliverable", "")
                 # Constraint JUDGMENT gate (2026-07-08): the evidence gate
                 # above only checks that result text EXISTS — the chess
                 # session showed the model happily supplies evidence prose
@@ -4516,9 +4254,12 @@ async def tool_manage_projects(
                     _decl_a = declared_deliverable(_desc_for_gate)
                     if _decl_a and _decl_a not in _audit_rels:
                         _audit_rels.append(_decl_a)
-                _c_over_used = bool(st_enum == TaskStatus.DONE and _c_over and task_constraints
-                                    and _files_for_task(store, project_id, tid, _audit_rels))
-                if (st_enum == TaskStatus.DONE and task_constraints and not _c_over):
+                # §4UI: the audit runs even with an override — an override
+                # only goes over a REAL refusal, and only once the OWNER
+                # approved it (a constraint is the owner's word; the agent's
+                # override used to skip the audit with no one asked)
+                _c_over_used = False
+                if (st_enum == TaskStatus.DONE and task_constraints):
                     # Audit ONLY the files THIS task produced.
                     #
                     # This used to pass the project-wide file collector from
@@ -4577,7 +4318,15 @@ async def tool_manage_projects(
                                                    + " (the task stays DONE: this re-close changed nothing)"),
                                         "fix": "fix the files so they honour the constraints"})
                         continue
-                    if (_task_files and _task_audit is not None
+                    if (_task_files and _task_audit is not None and not _task_audit[0]
+                            and _c_over and _owner_turn_now()):
+                        # §4UK (operator 11-12: no confirmations): in the owner's own turn the agent's stated
+                        # exception goes through at once and is RECORDED (event + ledger) — never parked for
+                        # an approval. An unattended turn still cannot go over a constraint.
+                        _c_over_used = True
+                        _record_constraint_override(store, project_id, tid, _c_over,
+                                                    _task_audit[1] if len(_task_audit) > 1 else "")
+                    elif (_task_files and _task_audit is not None
                             and not _task_audit[0]):
                         judged_violations.append(tid)
                         _reason = _task_audit[1] if len(_task_audit) > 1 else ""
@@ -4585,8 +4334,9 @@ async def tool_manage_projects(
                             judged_violation_reasons.append(_reason)
                         refused.append({"task_id": tid, "gate": "constraints",
                                         "reason": str(_reason or "the files break a constraint")[:400],
-                                        "fix": "fix the files so they honour the constraints — or, only with the "
-                                               "user's approval, override={\"constraints\": \"<why>\"}"})
+                                        "fix": "fix the files so they honour the constraints — or, in the "
+                                               "owner's own conversation, pass override={\"constraints\": "
+                                               "\"<why>\"} to go over it (recorded, no approval needed)"})
                         continue
                 # Register deliverables BEFORE flipping the task to DONE.
                 # update_status can roll the whole project to DONE on this
@@ -4622,19 +4372,11 @@ async def tool_manage_projects(
                     _res_text = (result or live_evidence)
                     if _waive_note:
                         _res_text = f"{str(_res_text or '').strip()} [not model data: {_waive_note}]".strip()
-                    # §4SU Phase 0 (audit A): a HUMAN_GATE is approved only
-                    # explicitly — the OWNER's turn closing a task an EARLIER
-                    # request parked. A second identical close in the same
-                    # turn used to count as the owner's approval.
-                    _approved = (st_enum == TaskStatus.DONE
-                                 and _human_gate_approved(store, project_id, tid,
-                                                          plan.tree.nodes[tid].status, context))
                     # ON the loop (r2: a worker thread opened a cancel point
                     # between the write and its records below; the roll-up's
                     # close check measured ~30 ms on a 3,000-file workspace)
                     plan.update_status(tid, st_enum, result=_res_text,
                                        failure_reason=failure_reason,
-                                       human_approved=_approved,
                                        postconditions_waived=bool(_post_waiver))
                     _after = plan.tree.nodes[tid].status
                     if _after == TaskStatus.DONE and not_closed:
@@ -4646,7 +4388,8 @@ async def tool_manage_projects(
                     # and the events (the owner reads both)
                     if st_enum == TaskStatus.DONE and _after == TaskStatus.DONE and not _done_before:
                         closed_now.append(str(tid))
-                        for _g, _why_w in (("model_run", _waive_note), ("postconditions", _post_waiver),
+                        for _g, _why_w in (("deliverable", _deliv_waiver),
+                                           ("model_run", _waive_note), ("postconditions", _post_waiver),
                                            ("constraints", _c_over if _c_over_used else "")):
                             if not _why_w:
                                 continue
@@ -4664,17 +4407,11 @@ async def tool_manage_projects(
                                            "why": str(plan.tree.nodes[_rp].result_summary or "")[:300],
                                            "waiting": plan.tree.nodes[_rp].wait_code})   # §4SU Phase 3
                     if st_enum == TaskStatus.DONE and _after != TaskStatus.DONE:
-                        from ..core.planning import _human_gate_reason as _hgr
-                        _gr = _hgr(plan.tree.nodes[tid].postconditions)
-                        _why_not = (f"human gate: {_gr}" if _after == TaskStatus.NEEDS_USER and _gr
-                                    else (plan.tree.nodes[tid].failure_reason
-                                          or plan.tree.nodes[tid].result_summary or ""))
+                        _why_not = (plan.tree.nodes[tid].failure_reason
+                                    or plan.tree.nodes[tid].result_summary or "")
                         not_closed.append({"task_id": tid, "status": _after.value,
                                            "why": str(_why_not)[:300],
                                            "waiting": plan.tree.nodes[tid].wait_code})        # §4SU Phase 3
-                        if _after == TaskStatus.NEEDS_USER:
-                            store.log_event(project_id, tid, "human_gate_parked",
-                                            _gate_park_payload(_why_not))
                         # files registered for a close that FAILED are not the
                         # project's deliverables (audit B); a gate PARK keeps
                         # them (r1 M2: the owner's approval close carries no
@@ -4730,22 +4467,43 @@ async def tool_manage_projects(
                     # call, closed the task with its file never written
                     from ..core.task_deliverable import declared_deliverable as _decl
                     _old_promise = _decl((store.get_task(tid) or {}).get("description"))
+                    # §4UI: unless this call closes the task and retracts the
+                    # file with a recorded reason (override.deliverable) —
+                    # then the path-less rewrite is the new plan
+                    from ..core.experiment_gate import MIN_WAIVER_CHARS as _MWC
+                    # r1 MAJOR 2: only in the call that CLOSES the task — its
+                    # deliverable gate ran on the old path and the waiver was
+                    # recorded there; a retraction in a non-closing call left
+                    # no record and no path for the next DONE to check
+                    # (r2 m2: and only when the waiver was USED on a first
+                    # close — that is when its record is written)
+                    _retracts = (st_enum == TaskStatus.DONE
+                                 and plan.tree.nodes[tid].status == TaskStatus.DONE
+                                 and bool(_deliv_waiver) and not _done_before
+                                 and isinstance(override, dict)
+                                 and len(str(override.get("deliverable") or "").strip()) >= _MWC)
                     extras["description"] = (f"{description.rstrip()} → {_old_promise}"
                                              if _old_promise and not _decl(description)
+                                             and not _retracts
                                              else description)
                 if alternatives is not None:
                     extras["alternatives"] = alternatives
                 if postconditions is not None:
-                    # §4SU r1 C1: a HUMAN_GATE is the owner's — a rewrite
-                    # cannot drop it (dropping it closed the gate in one turn)
-                    from ..core.planning import _human_gate_reason as _hgr
-                    _kept_gates = [str(p) for p in (plan.tree.nodes[tid].postconditions or [])
-                                   if _hgr([p]) is not None and str(p) not in [str(x) for x in postconditions]]
-                    extras["postconditions"] = list(postconditions) + _kept_gates
+                    extras["postconditions"] = list(postconditions)
                 if constraints is not None:
                     extras["constraints"] = constraints
                 if _task_kind_given:
                     extras["kind"] = task_kind          # §4SU Phase 2
+                    # §4UI: a retype is remembered — the model-run gate trusts
+                    # only a kind the plan declared (experiment_gate.planned_kind)
+                    _old_kind = str((store.get_task(tid) or {}).get("kind") or "")
+                    if _old_kind != str(task_kind or ""):
+                        try:
+                            store.log_event(project_id, tid, "kind_changed",
+                                            {"from": _old_kind, "to": str(task_kind or ""),
+                                             "req": _current_request_id()})
+                        except Exception:  # noqa: BLE001
+                            logger.debug("kind change not recorded", exc_info=True)
                 if extras:
                     store.update_task(tid, **extras)
                 updated.append({k: store.get_task(tid).get(k)
@@ -4881,11 +4639,6 @@ async def tool_manage_projects(
             _new = [d for d in subtasks if d and str(d).strip()]
             if not _new:
                 return _err("NOT replanned: every subtask is blank. Nothing changed.")
-            _rp = store.get_project(project_id) or {}
-            if len(_new) > 1 and _is_cohesive_single_file(_rp.get("title"), _rp.get("goal")):
-                return _err("NOT replanned: this is a SINGLE-FILE deliverable — do not split it into "
-                            "tasks; build the whole file in one turn. Nothing changed.")
-            from ..core.planning import _human_gate_reason as _hgr
             _all = store.list_tasks(project_id) or []
             _kids: Dict[str, List[str]] = {}
             for _t in _all:
@@ -4915,16 +4668,6 @@ async def tool_manage_projects(
             if _running:
                 return _err(f"NOT replanned: task(s) {', '.join(_running[:3])} are running now — "
                             "wait for the step to finish, then replan. Nothing changed.")
-            _gated = [t for t in _drop if _hgr(t.get("postconditions") or []) is not None
-                      and not _owner_released(store, project_id, t["id"], context, verbs=(_DELETE_WORD_RE,))]
-            if _gated:
-                for _t in _gated:
-                    store.log_event(project_id, _t["id"], "human_gate_parked",
-                                    _gate_park_payload(f"replan requested: {_hgr(_t.get('postconditions') or [])}"))
-                return _err("NOT replanned: " + "; ".join(
-                    f"task {_t['id']} waits for the owner's approval ({_hgr(_t.get('postconditions') or [])})"
-                    for _t in _gated[:3]) + ". Ask the owner and stop: it is removed only when their next "
-                    "message names it by id: \"delete <task id>\". Nothing changed.")
             _drop_ids = {t["id"] for t in _drop}
             # r1 C1/C2/M1/m1: the old open tasks are deleted only AFTER the new
             # plan is laid down (task_decompose below) — deleting first rolled
@@ -4962,23 +4705,6 @@ async def tool_manage_projects(
             # AND decompose, or decomposes twice — observed live: duplicate
             # Core Shell / File Explorer that then failed).
             if not target_id:
-                # A cohesive single-file deliverable must NOT be fanned out
-                # into per-feature tasks (they'd merge into one file and
-                # collide). Refuse the split and steer to a one-turn build.
-                _proj = store.get_project(project_id) or {}
-                if (_is_cohesive_single_file(_proj.get("title"), _proj.get("goal"))
-                        and len([d for d in subtasks if d and d.strip()]) > 1):
-                    return _ok({
-                        "created": [],
-                        "refused": True,
-                        "agent_instruction": (
-                            "This is a SINGLE-FILE deliverable — do NOT split it "
-                            "into per-feature tasks (they would have to merge "
-                            "into one file and collide, breaking the page). "
-                            "Build the WHOLE file yourself in ONE turn instead "
-                            "(write it directly with file_system); keep it as a "
-                            "single task."),
-                    })
                 if _replan is not None:
                     # replan: the new plan IS the plan — no dedupe against the
                     # open tasks it replaces (r1 M1: the dedupe ran against
@@ -5099,8 +4825,11 @@ async def tool_manage_projects(
                         "ONLY the tasks in `tasks` to the user."
                     ),
                 }
-            return _ok({"awaits_go_ahead": True,      # §4SU Phase 4: a plan for the user — the turn ends
-                        "created": ids,               # here (FIRST key: read from a truncated result)
+            return _ok({"plan_shown": True,           # §4SU Phase 4 / §4UI r1 M3: a plan was made; the
+                        # PACING rule decides whether the turn ends (a neutral key: "awaits_go_ahead"
+                        # told the model to stop when the message also asked for the work).
+                        # FIRST key: the trailing-promise steer reads it from a truncated result
+                        "created": ids,
                         **_dropped_note,
                         # id+description pairs (2026-07-25, req f59a793d):
                         # bare ids made this output unverifiable — the
@@ -5119,11 +4848,9 @@ async def tool_manage_projects(
                         **({"replanned": _replanned} if _replanned else {}),
                         "constraints": decompose_constraints,
                         "agent_instruction": (
-                            f"Plan created with {len(ids)} task(s). STOP here: "
-                            "present this task list to the user and wait for "
-                            "direction. DO NOT start executing — advance ONE "
-                            "task per explicit go-ahead (e.g. 'proceed to next "
-                            "task'), never the whole tree in one turn."
+                            f"Plan created with {len(ids)} task(s). Pacing: "
+                            "follow the PACING rule in the CURRENT "
+                            "PROJECT block."
                         )})
 
         if act == "task_next":
@@ -5813,31 +5540,6 @@ async def tool_manage_projects(
             _rg = _released_guard(store, _t.get("project_id"))
             if _rg:
                 return _err(_rg)
-            from ..core.planning import _human_gate_reason as _hgr
-            # §4SU r1 C1 / r2 C1-C2: deleting a task removes its whole SUBTREE;
-            # every open HUMAN_GATE in it needs the owner's release — the same
-            # rule as approving it (put to them by an earlier request, their yes now)
-            _pid_t = _t.get("project_id")
-            _all = store.list_tasks(_pid_t) or []
-            _sub, _frontier = {task_id}, [task_id]
-            while _frontier:
-                _cur = _frontier.pop()
-                for _c in _all:
-                    if _c.get("parent_id") == _cur and _c["id"] not in _sub:
-                        _sub.add(_c["id"]); _frontier.append(_c["id"])
-            _gated = [_c for _c in _all if _c["id"] in _sub
-                      and str(_c.get("status") or "").upper() != "DONE"
-                      and _hgr(_c.get("postconditions") or []) is not None]
-            _held = [_c for _c in _gated if not _owner_released(
-                store, _pid_t, _c["id"], context, verbs=(_DELETE_WORD_RE,))]
-            if _held:
-                for _c in _held:
-                    store.log_event(_pid_t, _c["id"], "human_gate_parked",
-                                    _gate_park_payload(f"delete requested: {_hgr(_c.get('postconditions') or [])}"))
-                return _err("NOT deleted: " + "; ".join(
-                    f"task {_c['id']} waits for the owner's approval ({_hgr(_c.get('postconditions') or [])})"
-                    for _c in _held[:3]) + ". Ask the owner now and stop. It goes only when the owner's next message "
-                    "names it by id: \"delete <task id>\" (a plain yes does not).")
             if not store.delete_task(task_id):
                 return _err(f"delete failed for task {task_id}")
             store.log_event(_t.get("project_id"), task_id, "task_deleted",
@@ -6203,7 +5905,7 @@ async def tool_manage_projects(
                     ][:10]
                     if _adv_payload["failed_tasks"]:
                         _adv_payload["agent_instruction"] += (
-                            " To fix a failed task: repair its deliverable, "
+                            " When the user wants a failed task fixed: repair its deliverable, "
                             "then task_update it with status=done and a "
                             "`result` naming the evidence (a stale recorded "
                             "failure is re-checked live), or revise it with "
@@ -6350,12 +6052,13 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "MULTIPLE files AND multiple turns — a SINGLE-FILE deliverable (even a large one) is written "
             "with file_system, no project. Past similar projects in memory are NOT a reason to create one. Never create twice: if a CURRENT PROJECT is shown, work on it "
             "(replan for a new plan of the same project). "
-            "PACING: after create / task_decompose / replan, present the plan and STOP; one task per "
-            "go-ahead; autoadvance count=N only when the user asks for several. "
+            "PACING: once a project is active, its CURRENT PROJECT block gives the one pacing rule "
+            "(a message that asks for the project AND the work is the go-ahead). create takes "
+            "`subtasks` too, so create + plan is one call. "
             "A task is DONE only when its work is really complete; a refused close comes back in "
             "`refused` with the fix. "
-            "release and delete return a PREVIEW + confirm_token: ask the user, repeat with the token only "
-            "after their yes. Prefer archive (reversible) to delete. autopilot and budget only on the "
+            "release, unrelease and delete run at once when the user asks (no confirmation). Prefer archive "
+            "(reversible) to delete when the user did not say delete. autopilot and budget only on the "
             "user's request. "
             "Actions: create · switch · status · get · list · update · archive · resume · delete · "
             "replan (subtasks = the NEW plan; keeps done tasks, their files and the research) · "
@@ -6363,7 +6066,7 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "task_update (task_ids=[…] for many) · task_delete · task_list · autoadvance (count) · "
             "autopilot (enabled) · budget · ledger · config · describe_file (when you create or work out a "
             "file) · unregister_file · artifact_list · research (topic/topics) · release (DONE→RELEASED "
-            "when the USER confirms it works; directions) · create_version (change a RELEASED project) · "
+            "when the user says it works or asks for it; directions) · create_version (change a RELEASED project) · "
             "constraint_retire · promote_from_context (after the user accepted the offer)."
         ),
         "parameters": {
@@ -6393,7 +6096,8 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "result": {"type": "string", "description": "task_update DONE: what was done / shown."},
                 "override": {"type": "object", "additionalProperties": {"type": "string"},
                              "description": "task_update DONE: {gate: reason} for a refused gate that may be "
-                                            "waived (model_run, postconditions, constraints); recorded."},
+                                            "waived (deliverable, model_run, postconditions, constraints); "
+                                            "recorded. deliverable = the task no longer makes its declared file."},
                 "failure_reason": {"type": "string"},
                 "subtasks": {"type": "array",
                              "items": {"anyOf": [
@@ -6413,7 +6117,6 @@ MANAGE_PROJECTS_TOOL_DEF = {
                                  "description": "task_update DONE: files to KEEP when the project finishes."},
                 "status_filter": {"type": "string"},
                 "context_summary": {"type": "string", "description": "promote_from_context: the chat's gist."},
-                "confirm_token": {"type": "string", "description": "release/delete: only after the user's yes."},
                 "enabled": {"type": "boolean"},
                 "count": {"type": "string", "description": "autoadvance: '3' or 'all'."},
                 "ledger": {"type": "string",

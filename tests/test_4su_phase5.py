@@ -183,15 +183,6 @@ async def test_a_rewritten_task_is_rebuilt_not_rechecked(tmp_path):
     assert len(calls) == 2
 
 
-async def test_a_gate_added_since_the_hold_takes_the_gate_path(tmp_path):
-    store, pid, tid, exe, calls = await _held(tmp_path)
-    store.update_task(tid, postconditions=["HUMAN_GATE: cto approval"])
-    res = await PA.advance_once(_ctx(store), pid, tool_runner=AsyncMock(return_value=""), coding_executor=exe,
-                                owner_requested=True)
-    assert res.classification != "recheck" and store.get_task(tid)["status"] == "NEEDS_USER"
-    assert store.latest_task_event(pid, tid, ("human_gate_triggered",)) is not None
-
-
 async def test_an_unmet_postcondition_reruns_instead_of_failing(tmp_path):
     store, pid, tid, exe, calls = await _held(tmp_path)
     store.update_task(tid, postconditions=["benchmark report written"])
@@ -254,8 +245,11 @@ async def test_the_real_batch_moves_past_an_experiment_to_independent_work(tmp_p
     store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
     pid = store.create_project("Study", goal="Compare how Gemma answers three prompts")
     store.update_project(pid, status="ACTIVE")
+    first = store.add_task(pid, "Set up the bibliography folder")
     exp = store.add_task(pid, "Run the three prompts on Gemma with probe_model")
-    other = store.add_task(pid, "Collect the citation list of related papers")
+    # §4UI: a later task runs past the experiment when it DECLARES what it
+    # waits on (an undeclared later peer may be the experiment's analysis)
+    other = store.add_task(pid, "Collect the citation list of related papers", depends_on=[first])
     runs = []
 
     async def runner(name, args):

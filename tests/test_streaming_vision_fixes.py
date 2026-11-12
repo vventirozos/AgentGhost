@@ -4,15 +4,16 @@ import json
 from unittest.mock import MagicMock, AsyncMock, patch
 from pathlib import Path
 
-from src.ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT
+from src.ghost_agent.core.prompts import SYSTEM_PROMPT
 from src.ghost_agent.tools.vision import tool_vision_analysis
 from src.ghost_agent.core.agent import GhostAgent, GhostContext
 
 
 def test_code_system_prompt_hardened():
     """Verify that the prompt requires exact Markdown formatting and raw filenames."""
-    assert "![Image](/api/download/filename.ext)" in SPECIALIST_SYSTEM_PROMPT
-    assert "Use the raw filename" in SPECIALIST_SYSTEM_PROMPT
+    # §4UI: the main prompt carries it (the coding persona is gone)
+    assert "![Image](/api/download/" in SYSTEM_PROMPT
+    assert "Use the raw filename" in SYSTEM_PROMPT
 
 @pytest.mark.asyncio
 async def test_vision_analysis_path_hallucination_guard():

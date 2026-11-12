@@ -51,12 +51,6 @@ def test_the_owner_can_add_on_demand_fields(tmp_path):
     assert "BMW" not in pm.get_context_string()
 
 
-def test_the_coding_persona_gets_the_preferences_only(tmp_path):
-    from ghost_agent.core.agent import _specialist_profile
-    out = _specialist_profile(SimpleNamespace(profile_memory=_profile(tmp_path)), "")
-    assert "ripgrep" in out and "elena" not in str(out).lower() and "athens" not in str(out).lower()
-
-
 def test_the_profile_closes_the_system_prompt():
     """Fails where {{PROFILE}} sat at char 226 and any change re-prefilled
     ~20k characters."""

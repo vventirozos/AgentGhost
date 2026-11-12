@@ -247,8 +247,9 @@ def test_a_turn_gets_the_room_only_when_its_time_could_hold_it(ceiling, elapsed,
     assert A.turn_room_fits_time(ceiling, elapsed) is want
 
 
-async def test_a_slack_request_keeps_16k(agent, monkeypatch):
-    # world: the 30-min Slack budget is never consulted when the turn is sized
+async def test_a_slack_request_gets_what_its_time_can_hold(agent, monkeypatch):
+    # §4UI: was a flat 16k (slack-0c cut at 15.5k); now the 30 min left, less
+    # the report's share, at the floor rule's rate (~22k)
     from ghost_agent.utils.logging import client_deadline_context
     monkeypatch.setattr(A._head_saves, "_http", _props(WIN, []))
     tok = client_deadline_context.set(1800.0)
@@ -256,10 +257,22 @@ async def test_a_slack_request_keeps_16k(agent, monkeypatch):
         limits = await _turns(agent, cuts=0)
     finally:
         client_deadline_context.reset(tok)
-    assert limits[0] == DEFAULT_TOOL_TURN_MAX_TOKENS
+    want = int((1800 - A.TURN_TIME_REPORT_SHARE_S) * A.TURN_TOKENS_PER_S)
+    assert DEFAULT_TOOL_TURN_MAX_TOKENS < limits[0] == want < TOOL_TURN_MAX_TOKENS_CEIL
 
 
-async def test_a_turn_late_in_a_capped_request_keeps_16k(agent, monkeypatch):
+@pytest.mark.parametrize("ceiling,elapsed,want", [
+    (0, 0, None), (float("inf"), 9e9, None), (14400, 0, None),
+    (1800, 0, int(1500 * 65536 / 4500)),
+    (1800, 1400, DEFAULT_TOOL_TURN_MAX_TOKENS),       # the floor, never below
+    (14400, 10000, int(4100 * 65536 / 4500)),
+    ("x", 0, DEFAULT_TOOL_TURN_MAX_TOKENS),
+])
+def test_the_time_cap_follows_the_time_left(ceiling, elapsed, want):
+    assert A.turn_tokens_for_time(ceiling, elapsed) == want
+
+
+async def test_a_turn_late_in_a_capped_request_shrinks_to_its_time(agent, monkeypatch):
     # world: the time already spent is not subtracted from the ceiling
     from ghost_agent.utils import logging as L
     monkeypatch.setattr(A._head_saves, "_http", _props(WIN, []))
@@ -269,4 +282,6 @@ async def test_a_turn_late_in_a_capped_request_keeps_16k(agent, monkeypatch):
     monkeypatch.setattr(L, "request_elapsed_s", lambda rid: 0.0)
     assert await agent._tool_turn_room(payload) == TOOL_TURN_MAX_TOKENS_CEIL
     monkeypatch.setattr(L, "request_elapsed_s", lambda rid: 10000.0)
+    assert await agent._tool_turn_room(payload) == A.turn_tokens_for_time(14400.0, 10000.0)
+    monkeypatch.setattr(L, "request_elapsed_s", lambda rid: 14000.0)
     assert await agent._tool_turn_room(payload) == DEFAULT_TOOL_TURN_MAX_TOKENS

@@ -391,19 +391,8 @@ class ProjectStore:
             rows = conn.execute(
                 "SELECT id, status, result_summary, postconditions_json FROM tasks "
                 "WHERE status IN ('NEEDS_USER', 'BLOCKED', 'PAUSED') AND wait_on = ''").fetchall()
-            from ..core.planning import _human_gate_reason
             for r in rows:
                 on, code, why = wait_from_marks(r["status"], r["result_summary"])
-                # r2: a held row later parked at its HUMAN_GATE kept the hold's
-                # text (the park keeps a non-empty summary) — the gate wins
-                if fold_status(r["status"]) == "NEEDS_USER" and on == "owner_turn":
-                    try:
-                        _pc = json.loads(r["postconditions_json"] or "[]")
-                    except (TypeError, ValueError):
-                        _pc = []
-                    _g = _human_gate_reason(_pc)
-                    if _g:
-                        on, code, why = "owner", "human_gate", str(_g)[:300]
                 # r6: an old BLOCKED row is the cascade's block only when a child
                 # failed and no reason of its own was written; otherwise it is
                 # the model's own block, never lifted automatically
@@ -442,8 +431,13 @@ class ProjectStore:
                  workspace, meta_json, now, now),
             )
             conn.commit()
+        try:      # §4UI: the briefing says "this message asked for it" only in that request
+            from ..utils.logging import request_id_context
+            _req = str(request_id_context.get() or "")
+        except Exception:  # noqa: BLE001
+            _req = ""
         self.log_event(project_id, None, "project_created",
-                       {"title": title, "kind": kind_norm})
+                       {"title": title, "kind": kind_norm, "req": _req})
         if workspace:
             try:
                 Path(workspace).mkdir(parents=True, exist_ok=True)

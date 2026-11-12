@@ -251,12 +251,13 @@ def test_none_is_a_real_answer(tmp_path, value):
 
 # (§4KX r8) the request-wording gate is gone: reset_all is preview → confirm
 # in a later turn — tests/test_forget_confirm_r8.py
-def test_the_reset_all_preview_says_what_it_would_erase_and_erases_nothing():
+def test_reset_all_outside_a_user_request_erases_nothing():
+    """§4UK: no preview any more — but a call with no user request is refused whole."""
     vec = MagicMock()
     vec.collection.count.return_value = 7
     gm = MagicMock()
     out = asyncio.run(M.tool_knowledge_base(action="reset_all", memory_system=vec, graph_memory=gm))
-    assert "vector memory" in str(out) and "7 rows" in str(out) and "episode, lesson" not in str(out)
+    assert str(out).startswith("NOT executed")
     vec.collection.delete.assert_not_called()
     gm.wipe_all.assert_not_called()
 

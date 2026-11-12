@@ -86,11 +86,13 @@ def test_plain_string_and_odd_rows_are_safe():
     assert _awaits_new_message_confirm(["junk"]) is False
 
 
-def test_the_live_closing_sentence_still_reads_as_a_promise():
-    # the detector is unchanged — the exemption lives at the guard
+def test_the_live_closing_sentence_is_an_offer():
+    # §4UI (log review): an action that waits on the user's reply is an offer,
+    # not a pending promise — the detector itself lets it stand now
     reply = ("The skill was not created yet.\n\n"
              "**Reply \"yes\" (or anything confirming) and I'll create it.**")
-    assert _ends_with_action_promise(reply)
+    assert _ends_with_action_promise(reply) == ""
+    assert _ends_with_action_promise("The skill was not created yet. I'll create it now.")
 
 
 CONFIRM_ENDING = ("The skill was not created: the creation guard needs your confirmation in a new message.\n\n"
@@ -125,10 +127,18 @@ async def test_a_confirm_in_a_new_message_refusal_is_not_steered(monkeypatch, tm
     assert "I'll create it" in final
 
 
-async def test_the_same_ending_after_an_ordinary_result_is_still_steered(monkeypatch, tmp_path):
-    """Control: the guard is untouched when nothing asked for a new message."""
+async def test_the_same_ending_after_an_ordinary_result_is_not_steered_either(monkeypatch, tmp_path):
+    """§4UI: a permission offer stands after any result (it was steered when
+    nothing had asked for a new message — 14 log fires, mostly false)."""
     _, model, logged, _, _ = await _drive_with(monkeypatch, tmp_path, [ToolOutcome.ok("skill draft checked")],
                                                _one_call(CONFIRM_ENDING))
+    assert not _steered(logged) and len(model.payloads) == 2
+
+
+async def test_an_unconditional_promise_after_an_ordinary_result_is_steered(monkeypatch, tmp_path):
+    """Control: the guard still fires on a promise that waits on nobody."""
+    _, model, logged, _, _ = await _drive_with(monkeypatch, tmp_path, [ToolOutcome.ok("skill draft checked")],
+                                               _one_call(UNRELATED_PROMISE))
     assert _steered(logged) and len(model.payloads) == 3
 
 

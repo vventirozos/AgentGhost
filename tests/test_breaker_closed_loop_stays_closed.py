@@ -80,23 +80,13 @@ def _is_assign_to(stmt, attr_or_name, value=None):
 
 # ── the three breaker sites raise the flag in the SAME body ───────────
 
-def test_futility_report_tier_raises_the_flag():
+def test_the_coding_breakers_have_no_report_tier():
+    """§4UI: the futility and edit-churn report tiers were removed (advice
+    only) — nothing sets their done-flag or logs a stop."""
     tree = _tree(GhostAgent._dispatch_and_process_tool_batch)
-    bodies = _enclosing_bodies_with(tree, lambda s: _is_assign_to(s, "_futility_report_done", True))
-    assert len(bodies) == 1
-    assert _assigns_flag(bodies[0], True)
-
-
-def test_edit_churn_report_tier_raises_the_flag():
-    tree = _tree(GhostAgent._dispatch_and_process_tool_batch)
-    def is_stop_log(s):
-        return (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
-                and getattr(s.value.func, "id", "") == "pretty_log"
-                and s.value.args and isinstance(s.value.args[0], ast.Constant)
-                and s.value.args[0].value == "Edit Churn Stop")
-    bodies = _enclosing_bodies_with(tree, is_stop_log)
-    assert len(bodies) == 1
-    assert _assigns_flag(bodies[0], True)
+    assert not _enclosing_bodies_with(tree, lambda s: _is_assign_to(s, "_futility_report_done", True))
+    src = ast.unparse(tree)
+    assert "Edit Churn Stop" not in src
 
 
 def test_reserved_report_turn_raises_the_flag():
@@ -240,8 +230,8 @@ async def test_futility_steer_tells_the_model_to_look_the_api_up():
 
 
 @pytest.mark.asyncio
-async def test_futility_report_tier_sets_the_flag_live():
-    """Behavioural twin of the AST pin: drive 6 writes + 4 runs and read the flag."""
+async def test_a_long_rewrite_rerun_cycle_is_never_forced_to_report():
+    """§4UI behavioural twin: 6 writes + 4 runs steer once and force nothing."""
     async def fs(**kw):
         return "SUCCESS: wrote"
 
@@ -254,12 +244,9 @@ async def test_futility_report_tier_sets_the_flag_live():
         seq.append([_write(f"w{i}", "probe.py")])
         if i < 4:
             seq.append([_run(f"r{i}", "probe.py")])
-    forced_at = []
-    for i, calls in enumerate(seq):
+    for calls in seq:
         ts = _ts(calls)
         await agent._dispatch_and_process_tool_batch(ts)
-        if ts.force_final_response:
-            forced_at.append(i)
-    assert forced_at, "report tier never fired"
-    assert agent.context._breaker_forced_final is True
-    assert agent.context._futility_report_done is True
+        assert not ts.force_final_response
+    assert not getattr(agent.context, "_futility_report_done", False)
+

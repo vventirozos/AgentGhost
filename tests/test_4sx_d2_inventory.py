@@ -285,22 +285,6 @@ async def test_the_console_archive_by_patch_tears_down_too(env, fake, monkeypatc
 
 # ------------------------------------------------------------------ preview + status
 
-async def test_the_preview_lists_the_inventory_and_a_grown_inventory_needs_a_new_yes(env, fake, scope, monkeypatch):
-    """review r1 M8."""
-    from ghost_agent.tools import memory as M
-    monkeypatch.setattr(M, "_confirm_allowed", lambda plan: "")   # the owner's yes is not what is tested
-    pid = _pid(env)
-    scope(env.ctx)
-    _ws_server(env, pid)
-    out = json.loads(P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx))
-    assert out["confirmation_needed"] is True and "run" in out["would_also_stop"] and "web" in out["would_also_stop"]
-    tok = out["confirm_token"]
-    _inv(env.ctx).record_create(LAB_D, owner=f"project:{pid}", origin="owner", template="t", label="",
-                                purpose="", host_id="")
-    host = [{"lab_id": LAB_K, "lifetime": "kept", "lineage": "x", "owner": f"project:{pid}"}]
-    again = P._lifecycle_confirmation(env.store, "delete", pid, tok, env.ctx, host)
-    assert again is not None and "gained" in str(again) and f"kept:{LAB_K}" in str(again)
-    assert f"lab:{LAB_D}" not in str(again)
 
 
 async def test_status_shows_the_inventory(env, fake, scope):
@@ -429,37 +413,8 @@ async def test_a_raising_service_state_counts_the_service_live(env, fake, scope,
     assert r.get("deleted") is not True and f"service {pid}:web" in json.dumps(r)
 
 
-async def test_the_preview_names_kept_labs_and_a_lab_turning_kept_needs_a_new_yes(env, fake, scope, monkeypatch):
-    """r2 #3a/#3b: the digest carries what the HOST says; a lab only the host knows is listed."""
-    from ghost_agent.tools import memory as M
-    monkeypatch.setattr(M, "_confirm_allowed", lambda plan: "")   # the owner's yes is not what is tested
-    pid = _pid(env)
-    scope(env.ctx)
-    host = [{"lab_id": LAB_D, "lifetime": "disposable", "owner": f"project:{pid}"},
-            {"lab_id": LAB_K2, "lifetime": "kept", "lineage": "shop", "owner": f"project:{pid}"}]   # no local row
-    out = json.loads(P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx, host))
-    assert LAB_K2 in out["would_also_stop"] and "KEPT, lineage shop" in out["would_also_stop"]
-    tok = out["confirm_token"]
-    host2 = [dict(host[0], lifetime="kept", lineage="x"), host[1]]
-    again = P._lifecycle_confirmation(env.store, "delete", pid, tok, env.ctx, host2)
-    assert again is not None and f"kept:{LAB_D}" in str(again)
 
 
-async def test_the_tokenless_yes_also_re_previews_a_grown_inventory(env, fake, scope, monkeypatch):
-    pid = _pid(env)
-    scope(env.ctx)
-    from ghost_agent.tools import memory as M
-    plan = {"kind": "project_delete", "project_id": pid, "inventory": []}
-    dropped = []
-    monkeypatch.setattr(M, "confirmed_earlier_preview", lambda kind, match: ("t0", plan))
-    monkeypatch.setattr(M, "_drop_plan", lambda t: dropped.append(t))
-    _ws_server(env, pid)                                               # a new server run alone: no new yes
-    assert P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx) is None
-    host = [{"lab_id": LAB_K, "lifetime": "kept", "lineage": "x", "owner": f"project:{pid}"}]
-    out = P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx, host)
-    assert out is not None and "confirmation_needed" in str(out) and dropped == ["t0", "t0"]
-    plan["inventory"] = P._inventory_ids(P._project_inventory(env.ctx, pid, host))
-    assert P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx, host) is None
 
 
 async def test_the_console_archive_reports_what_it_left_up(env, fake, monkeypatch):
@@ -475,19 +430,6 @@ async def test_the_console_archive_reports_what_it_left_up(env, fake, monkeypatc
 
 # ------------------------------------------------------------------ review r3
 
-async def test_new_background_work_or_a_disposable_lab_needs_no_new_yes(env, fake, scope):
-    """r3 #2: only a kept lab or an app run re-asks (D6 M8); churn must not loop the owner."""
-    pid = _pid(env)
-    scope(env.ctx)
-    out = json.loads(P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx, []))
-    _ws_server(env, pid)
-    _inv(env.ctx).record_create(LAB_D, owner=f"project:{pid}", origin="owner", template="t", label="",
-                                purpose="", host_id="")
-    host = [{"lab_id": LAB_D, "lifetime": "disposable", "owner": f"project:{pid}"}]
-    assert P._grew_since_preview(env.ctx, "delete", pid, {"inventory": []}, host) == []
-    app = {"run_id": "r1", "name": "shop", "lifetime": "app", "place": "lab"}
-    assert P._inventory_ids({"runs": [app]}) == ["app:r1", "run:r1"]
-    assert out["confirmation_needed"] is True
 
 
 async def test_a_lab_only_the_host_knew_is_recorded_so_a_later_unreachable_host_refuses(env, fake, scope):
@@ -622,16 +564,6 @@ async def test_the_console_soft_delete_reports_what_it_left_up(env, fake, monkey
     assert (await PR.delete_project(pid2, _Req(env.ctx), hard=False)).status_code == 204
 
 
-async def test_a_yes_while_the_host_is_silent_never_covers_the_labs(env, fake, scope):
-    """r3 m2: a lab may have turned kept; with no answer it cannot be checked."""
-    pid = _pid(env)
-    scope(env.ctx)
-    _inv(env.ctx).record_create(LAB_D, owner=f"project:{pid}", origin="owner", template="t")
-    plan = {"inventory": P._inventory_ids(P._project_inventory(env.ctx, pid))}
-    assert P._grew_since_preview(env.ctx, "delete", pid, plan, None) != []
-    assert P._grew_since_preview(env.ctx, "delete", pid, plan, []) == []
-    _inv(env.ctx).record_destroy(LAB_D, by="t")
-    assert P._grew_since_preview(env.ctx, "delete", pid, plan, None) == []   # no labs: nothing to check
 
 
 async def test_a_replaced_run_is_stopped_by_the_services_step(env, fake, scope, monkeypatch):
@@ -668,16 +600,6 @@ async def test_a_replaced_run_is_stopped_by_the_services_step(env, fake, scope, 
 
 # ------------------------------------------------------------------ review r5 (round-4 findings)
 
-async def test_a_same_turn_token_keeps_the_plan_for_the_owners_real_yes(env, fake, scope):
-    """r4 m2: the growth check ran before the owner's-yes check and dropped the plan."""
-    pid = _pid(env)
-    scope(env.ctx)
-    out = json.loads(P._lifecycle_confirmation(env.store, "delete", pid, None, env.ctx, []))
-    host = [{"lab_id": LAB_K, "lifetime": "kept", "lineage": "x", "owner": f"project:{pid}"}]
-    r = P._lifecycle_confirmation(env.store, "delete", pid, out["confirm_token"], env.ctx, host)
-    assert "gained" not in str(r)                                    # refused as not-the-owner first
-    from ghost_agent.tools.memory import _resolve_plan
-    assert _resolve_plan(out["confirm_token"], "project_delete", match=lambda p: True)[1] is not None
 
 
 async def test_a_lab_on_record_blocks_while_the_host_identity_is_unknown(env, fake, scope):
@@ -896,14 +818,6 @@ async def test_a_non_200_lab_list_with_labs_on_record_blocks(env, fake, scope):
     assert r.get("deleted") is not True and LAB_D in json.dumps(r) and "HTTP 500" in json.dumps(r)
 
 
-async def test_the_model_facing_preview_reads_the_labs_host(env, fake, scope):
-    """N11: the wrapper passes its own host read to the confirmation."""
-    pid = _pid(env)
-    scope(env.ctx)
-    fake.on("GET", "/v1/labs", (200, {"labs": [{"lab_id": LAB_K, "lifetime": "kept", "lineage": "chess",
-                                                "owner": f"project:{pid}"}]}))
-    out = _j(await P.tool_manage_projects_for_model(env.ctx, action="delete", project_id=pid))
-    assert "KEPT, lineage chess" in json.dumps(out), out
 
 
 async def test_the_refusal_says_what_was_already_stopped(env, fake, scope):

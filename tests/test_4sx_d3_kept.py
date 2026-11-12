@@ -103,13 +103,13 @@ async def test_keep_sends_the_projects_lineage_and_records_one_app_run(ctx, fake
     # a second version of the same app: no second row
     fake.on("GET", f"/v1/labs/{LAB2}", (200, _det(lab=LAB2, lifetime="disposable")))
     fake.on("POST", f"/v1/labs/{LAB2}/keep", (200, _det(lab=LAB2, app=_app(state="staged", mounted=False))))
-    out = await _lab(ctx, action="keep", lab_id=LAB2, params={"app": {"name": "shop", "member": "web", "port": 8080}})
+    out = await _lab(ctx, action="keep", lab_id=LAB2, params={"app": {"name": "shop", "member": "web", "port": 8080, "cmd": "./run.sh"}})
     assert "STAGED next version" in str(out) and len(_reg(ctx).rows(OWN, live_only=True)) == 1
 
 
 @pytest.mark.parametrize("params,why", [
-    ({"app": {"name": "shop", "member": "web", "port": 1}, "lineage": "other"}, "lineage is set by the system"),
-    ({"app": {"name": "shop", "member": "web", "port": 1}, "secret_values": {"A": "x"}}, "never passed"),
+    ({"app": {"name": "shop", "member": "web", "port": 1, "cmd": "./run.sh"}, "lineage": "other"}, "lineage is set by the system"),
+    ({"app": {"name": "shop", "member": "web", "port": 1, "cmd": "./run.sh"}, "secret_values": {"A": "x"}}, "never passed"),
     ({"app": {"name": "shop"}}, "keep needs params.app"),
     ("not json", "params must be a JSON object"),
 ])
@@ -123,7 +123,7 @@ async def test_keep_refuses_bad_inputs_before_the_host(ctx, fake, scope, params,
 async def test_keep_of_a_conversation_lab_says_make_it_in_a_project(ctx, fake, scope):
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(owner="conversation:conv1", lifetime="disposable")))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "a", "member": "web", "port": 80}})
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "a", "member": "web", "port": 80, "cmd": "./run.sh"}})
     assert "create the lab there first" in str(out)
 
 
@@ -132,7 +132,7 @@ async def test_keep_refuses_a_name_a_non_app_run_holds(ctx, fake, scope):
     _reg(ctx).add(name="shop", place="workspace", lifetime="server", command="x", port=8000, owner=OWN,
                   origin="owner", backend="services", backend_ref=f"{PID}:shop")
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(lifetime="disposable")))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 80}})
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 80, "cmd": "./run.sh"}})
     assert "already running" in str(out) and not [c for c in fake.calls if c.method == "POST"]
 
 
@@ -501,7 +501,7 @@ async def test_keep_of_an_already_kept_lab_records_its_app(ctx, fake, scope):
     """r1 #3: a keep whose answer was lost — the retry records the row instead of failing with already_kept."""
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(app=_app())))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080}})
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080, "cmd": "./run.sh"}})
     assert "already KEPT" in str(out) and not [c for c in fake.calls if c.method == "POST"]
     assert [r["backend_ref"] for r in _reg(ctx).rows(OWN, live_only=True)] == [f"{PID}/shop"]
 
@@ -510,7 +510,7 @@ async def test_a_keep_with_no_answer_that_landed_is_recorded(ctx, fake, scope):
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(lifetime="disposable")), (200, _det(app=_app())))
     fake.on("POST", f"/v1/labs/{LAB}/keep", L.LabsNoAnswer("timeout"))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080}})
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080, "cmd": "./run.sh"}})
     assert out.status is OutcomeStatus.OK and "KEPT" in str(out), str(out)
     assert len(_reg(ctx).rows(OWN, live_only=True)) == 1
 
@@ -518,7 +518,7 @@ async def test_a_keep_with_no_answer_that_landed_is_recorded(ctx, fake, scope):
 async def test_a_keep_whose_first_read_gets_no_answer_says_nothing_changed(ctx, fake, scope):
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", L.LabsNoAnswer("t"))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080}})
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080, "cmd": "./run.sh"}})
     assert "nothing was changed" in str(out) and out.world_changed is False
 
 
@@ -526,7 +526,7 @@ async def test_a_keep_whose_first_read_gets_no_answer_says_nothing_changed(ctx, 
 async def test_keep_secrets_must_be_a_list_of_names(ctx, fake, scope, secrets):
     """r1 #13: a dict of values would already sit in the tool args."""
     scope(ctx)
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "a", "member": "web", "port": 1},
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "a", "member": "web", "port": 1, "cmd": "./run.sh"},
                                                              "secrets": secrets})
     assert "list of NAMES" in str(out) and fake.calls == []
 
@@ -658,3 +658,53 @@ def test_execute_after_a_deploy_waits_for_it():
     """r1 #13."""
     from ghost_agent.core.agent import _batch_call_depends
     assert _batch_call_depends("execute", {}, "lab", {"action": "deploy"})
+
+
+# ------------------------------------------------------------------ req a3514318: a static site
+
+async def test_keep_with_no_cmd_is_refused_with_the_static_site_recipe(ctx, fake, scope):
+    """req a3514318: kept {name, member: web1, port: 80} with no cmd was never up (no process to be
+    alive), and deploy unpacked into /app while the web lab's nginx served /srv/www."""
+    scope(ctx)
+    fake.on("GET", f"/v1/labs/{LAB}", (200, _det(lifetime="disposable")))
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "webos", "member": "web1", "port": 80}})
+    assert out.status == OutcomeStatus.REJECTED
+    assert "params.app.cmd" in str(out) and "python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app" in str(out)
+    assert not [c for c in fake.calls if c.path.endswith("/keep")]           # nothing reached the host
+
+
+async def test_app_status_points_at_where_the_state_is(ctx, fake, scope):
+    scope(ctx)
+    out = await _lab(ctx, action="app", lab_id=LAB, op="status")
+    assert "lab status" in str(out) and "run status" in str(out)
+    assert not fake.calls or not [c for c in fake.calls if "/app/" in c.path]
+
+
+def test_a_failed_probe_names_its_cause():
+    v = L._probe_view({"alive": False, "ok": False, "http_status": 200,
+                       "why": "the app has no cmd: nothing runs, so it is never up"})
+    assert "has no cmd" in v
+    assert L._probe_view({"ok": False, "error": "ConnectionRefusedError"}).endswith("ConnectionRefusedError")
+
+
+async def test_a_lab_kept_before_the_cmd_rule_is_still_adopted(ctx, fake, scope):
+    """review m1: the cmd check runs after the already-kept branch."""
+    scope(ctx)
+    fake.on("GET", f"/v1/labs/{LAB}", (200, _det(app=_app(state="stopped"))))
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 80}})
+    assert "already KEPT" in str(out), out
+
+
+@pytest.mark.parametrize("det,want", [
+    ({"app": {"member": "app", "port": 8080}, "members": [{"name": "app", "ports": [{"container": 9000}]}]}, 8080),
+    ({"members": [{"name": "app", "ports": [{"container": 8080, "host": 20002}]}]}, 8080),
+    ({"members": [{"name": "app", "ports": []}]}, 80),
+])
+async def test_http_with_no_port_uses_the_apps_or_members_port(ctx, fake, scope, det, want):
+    """retest probe-792b62c5: `lab http` with no port probed 80 on a python-app lab serving 8080."""
+    scope(ctx)
+    fake.on("GET", f"/v1/labs/{LAB}", (200, {**_det(), **det}))
+    fake.on("POST", f"/v1/labs/{LAB}/http", (200, {"status": 200, "member": "app", "port": want, "path": "/"}))
+    await _lab(ctx, action="http", lab_id=LAB, member="app")
+    sent = [c for c in fake.calls if c.path.endswith("/http")][0].json
+    assert sent["port"] == want

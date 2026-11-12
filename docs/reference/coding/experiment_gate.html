@@ -107,6 +107,13 @@
 
   <h2 id="tests">Tests</h2>
   <p><code>tests/test_4st_experiment_gate.py</code> covers the trigger, backing, waiver, build, research and quarantine paths, including the b45ec99f shapes. Battery: <code>scripts/mutate_4st.py</code> (coverage-parallel, with no-op and known-bad controls).</p>
+  <h2 id="kind-4ui">A declared kind is trusted only from the plan (§4UI, 2026-11-12)</h2>
+  <ul>
+    <li><code>NOT_EXPERIMENT_KINDS = {"write", "research"}</code>: a task of these kinds whose files are all plain text (<code>.md .txt .rst .tex</code>: the declared deliverable, the delivered files and any file the result text names; not <code>.html</code>, whose tags hide the label lines) skips the word test (a "Test the login form" write-up is not a model experiment); its file is still read for transcript shapes. With no declared file or a non-prose one (<code>results/answers.json</code>) the words still decide (review r1 MAJOR 1).</li>
+    <li><code>planned_kind(store, pid, tid, kind)</code>: the kind counts only when it was set at plan time. <code>task_update</code> logs a <code>kind_changed</code> event when the kind changes; after one, any kind other than <code>model_run</code> returns "" and the words decide again, so a task cannot be relabelled to escape the gate.</li>
+    <li>A planned <code>build</code> still keeps the hold.</li>
+  </ul>
+
 </main>
 </body>
 </html>

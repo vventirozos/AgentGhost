@@ -287,26 +287,11 @@ def test_a_constraint_from_a_readme_is_not_the_users(owner_turn):
 
 # ── Class 3: a confirm is the user's yes ──
 
-@pytest.mark.parametrize("msg,ok", [
-    ("yes", True), ("y", True), ("ναι", True), ("βεβαίως", True), ("1, 3", True), ("ok go ahead", True),
-    ("go for it", True), ("yes I don't need them anymore", True),
-    ("no thanks, what's the weather tomorrow?", False), ("first read this article", False),
-    ("yes but wait", False), ("όχι", False), ("", False),
-    ("remove the duplicates from my CSV", False), ("what's the right way to cook rice?", False),
-    ("fine, what time is it in Tokyo?", False), ("reset my router how?", False),
-    ("is all of it backed up?", False), ("can you confirm the time?", False),
-])
-def test_only_a_yes_confirms(msg, ok):
-    from ghost_agent.tools.memory import user_confirms
-    assert user_confirms(msg) is ok
-
-
-def test_a_confirm_needs_the_users_yes_and_nothing_read_first(owner_turn):
+def test_a_deletion_needs_nothing_read_first(owner_turn):
+    """§4UK: no yes is needed any more — only the outside-content wall stays."""
     from ghost_agent.tools.memory import _confirm_allowed
     plan = {"rid": "own-0", "token": "ab12cd34"}
     owner_turn.said("no thanks, what's the weather tomorrow?")
-    assert _confirm_allowed(plan)
-    owner_turn.said("yes")
     assert _confirm_allowed(plan) is None
     owner_turn.read()
     assert "outside content" in _confirm_allowed(plan)

@@ -86,11 +86,10 @@ async def test_same_error_accumulates_across_command_heads():
     steer_at = [i for i, a, f, _ in events if a and not f]
     report_at = [i for i, a, f, _ in events if a and f]
     assert steer_at == [EXECUTE_SAME_ERROR_STEER - 1]           # 3rd run: heads python3, python3, for
-    assert report_at == [EXECUTE_SAME_ERROR_HARD_STOP - 1]       # 5th run, heads mixed
+    assert report_at == []                                       # §4UI: the hard tier is advice only
+    assert not any(f for _i, _a, f, _t in events)
     steer_text = events[steer_at[0]][3]
     assert "SpecError: [pl]" in steer_text and "`python3`" in steer_text and "`for`" in steer_text
-    report_text = events[report_at[0]][3]
-    assert "SpecError: [pl]" in report_text and "STOP trying variations" in report_text
     # one signature for the whole class, keyed on the error
     sigs = [k for k in strikes.action_sigs if k.startswith("execute|")]
     assert sigs == [f"execute|{SAME_ERROR_TARGET_SUFFIX}|" + sigs[0].rsplit("|", 1)[1]]

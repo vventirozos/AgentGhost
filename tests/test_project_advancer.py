@@ -46,16 +46,12 @@ def context(tmp_path, store):
     ("Write unit tests for the parser", "coding"),
     ("Refactor the job queue", "coding"),
     ("Fix the off-by-one in pagination", "coding"),
-    ("Approve the final migration plan", "needs_user"),
-    ("Publish the release notes", "needs_user"),
+    ("Approve the final migration plan", "research"),   # §4UK: no word gate
+    ("Publish the release notes", "research"),
     ("Xyzzy foo bar baz", "research"),  # default fallback
 ])
 def test_classify_task_buckets(desc, expected):
     assert classify_task(desc) == expected
-
-
-def test_classify_needs_user_wins_over_coding():
-    assert classify_task("Implement and approve the change") == "needs_user"
 
 
 @pytest.mark.parametrize("desc", [
@@ -69,11 +65,6 @@ def test_classify_strong_code_file_beats_research_verb(desc):
     # An explicit filename to PRODUCE + a build verb must route to coding even
     # when a research verb appears in the same sentence.
     assert classify_task(desc) == "coding"
-
-
-def test_classify_needs_user_still_wins_over_strong_code_file():
-    # A human gate outranks the strong-coding signal.
-    assert classify_task("Publish report.md to the site") == "needs_user"
 
 
 def test_classify_research_about_a_file_without_build_verb_stays_research():
@@ -199,21 +190,6 @@ async def test_advance_coding_task_without_build_path_fails(context, store):
     assert store.get_task(tid)["status"] == "FAILED"
     # it never reached for a web_search to fake progress
     assert seen.get("name") != "web_search"
-
-
-async def test_advance_needs_user_marks_task(context, store):
-    pid = store.create_project("P")
-    tid = store.add_task(pid, "Approve the production deploy")
-    called = []
-
-    async def runner(name, args):
-        called.append(name)
-        return "should not be called"
-
-    r = await advance_once(context, pid, tool_runner=runner)
-    assert r.classification == "needs_user"
-    assert store.get_task(tid)["status"] == "NEEDS_USER"
-    assert called == []  # never invoked a tool
 
 
 async def test_advance_tool_failure_marks_task_failed(context, store):

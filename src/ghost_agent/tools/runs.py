@@ -341,7 +341,8 @@ async def _app_op(context, reg, row, origin, op: str) -> ToolOutcome:
     url = a.get("url") or detail.get("url") or ""
     return _out(("" if ok else "RUN ERROR (app_not_up): ") + f"[run {row['name']} app {op}] {a.get('state') or '?'}"
                 + (f" — {url}" if url and op != "stop" else "")
-                + ("" if ok else f" — the check did not pass: {str(probe or a.get('last_error') or '')[:200]}"),
+                + ("" if ok else f" — the check did not pass: "
+                   f"{str(probe.get('why') or a.get('last_error') or probe or '')[:200]}"),
                 OutcomeStatus.OK if ok else OutcomeStatus.FAILED, changed=True,
                 code=None if ok else "run_app_not_up")
 

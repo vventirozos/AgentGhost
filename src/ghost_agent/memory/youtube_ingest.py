@@ -888,15 +888,14 @@ def ingest_youtube(url: str, *, sandbox_dir: Path, memory_system, tor_proxy: Opt
             if _gaps or _stopped:
                 _partial = (" NOTE: the stored transcript is PARTIAL — not transcribed: "
                             + "; ".join(_gaps[:4]) + (f"; stopped early: {_stopped}" if _stopped else "")
-                            + ". To redo the whole video, forget it first (the user confirms), then transcribe again.")
+                            + ". To redo the whole video, forget it first, then transcribe again.")
         except Exception:  # noqa: BLE001
             pass
         return YoutubeIngestResult(True, (
             f"Skipped: this video is already in the knowledge base as '{have}'.{_partial} Read it in order "
             f"with knowledge_base(action='transcript', filename='{have}') or ask about it with "
-            f"action='query'. To transcribe it afresh it must be forgotten first, which the USER confirms: "
-            f"knowledge_base(action='forget', target='{have}') shows them what would go; after their yes, "
-            f"transcribe again."), video_id=vid, filename=have)
+            f"action='query'. To transcribe it afresh, when the user asks for that, forget it first "
+            f"(knowledge_base(action='forget', target='{have}') — it deletes at once) and transcribe again."), video_id=vid, filename=have)
 
     stats = FetchStats()
     stats.deadline = time.monotonic() + FETCH_BUDGET_S       # §4PI (R1-M4)

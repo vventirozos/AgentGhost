@@ -591,6 +591,6 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=19.26" in index
-    assert "workspace.js?v=9.12" in app and "matrix_graph.js?v=19.26" in app
-    assert "sessions.js?v=7.13" in ws and "status.js?v=8.4" in ws
+    assert "app.js?v=19.28" in index
+    assert "workspace.js?v=9.14" in app and "matrix_graph.js?v=19.28" in app
+    assert "sessions.js?v=7.15" in ws and "status.js?v=8.4" in ws

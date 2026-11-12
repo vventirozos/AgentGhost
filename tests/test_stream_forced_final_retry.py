@@ -250,7 +250,9 @@ async def test_a_full_scrub_whose_retry_also_misses_ships_the_honest_fallback():
 
 
 @pytest.mark.asyncio
-async def test_a_task_closed_scrub_still_ships_the_task_complete_sentence_without_a_retry():
+async def test_a_task_closed_scrub_still_ships_the_task_complete_sentence_without_a_retry(monkeypatch):
+    from ghost_agent.core import agent as _A
+    monkeypatch.setattr(_A, "_CLOSE_ENDS_TURN", True)      # §4UI: dormant, pinned with the switch on
     pure = ("<tool_call>\n<function=manage_projects>\n<parameter=action>next</parameter>\n"
             "</function>\n</tool_call>")
     client, _, retries = await _drive([pure], retry_reply="SHOULD NOT APPEAR", task_closed=True)

@@ -224,10 +224,10 @@ def test_verify_ui_steer_present_in_both_prompt_personas():
     which had no verify_ui steer — so the agent kept reaching for bare
     describe_picture there. Both personas must carry the steer, and the
     specialist (which owns the browser guidance) must steer evaluate too."""
-    from ghost_agent.core.prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT
+    # §4UI: one persona now — the main prompt steers both
+    from ghost_agent.core.prompts import SYSTEM_PROMPT
     assert "verify_ui" in SYSTEM_PROMPT
-    assert "verify_ui" in SPECIALIST_SYSTEM_PROMPT
-    assert '"action":"evaluate"' in SPECIALIST_SYSTEM_PROMPT
+    assert "`evaluate` action reads the app's own variables" in SYSTEM_PROMPT
 
 
 async def test_verify_ui_exposed_in_registry():

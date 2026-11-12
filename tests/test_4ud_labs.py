@@ -1041,7 +1041,7 @@ async def test_r2_an_already_kept_lab_loses_its_expiry_too(tmp_path, fake, scope
     inv.record_create(LAB, owner="project:p1", origin="owner", template="t", expires_hard=time.time() + 99)
     kept = _detail(owner="project:p1", lifetime="kept", app={"name": "shop", "state": "up", "lineage": "p1"})
     fake.on("GET", f"/v1/labs/{LAB}", (200, kept))               # an earlier keep landed; its answer was lost
-    r = await L.tool_lab(c, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "app", "port": 8080}})
+    r = await L.tool_lab(c, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "app", "port": 8080, "cmd": "./run.sh"}})
     assert "already KEPT" in r and inv.get(LAB)["expires_hard"] is None
 
 
@@ -1906,7 +1906,7 @@ async def test_bat_a_probe_does_not_destroy_a_kept_lab_outside_a_probe_project_e
     k = _ctx(tmp_path, pid="p2", store=probe_store, conv="")
     scope(k, "probe")
     fake.on("GET", f"/v1/labs/{LAB}", (200, _detail(owner="project:p1", origin="probe")))
-    r2 = await L.tool_lab(k, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "app", "port": 80}})
+    r2 = await L.tool_lab(k, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "app", "port": 80, "cmd": "./run.sh"}})
     assert r2.status is OutcomeStatus.REJECTED and "project:p1" in r2 and _posts(fake, "/keep") == []
 
 

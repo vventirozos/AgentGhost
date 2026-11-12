@@ -22,17 +22,6 @@ async def test_a_plain_render_carries_the_shared_not_seen_note(tmp_path):
     assert RM.UNSEEN_IMAGE_NOTE in str(out) or "WHAT THE PICTURE SHOWS" in str(out)
 
 
-def test_the_memory_confirm_gate_speaks_the_shared_literal():
-    import ghost_agent.tools.memory as M
-    from ghost_agent.utils.logging import request_id_context
-    tok = request_id_context.set("web-4qo-1")
-    try:
-        why = M._confirm_allowed({"rid": "web-4qo-1", "kind": "forget"})
-    finally:
-        request_id_context.reset(tok)
-    assert why and RM.NOT_ANSWERED_YET in why
-
-
 async def test_the_live_health_check_opens_with_the_shared_head(monkeypatch):
     import ghost_agent.tools.system as S
     monkeypatch.setattr(S, "psutil", None, raising=False)

@@ -77,6 +77,12 @@ DEPLOY_MAX_BYTES = 20 * 1024 * 1024
 #: never shipped to a lab (secrets in .env*, caches, VCS)
 DEPLOY_EXCLUDE = (".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache")
 APP_OPS = ("start", "stop", "restart")
+#: req a3514318: the refusal for a keep with no app.cmd — with the recipe that works for a static site
+_KEEP_NEEDS_CMD = (
+    "keep needs params.app.cmd — the process labs starts in the app's workdir (/app, where `deploy` unpacks "
+    "the folder), probes on app.port and restarts. A STATIC site (HTML/JS/CSS): create a `python-app` lab and "
+    "keep it with app {name, member: \"app\", port: 8080, cmd: \"python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app\"}. "
+    "A `web` lab's nginx serves /srv/www, holds port 80 and is not an app: deploy does not change what it serves")
 MEMBER_OPS = ("stop", "start", "restart", "kill", "pause", "unpause", "isolate", "rejoin")
 _LAB_ID_RE = re.compile(r"^lab_[0-9a-f]{8}$")
 #: a member name — the service's own NAME_RE (ghost_labs/templates.py). It goes
@@ -1251,6 +1257,26 @@ def _app_status_line(a: Dict[str, Any]) -> str:
     return "; ".join(bits)
 
 
+async def _default_port(context, origin: str, lab_id: str, member: str) -> int:
+    """§4UI-labs: the port `http`/`screenshot` use when none is given — the kept app's port on its member, else
+    the member's first published port, else 80 (a python-app lab's kept site answers on 8080; probing 80 first
+    cost a refused call in the retest). Never raises (80)."""
+    try:
+        st, det = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin)
+        if st != 200 or not isinstance(det, dict):
+            return 80
+        app = det.get("app") if isinstance(det.get("app"), dict) else {}
+        if app.get("port") and str(app.get("member") or "") == str(member or ""):
+            return int(app["port"])
+        for m in det.get("members") or []:
+            if isinstance(m, dict) and str(m.get("name") or "") == str(member or "") and m.get("ports"):
+                p0 = m["ports"][0]
+                return int(p0.get("container") if isinstance(p0, dict) else p0)
+    except Exception:  # noqa: BLE001
+        pass
+    return 80
+
+
 def _probe_view(p) -> str:
     if not isinstance(p, dict):
         return ""
@@ -1258,7 +1284,7 @@ def _probe_view(p) -> str:
         return "probe OK"
     if p.get("ok") is None:
         return str(p.get("note") or "probe not run")
-    return f"probe FAILED {str(p.get('error') or p.get('detail') or '')[:200]}".rstrip()
+    return f"probe FAILED {str(p.get('why') or p.get('error') or p.get('detail') or '')[:200]}".rstrip()
 
 
 async def _record_app_run(context, origin: str, det: Dict[str, Any]) -> str:
@@ -1350,6 +1376,13 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
         if not lab_owner.startswith("project:"):
             return bad(f"{lab_id} belongs to {lab_owner or 'no project'} — a kept machine is a project's: switch to "
                        "the project and create the lab there first")
+        if not str(app.get("cmd") or "").strip():
+            # req a3514318: a kept app with no cmd is never up — labs starts, watches and restarts the
+            # cmd's process; the template's own server (the `web` lab's nginx on /srv/www) is not the app,
+            # and deploy unpacks into the app's workdir (/app), which that server does not serve. (After the
+            # already-kept branch: a lab kept before this check is still adopted — review m1; after the
+            # project-owner refusal, which decides first — review r2.)
+            return bad(_KEEP_NEEDS_CMD)
         from ..memory.run_registry import registry_for
         reg = registry_for(context)
         clash = reg.live_by_name(lab_owner, str(app["name"])) if reg is not None else None
@@ -1485,7 +1518,8 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
     # app start|stop|restart
     op = str(a.get("op") or "").strip().lower()
     if op not in APP_OPS:
-        return bad(f"app needs op one of {', '.join(APP_OPS)}")
+        return bad(f"app needs op one of {', '.join(APP_OPS)} — the app's state is in `lab status` "
+                   f"(lab_id) or `run status` (name)")
     try:
         st, out = await _call(context, "POST", f"/v1/labs/{lab_id}/app/{op}", origin=origin, timeout=120)
     except LabsNoAnswer as e:
@@ -1728,8 +1762,9 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
                            status=OutcomeStatus.OK, world_changed=False)
 
     if action == "http":
+        _port = a["port"] if a["port"] not in (None, "", 0, "0") else await _default_port(context, origin, lab_id, a["member"])
         st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/http", origin=origin, timeout=40,
-                               json_body={"member": a["member"], "port": _int(a["port"], 80, 1, 65535),
+                               json_body={"member": a["member"], "port": _int(_port, 80, 1, 65535),
                                           "path": a["path"] or "/", "method": str(a["method"] or "GET").upper()})
         if st != 200:
             return _service_reply(st, body, context, lab_id)
@@ -2174,7 +2209,8 @@ async def _screenshot(context, origin: str, lab_id: str, a: Dict[str, Any]) -> T
     if err:
         return ToolOutcome(f"LAB ERROR (bad_request): {err}", status=OutcomeStatus.REJECTED,
                            reason_code="lab_bad_request", world_changed=False)
-    port = _int(a["port"], 80, 1, 65535)
+    port = _int(a["port"] if a["port"] not in (None, "", 0, "0") else
+                await _default_port(context, origin, a["lab_id"], a["member"]), 80, 1, 65535)
     st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/screenshot", origin=origin, timeout=120,
                            json_body={"member": a["member"], "port": port, "path": a["path"] or "/"})
     if st != 200:
@@ -2610,7 +2646,9 @@ LAB_TOOL_DEFINITION = {
             "`create`; every exec names lab_id + member (`cancel` ends one that is still running; `screenshot` saves a "
             "picture of a member's web page to a workspace .png); `destroy` when "
             "done. A PROJECT's lab can be KEPT as production "
-            "(the owner's call only): `keep` (params.app {name, member, port, cmd}) → `deploy` (params.folder) → it "
+            "(the owner's call only): `keep` (params.app {name, member, port, cmd} — cmd is the app's process, run in "
+            "/app where deploy unpacks; a static site = a python-app lab, port 8080, cmd "
+            "`python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app`) → `deploy` (params.folder) → it "
             "serves on a stable tailnet URL; a new version = a second kept lab, `deploy`, then `switch` "
             "(params.from_lab = the one serving); `rollback`, `backup`/`backups`/`restore` (params.backup_id), "
             "`app` op=start|stop|restart, `rehearse`."),
@@ -2635,7 +2673,7 @@ LAB_TOOL_DEFINITION = {
                                  "to save it (a folder on the member goes into this folder); screenshot: "
                                  "the .png file to write"},
                 "op": {"type": "string", "enum": list(MEMBER_OPS), "description": "member: what to do to it; app: start|stop|restart"},
-                "port": {"type": "integer", "description": "http/screenshot: the member's port (default 80)"},
+                "port": {"type": "integer", "description": "http/screenshot: the member's port (default: the kept app's port, else the member's first published port, else 80)"},
                 "method": {"type": "string", "enum": ["GET", "HEAD"], "description": "http: default GET"},
                 "tail": {"type": "integer", "description": "logs: lines (default 200)"},
                 "ttl_idle_s": {"type": "integer", "description": "create/extend: idle lifetime in seconds"},

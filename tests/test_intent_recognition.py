@@ -24,96 +24,24 @@ def mock_agent():
     agent = GhostAgent(context=ctx)
     return agent
 
-@patch("ghost_agent.core.agent.pretty_log")
-@pytest.mark.asyncio
-async def test_intent_python_specialist(mock_pretty_log, mock_agent):
-    # Test strict word boundary for "sh" (should NOT trigger for "short")
-    message = {"role": "user", "content": "This is a short message."}
-    
-    # We mock run_smart_memory_task to avoid bg tasks
-    mock_agent.run_smart_memory_task = MagicMock()
-    
-    # Use AsyncMock for async method
-    mock_agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {"content": "Ok", "tool_calls": []}}]
-    })
-    
-    # 1. Negative Test: "short" should NOT trigger Python mode
-    #    If it triggered, "Ghost Python Specialist Activated" would be logged.
-    await mock_agent.handle_chat({"messages": [message]}, MagicMock())
-    
-    # Verify NO Python Specialist log
-    logs = [call.args for call in mock_pretty_log.call_args_list]
-    python_mode_logs = [l for l in logs if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    assert len(python_mode_logs) == 0, f"False positive: 'short' triggered Python mode! Logs: {python_mode_logs}"
+# §4UI: the "Ghost Specialist Activated" persona is gone; coding intent
+# still picks the coding node / sampling / sandbox listing, so the
+# classifier's word-boundary behaviour is pinned directly.
+from ghost_agent.core.agent import detect_coding_intent
 
-    # 2. Positive Test: "run python script" SHOULD trigger
-    message2 = {"role": "user", "content": "Please write a python script to calculate pi."}
-    await mock_agent.handle_chat({"messages": [message2]}, MagicMock())
-    
-    logs2 = [call.args for call in mock_pretty_log.call_args_list]
-    python_mode_logs2 = [l for l in logs2 if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    assert len(python_mode_logs2) > 0, "Failed to detect 'python script' intent!"
 
-@patch("ghost_agent.core.agent.pretty_log")
-@pytest.mark.asyncio
-async def test_intent_dba_routing(mock_pretty_log, mock_agent):
-    # Negative Test: "mysql" shouldn't trigger naive substring matching
-    
-    message = {"role": "user", "content": "I am working on mysql optimization."}
-    mock_agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {"content": "Ok", "tool_calls": []}}]
-    })
-    
-    await mock_agent.handle_chat({"messages": [message]}, MagicMock())
-    
-    logs = [call.args for call in mock_pretty_log.call_args_list]
-    dba_logs = [l for l in logs if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    
-    assert len(dba_logs) == 0
+@pytest.mark.parametrize("msg,expected", [
+    ("this is a short message.", False),          # "sh" inside "short"
+    ("please write a python script to calculate pi.", True),
+    ("i am working on mysql optimization.", False),
+    ("please explain analyze this postgres query.", True),
+    ("can you execute that plan?", False),        # "execute" alone
+    ("can you write a bash script for this?", True),
+    ("look at main.py", True),
+])
+def test_coding_intent_classifier(msg, expected):
+    assert detect_coding_intent(msg)[0] is expected
 
-    # Positive Test: "optimize sql query"
-    message2 = {"role": "user", "content": "Please explain analyze this postgres query."}
-    await mock_agent.handle_chat({"messages": [message2]}, MagicMock())
-    
-    logs2 = [call.args for call in mock_pretty_log.call_args_list]
-    dba_logs2 = [l for l in logs2 if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    assert len(dba_logs2) > 0
-
-@patch("ghost_agent.core.agent.pretty_log")
-@pytest.mark.asyncio
-async def test_intent_coding_fallback_execute(mock_pretty_log, mock_agent):
-    # Negative Test: "execute" alone should NOT trigger coding intent anymore
-    message = {"role": "user", "content": "Can you execute that plan?"}
-    
-    # Mocking internal task
-    mock_agent.run_smart_memory_task = MagicMock()
-    mock_agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {"content": "Ok", "tool_calls": []}}]
-    })
-    
-    await mock_agent.handle_chat({"messages": [message]}, MagicMock())
-    
-    logs = [call.args for call in mock_pretty_log.call_args_list]
-    python_mode_logs = [l for l in logs if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    
-    assert len(python_mode_logs) == 0, "Failed: 'execute' incorrectly activated Python Specialist!"
-
-    # Positive Test: "script" SHOULD still trigger it
-    message2 = {"role": "user", "content": "Can you write a bash script for this?"}
-    await mock_agent.handle_chat({"messages": [message2]}, MagicMock())
-    
-    logs2 = [call.args for call in mock_pretty_log.call_args_list]
-    python_mode_logs2 = [l for l in logs2 if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    assert len(python_mode_logs2) > 0, "Failed: 'script' did not activate Python Specialist!"
-    
-    # Positive Test: ".py" SHOULD still trigger it
-    message3 = {"role": "user", "content": "Look at main.py"}
-    await mock_agent.handle_chat({"messages": [message3]}, MagicMock())
-    
-    logs3 = [call.args for call in mock_pretty_log.call_args_list]
-    python_mode_logs3 = [l for l in logs3 if len(l) > 1 and "Ghost Specialist Activated" in str(l[1])]
-    assert len(python_mode_logs3) > 0, "Failed: '.py' did not activate Python Specialist!"
 
 @pytest.mark.asyncio
 async def test_intent_sets_use_coding_flag(mock_agent):

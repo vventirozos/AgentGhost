@@ -578,20 +578,6 @@ class TestInboxRoute:
             assert c.post("/api/turn/cancel", json={"request_id": "r1"}).json()["cancelled"]
         assert holds._held_since_start("Y") is held
 
-    def test_a_held_re_send_is_told_why(self, holds, monkeypatch):
-        # review r8: "while this request ran…" was false for a re-sent message
-        from ghost_agent.utils.logging import request_id_context
-        holds.note_handed_back("s1", "owner", [{"text": "yes", "ts": time.time() - 5}])
-        holds.note_queued_withdrawal("s1", "owner", "stop")
-        time.sleep(0.01)
-        holds.note_request_start("C", "s1", "owner", text="yes")
-        tok = request_id_context.set("C")
-        try:
-            msg = holds._confirm_allowed({"rid": "P"})
-        finally:
-            request_id_context.reset(tok)
-        assert "after the user first sent this" in msg
-
     @pytest.mark.parametrize("word", ["stop", "σταμάτησε", "σταμάτα", "abort", "άκυρο", "cancel!"])
     def test_every_stop_word_is_a_hold(self, holds, word):
         # review r7: "σταμάτησε" stopped the turn but withdrew nothing
@@ -823,31 +809,6 @@ async def test_the_inbox_is_closed_during_finalize(monkeypatch, tmp_path):
     body = {"session_id": "s7", "messages": [{"role": "user", "content": "what is 2+2?"}]}
     await agent.handle_chat(body, FakeBgTasks(), request_id="web-fin", requester_role="owner")
     assert got == {"accepted": False}
-
-
-def test_an_injected_hold_withdraws_the_requests_yes(monkeypatch):
-    """Request R2 is the owner's "yes" to R1's preview; mid-turn they add
-    "wait — keep project X". The yes must no longer confirm anything."""
-    from ghost_agent.tools import memory as M
-    from ghost_agent.utils.logging import request_id_context
-    monkeypatch.setattr(M, "_HOLDS", {})
-    monkeypatch.setattr(M, "_REQ_START", {})
-    M.note_request_start("R2", "s1", "owner")
-    assert not M.note_queued_withdrawal("s1", "owner", "also delete the old notes")
-    assert M.note_queued_withdrawal("s1", "owner", "wait — keep project X")
-    time.sleep(0.01)
-    M.note_request_start("R3", "s1", "owner")
-    tok = request_id_context.set("R2")
-    try:
-        why = M._confirm_allowed({"rid": "R1", "items": []})
-    finally:
-        request_id_context.reset(tok)
-    assert why and "no longer counts" in why
-    tok = request_id_context.set("R3")
-    try:
-        assert "no longer counts" not in str(M._confirm_allowed({"rid": "R1", "items": []}) or "")
-    finally:
-        request_id_context.reset(tok)
 
 
 async def test_a_reused_request_id_starts_without_an_old_withdrawal(monkeypatch, tmp_path):
@@ -2053,17 +2014,6 @@ class TestAYesSentBeforeThePreview:
         assert not M._started_before_preview("R2", plan)
         assert not M._started_before_preview("unknown-rid", plan)
         assert not M._started_before_preview("R2", {"ts": "bad"})
-
-    def test_the_refusal_comes_from_the_confirm_gate(self, M):
-        from ghost_agent.utils.logging import request_id_context
-        M.note_handed_back("s1", "owner", [{"text": "yes", "ts": time.time() - 30}])
-        M.note_request_start("R2", "s1", "owner", text="yes")
-        tok = request_id_context.set("R2")
-        try:
-            msg = M._confirm_allowed({"rid": "R1", "ts": time.time() - 10})
-        finally:
-            request_id_context.reset(tok)
-        assert msg and "before that preview was shown" in msg
 
 
 def test_current_ask_edge_limits_and_dropped_additions_are_said():
@@ -3352,7 +3302,9 @@ async def test_a_mid_turn_note_never_opens_the_project_build_fallback(monkeypatc
     import ghost_agent.core.agent as A
     monkeypatch.setattr(A, "turn_origin", lambda c: "user")
     agent, ctx, calls = _delivery_agent(monkeypatch, tmp_path)
-    ctx.last_user_content = "how does BPE tokenization work? explain with a short example"
+    # §4UI: the create gate reads only a "no project" refusal — a mid-turn
+    # note that is not one never opens or closes it
+    ctx.last_user_content = "how does BPE tokenization work? don't create a project"
     ctx.recent_user_contents = [ctx.last_user_content]
     assert P._create_not_requested(ctx)
     agent._on_queued_delivery(added, "web-s4n")

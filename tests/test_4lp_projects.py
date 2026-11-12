@@ -280,60 +280,10 @@ def test_a_symlinked_project_workspace_gets_no_research_writes(store, tmp_path):
 
 # ── §4LP recommendations: release / unrelease / delete are the owner's call ──
 
-async def test_a_model_delete_previews_then_needs_the_users_later_turn(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    from ghost_agent.utils.logging import request_id_context
-    pid = store.create_project("Keep me")
-    tok_rid = request_id_context.set("req-turn-1")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(context, action="delete", project_id=pid))
-        assert prev.get("confirmation_needed") and store.get_project(pid)
-        same = await tool_manage_projects_for_model(
-            context, action="delete", project_id=pid, confirm_token=prev["confirm_token"])
-        assert "NOT done" in same and store.get_project(pid)   # same turn: refused
-    finally:
-        request_id_context.reset(tok_rid)
-    tok_rid = request_id_context.set("req-turn-2")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(context, action="delete", project_id=pid))
-        request_id_context.set("req-turn-3")
-        await tool_manage_projects_for_model(context, action="delete", project_id=pid,
-                                             confirm_token=prev["confirm_token"])
-    finally:
-        request_id_context.reset(tok_rid)
-    assert not store.get_project(pid)
 
 
-async def test_a_probe_cannot_confirm_but_may_drop_its_own_project(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    from ghost_agent.utils.logging import request_id_context
-    real = store.create_project("Owner app")
-    tok_rid = request_id_context.set("probe-1")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(context, action="delete", project_id=real))
-        request_id_context.set("probe-2")
-        await tool_manage_projects_for_model(context, action="delete", project_id=real,
-                                             confirm_token=prev["confirm_token"])
-        assert store.get_project(real)
-        mine = json.loads(await tool_manage_projects_for_model(context, action="create", title="Probe scratch"))
-        mpid = mine["created"]
-        context.current_project_id = real          # the delete must not lean on the current project
-        await tool_manage_projects_for_model(context, action="delete", project_id=mpid)
-        assert store.get_project(real)
-        assert not store.get_project(mpid)
-    finally:
-        request_id_context.reset(tok_rid)
 
 
-async def test_release_by_the_model_is_only_a_preview(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    pid = store.create_project("Demo")
-    store.update_project(pid, status="DONE")
-    res = json.loads(await tool_manage_projects_for_model(
-        context, action="release", project_id=pid,
-        directions="Open index.html in a browser; the board loads and you play white."))
-    assert res.get("confirmation_needed")
-    assert str(store.get_project(pid).get("status")).upper() != "RELEASED"
 
 
 # ── the idle loop advances only projects the owner put on autopilot ──
@@ -417,16 +367,6 @@ def test_unattended_close_rule():
     assert _unattended_close(True, "Test the login flow")[0] == TaskStatus.DONE
 
 
-async def test_a_user_turn_still_confirms_a_probe_created_project(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    from ghost_agent.utils.logging import request_id_context
-    pid = store.create_project("Scratch", metadata={"probe_created": True})
-    tok = request_id_context.set("req-owner-7")
-    try:
-        res = json.loads(await tool_manage_projects_for_model(context, action="delete", project_id=pid))
-    finally:
-        request_id_context.reset(tok)
-    assert res.get("confirmation_needed") and store.get_project(pid)
 
 
 def test_the_idle_loop_sees_only_autopilot_projects(store):
@@ -486,41 +426,8 @@ async def test_an_unknown_title_never_falls_through_to_the_current_project(conte
     assert "not found" in res and store.get_project(pid)["status"] == "RELEASED"
 
 
-async def test_the_confirmed_unrelease_hits_the_previewed_project(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    from ghost_agent.utils.logging import request_id_context
-    x = store.create_project("App X")
-    cur = store.create_project("App Current")
-    for pid in (x, cur):
-        store.update_project(pid, status="RELEASED")
-    context.current_project_id = cur
-    tok = request_id_context.set("req-a")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(context, action="unrelease", title="App X"))
-        assert prev["project"] == x
-        request_id_context.set("req-b")
-        await tool_manage_projects_for_model(context, action="unrelease", title="App X",
-                                             confirm_token=prev["confirm_token"])   # confirmed BY TITLE (M1)
-    finally:
-        request_id_context.reset(tok)
-    assert store.get_project(x)["status"] == "DONE"
-    assert store.get_project(cur)["status"] == "RELEASED"
 
 
-async def test_a_case_mangled_id_still_confirms(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    from ghost_agent.utils.logging import request_id_context
-    x = store.create_project("App Y")
-    store.update_project(x, status="RELEASED")
-    tok = request_id_context.set("req-c")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(context, action="unrelease", project_id=x))
-        request_id_context.set("req-d")
-        await tool_manage_projects_for_model(context, action="unrelease", project_id=x.upper(),
-                                             confirm_token=prev["confirm_token"])   # m3
-    finally:
-        request_id_context.reset(tok)
-    assert store.get_project(x)["status"] == "DONE"
 
 
 async def test_the_model_cannot_mark_an_owner_project_as_a_probes(context, store):
@@ -533,12 +440,13 @@ async def test_the_model_cannot_mark_an_owner_project_as_a_probes(context, store
                                              metadata={"probe_created": True, "autopilot": True})
         await tool_manage_projects_for_model(context, action="update", project_id=pid,
                                              metadata=json.dumps({"probe_created": True}))
-        res = json.loads(await tool_manage_projects_for_model(context, action="delete", project_id=pid))
+        res = str(await tool_manage_projects_for_model(context, action="delete", project_id=pid))
     finally:
         request_id_context.reset(tok)
     meta = store.get_project(pid).get("metadata") or {}
     assert not meta.get("probe_created") and not meta.get("autopilot")
-    assert res.get("confirmation_needed") and store.get_project(pid)
+    # §4UK: no preview any more — the probe's delete of an owner project is refused outright
+    assert "NOT done" in res and store.get_project(pid)
 
 
 async def test_no_preview_for_an_action_that_would_refuse(context, store):
@@ -755,19 +663,3 @@ def test_the_check_rule_is_fast_on_long_text():
     assert time.monotonic() - t < 0.5
 
 
-async def test_one_preview_per_turn_and_a_refused_confirm_says_stop(context, store):
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    from ghost_agent.utils.logging import request_id_context
-    pid = store.create_project("Shipped")
-    store.update_project(pid, status="RELEASED")
-    tok = request_id_context.set("probe-loop")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(context, action="unrelease", project_id=pid))
-        again = await tool_manage_projects_for_model(context, action="unrelease", project_id=pid)
-        conf = await tool_manage_projects_for_model(context, action="unrelease", project_id=pid,
-                                                    confirm_token=prev["confirm_token"])
-    finally:
-        request_id_context.reset(tok)
-    assert "already previewed" in again and "STOP" in again
-    assert "NOT done" in conf and "STOP" in conf
-    assert store.get_project(pid)["status"] == "RELEASED"

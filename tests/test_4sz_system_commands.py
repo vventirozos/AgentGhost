@@ -51,8 +51,8 @@ def _rules(tmp_path):
 async def test_a_handled_command_is_answered_without_the_model(tmp_path, monkeypatch, stream):
     agent = _agent(tmp_path, monkeypatch)
     content, _, rid = await _ask(agent, "forget all my rules", stream)
-    assert content.startswith("Forget all 2 of your rules?")
-    assert content.endswith("Say “confirm forget all my rules” within 15 minutes to remove them.")   # nothing after it
+    assert content.startswith("✓ All 2 rules forgotten.")                 # §4UK: at once, no confirmation
+    assert content.endswith("- **Rule 2** — give five headlines for the news")   # nothing after it
     assert "MODEL TEXT" not in content and "---" not in content
     assert agent.context.llm_client.chat_completion.await_count == 0
     assert agent.available_tools["introspect"].await_count == 0
@@ -60,10 +60,9 @@ async def test_a_handled_command_is_answered_without_the_model(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_the_confirm_is_answered_and_done(tmp_path, monkeypatch):
+async def test_the_forget_is_answered_and_done(tmp_path, monkeypatch):
     agent = _agent(tmp_path, monkeypatch)
-    await _ask(agent, "forget rule 1")
-    content, _, _ = await _ask(agent, "confirm forget rule 1")
+    content, _, _ = await _ask(agent, "forget rule 1")
     assert content.startswith("✓ Rule 1 forgotten.")
     assert _rules(tmp_path) == ["give five headlines for the news"]
     assert agent.context.llm_client.chat_completion.await_count == 0

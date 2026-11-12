@@ -49,7 +49,9 @@ logger = logging.getLogger("GhostAgent")
 #: the fixed order (also the order the reply lists them in)
 GATE_ORDER = ("dependencies", "deliverable", "model_run", "evidence", "postconditions")
 #: gates the MODEL may waive with a reason (recorded); the owner's click goes over any
-MODEL_WAIVABLE = frozenset({"model_run", "postconditions"})
+#: §4UI: "deliverable" too — a plan that changed may drop its declared file,
+#: with a recorded reason (the dense model is trusted to say why; the owner reads it)
+MODEL_WAIVABLE = frozenset({"deliverable", "model_run", "postconditions"})
 ACTORS = frozenset({"model", "owner", "advancer_owner", "advancer_unattended", "rollup"})
 
 
@@ -175,7 +177,13 @@ def gate_deliverable(workspace, description: str) -> Optional[Refusal]:
         return None
     return Refusal("deliverable", problem,
                    "write the declared file at that path — or, if the plan changed, pass a "
-                   "`description` that ends with → the real path")
+                   "`description` that ends with → the real path — or, if the task no longer "
+                   "makes a file, override={\"deliverable\": \"<why, in a sentence>\"} for that one task")
+
+
+def _trusted_kind(store, project_id, task_id, node) -> str:
+    from .experiment_gate import planned_kind
+    return planned_kind(store, project_id, task_id, str(getattr(node, "kind", "") or ""))
 
 
 def gate_model_run(store, project_id: str, description: str, *, files: Iterable[str],
@@ -196,7 +204,8 @@ def gate_evidence(node, *, result: str, live_evidence: str, constraints: List[st
     if str(result or "").strip():
         return None
     stored = _stored_evidence(getattr(node, "result_summary", ""))
-    if not stored and _is_visual_artifact_task(getattr(node, "description", "")):
+    if not stored and _is_visual_artifact_task(getattr(node, "description", ""),
+                                               str(getattr(node, "kind", "") or "")):
         return Refusal("evidence", "a visual / runnable artifact closed with no verification evidence",
                        "verify it (open it, run it, screenshot it — a browser RENDER_CHECK line counts) "
                        "and pass what you observed as `result`",
@@ -266,7 +275,7 @@ def check_close(store, project_id: str, tree, task_id: str, *, actor: str,
         "deliverable": lambda: gate_deliverable(ws, judged_desc),
         "model_run": lambda: gate_model_run(store, project_id, stored_desc,
                                             files=files, result_text=result,
-                                            kind=str(getattr(node, "kind", "") or "")),
+                                            kind=_trusted_kind(store, project_id, task_id, node)),
         "evidence": lambda: gate_evidence(node, result=result, live_evidence=live_evidence,
                                           constraints=list(constraints or [])),
         "postconditions": lambda: gate_postconditions(tree, node, result or live_evidence),
@@ -287,7 +296,8 @@ def check_close(store, project_id: str, tree, task_id: str, *, actor: str,
             continue
         if actor == "model" and gate in MODEL_WAIVABLE and gate in over:
             from .experiment_gate import MIN_WAIVER_CHARS
-            if gate == "model_run" and (len(over[gate]) < MIN_WAIVER_CHARS or not single_task):
+            if gate in ("model_run", "deliverable") and (len(over[gate]) < MIN_WAIVER_CHARS
+                                                          or not single_task):
                 v.refused.append(Refusal(gate, r.reason,
                                          f"a waiver needs a reason of at least {MIN_WAIVER_CHARS} "
                                          "characters, for ONE task per call (task_id, not task_ids)"))

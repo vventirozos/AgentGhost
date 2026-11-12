@@ -47,7 +47,7 @@
     "test_boot_ready_ordering.py": 2,
     "test_browser_interact_evaluate.py": 1,
     "test_browser_service_proxy_bypass.py": 1,
-    "test_browser_tool.py": 6,
+    "test_browser_tool.py": 2,
     "test_browser_wallclock_ceiling.py": 2,
     "test_bug_hunt_fixes.py": 9,
     "test_bughunt_unit18_agent.py": 1,
@@ -151,7 +151,7 @@
     "test_project_work_log.py": 18,
     "test_promoted_result_graders.py": 5,
     "test_prompt_funnel_4n.py": 19,
-    "test_prompts_extended.py": 14,
+    "test_prompts_extended.py": 1,
     "test_qwen35_adaptations.py": 8,
     "test_registry_guard_4gi.py": 5,
     "test_release_immutability_ops.py": 1,
@@ -214,5 +214,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 856
+  "total_textual": 839
 }

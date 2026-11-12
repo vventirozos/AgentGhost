@@ -27,24 +27,6 @@ def _plan(kind, rid, **extra):
     return _store_plan({"kind": kind, "rid": rid, "ts": time.time(), **extra})
 
 
-def test_a_yes_finds_this_conversations_preview_and_not_anothers():
-    from ghost_agent.tools.memory import _resolve_plan
-    t = _turn("req-1", "convA")
-    try:
-        tok = _plan("forget", "req-1", items=[])
-    finally:
-        _end(t)
-    t = _turn("req-2", "convA")
-    try:
-        got_tok, plan = _resolve_plan("yes", "forget")
-    finally:
-        _end(t)
-    assert got_tok == tok and plan is not None
-    t = _turn("req-3", "convB")
-    try:
-        assert _resolve_plan("yes", "forget")[1] is None
-    finally:
-        _end(t)
 
 
 def test_without_a_conversation_there_is_no_fallback():
@@ -57,21 +39,6 @@ def test_without_a_conversation_there_is_no_fallback():
         _end(t)
 
 
-async def test_a_forget_confirmed_with_yes_runs_in_a_later_turn_only():
-    from ghost_agent.tools.memory import forget_execute
-    t = _turn("req-10", "convF")
-    try:
-        _plan("forget", "req-10", items=[])
-        same = await forget_execute("yes", "all")
-    finally:
-        _end(t)
-    assert "has not answered yet" in same                     # same turn: still refused
-    t = _turn("req-11", "convF")
-    try:
-        later = await forget_execute("yes", "all")
-    finally:
-        _end(t)
-    assert "unknown or expired" not in later and "has not answered" not in later
 
 
 async def test_a_reset_all_confirmed_with_yes_finds_its_preview(monkeypatch):
@@ -90,68 +57,10 @@ async def test_a_reset_all_confirmed_with_yes_finds_its_preview(monkeypatch):
     assert "unknown or expired" not in str(out)
 
 
-async def test_a_project_delete_confirmed_with_yes(tmp_path):
-    from ghost_agent.memory.projects import ProjectStore
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    ctx = SimpleNamespace(project_store=store, scratchpad=None, graph_memory=None,
-                          workspace_model=None, current_project_id=None, last_user_content="")
-    pid = store.create_project("Old app")
-    t = _turn("req-30", "convP")
-    try:
-        prev = json.loads(await tool_manage_projects_for_model(ctx, action="delete", project_id=pid))
-        assert prev.get("confirmation_needed")
-    finally:
-        _end(t)
-    t = _turn("req-31", "convP")
-    try:
-        await tool_manage_projects_for_model(ctx, action="delete", project_id=pid, confirm_token="yes")
-    finally:
-        _end(t)
-    assert not store.get_project(pid)
 
 
-async def test_a_yes_never_confirms_another_projects_preview(tmp_path):
-    from ghost_agent.memory.projects import ProjectStore
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    ctx = SimpleNamespace(project_store=store, scratchpad=None, graph_memory=None,
-                          workspace_model=None, current_project_id=None, last_user_content="")
-    a = store.create_project("App A")
-    b = store.create_project("App B")
-    t = _turn("req-40", "convQ")
-    try:
-        await tool_manage_projects_for_model(ctx, action="delete", project_id=a)
-    finally:
-        _end(t)
-    t = _turn("req-41", "convQ")
-    try:
-        out = await tool_manage_projects_for_model(ctx, action="delete", project_id=b, confirm_token="yes")
-    finally:
-        _end(t)
-    assert store.get_project(b) and store.get_project(a) and "mismatched" in out
 
 
-async def test_a_yes_finds_the_right_project_among_two_previews(tmp_path):
-    from ghost_agent.memory.projects import ProjectStore
-    from ghost_agent.tools.projects import tool_manage_projects_for_model
-    store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "sb")
-    ctx = SimpleNamespace(project_store=store, scratchpad=None, graph_memory=None,
-                          workspace_model=None, current_project_id=None, last_user_content="")
-    a = store.create_project("App A")
-    b = store.create_project("App B")
-    for rid, pid in (("req-50", a), ("req-51", b)):
-        t = _turn(rid, "convM")
-        try:
-            await tool_manage_projects_for_model(ctx, action="delete", project_id=pid)
-        finally:
-            _end(t)
-    t = _turn("req-52", "convM")
-    try:
-        await tool_manage_projects_for_model(ctx, action="delete", project_id=a, confirm_token="yes")
-    finally:
-        _end(t)
-    assert not store.get_project(a) and store.get_project(b)
 
 
 async def test_the_request_records_its_conversation():

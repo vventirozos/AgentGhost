@@ -141,7 +141,19 @@
 </ul>
 <!-- /refs -->
 
-  <footer><p>Ghost Agent documentation.</p></footer>
+    <h2 id="guards-4ui">Fewer brakes on a coding turn (§4UI, 2026-11-12)</h2>
+  <p>The main model is now a dense model and codes much better than the MoE model many coding guards were written for. Guards that second-guessed the model were relaxed; guards that protect your data, honest "it works" claims and destructive commands stay.</p>
+  <ul>
+    <li><strong>A failing test run is not a failure strike.</strong> When <code>execute</code> runs your program and the program itself fails (a red test, a traceback), and the output changed since the last such failure, it is logged as "Program Fail" and costs no strike. An output that matches one of the last 8 failures still counts, and after 12 free failures in one request every further one counts again, so a stuck or endlessly varying loop still reaches the cap.</li>
+    <li><strong>A refused edit is not a strike.</strong> An edit that would break the file's syntax is still refused (the file stays intact), but the refusal now shows the current lines where the edit began and asks for one edit covering the whole change.</li>
+    <li><strong>Edit-churn and futility only advise.</strong> Many edits of one file without a run (now from 6), or many writes and runs without progress, get a note. They no longer turn the tools off.</li>
+    <li><strong>The same error line under exit 0 only advises.</strong> A working program that logs the same warning on every run is no longer force-stopped.</li>
+    <li><strong>Long program output is not summarised.</strong> <code>execute</code> output keeps its head and tail (a traceback and pytest's summary are at the end), instead of a worker summary of the first 15k characters.</li>
+    <li><strong>The tool-turn cap follows the time left</strong>, so a long write near the deadline cannot run past it.</li>
+    <li><strong>Kept:</strong> read-before-rewrite, the "actually run it" check on claims, the write-in-parts guards, the shell deny-list, the Tor-only launch flags for raw Playwright (<code>TOR_PROXY</code> + <code>--host-resolver-rules</code>, so DNS cannot leak) in the <code>execute</code> description, and a rule there never to run a destructive statement (DROP, TRUNCATE, an unbounded DELETE/UPDATE, <code>rm -rf</code> of data) on data the agent did not just create unless you asked and confirmed.</li>
+  </ul>
+
+<footer><p>Ghost Agent documentation.</p></footer>
 </main>
 </body>
 </html>

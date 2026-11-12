@@ -14,7 +14,7 @@ from ghost_agent.core.project_advancer import advance_once
 from ghost_agent.core.project_safety import (
     BudgetDecision, PromotionSuggestion,
     check_budget, record_runtime,
-    enforce_human_gate, HUMAN_GATE_PREFIX,
+    HUMAN_GATE_PREFIX, is_human_gate_text,
     detect_contradiction,
     should_suggest_promotion,
     MIN_TURNS_FOR_SUGGESTION, MIN_PLAN_NODES_FOR_SUGGESTION,
@@ -114,36 +114,6 @@ async def test_advance_records_runtime_and_tool_calls(context, store):
 
 
 # --------------------------------------------------------------------- human gates
-
-def test_enforce_human_gate_returns_reason():
-    task = {"postconditions": [f"{HUMAN_GATE_PREFIX} needs CTO sign-off"]}
-    assert enforce_human_gate(task) == "needs CTO sign-off"
-
-
-def test_enforce_human_gate_returns_default_when_empty():
-    task = {"postconditions": [HUMAN_GATE_PREFIX]}
-    out = enforce_human_gate(task)
-    assert out and "human approval" in out.lower()
-
-
-def test_enforce_human_gate_none_when_absent():
-    assert enforce_human_gate({"postconditions": []}) is None
-    assert enforce_human_gate({}) is None
-
-
-async def test_human_gate_forces_needs_user(context, store):
-    pid = store.create_project("P")
-    tid = store.add_task(pid, "Deploy the new schema",
-                         postconditions=[f"{HUMAN_GATE_PREFIX} cto approval"])
-
-    async def runner(name, args):
-        return "ready to ship"
-
-    r = await advance_once(context, pid, tool_runner=runner)
-    assert r.classification == "needs_user"
-    assert store.get_task(tid)["status"] == "NEEDS_USER"
-    evs = store.list_events(pid, event_type="human_gate_triggered")
-    assert evs
 
 
 # --------------------------------------------------------------------- contradictions

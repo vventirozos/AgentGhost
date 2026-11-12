@@ -117,7 +117,7 @@ _T34 = ("Test the theory that 4-layer recursive thinking (thinking about thinkin
 
 
 @pytest.mark.parametrize("ask,refused", [
-    (_T34, True),                                                        # turns 34, 38
+    (_T34, False),                     # §4UI: no refusal word — the model decides
     (_T34 + ". don't create a project, just do it and report", True),     # turns 40, 43
     ("start a project to track my reading list", False),
     ("build the pipeline, don't use pandas for this", False),
@@ -152,18 +152,6 @@ def test_the_refusal_is_a_designed_stop_not_a_strike():
 
 
 # ── F4: the forget preview (turns 18, 19) ──────────────────────────────────
-def test_a_long_yes_confirms_only_the_items_it_names():
-    """Turn 19's 147-char "Yes, confirm — delete ONLY the stored copy of …"
-    is a yes to ONE item — never to the whole default list."""
-    from ghost_agent.tools.memory import user_confirms
-    long_yes = ("Yes, confirm — delete ONLY the stored knowledge-base copy of postgresql-19-A4.pdf, "
-                "keep the lessons and the episode, they are still useful to me")
-    assert user_confirms(long_yes) is False
-    assert user_confirms(long_yes, narrowed=True) is True
-    assert user_confirms("yes") is True
-    assert user_confirms("no thanks, what's the weather?", narrowed=True) is False
-
-
 def test_the_forget_preview_numbers_its_items_once_defaults_first(monkeypatch):
     """Turn 18: the list read 1, 2, 15 — the model renumbered it and its
     "remove 1, 2, 3" would have deleted the wrong item.
@@ -236,37 +224,7 @@ def test_the_not_executed_note_does_not_claim_a_parse_failure():
     assert "NOT executed" in UNPARSED_TOOL_CALL_NOTE and "parse" not in UNPARSED_TOOL_CALL_NOTE
 
 
-
 # ── §4MM r2: the fresh reader's findings inside the fixes ─────────────────
-def _confirm_world(monkeypatch, message):
-    from ghost_agent.tools import memory as M
-    from ghost_agent.utils import logging as L
-    import ghost_agent.utils.provenance as PV
-    monkeypatch.setattr(M, "_not_the_user", lambda rid: False)
-    monkeypatch.setattr(PV, "untrusted_seen", lambda rid: [])
-    monkeypatch.setattr(PV, "user_message", lambda rid: message)
-    items = [{"default": True, "label": "kb copy"}, {"default": True, "label": "lesson"},
-             {"default": False, "label": "episode #170"}]
-    return M, {"rid": "earlier-turn", "token": "t1", "items": items}
-
-
-_LONG_YES = ("Yes, confirm — delete ONLY the stored knowledge-base copy of postgresql-19-A4.pdf, keep the "
-             "lessons and the episode, they are still useful to me")
-
-
-@pytest.mark.parametrize("selection,allowed", [("1", True), ("1-3", False), ("1,2", False), ("all", False)])
-def test_a_long_qualified_yes_confirms_a_strict_subset_only(monkeypatch, selection, allowed):
-    """r2 M1: `items="1-N"` (everything) or the default list under another
-    name passed as "narrowed" — the lessons the owner asked to keep would go."""
-    from ghost_agent.utils.logging import request_id_context
-    M, plan = _confirm_world(monkeypatch, _LONG_YES)
-    tok = request_id_context.set("later-turn")          # reset below: a leaked id broke a later test
-    try:
-        assert (M._confirm_allowed(plan, selection) is None) is allowed
-    finally:
-        request_id_context.reset(tok)
-
-
 def test_forget_passes_its_selection_to_the_confirm_gate():
     import ast
     import inspect
@@ -279,8 +237,9 @@ def test_forget_passes_its_selection_to_the_confirm_gate():
 
 def test_an_answer_to_the_agents_question_about_a_project_may_create_it(monkeypatch):
     """r2 M3: "call it Snake" answers the agent's question after "create a
-    project for a snake game"; turn 38's history ("show all projects",
-    "delete projects …") never asked to BUILD and must not open the gate."""
+    project for a snake game". §4UI: the gate reads only an explicit "no
+    project" refusal, so a history without one never closes it, and one with
+    it does."""
     from types import SimpleNamespace
     import ghost_agent.core.agent as A
     from ghost_agent.tools.projects import _create_not_requested
@@ -290,7 +249,10 @@ def test_an_answer_to_the_agents_question_about_a_project_may_create_it(monkeypa
     assert _create_not_requested(ok) == ""
     t38 = SimpleNamespace(last_user_content=_T34, recent_user_contents=[
         _T34, "show all projects", "delete projects 9c69d96a88f0 and 7b62e5e533d1", "proceed.", _T34])
-    assert _create_not_requested(t38)
+    assert _create_not_requested(t38) == ""
+    no = SimpleNamespace(last_user_content=_T34 + ". don't create a project",
+                         recent_user_contents=[_T34 + ". don't create a project"])
+    assert _create_not_requested(no)
 
 
 @pytest.mark.parametrize("ask", [

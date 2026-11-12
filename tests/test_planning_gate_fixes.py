@@ -102,39 +102,6 @@ def test_checker_coerces_direct_string_postconditions():
 
 # ----------------------------------------------------------- 2. HUMAN_GATE close path
 
-def test_human_gate_close_parks_needs_user_not_failed():
-    tree = TaskTree()
-    root = tree.add_task("root")
-    tid = tree.add_task("deploy", parent_id=root,
-                        postconditions=["HUMAN_GATE: cto approval"])
-    tree.update_status(tid, TaskStatus.DONE, result="deployed to staging")
-    assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
-    # No spurious FAILED cascade up the tree
-    assert tree.nodes[root].status == TaskStatus.PENDING
-
-
-def test_human_gate_echoed_text_does_not_satisfy_gate():
-    """The gate must not be satisfiable by result-text similarity."""
-    tree = TaskTree()
-    tid = tree.add_task("deploy",
-                        postconditions=["HUMAN_GATE: cto approval"])
-    tree.update_status(tid, TaskStatus.DONE, result="HUMAN_GATE: cto approval")
-    assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
-
-
-def test_human_gate_second_close_is_not_the_approval():
-    # §4SU Phase 0 (audit A): a second identical close in the same turn was
-    # counted as the owner's approval — only human_approved=True approves
-    tree = TaskTree()
-    tid = tree.add_task("deploy",
-                        postconditions=["HUMAN_GATE: cto approval"])
-    tree.update_status(tid, TaskStatus.DONE, result="deployed")
-    assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
-    tree.update_status(tid, TaskStatus.DONE, result="deployed")
-    assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
-    tree.update_status(tid, TaskStatus.DONE, result="deployed", human_approved=True)
-    assert tree.nodes[tid].status == TaskStatus.DONE
-
 
 def test_human_gate_explicit_approval_flag_closes_directly():
     tree = TaskTree()
@@ -142,14 +109,6 @@ def test_human_gate_explicit_approval_flag_closes_directly():
     tree.update_status(tid, TaskStatus.DONE, result="shipped",
                        human_approved=True)
     assert tree.nodes[tid].status == TaskStatus.DONE
-
-
-def test_human_gate_park_records_reason_when_no_result():
-    tree = TaskTree()
-    tid = tree.add_task("deploy", postconditions=["HUMAN_GATE: cto approval"])
-    tree.update_status(tid, TaskStatus.DONE)
-    assert tree.nodes[tid].status == TaskStatus.NEEDS_USER
-    assert "cto approval" in tree.nodes[tid].result_summary
 
 
 def test_human_gate_other_postconditions_still_enforced_after_approval():
@@ -174,18 +133,6 @@ def test_postcondition_check_skips_human_gate_postconditions():
     node = tree.nodes[tid]
     node.result_summary = "any reply"
     assert tree._check_postconditions(node) == []
-
-
-def test_project_plan_forwards_human_approved(store):
-    pid = store.create_project("P")
-    plan = ProjectPlan(store, pid)
-    tid = plan.add_task("deploy",
-                        postconditions=["HUMAN_GATE: operator approval"])
-    plan.update_status(tid, TaskStatus.DONE, result="done")
-    assert store.get_task(tid)["status"] == "NEEDS_USER"
-    plan.update_status(tid, TaskStatus.DONE, result="done",
-                       human_approved=True)
-    assert store.get_task(tid)["status"] == "DONE"
 
 
 # ----------------------------------------------------------- 3. dangling alternatives

@@ -1,5 +1,5 @@
 name: web
-description: nginx serving /srv/www on port 80, published on the tailnet, Tor egress
+description: "A DISPOSABLE static preview: nginx serves files you put in /srv/www on port 80 (tailnet URL until the lab expires), Tor egress. Not for a kept site: nginx is not a kept app and deploy unpacks into /app, which it does not serve — a KEPT static site is a python-app lab (see lab keep)"
 egress: tor
 members:
   - {name: web1, image: "ghost-lab/web:1", mem_mb: 512, cpus: 1.0, ports: [80]}

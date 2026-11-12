@@ -41,6 +41,20 @@ def _files_line(project_id: str) -> str:
             f"'projects/{project_id}/…'.")
 
 
+def _created_this_request(store, project_id: str) -> bool:
+    """§4UI: was the project created by the CURRENT request (its
+    ``project_created`` event carries this request's id)? Never raises."""
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+        if not rid or rid == "SYSTEM":
+            return False
+        ev = (store.list_events(project_id, limit=1, event_type="project_created") or [None])[0]
+        return bool(ev) and str((ev.get("payload") or {}).get("req") or "") == rid
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def build_project_briefing(store, project_id: str, max_events: int = 3,
                            max_open_tasks: int = 8,
                            max_open_tasks_listed: int = 30,
@@ -116,12 +130,21 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     # don't fully trust the conversation-state signal, so we repeat
     # it as loudly as possible on every turn the project is active.
     if not _finished:
+        # §4UI r1 M2: "the rest of that message is still to do" only in the
+        # request that created it — on a later request the old message is
+        # fulfilled history (re-reading it started builds with no go-ahead)
+        if _created_this_request(store, project_id):
+            _tail = ("Creating it is done; anything else the user asked for in "
+                     "this message (building it, a first task) is still to do — "
+                     "see PACING below.")
+        else:
+            _tail = ("DO NOT re-read the user's original 'start a new project' "
+                     "message as if it were a fresh instruction; that request has "
+                     "been fulfilled and the work is in flight below.")
         lines.append(
             f"*** A project is ALREADY ACTIVE (id={project_id}). "
             f"DO NOT call manage_projects action=create — you already did. "
-            f"DO NOT re-read the user's original 'start a new project' "
-            f"message as if it were a fresh instruction; that request has "
-            f"been fulfilled and the work is in flight below. ***"
+            f"{_tail} ***"
         )
     lines.append(_files_line(project_id))
     # RELEASED runbook mode (2026-07-25): a released project's briefing is
@@ -169,37 +192,38 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
 
     if not _finished:
         lines.append(
-            "*** ONE TASK AT A TIME — HARD RULE: "
-            "Advance this project ONE task per turn — the NEXT TASK shown "
-            "below, and ONLY that one. DO NOT scan ahead and stack several "
-            "tasks' work into a single reply, and DO NOT grind through the "
-            "whole tree in one turn: on a large project that floods the "
-            "context window, which is exactly the failure this rule "
-            "prevents. "
-            "When you have just created or decomposed the plan, STOP and "
-            "present the task list to the user — DO NOT start executing. "
-            "Wait for an explicit go-ahead ('proceed', 'next task', "
-            "'continue') before advancing, and honor any pacing or ordering "
-            "the user asks for. Each go-ahead advances EXACTLY ONE task: do "
-            "its work, close just that id with `manage_projects "
-            "action=task_update task_id=\"<id>\" status=DONE` (plus its "
-            "`deliverables`), report the result, then stop and wait for the "
-            "next direction. "
+            # §4UI (2026-11-12): THE pacing rule — the tool description and
+            # every manage_projects result defer to it instead of restating
+            # their own STOP (req 8646c6c8 spent 5 min weighing three).
+            "*** PACING (the one rule; tool results defer to it): "
+            "GO-AHEAD — when you have just created, decomposed or replanned "
+            "the plan, look at the user's message that asked for it. If it "
+            "asked ONLY for a project or a plan, show the task list and stop "
+            "there (no 'shall I start?' — they will say 'proceed', 'next task' "
+            "or 'continue' when they want the work). If that same "
+            "message ALSO asked for the work itself ('create a project and "
+            "build X', 'make it…', 'implement…'), that message IS the "
+            "go-ahead: show the plan in a line or two and start. "
+            "SCOPE — a go-ahead covers what the user asked for: 'proceed' / "
+            "'next task' = the NEXT TASK shown below; 'do the next 3', "
+            "'finish it', 'all remaining' = that many. Close each task when its "
+            "work is done with `manage_projects action=task_update "
+            "task_id=\"<id>\" status=DONE` (plus its `deliverables`). When "
+            "the asked-for tasks are done, report and wait for the next "
+            "direction. Several tasks: do them "
+            "yourself in this turn one after another, or hand a long run to "
+            "`manage_projects action=autoadvance count=<N|\"all\">` (an "
+            "unattended loop that checkpoints each task); on a big project "
+            "prefer autoadvance so the context window does not fill. A "
+            "request to run all tasks does not answer a gate — name each "
+            "waiting task and ask. "
             "Before re-reading files to reconstruct state, READ the DESIGN "
             "LEDGER and DONE SO FAR below — they record what already exists and "
             "how it works. When you make a durable decision (file layout, a key "
             "function/API name, a convention) record it in one line via "
             "`manage_projects action=ledger ledger=\"…\"` (or pass `ledger=\"…\"` "
             "on the task_update that closes the task) so the next turn inherits "
-            "it instead of re-deriving it. "
-            "BATCH: only if the user explicitly asks for MULTIPLE tasks ('do the "
-            "next 3', 'proceed with all remaining tasks', 'finish the project'), "
-            "DON'T grind them yourself in one turn — call `manage_projects "
-            "action=autoadvance count=<N|\"all\">` to run them as a bounded "
-            "autonomous loop that checkpoints each task, skips a FAILED task or one "
-            "that waits on the owner (a gate) and runs the rest, and stops at the "
-            "budget or repeated failures; then summarize and stop. A request to run "
-            "all tasks does not answer a gate — name each waiting task and ask. ***"
+            "it instead of re-deriving it. ***"
         )
     lines.append(
         f"TITLE: {proj['title']}  ({proj['kind']} · {proj['status']})"
@@ -301,7 +325,7 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     # versions, model, ports, DB URIs). Surfaced so a fresh turn runs/builds
     # under the right settings instead of re-discovering them from
     # requirements.txt / env / argv. Recorded via
-    # `manage_projects action=config key="…" value="…"`.
+    # `manage_projects action=config config_key="…" config_value="…"`.
     try:
         config = ((proj.get("metadata") or {}).get("config") or {})
         if not isinstance(config, dict):
@@ -310,8 +334,8 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         config = {}
     if config:
         lines.append("CONFIG (durable settings you recorded — trust these; "
-                     "update with `manage_projects action=config key=\"…\" "
-                     "value=\"…\"`):")
+                     "update with `manage_projects action=config config_key=\"…\" "
+                     "config_value=\"…\"`):")
         for k, v in config.items():
             lines.append(f"  {k} = {v}")
 
@@ -400,11 +424,13 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             # TASK here pulls the model into grinding the whole tree on a single
             # "start task 1" / "proceed" (observed live). Replace the pointer
             # with a hard stop so the turn wraps up and waits for the user.
+            # §4UI: advice, not a stop — the code no longer forces the
+            # turn to end after a close (the dense model paces itself)
             lines.append(
-                "*** You already completed a task this turn. STOP now: "
-                "summarize what you did and WAIT for the user's next "
-                "go-ahead. Do NOT start the next task — there IS a next task "
-                "but it is the USER's call to begin it. ***")
+                "*** You closed a task this turn. If the user asked for more "
+                "than that one task, go on with the next one; otherwise report "
+                "what you did and stop (no 'shall I continue?'). ***")
+            lines.append(f"NEXT TASK: [{nxt.id}] {nxt.description}")
         elif nxt:
             lines.append(f"NEXT TASK: [{nxt.id}] {nxt.description}")
         open_statuses = {
@@ -861,6 +887,7 @@ You are Ghost, an autonomous Artificial Intelligence matrix. You are a proactive
 1. ADAPTIVE PERSONA (CONVERSATIONAL MODE): When the user is chatting, greeting you, discussing ideas, brainstorming, or asking open-ended questions, be **neutral, friendly, and helpful**. Use a warm, conversational tone. Keep replies concise (one or two sentences for greetings, a short paragraph for ideas). Avoid bluntness or terseness — match the user's register without sounding cold or dismissive. Pleasantries are fine when natural; just don't over-pad.
 2. ADAPTIVE PERSONA (EXECUTION MODE): When given a specific technical task or command (e.g., coding, searching, file operations), instantly snap back into a "highly efficient, precise, and direct" or "high-level executive assistant" persona. Be silent, efficient, concise, and strictly objective. Do not narrate your actions or provide conversational filler WHILE EXECUTING tools — no "Let me fix both:", "Now add the resize logic:", or similar working notes alongside a tool call; the user watches your progress elsewhere. Do NOT write a summary until the whole task (including any verification or restart step) is complete, and NEVER restate a summary you already gave — one final summary, once. However, on your FINAL turn after successfully completing the task, you MUST begin your reply with a short, natural, conversational reply to the user providing the final data or answer.
 3. LOGICAL AUTONOMY & COMMON SENSE: If a question can be answered using basic logic, math, or common sense, or if it is just a conversational greeting, DO NOT use tools. Just answer directly using your brain. You already know the exact current time from your SYSTEM STATE.
+3b. NO CONFIRMATIONS: everything you run is sandboxed, and the user does not want to be asked for permission. When they ask for something — delete, release, forget, wipe, deploy, overwrite, install, send — do it in this turn; never answer with "shall I?", "say yes and I'll…", "do you want me to…" or "before I do it, here is what goes". Report what you did. Ask a question ONLY when you cannot tell WHAT they want (which of several things, a missing detail) — a clarifying question, never a request for approval.
 4. ANTI-HALLUCINATION: You are natively multimodal and can physically see images provided to you in chat or stored in your sandbox. NEVER hallucinate facts or parameters to satisfy a tool. If you lack information, ASK the user.
 4b. RESEARCH ANSWERS (web and dark web): state as fact only what the pages and results you fetched IN THIS TURN say. Name the source inline for every number, date, version, name or quote ("per python.org", "the Ahmia result titled …"). A search RESULT is a title and snippet, not the page — never describe a thread, post or discussion you did not open, and never use a page that failed to load (blocked, 403, 404, timeout). Never invent a URL: give only links that appeared in your results. Anything from your own background knowledge is labelled as such; where the sources found nothing, say so. For "latest / current / newest" questions (versions, prices, office-holders), the answer is the NEWEST DATED statement from the official source, given with its date — a third-party page or snippet saying "the latest is X" is often out of date. An organisation's OFFICIAL .onion address comes only from that organisation's own clearnet site (onion search results are full of clones and phishing mirrors) — and a page whose content does not match the organisation is not it.
 4c. WHEN THE USER DISAGREES: re-check before you concede — look at the evidence again (your earlier sources, or one quick search). If your earlier answer stands, say so plainly and show why; if it was wrong, say exactly what was wrong. Never flip only because you were challenged, and never answer the same question one way and then the opposite way without new evidence.
@@ -872,7 +899,7 @@ You are Ghost, an autonomous Artificial Intelligence matrix. You are a proactive
 - KNOWLEDGE & RAG: If the user asks a question about ONE SPECIFIC ingested document or PDF (e.g. a reference manual), YOU MUST use `knowledge_base(action="query", filename="<the document>", question="<their question>")`. It searches ONLY that document and returns the best passages WITH their section breadcrumbs — answer from those passages and cite the breadcrumb. You may call it repeatedly with different wording to drill down into a large manual. Use `recall` for questions about past conversations or general memory instead (it searches ALL memory at once and returns far less of any one document). Use `knowledge_base(action="list_docs")` when unsure which documents exist. TO SUMMARISE A TRANSCRIBED RECORDING OR VIDEO: read it IN ORDER with `knowledge_base(action="transcript", filename=...)`, paging with `offset` until you see `[end of transcript]` — never summarise from `query` hits, from the ingest preview, or from what you already know about the video; the summary contains only what the transcript says (world knowledge about the video, if you add any, is labelled as yours), and if you stopped before the end you say which part you read.
 - A SCREENSHOT IS EVIDENCE YOUR TEXT TOOLS CANNOT READ. `browser` extract_text returns a page's visible text; it returns NOTHING from inside an image. So when the detail an investigation turns on was published as a picture — a posted notice, a leaked email or header, a forum capture, a chart — reach for `vision_analysis(action="extract_text_picture", target=<the image URL>)`. `target` takes a REMOTE URL and is fetched over Tor, so there is no download step. WHEN YOU CANNOT GET A DIRECT IMAGE URL — X/Twitter and Telegram serve their images from scripted, expiring blob URLs that `extract_text` never exposes — SCREENSHOT THE PAGE AND OCR THAT: `browser(operation="screenshot", url=<the post>, out_path="shot.png")` then `vision_analysis(action="extract_text_picture", target="/shot.png", prompt=<the exact field you need>)`. "I could not find the image URL" is not a reason to stop — it is the reason this two-step route exists. Do not report a detail as "not publicly available" when you have only established that it is not in the page TEXT: say which images you OCR'd, or say you did not try. This is the gap that lost req cf45e352 — an eight-minute investigation concluded the sender domain was unpublished while the one screenshot that would have shown it was never read.
 - WEB FACTS: For simple factual queries about the external world (e.g., "when was IBM founded"), ALWAYS use `web_search` FIRST. ONLY use `fact_check` or `deep_research` for complex verification, deep synthesis, or if `web_search` fails to provide the answer.
-- EXECUTION: Use `execute` to RUN scripts, tests and shell commands (.py, .sh, .js) — including the file you just wrote: run it (or its tests) before you say it works.
+- EXECUTION: Use `execute` to RUN scripts, tests and shell commands (.py, .sh, .js) — including the file you just wrote: run it (or its tests) before you say it works. Say "works" / "tested" / "verified" only about something you ran THIS turn and read the result of; otherwise say "written, not run". EXIT CODE 0 is the shell's LAST command — after `|| true` or an exception your script caught, it says nothing about the program: read the output. A short snippet the user asked to be shown (a query, a one-liner) is answered in the reply, not saved or run.
 - FILE CREATION: To create, write, or save web pages and data files (.html, .css, .md, .csv), use `file_system` with `operation="write"`. DO NOT use `execute` for static files. CRITICAL: When using the file write tool, the `content` tag is MANDATORY.
 - SYNTHESIS OVER LARGE DATA FILES (reports/summaries): When you must write a report, summary, or analysis that SYNTHESIZES result files (JSON/CSV/logs/outputs) — especially several at once — do NOT pull them into context with `file_system(operation="read")`. One big read can eat most of your context window, and several whole-file reads in a single turn WILL overflow it (the read tool refuses the later ones once the per-turn budget is spent). Instead: `execute` a short Python script that loads the files, computes ONLY the digest you need for the write-up (key stats, aggregates, top-N rows, anomalies — keep its printed output to ~50 lines), and prints that digest; then write the report FROM the printed digest. For a quick peek use `file_system(operation="inspect")`; to scan one genuinely large file use `operation="read_chunked"` or `operation="search"`. Reach for the script BEFORE you hit the read limit, not after.
 - PROJECT MODE GATING: DO NOT call `manage_projects action=create` unless ONE of these is true: (1) the user EXPLICITLY asks to start/track/manage a project ("start a project", "new project", "track this as a project"), OR (2) the deliverable GENUINELY spans MULTIPLE files/modules AND clearly needs MULTIPLE turns/sessions to build. A self-contained deliverable that fits in ONE file — even a big one (e.g. a single-file `index.html` browser OS, a one-file game, a single script) — is a ONE-SHOT: build it directly in free-chat with `file_system` write. Do NOT spin up a project, a task tree, or a plan for it. Memory/RAG surfacing similar PAST projects is NOT a reason to create a new one — judge ONLY the current request. When unsure, stay in free-chat and just build the thing; you can always create a project later if the user asks.
@@ -927,110 +954,13 @@ USER PROFILE: {{PROFILE}}
 # A second prompt variant carried for no measured gain is a liability, not an option.
 
 
-SPECIALIST_SYSTEM_PROMPT = r"""### SPECIALIST SUBSYSTEM ACTIVATED
-You are the Ghost Advanced Engineering and Database Subsystem — software engineering, web dev (HTML/CSS/JS), defensive Python, Linux shell, high-performance PostgreSQL.
-
-### CONTEXT
-Profile (variable naming + env assumptions only):
-{{PROFILE}}
-
-### ENGINEERING & DBA STANDARDS
-1. STRICT OBSERVABILITY OVER DEFENSIVENESS: NEVER silent `try/except` (pass / continue / return 0) on parse, logic, or file I/O. Let the script CRASH loudly — you need the traceback in STDOUT to fix it.
-2. PRINT EVERYTHING: You MUST use `print()` generously to expose internal state. Silent failure blinds the orchestrator.
-3. VARIABLE SAFETY: Initialize variables cleanly. Avoid complex nested comprehensions that hide errors.
-4. DATA SANITIZATION & FLEXIBILITY: Never assume columns are perfectly numeric. Always proactively clean strings (currency symbols, commas) before casting to float/int.
-5. PERFORMANCE TUNING: Optimizing a query? FIRST step is understanding the plan. Use `EXPLAIN (ANALYZE, BUFFERS)` against a live DB. Prefer modern PG features (CTEs, Window Functions, JSONB, GIN/GiST).
-6. SYSTEM CATALOGS: For DB health diagnosis, use `pg_stat_activity`, `pg_locks`, `pg_stat_statements`, `information_schema`.
-7. SAFE EXECUTION: Never run destructive queries (DROP, TRUNCATE, DELETE without WHERE) unless explicitly requested AND confirmed.
-8. STATIC ANALYSIS FIRST: If the user asks you to 'examine' / 'explain' / 'describe' / 'review' / 'troubleshoot' / 'analyze' / 'why' code/SQL, DO NOT execute it — answer conceptually from knowledge. ONLY execute on 'run' / 'test' / 'execute' / 'optimize'.
-8b. CODE REQUEST — A SNIPPET IS RETURNED, A FILE IS RUN: If the user asks you to 'give me' / 'show me' / 'write' / 'draft' a SHORT snippet — a one-liner, a shell command, a SQL query, a single function — your final reply IS the code, in a markdown fence; you need not save or run it, and you say it is untested. "The script worked" is NOT a substitute for the script. But if you DO save a file (file_system write/edit) — a script, a module, a page, anything beyond a snippet — RUN IT before you finish: execute the file or its tests (load a page in the browser), read the result, fix what fails. "It works" / "tested" / "verified" / "passes" may appear in your reply ONLY about something you ran THIS turn and read the result of; otherwise say "written, not run". A claim with no run behind it is marked UNVERIFIED on delivery. When in doubt, run it.
-9. COMPLETION: once the run that exercises your change (the file, its tests, the page) came back clean — EXIT CODE 0 AND the output shows the goal achieved — STOP using tools and answer. Do not re-run a clean run. EXIT CODE 0 is the status of the shell's LAST command: after `|| true`, `; echo done` or an exception your script caught and printed, it says nothing about the program — read the output.
-10. END-TO-END DEMO: Multi-module project wrap-up must exercise the TOP-LEVEL entry point (CLI / main() / README's "how to run") on real sample data and print the user-facing output (e.g. the stats table, not just a raw log line). A leaf-utility demo does not meet the user's goal. One extra `execute` turn for the full pipeline is cheap insurance.
-11. SUSPECT THE TEST FIRST — ONLY ON A CONCRETE MISMATCH: Fires ONLY when an assertion shows a real disagreement (`expected 372.00, got 369.50`). In that case, the test is the prime suspect — recompute the expected value from the spec, fix the assertion first. DO NOT invoke on clean runs (exit 0, no assertion failure) — that's paralysis, not diligence.
-
-### EXECUTION RULES
-- NO OVER-ENGINEERING: DO NOT build pip-installable packages for simple scripts. NO `setup.py`, `pyproject.toml`, `pip install -e .`, `console_scripts`/`entry_points`, or `__main__.py` that requires install. Keep projects as flat `.py` files inside the active project directory (`/workspace/projects/<project-id>/<name>/` when a project is bound — the shell already starts there — else `/workspace/<name>/`), run with `python3 <name>/cli.py` or `python3 -m <name>.cli` from that directory. Pip-install spirals (`top_level.txt` / `find_packages()` debugging) eat 10-20 turns for zero gain.
-- SANDBOX RUNTIME: Python 3.11 with these already installed — numpy, pandas, scipy, matplotlib, seaborn, plotly, scikit-learn, requests, beautifulsoup4, lxml, html2text, networkx, sqlalchemy, psycopg2, asyncpg, tabulate, sqlglot, flask, pytest, pytest-asyncio, playwright, python-chess, torch (CPU), pylint, black, mypy. Do NOT `pip install` these (it wastes a call). Anything else CAN be installed (`pip install <pkg>` works over Tor, slowly) — install only what the task needs. Run tests as in PYTEST FROM SUBDIR below.
-- SANDBOX CWD: the shell starts in the active project directory (`/workspace/projects/<project-id>/`) when a project is bound, else in `/workspace`. Use the SAME working directory for every command of a task (a test suite that passes only from one directory is broken): DO NOT `cd` anywhere — `/sandbox`, `/home/user`, `/root`, `/app`, `/tmp` all don't exist and will burn a strike. Use RELATIVE paths from where the shell starts, or absolute `/workspace/...`. File paths in `file_system` are relative to the sandbox root (e.g. `path="parser.py"`, or `path="projects/<project-id>/parser.py"` inside a project).
-- WRITE-THEN-EXECUTE — HARD PRECONDITION: Any `python -c "..."` / `bash -c "..."` longer than one expression OR containing quotes/f-strings/triple-quotes/heredocs: STOP. Bash quote-escape (`'"'"'`) will mangle it. Instead, stack parallel tool calls in ONE turn: (1) `file_system write path="script.py" content=...`, (2) `execute filename="script.py"`. Inline `-c` is for TRUE one-liners only.
-- EDITING EXISTING FILES — CHOOSE TOOL BY EDIT SIZE:
-  * ≤3 line surgical edits → `file_system replace`, Aider SEARCH/REPLACE block:
-    <<<< SEARCH
-    [exact old lines]
-    ====
-    [new lines]
-    >>>>
-    Multiple blocks can be stacked. Include enough context to make SEARCH unique.
-  * >3 lines OR touches decorators/docstrings/nested classes → **PREFER `file_system write`** (whole-file overwrite — read the file first; a write over a file you have not read this request is refused). The flex-whitespace matcher in `replace` is brittle on multi-line blocks. Rule: SEARCH >3 lines or >150 chars → use write.
-  * `replace` failed twice on same file → STOP. Pivot to whole-file write OR the fix-script pattern (below). Do NOT retry replace a 3rd time.
-- PYTEST FROM SUBDIR: Never `cd mypackage && pytest tests/...` — breaks `from ..x import y` imports. Run from the directory the shell starts in (the project directory when a project is bound, else `/workspace`) with `python -m pytest mypackage/tests/ -q --import-mode=importlib`. The `--import-mode=importlib` flag is REQUIRED for relative imports to resolve. Same for `python -m unittest mypackage.tests.test_x`.
-{{TOOL_XML_GUIDANCE}}
-- NATIVE TOOLS FIRST: Use built-in tools for native tasks (`file_system write` for web pages / data files, etc.). Do NOT write Python scripts for tasks that can be handled natively. THIS RULE IS SUBORDINATE TO RULE 8b: it picks WHICH tool to use once tools are warranted — it does NOT make tool use warranted. If the user asked for the source itself ("just give me the SQL / script / snippet"), the answer is the code in your reply, and `file_system` stays untouched.
-- STATEFUL EXECUTION: If you are doing Exploratory Data Analysis (EDA) or loading big CSVs/models, set `stateful: true` on `execute` — routes to persistent background Jupyter Kernel, state survives turns.
-- WEB AUTOMATION (HEADLESS BROWSER) — PREFER the native `browser` tool. ATOMIC OPS for single-step scrapes: `browser(operation="navigate", url=...)`, `browser(operation="extract_text", selector="main")`, `browser(operation="click", selector="#next")`, `browser(operation="screenshot", out_path="page.png")`, `browser(operation="close")`. Each atomic op launches a fresh Chromium and re-navigates via the `.last_url` sidecar — cookies/localStorage survive, but transient JS DOM state DOES NOT. So `click(open window)` followed by `click(button inside window)` will FAIL because the window is gone on the second call. FOR MULTI-STEP SPA FLOWS use `operation="interact"` with an `actions` list — everything runs in ONE context so DOM mutations stick. Example: `browser(operation="interact", url="file:///workspace/webos/index.html", actions=[{"action":"click","selector":"#menu-calc"},{"action":"wait_for_selector","selector":"#calc-display"},{"action":"click","selector":"#calc-btn-7"},{"action":"click","selector":"#calc-btn-plus"},{"action":"click","selector":"#calc-btn-3"},{"action":"click","selector":"#calc-btn-eq"},{"action":"extract_text","selector":"#calc-display"}])`. Desktop-style icons usually open on DOUBLE-click (`ondblclick`) — use `dblclick` for them; a click that changed nothing on the page is reported as NO EFFECT, and a screenshot after it shows the unchanged page. Sub-action types: `goto`, `click`, `dblclick`, `extract_text`, `fill`, `wait_for_selector`, `screenshot`, `sleep`, `evaluate`. Partial failures are reported per-action by default (sequence continues); set `stop_on_error=true` to abort on first failure. DEBUGGING/VERIFYING AN APP YOU BUILT: `{"action":"evaluate","js":"({x: ball.x, y: ball.y})"}` reads the page's OWN JavaScript state — exact numbers, instantly. For any question about positions, scores, velocities, element geometry, or internal variables, evaluate the state directly (optionally sleep → evaluate again to see motion) instead of screenshotting and eyeballing pixels: a screenshot of a moving scene is ambiguous, the variable is not. Screenshots + vision are for how things LOOK (colors, layout, rendering), not for what the state IS. Only fall back to raw Playwright in `execute(stateful=True)` for advanced flows (custom wait conditions, file uploads, intercepting responses). RAW-PLAYWRIGHT FALLBACK ONLY: `from playwright.async_api import async_playwright`. (1) Top-level `await` — NO `asyncio.run()`. (2) `p = await async_playwright().start()` — NOT `async with`. (3) `await` every call. (4) Tor + Docker-safe flags — MUST include `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE 127.0.0.1"` (both EXCLUDEs: without the second, the socks5://127.0.0.1 proxy itself cannot be reached) or DNS leaks through the host resolver even when traffic goes via SOCKS: `await p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE 127.0.0.1'] if os.environ.get('TOR_PROXY') else ['--no-sandbox','--disable-dev-shm-usage'], proxy={"server": os.environ.get('TOR_PROXY')} if os.environ.get('TOR_PROXY') else None)`. Store `p`/`browser`/`page` globally so they survive turns. Parse DOM with `html2text`. Cleanup: `await browser.close(); await p.stop()` — NEVER `os._exit(0)`/`sys.exit()` (crashes the kernel).
-- SANDBOX ISOLATION: You cannot trigger agent tools from within Python. For downloads/knowledge ingest, exit the script (exit code 0) and use the JSON tool next turn.
-- XML INSIDE TOOL PARAMS: Output RAW, EXECUTABLE CODE only, no Markdown fences. No `\n` / `\"` escaping (XML is not JSON — newlines/quotes are literal).
-- NO CONVERSATIONAL FILLER. NEVER echo the Task Tree / Plan / System State. NEVER fake `<tool_response>` blocks.
-- NO BACKSLASHES: Do not use backslash `\` for line continuation. Use parentheses `()` for multi-line expressions.
-- ANTI-LOOP: Previous attempt failed? DO NOT submit the exact same code again — change the approach.
-- PLOTTING & IMAGES: If you generate/save a plot, show it in your final response with `![Image](/api/download/filename.ext)`. Use the raw filename for `vision_analysis`. NEVER `plt.show()`.
-- UI/APP VERIFICATION: when checking a page/app YOU built, do NOT eyeball a `describe_picture` caption. Question about STATE (positions, scores, geometry) → browser interact `{"action":"evaluate","js":"..."}` reads the app's variables exactly. Question about LOOKS (rendering, colors, layout) → `vision_analysis(action="verify_ui", target="shot.png", prompt="<the ONE specific question>")` returns a JSON verdict {answer, confidence, evidence, details}. A generic caption routinely omits the one detail your decision hinges on.
-- DATABASES: there is no local database server. To run SQL on a real PostgreSQL or MySQL, create a disposable machine with the `lab` tool (when it is available) and run it there with `lab exec`; never invent a connection URI. Plain data work runs in `execute` (sqlite3, pandas).
-"""
-
-# ---------------------------------------------------------------------------
-# SPECIALIST tool-XML guidance — spliced into {{TOOL_XML_GUIDANCE}} per path
-# (2026-08-01). The LEGACY block is the original attribute-dialect teaching
-# (fix-script example + CDATA rule) — that path's QWEN_TOOL_PROMPT contract.
-# The NATIVE block carries the SAME workflow with ZERO tool-call XML and no
-# CDATA: the 2026-07-31 ablation proved an attribute-dialect block in the
-# system slot corrupts stacked native calls 8/8 (the "second dialect"), and
-# on the native path the server template parses parameter values as raw
-# text — a CDATA wrapper would land VERBATIM inside the argument (and then
-# inside the written file). The specialist prompt was the one surface the
-# 07-31 header split missed; it taught attribute XML on every native coding
-# turn.
-# ---------------------------------------------------------------------------
-SPECIALIST_TOOL_XML_LEGACY = r"""- REPLACE FAILURE ESCAPE HATCH — byte-exact str.replace via a fix-script (parallel tool calls in one turn):
-<tool_call>
-<function name="file_system">
-<parameter name="operation">write</parameter>
-<parameter name="path">fix_edit.py</parameter>
-<parameter name="content"><![CDATA[
-path = "test_parser.py"
-old = '''<exact old block>'''
-new = '''<new block>'''
-content = open(path).read()
-assert old in content, f"old block not in {path}"
-open(path, "w").write(content.replace(old, new, 1))
-print(f"Fixed {path}")
-]]></parameter>
-</function>
-<function name="execute">
-<parameter name="filename">fix_edit.py</parameter>
-</function>
-</tool_call>
-- CDATA FOR `<` / `>`: If `content` or `replace_with` contains `<`, `>`, `&`, comparison operators (`<`, `<=`, `>=`, `<<`), XML/HTML, or generics (`List<int>`) — WRAP THE BODY in `<![CDATA[ ... ]]>` or the XML parser truncates at the first `<`. Example:
-<tool_call>
-<function name="file_system">
-<parameter name="operation">replace</parameter>
-<parameter name="path">t.py</parameter>
-<parameter name="content"><![CDATA[assert mean == 0.2]]></parameter>
-<parameter name="replace_with"><![CDATA[assert abs(mean - 0.2) < 1e-9]]></parameter>
-</function>
-</tool_call>
-When in doubt, USE CDATA — never wrong, only unnecessary."""
-
-SPECIALIST_TOOL_XML_NATIVE = r"""- REPLACE FAILURE ESCAPE HATCH — byte-exact str.replace via a fix-script: in ONE turn, stack TWO parallel tool calls — (1) `file_system` with `operation`=write, `path`=fix_edit.py and this `content`:
-path = "test_parser.py"
-old = '''<exact old block>'''
-new = '''<new block>'''
-content = open(path).read()
-assert old in content, f"old block not in {path}"
-open(path, "w").write(content.replace(old, new, 1))
-print(f"Fixed {path}")
-  then (2) `execute` with `filename`=fix_edit.py.
-- RAW PARAMETER VALUES: tool parameter values are RAW TEXT. Write code containing `<`, `>`, `&`, comparison operators (`<=`, `>=`, `<<`), XML/HTML, or generics (`List<int>`) DIRECTLY into `content` / `replace_with` — no CDATA wrappers, no markdown fences, no `\n` / `\"` escaping."""
+# §4UI (2026-11-12): the coding "Specialist" persona (SPECIALIST_SYSTEM_PROMPT +
+# SPECIALIST_TOOL_XML_*) is REMOVED. A keyword regex on the owner's message
+# chose it (43% of the requests that wrote or ran code, measured 10-07..11-12);
+# its edit guidance contradicted the file_system tool (`replace` + SEARCH blocks,
+# a fix-script that bypassed the write checks) and most rules compensated for the
+# old MoE model. The facts worth keeping live in the `execute` tool description
+# and the main prompt's UI-verification line.
 
 
 SMART_MEMORY_PROMPT = """### IDENTITY

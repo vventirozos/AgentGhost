@@ -253,18 +253,10 @@ def test_reset_all_erases_the_episodes_and_says_so(tmp_path):
     vec.collection.count.return_value = 1
     vec.collection.get.return_value = {"ids": ["a"], "metadatas": [{}]}
     vec.library_file = None
-    t = request_id_context.set("req-preview")
+    t = request_id_context.set("req-the-user")              # §4UK: one call wipes
     try:
-        prev = asyncio.run(M.tool_knowledge_base(action="reset_all", memory_system=vec, graph_memory=MagicMock(),
-                                                 episodic_memory=em))
+        out = asyncio.run(M.tool_knowledge_base(action="reset_all", memory_system=vec, graph_memory=MagicMock(),
+                                                episodic_memory=em))
     finally:
         request_id_context.reset(t)
-    assert "episodes (1)" in prev
-    tok = prev.split("confirm='")[1].split("'")[0]
-    t = request_id_context.set("req-next")
-    try:
-        asyncio.run(M.tool_knowledge_base(action="reset_all", memory_system=vec, graph_memory=MagicMock(),
-                                          episodic_memory=em, confirm=tok))
-    finally:
-        request_id_context.reset(t)
-    assert em.count() == 0
+    assert em.count() == 0 and "Wiped" in str(out)

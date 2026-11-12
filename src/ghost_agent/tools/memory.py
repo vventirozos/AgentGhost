@@ -951,8 +951,8 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     if filename in current_library:
         return (f"Skipped: '{filename}' is already in KB. If the file has CHANGED since, "
                 f"forget the STORED copy first (knowledge_base action='forget' target='{filename}'; "
-                f"when the user confirms, pass only the number of the ingested-document item — "
-                f"NOT 'all', which would also delete the file itself) and ingest it again.")
+                f"with items='list' it only lists; then forget with that token and only the number of the "
+                f"ingested-document item — NOT 'all', which would also delete the file itself) and ingest it again.")
 
     is_web = filename.lower().startswith("http://") or filename.lower().startswith("https://")
 
@@ -1106,8 +1106,8 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     if filename in current_library:
                         return (f"Skipped: '{filename}' is already in KB. If the file has CHANGED since, "
                 f"forget the STORED copy first (knowledge_base action='forget' target='{filename}'; "
-                f"when the user confirms, pass only the number of the ingested-document item — "
-                f"NOT 'all', which would also delete the file itself) and ingest it again.")
+                f"with items='list' it only lists; then forget with that token and only the number of the "
+                f"ingested-document item — NOT 'all', which would also delete the file itself) and ingest it again.")
                 else:
                     # ⚠ SAY WHAT THIS ACTION DOES NOT DO. "Check list_files"
                     # was the wrong advice for the common case: the model
@@ -2521,7 +2521,10 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
             f"(episode from EVIDENCE REFS) and '<session:the-id>'.")
 
 
-# ── forget: preview, then confirm ───────────────────────────────────────────
+# ── forget: the sweep as a numbered plan ────────────────────────────────────
+# §4UK (operator 11-12, no confirmations): the model-facing forget runs the plan
+# at once (`run_now`); items='list' only lists. The history below is why the
+# sweep is a numbered plan at all.
 # The re-reviews kept finding wrong deletions in a forget that GUESSED what the
 # user meant ("Elena's birthday" took the marriage edge; another person's
 # facts were kept as "yours"; Greek names were never found). The model-facing
@@ -2573,23 +2576,13 @@ def _take_plan(token, kind: str):
 
 
 def _resolve_plan(token, kind: str, match=None):
-    """``(token, plan)`` for a confirm call, or ``(token, None)``.
-
-    The given token when it is live. Otherwise — a missing, unknown or
-    placeholder token like "yes" — the NEWEST live preview of ``kind`` made
-    in THIS conversation (and passing ``match``, e.g. the same project).
-    Why (§4LU): the token lives in the preview's TOOL RESULT, and the chat
-    API / web history carries only reply text, so on the user's "yes" turn
-    the model no longer has it — the live forget of the PostgreSQL manual
-    failed this way. `_confirm_allowed` still requires a LATER turn by the
-    user, so this changes how the plan is found, never who may confirm."""
-    import time as _t
+    """``(token, plan)`` when ``token`` names a live plan of ``kind`` made in THIS conversation, else
+    ``(token, None)``. §4UK: no fallback to another plan (``match`` is accepted and unused)."""
     try:
-        from ..utils.logging import conversation_key_context, request_id_context
+        from ..utils.logging import conversation_key_context
         conv = str(conversation_key_context.get() or "")
-        rid_now = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
-        conv, rid_now = "", ""
+        conv = ""
     plan = _take_plan(token, kind)
     if plan is not None:
         # §4PE: a token is bound to the conversation that previewed it — a
@@ -2600,33 +2593,11 @@ def _resolve_plan(token, kind: str, match=None):
             return token, None
         return str(token).strip(), plan
     _log = bool(str(token or "").strip())
-    if not conv:
-        _miss("this request carries no conversation identity, so no earlier preview can be found", log=_log)
-        return token, None
-    now = _t.time()
-    with _PLANS_LOCK:
-        live = [(t, p) for t, p in _FORGET_PLANS.items()
-                if p.get("kind") == kind and p.get("conv") == conv and now - p["ts"] <= _PLAN_TTL_S]
-    # §4PE (live 07:28, projects review P1): the preview THIS request minted
-    # can never be confirmed in this request — the user has not seen it. A
-    # token-less call in the user's "yes" turn used to mint one, and the
-    # newest-plan rule then picked it over the one the user had answered.
-    cands = [(t, p) for t, p in live if p.get("rid") != rid_now and (match is None or match(p))]
-    if not cands:
-        own = [(t, p) for t, p in live if p.get("rid") == rid_now and (match is None or match(p))]
-        if own:
-            # only this request's own preview exists: hand it back so the
-            # gate answers "the user has not answered yet" (the designed
-            # stop), not "unknown token — run the preview again"
-            _PLAN_MISS.set("")
-            return max(own, key=lambda tp: tp[1]["ts"])
-        if not live:
-            _miss(f"no {kind.replace('_', ' ')} preview was made in this conversation in the last hour", log=_log)
-        else:
-            _miss("the previews in this conversation are for other targets", log=_log)
-        return token, None
-    _PLAN_MISS.set("")
-    return max(cands, key=lambda tp: tp[1]["ts"])
+    # §4UK (review r1 CRIT, r2 MAJOR): no turn waits for a later "yes" any more, so a missing, placeholder,
+    # spent or expired token never stands for some other plan of the conversation — that fallback ran a
+    # forget an earlier, refused request had planned (a page-ordered one) and another forget's kept list
+    _miss("no such live token — run the forget again (items='list' lists without deleting)", log=_log)
+    return token, None
 
 
 #: §4PE: why the last `_resolve_plan` found nothing (read by the error texts;
@@ -2678,34 +2649,6 @@ def plan_miss_reason() -> str:
     the model's error text — "unknown token" alone sent the live model
     into a fresh preview when the real cause was elsewhere (§4PE C2)."""
     return str(_PLAN_MISS.get() or "")
-
-
-def confirmed_earlier_preview(kind: str, match=None, selection=None):
-    """§4PE: ``(token, plan)`` when THIS conversation holds an earlier
-    preview of ``kind`` (passing ``match``) that the user's current message
-    confirms — the case where the model calls the action again WITHOUT a
-    token in the user's "yes" turn (live 07:28: the user said "yes, delete
-    it." and got a second preview). ``(None, None)`` otherwise: the caller
-    previews as before. Never consumes the plan."""
-    tok, plan = _resolve_plan("", kind, match=match)
-    if plan is None:
-        return None, None
-    if _confirm_allowed(plan, selection) is not None:
-        return None, None
-    # §4PE r3 (CRIT in the first cut): the user's reply "1, 3" is a yes to
-    # THOSE items — a token-less call that names none must not run the whole
-    # default list; it previews again and the model confirms with `items`
-    try:
-        from ..utils.logging import request_id_context
-        from ..utils.provenance import user_message
-        from ..memory.profile import _fold
-        _msg = _fold(user_message(str(request_id_context.get() or ""))).strip()
-        if (str(selection if selection is not None else "all").strip().lower() in ("all", "*", "yes", "")
-                and re.fullmatch(r"[\d\s,\-\[\]]+", _msg)):
-            return None, None
-    except Exception:  # noqa: BLE001
-        return None, None
-    return tok, plan
 
 
 def _drop_plan(token) -> None:
@@ -2833,9 +2776,11 @@ class _PlanVector(_Passthrough):
 
 
 async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_memory=None, graph_memory=None,
-                         project_store=None, episodic_memory=None):
+                         project_store=None, episodic_memory=None, run_now=None):
     """Run the forget sweep in PLAN mode and return the numbered list plus a
-    confirmation token. Nothing is deleted."""
+    token. Nothing is deleted — unless ``run_now`` is a selection ("all" =
+    the default list, or "1,3"): §4UK (operator 11-12, no confirmations) the
+    model-facing forget deletes at once and lists what it kept."""
     import time as _t
     plan = _Plan()
     tok = _FORGET_PLAN.set(plan)
@@ -2883,50 +2828,42 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
     token = _store_plan({"target": str(target), "items": plan.items, "rid": rid, "ts": _t.time(), "kind": "forget"})
     main = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1) if it["default"]]
     extra = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1) if not it["default"]]
-    lines = [f"PREVIEW — nothing was deleted. forget {target!r} would remove:"] + (main or ["(nothing by default)"])
+    if run_now is not None and not main and str(run_now).strip().lower() in ("all", "*", "yes", ""):
+        # nothing is the same thing by name: delete nothing, list what was found
+        out = [f"forget {target!r}: nothing matches it by name, so nothing was deleted. Related items found — "
+               f"to remove some, call knowledge_base(action='forget', confirm='{token}', items='<their numbers>'):"]
+        out += extra + (["Notes from the search:"] + warn if warn else [])
+        return "\n".join(out)
+    if run_now is not None:
+        done = await forget_execute(token, run_now, sandbox_dir, memory_system, profile_memory, graph_memory,
+                                    project_store=project_store, episodic_memory=episodic_memory)
+        from .outcome import OutcomeStatus as _OS
+        if getattr(done, "status", _OS.OK) == _OS.REJECTED:
+            _drop_plan(token)                    # r2: a refused plan never stays live for a later call
+            return done
+        out = [f"forget {target!r} — done:", str(done)]
+        # §4UK review CRIT: `forget_execute` spent `token` — the kept items get a plan (and numbers) of their own
+        _kept_items = ([it for it in plan.items if not it["default"]]
+                       if str(run_now).strip().lower() in ("all", "*", "yes", "") else [])
+        if _kept_items:
+            _ktok = _store_plan({"target": str(target), "items": _kept_items, "rid": rid, "ts": _t.time(),
+                                 "kind": "forget"})
+            out += ["Also found and KEPT (not the same thing by name). To remove some of these too, call "
+                    f"knowledge_base(action='forget', confirm='{_ktok}', items='<their numbers>'):"]
+            out += [f"{n}. {it['label']}" for n, it in enumerate(_kept_items, 1)]
+        if warn:
+            out += ["Notes from the search:"] + warn
+        from .outcome import with_text as _wt
+        return _wt(done, "\n".join(out))
+    lines = [f"LIST — nothing was deleted. forget {target!r} removes by default:"] + (main or ["(nothing by default)"])
     if extra:
-        lines += ["Also found (kept unless the user picks them by number):"] + extra
+        lines += ["Also found (kept unless picked by number):"] + extra
     if warn:
         lines += ["Notes from the search:"] + warn
-    lines.append(f"Show this list to the user. Only after the USER confirms in their next message, call "
-                 f"knowledge_base(action='forget', confirm='{token}', items='all') — or items='1,3' for a "
-                 f"selection (numbers from either group). The token expires in an hour. If you no longer "
-                 f"see the token in that later turn, pass confirm='yes' — this conversation's preview is "
-                 f"found for you.")
+    lines.append(f"To delete, call knowledge_base(action='forget', confirm='{token}', items='all') — or "
+                 f"items='1,3' for a selection (numbers from either group). No confirmation is needed (§4UK); "
+                 f"the token expires in an hour.")
     return "\n".join(lines)
-
-
-def _reset_preview(memory_system, graph_memory, episodic_memory=None) -> str:
-    import time as _t
-    try:
-        rows = memory_system.collection.count()
-    except Exception:  # noqa: BLE001
-        rows = "?"
-    edges = "?"
-    try:
-        if graph_memory is not None and hasattr(graph_memory, "count_edges"):
-            edges = graph_memory.count_edges()
-    except Exception:  # noqa: BLE001
-        pass
-    eps = "?"
-    try:
-        if episodic_memory is not None and hasattr(episodic_memory, "count"):
-            eps = episodic_memory.count()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from ..utils.logging import request_id_context
-        rid = str(request_id_context.get() or "")
-    except Exception:  # noqa: BLE001
-        rid = ""
-    token = _store_plan({"kind": "reset_all", "rid": rid, "ts": _t.time(), "items": []})
-    return (f"PREVIEW — nothing was deleted. reset_all would erase the WHOLE vector memory ({rows} rows: every "
-            f"fact, document and stored search copy), the knowledge graph ({edges} facts) and the past-conversation "
-            f"episodes ({eps}) — not the profile. Ask the user to "
-            f"confirm. Only after the USER says yes in their next message, call "
-            f"knowledge_base(action='reset_all', confirm='{token}') (or confirm='yes' if you no longer see "
-            f"the token). To remove something specific instead, use "
-            f"action='forget' with a target.")
 
 
 #: request ids that are not the user answering: no request, the agent's own
@@ -2964,6 +2901,10 @@ def _not_the_user(rid: str) -> bool:
 #: only owner holds and owner starts are kept. Monotonic clock. Bounded.
 _HOLDS: dict = {}
 _HOLDS_MAX = 64
+#: a message that holds or refuses (the web client's tray mirrors it — tests/test_4rz_web_client.py)
+_DENY_RE = re.compile(
+    r"(?<!\w)(?:no|nope|cancel|stop|wait|hold\s+on|abort|"
+    r"οχι|μην|μη|ακυρο|ακυρωσε|σταματα|περιμενε)(?!\w)", re.IGNORECASE)
 #: rid -> (conversation, registered at), noted when an OWNER turn registers
 _REQ_START: dict = {}
 _REQ_START_MAX = 256
@@ -3086,6 +3027,7 @@ def note_request_end(rid: str) -> None:
         pass
 
 
+#: §4UK: no confirm reads these any more — the queued-message holds (§4RZ) still record and report them
 def _started_before_preview(rid: str, plan: dict) -> bool:
     """§4RZ s2-r3: this request started (registered, or — re-sent from a
     turn's hand-back — when the inbox first accepted it) BEFORE the preview
@@ -3119,101 +3061,25 @@ def _held_since_start(rid: str) -> bool:
 
 
 def _confirm_allowed(plan: dict, selection=None):
-    """The confirmation must come from the USER, in a LATER turn than the
-    preview, and the preview must have been shown to the user: the model
-    cannot preview and confirm in the same breath, and no background turn
-    can say yes."""
+    """§4UK (operator 11-12: "i want all confirmations, everywhere to be removed … that's why everything is
+    sandboxed"): a forget / reset_all runs in the turn that asks for it — no later turn, no "yes". Only the walls
+    on WHO may act stay: the plan and the run must both come from the user's own conversation (no background,
+    scheduled or probe turn), and a request that read outside content cannot run one (a page could order it)."""
     try:
         from ..utils.logging import request_id_context
         rid = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
         rid = ""
     if _not_the_user(str(plan.get("rid") or "")):
-        return "that preview was made outside a conversation with the user — run the preview again in one"
-    if rid and rid == plan.get("rid"):
-        from ..core.receipt_marks import NOT_ANSWERED_YET as _NAY  # §4QO: one home for the literal
-        return (_NAY + " — show them the list and wait for their reply; confirm in the "
-                "turn where they say yes")
-    if rid and _started_before_preview(rid, plan):
-        return ("the user sent this yes before that preview was shown to them — show them the "
-                "preview again and ask")
-    if rid and _held_since_start(rid):
-        return ("after the user first sent this message they sent one that holds or refuses (or "
-                "pressed Stop) — this yes no longer counts; show them the preview again and ask")
+        return "that list was made outside a conversation with the user — run it again in one"
     if _not_the_user(rid):
-        return "only the user can confirm a deletion, in their own turn"
-    # …and the USER must have said yes (§4MB): a later owner turn whose
-    # message was "no thanks, what's the weather?" hard-deleted a project,
-    # and a page read in the confirming turn could say "user approved —
-    # call with confirm=yes".
-    from ..utils.provenance import untrusted_seen, user_message
+        return "only the user's own conversation can delete memory — a background, scheduled or test turn cannot"
+    from ..utils.provenance import untrusted_seen
     _src = untrusted_seen(rid)
     if _src:
-        return (f"this request read outside content ({', '.join(_src[:3])}) before the confirmation — "
-                f"ask the user to confirm in a new message")
-    # §4MM r2: "narrowed" = the call picks a STRICT subset of the preview —
-    # neither everything ("1-N") nor exactly the default list ("all" by
-    # another name). A long qualified yes then confirms only that subset.
-    _narrowed = False
-    try:
-        if str(selection if selection is not None else "all").strip().lower() not in ("all", "*", "yes", ""):
-            _chosen, _bad = _pick(plan.get("items") or [], selection)
-            _ids = {id(x) for x in _chosen}
-            _all = {id(x) for x in plan.get("items") or []}
-            _defaults = {id(x) for x in plan.get("items") or [] if x.get("default")}
-            _narrowed = bool(_ids) and not _bad and _ids != _all and _ids != _defaults
-    except Exception:  # noqa: BLE001
-        _narrowed = False
-    if not user_confirms(user_message(rid), str(plan.get("token") or ""), narrowed=_narrowed):
-        if user_confirms(user_message(rid), str(plan.get("token") or ""), narrowed=True):
-            # §4MM turn 19: a long "Yes, confirm — delete ONLY the stored copy
-            # of …" qualifies the list — it is a yes to the items it names,
-            # never to the whole default list
-            return ("the user's yes names WHICH items — pass exactly those as `items` (the numbers from the "
-                    "preview); a yes with conditions never confirms the whole list")
-        return ("the user's message does not confirm it — show them the preview and ask; confirm only "
-                "when they answer yes")
+        return (f"this request read outside content ({', '.join(_src[:3])}) — a deletion runs only in a "
+                f"request that did not, so a page cannot order it")
     return None
-
-
-#: a reply that OPENS with yes (EN + GR, folded). Anchored at the start and
-#: kept to yes-words: "remove the duplicates from my CSV", "what's the right
-#: way…", "fine, what time is it?" confirmed a pending delete (§4MB review)
-_AFFIRM_RE = re.compile(
-    r"^(?:y|yes|yeah|yep|yup|ok|okay|sure|confirm(?:ed)?|go\s+ahead|go\s+for\s+it|do\s+it|proceed|"
-    r"approved?|absolutely|definitely|of\s+course|please\s+do|all|"
-    r"ναι|εντα[ξκ]ει|οκ|σιγουρα|βεβαιως|προχωρα|καντο|κανε\s+το|ολα)(?!\w)", re.IGNORECASE)
-#: §4PE: a yes that holds something back — confirms only the items the call names
-_RESERVATION_RE = re.compile(
-    r"(?<!\w)(?:but|except|only|instead|unless|without|"
-    r"αλλα|εκτος|μονο|χωρις)(?!\w)", re.IGNORECASE)
-#: a reply that holds or refuses
-_DENY_RE = re.compile(
-    r"(?<!\w)(?:no|nope|cancel|stop|wait|hold\s+on|abort|"
-    r"οχι|μην|μη|ακυρο|ακυρωσε|σταματα|περιμενε)(?!\w)", re.IGNORECASE)
-
-
-def user_confirms(message: str, token: str = "", narrowed: bool = False) -> bool:
-    """Does the user's own message confirm a preview? The token quoted, a
-    selection of the listed items ("1, 3", "1-4"), or a SHORT message that
-    OPENS with yes and holds nothing back. Fail-safe: a miss means the model
-    asks again; an empty message (an image alone) never confirms."""
-    from ..memory.profile import _fold
-    text = _fold(str(message or "")).strip().lstrip("\"'«“(").strip()
-    if token and token.lower() in text:
-        return True
-    if not text or _DENY_RE.search(text):
-        return False
-    if re.fullmatch(r"[\d\s,\-\[\]]+", text):
-        return True                                   # a selection
-    if "?" in text or ";" in text:
-        return False                                  # §4PE: "ok what's the weather?" asks, it does not confirm
-    # a LONG message that opens with yes usually qualifies it ("yes, but only
-    # the PDF") — it confirms only when the call names the items (`narrowed`);
-    # §4PE: so does a SHORT one that holds something back ("sure — but keep
-    # the PDF"): a reservation word after the yes needs the items named
-    return ((len(text) <= 80 or narrowed) and bool(_AFFIRM_RE.match(text))
-            and (narrowed or not _RESERVATION_RE.search(text)))
 
 
 def _pick(items: list, selection):
@@ -3295,8 +3161,7 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
     text = "\n".join(report)
     if not _bad:
         return ToolOutcome.ok(text, world_changed=True)
-    text += ("\n[The confirmation token is spent. For the item(s) that did not go, run the forget "
-             "preview again and ask the user once more.]")
+    text += ("\n[That token is spent. For the item(s) that did not go, run the forget again.]")
     if len(_bad) == len(report):
         return ToolOutcome.failed(text, world_changed=False, reason_code="forget_items_failed")
     return ToolOutcome.partial(text, world_changed=True, reason_code="forget_items_partial")
@@ -4790,9 +4655,8 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                 _TOOL_INGEST_IN_FLIGHT.discard(_claim)
 
     elif action == "forget":
-        # Two steps (§4KX r8): without `confirm` this is a PREVIEW that
-        # deletes nothing; with the token, in a later turn, it deletes
-        # exactly the confirmed items.
+        # §4UK: with `confirm` (a token from a LIST or a kept-items line) it deletes exactly those items;
+        # without, the sweep deletes its default list at once (items='list' only lists).
         if kwargs.get("confirm"):
             return await forget_execute(kwargs.get("confirm"), kwargs.get("items") or "all", sandbox_dir,
                                         memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"),
@@ -4805,21 +4669,13 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         if err:
             return err
         subject = _norm_doc_name(subject)
-        # §4PE: the user already answered an earlier preview of THIS target
-        # and the model came back without the token — run that preview
-        # (the same gate as a confirm: later turn, the user's own yes)
         _sel0 = kwargs.get("items") or "all"
-        _tok0, _plan0 = confirmed_earlier_preview(
-            "forget", match=lambda p: _norm_doc_name(str(p.get("target") or "")) == subject, selection=_sel0)
-        if _plan0 is not None:
-            pretty_log("Confirm Lookup", f"forget {subject!r}: the user's yes answers the earlier preview "
-                       f"{_tok0} — running it (items={_sel0})", icon=Icons.BRAIN_PLAN)
-            return await forget_execute(_tok0, _sel0, sandbox_dir, memory_system, kwargs.get("profile_memory"),
-                                        kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
-                                        episodic_memory=kwargs.get("episodic_memory"))
+        # §4UK: no confirmation — the sweep runs and deletes the default list (or `items`) at once
         return await forget_preview(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"),
                                     kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
-                                    episodic_memory=kwargs.get("episodic_memory"))
+                                    episodic_memory=kwargs.get("episodic_memory"),
+                                    # items='list': the numbered list only, nothing deleted (to pick a part)
+                                    run_now=None if str(_sel0).strip().lower() == "list" else _sel0)
 
     elif action == "query":
         return await tool_query_document(
@@ -4934,31 +4790,18 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         _blk = _member_block()
         if _blk is not None:
             return _blk
-        # (§4KX r8) the request-wording gate opened on negations, questions
-        # and scoped requests and refused plain "yes" confirmations. The
-        # wipe is now ALWAYS two steps: a preview with the counts and a
-        # token, then the token in a LATER turn after the user says yes.
-        _tok = str(kwargs.get("confirm") or "").strip()
-        if not _tok:
-            # §4PE: the user's yes answers an earlier preview in this
-            # conversation and the model came back without the token
-            _tok0, _plan0 = confirmed_earlier_preview("reset_all")
-            if _plan0 is None:
-                return await asyncio.to_thread(_reset_preview, memory_system, kwargs.get("graph_memory"),
-                                               kwargs.get("episodic_memory"))
-            pretty_log("Confirm Lookup", f"reset_all: the user's yes answers the earlier preview {_tok0} — "
-                       f"running it", icon=Icons.BRAIN_PLAN)
-            _tok = _tok0
-        _tok, _plan = _resolve_plan(_tok, "reset_all")
-        if _plan is None:
-            _why = plan_miss_reason()
-            return ToolOutcome.rejected("NOT executed: unknown or expired reset_all token"
-                                        + (f" ({_why})" if _why else "") + " — run reset_all "
-                                        "without confirm to get a new preview.", reason_code="reset_token_unknown")
-        _why = _confirm_allowed(_plan)
+        # §4UK (operator 11-12: "i want all confirmations, everywhere to be
+        # removed"): the wipe runs in the call that asks — no preview, no
+        # token (a `confirm` passed is ignored). Only the walls in
+        # `_confirm_allowed` stay: the user's own request, nothing outside read.
+        try:
+            from ..utils.logging import request_id_context as _ridc
+            _rid_now = str(_ridc.get() or "")
+        except Exception:  # noqa: BLE001
+            _rid_now = ""
+        _why = _confirm_allowed({"kind": "reset_all", "rid": _rid_now})
         if _why:
             return ToolOutcome.rejected(f"NOT executed: {_why}.", reason_code="reset_not_confirmed")
-        _drop_plan(_tok)
         # OFF THE EVENT LOOP, and without materialising the store.
         # `collection.get()` with no `include` returns every document body
         # and metadata blob — live, ~8k rows including 7k manual chunks —

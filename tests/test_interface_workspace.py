@@ -169,10 +169,11 @@ def test_sessions_module_contract():
     assert "data.enabled" in js, "sessions-disabled agents must degrade gracefully"
 
 
-def test_sessions_delete_confirms_first():
+def test_sessions_delete_never_asks():
+    """§4UK (operator 11-12: no confirmations anywhere): the click is the decision."""
     js = _read("sessions.js")
     fn = js.split("async function deleteSession", 1)[1].split("async function", 1)[0]
-    assert "confirm(" in fn, "destructive delete must confirm"
+    assert "confirm(" not in fn
     assert "method: 'DELETE'" in fn
 
 

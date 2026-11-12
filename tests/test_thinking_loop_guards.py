@@ -15,7 +15,6 @@ from ghost_agent.core.agent import (
     _detect_thinking_loop,
     _render_assistant_with_tool_calls,
 )
-from ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT
 from ghost_agent.utils import logging as glog
 from ghost_agent.utils.logging import (
     atomic_print,
@@ -194,30 +193,6 @@ class TestAtomicPrint:
         assert "aabbccdd" in out  # short id printed in BEGIN frame
         # Two complete atomic lines.
         assert out.count("\n") == 2
-
-
-# ---------------------------------------------------------------------------
-# Prompt rules: assertion-distrust / suspect-the-test guidance
-# ---------------------------------------------------------------------------
-
-class TestSelfCorrectionPrompts:
-    def test_specialist_prompt_has_suspect_test_rule(self):
-        text = SPECIALIST_SYSTEM_PROMPT.upper()
-        assert "SUSPECT THE TEST FIRST" in text
-        # Mentions the actual failure mode it's defending against.
-        assert "SPEC" in text and "ASSERTION" in text
-
-    def test_specialist_prompt_is_numbered_after_completion(self):
-        # SUSPECT THE TEST FIRST was originally rule 10, but got pushed to
-        # 11 when the END-TO-END DEMO rule was inserted at position 10 to
-        # address the verifier's REFUTED(90%) on demos that only
-        # exercised a leaf helper. The invariant this test protects is
-        # that SUSPECT THE TEST FIRST still lives AFTER COMPLETION in the
-        # numbered list (so the debug heuristic can't fire on clean runs).
-        idx_completion = SPECIALIST_SYSTEM_PROMPT.find("9. COMPLETION")
-        idx_suspect = SPECIALIST_SYSTEM_PROMPT.find("SUSPECT THE TEST FIRST")
-        assert idx_completion != -1 and idx_suspect != -1
-        assert idx_suspect > idx_completion
 
 
 # ---------------------------------------------------------------------------

@@ -516,11 +516,13 @@ def test_pipestatus_trailer_reports_the_first_failing_stage():
 # ═════════════════════════ A. the standing rules (R1-3, R1-4) ═════════════════════════
 
 def test_the_prompt_asks_for_a_run_before_a_claim():
-    from ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT as SP, SYSTEM_PROMPT
+    # §4UI: the coding persona is gone; the main prompt carries the rules
+    from ghost_agent.core.prompts import SYSTEM_PROMPT
     from ghost_agent.tools.registry import TOOL_DEFINITIONS
-    assert "RUN IT before you finish" in SP                  # rule 8b: a saved file is run
-    assert "ONLY about something you ran THIS turn" in SP
-    assert "|| true" in SP                                   # rule 9: exit 0 is the shell's last command
+    SP = SYSTEM_PROMPT
+    assert "run it (or its tests) before you say it works" in SP   # a saved file is run
+    assert "only about something you ran THIS turn" in SP
+    assert "|| true" in SP                                   # exit 0 is the shell's last command
     assert "verifier will REFUTE" not in SP                  # stale: the judge is off
     assert "DO NOT use `file_system` to save it or `execute` to run it" not in SP
     d = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")["function"]["description"]

@@ -256,13 +256,13 @@ def _calls_named(tree, name):
 
 
 def test_every_guard_the_brief_names_reports_itself():
-    """The sites, read off the tree: an edit-churn steer and stop, a futility
-    steer and report, a killed thinking loop — and every breaker close, through
-    `stamp_loop_breaker`."""
+    """The sites, read off the tree: an edit-churn steer, a futility steer, a
+    killed thinking loop — and every breaker close, through
+    `stamp_loop_breaker` (§4UI removed the edit-churn stop and futility report)."""
     tree = ast.parse((ROOT / "src" / "ghost_agent" / "core" / "agent.py").read_text(encoding="utf-8"))
     kinds = sorted(c.args[2].value for c in _calls_named(tree, "note_guard_event")
                    if len(c.args) == 3 and isinstance(c.args[2], ast.Constant))
-    assert kinds == ["edit_churn", "edit_churn", "futility", "futility", "thinking_loop"]
+    assert kinds == ["edit_churn", "futility", "thinking_loop"]
     stamp = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "stamp_loop_breaker")
     assert len(_calls_named(stamp, "note_guard_event")) == 1
     assert len(_calls_named(tree, "stamp_loop_breaker")) >= 5

@@ -357,33 +357,12 @@ class TestBrokenReplayScrub:
         assert '"native_tools"' in assign
 
     def test_specialist_native_guidance_teaches_zero_xml(self):
-        # The specialist prompt was the one dialect-teaching surface the
-        # 07-31 header split missed: attribute-dialect examples + CDATA
-        # rule on every native coding turn — the prompt-block class the
-        # ablation showed corrupts stacked native calls 8/8. The native
-        # variant must carry the same workflow with ZERO tool-call XML
-        # and no CDATA (the server template parses values as raw text;
-        # a CDATA wrapper would land verbatim inside the argument).
-        from ghost_agent.core.prompts import (
-            SPECIALIST_SYSTEM_PROMPT,
-            SPECIALIST_TOOL_XML_LEGACY,
-            SPECIALIST_TOOL_XML_NATIVE,
-        )
-        assert "<tool_call" not in SPECIALIST_TOOL_XML_NATIVE
-        assert "<function" not in SPECIALIST_TOOL_XML_NATIVE
-        # No CDATA *example* — the prose "no CDATA wrappers"
-        # anti-instruction is allowed (and wanted).
-        assert "<![CDATA[" not in SPECIALIST_TOOL_XML_NATIVE
-        # Workflow survives the format removal.
-        assert "fix_edit.py" in SPECIALIST_TOOL_XML_NATIVE
-        assert "RAW" in SPECIALIST_TOOL_XML_NATIVE
-        # Legacy keeps its contract verbatim.
-        assert '<function name="file_system">' in SPECIALIST_TOOL_XML_LEGACY
-        assert "<![CDATA[" in SPECIALIST_TOOL_XML_LEGACY
-        # The shared body carries the placeholder and no attribute
-        # dialect of its own.
-        assert "{{TOOL_XML_GUIDANCE}}" in SPECIALIST_SYSTEM_PROMPT
-        assert '<function name=' not in SPECIALIST_SYSTEM_PROMPT
+        # §4UI: the coding persona (and its two tool-XML variants) is gone —
+        # no dialect-teaching surface remains to split per path.
+        import ghost_agent.core.prompts as _p
+        assert not hasattr(_p, "SPECIALIST_TOOL_XML_LEGACY")
+        assert not hasattr(_p, "SPECIALIST_TOOL_XML_NATIVE")
+        assert not hasattr(_p, "SPECIALIST_SYSTEM_PROMPT")
 
     def test_specialist_splice_and_grammar_gate_are_path_aware(self):
         # Source guards: the specialist splice selects the guidance per
@@ -391,8 +370,6 @@ class TestBrokenReplayScrub:
         # hard-coded) is refused with a loud warning on the native path
         # instead of silently forcing a third dialect.
         src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
-        assert "SPECIALIST_TOOL_XML_NATIVE if _specialist_native" in src
-        assert "SPECIALIST_TOOL_XML_LEGACY" in src
         assert "GHOST_TOOL_GRAMMAR=1 ignored" in src
         gate_region = src.split("grammar_payload_fields", 1)[0]
         assert '"native_tools"' in gate_region.rsplit("is_final_generation and all_tools", 1)[1]
