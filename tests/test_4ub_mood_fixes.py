@@ -3,7 +3,7 @@
 What the evaluation found (live journals, 84 synthetic messages scored against the live model, code reading):
 
 * the automatic mood was a thumbs-up counter: most owner turns use 0–1 tool calls and earned nothing;
-* the owner's thumbs fed the Mirror's "lasting mood" note — the owner's reactions read as the agent's character;
+* the owner's thumbs fed the (since removed) Mirror's "lasting mood" note — the owner's reactions read as the agent's character;
 * sentiment misread sarcasm ("great, you broke it again" +0.94), task wording ("delete the failed jobs" −0.87),
   pasted logs and articles, and capitals ("WHY IS THIS STILL BROKEN": "language unclear"); its outage was
   logged at DEBUG only; three upbeat messages alone made a heard mood;
@@ -30,7 +30,7 @@ from ghost_agent.core import agent as A
 from ghost_agent.core import feedback as F
 from ghost_agent.distill.user_correction import has_correction_phrase, is_correction_candidate
 from ghost_agent.selfhood import SelfModel
-from ghost_agent.selfhood import mirror as MI
+from ghost_agent.selfhood import loop as MI
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood import sentiment as C
 from ghost_agent.selfhood.state import MOOD_HISTORY_FILENAME
@@ -265,32 +265,9 @@ def test_a_failure_or_two_is_not_an_outage(caplog):
     assert C.BREAKER.ok(2.0) is False
 
 
-# ── 6. the Mirror's lasting note counts the agent's own work only ───────────
+# ── 6. (§4UH-loop: the Mirror's lasting-mood note went with the Mirror) ──────
 
 NOW = dt.datetime(2026, 11, 10, 15, 0).astimezone()
-
-
-def _journal(home, kind, label="content"):
-    p = home / "system" / "selfhood" / MOOD_HISTORY_FILENAME
-    p.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for d in (0, 2, 4):
-        local = dt.datetime.combine(NOW.date() - dt.timedelta(days=d), dt.time(14)).astimezone()
-        at = local.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-        rows.append({"label": label, "intensity": 2, "at": at, "cause": "x", "kind": kind})
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-
-
-@pytest.mark.parametrize("kind", ["thumb_up", "praise", "sentiment", "thumb_down", "correction", "owner",
-                                  "manner", "decay", "quiet", "quiet_end", "", "something new"])
-def test_the_owners_reactions_are_not_the_agents_character(tmp_path, kind):
-    _journal(tmp_path, kind)
-    assert MI.lasting_mood_note(tmp_path, now=NOW) == ""
-
-
-def test_the_agents_own_turns_are(tmp_path):
-    _journal(tmp_path, "turn")
-    assert "content (2 or more of 3) on 3 of them" in MI.lasting_mood_note(tmp_path, now=NOW)
 
 
 # ── 7. project tasks a job closed ───────────────────────────────────────────
@@ -478,22 +455,7 @@ def test_the_web_client_shows_the_note_once():
     assert out == {"shown": [["system", note]], "latched": ["positive", "negative", "positive"]}
 
 
-# ── 12. the Mirror says why a look had nothing to read ──────────────────────
-
-def test_a_look_with_only_strong_mood_replies_says_so(tmp_path, monkeypatch):
-    import asyncio
-    monkeypatch.setattr(MI, "pick_replies", lambda h, now=None, rng=None, after="": [])
-    monkeypatch.setattr(MI, "strong_mood_replies_since", lambda h, now=None, after="": 3)
-    said = asyncio.run(MI.look(tmp_path, object(), now=NOW))
-    assert said.startswith("skipped — all 3 replies of yours since the last look were written under a strong")
-
-
-def test_a_look_with_no_reply_at_all_says_that(tmp_path, monkeypatch):
-    import asyncio
-    monkeypatch.setattr(MI, "pick_replies", lambda h, now=None, rng=None, after="": [])
-    said = asyncio.run(MI.look(tmp_path, object(), now=NOW))
-    assert said == "skipped — no reply of yours since the last look (2 days back at most)"
-
+# ── 12. (§4UH-loop: the Mirror's look and its skip reasons went with the Mirror) ──
 
 # ── 13. introspect quotes what a reply hears ────────────────────────────────
 
@@ -798,7 +760,7 @@ async def test_sarcasm_is_read_off_the_owners_own_words(client, tmp_path):
     assert row["label"] == "positive" and row["nudge"] == 0.0 and row["held"] == C.HELD_SARCASM
 
 
-def test_only_strong_mood_replies_are_counted_as_left_out(tmp_path, monkeypatch):
+def test_only_strong_mood_replies_are_left_out_of_a_look(tmp_path, monkeypatch):
     import ghost_agent.core.failure_census as FC
     from tests.test_4ua_character_mood_tone import NOW as N2, _turn
     # §4UD: the record's VALUES are read (a record with the sentences only is not read at all)
@@ -808,7 +770,9 @@ def test_only_strong_mood_replies_are_counted_as_left_out(tmp_path, monkeypatch)
                                  "manner_name": ""}),
              _turn(4, {"mood": "irritable, 3 of 3", "manner": "evil, 3 of 3"})]
     monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
-    assert MI.strong_mood_replies_since(tmp_path, now=N2) == 1
+    # §4UH-loop: the daily look's reader (``loop.pick_replies``) leaves out exactly the one strong record
+    assert sorted(p["at"] for p in MI.pick_replies(tmp_path, now=N2)) == sorted(
+        t["timestamp"] for t in turns[1:])
 
 
 def test_a_labelled_row_is_never_sent_for_scoring(tmp_path, monkeypatch):

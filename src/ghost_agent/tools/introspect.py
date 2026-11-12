@@ -382,20 +382,18 @@ WORK_LOG_NOTE = ("(a log of requests I worked on — what was ASKED, not facts a
 
 
 def _self_image(context, *, indent: str = "") -> str:
-    """The Mirror's latest sentence as one line, or "" (§4SV-b). The home is
-    resolved by the Mirror's own resolver from the same `memory_dir` the idle
-    phase writes under — one path for the writer and this reader. Not on a
-    public surface: the sentence is drawn from the owner's replies, and the
-    `mirror` command is refused there too."""
+    """The character as one line (``character.line``), or "" — with the character off, or on a public
+    surface (the character is the owner's, and the `mirror` and `character` commands are refused there too).
+    The home is resolved from the same `memory_dir` the idle phase writes under."""
     try:
-        from ..selfhood.mirror import home_from_memory_dir, self_image_line
+        from ..selfhood.loop import home_from_memory_dir
         from ..selfhood import character as _character
         from ..utils.logging import reply_is_public
         if reply_is_public():
             return ""
         _home = home_from_memory_dir(getattr(context, "memory_dir", None))
-        # §4UG: the character's line when it is on (what an owner reply hears), else the Mirror's sentence
-        line = _character.line(_home) if _character.enabled() else self_image_line(_home)
+        # §4UG: the character's line (what an owner reply hears); nothing with the character off
+        line = _character.line(_home) if _character.enabled() else ""
         return indent + line if line else ""
     except Exception as e:  # noqa: BLE001 — a view must render without it
         logger.debug("introspect self-image read skipped: %s", e)
@@ -796,6 +794,32 @@ def _overview_activity(context) -> str:
     return text
 
 
+def _learning_warnings(text: str) -> list:
+    """The report's ⚠ lines, each WITH its detail. §4UI (req 126bbc5f): a
+    "⚠ … REGRESSION:" heading kept without the indented line under it
+    reached the model bare, and the agent invented a "quirk" to the owner.
+    A ⚠ line ending in ':' takes the indented non-⚠ lines that follow it;
+    one that still has none is dropped — a heading with no content is
+    not a warning anyone can act on."""
+    rows = text.split("\n")
+    out = []
+    for i, line in enumerate(rows):
+        head = line.strip()
+        if not head.startswith("⚠"):
+            continue
+        if not head.endswith(":"):
+            out.append(head)
+            continue
+        detail = []
+        for nxt in rows[i + 1:]:
+            if not nxt.strip() or not nxt[:1].isspace() or nxt.strip().startswith("⚠"):
+                break
+            detail.append(nxt.strip())
+        if detail:
+            out.append(head + " " + " ".join(detail))
+    return out
+
+
 async def _overview_learning(context) -> str:
     import asyncio as _asyncio
     _md = getattr(context, "memory_dir", None)
@@ -809,9 +833,7 @@ async def _overview_learning(context) -> str:
     # §4NH review: the ⚠ lines are what a "how's things" must not lose.
     # §4TD: they are the whole section — its one headline was the lesson
     # count, gone with the lesson store.
-    warns = [l.strip() for l in text.split("\n")
-             if l.lstrip().startswith("⚠")]
-    picked = warns[:_OVERVIEW_LEARNING_MAX_LINES]
+    picked = _learning_warnings(text)[:_OVERVIEW_LEARNING_MAX_LINES]
     if not picked:
         return ("Background loops: no warning in the loop-health report (action='learning' for the report)."
                 + _learning_trailer(age))
@@ -1596,7 +1618,7 @@ def _render_mood(self_model, days=None) -> str:
 
 
 #: §4UA: how the character's resting point is described (owner's view only — from the character's dials,
-#: §4UH-e2e; with the character off, from the Mirror, whose sentence is drawn from the owner's conversations)
+#: §4UH-e2e; (0, 0) with the character off)
 REST_TEXT = ("Resting point (set by my character): with nothing happening my mood "
              "settles at pleasantness {p:+.2f}, energy {e:+.2f} — too faint to be a mood; which mood I am in, "
              "and how strongly, comes from what happens.")

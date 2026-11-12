@@ -422,8 +422,8 @@ IDLE_SCHEDULER_JOBS = (
                         and getattr(ctx, "project_store", None) is not None)),
     ("selfhood-narrative", "self narrative", _self_model_on),
     ("workspace-narrative", "workspace narrative", _workspace_model_on),
-    ("mirror", "mirror (one I-sentence a day)",
-     lambda args, ctx: getattr(ctx, "llm_client", None) is not None),
+    ("character", "character (day record; with the character on, the daily dial rule and one look a day)",
+     lambda args, ctx: True),
 )
 
 
@@ -449,7 +449,8 @@ IDLE_JOB_PURPOSE = {
     "autoadvance": "one unattended step on a project you put on autopilot",
     "selfhood-narrative": "rewrites the agent's running diary",
     "workspace-narrative": "rewrites the running summary of the workspace",
-    "mirror": "rewrites its one-sentence self-description from its earlier ones plus a few of your replies",
+    "character": ("closes the day's record, lets the character's dials move from it, and once a day rates how "
+                  "its own replies sound"),
 }
 
 
@@ -12825,7 +12826,7 @@ def _mood_tone_block(context) -> str:
                 _MOOD_TONE_BY_REQ[req_id] = {
                     "mood": view.describe(), "manner": (f"{view.manner}, {view.manner_intensity} of 3"
                                                         if view.manner else ""),
-                    # §4UD (W2): the same as VALUES — readers (the Mirror's strong-mood filter) take these,
+                    # §4UD (W2): the same as VALUES — readers (the daily look's strong-mood filter) take these,
                     # never the two sentences above
                     "label": view.label, "intensity": int(view.intensity),
                     "manner_name": view.manner, "manner_intensity": int(view.manner_intensity or 0),
@@ -12843,7 +12844,7 @@ SELF_IMAGE_OFF_ARM = "no_self_image"
 
 
 def self_image_is_heard_on_this_request(context) -> bool:
-    """§4TZ: does this reply carry the Mirror's self-image? Only a reply to the
+    """§4TZ: does this reply carry the character's self-image? Only a reply to the
     OWNER on a private surface (operator 11-10: "owner only" — the sentence is
     drawn from the owner's replies alone), and a probe of one (it must see
     what a real owner turn sees). NOT a member (a member's probe included), a
@@ -12880,14 +12881,14 @@ _SELF_IMAGE_FREEZE_S = 4 * 3600
 
 
 def self_image_heard(req_id: str) -> str:
-    """The date of the Mirror sentence request ``req_id`` heard ("" = none)."""
+    """The stamp of the character sentence request ``req_id`` heard ("" = none)."""
     with _MOOD_MEMO_LOCK:
         got = _SELF_IMAGE_BY_REQ.get(str(req_id or ""))
         return got[1] if got and got[0] else ""
 
 
 def _self_image_block(context) -> str:
-    """§4TZ: the Mirror's latest sentence as a section of the per-turn state
+    """§4TZ/§4UG: the character's sentence as a section of the per-turn state
     block, after the cached head (never the system slot, never a tool
     description) — the return path of the strange loop. "" (zero bytes)
     when this request does not hear it or there is no sentence yet. The
@@ -12903,10 +12904,9 @@ def _self_image_block(context) -> str:
                     _SELF_IMAGE_BY_REQ.pop(_rid, None)
             return ""
         req_id = str(request_id_context.get() or "")
-        from ..selfhood.mirror import (home_from_memory_dir, self_image_section, probe_section,
-                                       probe_stamp, PROBE_DATE)
+        from ..selfhood.loop import home_from_memory_dir, probe_section, probe_stamp, PROBE_DATE
         # §4UF: a probe may bring the self-image under test (sentence, rule) — heard in the place of
-        # the Mirror's; `probe_self_image()` is empty for anything but a probe. Review r1: read BEFORE
+        # the character's; `probe_self_image()` is empty for anything but a probe. Review r1: read BEFORE
         # the per-request memo (a pure function of the request's own headers, so every step gets the
         # same bytes without it) — a request id sent again with another sentence or rule heard the
         # first one's section, and the record could not show it. The record carries a fingerprint of
@@ -12929,13 +12929,12 @@ def _self_image_block(context) -> str:
                     and time.monotonic() - got[2] < _SELF_IMAGE_FREEZE_S):
                 return got[0]
         # §4UG: the character (three dials, one sentence that is a function of them) is what an owner
-        # reply hears in this place; with GHOST_CHARACTER=0 it is the Mirror's own sentence, as before
+        # reply hears in this place; nothing with GHOST_CHARACTER=0 (the Mirror it replaced is removed)
         from ..selfhood import character as _character
         _home = home_from_memory_dir(getattr(context, "memory_dir", None))
-        if _character.enabled():
-            text, date = _character.section(_home)
-        else:
-            text, date = self_image_section(_home)
+        if not _character.enabled():
+            return ""
+        text, date = _character.section(_home)
         if req_id:
             with _MOOD_MEMO_LOCK:
                 _SELF_IMAGE_BY_REQ[req_id] = (text, date, time.monotonic())
@@ -14163,7 +14162,7 @@ class GhostAgent:
     _STORE_HYGIENE_COOLDOWN = 7200
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
-    _MIRROR_TRY_COOLDOWN = 3600       # §4SV: 1 h between mirror attempts (the diary itself allows one row a day)
+    _SELF_TRY_COOLDOWN = 3600         # §4SV/§4UH: 1 h between tries of the character phase (one look a day)
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
@@ -14310,52 +14309,29 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001
             logger.debug("autonomous-activity record skipped: %s", e)
 
-    async def _mirror_phase(self, ctx, ran: list, notes: dict) -> None:
-        """§4SV idle phase 2.8c: at most one try an hour, one diary row a day.
-        Never raises (a failure is booked on the Idle Cycle line)."""
+    async def _self_phase(self, ctx, ran: list, notes: dict) -> None:
+        """§4UG/§4UH idle phase 2.8c: at most one try an hour — the day's close, the character's daily rule and
+        the daily look (``_character_phase``). The anchor keeps its persisted name, ``_last_mirror_try_at``
+        (idle_cooldowns.json). Never raises (a failure is booked on the Idle Cycle line)."""
         if not hasattr(self, '_last_mirror_try_at'):
             self._last_mirror_try_at = datetime.datetime.min
         if (datetime.datetime.now() - self._last_mirror_try_at).total_seconds() \
-                < self._bio_cooldown(self._MIRROR_TRY_COOLDOWN):
+                < self._bio_cooldown(self._SELF_TRY_COOLDOWN):
             return
         self._last_mirror_try_at = datetime.datetime.now()
         try:
-            from ..selfhood import mirror as _mirror
-            home = _mirror.home_from_memory_dir(getattr(ctx, 'memory_dir', None))
+            from ..selfhood import loop as _loop
+            home = _loop.home_from_memory_dir(getattr(ctx, 'memory_dir', None))
             if home is None:
                 return
-            from ..selfhood import character as _character
-            # §4UG: the day's close (and the character's daily rule, when it is on) — no model call
             await self._character_phase(home, ran, notes, ctx)
-            if _character.enabled():
-                # the self-image is the character's sentence now (a function of its dials) — the look
-                # that rewrote a sentence from the replies is not asked: nothing would hear it
-                return
-            if await asyncio.to_thread(_mirror.looked_today, home):
-                return
-            from .llm import BackgroundDeferred as _BgDeferred
-            try:
-                note = await _mirror.look(home, getattr(ctx, 'llm_client', None),
-                                          model=str(getattr(getattr(ctx, 'args', None), 'model', '') or ''))
-            except _BgDeferred:
-                # review r2 m1: a request started — a guard, not a failure (§4PM);
-                # the next tick in this idle window tries again
-                self._last_mirror_try_at = datetime.datetime.min
-                ran.append("mirror")
-                notes["mirror"] = "deferred — a request started; tries again on the next idle tick"
-                logger.info("mirror: deferred — a request started")
-                return
-            ran.append("mirror")
-            notes["mirror"] = note
-            if note.startswith(("new I-sentence", "unchanged")):
-                pretty_log("Mirror", note, icon=Icons.MIRROR)
         except Exception as e:  # noqa: BLE001 — a real failure: booked, retried in an hour (same window)
-            _idle_phase_failed(self, ran, "mirror", e)
+            _idle_phase_failed(self, ran, "character", e)
 
     async def _character_phase(self, home, ran: list, notes: dict, ctx=None) -> None:
         """§4UG: close the days that are over (``selfhood.days``) and, with the character on, let its
-        daily rule look at them (``selfhood.character.daily``). No model call. Runs at the Mirror's place
-        in the idle window, at most once an hour; a day already closed costs one small file read. The
+        daily rule look at them (``selfhood.character.daily``). No model call. Runs in phase 2.8c
+        of the idle window, at most once an hour; a day already closed costs one small file read. The
         mood is SETTLED first (review r1: a mood that wore off unseen was still "held" in the journal,
         and a day closed over it read content for 19 hours). Never raises."""
         try:
@@ -14410,8 +14386,16 @@ class GhostAgent:
                     _likes = await asyncio.to_thread(lambda: _tastes.line(home, liked_only=False))
                     if _likes:
                         pretty_log("Tastes", _likes, icon=Icons.MIRROR, durable_only=True)
+                if _character.enabled() and written:
+                    # §4UH-warmth (operator: "would be nice to have it" in the logs): each closed day's pull on
+                    # each dial against its own norm — what the rule counts, even when nothing moves
+                    _all = await asyncio.to_thread(_days.load_days, home)
+                    for _date in written:
+                        _pl = _character.pull_line(_all, _date)
+                        if _pl:
+                            pretty_log("Character", "day compared: " + _pl, icon=Icons.MIRROR)
                 for mv in moves:
-                    pretty_log("Character", mv, icon=Icons.MIRROR)
+                    pretty_log("Character", "dial moved by itself: " + mv, icon=Icons.MIRROR)
                 if written:
                     for rec in (await asyncio.to_thread(_days.load_days, home, limit=len(written))):
                         pretty_log("Day Record", _days.day_line(rec), icon=Icons.MIRROR, durable_only=True)
@@ -14428,13 +14412,13 @@ class GhostAgent:
             msgs = body.get("messages") if isinstance(body, dict) else None
             last = next((m for m in reversed(msgs or []) if isinstance(m, dict) and m.get("role") == "user"), None)
             text = _message_lines(last.get("content")) if last else ""
-            from ..selfhood.mirror import is_mirror_command, mirror_banner, home_from_memory_dir
-            if is_mirror_command(text):          # §4SV: the Mirror's diary, shown by the system
+            from ..selfhood.loop import is_mirror_command, banner as _loop_banner, home_from_memory_dir
+            if is_mirror_command(text):          # §4UH-loop: the strange loop's path, shown by the system
                 home = home_from_memory_dir(getattr(self.context, "memory_dir", None))
                 if home is None:
                     return ""
                 from .owner_rules import _note as _rn
-                note = _rn(await asyncio.to_thread(mirror_banner, home))
+                note = _rn(await asyncio.to_thread(_loop_banner, home))
                 pretty_log("Owner Command", _owner_command_line("mirror", text, note), icon=Icons.MIRROR)
                 return note
             from ..selfhood import character as _character
@@ -15053,17 +15037,16 @@ class GhostAgent:
         # 2026-11-05: open questions went with the `self_state` tool, their
         # only writer.)
 
-        # Phase 2.8c (§4SV): the Mirror — a toy strange loop. Once a day the
-        # main model rewrites the agent's one-sentence self-description from
-        # its earlier sentences plus a few of the owner's replies. §4SV-b: the
-        # latest sentence is one line of `introspect` (overview, summary);
-        # §4TZ: and one section of the state block of every owner reply on a
-        # private surface (`_self_image_block`); the owner's `mirror` command
-        # shows the diary. The MAIN model at background priority (operator: the model that
-        # wrote the replies reads them); the conversation is saved first
-        # (§4RV). Listed on the Idle Cycle line only when it looked.
+        # Phase 2.8c (§4UG/§4UH): the character — the strange loop's turn. The
+        # days that are over are closed into day records, the character's daily
+        # rule lets a dial move from them (no model call), and once a day the
+        # agent rates how its own replies sound (one background call on the MAIN
+        # model; the conversation is saved first, §4RV). The sentence is one
+        # section of every private owner reply's state block (`_self_image_block`)
+        # and one line of `introspect`; the owner's `mirror` command shows the
+        # loop's path. Listed on the Idle Cycle line only when something happened.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
-            await self._mirror_phase(ctx, _idle_ran, _idle_notes)
+            await self._self_phase(ctx, _idle_ran, _idle_notes)
 
         # Phase 2.9: Workspace Narrative Consolidation (15-60 min idle).
         # Mirrors phase 2.8 but for the world-model. Re-renders the
@@ -37644,7 +37627,7 @@ class GhostAgent:
         _heard = mood_tone_heard(req_id or "")
         if _heard:
             _extra["mood_tone"] = _heard
-        _si = self_image_heard(req_id or "")                    # §4TZ: which Mirror sentence it heard
+        _si = self_image_heard(req_id or "")                    # §4TZ: which character sentence it heard
         if _si:
             _extra["self_image"] = _si
         _shade_heard = mood_shade_heard(req_id or "")           # §4UG: the mood's shade this reply carried

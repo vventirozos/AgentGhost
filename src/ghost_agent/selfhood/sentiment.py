@@ -45,6 +45,22 @@ JOURNAL_TEXT_CHARS = 300
 #: past this the journal is moved to ``.1`` (one old file kept) — ~50 messages a day is ~20 KB
 JOURNAL_MAX_BYTES = 5 * 1024 * 1024
 LABELS = ("negative", "neutral", "positive", "unknown")
+#: §4UH-warmth: the emotion model's labels (GoEmotions: 27 emotions + neutral). The service answers ``emotions``
+#: {label: probability} for those at 0.05 or more; an unknown label or a bad number drops the whole field
+EMOTION_LABELS = frozenset((
+    "admiration", "amusement", "anger", "annoyance", "approval", "caring", "confusion", "curiosity", "desire",
+    "disappointment", "disapproval", "disgust", "embarrassment", "excitement", "fear", "gratitude", "grief", "joy",
+    "love", "nervousness", "optimism", "pride", "realization", "relief", "remorse", "sadness", "surprise",
+    "neutral"))
+#: what the character's WARMTH reads (``days`` counts a message for a side when one of its labels is at
+#: ``EMOTION_COUNT_MIN`` or more): how the owner talks to it. Not curiosity or confusion (questions), not sadness,
+#: fear, grief or nervousness (the owner's own news, not how they are with Ghost)
+WARM_EMOTIONS = frozenset(("gratitude", "admiration", "approval", "joy", "caring", "love", "amusement",
+                           "excitement", "optimism", "relief", "pride"))
+COLD_EMOTIONS = frozenset(("annoyance", "anger", "disapproval", "disappointment", "disgust"))
+EMOTION_COUNT_MIN = 0.5
+#: the log line shows emotions from here (weaker readings are noise); only EMOTION_COUNT_MIN ones are counted
+EMOTION_SHOWN_MIN = 0.2
 
 
 def settings() -> tuple:
@@ -127,8 +143,14 @@ def _answer(body) -> Optional[Dict[str, object]]:
     if not isinstance(probs, dict) or not all(
             k in LABELS and isinstance(v, (int, float)) and not isinstance(v, bool) for k, v in probs.items()):
         return None
-    return {"label": label, "score": float(score), "probs": {k: float(v) for k, v in probs.items()},
-            "reason": str(body.get("reason") or "")[:40]}
+    out = {"label": label, "score": float(score), "probs": {k: float(v) for k, v in probs.items()},
+           "reason": str(body.get("reason") or "")[:40]}
+    emo = body.get("emotions")
+    if isinstance(emo, dict) and label != "unknown" and all(
+            k in EMOTION_LABELS and isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0
+            for k, v in emo.items()):
+        out["emotions"] = {k: round(float(v), 4) for k, v in emo.items()}
+    return out
 
 
 async def classify(text: str, *, tor_proxy: Optional[str] = None,
@@ -391,22 +413,47 @@ async def score_message(content, root, *, request_id: str = "", tor_proxy: Optio
 
 
 def rating_line(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -> str:
-    """The log line's content: the rating and what it did to the mood, never the words.
-    ``positive 0.95 (neg 0.01 · neu 0.04) · mood +0.08``, ``neutral 0.89 (…) · mood unmoved — message neutral``,
-    ``unknown — not English · mood unmoved``. A neutral message says so in words: a bare ``(neutral)`` read as the
-    MOOD being neutral while the owner's set mood held."""
+    """The log line's content, in plain words, never the message's words (operator 11-12: "make the logs easy to
+    read and understand but informative"). Three parts: how the message read, its strongest emotions (and whether
+    the day record counts them for warmth), and what it did to the mood:
+    ``positive 95% (neutral 4%, negative 1%) · emotion: gratitude 99% (counts as warm) · mood nudged up +0.08``,
+    ``positive 82% (…) · emotion: curiosity 44% · mood unchanged: a nudge needs 85% or more``,
+    ``not rated: not English · mood unchanged``."""
     label = str(answer.get("label") or "")
     if nudge:
-        effect = f"mood {nudge:+.2f}".replace("-", "−")
-    elif held == "neutral" and label == "neutral":
-        effect = "mood unmoved — message neutral"
+        effect = f"mood nudged {'up' if nudge > 0 else 'down'} {nudge:+.2f}".replace("-", "−")
+    elif label == "unknown":
+        effect = "mood unchanged"
+    elif held == "neutral" or label == "neutral":
+        effect = "mood unchanged: a neutral message"
+    elif held.startswith("below "):
+        try:
+            effect = f"mood unchanged: a nudge needs {float(held.split()[1]) * 100:.0f}% or more"
+        except (IndexError, ValueError):
+            effect = f"mood unchanged: {held}"
     else:
-        effect = "mood unmoved" + (f" ({held})" if held and label != "unknown" else "")
+        effect = "mood unchanged" + (f": {held}" if held else "")
     if label == "unknown":
-        return f"unknown — {answer.get('reason') or 'no reason given'} · {effect}"
+        return f"not rated: {answer.get('reason') or 'no reason given'} · {effect}"
     probs = answer.get("probs") or {}
-    others = " · ".join(f"{k[:3]} {float(v):.2f}" for k, v in probs.items() if k != label)
-    return f"{label} {float(answer.get('score') or 0):.2f}" + (f" ({others})" if others else "") + f" · {effect}"
+    others = ", ".join(f"{k} {float(v) * 100:.0f}%" for k, v in sorted(probs.items(), key=lambda kv: -float(kv[1]))
+                       if k != label)
+    # operator 11-12 (req 9cbdf9aa: a question read curiosity 0.44 and the line said nothing): the strongest two
+    # at EMOTION_SHOWN_MIN or more are shown; the ones the day record COUNTS (EMOTION_COUNT_MIN, warm or annoyed)
+    # say so; a reading with none says "none clear", so a line with no emotion part means no emotion answer
+    emo = answer.get("emotions")
+    shown = ""
+    if isinstance(emo, dict):
+        top = sorted(((v, k) for k, v in emo.items() if k != "neutral" and v >= EMOTION_SHOWN_MIN), reverse=True)[:2]
+
+        def _tag(k, v):
+            if v < EMOTION_COUNT_MIN:
+                return ""
+            return " (counts as warm)" if k in WARM_EMOTIONS else " (counts as annoyed)" if k in COLD_EMOTIONS else ""
+        shown = (" · emotion: " + ", ".join(f"{k} {v * 100:.0f}%{_tag(k, v)}" for v, k in top)) if top \
+            else " · emotion: none clear"
+    return (f"{label} {float(answer.get('score') or 0) * 100:.0f}%" + (f" ({others})" if others else "") + shown
+            + f" · {effect}")
 
 
 def log_rating(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -> None:

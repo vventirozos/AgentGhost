@@ -80,7 +80,7 @@ RULE = ("(Your character: how you are with the owner, set by a few dials that mo
 # and every dial sat at its limit within a month. Compared with its own norm the pulls are balanced
 # (14/12, 11/9, 16/8) and the dials moved nine times in six weeks, both ways.
 #: what each dial listens to, in words (the log and the view say it)
-SIGNAL_WORDS = {"warmth": "what came from the owner (thumbs, thanks, the tone of the messages)",
+SIGNAL_WORDS = {"warmth": "how the owner talked to it (thanks, praise and warmth in the messages, against annoyance)",
                 "humour": "how its own work went (clean turns, relief and pride against trouble)",
                 "directness": "how its answers were judged (thumbs up against thumbs down and corrections)"}
 #: one very good day counts no more than a good one
@@ -117,9 +117,18 @@ def day_signals(rec: Dict[str, object]) -> Dict[str, Optional[float]]:
             return max(0, int(v)) if not isinstance(v, bool) else 0
         except (TypeError, ValueError):
             return 0
-    good = n("thumbs_up") + n("praise") + n("tone_up")
-    bad = n("thumbs_down") + n("corrections") + n("tone_down")
-    warm = max(-WARMTH_CAP, min(WARMTH_CAP, float(good - 2 * bad))) if good + bad else None
+    # §4UH-warmth (operator 2026-11-12, "separate them"): warmth reads HOW THE OWNER TALKS TO IT, directness how
+    # its answers were JUDGED — no signal in both (thumbs fed both until then, and a good day of thumbs moved
+    # both dials at once). From the emotion model's counts when the day has rated messages; a day from before
+    # it (or with none rated) reads thanks and the sentiment tone the mood saw
+    if n("msgs_rated"):
+        # review: thanks the emotion model did not read (Greek — it reads English only — or a miss) still count:
+        # the praise check's thanks beyond the gratitude the model saw
+        good, bad = n("msgs_warm") + max(0, n("praise") - n("msgs_thanks")), n("msgs_cold")
+        warm = max(-WARMTH_CAP, min(WARMTH_CAP, float(good - 2 * bad)))
+    else:
+        good, bad = n("praise") + n("tone_up"), n("tone_down")
+        warm = max(-WARMTH_CAP, min(WARMTH_CAP, float(good - 2 * bad))) if good + bad else None
     work = m(own, "clean_turns") + m(own, "trouble")
     ease = ((m(own, "clean_turns") + m(shades, "relieved") + m(shades, "proud") - 2 * m(own, "trouble")) / work
             if work >= WORK_MIN_TURNS else None)
@@ -128,24 +137,76 @@ def day_signals(rec: Dict[str, object]) -> Dict[str, Optional[float]]:
     return {"warmth": warm, "humour": ease, "directness": sure}
 
 
+def signal_scales(rec: Dict[str, object]) -> Dict[str, str]:
+    """Which scale each dial's number is on for this day: warmth is "emotions" when the emotion model read a
+    message that day (§4UH-warmth), else "counts"; the other dials have one scale. Pure."""
+    try:
+        v = rec.get("msgs_rated")
+        rated = int(v) > 0 if isinstance(v, int) and not isinstance(v, bool) else False
+    except (TypeError, ValueError, AttributeError):
+        rated = False
+    return {"warmth": "emotions" if rated else "counts", "humour": "", "directness": ""}
+
+
 def day_pulls(days: List[Dict[str, object]]) -> Dict[str, Dict[str, int]]:
     """{date: {dial: +1 | -1}} — for each day (in date order), which way it pulls each dial: its number
     against the mean of the same number over the ``BASE_DAYS`` before it, when at least ``BASE_MIN`` of them
     carry one and the day is more than ``BAND`` standard deviations off. A day with no pull is not listed."""
+    out: Dict[str, Dict[str, int]] = {}
+    for date, dial, _v, _mean, pull in _readings(days):
+        if pull:
+            out.setdefault(date, {})[dial] = pull
+    return out
+
+
+def _readings(days: List[Dict[str, object]]):
+    """(date, dial, the day's number, its norm's mean, pull ±1 or 0) for every day and dial that has a number and a
+    norm (``BASE_MIN`` days on its own scale among the ``BASE_DAYS`` before it) — ``day_pulls`` and the log line."""
     import statistics
     ordered = _by_date(days)
     sig = [day_signals(d) for d in ordered]
-    out: Dict[str, Dict[str, int]] = {}
+    scale = [signal_scales(d) for d in ordered]
     for i, d in enumerate(ordered):
         for dial in DIALS:
             v = sig[i][dial]
-            prev = [x[dial] for x in sig[max(0, i - BASE_DAYS):i] if x[dial] is not None]
+            # §4UH-warmth review (MAJOR): a day is judged only against days read on the SAME scale — the
+            # emotion counts and the older thanks/tone counts are different numbers (an old day with nothing on
+            # it was None, so the old norm held only days that had something, and every ordinary new day read
+            # "clearly worse": warmth went −1 → −2 in a week in the review's simulation)
+            prev = [x[dial] for k, x in enumerate(sig[max(0, i - BASE_DAYS):i], start=max(0, i - BASE_DAYS))
+                    if x[dial] is not None and scale[k][dial] == scale[i][dial]]
             if v is None or len(prev) < BASE_MIN:
                 continue
-            z = (v - statistics.fmean(prev)) / (statistics.pstdev(prev) or 1.0)
-            if abs(z) > BAND:
-                out.setdefault(str(d.get("date")), {})[dial] = 1 if z > 0 else -1
-    return out
+            mean = statistics.fmean(prev)
+            z = (v - mean) / (statistics.pstdev(prev) or 1.0)
+            yield str(d.get("date")), dial, v, mean, (1 if z > 0 else -1) if abs(z) > BAND else 0
+
+
+def pull_line(days: List[Dict[str, object]], date: str) -> str:
+    """One log line for a closed day, in plain words: how each dial's day score compares with its usual (the
+    mean of the days before it, on its own scale) and which way that pulls the dial, e.g.
+    "2026-11-13 vs usual: warmth higher (3.0 vs 1.2), pulls up · humour about usual (0.8 vs 0.7) · directness no
+    signal today". A dial moves only when several days pull the same way. Never raises."""
+    try:
+        got = {dial: (v, mean, pull) for d, dial, v, mean, pull in _readings(days) if d == date}
+        day = next((d for d in _by_date(days) if str(d.get("date")) == date), None)
+        sig = day_signals(day) if day else {}
+        parts = []
+        for dial in DIALS:
+            if dial in got:
+                v, mean, pull = got[dial]
+                if pull:
+                    parts.append(f"{dial} {'higher' if pull > 0 else 'lower'} ({v:.1f} vs {mean:.1f}), "
+                                 f"pulls {'up' if pull > 0 else 'down'}")
+                else:
+                    parts.append(f"{dial} about usual ({v:.1f} vs {mean:.1f})")
+            elif sig.get(dial) is not None:
+                parts.append(f"{dial} {sig[dial]:.1f}, not enough days yet to compare (needs {BASE_MIN})")
+            else:
+                parts.append(f"{dial} no signal today")
+        return f"{date} vs usual: " + " · ".join(parts)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 KIND_START = "start"
@@ -164,7 +225,8 @@ _SYNONYMS = {"humor": "humour"}
 
 
 def enabled() -> bool:
-    """On unless ``GHOST_CHARACTER=0`` (then the Mirror's own sentence is heard, as before §4UG)."""
+    """On unless ``GHOST_CHARACTER=0`` (then no self-image is heard, the mood rests at (0, 0) and the dials never
+    move; the Mirror it replaced was removed on 2026-11-12)."""
     return os.environ.get(ENV, "1").strip() != "0"
 
 
@@ -285,9 +347,12 @@ def stamp(dials: Dict[str, int]) -> str:
 
 # ── how hard things land (§4UH) ─────────────────────────────────────────────
 #: each step of a dial makes the events it bears on land this much harder or lighter — at most
-#: ``2 * LEAN_STEP`` (20 %) either way. Scaled ON ARRIVAL, before the mood books them, so the ledger, the
-#: tone shares and the history all hold what really moved; nothing is tilted when the mood is read
-LEAN_STEP = 0.1
+#: ``2 * LEAN_STEP`` (50 %) either way. Scaled ON ARRIVAL, before the mood books them, so the ledger, the
+#: tone shares and the history all hold what really moved; nothing is tilted when the mood is read.
+#: §4UH-lean (operator 2026-11-12, "make it stronger"): 0.1 → 0.25. Replayed over 30 real days (581 owner
+#: turns): at 0.1 the lean was ~invisible (humour +1: 4.0 h unpleasant → 3.5 h); at 0.25 humour +1 takes the
+#: bad turns' 4 h of unpleasant mood to none, humour −2 makes them ~25 h
+LEAN_STEP = 0.25
 #: warmth bears on what comes from the owner: a warm character feels a thumb, thanks, a correction or the
 #: tone of a message more, a dry one less — both ways, pleasant and unpleasant alike
 WARMTH_KINDS = ("thumb_up", "thumb_down", "correction", "praise", "sentiment")
@@ -333,7 +398,7 @@ def lean(ev, dials: Dict[str, int]):
 # ── where the mood rests (§4UH-e2e) ─────────────────────────────────────────
 
 def rest_units(dials: Dict[str, int]) -> Tuple[int, int]:
-    """The character's resting point in the Mirror's units (−2..2 each). The dials are TRAITS, not moods — dry,
+    """The character's resting point in units of ``loop.REST_UNIT`` (−2..2 each). The dials are TRAITS, not moods — dry,
     serious or blunt is not unhappy — so the rest only ever leans pleasant, or is even:
 
     * pleasantness = the mean of warmth and humour, rounded half away from 0, never below 0;
@@ -351,19 +416,16 @@ def rest_units(dials: Dict[str, int]) -> Tuple[int, int]:
 
 
 def rest_pair(home) -> Tuple[float, float]:
-    """§4UH-e2e: where the mood rests, as the pair's two numbers — from the character's dials while the
-    character is on (the §4UA link "the character sets where the mood rests"; it read the Mirror's diary, which
-    is retired), else the Mirror's (``mirror.rest_pair``). (0, 0) with ``GHOST_MIRROR_REST=0``, without a home,
-    or when the character file cannot be read. Read on every read of the mood: ``dials`` is memoised.
-    Never raises."""
+    """§4UH-e2e: where the mood rests, as the pair's two numbers — from the character's dials (the §4UA link
+    "the character sets where the mood rests"). (0, 0) with the character off, with ``GHOST_MIRROR_REST=0``,
+    without a home, or when the character file cannot be read. Read on every read of the mood: ``dials`` is
+    memoised. Never raises."""
     try:
-        from . import mirror as _mirror
-        if not enabled():
-            return _mirror.rest_pair(home)
-        if not _mirror.rest_enabled() or _root(home) is None or unreadable(home):
+        from . import loop as _loop
+        if not enabled() or not _loop.rest_enabled() or _root(home) is None or unreadable(home):
             return 0.0, 0.0
         a, b = rest_units(dials(home))
-        return a * _mirror.REST_UNIT, b * _mirror.REST_UNIT
+        return a * _loop.REST_UNIT, b * _loop.REST_UNIT
     except Exception:  # noqa: BLE001
         return 0.0, 0.0
 
@@ -753,7 +815,7 @@ def view(home) -> str:
            else "Nothing is pinned.",
            "Each dial moves by itself, one step at a time, when over two weeks the days that were clearly "
            "better than my usual lead the days that were clearly worse (or the other way round): warmth from "
-           "what comes from you, humour from how my own work goes, directness from how my answers are judged. "
+           "how you talk to me, humour from how my own work goes, directness from how my answers are judged. "
            "Your commands set, hold or take back a dial whenever you want."]
     try:
         from . import selfview as _selfview

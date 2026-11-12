@@ -412,32 +412,6 @@ footer#input-area-wrapper {
        later in this file */
     #input-area:has(> #token-count) { flex-wrap: wrap; row-gap: 2px; }
 }
-/* §4UD: the mood in words, on the token counter's line (which always holds
-   its height), at the pill's left padding. Absolutely placed so it takes no
-   room and moves nothing: #input-area is its containing block (the pill's
-   backdrop-filter makes it one; `position` is not set on the pill, so its
-   painting order is as before). Same grey and size as the counter; cut with
-   an ellipsis before it can reach the counter's digits.
-   Pinned (rendered, WebKit) in tests/test_4ud_mood_ui.py. */
-#mood-text {
-    position: absolute;
-    left: 24px;
-    bottom: 10px;
-    max-width: calc(100% - 170px);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    line-height: 1.2;
-    color: rgba(255, 255, 255, 0.38);
-    -webkit-user-select: none;
-    user-select: none;
-    cursor: default;
-}
-@media (max-width: 480px) {
-    #mood-text { left: 18px; bottom: 8px; max-width: calc(100% - 140px); }
-}
 #turn-status-clock {
     flex-shrink: 0;
     font-family: var(--font-mono);

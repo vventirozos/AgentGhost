@@ -1,16 +1,17 @@
-"""§4UE: the probe arm `no_self_image` leaves the Mirror's self-image section out of ONE probe's state
+"""§4UE: the probe arm `no_self_image` leaves the character's self-image section out of ONE probe's state
 block, so paired probes can measure whether the section is audible in a reply. It is a probe's arm only:
-an owner turn that somehow carried the arm value still hears the section."""
+an owner turn that somehow carried the arm value still hears the section. (§4UH-loop: written for the
+Mirror's sentence; the Mirror is removed and the section is the character's.)"""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from ghost_agent.core import agent as A
-from ghost_agent.selfhood import mirror as M
+from ghost_agent.selfhood import character as C
+from ghost_agent.selfhood import loop as M
 from ghost_agent.utils import logging as L
 from ghost_agent.utils.logging import (
 
@@ -18,30 +19,15 @@ from ghost_agent.utils.logging import (
     ORIGIN_PROBE, prompt_arm_context, reply_surface_context, request_id_context, request_origin_context,
     requester_role_context)
 
-SENTENCE = "I am the one who checks twice and then says it plainly."
-EXPECT = f"{M.SELF_IMAGE_HEADER}\n«{SENTENCE}»\n{M.SELF_IMAGE_RULE}\n\n"
-
-
-
-# dates relative to the mood day (§4UH-e2e: these were fixed dates, written on 11-10 — after 11-12 the diary read stale and the block wording changed)
-import datetime as _dt_rel  # noqa: E402
-from ghost_agent.selfhood import mirror as _MI_rel  # noqa: E402
-D09 = (_MI_rel._mood_date() + _dt_rel.timedelta(days=-1)).isoformat()
-
-@pytest.fixture(autouse=True)
-def _the_mirrors_own_path(monkeypatch):
-    """§4UG: these tests are about the Mirror's own sentence — what a reply hears with the character
-    switched off (``GHOST_CHARACTER=0``). The character has its tests in test_4ug_character.py."""
-    monkeypatch.setenv("GHOST_CHARACTER", "0")
+#: what an owner reply hears with no character file: the starting character
+SENTENCE = C.sentence(C.START)
+EXPECT = C.section_text(C.START)
+#: what the turn record says it heard (the character's stamp)
+HEARD = C.stamp(C.START)
 
 
 def _home(tmp_path) -> Path:
     (tmp_path / "system" / "memory").mkdir(parents=True, exist_ok=True)
-    p = tmp_path / M.MIRROR_REL
-    p.parent.mkdir(parents=True, exist_ok=True)
-    row = {"at": f"{D09}T00:30:00", "date": D09, "sentence": SENTENCE, "prev": M.SEED_SENTENCE,
-           "replies": [{"at": f"{D09}T09:00:00Z", "excerpt": "Bruno's match is at six."}]}
-    p.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
     return tmp_path
 
 
@@ -65,7 +51,7 @@ class _req:
 
 @pytest.fixture(autouse=True)
 def _fresh_memos():
-    M._BLOCK_MEMO.clear()
+    C._MEMO.clear()
     A._SELF_IMAGE_BY_REQ.clear()
     yield
     A._SELF_IMAGE_BY_REQ.clear()
@@ -91,7 +77,7 @@ def test_a_probe_without_the_arm_or_with_another_arm_hears_it(tmp_path, arm):
     with _req("probe-4ue-2", arm=arm):
         assert A.self_image_is_heard_on_this_request(_ctx(home)) is True
         assert A._self_image_block(_ctx(home)) == EXPECT
-    assert A.self_image_heard("probe-4ue-2") == D09
+    assert A.self_image_heard("probe-4ue-2") == HEARD
 
 
 @pytest.mark.parametrize("rid", ["web-4ue-3", "slack-4ue-3"])
@@ -121,7 +107,7 @@ def test_a_reused_request_id_does_not_keep_what_the_earlier_request_heard(tmp_pa
     home = _home(tmp_path)
     with _req("probe-4ue-5"):
         assert A._self_image_block(_ctx(home)) == EXPECT
-    assert A.self_image_heard("probe-4ue-5") == D09
+    assert A.self_image_heard("probe-4ue-5") == HEARD
     with _req("probe-4ue-5", arm=A.SELF_IMAGE_OFF_ARM):
         assert A._self_image_block(_ctx(home)) == ""
         assert A._self_image_block(_ctx(home)) == ""        # every step of the request
@@ -188,12 +174,12 @@ class _probe(_req):
         self.v.append((probe_self_image_context, (sentence, rule)))
 
 
-def test_a_probe_hears_the_sentence_it_brought_in_the_mirrors_place(tmp_path):
+def test_a_probe_hears_the_sentence_it_brought_in_the_characters_place(tmp_path):
     home = _home(tmp_path)
     with _probe("probe-4uf-1", DRY):
         got = A._self_image_block(_ctx(home))
-        assert got == f"{M.SELF_IMAGE_HEADER}\n«{DRY}»\n{M.SELF_IMAGE_RULE}\n\n"       # the standing rule
-        assert SENTENCE not in got                                                   # not the diary's
+        assert got == f"{C.HEADER}\n«{DRY}»\n{C.RULE}\n\n"                          # the standing rule
+        assert SENTENCE not in got                                                   # not the character's
         assert A._self_image_block(_ctx(home)) == got                                # the same on every step
     assert M.PROBE_DATE == "probe"
     assert A.self_image_heard("probe-4uf-1") == M.probe_stamp(got)      # a fingerprint of the section heard
@@ -203,20 +189,26 @@ def test_a_probe_hears_the_sentence_it_brought_in_the_mirrors_place(tmp_path):
 def test_a_probe_may_bring_the_rule_text_too(tmp_path):
     home = _home(tmp_path)
     with _probe("probe-4uf-2", DRY, RULE):
-        assert A._self_image_block(_ctx(home)) == f"{M.SELF_IMAGE_HEADER}\n«{DRY}»\n{RULE}\n\n"
+        assert A._self_image_block(_ctx(home)) == f"{C.HEADER}\n«{DRY}»\n{RULE}\n\n"
 
 
-def test_it_needs_no_diary(tmp_path):
+def test_it_needs_no_character_file_and_the_character_off_hears_nothing(tmp_path, monkeypatch):
     (tmp_path / "system" / "memory").mkdir(parents=True)
     with _probe("probe-4uf-3", DRY):
         assert DRY in A._self_image_block(_ctx(tmp_path))
     with _probe("probe-4uf-3b"):
-        assert A._self_image_block(_ctx(tmp_path)) == ""                             # no diary, nothing brought
+        assert A._self_image_block(_ctx(tmp_path)) == EXPECT                         # nothing brought: the character
+    monkeypatch.setenv(C.ENV, "0")                                                    # §4UH-loop: off is nothing at all
+    A._SELF_IMAGE_BY_REQ.clear()
+    with _probe("probe-4uf-3c"):
+        assert A._self_image_block(_ctx(tmp_path)) == ""
+    with _probe("probe-4uf-3d", DRY):
+        assert DRY in A._self_image_block(_ctx(tmp_path))                            # a probe still brings one
 
 
 @pytest.mark.parametrize("rid", ["web-4uf-4", "slack-4uf-4", "sched-4uf-4", "job-4"])
 def test_only_a_probe_can_bring_one(tmp_path, rid):
-    """The context set by mistake on a real request changes nothing: the owner hears the Mirror's own
+    """The context set by mistake on a real request changes nothing: the owner hears the character's own
     sentence, a scheduled run or a job hears none."""
     home = _home(tmp_path)
     with _probe(rid, DRY, RULE):
@@ -263,14 +255,14 @@ def test_a_request_id_sent_again_hears_what_it_brought_not_what_the_first_did(tm
     """Review r1: the per-request memo was looked up first, so the second request of a reused id heard
     the first one's section while the record said "probe" for both."""
     home = _home(tmp_path)
-    standing = f"{M.SELF_IMAGE_HEADER}\n«{DRY}»\n{M.SELF_IMAGE_RULE}\n\n"
-    firm = f"{M.SELF_IMAGE_HEADER}\n«{DRY}»\n{RULE}\n\n"
-    other = f"{M.SELF_IMAGE_HEADER}\n«I am loud.»\n{M.SELF_IMAGE_RULE}\n\n"
+    standing = f"{C.HEADER}\n«{DRY}»\n{C.RULE}\n\n"
+    firm = f"{C.HEADER}\n«{DRY}»\n{RULE}\n\n"
+    other = f"{C.HEADER}\n«I am loud.»\n{C.RULE}\n\n"
     assert _heard("probe-4uf-7", DRY, home=home) == (standing, M.probe_stamp(standing))
     assert _heard("probe-4uf-7", DRY, RULE, home=home) == (firm, M.probe_stamp(firm))      # another rule
     assert _heard("probe-4uf-7", "I am loud.", home=home) == (other, M.probe_stamp(other))  # another sentence
     assert len({M.probe_stamp(standing), M.probe_stamp(firm), M.probe_stamp(other)}) == 3
-    assert _heard("probe-4uf-7", home=home) == (EXPECT, D09)                       # nothing brought
+    assert _heard("probe-4uf-7", home=home) == (EXPECT, HEARD)                     # nothing brought
     assert _heard("probe-4uf-7", DRY, home=home)[0] == standing                             # brought again
     assert _heard("probe-4uf-7", DRY, arm=A.SELF_IMAGE_OFF_ARM, home=home) == ("", "")      # the arm
 
@@ -287,9 +279,10 @@ def test_the_cleaning_order_leaves_no_token_behind():
     assert parse_probe_self_image(quote("<|" * 20 + "x" + "|>" * 20), "")[0] in ("", "x")
 
 
-def test_the_section_is_the_mirrors_shape():
+def test_the_section_is_the_characters_shape():
     assert M.probe_section("") == "" and M.probe_section("   ", RULE) == ""
-    assert M.probe_section(" a\n b ", "") == f"{M.SELF_IMAGE_HEADER}\n«a b»\n{M.SELF_IMAGE_RULE}\n\n"
+    assert M.probe_section(" a\n b ", "") == f"{C.HEADER}\n«a b»\n{C.RULE}\n\n"
+    assert M.probe_section("I am x.", "") == C.section_text(C.START).replace(f"«{SENTENCE}»", "«I am x.»")
 
 
 def test_the_route_reads_the_two_headers_inside_the_probe_branch_only():

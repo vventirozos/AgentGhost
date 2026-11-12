@@ -103,7 +103,8 @@ def test_every_idle_label_is_a_listed_job():
            and n.func.attr == "append" and ast.unparse(n.func.value) == "_idle_ran"
            and n.args and isinstance(n.args[0], ast.Constant)} - {"idle-window"}
     # §4SV: a phase extracted into its own method appends to the `ran` it is handed
-    for meth in (A.GhostAgent._mirror_phase,):
+    # §4UH-loop: the character phase (``_self_phase`` → ``_character_phase``) appends "character"
+    for meth in (A.GhostAgent._self_phase, A.GhostAgent._character_phase):
         mt = ast.parse(textwrap.dedent(inspect.getsource(meth)))
         ran |= {n.args[0].value for n in ast.walk(mt)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -111,7 +112,7 @@ def test_every_idle_label_is_a_listed_job():
                 and n.args and isinstance(n.args[0], ast.Constant)}
     # review r2 m2: an AWAITED call in the code (a comment would pass a text check)
     assert any(isinstance(n, ast.Await) and isinstance(n.value, ast.Call)
-               and ast.unparse(n.value.func) == "self._mirror_phase" for n in ast.walk(tree))
+               and ast.unparse(n.value.func) == "self._self_phase" for n in ast.walk(tree))
     listed = {label for label, _t, _f in A.IDLE_SCHEDULER_JOBS} - {"memory-journal"}
     assert ran == listed, (ran ^ listed)
 

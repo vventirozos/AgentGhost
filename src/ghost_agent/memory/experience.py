@@ -365,7 +365,7 @@ def is_system_command(request: str) -> bool:
     OWN matchers — the loose pattern that stood here ("show … tests",
     "list … rules") also took "show me the failing tests" for one."""
     from ..core.owner_rules import is_rule_command
-    from ..selfhood.mirror import is_mirror_command
+    from ..selfhood.loop import is_mirror_command
     return is_rule_command(request) or is_mirror_command(request)
 
 

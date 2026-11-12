@@ -643,10 +643,10 @@ def test_the_sentiment_icon_is_its_own_and_wide():
 
 @pytest.mark.parametrize("answer,line", [
     ({"label": "positive", "score": 0.9529, "probs": {"negative": 0.0088, "neutral": 0.0383, "positive": 0.9529}},
-     "positive 0.95 (neg 0.01 · neu 0.04) · mood +0.08"),
+     "positive 95% (neutral 4%, negative 1%) · mood nudged up +0.08"),
     ({"label": "negative", "score": 0.907, "probs": {"negative": 0.907, "neutral": 0.0874, "positive": 0.0056}},
-     "negative 0.91 (neu 0.09 · pos 0.01) · mood −0.08"),
-    ({"label": "unknown", "score": 0.0, "probs": {}, "reason": "not English"}, "unknown — not English · mood unmoved"),
+     "negative 91% (neutral 9%, positive 1%) · mood nudged down −0.08"),
+    ({"label": "unknown", "score": 0.0, "probs": {}, "reason": "not English"}, "not rated: not English · mood unchanged"),
 ])
 def test_the_rating_line(answer, line):
     nudge = {"positive": 0.08, "negative": -0.08}.get(answer["label"], 0.0)
@@ -656,8 +656,8 @@ def test_the_rating_line(answer, line):
 def test_the_rating_line_says_why_the_mood_did_not_move():
     answer = {"label": "positive", "score": 0.84, "probs": {"negative": 0.06, "neutral": 0.10, "positive": 0.84}}
     neutral = {"label": "neutral", "score": 0.81, "probs": {"negative": 0.15, "neutral": 0.81, "positive": 0.04}}
-    assert C.rating_line(neutral, 0.0, "neutral") == "neutral 0.81 (neg 0.15 · pos 0.04) · mood unmoved — message neutral"
-    assert C.rating_line(answer, 0.0, "below 0.85") == "positive 0.84 (neg 0.06 · neu 0.10) · mood unmoved (below 0.85)"
+    assert C.rating_line(neutral, 0.0, "neutral") == "neutral 81% (negative 15%, positive 4%) · mood unchanged: a neutral message"
+    assert C.rating_line(answer, 0.0, "below 0.85") == "positive 84% (neutral 10%, negative 6%) · mood unchanged: a nudge needs 85% or more"
 
 
 async def test_a_scored_message_logs_its_rating_with_the_icon_and_not_its_words(client, tmp_path, monkeypatch):
@@ -665,7 +665,7 @@ async def test_a_scored_message_logs_its_rating_with_the_icon_and_not_its_words(
     calls = []
     monkeypatch.setattr(L, "pretty_log", lambda title, content=None, icon="", **kw: calls.append((title, content, icon)))
     await C.score_message("Markos loved the new garden", tmp_path)
-    assert calls == [("Sentiment", "positive 0.85 (neg 0.05 · neu 0.10) · mood unmoved (no mood to move)", "💗")]
+    assert calls == [("Sentiment", "positive 85% (neutral 10%, negative 5%) · mood unchanged: no mood to move", "💗")]
 
 
 async def test_no_answer_logs_no_rating(tmp_path, monkeypatch):

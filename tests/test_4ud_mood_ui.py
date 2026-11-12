@@ -299,9 +299,11 @@ def test_the_tooltip_adds_the_cause_the_hold_and_the_manners_end():
 _PAGE = r"""
 const mk = () => ({ textContent: '', title: null, classList: { toggle() {} },
                     getAttribute: () => 'Live log', removeAttribute(n) { this[n] = null; } });
-const chip = mk(), moodEl = mk();
+const chip = mk();
+// the mood as the chip's tooltip says it (the words under the input are gone, 2026-11-12)
+const moodLine = () => { const t = String(chip.title || ''); const i = t.indexOf('\nmood:'); return i < 0 ? '' : t.slice(i + 1); };
 globalThis.document = { visibilityState: 'visible', addEventListener() {},
-    getElementById: id => (id === 'status-indicator' ? chip : id === 'mood-text' ? moodEl : null) };
+    getElementById: id => (id === 'status-indicator' ? chip : null) };
 globalThis.window = { dispatchEvent() {} };
 const timers = [];
 globalThis.setTimeout = (fn, ms) => { timers.push([fn, ms]); return timers.length; };
@@ -327,7 +329,7 @@ const settle = async () => { for (let i = 0; i < 25; i++) await new Promise(r =>
 S.initStatus({ Core: { events, activeFace: face } });
 await settle();
 const seen = [];
-const snap = () => seen.push([moodEl.textContent, told.length ? told[told.length - 1] : null, moodEl.title]);
+const snap = () => seen.push([moodLine(), told.length ? told[told.length - 1] : null]);
 snap();
 """
 _POLL_THE_REST = "while (script.length) { await tick(); await settle(); snap(); }\n"
@@ -345,26 +347,24 @@ def test_three_polls_without_a_mood_ease_the_face_to_neutral_and_say_unknown():
     seen = _node(_PAGE + _POLL_THE_REST + "out(seen);", {"polls": polls, "face": True})
     words = [s[0] for s in seen]
     looks = [s[1] for s in seen]
-    assert words == ["calm, 1 of 3", "calm, 1 of 3", "calm, 1 of 3", "mood unknown", "mood unknown",
-                     "rests content", "rests content"]
+    unknown = "mood: unknown — no reading for 3 polls"
+    assert words == ["mood: calm, 1 of 3"] * 3 + [unknown] * 2 + ["mood: neutral — rests content"] * 2
     assert looks == [["calm", 1], ["calm", 1], ["calm", 1], ["neutral", 0], ["neutral", 0],
                      ["content", "rest"], ["content", "rest"]]
-    assert seen[3][2] == "mood: unknown — no reading for 3 polls" and seen[0][2] == "mood: calm, 1 of 3"
 
 
 def test_before_the_first_reading_nothing_is_claimed_then_unknown():
     seen = _node(_PAGE + _POLL_THE_REST + "out(seen);", {"polls": ["DOWN", "DOWN", "DOWN", "DOWN"], "face": True})
-    assert [s[0] for s in seen] == ["", "", "mood unknown", "mood unknown"]
+    assert [s[0] for s in seen] == ["", ""] + ["mood: unknown — no reading for 3 polls"] * 2
     assert [s[1] for s in seen] == [[None, None], [None, None], ["neutral", 0], ["neutral", 0]]
 
 
-def test_the_words_do_not_need_the_face():
-    """F11 (b)(c): the mood is visible text in the page, written whether or not a face takes it."""
+def test_the_reading_does_not_need_the_face():
+    """F11 (b)(c): the mood reaches the chip's tooltip whether or not a face takes it."""
     polls = [{"status": "ok", "mood": _CALM},
              {"status": "ok", "mood": {"label": "neutral", "intensity": 0, "problem": "state.json unreadable"}}]
     seen = _node(_PAGE + _POLL_THE_REST + "out(seen);", {"polls": polls, "face": False})
-    assert [s[0] for s in seen] == ["calm, 1 of 3", "mood unreadable"]
-    assert seen[1][2] == "mood: unreadable — state.json unreadable"
+    assert [s[0] for s in seen] == ["mood: calm, 1 of 3", "mood: unreadable — state.json unreadable"]
 
 
 def test_the_end_of_a_turn_and_a_thumb_trigger_one_extra_read_not_a_faster_poll():
@@ -384,21 +384,23 @@ events.dispatchEvent(new Event('mood-changed'));
 const afterThumb = timers.length;
 timers[1][0](); await settle();
 events.dispatchEvent(new Event('turn-complete'));
-out({ queued, notYet, afterFire, afterThumb, afterTurn: timers.length, words: moodEl.textContent, told });
+out({ queued, notYet, afterFire, afterThumb, afterTurn: timers.length, words: moodLine(), told });
 """, {"polls": [{"status": "ok", "mood": _CALM}, {"status": "ok", "mood": {"label": "irritable", "intensity": 3}}],
       "face": True})
     assert got["queued"] == [1500] and got["notYet"] == 0 and got["afterFire"] == 1
     assert (got["afterThumb"], got["afterTurn"]) == (2, 3)
-    assert got["words"] == "irritable, 3 of 3" and got["told"][-1] == ["irritable", 3]
+    assert got["words"] == "mood: irritable, 3 of 3" and got["told"][-1] == ["irritable", 3]
 
 
 _RACE_PAGE = r"""
 const mk = () => ({ textContent: '', title: null, classList: { toggle() {} },
                     getAttribute: () => 'Live log', removeAttribute(n) { this[n] = null; } });
-const chip = mk(), moodEl = mk();
+const chip = mk();
+// the mood as the chip's tooltip says it (the words under the input are gone, 2026-11-12)
+const moodLine = () => { const t = String(chip.title || ''); const i = t.indexOf('\nmood:'); return i < 0 ? '' : t.slice(i + 1); };
 const listeners = {};
 globalThis.document = { visibilityState: 'visible', addEventListener(name, fn) { listeners[name] = fn; },
-    getElementById: id => (id === 'status-indicator' ? chip : id === 'mood-text' ? moodEl : null) };
+    getElementById: id => (id === 'status-indicator' ? chip : null) };
 globalThis.window = { dispatchEvent() {} };
 const timers = [];
 globalThis.setTimeout = (fn, ms) => { timers.push(fn); return timers.length; };
@@ -434,14 +436,14 @@ timers.shift()(); await settle();                  // the extra read is due whil
 tick(); listeners.visibilitychange(); await settle();   // … and the poll and the tab, too
 const whileOut = asked.length;
 asked[0](DATA.old); await settle();                // the slow poll answers with the mood from before the turn
-const afterOld = [moodEl.textContent, asked.length];
+const afterOld = [moodLine(), asked.length];
 asked[1](DATA.fresh); await settle();
-out({ whileOut, afterOld, words: moodEl.textContent, told, asked: asked.length, most });
+out({ whileOut, afterOld, words: moodLine(), told, asked: asked.length, most });
 """, {"old": {"label": "irritable", "intensity": 2, "face": "irritable"},
       "fresh": {"label": "cheerful", "intensity": 3, "face": "cheerful"}})
     assert got["whileOut"] == 1 and got["most"] == 1, got      # never a second request beside the first
-    assert got["afterOld"] == ["irritable, 2 of 3", 2]         # then ONE re-read for the three triggers
-    assert got["words"] == "cheerful, 3 of 3" and got["told"] == [["irritable", 2], ["cheerful", 3]]
+    assert got["afterOld"] == ["mood: irritable, 2 of 3", 2]         # then ONE re-read for the three triggers
+    assert got["words"] == "mood: cheerful, 3 of 3" and got["told"] == [["irritable", 2], ["cheerful", 3]]
     assert got["asked"] == 2
 
 
@@ -454,14 +456,14 @@ tick(); await settle();                            // a poll goes out …
 events.dispatchEvent(new Event('mood-changed')); timers.shift()(); listeners.visibilitychange(); tick();
 await settle();
 asked[1]('DOWN'); await settle();                  // … and fails with three more triggers waiting
-const afterBurst = [moodEl.textContent, asked.length, told[told.length - 1]];
+const afterBurst = [moodLine(), asked.length, told[told.length - 1]];
 tick(); await settle(); asked[2]('DOWN'); await settle();
-const second = moodEl.textContent;
+const second = moodLine();
 tick(); await settle(); asked[3]('DOWN'); await settle();
-out({ afterBurst, second, third: moodEl.textContent, most, last: told[told.length - 1] });
+out({ afterBurst, second, third: moodLine(), most, last: told[told.length - 1] });
 """, {"calm": {"label": "calm", "intensity": 1, "face": "calm"}})
-    assert got["afterBurst"] == ["calm, 1 of 3", 2, ["calm", 1]] and got["second"] == "calm, 1 of 3"
-    assert got["third"] == "mood unknown" and got["last"] == ["neutral", 0] and got["most"] == 1
+    assert got["afterBurst"] == ["mood: calm, 1 of 3", 2, ["calm", 1]] and got["second"] == "mood: calm, 1 of 3"
+    assert got["third"] == "mood: unknown — no reading for 3 polls" and got["last"] == ["neutral", 0] and got["most"] == 1
 
 
 def test_a_recorded_thumb_announces_the_mood_may_have_moved():
@@ -1030,66 +1032,14 @@ def test_the_health_endpoint_serves_that_block(tmp_path):
     assert look == ["calm", "rest"] and words.startswith("rests calm · manner terse, ")
 
 
-# ── rendered: where the words sit (WebKit) ──────────────────────────────────
+# ── 2026-11-12: no mood words under the input ───────────────────────────────
 
-@pytest.fixture(scope="module")
-def browser():
-    from tests.test_interface_header_simplify import _real_playwright
-    try:
-        sync_playwright = _real_playwright().sync_playwright
-    except ImportError:               # pragma: no cover
-        pytest.skip("playwright not installed")
-    with sync_playwright() as p:
-        try:
-            b = p.webkit.launch(timeout=120_000)
-        except Exception as e:
-            if "Executable doesn't exist" in str(e) or "playwright install" in str(e):
-                pytest.skip(f"WebKit not installed: {str(e)[:80]}")
-            raise
-        yield b
-        b.close()
-
-
-_MEASURE = """() => {
-    const box = e => { const r = e.getBoundingClientRect();
-                       return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, h: r.height, w: r.width}; };
-    const el = id => document.getElementById(id);
-    const range = document.createRange(); range.selectNodeContents(el('token-count'));
-    return {pill: box(el('input-area')), mood: box(el('mood-text')), count: box(range), row: box(el('token-count')),
-            field: box(el('chat-input')), mic: box(el('mic-btn')), send: box(el('send-btn')),
-            clipped: el('mood-text').scrollWidth > el('mood-text').clientWidth,
-            shown: getComputedStyle(el('mood-text')).visibility + '/' + getComputedStyle(el('mood-text')).display};
-}"""
-
-
-@pytest.mark.parametrize("width,height", [(375, 667), (430, 932), (820, 1180), (1280, 720), (1440, 900)])
-def test_the_mood_words_sit_on_the_counters_line_and_move_nothing(browser, width, height):
-    """Rendered. The words are visible at every width (a phone included: no hover there), on the token
-    counter's line, clear of the counter's digits and of the controls, and the composer is the same size
-    with and without them."""
-    from tests.test_interface_header_simplify import _serve
-    ctx = browser.new_context(viewport={"width": width, "height": height},
-                              has_touch=width < 900, is_mobile=width < 600)
-    page = ctx.new_page()
-    try:
-        _serve(page)
-        page.goto("http://ghost.test/", wait_until="load")
-        page.evaluate("""() => { document.getElementById('effort-select').classList.remove('hidden');
-            const t = document.getElementById('token-count'); t.textContent = '↑~29.6k ↓12.4k';
-            t.classList.remove('hidden'); }""")
-        empty = page.evaluate(_MEASURE)
-        for words in ("rests calm", "irritable, 2 of 3 · manner sarcastic, 3 of 3 — until 04:00 " + "and more " * 20):
-            page.evaluate("(w) => { document.getElementById('mood-text').textContent = w; }", words)
-            m = page.evaluate(_MEASURE)
-            assert m["shown"] == "visible/block" and m["mood"]["w"] > 20 and m["mood"]["h"] >= 11, m
-            # on the counter's line …
-            assert abs(m["mood"]["top"] - m["row"]["top"]) <= 1.5 and abs(m["mood"]["bottom"] - m["row"]["bottom"]) <= 1.5, m
-            # … inside the pill, left of the counter's digits, under the field and the controls
-            assert m["mood"]["left"] >= m["pill"]["left"] + 8 and m["mood"]["right"] <= m["count"]["left"] - 8, m
-            assert m["mood"]["top"] >= max(m["field"]["bottom"], m["mic"]["bottom"], m["send"]["bottom"]) - 1, m
-            # … and nothing moved for it
-            for part in ("pill", "field", "mic", "send", "row", "count"):
-                assert m[part] == empty[part], (part, m[part], empty[part])
-        assert m["clipped"] is True, m                   # a phrase too long for the line is cut, at every width
-    finally:
-        ctx.close()
+def test_the_page_shows_no_mood_words_under_the_input():
+    """Operator 2026-11-12: "change the ui so it doesn't show the mood under the input bubble". The element,
+    its style and its writer are gone; the face and the status chip's tooltip still carry the mood, and
+    ``moodWords`` stays as the wording the handheld's status line shares (pinned above)."""
+    static = _ROOT / "interface" / "static"
+    assert 'id="mood-text"' not in (static / "index.html").read_text()
+    assert "#mood-text" not in (static / "style.css").read_text()
+    js = (static / "status.js").read_text()
+    assert "mood-text" not in js and "paintMood" not in js

@@ -9,7 +9,10 @@ written once the day is over, from the two files the mood already keeps:
 
 * ``mood.events.jsonl`` — every event that moved or tried to move the pair, with its kind and size. Counted
   BY KIND, so what the agent's own work did and what the owner did stay apart;
-* ``mood.history.jsonl`` — the label changes, for how long each mood was held (the arc) and the day's peak.
+* ``mood.history.jsonl`` — the label changes, for how long each mood was held (the arc) and the day's peak;
+* ``sentiment.jsonl`` (§4UH-warmth) — the emotion labels of the owner's rated messages, counted as messages
+  that sounded warm (gratitude, admiration, approval…) and messages that sounded annoyed (annoyance, anger,
+  disapproval…): ``msgs_rated`` / ``msgs_warm`` / ``msgs_cold`` / ``msgs_thanks``. Counts only — never a word of a message.
 
 A row holds numbers, labels, manner names and the events' own cause sentences (the system's words: "2 tool
 calls failed (of 5) in this turn"). It never holds a message, a task name or a subject, so it can be shown
@@ -146,6 +149,42 @@ def _count_evidence(rec: Dict[str, object], kind: str, cause: str, dp: float, ev
             rec["own"][name] = int(rec["own"].get(name, 0)) + n
 
 
+def owner_tones(home, day: datetime.date, *, tz=None) -> Tuple[int, int, int, int]:
+    """(rated, warm, cold, thanks): the owner's messages of mood day ``day`` that the emotion model read, how many
+    of them sounded warm / annoyed (a label of ``sentiment.WARM_EMOTIONS`` / ``COLD_EMOTIONS`` at
+    ``EMOTION_COUNT_MIN`` or more; a message can be both), and how many of the warm ones were thanks (gratitude) —
+    so the thanks the model did NOT read (Greek, a miss) can be told from the ones it did. Rows without emotions
+    (before §4UH-warmth, the service without its emotion model, a message that was not English) are not counted.
+    A rating held as the wording of a task is not counted; one held as possible sarcasm counts as read and for
+    its annoyance only (review: "great, you broke it again" is annoyed, not warm). Reads the rotated journal
+    (``.1``) too. (0, 0, 0, 0) when unreadable."""
+    from .sentiment import COLD_EMOTIONS, EMOTION_COUNT_MIN, HELD_SARCASM, HELD_TASK, JOURNAL_FILENAME, WARM_EMOTIONS
+    if not home:
+        return 0, 0, 0, 0
+    path = Path(home) / SELFHOOD_REL / JOURNAL_FILENAME
+    rows = (read_jsonl_rows(path.with_name(path.name + ".1"), what="sentiment journal")
+            + read_jsonl_rows(path, what="sentiment journal"))
+    rated = warm = cold = thanks = 0
+    for r in rows:
+        emo = r.get("emotions")
+        held = str(r.get("held") or "")
+        if not isinstance(emo, dict) or held == HELD_TASK:
+            continue
+        at = M.parse_iso_utc(str(r.get("ts") or ""))
+        if at is None or M.mood_day(at, tz=tz) != day:
+            continue
+
+        def felt(names) -> bool:
+            return any(isinstance(emo.get(k), (int, float)) and not isinstance(emo.get(k), bool)
+                       and emo[k] >= EMOTION_COUNT_MIN for k in names)
+        rated += 1
+        cold += 1 if felt(COLD_EMOTIONS) else 0
+        if held != HELD_SARCASM and felt(WARM_EMOTIONS):
+            warm += 1
+            thanks += 1 if felt(("gratitude",)) else 0
+    return rated, warm, cold, thanks
+
+
 def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datetime] = None) -> Dict[str, object]:
     """The record of mood day ``day``, computed from the mood's two journals. Pure reading; never raises
     past an unreadable file (an absent journal is an empty day)."""
@@ -155,6 +194,7 @@ def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datet
     rec: Dict[str, object] = {
         "date": day.isoformat(), "events": 0, "held": 0, "by_kind": {},
         "thumbs_up": 0, "thumbs_down": 0, "corrections": 0, "praise": 0, "tone_up": 0, "tone_down": 0,
+        "msgs_rated": 0, "msgs_warm": 0, "msgs_cold": 0, "msgs_thanks": 0,
         "owner_moods": [], "manners": [],
         "own": {"trouble": 0, "clean_turns": 0, "research": 0, "tasks_done": 0, "long_turns": 0},
         "arc": {}, "peak": None, "biggest": [], "shades": {},
@@ -194,6 +234,7 @@ def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datet
                                                    "dp": round(dp, 4), "de": round(de, 4), "cause": cause[:160]}))
     rec["by_kind"] = by_kind
     rec["thumbs_up"], rec["thumbs_down"] = owner_thumbs(home, day, tz=tz)
+    rec["msgs_rated"], rec["msgs_warm"], rec["msgs_cold"], rec["msgs_thanks"] = owner_tones(home, day, tz=tz)
     candidates.sort(key=lambda c: -c[0])
     rec["biggest"] = [c[1] for c in candidates[:BIGGEST] if c[0] > 0]
     rec["arc"], rec["peak"] = _arc(history, day, tz, now)
@@ -321,28 +362,34 @@ def _append(path: Path, row: dict) -> None:
 
 
 def day_line(rec: Dict[str, object]) -> str:
-    """One line a person can read: "2026-11-10: irritable 40 min, content 3 h · own work: 1 trouble,
-    4 clean · you: 2 👍, 1 correction, manner sarcastic"."""
+    """One line a person can read (operator 11-12: easy to read but informative):
+    "2026-11-10 · moods: irritable 40 min, content 3 h · my turns: 1 ran into trouble, 4 went fine · from you:
+    2 👍, 1 correction(s), asked for a sarcastic manner · your messages: 6 read for emotion, 2 warm, 1 annoyed"."""
     def _span(minutes: int) -> str:
         return f"{minutes} min" if minutes < 90 else f"{minutes / 60:.1f} h".replace(".0 h", " h")
     arc = rec.get("arc") or {}
     moods = ", ".join(f"{lab} {_span(int(m))}" for lab, m in sorted(arc.items(), key=lambda kv: -int(kv[1]))) \
-        or "no mood"
+        or "none recorded"
+    if rec.get("shades"):
+        moods += " (shades: " + ", ".join(f"{k} ×{v}" if v > 1 else k for k, v in sorted(rec["shades"].items())) + ")"
     own = rec.get("own") or {}
-    own_bits = [f"{own[k]} {name}" for k, name in (("trouble", "trouble"), ("clean_turns", "clean"),
-                                                   ("tasks_done", "task done"), ("research", "research"))
+    own_bits = [f"{own[k]} {name}" for k, name in (("trouble", "ran into trouble"), ("clean_turns", "went fine"),
+                                                   ("tasks_done", "task(s) done"), ("research", "research"))
                 if own.get(k)]
     you = []
-    for key, name in (("thumbs_up", "👍"), ("thumbs_down", "👎"), ("corrections", "correction"),
-                      ("praise", "thanks")):
+    for key, name in (("thumbs_up", "👍"), ("thumbs_down", "👎"), ("corrections", "correction(s)"),
+                      ("praise", "thank-you(s)")):
         if rec.get(key):
             you.append(f"{rec[key]} {name}")
     if rec.get("owner_moods"):
-        you.append("set mood " + "/".join(rec["owner_moods"]))
+        you.append("set my mood to " + "/".join(rec["owner_moods"]))
     if rec.get("manners"):
-        you.append("manner " + "/".join(rec["manners"]))
-    if rec.get("shades"):
-        moods += " (" + ", ".join(f"{k} ×{v}" if v > 1 else k for k, v in sorted(rec["shades"].items())) + ")"
-    return (f"{rec.get('date')}: {moods}"
-            + (" · own work: " + ", ".join(own_bits) if own_bits else "")
-            + (" · you: " + ", ".join(you) if you else ""))
+        you.append("asked for a " + "/".join(rec["manners"]) + " manner")
+    # §4UH-warmth: how the owner talked (what warmth reads), counts only
+    talk = ""
+    if rec.get("msgs_rated"):
+        talk = (f" · your messages: {rec['msgs_rated']} read for emotion, "
+                f"{rec.get('msgs_warm') or 0} warm, {rec.get('msgs_cold') or 0} annoyed")
+    return (f"{rec.get('date')} · moods: {moods}"
+            + (" · my turns: " + ", ".join(own_bits) if own_bits else "")
+            + (" · from you: " + ", ".join(you) if you else "") + talk)

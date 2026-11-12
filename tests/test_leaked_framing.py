@@ -118,7 +118,7 @@ class TestRecurrenceWatch:
     """The watch is keyed on the NEWEST occurrence, not the count: the corpus
     is append-only, so the historical 16 never go away."""
 
-    def _health(self, tmp_path, ts):
+    def _health(self, tmp_path, ts, now=None):
         from ghost_agent.core.learning_health import _framing_leak_health
         root = tmp_path / "trajectories"
         (root / "2026-08-04").mkdir(parents=True)
@@ -131,7 +131,7 @@ class TestRecurrenceWatch:
         # other filename is silently invisible.
         (root / "2026-08-04" / "session-test.jsonl").write_text(
             json.dumps(rec) + "\n", encoding="utf-8")
-        return _framing_leak_health(root)
+        return _framing_leak_health(root, now=now)
 
     def test_pre_fix_occurrence_is_not_a_regression(self, tmp_path):
         h = self._health(tmp_path, "2026-07-20T10:00:00Z")
@@ -139,10 +139,49 @@ class TestRecurrenceWatch:
         assert h["regression"] is False
 
     def test_post_fix_occurrence_IS_a_regression(self, tmp_path):
-        h = self._health(tmp_path, "2026-08-04T10:00:00Z")
-        assert h["regression"] is True
+        # 2 days after the leak: recent.
+        h = self._health(tmp_path, "2026-08-04T10:00:00Z", now=_ts("2026-08-06T10:00:00"))
+        assert h["regression"] is True and h["post_fix"] is True
+
+    def test_old_post_fix_occurrence_is_historical_not_a_regression(self, tmp_path):
+        """§4UI: one 10-12 probe leak held REGRESSION for a month; the agent
+        explained the bare word to the owner with an invented quirk."""
+        h = self._health(tmp_path, "2026-10-12T23:05:49Z", now=_ts("2026-11-12T07:00:00"))
+        assert h["post_fix"] is True and h["regression"] is False
+
+    def test_window_edge(self, tmp_path):
+        inside = self._health(tmp_path / "a", "2026-10-12T23:05:49Z", now=_ts("2026-10-19T23:05:00"))
+        assert inside["regression"] is True
+        outside = self._health(tmp_path / "b", "2026-10-12T23:05:49Z", now=_ts("2026-10-19T23:06:00"))
+        assert outside["regression"] is False
+
+    def test_rendered_regression_is_one_line_with_its_detail(self):
+        fl = {"available": True, "corrupt_calls": 1, "calls": 10, "scanned": 5,
+              "by_tool": {"file_system": 1}, "last_seen": "2026-11-11T10:00:00Z",
+              "post_fix": True, "regression": True, "recent_days": 7}
+        text = _render_framing(fl)
+        line = [l for l in text.split("\n") if "FRAMING LEAK" in l]
+        assert len(line) == 1 and line[0].startswith("⚠")
+        assert "1/10" in line[0] and "file_system" in line[0]
+
+    def test_rendered_old_post_fix_is_not_a_warning(self):
+        fl = {"available": True, "corrupt_calls": 1, "calls": 10, "scanned": 5,
+              "by_tool": {"file_system": 1}, "last_seen": "2026-10-12T23:05:49Z",
+              "post_fix": True, "regression": False, "recent_days": 7}
+        text = _render_framing(fl)
+        assert "⚠" not in text and "historical" in text and "2026-10-12T23:05" in text
 
     def test_missing_corpus_says_why(self, tmp_path):
         from ghost_agent.core.learning_health import _framing_leak_health
         h = _framing_leak_health(tmp_path / "nope")
         assert h["available"] is False and "reason" in h
+
+
+def _ts(iso):
+    import datetime as dt
+    return dt.datetime.fromisoformat(iso).replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+def _render_framing(fl):
+    from ghost_agent.core import learning_health as LH
+    return "\n".join(LH.render_framing_leak(fl))

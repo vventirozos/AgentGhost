@@ -92,7 +92,7 @@ def brought(dials):
     """(sentence, rule, the stamp the turn record must carry) for --dials, or None for the stored character."""
     if dials is None:
         return None
-    from ghost_agent.selfhood import character as C, mirror as M
+    from ghost_agent.selfhood import character as C, loop as M
     d = dict(zip(C.DIALS, dials))
     s = C.sentence(d)
     if not s:

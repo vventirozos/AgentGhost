@@ -943,7 +943,8 @@ def test_the_state_thread_and_the_model_have_no_question_thread_or_principle_api
 def test_no_idle_job_lists_stale_questions():
     labels = [row[0] for row in A.IDLE_SCHEDULER_JOBS]
     assert "stale-questions" not in labels and "stale-questions" not in A.IDLE_JOB_PURPOSE
-    assert "selfhood-narrative" in labels and "mirror" in labels            # its neighbours stay
+    assert "selfhood-narrative" in labels and "character" in labels         # its neighbours stay
+    assert "mirror" not in labels and "mirror" not in A.IDLE_JOB_PURPOSE   # §4UH-loop: the Mirror is removed
     assert not hasattr(A.GhostAgent, "_STALE_QUESTIONS_COOLDOWN")
 
 

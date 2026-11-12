@@ -222,9 +222,13 @@ def _escalation_health(ledger_path: Path) -> Dict[str, Any]:
 # (UTC+3) = ~15:54Z — the old value 19:00 (local, unconverted) left a
 # 3h06m blind window where a real recurrence rendered "all historical".
 _FRAMING_FIX_TS = "2026-07-31T15:54"
+# A post-fix leak is a REGRESSION only while it is this recent; older ones
+# are reported as historical post-fix (§4UI, 2026-11-12).
+_FRAMING_RECENT_DAYS = 7
 
 
-def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
+def _framing_leak_health(traj_root: Path,
+                         now: Optional[float] = None) -> Dict[str, Any]:
     """Recurrence watch for tool-call framing leaking into argument values.
 
     The journal recorded "repair fires ≈0 now, each one is news" — and then
@@ -232,7 +236,12 @@ def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
     days later and briefly mistaken for a live defect. This is the listener
     that note assumed existed.
 
-    Verdict is keyed on the newest occurrence, not the count.
+    Verdict is keyed on the newest occurrence, not the count — and, since
+    2026-11-12, on its AGE: one post-fix leak (a 10-12 probe write, the
+    write itself landed) held "REGRESSION" on every overview for a month
+    and the agent invented a "quirk" to explain it to the owner. A
+    post-fix leak older than ``_FRAMING_RECENT_DAYS`` is ``post_fix`` but
+    not ``regression``.
     """
     out: Dict[str, Any] = {"available": False}
     try:
@@ -250,6 +259,14 @@ def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001 — telemetry never breaks a turn
         out["reason"] = f"scan failed ({e})"
         return out
+    import datetime as _dt
+    _now = _dt.datetime.fromtimestamp(time.time() if now is None else now,
+                                      tz=_dt.timezone.utc)
+    # String-compared like _FRAMING_FIX_TS: both sides UTC ISO.
+    _cutoff = (_now - _dt.timedelta(days=_FRAMING_RECENT_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+    _post_fix = bool(stats["last_seen"]
+                     and stats["last_seen"] > _FRAMING_FIX_TS)
     out.update({
         "available": True,
         "scanned": stats["scanned"],
@@ -259,8 +276,9 @@ def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
         "last_seen": stats["last_seen"],
         # The load-bearing field. A post-fix timestamp means the dual-dialect
         # corruption is BACK, which historically wasted whole turns.
-        "regression": bool(stats["last_seen"]
-                           and stats["last_seen"] > _FRAMING_FIX_TS),
+        "post_fix": _post_fix,
+        "regression": bool(_post_fix and stats["last_seen"] > _cutoff),
+        "recent_days": _FRAMING_RECENT_DAYS,
     })
     return out
 
@@ -515,6 +533,41 @@ def activity_liveness(ledger_path: Path,
         # Loud rather than silent if the tail-read ever truncates the window.
         "read_truncated": n_read >= _ACTIVITY_READ_LIMIT,
     }
+
+
+def render_framing_leak(fl: Dict[str, Any]) -> List[str]:
+    """The FRAMING LEAK lines of the report (each starts with a newline).
+    §4UI: a regression is ONE ⚠ line carrying its own detail."""
+    lines: List[str] = []
+    if fl.get("available"):
+        n, tot = fl["corrupt_calls"], fl["calls"]
+        if fl.get("regression"):
+            # ONE line (§4UI): the overview keeps only ⚠ lines, and a
+            # heading whose detail sat on the next line reached the model
+            # as a bare "REGRESSION:" it then explained by invention.
+            lines.append(
+                f"\n⚠ TOOL-CALL FRAMING LEAK — REGRESSION: {n}/{tot} calls "
+                f"carry leaked framing; newest {fl['last_seen'][:16]} is "
+                f"AFTER the 2026-07-31 fix and within "
+                f"{fl.get('recent_days', _FRAMING_RECENT_DAYS)} d — the "
+                f"dual-dialect corruption is back {fl.get('by_tool')}")
+        elif fl.get("post_fix"):
+            lines.append(
+                f"\nTOOL-CALL FRAMING LEAK: {n}/{tot} calls; newest "
+                f"{fl['last_seen'][:16]} is after the 2026-07-31 fix but "
+                f"older than {fl.get('recent_days', _FRAMING_RECENT_DAYS)} d "
+                f"{fl.get('by_tool')} — historical, no action unless it recurs")
+        elif n:
+            lines.append(
+                f"\nTOOL-CALL FRAMING LEAK: {n}/{tot} calls, all historical "
+                f"(newest {fl['last_seen'][:16]}, pre-fix) — no action")
+        else:
+            lines.append(
+                f"\nTOOL-CALL FRAMING LEAK: none in {tot} calls "
+                f"across {fl['scanned']} trajectories")
+    elif fl:
+        lines.append(f"\nTOOL-CALL FRAMING LEAK: {fl.get('reason', 'unknown')}")
+    return lines
 
 
 def render_learning_health(memory_dir, args: Any = None) -> str:
@@ -786,24 +839,6 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
         lines.append(f"\nVERIFIER ESCALATION: {esc.get('reason', 'unknown')} "
                      "— the file appears on the first escalation after a boot")
 
-    fl = r.get("framing_leak") or {}
-    if fl.get("available"):
-        n, tot = fl["corrupt_calls"], fl["calls"]
-        if fl.get("regression"):
-            lines.append("\n⚠ TOOL-CALL FRAMING LEAK — REGRESSION:")
-            lines.append(
-                f"  {n}/{tot} calls carry leaked framing; newest "
-                f"{fl['last_seen'][:16]} is AFTER the 2026-07-31 fix "
-                f"— the dual-dialect corruption is back {fl.get('by_tool')}")
-        elif n:
-            lines.append(
-                f"\nTOOL-CALL FRAMING LEAK: {n}/{tot} calls, all historical "
-                f"(newest {fl['last_seen'][:16]}, pre-fix) — no action")
-        else:
-            lines.append(
-                f"\nTOOL-CALL FRAMING LEAK: none in {tot} calls "
-                f"across {fl['scanned']} trajectories")
-    elif fl:
-        lines.append(f"\nTOOL-CALL FRAMING LEAK: {fl.get('reason', 'unknown')}")
+    lines.extend(render_framing_leak(r.get("framing_leak") or {}))
 
     return "\n".join(lines)

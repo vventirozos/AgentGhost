@@ -42,7 +42,7 @@ FEATURES = [
     ("coding", "Coding & sandbox", "Writes and runs code in a Docker sandbox, with services and jobs."),
     ("projects", "Projects & autonomy", "Multi-step projects, scheduled tasks and an autopilot that works while idle."),
     ("labs", "Labs", "Throwaway real machines on a Raspberry Pi for experiments."),
-    ("selfhood", "Selfhood", "Mood, tone, the self-image (Mirror), the sentiment model and the face."),
+    ("selfhood", "Selfhood", "Mood, tone, the evolving character, tastes, the sentiment model and the face."),
     ("performance", "Performance", "Head and slot saves, cache protection, MTP, node offload and time budgets."),
     ("reliability", "Reliability", "The verifier, guards and breakers, health checks and feedback."),
     ("personal", "Personal services", "Portfolio, weather and games."),

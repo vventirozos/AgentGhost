@@ -853,7 +853,7 @@ def _health_character(context) -> dict:
     react in this character's way; {} when the character is off or cannot be read. A read; never raises."""
     try:
         from ..selfhood import character as _character
-        from ..selfhood.mirror import home_from_memory_dir
+        from ..selfhood.loop import home_from_memory_dir
         if not _character.enabled():
             return {}
         home = home_from_memory_dir(getattr(context, "memory_dir", None))

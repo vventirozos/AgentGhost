@@ -149,17 +149,17 @@ async def look(home, llm_client: Any, *, now: Optional[datetime.datetime] = None
     """The day's look. The outcome in words for the idle line ("" when today's look is already there).
     A deferred background call (`BackgroundDeferred`) is raised to the caller, which tries again later."""
     import asyncio
-    from . import mirror as _mirror
+    from . import loop as _loop
     if await asyncio.to_thread(looked_today, home, now):
         return ""
     if llm_client is None:
         return ""                                   # nobody to ask (said once an hour it would only be noise)
     got = await asyncio.to_thread(rows, home)
     after = str(got[-1].get("at") or "") if got else ""
-    picked = await asyncio.to_thread(_mirror.pick_replies, home, now, rng, after)
+    picked = await asyncio.to_thread(_loop.pick_replies, home, now, rng, after)
     if len(picked) < MIN_REPLIES:
         return ""                                   # too few replies since the last look: nothing to say today
-    replies = [p["text"][:_mirror.REPLY_MAX_CHARS] for p in picked]
+    replies = [p["text"][:_loop.REPLY_MAX_CHARS] for p in picked]
     payload = {
         "messages": [{"role": "system", "content": "Answer directly. Do NOT emit a <think> block."},
                      {"role": "user", "content": build_prompt(replies) + "\n\n/no_think"}],

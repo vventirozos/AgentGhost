@@ -189,7 +189,7 @@ def decay_step_s(magnitude: float, level: int) -> float:
 
 # ── the resting point (§4UA) ────────────────────────────────────────────────
 #
-# The character (the Mirror's sentence) sets where the pair rests: the numbers
+# The character (its dials, ``character.rest_pair``) sets where the pair rests: the numbers
 # a reader sees settle at ``rest`` instead of at 0. The store keeps the DEVIATION from the
 # rest and decays it toward 0 exactly as before; the label and the level are
 # read off the deviation alone, exactly as before, and a reader sees the

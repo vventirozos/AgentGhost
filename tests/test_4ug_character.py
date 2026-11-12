@@ -14,7 +14,7 @@ from ghost_agent.core import agent as A
 from ghost_agent.selfhood import SelfModel
 from ghost_agent.selfhood import character as C
 from ghost_agent.selfhood import days as D
-from ghost_agent.selfhood import mirror as MIRROR
+from ghost_agent.selfhood import loop as LOOP
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood import shade as S
 from ghost_agent.utils.logging import (
@@ -339,8 +339,9 @@ def test_a_day_is_counted_by_kind_from_the_moods_journals(tmp_path):
     assert [b["kind"] for b in rec["biggest"]] == ["turn", "turn", "thumb_up"]   # never the owner's own word
     assert rec["shades"] == {"relieved": 1}
     line = D.day_line(rec)
-    assert "bored 9 h" in line and "(relieved)" in line and "own work: 1 trouble, 1 clean, 1 task done, 1 research" in line
-    assert "you: 1 correction, 1 thanks, set mood cheerful, manner sarcastic" in line
+    assert "bored 9 h" in line and "my turns: 1 ran into trouble, 1 went fine, 1 task(s) done, 1 research" in line
+    assert "(shades: relieved)" in line and line.startswith(rec["date"] + " · moods: ")
+    assert "from you: 1 correction(s), 1 thank-you(s), set my mood to cheerful, asked for a sarcastic manner" in line
 
 
 def test_the_parsers_read_what_the_mood_really_writes(tmp_path):
@@ -440,27 +441,27 @@ def test_an_event_the_owners_set_mood_holds_sets_no_shade(tmp_path):
 # ── what a reply hears ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("rid", ["web-4ug-1", "slack-4ug-1", "probe-4ug-1"])
-def test_an_owner_reply_hears_the_character_not_the_mirrors_sentence(tmp_path, rid):
+def test_an_owner_reply_hears_the_character(tmp_path, rid):
     home = _home(tmp_path)
-    (home / MIRROR.MIRROR_REL).write_text(json.dumps({
-        "at": "2026-11-09T00:30:00", "date": "2026-11-09", "sentence": "I am the Mirror's old sentence.",
-        "prev": MIRROR.SEED_SENTENCE, "replies": [{"at": "2026-11-09T09:00:00Z", "excerpt": "x"}]}) + "\n")
     with _req(rid):
         got = A._self_image_block(_ctx(home))
         assert got == f"{C.HEADER}\n«I am a little dry and fond of a light joke.»\n{C.RULE}\n\n"
-        assert "Mirror's old sentence" not in got and A._self_image_block(_ctx(home)) == got
+        assert A._self_image_block(_ctx(home)) == got
     assert A.self_image_heard(rid) == "character:-1,1,0"        # the record says which dials the reply heard
 
 
-def test_the_switch_puts_the_mirrors_sentence_back(tmp_path, monkeypatch):
+def test_the_switch_off_is_no_self_image_at_all(tmp_path, monkeypatch):
+    """§4UH-loop: with GHOST_CHARACTER=0 nothing is heard — the Mirror's sentence it once put back is removed;
+    a leftover diary file is not read."""
     home = _home(tmp_path)
-    (home / MIRROR.MIRROR_REL).write_text(json.dumps({
+    (home / "system" / "selfhood" / "mirror.jsonl").write_text(json.dumps({
         "at": "2026-11-09T00:30:00", "date": "2026-11-09", "sentence": "I am the Mirror's old sentence.",
-        "prev": MIRROR.SEED_SENTENCE, "replies": [{"at": "2026-11-09T09:00:00Z", "excerpt": "x"}]}) + "\n")
+        "replies": [{"at": "2026-11-09T09:00:00Z", "excerpt": "x"}]}) + "\n")
     monkeypatch.setenv("GHOST_CHARACTER", "0")
     with _req("web-4ug-2"):
-        assert "Mirror's old sentence" in A._self_image_block(_ctx(home))
-    assert A.self_image_heard("web-4ug-2") == "2026-11-09"
+        assert A._self_image_block(_ctx(home)) == ""
+    assert A.self_image_heard("web-4ug-2") == ""
+    assert C.rest_pair(home) == (0.0, 0.0)
 
 
 @pytest.mark.parametrize("who", [{"rid": "slack-4ug-m", "role": "member"}, {"rid": "slack-4ug-p", "surface": "public"},
@@ -527,7 +528,7 @@ def test_introspect_shows_the_characters_line_to_the_owner_only(tmp_path, monkey
     with _req("slack-4ug-pub", surface="public"):
         assert I._self_image(ctx) == ""
     monkeypatch.setenv("GHOST_CHARACTER", "0")
-    assert I._self_image(ctx) == ""                             # no Mirror diary here: nothing
+    assert I._self_image(ctx) == ""                             # the character off: nothing (no Mirror)
 
 
 def test_health_carries_the_dials_the_numbers_and_the_shade(tmp_path, monkeypatch):
@@ -606,12 +607,12 @@ def test_with_the_character_off_the_command_is_not_one(tmp_path, monkeypatch):
 
 
 def test_the_mirror_banner_says_what_a_reply_hears_now(tmp_path, monkeypatch):
-    # §4UH: with the character on, `mirror` is the daily look under the sentence replies hear now
-    b = MIRROR.mirror_banner(tmp_path)
-    assert f"My character now: «{C.sentence(C.START)}»" in b and "No look yet" in b
+    # §4UH-loop: `mirror` is the strange loop's path, with the sentence replies hear now and the daily look
+    b = LOOP.banner(tmp_path)
+    assert f"**Now:** «{C.sentence(C.START)}»" in b and "No look yet" in b
     monkeypatch.setenv("GHOST_CHARACTER", "0")
-    b = MIRROR.mirror_banner(tmp_path)
-    assert "My character now" not in b and "No sentence yet" in b
+    b = LOOP.banner(tmp_path)
+    assert "**Now:**" not in b and "switched off (GHOST_CHARACTER=0)" in b and "diary" not in b
 
 
 # ── review r1: the defects it found, and the mutants that had survived ──────
@@ -909,7 +910,9 @@ async def test_the_turn_record_says_which_shade_the_reply_carried(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_the_idle_window_runs_the_character_phase_and_the_look_only_when_it_is_off(tmp_path, monkeypatch):
+async def test_the_idle_window_runs_the_character_phase_on_or_off(tmp_path, monkeypatch):
+    """§4UH-loop: the idle phase is the character's turn alone (the Mirror's look is removed); its cooldown
+    holds, and the days are closed with the character off too."""
     home = _home(tmp_path)
     agent = A.GhostAgent.__new__(A.GhostAgent)
     agent._bio_cooldown = lambda s: s
@@ -917,20 +920,17 @@ async def test_the_idle_window_runs_the_character_phase_and_the_look_only_when_i
 
     async def phase(h, ran, notes, ctx=None):
         calls.append(("character", Path(h)))
-    looked = []
-
-    async def look(h, llm, **k):
-        looked.append(1)
-        return "new I-sentence: I am x."
     monkeypatch.setattr(agent, "_character_phase", phase)
-    monkeypatch.setattr(MIRROR, "look", look)
     ctx = SimpleNamespace(memory_dir=str(home / "system" / "memory"), llm_client=object(), args=None)
-    await agent._mirror_phase(ctx, [], {})
-    assert calls == [("character", home)] and looked == []       # on: the days are closed, no look
+    await agent._self_phase(ctx, [], {})
+    assert calls == [("character", home)]
+    await agent._self_phase(ctx, [], {})
+    assert len(calls) == 1                                       # one try an hour
     monkeypatch.setenv("GHOST_CHARACTER", "0")
     agent._last_mirror_try_at = datetime.datetime.min
-    await agent._mirror_phase(ctx, [], {})
-    assert len(calls) == 2 and looked == [1]                     # off: the days are still closed, and the look runs
+    await agent._self_phase(ctx, [], {})
+    assert len(calls) == 2
+    assert not (home / "system" / "selfhood" / "mirror.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -1318,11 +1318,21 @@ def test_each_dial_listens_to_one_number_of_the_day():
     assert s == {"warmth": 2.0, "humour": (5 + 1 - 2) / 6, "directness": (2 - 2) / 3}
     quiet = C.day_signals(_rec("d"))
     assert quiet == {"warmth": None, "humour": None, "directness": None}      # a day that says nothing
-    assert C.day_signals(_rec("d", thumbs_up=40))["warmth"] == C.WARMTH_CAP   # one very good day is a good day
-    assert C.day_signals(_rec("d", thumbs_down=9))["warmth"] == -C.WARMTH_CAP
+    assert C.day_signals(_rec("d", praise=40))["warmth"] == C.WARMTH_CAP      # one very good day is a good day
+    assert C.day_signals(_rec("d", tone_down=9))["warmth"] == -C.WARMTH_CAP
+    # §4UH-warmth: thumbs and corrections judge an ANSWER — directness only, never warmth
+    assert C.day_signals(_rec("d", thumbs_up=40, thumbs_down=9))["warmth"] is None
     assert C.day_signals(_rec("d", clean_turns=2))["humour"] is None          # too little work to say
     assert C.day_signals(_rec("d", tone_up=1))["directness"] is None          # tone does not judge an answer
-    assert C.day_signals(_rec("d", corrections=1)) == {"warmth": -2.0, "humour": None, "directness": -2.0}
+    assert C.day_signals(_rec("d", corrections=1)) == {"warmth": None, "humour": None, "directness": -2.0}
+    # a day with messages the emotion model read: warmth is their warm and annoyed counts, nothing else
+    assert C.day_signals(_rec("d", msgs_rated=4, msgs_warm=2, msgs_cold=1, msgs_thanks=2, praise=2))["warmth"] == 0.0
+    # … plus the thanks it did not read (Greek): praise beyond the gratitude it saw
+    assert C.day_signals(_rec("d", msgs_rated=4, msgs_warm=2, msgs_cold=1, msgs_thanks=2, praise=3))["warmth"] == 1.0
+    assert C.day_signals(_rec("d", msgs_rated=3))["warmth"] == 0.0           # read, and nothing warm: a 0, not None
+    assert C.day_signals(_rec("d", msgs_rated=9, msgs_warm=9))["warmth"] == C.WARMTH_CAP
+    assert C.day_signals(_rec("d", msgs_rated=9, msgs_cold=9))["warmth"] == -C.WARMTH_CAP
+    assert C.day_signals(_rec("d", msgs_rated=0, praise=1))["warmth"] == 1.0  # none read: the older counts
     assert C.day_signals({"own": "x", "shades": 3, "thumbs_up": True, "praise": "2", "tone_up": None})["warmth"] == 2.0
     assert set(C.SIGNAL_WORDS) == set(C.DIALS)
     # the manners the owner asks for move no dial: they are not in any signal
@@ -1331,18 +1341,19 @@ def test_each_dial_listens_to_one_number_of_the_day():
 
 def test_a_day_counts_only_against_the_agents_own_norm(monkeypatch):
     monkeypatch.setattr(C, "day_pulls", _REAL_DAY_PULLS)
-    usual = [_rec("d", thumbs_up=1, clean_turns=4)] * 6
-    days = _run(*usual, _rec("d", thumbs_up=3, clean_turns=4), _rec("d", thumbs_down=1, clean_turns=1, trouble=3),
-                _rec("d"), _rec("d", thumbs_up=1, clean_turns=4))
+    usual = [_rec("d", praise=1, thumbs_up=1, clean_turns=4)] * 6
+    days = _run(*usual, _rec("d", praise=3, thumbs_up=1, clean_turns=4),
+                _rec("d", tone_down=1, thumbs_down=1, clean_turns=1, trouble=3),
+                _rec("d"), _rec("d", praise=1, thumbs_up=1, clean_turns=4))
     pulls = C.day_pulls(days)
     assert pulls == {"2026-10-07": {"warmth": 1}, "2026-10-08": {"warmth": -1, "humour": -1, "directness": -1}}
     # the same good day means nothing to an agent whose days are all like it …
-    always = _run(*[_rec("d", thumbs_up=3, clean_turns=4)] * 8)
+    always = _run(*[_rec("d", praise=3, clean_turns=4)] * 8)
     assert C.day_pulls(always) == {}
     # … and nothing before it has ``BASE_MIN`` days to compare with
-    assert C.day_pulls(_run(*usual[:4], _rec("d", thumbs_up=3))) == {}
+    assert C.day_pulls(_run(*usual[:4], _rec("d", praise=3))) == {}
     # only the ``BASE_DAYS`` before a day are its norm: an old stretch of bad days is forgotten
-    old_bad = _run(*[_rec("d", thumbs_down=2)] * 6, *[_rec("d", thumbs_up=1)] * C.BASE_DAYS, _rec("d", thumbs_up=1))
+    old_bad = _run(*[_rec("d", tone_down=2)] * 6, *[_rec("d", praise=1)] * C.BASE_DAYS, _rec("d", praise=1))
     assert old_bad[-1]["date"] not in C.day_pulls(old_bad)
     assert C.day_pulls([]) == {} and C.day_pulls([None, "x", {"date": "zzz"}]) == {}
 
@@ -1365,10 +1376,10 @@ def test_the_real_rule_moves_a_dial_from_a_run_of_better_days(tmp_path, monkeypa
     monkeypatch.setattr(C, "LEAD_OUT", 4)
     home = _home(tmp_path)
     now = datetime.datetime(2026, 11, 20, 9, 0, tzinfo=UTC)
-    days = _run(*[_rec("d", thumbs_up=1)] * 6, *[_rec("d", thumbs_up=3)] * 3)
+    days = _run(*[_rec("d", msgs_rated=4, msgs_warm=1)] * 6, *[_rec("d", msgs_rated=4, msgs_warm=3)] * 3)
     said = C.daily(home, days, now=now)
     assert [x.split(":")[0] for x in said] == ["warmth -1 → +0"]            # three better days: a step back toward 0
-    assert "in what came from the owner (thumbs, thanks, the tone of the messages)" in said[0]
+    assert f"in {C.SIGNAL_WORDS['warmth']}" in said[0] and "thumbs" not in said[0]
     row = [r for r in C.log_rows(home) if r["kind"] == C.KIND_MOVE][0]
     assert row["days_up"] == ["2026-10-07", "2026-10-08", "2026-10-09"] and row["days_down"] == []
     assert "moves by itself" in C.view(home) and "manner" not in C.view(home).split("How it got here")[0]

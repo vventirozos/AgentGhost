@@ -13,7 +13,7 @@ import pytest
 from ghost_agent.core import agent as A
 from ghost_agent.selfhood import SelfModel
 from ghost_agent.selfhood import character as C
-from ghost_agent.selfhood import mirror as MIRROR
+from ghost_agent.selfhood import loop as LOOP
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood import selfview as V
 
@@ -46,7 +46,7 @@ class _LLM:
 
 def _replies(monkeypatch, n=4):
     picked = [{"text": f"reply number {i} " + "x" * 100, "at": f"2026-11-12T0{i}:00:00Z"} for i in range(n)]
-    monkeypatch.setattr(MIRROR, "pick_replies", lambda home, now=None, rng=None, after="": list(picked))
+    monkeypatch.setattr(LOOP, "pick_replies", lambda home, now=None, rng=None, after="": list(picked))
     return picked
 
 
@@ -354,7 +354,8 @@ def _ev(kind, dp=-0.2, de=0.1):
     return M.Event(dp, de, "why", kind)
 
 
-@pytest.mark.parametrize("warmth,factor", [(-2, 0.8), (-1, 0.9), (0, 1.0), (1, 1.1), (2, 1.2)])
+# §4UH-lean: LEAN_STEP 0.25 (was 0.1) — the factors are written out, not derived, so a changed step fails here
+@pytest.mark.parametrize("warmth,factor", [(-2, 0.5), (-1, 0.75), (0, 1.0), (1, 1.25), (2, 1.5)])
 def test_warmth_scales_what_comes_from_the_owner_both_ways(warmth, factor):
     dials = {"warmth": warmth, "humour": 2, "directness": -2}
     for kind in (M.KIND_THUMB_UP, M.KIND_THUMB_DOWN, M.KIND_CORRECTION, M.KIND_PRAISE, M.KIND_SENTIMENT):
@@ -366,8 +367,8 @@ def test_warmth_scales_what_comes_from_the_owner_both_ways(warmth, factor):
 
 def test_humour_lightens_or_weighs_only_the_agents_own_setbacks():
     playful, serious = {"warmth": 0, "humour": 2, "directness": 0}, {"warmth": 0, "humour": -2, "directness": 0}
-    assert C.lean(_ev(M.KIND_TURN, -0.3), playful).dp == pytest.approx(-0.24)
-    assert C.lean(_ev(M.KIND_TURN, -0.3), serious).dp == pytest.approx(-0.36)
+    assert C.lean(_ev(M.KIND_TURN, -0.3), playful).dp == pytest.approx(-0.15)
+    assert C.lean(_ev(M.KIND_TURN, -0.3), serious).dp == pytest.approx(-0.45)
     good = _ev(M.KIND_TURN, 0.3)
     assert C.lean(good, playful) is good and C.lean(good, serious) is good
     assert C.lean(_ev(M.KIND_THUMB_DOWN), {"warmth": 0, "humour": 2, "directness": 0}).dp == pytest.approx(-0.2)
@@ -396,7 +397,7 @@ def test_the_mood_books_the_leaned_size_on_arrival(tmp_path, real_lean):
     a = warm.note_owner_reaction(M.KIND_THUMB_UP, now=NOW, reply_id="r1")
     b = flat.note_owner_reaction(M.KIND_THUMB_UP, now=NOW, reply_id="r1")
     assert a is not None and b is not None
-    assert a.moved[0] == pytest.approx(b.moved[0] * 1.2, abs=1e-3)
+    assert a.moved[0] == pytest.approx(b.moved[0] * 1.5, abs=1e-3)
     assert warm._applied["r1"][0] == pytest.approx(a.base_moved[0])          # the ledger holds what moved
     # the same thumb again changes nothing: it was booked at its leaned size
     assert warm.note_owner_reaction(M.KIND_THUMB_UP, now=NOW, reply_id="r1") is None
@@ -409,7 +410,7 @@ def test_a_bad_turn_lands_lighter_on_a_playful_character(tmp_path, real_lean):
     sig = M.TurnSignals(tool_calls=6, failures=5)
     a = _sm(home).note_owner_turn(sig, now=NOW)
     b = _sm(plain).note_owner_turn(sig, now=NOW)
-    assert a.moved[0] < 0 and a.moved[0] == pytest.approx(b.moved[0] * 0.8, abs=1e-3)
+    assert a.moved[0] < 0 and a.moved[0] == pytest.approx(b.moved[0] * 0.5, abs=1e-3)
 
 
 def test_no_lean_when_it_is_switched_off_or_the_character_is_off_or_unreadable(tmp_path, monkeypatch, real_lean):
@@ -507,7 +508,7 @@ def test_trouble_is_judged_on_the_turns_own_size_and_only_the_booking_leans(tmp_
     monkeypatch.setattr(M, "turn_events", lambda sig: [M.Event(raw, 0.0, "a call failed in this turn", M.KIND_TURN)])
     sm = _sm(home)
     after = sm.note_owner_turn(M.TurnSignals(tool_calls=2, failures=1), now=NOW)
-    assert after.moved[0] == pytest.approx(raw * (1 - 0.1 * humour), abs=1e-3)   # leaned once, not twice
+    assert after.moved[0] == pytest.approx(raw * (1 - 0.25 * humour), abs=1e-3)  # leaned once, not twice
     assert (sm._trouble_at is not None) is trouble and (sm._own_trouble_at is not None) is trouble
 
 
@@ -665,7 +666,7 @@ def test_only_a_thumbs_outcome_counts(tmp_path):
     assert D.owner_thumbs(home, datetime.date(2026, 11, 10), tz=UTC) == (0, 0)
 
 
-# ── the `mirror` command shows the look (§4UH-m) ─────────────────────────────
+# ── the `mirror` command shows the loop's path and the look (§4UH-m, §4UH-loop) ─
 
 def _sv_rows(home, rows):
     p = home / "system" / "selfhood" / V.LOG_FILENAME
@@ -675,7 +676,7 @@ def _sv_rows(home, rows):
 
 def test_the_mirror_command_shows_each_look_meant_against_sounded_and_its_pull(tmp_path, monkeypatch):
     monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     home = tmp_path
     then = {"warmth": -1, "humour": 1, "directness": 0}
     _sv_rows(home, [
@@ -696,54 +697,51 @@ def test_the_mirror_command_shows_each_look_meant_against_sounded_and_its_pull(t
         "directness meant 0, sounded +2 → votes directness up",
         "- **2026-11-14** · 3 replies — no look: the call failed"]
     assert V.history_lines(home, limit=1) == got[-1:] and V.history_lines(home, limit=0) == []
-    b = MI.mirror_banner(home)
-    assert "My character now: «" in b and "\n".join(got) in b and "The latest looks:" in b
+    b = MI.banner(home)
+    assert "**Now:** «" in b and "\n".join(got) in b and "**What I see when I look at my replies.**" in b
     assert V.line(home) in b                                    # the latest look in words, under the list
-    assert "the Mirror was a diary" not in b                    # no diary: no history paragraph
-    assert b.index("My character now") < b.index("The latest looks")
+    assert "diary" not in b                                     # §4UH-loop: the Mirror's diary is removed
+    assert b.index("**Now:**") < b.index("**What I see when I look")
+    assert b.startswith("**The strange loop**")
 
 
-def test_the_mirror_command_keeps_the_old_diary_below_as_history(tmp_path):
-    from ghost_agent.selfhood import mirror as MI
-    home = tmp_path
-    p = home / MI.MIRROR_REL
+def test_the_mirror_command_shows_no_diary_even_when_the_old_file_is_there(tmp_path):
+    """§4UH-loop: the Mirror is removed; a leftover diary file is never read or shown."""
+    from ghost_agent.selfhood import loop as MI
+    p = tmp_path / "system" / "selfhood" / "mirror.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"date": "2026-11-09", "sentence": "I am bright.", "prev": MI.SEED_SENTENCE,
-                             "replies": [], "rest": [1, -1]}) + "\n", encoding="utf-8")
-    b = MI.mirror_banner(home)
-    assert "No look yet" in b and "**Until 2026-11-09**" in b and "— I am bright." in b
-    assert b.index("No look yet") < b.index("Until 2026-11-09")
-    # §4UH-e2e: the diary's rest is not shown — the character's dials set it, and at the starting dials it is even
-    assert "Where my mood settles" not in b
-    assert "The latest look (" not in b and "skipped" not in b   # no quoted replies, no skip reason
+    p.write_text(json.dumps({"date": "2026-11-09", "sentence": "I am bright.", "replies": [], "rest": [1, -1]})
+                 + "\n", encoding="utf-8")
+    b = MI.banner(tmp_path)
+    assert "No look yet" in b and "I am bright." not in b and "Until 2026-11-09" not in b
+    assert "my mood rests" not in b                             # the starting dials rest even
 
 
 def test_the_mirror_command_with_an_unreadable_character_says_so(tmp_path):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     p = tmp_path / C.SELFHOOD_REL / C.CHARACTER_FILENAME
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{not json", encoding="utf-8")
-    assert "cannot be read" in MI.mirror_banner(tmp_path)
+    b = MI.banner(tmp_path)
+    assert "cannot be read" in b and "STARTING character" in b
 
 
-def test_a_broken_look_history_falls_back_to_the_diary(tmp_path, monkeypatch):
-    from ghost_agent.selfhood import mirror as MI
+def test_a_broken_look_history_says_so_and_keeps_the_path(tmp_path, monkeypatch):
+    from ghost_agent.selfhood import loop as MI
     def boom(*a, **k):
         raise RuntimeError("x")
     monkeypatch.setattr(V, "history_lines", boom)
-    b = MI.mirror_banner(tmp_path)
-    assert b.startswith("**The Mirror**") and "could not be read just now" in b and "diary" not in b
-    # review: the fallback is NOT the diary's banner (it quotes replies and says replies hear its sentence)
-    p = tmp_path / MI.MIRROR_REL
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"date": "2026-11-09", "sentence": "I am bright.", "prev": MI.SEED_SENTENCE,
-                             "replies": [{"at": "2026-11-09T10:00:00", "excerpt": "SECRET REPLY"}]}) + "\n")
-    b = MI.mirror_banner(tmp_path)
-    assert "— I am bright." in b and "SECRET REPLY" not in b and "before every reply" not in b
+    b = MI.banner(tmp_path)
+    assert b.startswith("**The strange loop**") and "could not be read just now" in b and "diary" not in b
+    assert "**Now:**" in b                                      # the character's part still renders
+    monkeypatch.undo()
+    monkeypatch.setattr(C, "log_rows", boom)                    # … and the other way round
+    b = MI.banner(tmp_path)
+    assert "path could not be read just now" in b and "**What I see when I look" in b
 
 
 def test_the_mirror_command_shows_the_latest_seven_of_many(tmp_path):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     then = {"warmth": 0, "humour": 0, "directness": 0}
     _sv_rows(tmp_path, [{"at": f"2026-10-{d:02d}T04:00:00Z", "date": f"2026-10-{d:02d}", "replies": True if d == 9 else 3,
                          "observed": then, "dials": then} for d in range(1, 10)])
@@ -751,18 +749,14 @@ def test_the_mirror_command_shows_the_latest_seven_of_many(tmp_path):
     assert len(got) == V.SHOW_LAST == 7 and got[0].startswith("- **2026-10-03**") and got[-1].startswith("- **2026-10-09**")
     assert "replies" not in got[-1] and "· 3 replies" in got[0]          # a bool count is not a count
     assert "(some replies)" in V.line(tmp_path)                           # nor in the line under the list
-    p = tmp_path / MI.MIRROR_REL
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("".join(json.dumps({"date": f"2026-10-{d:02d}", "sentence": f"I am number {d}.", "replies": []}) + "\n"
-                         for d in range(1, 10)))
-    b = MI.mirror_banner(tmp_path)
-    assert "I am number 9." in b and "I am number 3." in b and "I am number 2." not in b and "the last 7 shown" in b
+    b = MI.banner(tmp_path)
+    assert "\n".join(got) in b and "- **2026-10-02**" not in b
 
 
 def test_the_mirror_command_says_how_many_replies_a_first_look_needs(tmp_path, monkeypatch):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     monkeypatch.setattr(V, "MIN_REPLIES", 5)
-    assert "at least 5 replies" in MI.mirror_banner(tmp_path)
+    assert "at least 5 replies" in MI.banner(tmp_path)
 
 
 def test_todays_failed_try_is_not_a_missed_day_while_a_second_may_come(tmp_path):
@@ -784,7 +778,7 @@ def test_a_vote_on_a_pinned_dial_says_it_is_not_counted(tmp_path, monkeypatch):
 
 
 def test_the_picker_reads_a_looks_utc_stamp(tmp_path):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     # review: py3.10 refused the "Z" → 0.0 → the plain 48 h window, re-reading replies the last look rated
     assert MI._look_epoch("2026-11-11T21:27:50Z") == datetime.datetime(2026, 11, 11, 21, 27, 50,
                                                                         tzinfo=datetime.timezone.utc).timestamp()
@@ -804,18 +798,18 @@ def test_a_vote_from_before_the_dials_last_change_says_it_is_not_counted(tmp_pat
 
 
 def test_a_first_failed_try_today_says_a_second_one_comes(tmp_path):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     _sv_rows(tmp_path, [{"at": "x", "date": C._mood_day(), "failed": True, "replies": 5}])
-    b = MI.mirror_banner(tmp_path)
+    b = MI.banner(tmp_path)
     assert "one more try comes" in b and "at least 3 replies" not in b
     _sv_rows(tmp_path, [{"at": "x", "date": C._mood_day(), "failed": True, "replies": 5}] * 2)
-    assert "one more try comes" not in MI.mirror_banner(tmp_path)
+    assert "one more try comes" not in MI.banner(tmp_path)
 
 
 # ── §4UH-e2e: the look is shown, not a vote; the dials set where the mood rests ─────────────────────
 
 def test_with_the_vote_off_a_look_leans_but_moves_nothing(tmp_path, monkeypatch):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     monkeypatch.delenv(V.VOTE_ENV, raising=False)
     assert V.vote_enabled() is False
     then = {"warmth": -1, "humour": 1, "directness": 0}
@@ -823,10 +817,11 @@ def test_with_the_vote_off_a_look_leans_but_moves_nothing(tmp_path, monkeypatch)
                          "observed": {"warmth": 1, "humour": 1, "directness": 1}, "dials": then}])
     assert V.votes(tmp_path) == {}                                   # nothing reaches `character.propose`
     assert V.history_lines(tmp_path)[0].endswith("→ leans warmth up (not a vote)")
-    b = MI.mirror_banner(tmp_path)
-    assert "not what moves me" in b and "adds one vote" not in b and "and by your commands" in b
+    b = MI.banner(tmp_path)
+    assert "This is shown, not counted" in b and "adds a vote" not in b
     monkeypatch.setenv(V.VOTE_ENV, "1")
-    assert V.votes(tmp_path) == {"2026-11-11": {"warmth": 1}} and "adds one vote" in MI.mirror_banner(tmp_path)
+    b = MI.banner(tmp_path)
+    assert V.votes(tmp_path) == {"2026-11-11": {"warmth": 1}} and "adds a vote" in b and "shown, not counted" not in b
 
 
 @pytest.mark.parametrize("dials, units", [
@@ -848,24 +843,24 @@ def test_the_dials_set_where_the_mood_rests(dials, units):
 @pytest.mark.parametrize("d", range(-2, 3))
 def test_a_rest_never_sits_in_an_unhappy_restless_or_bored_region(w, h, d):
     from ghost_agent.selfhood import mood as MM
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     a, b = C.rest_units({"warmth": w, "humour": h, "directness": d})
     assert MM.rest_label((a * MI.REST_UNIT, b * MI.REST_UNIT)) in ("neutral", "content", "cheerful", "calm", "curious")
 
 
 def test_the_rest_pair_follows_the_character_and_its_switches(tmp_path, monkeypatch):
-    from ghost_agent.selfhood import mirror as MI
+    from ghost_agent.selfhood import loop as MI
     C.set_dial(tmp_path, "directness", 1)
     assert C.rest_pair(tmp_path) == (0.0, 0.0)                       # the start + blunt: even
     C.set_dial(tmp_path, "warmth", 2)
     C.set_dial(tmp_path, "humour", 2)
     assert C.rest_pair(tmp_path) == (2 * MI.REST_UNIT, 2 * MI.REST_UNIT)
-    assert "Where my mood settles when nothing happens (set by my character)" in MI.mirror_banner(tmp_path)
+    assert "With nothing happening, my mood rests at pleasantness sunny, energy lively." in MI.banner(tmp_path)
     monkeypatch.setenv(MI.REST_ENV, "0")
-    assert C.rest_pair(tmp_path) == (0.0, 0.0) and "Where my mood settles" not in MI.mirror_banner(tmp_path)
+    assert C.rest_pair(tmp_path) == (0.0, 0.0) and "my mood rests" not in MI.banner(tmp_path)
     monkeypatch.delenv(MI.REST_ENV)
-    monkeypatch.setenv("GHOST_CHARACTER", "0")                       # off: the Mirror's (no diary: even)
-    assert C.rest_pair(tmp_path) == MI.rest_pair(tmp_path) == (0.0, 0.0)
+    monkeypatch.setenv("GHOST_CHARACTER", "0")                       # §4UH-loop: off is no rest (no Mirror)
+    assert C.rest_pair(tmp_path) == (0.0, 0.0)
     monkeypatch.delenv("GHOST_CHARACTER")
     p = tmp_path / C.SELFHOOD_REL / C.CHARACTER_FILENAME
     p.write_text("{broken", encoding="utf-8")

@@ -203,7 +203,6 @@ export function initStatus(_ctx) {
     // §4UD: the last mood reading and how many polls in a row had none (`moodTrack`)
     let moodState = { misses: 0, mood: null, unknown: false };
     let moodRefreshTimer = null;
-    const moodText = document.getElementById('mood-text');
 
     // 401/403 is an AUTH failure, not an unreachable agent: after a key
     // rotation the injected key is stale and every call fails, while the
@@ -282,13 +281,6 @@ export function initStatus(_ctx) {
             + moodNote({ mood: moodState.mood }, moodState.unknown);
     }
 
-    function paintMood() {
-        if (!moodText) return;
-        moodText.textContent = moodWords(moodView(moodState.mood), moodState.unknown);
-        const note = moodNote({ mood: moodState.mood }, moodState.unknown).trim();
-        if (note) moodText.title = note; else moodText.removeAttribute('title');
-    }
-
     // One extra health read a moment from now; triggers inside the wait share it.
     function scheduleMoodRefresh() {
         if (moodRefreshTimer !== null) return;
@@ -321,7 +313,6 @@ export function initStatus(_ctx) {
         }
         window.__ghostHealth = health;
         moodState = moodTrack(moodState, health && health.mood);
-        paintMood();
         // §4RB: every health result, for readers outside this module (effort.js)
         try { window.dispatchEvent(new CustomEvent('ghost-health', { detail: health })); } catch (_) { /* old browser */ }
         await pollInterfaceHealth();

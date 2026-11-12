@@ -72,7 +72,7 @@ slot_session_context = contextvars.ContextVar("slot_session", default="")
 #: §4QX: `look_owned` — the system shows the look line; the model writes only what is missing.
 #: §4QZ: `effort_low` / `effort_medium` / `effort_xhigh` — the main server's chat-template
 #: `reasoning_effort` for this request (core/llm.py `with_probe_effort`).
-#: §4UE: `no_self_image` — the Mirror's self-image section is left out of this probe's state block
+#: §4UE: `no_self_image` — the character's self-image section is left out of this probe's state block
 #: (core/agent.py `self_image_is_heard_on_this_request`), so paired probes can measure whether the
 #: section is audible in a reply. The prompt, the tools and the mood line are what an owner's probe
 #: gets; like every arm, its name is in the turn record (`extra.prompt_arm`) and the prefill log line.
@@ -102,11 +102,11 @@ def probe_rule() -> str:
 
 #: §4UF: a candidate SELF-IMAGE under test, sent by an operator probe — `X-Ghost-Probe-Self-Image` is the
 #: sentence, `X-Ghost-Probe-Self-Image-Rule` (optional) the rule text under it; both percent-encoded
-#: UTF-8, honoured only with `X-Ghost-Origin: probe`. The probe hears them in the place of the Mirror's
+#: UTF-8, honoured only with `X-Ghost-Origin: probe`. The probe hears them in the place of the character's
 #: sentence and rule (core/agent.py `_self_image_block`), so paired probes can tell whether a character
 #: line is audible at all, and which wording makes it so. (sentence, rule).
 probe_self_image_context = contextvars.ContextVar("probe_self_image", default=("", ""))
-PROBE_SELF_IMAGE_MAX = 300          # the Mirror's own SENTENCE_MAX_CHARS
+PROBE_SELF_IMAGE_MAX = 300          # one sentence (the removed Mirror's SENTENCE_MAX_CHARS)
 PROBE_SELF_IMAGE_RULE_MAX = 900
 
 
@@ -1032,7 +1032,7 @@ class Icons:
     USER_ID      = "👤"
     SELF_STATE   = "🪞"   # selfhood state / mood transition
     SENTIMENT    = "💗"   # §4TW: the sentiment service's rating of an owner message (shadow)
-    MIRROR       = "🎭"   # §4SV: the Mirror — the daily I-sentence and the owner's `mirror` command
+    MIRROR       = "🎭"   # §4UG/§4UH: the character, its day records and the owner's `mirror` command
     DREAM        = "🌙"   # REM / dream consolidation cycle (NOT 💤 — that's SYSTEM_SHUT)
     SKIP         = "⏩"   # a step/cycle deliberately skipped
     ACTIVITY     = "📡"   # autonomous-activity ledger / background digest surfaced

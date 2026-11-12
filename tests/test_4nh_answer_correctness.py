@@ -137,3 +137,21 @@ def test_the_knowledge_shadow_is_off_by_default(monkeypatch):
         assert enabled() is True
     monkeypatch.setenv("GHOST_KNOWLEDGE_SHADOW", "0")
     assert enabled() is False
+
+
+def test_learning_warning_heading_keeps_its_detail(monkeypatch):
+    """§4UI (req 126bbc5f): the overview kept "⚠ … REGRESSION:" and dropped the
+    indented line under it; the agent invented a "quirk" for the bare word."""
+    from ghost_agent.tools import introspect as I
+    rep = ("### LEARNING HEALTH\n\n⚠ SOMETHING — REGRESSION:\n"
+           "  1/10 calls; newest 2026-11-11\n\nNEXT: fine")
+    monkeypatch.setattr(I, "_learning_report_cached", lambda md, args, allow_stale=True: (rep, 0))
+    out = asyncio.run(I._overview_learning(SimpleNamespace(memory_dir="/tmp", args=None)))
+    assert "⚠ SOMETHING — REGRESSION: 1/10 calls; newest 2026-11-11" in out
+    assert "NEXT" not in out
+
+
+def test_learning_warning_heading_without_detail_is_dropped():
+    from ghost_agent.tools import introspect as I
+    assert I._learning_warnings("⚠ BARE:\n⚠ REAL thing\n  └ not mine") == ["⚠ REAL thing"]
+    assert I._learning_warnings("⚠ BARE:\nunindented") == []

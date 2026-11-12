@@ -35,7 +35,7 @@ import pytest
 from ghost_agent.core import agent as A
 from ghost_agent.core import feedback as F
 from ghost_agent.selfhood import SelfModel
-from ghost_agent.selfhood import mirror as MI
+from ghost_agent.selfhood import loop as MI
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood import sentiment as SE
 from ghost_agent.selfhood import state as ST
@@ -427,38 +427,7 @@ def test_the_state_file_is_forced_to_disk_before_it_replaces_the_old_one(tmp_pat
 
 # ── F5. one bad byte ─────────────────────────────────────────────────────────
 
-def _diary(home: Path, rows):
-    p = home / MI.MIRROR_REL
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    return p
-
-
-def _look(date, sentence, prev, rest=(1, 0)):
-    return {"at": f"{date}T05:00:00", "date": date, "sentence": sentence, "prev": prev,
-            "replies": [{"at": "", "excerpt": "x"}], "rest": list(rest)}
-
-
-def test_one_bad_byte_in_the_mirrors_diary_costs_its_line_not_the_mirror(tmp_path):
-    """Before: 2 rows + one bad line → 0 rows, rest (0.12, 0.06) → (0, 0), no self-image block, "No sentence
-    yet", and `looked_today` false — the next look would have started again from the seed."""
-    p = _diary(tmp_path, [_look("2026-11-09", "I am careful.", MI.SEED_SENTENCE, (1, 0)),
-                          _look("2026-11-10", "I am careful and warm.", "I am careful.", (2, 1))])
-    good = (len(MI.load(tmp_path)), MI.rest_pair(tmp_path), bool(MI.self_image_block(tmp_path)))
-    with p.open("ab") as f:
-        f.write(b'{"at": "x", "sentence": "caf\xe9 not utf-8", "date": "2026-11-08"\n')      # torn AND a bad byte
-        f.write(b"\xff\xfe\n")
-    os.utime(p, None)
-    assert good == (2, (pytest.approx(0.12), pytest.approx(0.06)), True)
-    assert (len(MI.load(tmp_path)), MI.rest_pair(tmp_path), bool(MI.self_image_block(tmp_path))) == good
-    assert MI.looked_today(tmp_path, dt.datetime(2026, 11, 10, 6))
-    with p.open("ab") as f:                       # a bad byte in a line that still parses: a row, but not a look
-        f.write(b'{"at": "x", "sentence": "caf\xe9"}\n')
-    os.utime(p, None)
-    assert len(MI.load(tmp_path)) == 3 and MI.rest_pair(tmp_path) == good[1]
-    assert "careful and warm" in MI.self_image_block(tmp_path)
-    assert MI.looked_today(tmp_path, dt.datetime(2026, 11, 10, 6))
-    assert "No sentence yet" not in MI.mirror_banner(tmp_path) and "careful and warm" in MI.mirror_banner(tmp_path)
+# (§4UH-loop: the Mirror's diary, whose one bad byte this section first fixed, is removed.)
 
 
 def test_one_bad_byte_in_any_selfhood_journal_costs_its_line(tmp_path):
@@ -1667,92 +1636,7 @@ def test_a_tone_share_that_has_worn_to_nothing_leaves_the_pair_too(tmp_path):
     assert pair[0] == pytest.approx(pair[1], abs=1e-9) and abs(pair[0][0] - (0.5 / 4096 + 0.01)) < 1e-9
 
 
-# ── R2-8. the Mirror's skip record ───────────────────────────────────────────
-
-def test_a_skipped_look_is_one_small_record_not_rows_in_the_diary(tmp_path):
-    """Before: 8 rows in one day (the reason's wording carried the reply count), in a diary with no compaction."""
-    p = _diary(tmp_path, [_look("2026-11-05", "I am brisk and dry.", MI.SEED_SENTENCE)])
-    before = p.read_bytes()
-    now = dt.datetime(2026, 11, 11, 9, 0)
-    for kind in ("strong_mood", "strong_mood", "no_replies", "strong_mood", "strong_mood"):
-        MI._note_skip(tmp_path, kind, now)
-    assert p.read_bytes() == before                                           # the diary is not touched
-    skip = tmp_path / MI.SKIP_REL
-    assert json.loads(skip.read_text()) == {"date": "2026-11-11", "kind": "strong_mood"}
-    stamp = skip.stat().st_mtime_ns
-    MI._note_skip(tmp_path, "strong_mood", now)                               # unchanged: not rewritten
-    MI._note_skip(tmp_path, "something else", now)                            # not a kind: not written
-    assert skip.stat().st_mtime_ns == stamp and len(list(skip.parent.iterdir())) == 2
-    assert MI.stale_note(tmp_path, now) == "6 days ago (skipped: replies written under a strong mood or a manner)"
-
-
-def test_a_stale_self_image_says_its_age_and_why_in_one_short_clause(tmp_path, monkeypatch):
-    """Before: the block still said "rewritten once a day" over a sentence nobody had rewritten for days. And
-    the first cut's clause ran on: "… last rewritten 6 days ago; not rewritten since: all 4 replies of yours
-    since the last look were written under a strong mood or a manner (the mood talking, not the character)"."""
-    today = MI._mood_date()
-    old = (today - dt.timedelta(days=6)).isoformat()
-    _diary(tmp_path, [_look(old, "I am careful.", MI.SEED_SENTENCE)])
-    assert MI.stale_note(tmp_path) == "6 days ago"                            # no record of why: the age alone
-    MI._note_skip(tmp_path, "no_replies")
-    stale = "6 days ago (skipped: no new replies)"
-    assert MI.stale_note(tmp_path) == stale
-    block = MI.self_image_block(tmp_path)
-    assert f"self-portrait, last rewritten in the Mirror {stale}, from the way you wrote to the owner." in block
-    assert "once a day" not in block and len(MI.self_image_rule(stale)) < len(MI.SELF_IMAGE_RULE) + 60
-    MI._note_skip(tmp_path, "strong_mood")                                    # the reason changed: the block follows
-    assert "(skipped: replies written under a strong mood or a manner)" in MI.self_image_block(tmp_path)
-    # §4UH: with the character on the diary is frozen history — its banner names no skip reason (it is not
-    # skipped, it is no longer written); the diary's own banner (character off) still says it
-    assert "skipped" not in MI.mirror_banner(tmp_path)
-    monkeypatch.setenv("GHOST_CHARACTER", "0")
-    assert f"My latest sentence was last rewritten 6 days ago (skipped: {MI.SKIP_REASONS['strong_mood']})." in MI.mirror_banner(tmp_path)
-    monkeypatch.delenv("GHOST_CHARACTER")
-    assert f"last on {old} — 6 days ago (skipped:" in MI.self_image_line(tmp_path)
-    # a skip from BEFORE the latest look says nothing about it
-    (tmp_path / MI.SKIP_REL).write_text(json.dumps({"date": (today - dt.timedelta(days=9)).isoformat(), "kind": "no_replies"}))
-    assert MI.stale_note(tmp_path) == "6 days ago"
-
-
-def test_a_fresh_self_image_keeps_its_wording(tmp_path):
-    two = (MI._mood_date() - dt.timedelta(days=MI.STALE_AFTER_DAYS)).isoformat()
-    _diary(tmp_path, [_look(two, "I am careful.", MI.SEED_SENTENCE)])
-    MI._note_skip(tmp_path, "no_replies")
-    assert MI.stale_note(tmp_path) == ""
-    block = MI.self_image_block(tmp_path)
-    assert MI.SELF_IMAGE_RULE in block and "rewritten once a day in the Mirror" in block
-    assert "last rewritten" not in MI.mirror_banner(tmp_path) and "days ago" not in MI.self_image_line(tmp_path)
-
-
-def test_skip_rows_an_earlier_cut_wrote_into_a_diary_are_ignored_by_every_reader(tmp_path):
-    today = MI._mood_date().isoformat()
-    looks = [_look("2026-11-05", "I am brisk.", MI.SEED_SENTENCE, (1, 0)), _look(today, "I am brisk and dry.", "I am brisk.", (2, 1))]
-    _diary(tmp_path, looks)
-    clean = (MI.load(tmp_path), MI.rest_pair(tmp_path), MI.self_image_block(tmp_path), MI.mirror_banner(tmp_path),
-             MI.self_image_line(tmp_path), MI.looked_today(tmp_path), MI.stale_note(tmp_path))
-    skip = {"at": f"{today}T09:00:00", "date": today, "skip": "all 4 replies of yours since the last look were written …"}
-    p = _diary(tmp_path, looks[:1] + [skip] + looks[1:] + [skip, dict(skip, date="2026-11-30")])
-    os.utime(p, None)
-    assert (MI.load(tmp_path), MI.rest_pair(tmp_path), MI.self_image_block(tmp_path), MI.mirror_banner(tmp_path),
-            MI.self_image_line(tmp_path), MI.looked_today(tmp_path), MI.stale_note(tmp_path)) == clean
-    assert clean[5] is True and len(clean[0]) == 2
-
-
-async def test_a_look_with_nothing_to_read_writes_down_why(tmp_path, monkeypatch):
-    import ghost_agent.core.failure_census as FC
-    now = dt.datetime.now()
-    strong = {"final_response": "x" * 200, "timestamp": (dt.datetime.now(UTC) - dt.timedelta(hours=1)).isoformat(),
-              "extra": {"mood_tone": {"mood": "irritable, 2 of 3", "manner": "", "label": "irritable",
-                                      "intensity": 2, "manner_name": "", "manner_intensity": 0}}}
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: ([strong], []))
-    out = await MI.look(tmp_path, llm_client=object(), now=now)
-    assert out.startswith("skipped — the 1 reply of yours since the last look")          # the log line keeps its count
-    assert json.loads((tmp_path / MI.SKIP_REL).read_text())["kind"] == "strong_mood"
-    assert not (tmp_path / MI.MIRROR_REL).exists()
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: ([], []))
-    await MI.look(tmp_path, llm_client=object(), now=now)
-    assert MI.last_skip(tmp_path) == MI.SKIP_REASONS["no_replies"]
-
+# ── R2-8. (§4UH-loop: the Mirror's skip record and stale note went with the Mirror) ──
 
 async def test_a_turn_record_from_before_the_values_is_not_read_as_a_strong_mood(tmp_path, monkeypatch):
     """After a deploy the last two days' records hold the sentences only. Counting any mood in them as strong
@@ -1763,36 +1647,17 @@ async def test_a_turn_record_from_before_the_values_is_not_read_as_a_strong_mood
            "timestamp": (dt.datetime.now(UTC) - dt.timedelta(hours=1)).isoformat(),
            "extra": {"mood_tone": {"mood": "irritable, 3 of 3", "manner": "evil, 3 of 3"}}}
     monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: ([old], []))
-    assert MI.written_under_strong_mood(old) is False and MI.strong_mood_replies_since(tmp_path, now) == 0
+    assert MI.written_under_strong_mood(old) is False
     assert [p["text"] for p in MI.pick_replies(tmp_path, now)] == [old["final_response"].strip()]
 
 
 # ── R2-10. one day, everywhere ───────────────────────────────────────────────
 
-def test_the_mirror_counts_mood_days(tmp_path):
-    """A look at 02:00 belongs to the evening before; a strong mood at 00:30 counts for that evening's day; a
-    sentence is stale by mood days."""
-    assert MI._today(dt.datetime(2026, 11, 10, 2, 0)) == "2026-11-09"
-    assert MI._today(dt.datetime(2026, 11, 10, 4, 0)) == "2026-11-10"
-    _diary(tmp_path, [_look("2026-11-09", "I am careful.", MI.SEED_SENTENCE)])
-    assert MI.looked_today(tmp_path, dt.datetime(2026, 11, 10, 2, 0)) and not MI.looked_today(tmp_path, dt.datetime(2026, 11, 10, 5, 0))
-    assert MI.stale_note(tmp_path, dt.datetime(2026, 11, 12, 3, 59)) == ""               # still the 11th: 2 days
-    assert MI.stale_note(tmp_path, dt.datetime(2026, 11, 12, 4, 0)) == "3 days ago"
-    # three nights in a row at 00:30 — three mood days (the 6th, 7th, 8th), and all inside the week of the 9th
-    journal = tmp_path / "system" / "selfhood" / ST.MOOD_HISTORY_FILENAME
-    journal.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{"label": "irritable", "intensity": 2, "p": -0.5, "e": 0.4, "kind": "turn", "cause": "x",
-             "at": _z(dt.datetime(2026, 11, d, 0, 30).astimezone(UTC))} for d in (7, 8, 9)]
-    journal.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    assert "irritable (2 or more of 3) on 3 of them" in MI.lasting_mood_note(tmp_path, dt.datetime(2026, 11, 9, 12, 0))
-    # the week ends with its mood day: at 03:00 on the 15th it is still the 14th's (the 8th is its first day),
-    # an hour later it is the 15th's and the row of the 7th/8th night has left the window
-    rows[0]["at"] = _z(dt.datetime(2026, 11, 9, 0, 30).astimezone(UTC))
-    rows[1]["at"] = _z(dt.datetime(2026, 11, 11, 0, 30).astimezone(UTC))
-    rows[2]["at"] = _z(dt.datetime(2026, 11, 13, 0, 30).astimezone(UTC))
-    journal.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    assert "on 3 of them" in MI.lasting_mood_note(tmp_path, dt.datetime(2026, 11, 15, 3, 0))
-    assert MI.lasting_mood_note(tmp_path, dt.datetime(2026, 11, 15, 4, 0)) == ""
+def test_the_look_counts_mood_days():
+    """A look at 02:00 belongs to the evening before (§4UH-loop: the Mirror's diary and lasting note, which
+    this test also dated, are removed)."""
+    assert MI._mood_date(dt.datetime(2026, 11, 10, 2, 0)) == dt.date(2026, 11, 9)
+    assert MI._mood_date(dt.datetime(2026, 11, 10, 4, 0)) == dt.date(2026, 11, 10)
 
 
 def test_a_stamp_prints_its_date_by_the_mood_day():
@@ -1808,7 +1673,7 @@ def test_a_stamp_prints_its_date_by_the_mood_day():
 def test_today_is_asked_of_mood_day_and_nowhere_else():
     """No calendar "today" in the mood's code: every `.date()` and `date.today()` in the selfhood modules and
     in `introspect` is listed here — `mood_day` itself, and the one place that names UTC day FOLDERS."""
-    allowed = {("mood.py", "mood_day"), ("mirror.py", "_replies_since")}
+    allowed = {("mood.py", "mood_day"), ("loop.py", "_replies_since")}
     found = set()
     for path in sorted((SRC / "selfhood").glob("*.py")) + [SRC / "tools" / "introspect.py"]:
         tree = ast.parse(path.read_text(encoding="utf-8"))

@@ -2079,12 +2079,12 @@ async def lifespan(app):
         # it reads while there is no stamp yet
         from .selfhood.model import owner_quiet_seconds as _owner_quiet_seconds
         context.self_model.attach_owner_clock(lambda: _owner_quiet_seconds(context))
-        # §4UA: the character sets where the mood rests — §4UH-e2e: from its dials (the Mirror's sentence
-        # only with GHOST_CHARACTER=0; `character.rest_pair` chooses on every read)
-        from .selfhood import mirror as _mirror
+        # §4UA: the character sets where the mood rests — §4UH-e2e: from its dials, read on every read
+        # ((0, 0) with GHOST_CHARACTER=0)
+        from .selfhood import loop as _loop
         from .selfhood import character as _character_rest
         context.self_model.attach_rest(
-            lambda: _character_rest.rest_pair(_mirror.home_from_memory_dir(getattr(context, "memory_dir", None))))
+            lambda: _character_rest.rest_pair(_loop.home_from_memory_dir(getattr(context, "memory_dir", None))))
         if self_enabled:
             # Emit the "Session resumed…" boot marker (symmetric to the
             # workspace_model.mark_session_boot() call below). Previously

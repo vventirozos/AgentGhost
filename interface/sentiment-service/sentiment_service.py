@@ -5,7 +5,12 @@ The model is cardiffnlp/twitter-roberta-base-sentiment-latest (negative / neutra
 ONNX and run on the CPU with onnxruntime, so it takes no GPU memory from llama-server on the same box. It reads
 English only, and a message is let through only when it is: its letters must be mostly Latin (Greek letters fail
 here), and fastText's language identifier (lid.176) must name English first, with enough confidence (Greek typed in
-Latin letters fails here). Everything else answers ``unknown`` without being classified. Message text reaches this process and goes no further: the model files are local and nothing here
+Latin letters fails here). Everything else answers ``unknown`` without being classified.
+
+§4UH-warmth (2026-11-12): a second, optional model reads the same English text for EMOTIONS —
+SamLowe/roberta-base-go_emotions, 28 labels (27 emotions + neutral), multi-label (one sigmoid each), exported to
+ONNX the same way (deploy/export_emotions.py). Its answer is the ``emotions`` field; the three-way sentiment above
+is unchanged. Without its model directory the service runs as before and answers no ``emotions``. Message text reaches this process and goes no further: the model files are local and nothing here
 opens a network connection. The log holds routes, labels and exception types, never the text.
 """
 from __future__ import annotations
@@ -95,13 +100,16 @@ class LanguageId:
 
 
 class Classifier:
-    """One ONNX session. onnxruntime's ``run`` is safe to call from several threads on one session."""
+    """One ONNX session. onnxruntime's ``run`` is safe to call from several threads on one session.
+    ``activation`` is "softmax" (one label of several: the sentiment) or "sigmoid" (each label on its own: the
+    emotions)."""
 
-    def __init__(self, model_dir: Path, threads: int) -> None:
+    def __init__(self, model_dir: Path, threads: int, activation: str = "softmax") -> None:
         import numpy as np            # here so the HTTP layer can be tested without the runtime
         import onnxruntime as ort
         from tokenizers import Tokenizer
         self._np = np
+        self.activation = activation
         self.labels = json.loads((model_dir / "labels.json").read_text())
         self._tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self._tok.enable_truncation(MAX_TOKENS)
@@ -120,6 +128,8 @@ class Classifier:
             "input_ids": np.array([enc.ids], dtype=np.int64),
             "attention_mask": np.array([enc.attention_mask], dtype=np.int64),
         })[0][0]
+        if self.activation == "sigmoid":
+            return [float(x) for x in 1.0 / (1.0 + np.exp(-logits))]
         e = np.exp(logits - logits.max())
         return [float(x) for x in e / e.sum()]
 
@@ -127,24 +137,42 @@ class Classifier:
         """The export's own reference answers, from the original model: a wrong file fails at start, and the
         first real message doesn't pay for the load."""
         ref = json.loads(path.read_text())
+        if ref.get("activation", "softmax") != self.activation:
+            raise SystemExit("the model's parity file was written for another activation")
         for text, want in zip(ref["samples"], ref["probs"]):
             got = self.probs(text)
+            if len(got) != len(self.labels) or len(got) != len(want):
+                raise SystemExit("the model's outputs do not match its labels or its reference answers")
             if max(abs(a - b) for a, b in zip(got, want)) > 0.01:
                 raise SystemExit("the model does not reproduce its export's reference answers")
 
 
-def classify(classifier, langid, text: str) -> dict:
-    """The answer for one text: label, its probability, all three probabilities, and why when unknown."""
+#: an emotion below this probability is left out of the answer (28 labels, most near 0 on any message)
+EMOTION_MIN = 0.05
+
+
+def classify(classifier, langid, text: str, emotions=None) -> dict:
+    """The answer for one text: label, its probability, all three probabilities, and why when unknown; with the
+    emotion model, ``emotions``: {label: probability} for each emotion at ``EMOTION_MIN`` or more."""
     reason = script_gate(text) or language_gate(*langid.top(text))
     if reason:
         return {"ok": True, "label": UNKNOWN, "score": 0.0, "probs": {}, "reason": reason}
     probs = classifier.probs(text)
     best = max(range(len(probs)), key=probs.__getitem__)
-    return {"ok": True, "label": classifier.labels[best], "score": round(probs[best], 4),
-            "probs": {lab: round(p, 4) for lab, p in zip(classifier.labels, probs)}, "reason": ""}
+    out = {"ok": True, "label": classifier.labels[best], "score": round(probs[best], 4),
+           "probs": {lab: round(p, 4) for lab, p in zip(classifier.labels, probs)}, "reason": ""}
+    if emotions is not None:
+        try:
+            got = emotions.probs(text)
+            if len(got) != len(emotions.labels):
+                raise ValueError("the emotion model's outputs do not match its labels")
+            out["emotions"] = {lab: round(p, 4) for lab, p in zip(emotions.labels, got) if p >= EMOTION_MIN}
+        except Exception as exc:  # noqa: BLE001 - review: the emotions are extra; the sentiment answer stands
+            log.error("emotions failed: %s", type(exc).__name__)
+    return out
 
 
-def make_handler(classifier, langid, key: str):
+def make_handler(classifier, langid, key: str, emotions=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "sentiment-service"
         timeout = SOCKET_TIMEOUT_S
@@ -187,7 +215,7 @@ def make_handler(classifier, langid, key: str):
             if len(text) > MAX_TEXT_CHARS:
                 return self._fail(413, "text too long")
             try:
-                answer = classify(classifier, langid, text)
+                answer = classify(classifier, langid, text, emotions)
             except Exception as exc:  # noqa: BLE001 - the type only: a message could quote the text
                 log.error("classification failed: %s", type(exc).__name__)
                 return self._fail(500, "classification failed")
@@ -214,6 +242,8 @@ def main() -> None:
     parser.add_argument("--key-file", default="~/Data/AI/.sentiment_service_key")
     parser.add_argument("--model-dir", default="~/Data/AI/sentiment-service/model")
     parser.add_argument("--langid", default="~/Data/AI/sentiment-service/langid/lid.176.ftz")
+    parser.add_argument("--emotions-dir", default="~/Data/AI/sentiment-service/emotions",
+                        help="the emotion model; absent = no 'emotions' in the answers")
     parser.add_argument("--threads", type=int, default=2)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -222,7 +252,17 @@ def main() -> None:
         raise SystemExit("the service key file is empty")
     classifier = Classifier(Path(args.model_dir).expanduser(), args.threads)
     langid = LanguageId(Path(args.langid).expanduser())
-    server = Server((args.host, args.port), make_handler(classifier, langid, key))
+    emo_dir = Path(args.emotions_dir).expanduser()
+    emotions = None
+    if (emo_dir / "model.onnx").is_file():
+        try:
+            emotions = Classifier(emo_dir, args.threads, activation="sigmoid")
+            log.info("emotion model: loaded")
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - review: a broken extra model never stops the sentiment
+            log.error("emotion model not loaded (%s): answering without emotions", type(exc).__name__)
+    else:
+        log.info("emotion model: absent")
+    server = Server((args.host, args.port), make_handler(classifier, langid, key, emotions))
     log.info("listening on %s:%d", args.host, args.port)
     server.serve_forever()
 

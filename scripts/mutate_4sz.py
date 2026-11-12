@@ -39,7 +39,7 @@ _TRY = '    try:\n        return _dispatch(str(text or "").strip(), home)\n    e
 _GATE = '            if _rk() != "owner" or reply_is_public():\n                return ""\n            msgs = body.get("messages")'
 _HOME = "            home = Path(md).parent if isinstance(md, (str, Path)) and str(md) else None"
 _LAST = ('            text = _message_lines(last.get("content")) if last else ""\n'
-         "            from ..selfhood.mirror import is_mirror_command")
+         "            from ..selfhood.loop import is_mirror_command")
 _NEXT = ('            last = next((m for m in reversed(msgs or []) if isinstance(m, dict) and m.get("role") == "user"), None)\n'
          + _LAST)
 _PARTS = ('content = "\\n".join(str(i.get("text") or "") for i in content\n'

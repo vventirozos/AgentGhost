@@ -281,7 +281,7 @@ class SelfState:
 
 
 def read_jsonl_rows(path, *, what: str = "") -> List[Dict[str, Any]]:
-    """§4UD (F5): THE reader of the selfhood jsonl files (the Mirror's diary,
+    """§4UD (F5): THE reader of the selfhood jsonl files (the character's log,
     the sentiment journal, the mood journals): every line that is a JSON
     object, oldest first. A byte that is not UTF-8 costs its own line, never
     the file (it is replaced, and the line then parses or is skipped); a

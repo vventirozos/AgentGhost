@@ -285,7 +285,7 @@ class SelfStateThread:
         #: journal has a row for) — what `_note_bored` last worked out
         self._bored_seen: Optional[Tuple[float, int]] = None
         #: §4UA: where the pair rests — attached by the process that owns the
-        #: Mirror (``main.py``); None = rest at (0, 0), as before
+        #: character (``main.py``); None = rest at (0, 0), as before
         self._rest_fn: Optional[Callable[[], Tuple[float, float]]] = None
 
     # -----------------------------------------------------------------

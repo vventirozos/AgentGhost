@@ -1,11 +1,11 @@
-"""§4UA: character (the Mirror's sentence), state (the mood pair) and
-expression (the tone lines) as one — four designed couplings, each bounded.
+"""§4UA: character, state (the mood pair) and expression (the tone lines) as one — four designed
+couplings, each bounded.
 
-(1) one ranking in the character section; (2) a reply written under a mood at
-2+ or a manner never feeds the Mirror, a mood that LASTS reaches it as one
-note; (3) the character sets the mood's resting point, |rest| ≤ 0.12, a look
-moves it ≤ 1 unit per axis, ``GHOST_MIRROR_REST=0`` switches it off; (4) the
-face shows the rest faintly while the mood is neutral."""
+(1) one ranking in the character section; (2) a reply written under a mood at 2+ or a manner never
+feeds the daily look; (3) the character sets the mood's resting point, |rest| ≤ 0.12,
+``GHOST_MIRROR_REST=0`` switches it off; (4) the face shows the rest faintly while the mood is neutral.
+(§4UH-loop: written for the Mirror's sentence, whose look also asked for the rest and got a "lasting mood"
+note; the Mirror is removed — the character's dials set the rest, ``character.rest_pair``.)"""
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 from ghost_agent.selfhood import SelfModel
-from ghost_agent.selfhood import mirror as MI
+from ghost_agent.selfhood import character as C
+from ghost_agent.selfhood import loop as MI
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood.state import MOOD_HISTORY_FILENAME
 
@@ -239,7 +240,7 @@ def test_a_rest_that_cannot_be_read_is_no_rest(tmp_path):
     assert st.rest() == (M.REST_MAX, -M.REST_MAX)
 
 
-# ── (2) the Mirror: what it is shown ─────────────────────────────────────────
+# ── (2) the daily look: what it is shown ─────────────────────────────────────
 
 NOW = datetime.datetime(2026, 11, 10, 3, 0, 0)
 
@@ -296,59 +297,6 @@ def test_a_turn_record_with_a_non_dict_extra_is_no_mood():
     assert MI.written_under_strong_mood({}) is False
 
 
-def _journal(home, rows):
-    p = home / "system" / "selfhood" / MOOD_HISTORY_FILENAME
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows) + "{torn", encoding="utf-8")
-
-
-#: §4UD review r2: the lasting note counts MOOD days (they end at 04:00) — NOW is 03:00 on the 10th, which is
-#: still the 9th's (these fixtures counted calendar days from NOW.date())
-MOOD_TODAY = datetime.date(2026, 11, 9)
-
-
-def _jrow(days_ago, label="irritable", n=2, kind="turn", hour=14):
-    local = datetime.datetime.combine(MOOD_TODAY - datetime.timedelta(days=days_ago), datetime.time(hour))
-    at = local.astimezone(UTC).replace(tzinfo=None).isoformat() + "Z"
-    return {"label": label, "intensity": n, "at": at, "cause": "x", "kind": kind}
-
-
-def test_a_mood_that_lasted_reaches_the_look_as_one_note(tmp_path):
-    _journal(tmp_path, [_jrow(0), _jrow(2), _jrow(2, hour=9), _jrow(5),
-                        _jrow(1, "content", 2), _jrow(3, "content", 3), _jrow(6, "content", 2)])
-    note = MI.lasting_mood_note(tmp_path, now=NOW)
-    assert note == MI.LASTING_NOTE.format(days=7, moods="content (2 or more of 3) on 3 of them and "
-                                                     "irritable (2 or more of 3) on 3 of them")
-
-
-@pytest.mark.parametrize("rows", [
-    [_jrow(0), _jrow(2)],                                                # two days: did not last
-    [_jrow(0), _jrow(2), _jrow(7)],                                      # the third is 8 days back
-    [_jrow(0, n=1), _jrow(2, n=1), _jrow(4, n=1)],                       # a tint is not a mood that lasted
-    [_jrow(0, kind="owner"), _jrow(2, kind="owner"), _jrow(4, kind="owner")],     # the owner's word
-    [_jrow(0, kind="decay"), _jrow(2, kind="decay"), _jrow(4, kind="decay")],
-    [_jrow(0, kind="manner"), _jrow(2, kind="manner"), _jrow(4, kind="manner")],
-    [_jrow(0, "bored"), _jrow(2, "bored"), _jrow(4, "bored")],           # a quiet is not a character
-    [_jrow(0, "nonsense"), _jrow(2, "nonsense"), _jrow(4, "nonsense")],
-])
-def test_what_does_not_count_as_a_mood_that_lasted(tmp_path, rows):
-    _journal(tmp_path, rows)
-    assert MI.lasting_mood_note(tmp_path, now=NOW) == ""
-
-
-def test_days_are_local_days_not_utc_days(tmp_path):
-    """Review r1 n5: the day is read in LOCAL time. §4UD review r2: and it is the mood day — a row 30 min
-    after it begins (04:30 local) belongs to it. Read as a UTC date the oldest of these can fall out of the
-    window and nothing lasted."""
-    rows = [_jrow(0, hour=4), _jrow(3, hour=4), _jrow(6, hour=4)]
-    for r in rows:
-        r["at"] = (datetime.datetime.fromisoformat(r["at"][:-1]) + datetime.timedelta(minutes=30)).isoformat() + "Z"
-    _journal(tmp_path, rows)
-    off = datetime.datetime.now().astimezone().utcoffset()
-    note = MI.lasting_mood_note(tmp_path, now=NOW)
-    assert "irritable (2 or more of 3) on 3 of them" in note, off
-
-
 def test_the_real_tone_record_is_what_the_filter_reads(tmp_path):
     """Review r1 n5: the record built by core/agent.py's own tone block, not a hand-written dict."""
     from ghost_agent.core import agent as A
@@ -370,166 +318,48 @@ def test_the_real_tone_record_is_what_the_filter_reads(tmp_path):
         assert MI.written_under_strong_mood({"extra": {"mood_tone": rec}}) is strong, rec
 
 
-def test_no_journal_no_note(tmp_path):
-    assert MI.lasting_mood_note(tmp_path, now=NOW) == ""
-    assert MI.lasting_mood_note(None, now=NOW) == ""
-
-
-def test_the_note_sits_before_the_rewrite_and_its_absence_is_the_old_prompt():
-    plain = MI.build_prompt([], ["first reply", "second reply"])
-    assert MI.build_prompt([], ["first reply", "second reply"], "") == plain
-    assert "{" not in plain and "Your own mood" not in plain
-    note = MI.LASTING_NOTE.format(days=7, moods="irritable (2 or more of 3) on 4 of them")
-    p = MI.build_prompt([], ["first reply", "second reply"], note)
-    assert p.index("2. «second reply»") < p.index("Your own mood over the last 7 days") < p.index("Rewrite")
-    assert p.replace(note, "") == plain
-
-
-# ── (3) the resting point the look sets ─────────────────────────────────────
-
-@pytest.mark.parametrize("raw,want", [
-    ("1 0", (1, 0)), ("-2 2", (-2, 2)), ("+1, -1", (1, -1)), ("2/1", (2, 1)), ("1\n0", (1, 0)),
-    ("<think>hmm</think>\n0 1", (0, 1)), ("`1 1`", (1, 1)), ('"-1 0"', (-1, 0)), ("**1 0**", (1, 0)),
-    ("0 -1.", (0, -1)),
-    # review r1 m3: off the scale, a fraction, more than two, words — not an answer
-    ("5 -9", None), ("3 9", None), ("1 0.5", None), ("1 0 2", None), ("12", None),
-    ("one zero", None), ("1", None), ("", None), (None, None), ("pleasantness 1 energy 0", None),
-])
-def test_parse_rest(raw, want):
-    assert MI.parse_rest(raw) == want
-
-
-def test_one_look_moves_the_rest_one_unit_per_axis_at_most():
-    assert MI.step_rest((0, 0), (2, -2)) == (1, -1)
-    assert MI.step_rest((1, -1), (2, -2)) == (2, -2)
-    assert MI.step_rest((2, 2), (-2, 2)) == (1, 2)
-    assert MI.step_rest((0, 1), (0, 1)) == (0, 1)
-
-
-class _LLM:
-    def __init__(self, sentences, rests):
-        self.sentences, self.rests, self.calls = list(sentences), list(rests), []
-
-    async def chat_completion(self, payload, **kw):
-        self.calls.append(payload)
-        text = payload["messages"][-1]["content"]
-        src = self.rests if "temperament rest" in text else self.sentences
-        return {"choices": [{"message": {"content": src.pop(0)}}]}
-
+# ── (3) the resting point the character sets (§4UH-e2e; the Mirror's look no longer asks) ─────────
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    monkeypatch.setattr(MI, "pick_replies", lambda h, now=None, rng=None, after="": [
-        {"text": "Here is the answer, plainly put, with the one caveat that matters.", "at": "2026-11-09T09:00:00Z"}])
     monkeypatch.delenv(MI.REST_ENV, raising=False)
-    MI._BLOCK_MEMO.clear()
+    monkeypatch.delenv(C.ENV, raising=False)
+    C._MEMO.clear()
     (tmp_path / "system" / "memory").mkdir(parents=True)
     return tmp_path
 
 
-def _look(home, llm, day):
-    return asyncio.run(MI.look(home, llm, now=datetime.datetime(2026, 11, day, 1, 0, 0)))
-
-
-def test_the_rest_walks_one_unit_a_day_toward_what_the_sentence_says(home):
-    llm = _LLM(["I am the bright, quick one.", "I am the bright, quick one.", "I am the bright, quick one."],
-               ["2 2", "2 2", "2 2"])
-    _look(home, llm, 10)
-    assert MI.load(home)[-1]["rest"] == [1, 1] and MI.rest_pair(home) == pytest.approx((0.06, 0.06))
-    _look(home, llm, 11)                                    # unchanged sentence: asked again, one more step
-    assert MI.load(home)[-1]["rest"] == [2, 2] and MI.rest_pair(home) == pytest.approx((0.12, 0.12))
-    _look(home, llm, 12)
-    assert MI.load(home)[-1]["rest"] == [2, 2]                # at the bound
-    assert all(abs(v) <= M.REST_MAX for v in MI.rest_pair(home))
-    asks = [c for c in llm.calls if "temperament rest" in c["messages"][-1]["content"]]
-    assert len(asks) == 3 and all(c["temperature"] == 0.0 and c["max_tokens"] <= 16 for c in asks)
-    assert "«I am the bright, quick one.»" in asks[0]["messages"][-1]["content"]
-
-
-def test_an_answer_that_is_not_two_numbers_keeps_the_old_rest(home):
-    llm = _LLM(["I am even.", "I am even, still."], ["-1 1", "I would say slightly low"])
-    _look(home, llm, 10)
-    _look(home, llm, 11)
-    assert [r["rest"] for r in MI.load(home)] == [[-1, 1], [-1, 1]]
-
-
-@pytest.mark.parametrize("exc,said", [
-    ("deferral", "resting point unchanged: the question deferred (a request started)"),
-    (RuntimeError("boom"), "resting point unchanged: the question failed: RuntimeError"),
-])
-def test_a_rest_question_that_got_no_answer_keeps_the_rest_and_says_so(home, exc, said):
-    """Review r1 m1: a deferral was swallowed at debug level — now the Idle Cycle note says it."""
-    from ghost_agent.core.llm import BackgroundDeferred
-    err = BackgroundDeferred("a request started") if exc == "deferral" else exc
-
-    class _Half(_LLM):
-        async def chat_completion(self, payload, **kw):
-            if "temperament rest" in payload["messages"][-1]["content"]:
-                raise err
-            return await super().chat_completion(payload, **kw)
-    note = _look(home, _Half(["I am even."], []), 10)
-    row = MI.load(home)[-1]
-    assert row["sentence"] == "I am even." and row["rest"] == [0, 0]
-    assert note == "new I-sentence: I am even. (" + said + ")"
-
-
-def test_an_answer_off_the_scale_is_said_too(home):
-    note = _look(home, _LLM(["I am even."], ["3 9"]), 10)
-    assert note.endswith("(resting point unchanged: the answer was not two numbers from -2 to 2)")
-
-
 def test_the_switch_turns_the_rest_off_everywhere(home, monkeypatch):
-    llm = _LLM(["I am bright.", "I am bright."], ["2 2"])
-    _look(home, llm, 10)
-    assert MI.rest_pair(home) == pytest.approx((0.06, 0.06))
+    C.set_dial(home, "humour", 2)                                   # warmth -1, humour +2: a little sunny, brisk
+    assert C.rest_pair(home) == pytest.approx((0.06, 0.06))
+    assert "my mood rests at pleasantness a little sunny" in MI.banner(home)
     monkeypatch.setenv(MI.REST_ENV, "0")
-    assert MI.rest_pair(home) == (0.0, 0.0)
-    assert "Where my mood settles" not in MI.mirror_banner(home)
-    _look(home, llm, 11)                                    # no question asked with it off
-    assert sum("temperament rest" in c["messages"][-1]["content"] for c in llm.calls) == 1
-    assert MI.load(home)[-1]["rest"] == [1, 1]               # carried, not moved
+    assert C.rest_pair(home) == (0.0, 0.0)
+    assert "my mood rests" not in MI.banner(home)
+    monkeypatch.setenv(MI.REST_ENV, "1")
+    monkeypatch.setenv(C.ENV, "0")                                  # §4UH-loop: the character off is no rest
+    assert C.rest_pair(home) == (0.0, 0.0)
 
 
-def test_a_hand_edited_rest_is_brought_into_range(home):
-    p = home / MI.MIRROR_REL
-    p.parent.mkdir(parents=True, exist_ok=True)
-    for i, bad in enumerate(([9, -9], ["x", 1], [1], None, "2 2")):
-        p.write_text(json.dumps({"at": f"2026-11-0{i + 1}T01:00:00", "date": f"2026-11-0{i + 1}",
-                                 "sentence": "I am.", "prev": MI.SEED_SENTENCE, "replies": [], "rest": bad}) + "\n")
-        got = MI.rest_pair(home)
-        assert all(abs(v) <= M.REST_MAX + 1e-9 for v in got)
-    assert MI._row_rest({"rest": [9, -9]}) == (2, -2) and MI._row_rest({"rest": "2 2"}) == (0, 0)
-    assert MI._row_rest({"rest": "12"}) == (0, 0) and MI._row_rest({"rest": [True, 1]}) == (0, 0)
+def test_the_rest_stays_in_range_at_every_dial(home):
+    for w in range(-2, 3):
+        for h in range(-2, 3):
+            a, b = C.rest_units({"warmth": w, "humour": h, "directness": 0})
+            assert all(abs(v) * MI.REST_UNIT <= M.REST_MAX + 1e-9 for v in (a, b))
 
 
-def test_the_lasting_note_reaches_the_look_and_the_row(home):
-    _journal(home, [_jrow(0), _jrow(2), _jrow(4)])
-    llm = _LLM(["I am short with people lately."], ["-1 1"])
-    asyncio.run(MI.look(home, llm, now=NOW))
-    prompt = llm.calls[0]["messages"][-1]["content"]
-    assert "Your own mood over the last 7 days: irritable (2 or more of 3) on 3 of them." in prompt
-    assert MI.load(home)[-1]["lasting"].startswith("Your own mood over the last 7 days")
-
-
-def test_the_banner_says_where_the_mood_settles(home, monkeypatch):
-    monkeypatch.setenv("GHOST_CHARACTER", "0")       # §4UH-e2e: the diary's rest is the character-off path
-    _look(home, _LLM(["I am bright."], ["1 -1"]), 10)
-    b = MI.mirror_banner(home)
-    assert "Where my mood settles when nothing happens (set by the latest sentence): pleasantness a little " \
-           "sunny, energy unhurried." in b
-
-
-def test_the_live_wiring_the_mood_reads_the_diarys_rest(home):
+def test_the_live_wiring_the_mood_reads_the_characters_rest(home):
     """main.py's lambda, through the real layout: memory_dir = $HOME/system/memory."""
-    _look(home, _LLM(["I am bright."], ["1 0"]), 10)
+    C.set_dial(home, "humour", 2)
+    C.set_dial(home, "warmth", 0)                                   # s = 2 → p 1, e 1
     sm = SelfModel(root=home / "system" / "selfhood")
     ctx = SimpleNamespace(memory_dir=str(home / "system" / "memory"))
-    sm.attach_rest(lambda: MI.rest_pair(MI.home_from_memory_dir(getattr(ctx, "memory_dir", None))))
+    sm.attach_rest(lambda: C.rest_pair(MI.home_from_memory_dir(getattr(ctx, "memory_dir", None))))
     v = sm.state.mood(now=T0)
-    assert v.neutral and (v.p, v.e) == pytest.approx((0.06, 0.0))
+    assert v.neutral and (v.p, v.e) == pytest.approx((0.06, 0.06))
 
 
-def test_main_attaches_the_rest_from_the_mirror():
+def test_main_attaches_the_rest_from_the_character():
     """The one production call site, read off the syntax tree (a call in a comment is not a call)."""
     import ast
     src = Path(__file__).resolve().parents[1] / "src" / "ghost_agent" / "main.py"
@@ -543,7 +373,7 @@ def test_main_attaches_the_rest_from_the_mirror():
 # ── (1) one ranking ──────────────────────────────────────────────────────────
 
 def test_the_character_section_states_the_ranking_and_yields_to_mood_and_manner(tmp_path):
-    rule = MI.SELF_IMAGE_RULE
+    rule = C.RULE
     assert ("Precedence: the owner's rules, then correctness, then the manner, then the mood, then your "
             "character.") in rule
     assert "when a MOOD or MANNER line is present, that line comes first for this reply" in rule
