@@ -164,6 +164,30 @@ class TestRecurrenceWatch:
         assert len(line) == 1 and line[0].startswith("⚠")
         assert "1/10" in line[0] and "file_system" in line[0]
 
+    def test_undated_leak_is_not_called_pre_fix(self):
+        fl = {"available": True, "corrupt_calls": 2, "calls": 10, "scanned": 5,
+              "by_tool": {"x": 2}, "last_seen": "", "post_fix": False, "regression": False}
+        text = _render_framing(fl)
+        assert "pre-fix" not in text and "none dated" in text
+
+    def test_report_regression_reaches_the_overview_with_its_detail(self, tmp_path, monkeypatch):
+        """Wiring: render_learning_health → _overview_learning, not a made-up report."""
+        import asyncio
+        from types import SimpleNamespace
+        from ghost_agent.core import learning_health as LH
+        from ghost_agent.tools import introspect as I
+        fl = {"available": True, "corrupt_calls": 1, "calls": 10, "scanned": 5,
+              "by_tool": {"file_system": 1}, "last_seen": "2026-11-11T10:00:00Z",
+              "post_fix": True, "regression": True, "recent_days": 7}
+        monkeypatch.setattr(LH, "_framing_leak_health", lambda *a, **k: fl)
+        report = LH.render_learning_health(tmp_path)
+        monkeypatch.setattr(I, "_learning_warnings", I._learning_warnings)
+        monkeypatch.setattr(I, "_learning_report_cached", lambda md, args, allow_stale=True: (report, 0))
+        monkeypatch.setattr(I, "_OVERVIEW_LEARNING_MAX_LINES", 99)
+        out = asyncio.run(I._overview_learning(SimpleNamespace(memory_dir=tmp_path, args=None)))
+        line = [l for l in out.split("\n") if "FRAMING LEAK" in l]
+        assert len(line) == 1 and "1/10 calls" in line[0] and "2026-11-11T10:00" in line[0]
+
     def test_rendered_old_post_fix_is_not_a_warning(self):
         fl = {"available": True, "corrupt_calls": 1, "calls": 10, "scanned": 5,
               "by_tool": {"file_system": 1}, "last_seen": "2026-10-12T23:05:49Z",

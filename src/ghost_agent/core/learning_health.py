@@ -557,6 +557,12 @@ def render_framing_leak(fl: Dict[str, Any]) -> List[str]:
                 f"{fl['last_seen'][:16]} is after the 2026-07-31 fix but "
                 f"older than {fl.get('recent_days', _FRAMING_RECENT_DAYS)} d "
                 f"{fl.get('by_tool')} — historical, no action unless it recurs")
+        elif n and not fl.get("last_seen"):
+            # Undated leaks cannot be placed against the fix — say so
+            # instead of the "pre-fix" all-clear (§4UI review MINOR-4).
+            lines.append(
+                f"\nTOOL-CALL FRAMING LEAK: {n}/{tot} calls, none dated — "
+                f"cannot tell pre- from post-fix {fl.get('by_tool')}")
         elif n:
             lines.append(
                 f"\nTOOL-CALL FRAMING LEAK: {n}/{tot} calls, all historical "
