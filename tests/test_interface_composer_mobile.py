@@ -64,9 +64,11 @@ def test_on_a_phone_the_text_field_has_the_row_and_the_controls_share_one_below(
         assert field["w"] >= pill["w"] - 40, (field, pill)
         # … and every control sits under it, on ONE row, at the same size
         assert all(b["top"] >= field["bottom"] - 1 for b in boxes), (field, boxes)
-        tops = [b["top"] for b in boxes]
-        assert max(tops) - min(tops) < 1, boxes
-        assert all(abs(b["w"] - 40) < 1 and abs(b["h"] - 40) < 1 for b in boxes), boxes
+        mids = [(b["top"] + b["bottom"]) / 2 for b in boxes]
+        assert max(mids) - min(mids) < 1, boxes
+        # §4UJ toolbar (2026-11-12): 36px icons, 44px Send
+        mic_, eff_, send_ = boxes
+        assert abs(mic_["w"] - 36) < 1 and abs(eff_["w"] - 36) < 1 and abs(send_["w"] - 44) < 1, boxes
         # mic left, effort next to it, send at the right edge of the pill
         mic, eff, send = boxes
         assert mic["left"] < eff["left"] < send["left"]
@@ -84,22 +86,82 @@ def test_without_the_effort_switch_the_row_keeps_its_shape(browser):
         page.evaluate("document.getElementById('effort-select').classList.add('hidden')")
         assert page.evaluate("getComputedStyle(document.getElementById('effort-wrap')).display") == "none"
         pill, mic, send = _box(page, "input-area"), _box(page, "mic-btn"), _box(page, "send-btn")
-        assert abs(mic["top"] - send["top"]) < 1
+        assert abs((mic["top"] + mic["bottom"]) - (send["top"] + send["bottom"])) < 2
         assert mic["left"] <= pill["left"] + 12 and send["right"] >= pill["right"] - 12, (pill, mic, send)
     finally:
         ctx.close()
 
 
-def test_the_desktop_composer_is_still_one_row_at_its_designed_width(browser):
-    """box-sizing: border-box must not change the desktop layout except for the
-    pill now being its designed 750px (it rendered 786px)."""
-    ctx, page = _open(browser, 1280, 800)
+@pytest.mark.parametrize("width,height", [(1280, 800), (1280, 720), (820, 1180)])
+def test_the_desktop_composer_is_the_toolbar_at_its_designed_width(browser, width, height):
+    """§4UJ (2026-11-12, operator: the mic, speaker and effort buttons "take too
+    much estate … smaller and nicely aligned with send … use 2 rows"). Before:
+    52px mic and speaker circles beside the text, ~200px of the row. Now the
+    text field has the first row and the controls are a toolbar under it:
+    32px borderless icons, a 40px Send at the right edge. 1280x720 is the
+    uConsole, whose old 36px shrink must not win over the toolbar."""
+    ctx, page = _open(browser, width, height)
     try:
         pill, field = _box(page, "input-area"), _box(page, "chat-input")
-        boxes = [_box(page, i) for i in CONTROLS]
+        mic, tts, eff, send = (_box(page, i) for i in ("mic-btn", "tts-toggle-btn", "effort-wrap", "send-btn"))
         assert abs(pill["w"] - 750) < 1, pill
-        assert all(b["left"] > field["right"] for b in boxes), (field, boxes)   # beside, not below
-        assert all(b["bottom"] <= pill["bottom"] and b["top"] >= pill["top"] for b in boxes)
+        assert field["w"] >= pill["w"] - 40, (field, pill)                      # the whole first row
+        assert all(b["top"] >= field["bottom"] - 1 for b in (mic, tts, eff, send))   # below, not beside
+        assert all(abs(b["w"] - 32) < 1 and abs(b["h"] - 32) < 1 for b in (mic, tts, eff)), (mic, tts, eff)
+        assert abs(send["w"] - 40) < 1 and send["right"] >= pill["right"] - 12, (send, pill)
+        assert mic["left"] < tts["left"] < eff["left"] < send["left"]
+        assert abs((mic["left"] + 7.5) - field["left"]) < 3, (mic, field)       # the mic glyph under the text
+        assert all(b["bottom"] <= pill["bottom"] and b["top"] >= pill["top"] for b in (mic, send))
+        st = page.evaluate("""(() => { const s = getComputedStyle(document.getElementById('mic-btn'));
+            return {bg: s.backgroundColor, bw: s.borderTopWidth}; })()""")
+        assert st["bw"] == "0px" and st["bg"] in ("rgba(0, 0, 0, 0)", "transparent"), st   # borderless
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("width,height", [(1280, 800), (390, 844)])
+def test_the_borderless_icons_still_show_recording_and_spoken_replies(browser, width, height):
+    """The toolbar rules carry #input-area and beat the single-id state rules;
+    the states are restated so a recording mic is still a red circle and an
+    active speaker still green."""
+    ctx, page = _open(browser, width, height)
+    try:
+        page.evaluate("""document.getElementById('mic-btn').classList.add('recording');
+            document.getElementById('tts-toggle-btn').classList.add('active')""")
+        page.wait_for_timeout(400)      # the icons' 0.15s colour transition
+        st = page.evaluate("""(() => ({mic: getComputedStyle(document.getElementById('mic-btn')).backgroundColor,
+            tts: getComputedStyle(document.getElementById('tts-toggle-btn')).color}))()""")
+        assert st["mic"] == "rgb(194, 39, 69)", st
+        assert st["tts"] == "rgb(73, 176, 124)", st
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("width,height", [(320, 568), (390, 844)])
+def test_on_a_phone_the_icons_have_a_44px_finger_target(browser, width, height):
+    ctx, page = _open(browser, width, height)
+    try:
+        for i in ("mic-btn", "tts-toggle-btn"):
+            r = _box(page, i)
+            # a point 3px outside the drawn 36px circle still lands on the button
+            hit = page.evaluate("""([id, x, y]) => { const e = document.elementFromPoint(x, y);
+                return !!(e && e.closest('#' + id)); }""", [i, r["left"] + r["w"] / 2, r["top"] - 3])
+            assert hit, (i, r)
+    finally:
+        ctx.close()
+
+
+def test_on_the_narrowest_phone_a_running_turn_keeps_send_on_the_toolbar(browser):
+    """320px with the tool-stop button and the widest count: the counter is cut
+    ("…"), Send does not wrap to a third row."""
+    ctx, page = _open(browser, 320, 568)
+    try:
+        page.evaluate("document.getElementById('interrupt-btn').classList.remove('hidden')")
+        _show_counter(page)
+        mic, stop, send = (_box(page, i) for i in ("mic-btn", "interrupt-btn", "send-btn"))
+        assert abs((mic["top"] + mic["bottom"]) - (send["top"] + send["bottom"])) < 2, (mic, send)
+        assert stop["right"] <= send["left"] and send["right"] <= 320
+        assert page.evaluate("document.documentElement.scrollWidth") <= 320
     finally:
         ctx.close()
 
@@ -193,8 +255,9 @@ def _show_counter(page, text=_WIDEST):
 
 
 @pytest.mark.parametrize("width,height", [(320, 568), (360, 740), (375, 667), (390, 844), (430, 932)])
-def test_on_a_phone_the_counter_is_a_small_line_under_the_buttons_on_the_right(browser, width, height):
-    """Operator 10-27: "on the right side, under the buttons … similar in mobile"."""
+def test_on_a_phone_the_counter_sits_in_the_toolbar_before_send(browser, width, height):
+    """Operator 10-27 put it under the buttons on the right; §4UJ (2026-11-12) moved
+    it into the toolbar row, its text ending just before Send."""
     ctx, page = _open(browser, width, height)
     try:
         before = _box(page, "input-area")
@@ -203,8 +266,8 @@ def test_on_a_phone_the_counter_is_a_small_line_under_the_buttons_on_the_right(b
         pill, field, cnt = _box(page, "input-area"), _box(page, "chat-input"), _text_box(page, "token-count")
         b1 = [_box(page, i) for i in CONTROLS]
         mic, eff, send = b1
-        _assert_under_the_buttons_on_the_right(before, pill, b0, b1, cnt, send)
-        assert all(abs(b["w"] - 40) < 1 for b in b1)                    # controls keep their size
+        _assert_in_the_toolbar_before_send(before, pill, b0, b1, cnt, send)
+        assert abs(mic["w"] - 36) < 1 and abs(send["w"] - 44) < 1      # controls keep their size
         assert all(b["top"] >= field["bottom"] - 1 for b in b1)         # the phone layout is intact
     finally:
         ctx.close()
@@ -217,14 +280,15 @@ def _text_box(page, el_id):
         return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, w: r.width, h: r.height}; }""", el_id)
 
 
-def _assert_under_the_buttons_on_the_right(before, pill, b0, b1, cnt, send):
+def _assert_in_the_toolbar_before_send(before, pill, b0, b1, cnt, send):
     # nothing moves when a count appears (operator 10-27: the resize "looks
-    # weird") — the pill always holds the line
+    # weird") — the pill always holds the counter's place
     assert abs(pill["h"] - before["h"]) < 0.5 and abs(pill["top"] - before["top"]) < 0.5, (before, pill)
     assert all(abs(a["left"] - b["left"]) < 0.5 and abs(a["top"] - b["top"]) < 0.5
                for a, b in zip(b0, b1)), (b0, b1)
-    assert cnt["top"] >= max(b["bottom"] for b in b1) - 0.5, (b1, cnt)   # under, never over Send
-    assert send["right"] - 12 <= cnt["right"] <= send["right"] + 0.5, (send, cnt)   # ends under Send
+    # §4UJ: on the toolbar's centre line, its text ending just before Send
+    assert abs((cnt["top"] + cnt["bottom"]) / 2 - (send["top"] + send["bottom"]) / 2) < 2, (send, cnt)
+    assert send["left"] - 16 <= cnt["right"] <= send["left"], (send, cnt)
     assert cnt["h"] < 16, cnt                                             # one small line
     assert cnt["bottom"] <= pill["bottom"] and cnt["left"] >= pill["left"]
 
@@ -245,9 +309,10 @@ def test_the_counter_is_quiet_and_not_a_control(browser):
 
 
 @pytest.mark.parametrize("width,height", [(1280, 800), (820, 1180)])
-def test_on_wider_screens_it_is_a_small_line_under_the_buttons_on_the_right(browser, width, height):
+def test_on_wider_screens_it_sits_in_the_toolbar_before_send(browser, width, height):
     """Operator 10-27: "in desktop, put the token information on the right
-    side, under the buttons" — the text field's width untouched."""
+    side, under the buttons" — the text field's width untouched. §4UJ: now in
+    the toolbar row, before Send."""
     ctx, page = _open(browser, width, height)
     try:
         before, field0 = _box(page, "input-area"), _box(page, "chat-input")
@@ -256,7 +321,7 @@ def test_on_wider_screens_it_is_a_small_line_under_the_buttons_on_the_right(brow
         pill, field, cnt = _box(page, "input-area"), _box(page, "chat-input"), _text_box(page, "token-count")
         b1 = [_box(page, i) for i in CONTROLS]
         assert abs(field["w"] - field0["w"]) < 1 and abs(pill["w"] - before["w"]) < 1, (field0, field)
-        _assert_under_the_buttons_on_the_right(before, pill, b0, b1, cnt, b1[2])
+        _assert_in_the_toolbar_before_send(before, pill, b0, b1, cnt, b1[2])
         # hoverable: its title (the cached part) is the desktop detail (review r2)
         hit = page.evaluate("""(([x, y]) => document.elementFromPoint(x, y).id)""",
                             [cnt["right"] - 4, (cnt["top"] + cnt["bottom"]) / 2])
@@ -276,5 +341,35 @@ def test_an_empty_counter_still_holds_its_line(browser, width, height):
         assert 10 < e["h"] < 16, e
         if width > 480:
             assert abs(_box(page, "input-area")["w"] - 750) < 1
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("width,height", [(844, 390), (1024, 768)])
+def test_touch_screens_wider_than_a_phone_keep_the_finger_sizes(browser, width, height):
+    """Review §4UJ MAJOR: a landscape iPhone or an iPad matched only the desktop
+    width rules and got 32px borderless targets (52px circles before) —
+    hold-to-talk on 32px. Touch screens get the phone sizes at any width."""
+    ctx = browser.new_context(viewport={"width": width, "height": height}, has_touch=True, is_mobile=True)
+    page = ctx.new_page()
+    try:
+        _serve(page)
+        page.goto("http://ghost.test/", wait_until="load")
+        page.evaluate("document.getElementById('effort-select').classList.remove('hidden')")
+        mic, eff, send = (_box(page, i) for i in CONTROLS)
+        assert abs(mic["w"] - 36) < 1 and abs(eff["w"] - 36) < 1 and abs(send["w"] - 44) < 1, (mic, eff, send)
+        sel = _box(page, "effort-select")
+        assert sel["w"] >= 43, sel                  # the picker's own tap area is 44px
+    finally:
+        ctx.close()
+
+
+def test_the_tool_stop_button_keeps_its_red_hover(browser):
+    ctx, page = _open(browser, 1280, 800)
+    try:
+        page.evaluate("document.getElementById('interrupt-btn').classList.remove('hidden')")
+        page.hover("#interrupt-btn")
+        page.wait_for_timeout(400)
+        assert page.evaluate("getComputedStyle(document.getElementById('interrupt-btn')).color") == "rgb(194, 39, 69)"
     finally:
         ctx.close()

@@ -179,7 +179,7 @@ def test_on_a_phone_it_sits_on_the_mic_row_at_the_same_size(browser, width, heig
     try:
         mic, tts, eff, send = (_box(page, i) for i in ("mic-btn", "tts-toggle-btn", "effort-wrap", "send-btn"))
         assert abs(tts["top"] - mic["top"]) < 1 and abs(tts["w"] - mic["w"]) < 1 and abs(tts["h"] - mic["h"]) < 1
-        assert tts["w"] == 40
+        assert tts["w"] == 36   # §4UJ toolbar (2026-11-12): 36px icons on a phone
         assert mic["right"] <= tts["left"] and tts["right"] <= eff["left"] and eff["right"] <= send["left"]
         assert send["right"] <= width
         assert page.evaluate("document.documentElement.scrollWidth") <= width
@@ -187,13 +187,14 @@ def test_on_a_phone_it_sits_on_the_mic_row_at_the_same_size(browser, width, heig
         ctx.close()
 
 
-@pytest.mark.parametrize("width,height,size", [(1280, 800, 52), (1280, 720, 36)])
+@pytest.mark.parametrize("width,height,size", [(1280, 800, 32), (1280, 720, 32)])
 def test_on_a_desktop_it_matches_the_mic_and_the_text_field_keeps_its_row(browser, width, height, size):  # noqa: F811
+    """§4UJ (2026-11-12): the toolbar under the text field, 32px icons."""
     ctx, page = _open(browser, width, height)
     try:
         field, mic, tts = (_box(page, i) for i in ("chat-input", "mic-btn", "tts-toggle-btn"))
         assert tts["w"] == size and tts["h"] == size and abs(tts["top"] - mic["top"]) < 1
-        assert tts["left"] > mic["right"] and field["right"] <= mic["left"] and field["w"] > 300
+        assert tts["left"] > mic["right"] and mic["top"] >= field["bottom"] - 1 and field["w"] > 600
     finally:
         ctx.close()
 

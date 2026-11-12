@@ -2944,3 +2944,143 @@ body.restoring .message { animation: none !important; }
 /* §4SB: the tray's live status line — read by screen readers, not seen */
 #restore-status { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
     clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+
+/* ═══════════════════════════════════════════════════════════════
+   COMPOSER TOOLBAR (2026-11-12, operator: the STT, TTS and effort
+   buttons "take too much estate and they are not being used often
+   enough … smaller and nicely aligned with send … use 2 rows";
+   picked layout C of three mocks, checked in WebKit at iPhone size).
+   One layout at every width — the phone composer's two rows, made
+   quieter: the text field owns the first row; under it a toolbar of
+   borderless icons (mic, speaker, | effort) on the left and the token
+   count, the tool-stop button and Send on the right. Placed last, and
+   every selector carries #input-area, so the older per-button rules
+   (52px circles, the uConsole 36px shrink, the phone 40px block) lose.
+   Rendered pins: tests/test_interface_composer_mobile.py.
+   ═══════════════════════════════════════════════════════════════ */
+#input-area {
+    --composer-btn: 40px;
+    --composer-icon: 32px;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 2px;
+    border-radius: 26px;
+    padding: 6px 10px 10px 22px;
+}
+#input-area #chat-input {
+    flex: 1 1 100%;
+    padding: 12px 0 6px;
+}
+#input-area #mic-btn,
+#input-area #tts-toggle-btn,
+#input-area #effort-wrap,
+#input-area #interrupt-btn {
+    width: var(--composer-icon);
+    height: var(--composer-icon);
+    align-self: center;
+    margin: 0;
+    background: transparent;
+    border: 0;
+    border-radius: 50%;
+    color: rgba(255, 255, 255, 0.38);
+    box-shadow: none;
+    transform: none;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+/* the first icon's glyph lines up with the text above it */
+#input-area #mic-btn { margin-left: -8px; }
+#input-area #mic-btn svg,
+#input-area #tts-toggle-btn svg,
+#input-area #interrupt-btn svg { width: 17px; height: 17px; }
+#input-area #interrupt-btn { color: rgba(255, 255, 255, 0.7); }
+#input-area #interrupt-btn.hidden { display: none; }
+@media (hover: hover) {
+    #input-area #mic-btn:hover,
+    #input-area #tts-toggle-btn:hover,
+    #input-area #interrupt-btn:hover,
+    #input-area #effort-wrap:hover {
+        color: rgba(255, 255, 255, 0.85);
+        background: rgba(255, 255, 255, 0.06);
+        transform: none;
+    }
+    /* the tool-stop button keeps its red hover (it stops something) */
+    #input-area #interrupt-btn:hover { color: var(--error-color); }
+}
+/* the older :has() row-gap rule (min-width 481px) is more specific than
+   `gap` above; the toolbar wants no extra space between its rows */
+#input-area:has(> #token-count) { row-gap: 0; }
+/* States the borderless look must not swallow (the base rules are
+   single-id and lose to the #input-area rules above). */
+#input-area #mic-btn.recording {
+    background: var(--error-color);
+    color: #fff;
+    animation: pulseRecording 1s infinite alternate;
+}
+#input-area #mic-btn.barge-listening { box-shadow: 0 0 0 2px var(--accent-color); color: rgba(255, 255, 255, 0.85); }
+#input-area #tts-toggle-btn.active,
+#input-area #tts-toggle-btn.active:hover { color: #49b07c; background: transparent; }
+/* a hairline between the voice pair and the effort icon; it goes with the
+   wrap when the effort switch is off */
+#input-area #effort-wrap { margin-left: 9px; }
+#input-area #effort-wrap::before {
+    content: "";
+    position: absolute;
+    left: -6px;
+    top: 50%;
+    width: 1px;
+    height: 16px;
+    transform: translateY(-50%);
+    background: var(--surface-border);
+    pointer-events: none;
+}
+/* the counter sits in the toolbar and takes the space between the effort
+   icon and Send, its text at the right. Basis 0: on a 320px phone with the
+   tool-stop button shown, the counter is cut ("…") rather than Send
+   wrapping to a third row. */
+#input-area #token-count {
+    order: 0;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-left: 0;
+    padding: 0 10px 0 6px;
+    text-align: right;
+}
+#input-area #send-btn {
+    width: var(--composer-btn);
+    height: var(--composer-btn);
+    margin-left: 0;
+    align-self: center;
+}
+#input-area #send-btn svg { width: 18px; height: 18px; }
+
+/* Phones and every touch screen (a landscape iPhone is 844px wide, an
+   iPad 768–1024 — review: width alone gave them 32px targets): 36px icons
+   with a 44px finger target, 44px Send (the size of the phone composer
+   before). Hold-to-talk keeps its touch settings from the base #mic-btn
+   rule (touch-action none, no callout, no selection). */
+@media (max-width: 480px), (pointer: coarse) {
+    #input-area {
+        --composer-btn: 44px;
+        --composer-icon: 36px;
+        border-radius: 24px;
+        padding: 4px 8px 8px 8px;
+    }
+    #input-area #chat-input { padding: 10px 10px 6px 10px; }
+    #input-area #mic-btn { margin-left: 2px; }
+    #input-area #mic-btn::after,
+    #input-area #tts-toggle-btn::after,
+    #input-area #interrupt-btn::after {
+        content: "";
+        position: absolute;
+        inset: -4px;
+        border-radius: 50%;
+    }
+    #input-area #mic-btn,
+    #input-area #tts-toggle-btn,
+    #input-area #interrupt-btn { position: relative; -webkit-tap-highlight-color: transparent; }
+    /* the effort picker: grow the invisible select itself (a pseudo-element
+       on the wrap would take the tap without opening the system picker) */
+    #input-area #effort-select { inset: -4px; width: auto; height: auto; }
+}

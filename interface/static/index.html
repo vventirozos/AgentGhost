@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=8.9">
+    <link rel="stylesheet" href="/static/style.css?v=9.0">
 </head>
 
 <body>
@@ -286,9 +286,11 @@
                     <option value="low">Low</option>
                 </select>
                 </span>
-                <!-- Token counter (2026-10-27, operator: discreet, right, under the buttons): the last
-                     reply's context ↑ and generation ↓ tokens, from the agent's usage frame
-                     (tokens.js). Hidden until a turn reports one. -->
+                <!-- Token counter (2026-10-27, operator: discreet): the last reply's context ↑ and
+                     generation ↓ tokens, from the agent's usage frame (tokens.js). Hidden until a
+                     turn reports one. §4UJ (2026-11-12): the composer is two rows (text, then a
+                     toolbar of mic, speaker, effort … counter, tool-stop, Send); the counter
+                     sits in the toolbar just before Send. -->
                 <span id="token-count" class="hidden" aria-live="off"></span>
                 <!-- §4UD's mood words under the input were removed 2026-11-12 (operator: "change the
                      ui so it doesn't show the mood under the input bubble"); the face and the status
