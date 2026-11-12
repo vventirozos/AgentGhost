@@ -458,7 +458,7 @@ def _lab_result_failed(result: str) -> bool:
     first = h.splitlines()[0] if h else ""
     if " no exit code" in first:
         return False        # unresolved, as live (r4 minor 3: stdout's "EXIT CODE: 1" is not the exit)
-    if " TIMED OUT" in first:
+    if " TIMED OUT" in first or " CANCELLED" in first:        # §4UD: ended by `lab cancel` — no exit code, not a result
         return True
     from ..tools.tool_failure import exec_exit_code as _eec
     c = _eec(result)

@@ -7085,14 +7085,16 @@ def _batch_call_depends(name: str, args: dict, prev_name: str, prev_args: dict) 
     if name == "run" or prev_name == "run":
         return _run_call_depends(name, a, act, prev_name, pa, pact)
     if name == "execute":
-        return prev_name == "execute" or (prev_name == "lab" and pact in ("put", "get", "deploy"))   # D3 code r1 #13
+        return prev_name == "execute" or (prev_name == "lab" and pact in _LAB_FILE_ACTIONS)   # D3 code r1 #13
     if name != "lab":
         return False
     if prev_name == "execute":
-        return act in ("put", "get", "deploy")       # §4SX D3: deploy tars the workspace folder execute built
+        return act in _LAB_FILE_ACTIONS       # §4SX D3: deploy tars the workspace folder execute built
     if prev_name != "lab":
         return False
-    if act in ("put", "get", "deploy") and pact in ("put", "get", "deploy"):
+    if act == "cancel" and pact == "exec":
+        return False                     # §4UD: a cancel never waits behind the exec it is there to end
+    if act in _LAB_FILE_ACTIONS and pact in _LAB_FILE_ACTIONS:
         # workspace files move in written order, across labs too (review 11-05 M4: `get A → app/seed.sql`, then
         # `deploy B folder=app` packed the folder before the get wrote it)
         return True
@@ -7123,9 +7125,13 @@ def _batch_call_depends(name: str, args: dict, prev_name: str, prev_args: dict) 
 #: running" — the MULTI-STEP OUTCOME gives them their own line
 _NO_ANSWER_CODES = frozenset({"run_no_answer", "run_unreachable", "run_unverified", "lab_no_answer"})
 
-#: lab actions on one app's lineage (data volume, serving version) — ordered across labs in a batch
-_LAB_LINEAGE_ACTIONS = frozenset({"keep", "deploy", "rehearse", "switch", "rollback", "restore", "destroy",
-                                  "backup"})
+#: lab actions on one app's lineage (data volume, serving version) — ordered across labs in a batch.
+#: §4UD F9: ONE source (tools/labs.LINEAGE_ACTIONS = the kept actions that change something, plus destroy). The two
+#: hand lists here had drifted: `app` was in neither, `backup` in one.
+from ..tools.labs import LINEAGE_ACTIONS as _LAB_LINEAGE_ACTIONS  # noqa: E402
+#: §4UD: the lab actions that move workspace files (ordered with execute and with each other), and those that WRITE
+#: into the workspace (the cached workspace listing is dropped after them) — tools/labs.py is the one source
+from ..tools.labs import FILE_ACTIONS as _LAB_FILE_ACTIONS, WORKSPACE_WRITE_ACTIONS as _LAB_WS_WRITERS  # noqa: E402
 
 
 def _lab_from_lab(a: dict) -> str:
@@ -7140,8 +7146,8 @@ def _lab_from_lab(a: dict) -> str:
 
 
 _RUN_LAB_RE = re.compile(r"^\s*(lab_[0-9a-f]{8})/")
-#: lab actions that change which version of a kept app serves (a `run` on that app follows / precedes them)
-_LAB_APP_ACTIONS = frozenset({"keep", "deploy", "rehearse", "switch", "rollback", "restore", "destroy"})
+#: lab actions that change a kept app or which version of it serves (a `run` on that app follows / precedes them)
+_LAB_APP_ACTIONS = _LAB_LINEAGE_ACTIONS
 
 
 def _run_call_depends(name, a, act, prev_name, pa, pact) -> bool:
@@ -7163,7 +7169,7 @@ def _run_call_depends(name, a, act, prev_name, pa, pact) -> bool:
         if prev_name == "lab":
             m = _RUN_LAB_RE.match(str(a.get("where") or ""))
             plid = str(pa.get("lab_id") or "").strip()
-            if pact in ("put", "get", "deploy") and not m and act not in ("status", "logs", "url", "collect"):
+            if pact in _LAB_FILE_ACTIONS and not m and act not in ("status", "logs", "url", "collect"):
                 return True              # r12 M3: a workspace run reads what an earlier `lab get` writes (as execute)
             return bool(m and plid and m.group(1) == plid) or pact in _LAB_APP_ACTIONS
         if prev_name == "run":
@@ -12343,6 +12349,40 @@ def conv_min_past_tokens() -> int:
         return CONV_MIN_PAST_TOKENS
 #: §4RV: how long a background call's save waits for the slot to go idle
 CONV_SAVE_WAIT_S = 60.0
+#: §4UD (H3): with no save plan, one attempt to make it at most this often —
+#: doubling after each failure up to the max (a request that needs the plan
+#: and the re-warm loop's poll both ask; neither can loop on a dead llama)
+PLAN_RETRY_S = 10.0
+PLAN_RETRY_MAX_S = 120.0
+#: §4UD r2: why `_head_save_plan` made no plan, as a code (the words go to the log)
+#: (r3) UNANSWERED = llama could not be reached or timed out — the one failure
+#: after which a warm-up sends nothing; ERROR = anything else went wrong while
+#: planning (a 4xx, a directory that cannot be made): the warm-up prefills
+#: without a plan, as it did before head saves had plans
+PLAN_OFF, PLAN_NO_HOME, PLAN_UNSUPPORTED, PLAN_UNANSWERED, PLAN_ERROR = (
+    "off", "no_home", "unsupported", "unanswered", "error")
+
+
+def _plan_unanswered(e: BaseException) -> bool:
+    """§4UD r3 (F6): is this planning failure "llama did not answer" (a
+    refused or dropped connection, a timeout, a 5xx while it loads)? Anything
+    else — a 4xx from /apply-template, a PermissionError on the save directory
+    — says nothing about what the slot can take."""
+    import socket
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return int(getattr(e, "code", 0) or 0) >= 500
+    return isinstance(e, (TimeoutError, socket.timeout, ConnectionError, urllib.error.URLError))
+#: §4UD r2: `_restore_file`'s two reasons for posting nothing (its ``ok`` is then None)
+RESTORE_NO_PROPS = "llama's /props did not answer"
+RESTORE_OTHER_SERVER = "llama runs another model, build or template than the saved state's"
+#: §4UD (H5): why a wait for llama's slot ended without an idle slot, in words
+SLOT_WAIT_WHY = {
+    "busy": "the main slot stayed busy",
+    "unreachable": "llama did not answer /slots (unreachable, or it refuses the read)",
+    "stopped": "a request started",
+    "silent": "llama does not say whether the slot is processing",
+}
 #: §4RW review: a conversation save needs this much of its deadline, or it is not posted
 CONV_SAVE_MIN_S = 20.0
 #: §4RW review: processing the ~9k-token members' head takes ~50 s
@@ -12509,6 +12549,39 @@ def _is_foreign_row(content) -> bool:
         return False
 
 
+#: §4UD (F4): the requests that carry a row the bot labelled as ANOTHER person's (a channel member's message in
+#: the owner's thread) — `set_mood` treats such a request like one that read outside content, unless the
+#: owner's own message names what is set (`tools.introspect._mood_guard`). Bounded; in memory.
+_MOOD_FOREIGN_REQ: "collections.OrderedDict[str, bool]" = collections.OrderedDict()
+
+
+def mood_note_foreign_rows(messages, req_id: str) -> bool:
+    """Record whether this request's messages hold a foreign-labelled user row. Returns what it recorded."""
+    try:
+        found = any(isinstance(m, dict) and m.get("role") == "user" and _is_foreign_row(m.get("content"))
+                    for m in (messages or ()))
+    except Exception:  # noqa: BLE001
+        found = True                     # cannot tell: the guard then asks for the owner's own words
+    rid = str(req_id or "")
+    if rid:
+        with _MOOD_MEMO_LOCK:
+            if found:
+                _MOOD_FOREIGN_REQ[rid] = True
+                _MOOD_FOREIGN_REQ.move_to_end(rid)
+                while len(_MOOD_FOREIGN_REQ) > _MOOD_MEMO_MAX:
+                    _MOOD_FOREIGN_REQ.popitem(last=False)
+            else:
+                _MOOD_FOREIGN_REQ.pop(rid, None)     # a request id used again (a probe's fixed id)
+    return found
+
+
+def mood_request_has_foreign_row(req_id=None) -> bool:
+    """§4UD (F4): does the request being served carry another person's labelled message?"""
+    rid = str(request_id_context.get() or "") if req_id is None else str(req_id or "")
+    with _MOOD_MEMO_LOCK:
+        return bool(rid) and rid in _MOOD_FOREIGN_REQ
+
+
 #: §4UB review r1: queued messages read for the mood and then HANDED BACK unanswered (§4SB) — (conversation,
 #: words) → when. The request that re-sends one does not read it again. Bounded; in memory.
 _MOOD_QUEUED_READ: "collections.OrderedDict[Tuple[str, str], float]" = collections.OrderedDict()
@@ -12576,6 +12649,21 @@ def mood_is_heard_on_this_request(context) -> bool:
 #: §4TC (review): refusals that are the system working as designed — a tool
 #: row carrying one of these reason codes is not "trouble" for the mood
 MOOD_BLIND_REASONS = frozenset({"untrusted_content", "owner_data_blocked", "owner_only"})
+
+
+def mood_write_changed(m) -> bool:
+    """§4UD (W2): is this tool row a `set_mood` that CHANGED something — the
+    owner's word on the mood or the manner? Read off the outcome the tool
+    declared: `introspect` declares an outcome only for its one write, OK
+    with ``world_changed`` False when nothing changed (a step down on what
+    is not on, an undo with nothing on record, a probe) and unset when it
+    did. A refusal or a failure is not the owner's word either."""
+    if not isinstance(m, dict) or m.get("role") != "tool" or str(m.get("name") or "").strip() != "introspect":
+        return False
+    from ..tools.outcome import OutcomeStatus as _OS, ToolOutcome as _TO
+    raw = m.get("content")
+    return (isinstance(raw, _TO) and bool(getattr(raw, "declared", False)) and raw.status == _OS.OK
+            and raw.world_changed is not False)
 
 
 def _mood_blind_row(m) -> bool:
@@ -12737,6 +12825,10 @@ def _mood_tone_block(context) -> str:
                 _MOOD_TONE_BY_REQ[req_id] = {
                     "mood": view.describe(), "manner": (f"{view.manner}, {view.manner_intensity} of 3"
                                                         if view.manner else ""),
+                    # §4UD (W2): the same as VALUES — readers (the Mirror's strong-mood filter) take these,
+                    # never the two sentences above
+                    "label": view.label, "intensity": int(view.intensity),
+                    "manner_name": view.manner, "manner_intensity": int(view.manner_intensity or 0),
                     "remarked": remarked, "audience": audience}
                 _MOOD_TONE_BY_REQ.move_to_end(req_id)
                 while len(_MOOD_TONE_BY_REQ) > _MOOD_MEMO_MAX:
@@ -12746,18 +12838,29 @@ def _mood_tone_block(context) -> str:
         return ""
 
 
+#: §4UE: the probe arm that leaves the self-image section out (utils/logging.py `PROMPT_ARMS`)
+SELF_IMAGE_OFF_ARM = "no_self_image"
+
+
 def self_image_is_heard_on_this_request(context) -> bool:
     """§4TZ: does this reply carry the Mirror's self-image? Only a reply to the
     OWNER on a private surface (operator 11-10: "owner only" — the sentence is
     drawn from the owner's replies alone), and a probe of one (it must see
     what a real owner turn sees). NOT a member (a member's probe included), a
     public channel, a scheduled task, a job wake, a sub-agent, self-play, a
-    bench or replay run, a coding leaf or a contained copy."""
+    bench or replay run, a coding leaf or a contained copy.
+
+    §4UE: nor a probe sent with the arm `no_self_image` (`X-Ghost-Arm`) — the
+    "without" side of a paired probe that measures whether the section is
+    audible. `prompt_arm()` is "" for anything but a probe, so no owner turn
+    can lose the section this way."""
     try:
-        from ..utils.logging import request_kind as _rk
+        from ..utils.logging import request_kind as _rk, prompt_arm as _arm
         if _rk() not in ("owner", "probe"):
             return False
         if requester_is_member() or reply_is_public():
+            return False
+        if _arm() == SELF_IMAGE_OFF_ARM:
             return False
         return not _mood_run_is_contained(context)
     except Exception:  # noqa: BLE001
@@ -12791,21 +12894,107 @@ def _self_image_block(context) -> str:
     same bytes on every turn of a request (frozen at its first turn)."""
     try:
         if not self_image_is_heard_on_this_request(context):
+            # §4UE (review r1): a request that does not hear the section must not keep the one an
+            # EARLIER request of the same id heard (a client may reuse X-Request-ID) — the turn
+            # record reads this memo, and it would say the sentence was heard
+            _rid = str(request_id_context.get() or "")
+            if _rid:
+                with _MOOD_MEMO_LOCK:
+                    _SELF_IMAGE_BY_REQ.pop(_rid, None)
             return ""
         req_id = str(request_id_context.get() or "")
+        from ..selfhood.mirror import (home_from_memory_dir, self_image_section, probe_section,
+                                       probe_stamp, PROBE_DATE)
+        # §4UF: a probe may bring the self-image under test (sentence, rule) — heard in the place of
+        # the Mirror's; `probe_self_image()` is empty for anything but a probe. Review r1: read BEFORE
+        # the per-request memo (a pure function of the request's own headers, so every step gets the
+        # same bytes without it) — a request id sent again with another sentence or rule heard the
+        # first one's section, and the record could not show it. The record carries a fingerprint of
+        # the section heard (`probe:<6 hex>`).
+        _ps, _pr = _glog.probe_self_image()
+        if _ps:
+            text = probe_section(_ps, _pr)
+            if req_id:
+                with _MOOD_MEMO_LOCK:
+                    _SELF_IMAGE_BY_REQ[req_id] = (text, probe_stamp(text), time.monotonic())
+                    _SELF_IMAGE_BY_REQ.move_to_end(req_id)
+                    while len(_SELF_IMAGE_BY_REQ) > _MOOD_MEMO_MAX:
+                        _SELF_IMAGE_BY_REQ.popitem(last=False)
+            return text
         if req_id:
             with _MOOD_MEMO_LOCK:
                 got = _SELF_IMAGE_BY_REQ.get(req_id)
-            if got is not None and time.monotonic() - got[2] < _SELF_IMAGE_FREEZE_S:
+            # … and an entry a probe's brought sentence left under this id is not this request's
+            if (got is not None and not str(got[1]).startswith(PROBE_DATE)
+                    and time.monotonic() - got[2] < _SELF_IMAGE_FREEZE_S):
                 return got[0]
-        from ..selfhood.mirror import home_from_memory_dir, self_image_section
-        text, date = self_image_section(home_from_memory_dir(getattr(context, "memory_dir", None)))
+        # §4UG: the character (three dials, one sentence that is a function of them) is what an owner
+        # reply hears in this place; with GHOST_CHARACTER=0 it is the Mirror's own sentence, as before
+        from ..selfhood import character as _character
+        _home = home_from_memory_dir(getattr(context, "memory_dir", None))
+        if _character.enabled():
+            text, date = _character.section(_home)
+        else:
+            text, date = self_image_section(_home)
         if req_id:
             with _MOOD_MEMO_LOCK:
                 _SELF_IMAGE_BY_REQ[req_id] = (text, date, time.monotonic())
                 _SELF_IMAGE_BY_REQ.move_to_end(req_id)
                 while len(_SELF_IMAGE_BY_REQ) > _MOOD_MEMO_MAX:
                     _SELF_IMAGE_BY_REQ.popitem(last=False)
+        return text
+    except Exception:  # noqa: BLE001 — a state block never breaks a turn
+        return ""
+
+
+#: §4UG: per request, the shade line its first step heard (frozen: the same bytes on every step)
+_MOOD_SHADE_BY_REQ: "collections.OrderedDict[str, Tuple[str, str, float]]" = collections.OrderedDict()
+
+
+def mood_shade_heard(req_id: str) -> str:
+    """The shade the reply of request ``req_id`` heard ("" = none)."""
+    with _MOOD_MEMO_LOCK:
+        got = _MOOD_SHADE_BY_REQ.get(str(req_id or ""))
+        return got[1] if got else ""
+
+
+def _mood_shade_block(context) -> str:
+    """§4UG: the mood's shade (relieved / chastened / proud) as ONE line of the per-turn state block —
+    heard by the first reply to the OWNER on a private surface after the shade was set, and by no reply
+    after it (``ShadeStore.take``). Not a probe (it would use the moment up), a member, a public channel,
+    a scheduled run, a job or a contained copy. "" otherwise. The same bytes on every step of the request."""
+    try:
+        req_id = str(request_id_context.get() or "")
+        if not req_id:
+            return ""
+        # review r1: the gate FIRST, on every call — the memo was read before it, so a request id sent
+        # again by a member, on a public surface or from a contained run was handed the owner's line
+        if not (mood_moves_on_this_request(context) and not requester_is_member() and not reply_is_public()):
+            with _MOOD_MEMO_LOCK:
+                _MOOD_SHADE_BY_REQ.pop(req_id, None)
+            return ""
+        with _MOOD_MEMO_LOCK:
+            got = _MOOD_SHADE_BY_REQ.get(req_id)
+            if got is not None and time.monotonic() - got[2] < _SELF_IMAGE_FREEZE_S:
+                # a request still running keeps its entry: fresh for eviction (r1: 257 others evicted it)
+                # AND for the age limit (r2: the stamp stayed at step 1, so the line left a 4-hour request)
+                _MOOD_SHADE_BY_REQ[req_id] = (got[0], got[1], time.monotonic())
+                _MOOD_SHADE_BY_REQ.move_to_end(req_id)
+                return got[0]
+        text = name = ""
+        sm = _mood_model(context)
+        store = getattr(sm, "shade", None) if sm is not None else None
+        if store is not None:
+            from ..selfhood import shade as _shade
+            name = store.take()
+            text = _shade.line(name)
+            if not text:
+                name = ""
+        with _MOOD_MEMO_LOCK:
+            _MOOD_SHADE_BY_REQ[req_id] = (text, name, time.monotonic())
+            _MOOD_SHADE_BY_REQ.move_to_end(req_id)
+            while len(_MOOD_SHADE_BY_REQ) > _MOOD_MEMO_MAX:
+                _MOOD_SHADE_BY_REQ.popitem(last=False)
         return text
     except Exception:  # noqa: BLE001 — a state block never breaks a turn
         return ""
@@ -14135,6 +14324,13 @@ class GhostAgent:
             home = _mirror.home_from_memory_dir(getattr(ctx, 'memory_dir', None))
             if home is None:
                 return
+            from ..selfhood import character as _character
+            # §4UG: the day's close (and the character's daily rule, when it is on) — no model call
+            await self._character_phase(home, ran, notes, ctx)
+            if _character.enabled():
+                # the self-image is the character's sentence now (a function of its dials) — the look
+                # that rewrote a sentence from the replies is not asked: nothing would hear it
+                return
             if await asyncio.to_thread(_mirror.looked_today, home):
                 return
             from .llm import BackgroundDeferred as _BgDeferred
@@ -14156,6 +14352,72 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001 — a real failure: booked, retried in an hour (same window)
             _idle_phase_failed(self, ran, "mirror", e)
 
+    async def _character_phase(self, home, ran: list, notes: dict, ctx=None) -> None:
+        """§4UG: close the days that are over (``selfhood.days``) and, with the character on, let its
+        daily rule look at them (``selfhood.character.daily``). No model call. Runs at the Mirror's place
+        in the idle window, at most once an hour; a day already closed costs one small file read. The
+        mood is SETTLED first (review r1: a mood that wore off unseen was still "held" in the journal,
+        and a day closed over it read content for 19 hours). Never raises."""
+        try:
+            from ..selfhood import character as _character, days as _days
+            _st = getattr(_mood_model(ctx), "state", None) if ctx is not None else None
+            if _st is not None:
+                try:
+                    await asyncio.to_thread(_st.settle)
+                    # … and READ once: the boredom of a long quiet is journalled (back-dated) only when a
+                    # reader first sees it (review r2: with no client polling overnight, the day was
+                    # closed before its boredom was written into it)
+                    await asyncio.to_thread(_st.mood)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("day record: the mood was not settled first (%s)", type(e).__name__)
+            written = await asyncio.to_thread(_days.close_days, home)
+            # §4UH: tastes — each closed day's turns are added to the kinds of work they were
+            from ..selfhood import tastes as _tastes
+            tasted = await asyncio.to_thread(
+                lambda: _tastes.close_days(home, [d.get("date") for d in _days.load_days(home)]))
+            moves, looked = [], ""
+            if _character.enabled():
+                # §4UH: the look — once a day the agent says how its own replies sound, on its three dials
+                # (one background call on the main model); what it saw is a vote in the daily rule
+                from ..selfhood import selfview as _selfview
+                from .llm import BackgroundDeferred as _BgDeferred
+                # review r1 (§4UH): the rule FIRST, with the votes of the looks already taken — today's look
+                # then records the dials as they are after any move, and votes against those
+                votes = await asyncio.to_thread(_selfview.votes, home)
+                moves = await asyncio.to_thread(
+                    lambda: _character.daily(home, _days.load_days(home), votes=votes))
+                try:
+                    looked = await _selfview.look(
+                        home, getattr(ctx, "llm_client", None) if ctx is not None else None,
+                        model=str(getattr(getattr(ctx, "args", None), "model", "") or ""))
+                except _BgDeferred:
+                    self._last_mirror_try_at = datetime.datetime.min     # a request started: the next idle tick
+                    looked = "the look was deferred — a request started; it tries again on the next idle tick"
+                except Exception as e:  # noqa: BLE001 — the look is secondary: the days and the rule still run
+                    logger.warning("character: the look failed (%s: %s)", type(e).__name__, e)
+                    looked = f"the look failed ({type(e).__name__})"
+            if written or moves or looked or tasted:
+                ran.append("character")
+                notes["character"] = "; ".join(
+                    ([f"day record written for {', '.join(written)}"] if written else [])
+                    + ([looked] if looked else [])
+                    + ([f"tastes counted for {len(tasted)} day(s)"] if tasted else [])
+                    + (moves if moves else (["no dial moved"] if _character.enabled() and written else [])))
+                if looked.startswith("looked at"):
+                    pretty_log("Character", looked, icon=Icons.MIRROR)
+                if tasted:
+                    # §4UH review r2: the rough kinds are said HERE, in the log, and nowhere a model reads
+                    _likes = await asyncio.to_thread(lambda: _tastes.line(home, liked_only=False))
+                    if _likes:
+                        pretty_log("Tastes", _likes, icon=Icons.MIRROR, durable_only=True)
+                for mv in moves:
+                    pretty_log("Character", mv, icon=Icons.MIRROR)
+                if written:
+                    for rec in (await asyncio.to_thread(_days.load_days, home, limit=len(written))):
+                        pretty_log("Day Record", _days.day_line(rec), icon=Icons.MIRROR, durable_only=True)
+        except Exception as e:  # noqa: BLE001
+            _idle_phase_failed(self, ran, "character", e)
+
     async def _owner_rule_note(self, body) -> str:
         """The state-block note for an owner's rule command, or "" (§4MX r3,
         see `owner_rules.rule_command`). Never raises."""
@@ -14175,6 +14437,22 @@ class GhostAgent:
                 note = _rn(await asyncio.to_thread(mirror_banner, home))
                 pretty_log("Owner Command", _owner_command_line("mirror", text, note), icon=Icons.MIRROR)
                 return note
+            from ..selfhood import character as _character
+            if _character.enabled() and _character.is_command(text):   # §4UG: the character, shown or set
+                home = home_from_memory_dir(getattr(self.context, "memory_dir", None))
+                if home is None:
+                    return ""
+                from .owner_rules import _note as _rn
+                note = _rn(await asyncio.to_thread(_character.command, text, home) or "")
+                pretty_log("Owner Command", _owner_command_line("character", text, note), icon=Icons.MIRROR)
+                return note
+            if _character.enabled():
+                # nearly the command: the model is told nothing changed and which exact message does it
+                _hint = _character.command_hint(text)
+                if _hint:
+                    pretty_log("Owner Command", f"not a character command: {text.strip()[:100]} → told the "
+                               f"model the exact commands", icon=Icons.MIRROR)
+                    return _hint
             # §4SZ: the owner's rules live in core/owner_rules.py
             from .owner_rules import is_rule_command, rule_command, rule_command_hint
             md = getattr(self.context, "memory_dir", None)
@@ -15903,12 +16181,15 @@ class GhostAgent:
             # existed, a changed head left the previous one in place; r2: a
             # failed plan cleared to None, not left on the previous head); the
             # hook reads the file's presence when it runs
-            self._head_plan_last = _hs
-            if _hs is not None:
-                self._conv_plan_last = _hs       # §4RW-e: a conversation save outlives a failed plan
-                llm.before_main_dispatch = self._slot_switch_before
-                llm.before_background_dispatch = self._conv_before_background   # §4RV
-                llm.before_side_main_dispatch = self._side_call_before           # §4RW-g
+            _fail = getattr(self, "_plan_fail", None) or ("", "")    # (read at once: every plan writes it)
+            self._head_plan_keep(llm, _hs, payload, _fail)
+            if _hs is None and _fail[0] == PLAN_UNANSWERED:
+                # §4UD r2 (F6): llama did not answer the plan's reads this tick.
+                # Without a plan nothing below can save a kept conversation or
+                # restore the head, and the bare prefill went over the
+                # conversation unsaved — the warm-up sends nothing; the next
+                # tick plans again (re-warm loop off: the prefill, as `_head_defer` says)
+                self._head_defer({}, f"no save plan this tick ({_fail[1]})", loud=not quiet)
             _cc_kw = {}
             # §4RW (operator 10-27: "i thought that changing xhigh didn't change the
             # head"): the effort sentence closes the system block, so a level with no
@@ -15960,8 +16241,11 @@ class GhostAgent:
                             self._head_defer(_hs, "a request reached the slot during the park", loud=not quiet)
                             return
                     _hs["restore"] = True
-                    _hs["restored"], _hs["detail"], _hs["restore_s"] = await asyncio.to_thread(
-                        _head_saves.restore, _hs["base"], _hs["dir"], _hs["key"])
+                    # §4UD (H10): the one restore sink — llama's identity is read
+                    # again here too (the client's waits sit between the plan and
+                    # this dispatch); not posted reads as a failed restore
+                    _ok, _hs["detail"], _hs["restore_s"] = await self._restore_file(_hs)
+                    _hs["restored"] = _ok is True
                 if _hs["have"]:
                     _cc_kw["before_dispatch"] = _restore_head
             if _hs is not None and not _hs["have"]:
@@ -16154,6 +16438,123 @@ class GhostAgent:
         return ("a conversation holds the slot (it goes to disk before anything replaces it)"
                 if conv_keep_enabled() else "a conversation keeps the slot inside its idle window")
 
+    def _head_plan_keep(self, llm, hs: Optional[Dict[str, Any]], payload, fail=("", "")) -> None:
+        """§4UD (H3): record a plan attempt's outcome and install the hooks.
+
+        A plan that was made is the plan. An attempt that failed leaves NO
+        plan (§4RP r2: never the previous head's), with its reason
+        (``fail``: `_head_save_plan`'s code and words) kept for the log and
+        said once per distinct reason. Round 1 kept the last good plan when
+        the head payload had not changed; round 2 removed that: a plan is
+        cheap to make again, and a request that finds none asks for one itself
+        (`_head_plan_retry`), which gives the same restore without a plan that
+        can outlive "saves off" or a model swap.
+
+        The hooks are installed whenever head saves are on, plan or not (it
+        was: only with a plan, so an agent that booted while llama was loading
+        had no hook for a whole tick). Head saves off: no plan, no hooks."""
+        self._head_payload_last = payload
+        plan = hs if isinstance(hs, dict) else None     # (saves off: `_head_save_plan` made none)
+        self._head_plan_last = plan              # (a failed attempt, or saves off: no plan)
+        if not _head_saves.enabled():
+            return
+        if plan is not None:
+            self._conv_plan_last = hs            # §4RW-e: a conversation save outlives a failed plan
+            self._head_plan_tries = 0
+            self._head_plan_retry_at = 0.0       # (the next failure's first poll is not held back)
+            self._head_plan_why = ""
+            self._head_plan_why_said = None
+        else:
+            why = str((fail or ("", ""))[1] or "no reason recorded")
+            self._head_plan_why = why
+            if getattr(self, "_head_plan_why_said", None) != why:
+                self._head_plan_why_said = why
+                pretty_log("Head Disk", f"no save plan ({why}) — nothing is restored until one is made; "
+                           f"asked again when a request needs it and by the re-warm loop, at most every "
+                           f"{PLAN_RETRY_S:.0f}–{PLAN_RETRY_MAX_S:.0f}s", icon=Icons.HEAD_FAIL)
+        llm.before_main_dispatch = self._slot_switch_before
+        llm.before_background_dispatch = self._conv_before_background   # §4RV
+        llm.before_side_main_dispatch = self._side_call_before           # §4RW-g
+
+    async def _head_plan_retry(self, llm) -> Optional[Dict[str, Any]]:
+        """§4UD (H3, H7): the current plan, or — when there is none — an
+        attempt to make it from the last warm-up's payload (`_head_plan_once`).
+
+        Who may start an attempt (r3):
+        - a caller with NO request id — the re-warm loop's poll (every 5 s), a
+          background call's hook, the shutdown: one per `PLAN_RETRY_S`,
+          doubling to `PLAN_RETRY_MAX_S` after each failure. That back-off
+          bounds only them;
+        - a REQUEST's hook: one attempt per request id, whatever that back-off
+          says (the poll had ratcheted the gate to 120 s by the time llama
+          answered, and the request that needed the plan found the gate shut).
+        Whoever asks while an attempt is in flight AWAITS that one attempt and
+        gets its plan (it got None, 0.4 s before the plan existed). The
+        attempt is its own task: a waiter that is cancelled does not cancel it
+        for the others. Never raises (but passes a waiter's own cancel)."""
+        hs = getattr(self, "_head_plan_last", None)
+        if isinstance(hs, dict) or not _head_saves.enabled():
+            return hs if isinstance(hs, dict) else None
+        payload = getattr(self, "_head_payload_last", None)
+        if not isinstance(payload, dict) or llm is None:
+            return None                      # no warm-up reached its payload yet: nothing to plan from
+        task = getattr(self, "_head_plan_task", None)
+        if not isinstance(task, asyncio.Future) or task.done():
+            rid = str(request_id_context.get() or "")
+            if rid and rid != "SYSTEM":      # ("SYSTEM": the context's default — no request)
+                if getattr(self, "_head_plan_asked_rid", None) == rid:
+                    return None              # this request had its attempt
+                self._head_plan_asked_rid = rid
+            else:
+                now = time.monotonic()
+                nxt = getattr(self, "_head_plan_retry_at", 0.0)
+                if isinstance(nxt, (int, float)) and now < nxt:
+                    return None
+                tries = int(getattr(self, "_head_plan_tries", 0) or 0) + 1
+                self._head_plan_tries = tries
+                self._head_plan_retry_at = now + min(PLAN_RETRY_MAX_S, PLAN_RETRY_S * (2 ** min(tries - 1, 6)))
+            # (no await between the checks above and this: one attempt at a time)
+            task = self._head_plan_task = asyncio.ensure_future(self._head_plan_once(llm, payload))
+        await asyncio.shield(task)
+        hs = getattr(self, "_head_plan_last", None)
+        return hs if isinstance(hs, dict) else None
+
+    async def _head_plan_once(self, llm, payload) -> None:
+        """One plan attempt (see `_head_plan_retry`). Before it the "saves off"
+        mark is re-checked, so a llama that was restarted with
+        --slot-save-path is seen by the request that needs it and not only by
+        an idle tick; while the mark stands no plan is made and so no restore
+        is posted. A failure writes a line only when its reason is not the one
+        on record. Never raises."""
+        try:
+            await self._head_saves_back()
+            hs = await self._head_save_plan(llm, payload)
+            fail = getattr(self, "_plan_fail", None) or ("", "")
+        except Exception as e:  # noqa: BLE001 — never a failed call
+            hs, fail = None, (PLAN_ERROR, f"{type(e).__name__}: {e}")
+        try:
+            if not isinstance(hs, dict):
+                why = str(fail[1] or "no reason recorded")
+                if why != getattr(self, "_head_plan_why", None):
+                    self._head_plan_why = why
+                    logger.info("head disk: save plan attempt failed (%s)", why)
+                return
+            if isinstance(getattr(self, "_head_plan_last", None), dict):
+                return                       # a warm-up made one meanwhile: that one is newer
+            self._head_plan_keep(llm, hs, payload)
+            pretty_log("Head Disk", "save plan made — saves and restores are on", icon=Icons.HEAD_SAVE)
+        except Exception as e:  # noqa: BLE001
+            logger.info("head disk: save plan attempt skipped: %s: %s", type(e).__name__, e)
+
+    def _switch_exit(self, rid: str, why: str) -> None:
+        """§4UD (H11): the switch leaves without a restore — one file-only line
+        per request and reason (a request makes many calls)."""
+        said = (str(rid or ""), why)
+        if getattr(self, "_switch_exit_said", None) == said:
+            return
+        self._switch_exit_said = said
+        logger.info("head disk: no restore before this call — %s", why)
+
     async def _slot_switch_before(self, payload) -> None:
         """§4RP rule 3: before a foreground main call of a conversation other
         than the one that owns the slot, put the saved head back (~0.5 s), so
@@ -16180,6 +16581,10 @@ class GhostAgent:
         _late = time.monotonic() + BEFORE_MAIN_DISPATCH_S - _head_saves.RESTORE_TIMEOUT_S - 2.0
         llm = getattr(getattr(self, "context", None), "llm_client", None)
         hs = getattr(self, "_head_plan_last", None)
+        if not isinstance(hs, dict) and _head_saves.enabled():
+            # §4UD (H3): no plan (llama was loading at boot, or the head changed
+            # and the tick's plan failed) — ask for one now, bounded
+            hs = await self._head_plan_retry(llm)
         from .llm import outside_slot_dirty
         from .llm import conv_keep_enabled
         _conv = conv_keep_enabled()
@@ -16207,9 +16612,16 @@ class GhostAgent:
         # (review: and only once that look displaced the slot — a marker left by a
         # look that never reached it, or by an earlier run of the same sched- id,
         # must not restore over the request's own conversation)
-        if ((not key and not (getattr(self, "_side_call_rid", None) == str(request_id_context.get() or "")
-                              and slot_moved_on(llm)))
-                or not isinstance(hs, dict) or not _head_saves.enabled()):
+        if not _head_saves.enabled():
+            return                           # (off: nothing to say on every call)
+        if not isinstance(hs, dict):
+            self._switch_exit(str(request_id_context.get() or ""),
+                              f"no save plan ({getattr(self, '_head_plan_why', '') or 'no warm-up yet'})")
+            return
+        if (not key and not (getattr(self, "_side_call_rid", None) == str(request_id_context.get() or "")
+                             and slot_moved_on(llm))):
+            self._switch_exit(str(request_id_context.get() or ""),
+                              "the request has no conversation key (a probe or a scheduled task)")
             return
         # §4RW-f (operator item 5): the effort sentence closes the system block,
         # so a new level leaves the slot ~28.2k tokens in — past every checkpoint
@@ -16291,6 +16703,7 @@ class GhostAgent:
         # Round-2 review MAJOR: recorded per request id, and only for a call
         # that is accepted — another request's call overwrote the record
         if not self._turn_holder_ok():
+            self._switch_exit(rid, "another turn holds the lock (this call is not the running turn's)")
             return
         done = getattr(self, "_switch_done", None)
         if not isinstance(done, dict):
@@ -16309,8 +16722,11 @@ class GhostAgent:
             done.pop(next(iter(done)))
         # §4SA: a "tools" call (the owner on Slack) has a conversation file too; a
         # long request's follow-up skips its (older) file — the slot IS the conversation
+        from .llm import expect_restore_reuse
+        # §4UD (H1): a conversation file is restored only when it was saved on
+        # what THIS call opens with (`_conv_restore` reads the payload)
         if (_conv and key and kind in ("head", "tools") and not _long_followup
-                and await self._conv_restore(llm, hs, key, rid, _late, level=cur_level)):
+                and await self._conv_restore(llm, hs, key, rid, _late, level=cur_level, payload=payload)):
             return
         n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
         if not n_head:
@@ -16319,17 +16735,26 @@ class GhostAgent:
             _near = _head_saves.newest_head_for(hs["dir"], hs.get("identity", ""))
             n_head = _head_saves.stored_tokens(hs["dir"], _near) if _near else None
             if not n_head:
+                self._switch_exit(rid, "no head file for this server yet (the next quiet warm-up saves one)")
                 return
             # review: a re-warm that just processed THIS head (its save refused
             # while this request came in) left exactly it — not the near file over it
             if hs.get("prompt_n") and await asyncio.to_thread(
                     _head_saves.slot_tokens, hs["base"]) == hs["prompt_n"]:
+                self._switch_exit(rid, "the slot holds exactly this head, processed by the last warm-up")
                 return
             hs = {**hs, "key": _near, "n_tokens": n_head, "near": True}
         res = await self._restore_when_idle(llm, hs, _late, skip_n=n_head)
         if res is None:
-            return
+            return                           # (`_restore_when_idle` wrote the reason)
         ok, detail, dt, n = res
+        if ok and kind == "head" and not hs.get("near"):
+            # §4UD (H12): this call's reply says whether llama reused it — one
+            # line when it did not (the check deletes nothing).
+            # Only for a call that opens with THIS head: the nearest head
+            # (another level's file) and a tools-only call (the owner on
+            # Slack) reuse a part of the file by design
+            expect_restore_reuse(llm, payload, hs["key"], "head", n_head)
         _same = bool((level_moved or _after_side) and owner and owner == key)   # §4RW-f, §4RW-g
         # §4SC-c: the side call by name (the look, the cut-write continuation,
         # a fact-check-verify call) — what `_side_call_before` saved before
@@ -16459,10 +16884,20 @@ class GhostAgent:
         except Exception:  # noqa: BLE001
             return 0.0
 
-    async def _slot_idle(self, base: str, late: float, stop=None) -> bool:
-        """§4RV: wait (until ``late``, or until ``stop()``) for llama's slot to
-        be idle — a save or a restore posted while it works lands in the
-        middle of a call."""
+    async def _slot_wait(self, base: str, late: float, stop=None) -> Tuple[str, Dict[str, Any]]:
+        """§4RV / §4UD (H5, H10): THE wait for llama's slot to be idle (until
+        ``late``, or until ``stop()``) — a save or a restore posted while it
+        works lands in the middle of a call. Every save and every restore
+        waits here. Returns ``(why, slot)``: ``""`` and llama's slot record
+        when it is idle, else why not (`SLOT_WAIT_WHY`) and ``{}``:
+        ``"busy"`` (still processing at the deadline — a read that TIMED OUT is
+        a long batch and counts as busy), ``"unreachable"``
+        (`SWITCH_UNREAD_LIMIT` reads in a row failed fast: refused, an HTTP
+        error — req 11-11 07:38: logged as "stayed busy" 1 s into a 25 s
+        budget), ``"stopped"`` (``stop()`` said so) or ``"silent"`` (llama
+        answered without ``is_processing``: left alone at once). Reads llama's
+        own state, not the agent's counters (a leaked stream count once held
+        every tick)."""
         def _read():
             return (_head_saves._http(base + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID]
         unread = 0
@@ -16472,15 +16907,24 @@ class GhostAgent:
                 unread = 0                   # (round-3 review: failures in a row)
             except Exception as e:  # noqa: BLE001 — llama answers /slots only between batches
                 slot = {}
+                # round-3 review: a read that TIMED OUT is a long batch (a
+                # prefill ahead of this call) — wait on; only a fast failure
+                # (refused, an HTTP error) means a llama that will not answer
                 _t = f"{type(e).__name__} {e}".lower()
                 if not ("timeout" in _t or "timed out" in _t):
                     unread += 1
                 if unread >= SWITCH_UNREAD_LIMIT:
-                    return False
-            if slot and not slot.get("is_processing", True):
-                return True
-            if time.monotonic() > late or (stop is not None and stop()):
-                return False
+                    # round-2 review: a wedged or slot-less llama cost ~118 s
+                    # before every request's first call
+                    return ("unreachable", {})
+            if slot and (not isinstance(slot, dict) or "is_processing" not in slot):
+                return ("silent", {})        # a llama that does not say: leave it
+            if slot and not slot["is_processing"]:
+                return ("", slot)
+            if stop is not None and stop():
+                return ("stopped", {})
+            if time.monotonic() > late:
+                return ("busy", {})
             await asyncio.sleep(0.5)
 
     async def _conv_save(self, llm, why: str, late: Optional[float] = None, stop=None) -> bool:
@@ -16498,27 +16942,43 @@ class GhostAgent:
             # §4RW-e (review): a plan that failed (a /props timeout in a tick)
             # left None for up to a re-warm period, and a displacement then
             # dropped the conversation unsaved. The save needs only the dir,
-            # the server and its identity — a key under a stale identity is
-            # never restored (the next plan's key differs).
+            # the server and its identity.
+            # §4UD (H2): the plan's identity is what llama WAS. The old words
+            # here ("a key under a stale identity is never restored") were
+            # false for a swap A → B → A: B's state filed under A's identity
+            # restores on A. The check that holds is in `head_saves.save`: it
+            # reads llama's identity after the save and drops a file that is
+            # not the planned server's — for every plan, not only the fallback.
             hs = getattr(self, "_head_plan_last", None) or getattr(self, "_conv_plan_last", None)
             if not owner:
-                return False
+                return False                 # (no conversation owns the slot: nothing to save)
+            if not isinstance(hs, dict):
+                hs = await self._head_plan_retry(llm)      # §4UD (H3): bounded
             if not isinstance(hs, dict):
                 pretty_log("Conversation", f"not saved before {why} — no save plan yet; its next request "
                            f"re-reads it", icon=Icons.HEAD_FAIL)                      # §4TJ: was silent
                 return False
-            if hs is not getattr(self, "_head_plan_last", None):
+            # §4UD (H2): asked for EVERY plan (it was: only the fallback plan) —
+            # the current plan is a tick old too, and since H3 it can be the
+            # last good one of several ticks. One /props read before a
+            # multi-GB write that `head_saves.save` would then drop.
+            # §4UD r3: NOT when the caller gave a deadline (a request's hook, the
+            # shutdown: 25 s, of which the save itself needs 20) — a /props that
+            # hangs to its 5 s timeout would spend the room the save needs, and
+            # `head_saves.save` reads the identity after llama answered anyway
+            ident = hs.get("identity")
+            if late is None:
                 try:
                     ident = await asyncio.to_thread(_head_saves.server_identity, hs["base"])
                 except Exception:  # noqa: BLE001 — r3: /props down is not another model
-                    ident = hs.get("identity")
-                if ident != hs.get("identity"):
-                    # round 2: llama now runs another model — not under the old
-                    # identity. §4TJ: req c6751cb9 lost 80k tokens here silently
-                    # (the only plan left was from the model before a swap)
-                    pretty_log("Conversation", f"not saved before {why} — llama runs another model than the "
-                               f"last save plan; its next request re-reads it", icon=Icons.HEAD_FAIL)
-                    return False
+                    pass
+            if ident != hs.get("identity"):
+                # round 2: llama now runs another model — not under the old
+                # identity. §4TJ: req c6751cb9 lost 80k tokens here silently
+                # (the only plan left was from the model before a swap)
+                pretty_log("Conversation", f"not saved before {why} — llama runs another model than the "
+                           f"last save plan; its next request re-reads it", icon=Icons.HEAD_FAIL)
+                return False
             used = getattr(llm, "_slot_session_used", None)
 
             def _still_it() -> bool:
@@ -16551,8 +17011,11 @@ class GhostAgent:
         from .llm import BEFORE_MAIN_DISPATCH_S
         try:
             if getattr(llm, "_conv_saved", None) == (owner, used):
+                logger.info("conversation already on disk before %s — not saved again", why)   # §4UD (H11)
                 return True
             if not still_it():
+                logger.info("conversation not saved before %s: the slot's last call was not this "
+                            "conversation's (another call, or another owner, since)", why)
                 return False
             # the head's size: this head's file, else (a changed head has none
             # yet — the gap that makes it saves first) the newest owner head's
@@ -16562,8 +17025,11 @@ class GhostAgent:
                 n_head = (_head_saves.stored_tokens(hs["dir"], _prev) if _prev else None) or 0
             late_given = late is not None
             late = time.monotonic() + CONV_SAVE_WAIT_S if late is None else late
-            if not await self._slot_idle(hs["base"], late, stop):
-                pretty_log("Conversation", f"not saved before {why} — the main slot stayed busy; its next "
+            _wait_why, _slot = await self._slot_wait(hs["base"], late, stop)
+            if _wait_why:
+                # §4UD (H5): the true reason — an unreachable llama and a request
+                # that started both read "the main slot stayed busy"
+                pretty_log("Conversation", f"not saved before {why} — {SLOT_WAIT_WHY[_wait_why]}; its next "
                            f"request re-reads it", icon=Icons.HEAD_FAIL)
                 return False
             n = await asyncio.to_thread(_head_saves.slot_tokens, hs["base"])
@@ -16576,6 +17042,8 @@ class GhostAgent:
                            f"request re-reads it", icon=Icons.HEAD_FAIL)              # §4TJ: was silent
                 return False
             if not still_it():
+                logger.info("conversation not saved before %s: a call reached the slot while its "
+                            "state was being read", why)
                 return False
             # §4SA review: one file per conversation AND level — a flip between
             # levels must not overwrite the other level's state
@@ -16602,7 +17070,18 @@ class GhostAgent:
             t0 = time.monotonic()
             # §4SA: whether the state opens with the head (the owner on Slack's
             # does not) — the restore sets the head mark from it
+            # §4UD (H1): what the state opens with — the tool-list and
+            # system-text hashes of the conversation's own last call
+            # (`note_main_slot_prompt`); the restore refuses a file whose tag is
+            # not its request's. A state with no such record cannot be bound to
+            # anything and would be discarded at its restore: it is not written.
+            _tag = getattr(llm, "_slot_head_tag", None)
+            if not isinstance(_tag, str) or not _tag:
+                logger.info("conversation not saved before %s: no record of what its state opens with", why)
+                return False
             _extra = {"head_in_slot": getattr(llm, "_head_displaced", False) is not True,
+                      "head": _tag,
+                      "head_n": int(n_head) if n_head else None,   # (H12: the reuse line reads it)
                       "calls": int(getattr(llm, "_slot_request_calls", 0) or 0),   # §4SA: for the head-first gate
                       # §4SO: and the growth (ints or None: the meta is JSON)
                       "start": _int_or_none(getattr(llm, "_slot_request_start", None)),
@@ -16620,15 +17099,22 @@ class GhostAgent:
                 pretty_log("Conversation", f"not saved before {why} ({detail}) — its next request "
                            f"re-reads it", icon=Icons.HEAD_FAIL)
                 return False
-            # (llama runs the save before any call posted after it, so the
-            # file is this conversation; the "on disk" mark only while it is
-            # still what the slot holds)
-            if still_it():
-                llm._conv_saved = (owner, getattr(llm, "_slot_session_used", used))
-                # review r2: what a later claim may trust — this conversation,
-                # this many tokens, last on the slot
-                llm._conv_last_saved = (owner, _head_saves.stored_tokens(hs["dir"], key),
-                                        time.monotonic(), key)          # (§4SA r2: which file)
+            # §4UD (H13): a call that reached the slot between the last check
+            # and the save may be what llama saved (any count from n up
+            # passes) — the file is not known to be this conversation: not kept,
+            # not reported as saved. (Before: kept and "saved", only the "on
+            # disk" mark was withheld.)
+            if not still_it():
+                _head_saves.discard(hs["dir"], key)
+                pretty_log("Conversation", f"not saved before {why} — another call reached the slot "
+                           f"during the save, so the file is not known to be this conversation and "
+                           f"was discarded; its next request re-reads it", icon=Icons.HEAD_FAIL)
+                return False
+            llm._conv_saved = (owner, getattr(llm, "_slot_session_used", used))
+            # review r2: what a later claim may trust — this conversation,
+            # this many tokens, last on the slot
+            llm._conv_last_saved = (owner, _head_saves.stored_tokens(hs["dir"], key),
+                                    time.monotonic(), key)          # (§4SA r2: which file)
             pretty_log("Conversation", f"saved to disk before {why} in {time.monotonic() - t0:.1f}s "
                        f"({detail}) — its next request restores it",
                        icon=Icons.CONV_SAVE)
@@ -16684,11 +17170,21 @@ class GhostAgent:
         return True
 
     async def _conv_restore(self, llm, hs: Dict[str, Any], session: str, rid: str,
-                            late: float, level: Optional[str] = None) -> bool:
+                            late: float, level: Optional[str] = None, *, payload) -> bool:
         """§4RV: before a request's first call, put its conversation back
         from disk (it holds the head too, and llama's checkpoint at its last
         message). True when it is in the slot. §4RW-f: ``level`` is the
-        call's effort level (None: unknown)."""
+        call's effort level (None: unknown).
+        §4UD (H1; r2 by content): ``payload`` is the call about to run. Its
+        tag (`llm.head_bind_tag`: the hashes of its tool list and of its system
+        text) must equal the file's meta ``head`` — the tag of the call that
+        built the saved state. Anything else (other tools, another system
+        text, or no field: a file saved before §4UD) is refused AND discarded
+        with one line: it parts from this prompt inside the head, so llama
+        would re-read head and conversation from token 0 where the head's own
+        file costs only the conversation. The caller then restores the head."""
+        from .llm import expect_restore_reuse, head_bind_tag
+        bound = head_bind_tag(payload)
         # §4SA review: this level's own file first; the plain key is a file saved
         # before §4SA or at an unknown level (the level check below judges it)
         ckey = _head_saves.conv_key(hs.get("identity", ""), session, level) if level else None
@@ -16704,6 +17200,14 @@ class GhostAgent:
             # replacing the file and its meta right now)
             n_conv = _head_saves.stored_tokens(hs["dir"], ckey)
             if not n_conv:
+                return False
+            saved_head = _head_saves.meta_field(hs["dir"], ckey, "head")
+            if not bound or saved_head != bound:
+                _head_saves.discard(hs["dir"], ckey)
+                pretty_log("Conversation", "not restored — its file was saved on "
+                           + ("another head (the system text or the tool list changed since)"
+                              if saved_head and bound else "an unrecorded head")
+                           + "; file discarded, the head instead", icon=Icons.CONV_LEFT)
                 return False
             saved_level = _head_saves.meta_field(hs["dir"], ckey, "effort")
             # §4SA review: the file holds the previous request's last 12
@@ -16730,6 +17234,7 @@ class GhostAgent:
                 return False
             _ls = getattr(llm, "_conv_last_saved", None)
             _end = getattr(llm, "_last_main_call_end", None)
+            claimed = False
             if (isinstance(_ls, tuple) and _ls[:2] == (session, n_conv)
                     and (len(_ls) < 4 or _ls[3] == ckey)         # §4SA r2: this level's file
                     # round-3 review: and no call ran on the slot since that save
@@ -16737,15 +17242,18 @@ class GhostAgent:
                     and await asyncio.to_thread(_head_saves.slot_tokens, hs["base"]) == n_conv):
                 # review: the slot still holds what the file holds (a gap job
                 # saved it, then deferred) — it is this conversation's again
-                ok, detail, dt, _n = True, "already in the slot", 0.0, n_conv
+                ok, detail, dt, _n, claimed = True, "already in the slot", 0.0, n_conv, True
             else:
                 # (review r2: "already here" is the claim above's call; an equal
                 # count alone is not this conversation)
                 res = await self._restore_when_idle(llm, {**hs, "key": ckey}, late, skip_n=-1)
                 if res is None:
+                    # (`_restore_when_idle` wrote why; the file stays)
+                    logger.info("conversation not restored from head-%s: nothing was posted — the head instead",
+                                ckey)
                     return False
                 ok, detail, dt, _n = res
-                if not ok and any(w in str(detail).lower() for w in ("timeout", "timed out")):
+                if _head_saves.restore_timed_out(detail):
                     # §4RW review MAJOR: llama finishes a restore the client gave
                     # up on (a 6 GB file under swap) — the head restored after it
                     # threw the conversation away. §4RW-e (review) posted the
@@ -16759,13 +17267,16 @@ class GhostAgent:
                     # Only posted when the request's deadline allows its bound.
                     _bound = _head_saves.restore_timeout_s(hs["dir"], ckey)
                     if (late - time.monotonic() >= _bound            # r3: the idle wait inside it too
-                            and await self._slot_idle(hs["base"], min(time.monotonic() + CONV_SAVE_WAIT_S,
-                                                                      late - _bound))):
-                        ok2, detail2, dt2 = await asyncio.to_thread(_head_saves.restore, hs["base"],
-                                                                    hs["dir"], ckey)
-                        if ok2:
+                            and not (await self._slot_wait(hs["base"], min(time.monotonic() + CONV_SAVE_WAIT_S,
+                                                                           late - _bound)))[0]):
+                        ok2, detail2, dt2 = await self._restore_file({**hs, "key": ckey})
+                        # §4UD r2 (F5): ok2 None = NOTHING WAS POSTED (/props did
+                        # not answer, another server) — not a second timeout of a
+                        # restore: the conversation is not claimed, the head instead
+                        # (`restore_timed_out` is False for both not-posted reasons)
+                        if ok2 is True:
                             ok, detail, dt = True, f"{detail2}; the second try, after a timeout", dt + dt2
-                        elif any(w in str(detail2).lower() for w in ("timeout", "timed out")):
+                        elif _head_saves.restore_timed_out(detail2):
                             ok, detail, dt = True, (f"{n_conv} tokens; llama is still reading it after "
                                                     f"two timeouts"), dt + dt2
         if not ok:
@@ -16797,6 +17308,12 @@ class GhostAgent:
         llm._head_displaced_early = False           # (review: a background call's marks must not outlive it)
         llm._head_displaced_by = "conversation restore"
         llm._slot_moved_on = False
+        llm._slot_head_tag = bound                  # §4UD (H1): the state is the file's, which opens with this
+        if not claimed:
+            # §4UD (H12): this call's reply says whether llama reused it (a
+            # state claimed in the slot was not restored: nothing to judge)
+            expect_restore_reuse(llm, payload, ckey, "conversation", n_conv,
+                                 head_n=_int_or_none(_head_saves.meta_field(hs["dir"], ckey, "head_n")))
         pretty_log("Conversation", f"restored from disk in {dt:.1f}s ({detail}) — it resumes at "
                    f"its last message", icon=Icons.CONV_RESTORE)
         return True
@@ -16832,61 +17349,86 @@ class GhostAgent:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _restore_file(self, hs: Dict[str, Any], late: Optional[float] = None):
+        """§4UD (H10): the ONE place the agent posts a slot restore
+        (`head_saves.restore`) — the warm-up's, a request's (head, members'
+        head, conversation, over an outside call) and the owner's head after a
+        members' prefill all end here, so none can lack a check the others have.
+        The caller has waited for an idle slot (`_slot_wait`).
+
+        llama's identity is read from /props NOW: the plan's can be a tick old,
+        and a llama restarted on another model of the same shape would take
+        the old state silently (H2: `_outside_slot_restore` had no such read).
+        Refused when it is not the plan's, or not the one in the file's meta.
+        ``late``: past it the thread posts nothing (review r1: the client's
+        bound cancels the wait, not a thread that starts late).
+
+        Returns ``(ok, detail, seconds)`` as `head_saves.restore` does; ``ok``
+        is None when NOTHING WAS POSTED, with ``detail`` one of
+        `RESTORE_NO_PROPS` / `RESTORE_OTHER_SERVER` (the line is written here).
+        A caller reads ``ok``, never the words: only ``ok is False`` is a
+        restore llama was asked for and did not confirm."""
+        base, d, key = hs["base"], hs["dir"], hs["key"]
+        ident, err = await asyncio.to_thread(_head_saves.confirmed_identity, base)   # (r3: asked twice, as `save` does)
+        if ident is None:
+            logger.info("head disk: llama's /props did not answer (%s) — head-%s not restored", err, key)
+            return (None, RESTORE_NO_PROPS, 0.0)
+        saved_ident = _head_saves.meta_field(d, key, "identity")
+        if ident != hs.get("identity") or (saved_ident and saved_ident != ident):
+            logger.info("head disk: llama now runs another model, build or template than "
+                        "head-%s was saved on — no restore until the next plan", key)
+            return (None, RESTORE_OTHER_SERVER, 0.0)
+
+        def _restore_in_time():
+            if late is not None and time.monotonic() > late:
+                return False, "too late to post", 0.0
+            return _head_saves.restore(base, d, key)
+        return await asyncio.to_thread(_restore_in_time)
+
     async def _restore_when_idle(self, llm, hs: Dict[str, Any], late: float, *, skip_n: int,
                                  park: bool = False):
-        """§4RU-r: wait (until ``late``) for llama's slot to be idle — a reply
-        still draining or a background verdict ahead of this call, which the
-        call would wait behind in llama anyway (review 10-27: giving up on a
-        busy slot brought back the 5a58a6ca re-processing) — then restore
-        ``hs``'s file, unless the slot holds ``skip_n`` tokens or llama does
-        not say. Reads llama's own state, not the agent's counters (a leaked
-        stream count once held every tick). The server identity is read again
-        (review: the plan can be a tick old — a llama restarted on another
-        model of the same shape would take the old state silently). ``park``
-        (a member's turn): park the slot's state in llama's RAM cache first,
-        as llama itself did before §4RU, unless it holds exactly the owner's
-        head (on disk). Returns (ok, detail, seconds, slot tokens), or None
-        when nothing was posted."""
-        def _read():
-            return (_head_saves._http(hs["base"] + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID]
-        unread = 0
-        while True:
-            try:
-                slot = await asyncio.to_thread(_read)
-                unread = 0
-            except Exception as e:  # noqa: BLE001 — llama answers /slots only between batches
-                slot = {}
-                # round-3 review: a read that TIMED OUT is a long batch (a
-                # prefill ahead of this call) — wait on; only a fast failure
-                # (refused, an HTTP error) means a llama that will not answer
-                _t = f"{type(e).__name__} {e}".lower()
-                if not ("timeout" in _t or "timed out" in _t):
-                    unread += 1
-                if unread >= SWITCH_UNREAD_LIMIT:
-                    # round-2 review: a wedged or slot-less llama cost ~118 s
-                    # before every request's first call
-                    logger.info("head disk: llama's /slots did not answer %d times — no restore", unread)
-                    return None
-            if slot and "is_processing" not in slot:
-                return None                  # a llama that does not say: leave it
-            if slot and not slot["is_processing"]:
-                break
-            if time.monotonic() > late:
-                logger.info("head disk: the main slot stayed busy past the deadline — no restore")
-                return None
-            await asyncio.sleep(0.5)
+        """§4RU-r / §4UD (H10): THE "wait for the slot, then restore" — every
+        request-path restore (the head, the members' head, a conversation, the
+        head over an outside call) runs it. Waits (until ``late``) for llama's
+        slot to be idle (`_slot_wait`: a reply still draining or a background
+        verdict ahead of this call, which the call would wait behind in llama
+        anyway — review 10-27: giving up on a busy slot brought back the
+        5a58a6ca re-processing; it carries the unread limit), then restores
+        ``hs``'s file through `_restore_file` (the identity re-read), unless the
+        slot holds ``skip_n`` tokens.
+
+        §4UD (H6): a slot llama does not count yet (``n_prompt_tokens`` absent
+        until its first completion) is restored into when llama has served
+        nothing since it started (`server_fresh`: the slot is empty, nothing can
+        be lost) — the first request after a llama restart got neither its file
+        nor the head. Not fresh and no count: left alone, as before (§4RO r5:
+        the count can be missing while llama copies state), now with a line.
+
+        ``park`` (a member's turn): park the slot's state in llama's RAM cache
+        first, as llama itself did before §4RU, unless it holds exactly the
+        owner's head (on disk) or llama is fresh. Returns (ok, detail, seconds,
+        slot tokens), or None when nothing was posted — every such exit writes
+        one line saying why (§4UD, H11)."""
+        why, slot = await self._slot_wait(hs["base"], late)
+        if why:
+            logger.info("head disk: head-%s not restored — %s", hs["key"], SLOT_WAIT_WHY[why])
+            return None
         n = slot.get("n_prompt_tokens")
-        if n is None or int(n) == skip_n:
+        fresh = False
+        if n is None:
+            fresh = await asyncio.to_thread(_head_saves.server_fresh, hs["base"])
+            if not fresh:
+                logger.info("head disk: head-%s not restored — llama did not say how many tokens the "
+                            "slot holds, and it has served requests since it started", hs["key"])
+                return None
+            logger.info("head disk: llama has served nothing since it started — head-%s is restored "
+                        "into its empty slot", hs["key"])
+            n = 0
+        if int(n) == skip_n:
+            logger.info("head disk: head-%s not restored — the slot already holds exactly its %d tokens",
+                        hs["key"], int(n))
             return None
-        try:
-            ident = await asyncio.to_thread(_head_saves.server_identity, hs["base"])
-        except Exception:  # noqa: BLE001
-            return None
-        if ident != hs.get("identity"):
-            logger.info("head disk: llama now runs another model/build/template than the "
-                        "saved head's — no restore until the next warm-up plans again")
-            return None
-        if park:
+        if park and not fresh:
             owner_hs = getattr(self, "_head_plan_last", None)
             owner_n = (_head_saves.stored_tokens(owner_hs["dir"], owner_hs["key"])
                        if isinstance(owner_hs, dict) else None)
@@ -16902,15 +17444,9 @@ class GhostAgent:
                 if not parked:
                     logger.info("members' head: could not park the slot first (%s) — no restore", why)
                     return None
-
-        def _restore_in_time():
-            # review r1: the client's bound cancels the wait, not a thread that
-            # starts late — past this deadline the thread posts nothing, so a
-            # restore never reaches llama after the call it was for
-            if time.monotonic() > late:
-                return False, "too late to post", 0.0
-            return _head_saves.restore(hs["base"], hs["dir"], hs["key"])
-        ok, detail, dt = await asyncio.to_thread(_restore_in_time)
+        ok, detail, dt = await self._restore_file(hs, late)
+        if ok is None:
+            return None                      # (`_restore_file` wrote the reason)
         return ok, detail, dt, int(n)
 
     async def _member_head_plan(self, llm) -> Optional[Dict[str, Any]]:
@@ -17001,8 +17537,9 @@ class GhostAgent:
         save. Gives up — the call then processes the head as before — when the
         slot stays busy, the deadline is too close, or the slot moved on."""
         try:
-            if not await self._slot_idle(hs["base"], late):
-                pretty_log("Head Disk", "members' head not saved — the main slot stayed busy; "
+            _wait_why, _slot = await self._slot_wait(hs["base"], late)
+            if _wait_why:
+                pretty_log("Head Disk", f"members' head not saved — {SLOT_WAIT_WHY[_wait_why]}; "
                            "this request processes it as before", icon=Icons.HEAD_FAIL)
                 return False
             left = late - time.monotonic()
@@ -17122,8 +17659,7 @@ class GhostAgent:
             # (review 10-27: only if the plan's server is still the one running)
             if (owner_hs.get("identity") == hs.get("identity")
                     and await self._head_slot_quiet(llm, owner_hs)):
-                ok, detail, rdt = await asyncio.to_thread(
-                    _head_saves.restore, owner_hs["base"], owner_hs["dir"], owner_hs["key"])
+                ok, detail, rdt = await self._restore_file(owner_hs)     # §4UD (H10): the one sink
                 if ok:
                     llm._head_displaced = False
                     release_slot_session(llm, stamp=False)
@@ -17141,47 +17677,44 @@ class GhostAgent:
         call without the head, another request's stream or request live."""
         from .llm import opens_with_head, outside_slot_dirty, release_slot_session
         if not opens_with_head(payload, getattr(llm, "_head_ref", None)):
-            return
+            return                           # (a call without the head spends the mark: the normal rules)
         if (int(getattr(llm, "_main_streams_open", 0) or 0) > 0
                 or int(getattr(llm, "foreground_requests", 0) or 0) > 1):
+            logger.info("head disk: head not restored over an outside call's state — another request "
+                        "or stream is live")
             return
         n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
         if not n_head:
+            logger.info("head disk: head not restored over an outside call's state — no file for this head")
             return
 
-        def _read():
-            return (_head_saves._http(hs["base"] + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID]
-        while True:
-            try:
-                slot = await asyncio.to_thread(_read)
-            except Exception:  # noqa: BLE001 — llama answers /slots only between batches
-                slot = {}
-            if slot and "is_processing" not in slot:
-                return                       # a llama that does not say: leave it
-            if slot and not slot["is_processing"]:
-                break
-            if time.monotonic() > late:
-                pretty_log("Head Disk", "head not restored: an outside call is still on the main "
-                           "slot — this call waits behind it and re-processes the head",
-                           icon=Icons.HEAD_FAIL)
-                return
-            await asyncio.sleep(0.5)
+        # §4UD (H10): the same wait and the same restore sink as every other
+        # restore — this copy had neither the unread limit (a refusing llama
+        # was polled to the 118 s deadline) nor the identity re-read
+        why, slot = await self._slot_wait(hs["base"], late)
+        if why == "busy":
+            pretty_log("Head Disk", "head not restored: an outside call is still on the main "
+                       "slot — this call waits behind it and re-processes the head",
+                       icon=Icons.HEAD_FAIL)
+            return
+        if why:
+            logger.info("head disk: head not restored over an outside call's state — %s", SLOT_WAIT_WHY[why])
+            return
         # review r2 MAJOR: the wait took seconds — another request may have
         # run its call meanwhile (that spends the mark) and be in its tool gap
         if (not outside_slot_dirty(llm)
                 or int(getattr(llm, "_main_streams_open", 0) or 0) > 0
                 or int(getattr(llm, "foreground_requests", 0) or 0) > 1):
+            logger.info("head disk: head not restored over an outside call's state — another call or "
+                        "request took the slot during the wait")
             return
         n = slot.get("n_prompt_tokens")
         if n is not None and int(n) == n_head:
             llm._outside_slot_dirty = False
             return
-
-        def _restore_in_time():
-            if time.monotonic() > late:
-                return False, "too late to post", 0.0
-            return _head_saves.restore(hs["base"], hs["dir"], hs["key"])
-        ok, detail, dt = await asyncio.to_thread(_restore_in_time)
+        ok, detail, dt = await self._restore_file(hs, late)
+        if ok is None:
+            return                           # (`_restore_file` wrote the reason)
         if ok:
             # review 2026-10-26: an outside call that started meanwhile (a
             # background caller's restore is not gated by /outside-call start)
@@ -17237,14 +17770,23 @@ class GhostAgent:
     async def _head_save_plan(self, llm, payload) -> Optional[Dict[str, Any]]:
         """§4RO: None when head saves are off or the server cannot take them;
         else this head's file key and whether a saved head exists for it."""
+        # §4UD r2: why no plan was made goes to `_plan_fail` (code, words) — the
+        # caller that plans the OWNER's head reads it at once; a members' or a
+        # level plan writes it too and changes nothing the owner's log reads
         if not _head_saves.enabled():
+            self._plan_fail = (PLAN_OFF, "head saves are off")
             return None
         try:
             d = _head_saves.head_dir()
             base = _head_saves.server_base(getattr(llm, "upstream_url", ""))
-            if d is None or not _head_saves.supported(base):
+            if d is None:
+                self._plan_fail = (PLAN_NO_HOME, "GHOST_HOME is not set")
+                return None
+            if not _head_saves.supported(base):
+                self._plan_fail = (PLAN_UNSUPPORTED, "llama-server was started without --slot-save-path")
                 return None
             d.mkdir(parents=True, exist_ok=True)
+            _head_saves.secure_dir(d)        # §4UD (H14): the owner's tokens — 0700
             ident = await asyncio.to_thread(_head_saves.server_identity, base)
             rendered = await asyncio.to_thread(_head_saves.render, base, payload)
             key = _head_saves.head_key(ident, rendered)
@@ -17254,6 +17796,9 @@ class GhostAgent:
                     "have": n_tokens is not None, "n_tokens": n_tokens, "parked": False,
                     "restore": False, "restored": None, "detail": "", "restore_s": 0.0}
         except Exception as e:  # noqa: BLE001 — best-effort, like the warm-up
+            self._plan_fail = ((PLAN_UNANSWERED, f"llama did not answer the plan's reads: {type(e).__name__}: {e}"[:200])
+                               if _plan_unanswered(e) else
+                               (PLAN_ERROR, f"the plan failed: {type(e).__name__}: {e}"[:200]))
             logger.debug("head save plan skipped: %s: %s", type(e).__name__, e)
             return None
 
@@ -17331,7 +17876,7 @@ class GhostAgent:
                     icon=Icons.HEAD_RESTORE,
                 )
             elif (hs.get("restore") and verdict == "resident"
-                  and any(w in str(hs.get("detail") or "").lower() for w in ("timeout", "timed out"))):
+                  and _head_saves.restore_timed_out(hs.get("detail"))):
                 # review 10-27: 9 "failed (TimeoutError)" lines were restores
                 # llama applied after the client gave up — the warm-up found
                 # the head cached
@@ -17346,6 +17891,9 @@ class GhostAgent:
                     icon=Icons.HEAD_FAIL,
                 )
             if not _head_saves.supported(base):
+                # (the same words as the plan's reason: the tick that finds no
+                # plan for it does not say it a second time)
+                self._head_plan_why_said = "llama-server was started without --slot-save-path"
                 pretty_log("Head Disk",
                            "head saves off: llama-server was started without --slot-save-path",
                            icon=Icons.HEAD_FAIL)
@@ -17374,6 +17922,9 @@ class GhostAgent:
                     icon=Icons.HEAD_SAVE, durable_only=True,
                 )
             elif not _head_saves.supported(base):
+                # (the same words as the plan's reason: the tick that finds no
+                # plan for it does not say it a second time)
+                self._head_plan_why_said = "llama-server was started without --slot-save-path"
                 pretty_log("Head Disk",
                            "head saves off: llama-server was started without --slot-save-path",
                            icon=Icons.HEAD_FAIL)
@@ -17381,6 +17932,22 @@ class GhostAgent:
                 pretty_log("Head Disk", f"head not saved ({detail})", icon=Icons.HEAD_FAIL)
         except Exception as e:  # noqa: BLE001
             logger.debug("head save skipped: %s: %s", type(e).__name__, e)
+
+    async def _head_dir_upkeep(self) -> None:
+        """§4UD (H14): one prune of the save directory per idle tick — age
+        caps, counts, stale .part files, owner-only modes. Stats and the small
+        meta files only (no llama call, no identity: an identity is given to
+        prune only where it was just read from llama — `head_saves.save` and
+        the llama-start helper). Before, prune ran only on a save or a llama
+        start, so a directory nobody saved into was never looked at."""
+        try:
+            if not _head_saves.enabled():
+                return
+            d = _head_saves.head_dir()
+            if d is not None and d.is_dir():
+                await asyncio.to_thread(_head_saves.prune, d)
+        except Exception as e:  # noqa: BLE001 — upkeep never stops the loop
+            logger.info("head disk: directory upkeep skipped: %s: %s", type(e).__name__, e)
 
     async def _head_saves_back(self) -> bool:
         """§4TJ: lift "head saves off" once llama takes slot actions again
@@ -17550,9 +18117,18 @@ class GhostAgent:
         last_total: Optional[int] = None
         early = True
         busy_since: Optional[float] = None
+        saves_back = False
         while True:
             displaced_by = await self._rewarm_wait(float(period_s), _sleep, early=early)
             early = True
+            # §4UD (H7, H14): once per tick and BEFORE the busy skips below —
+            # the directory's upkeep (no llama call) and the "saves off"
+            # recheck (asked only while the mark is set; llama answers it at
+            # once, busy or not). After the skips, an owner who kept working
+            # kept saves off for the whole session.
+            await self._head_dir_upkeep()
+            if await self._head_saves_back():
+                saves_back = True
             # §4MU: never while a request is live. Its head is in the slot
             # already, and the re-warm — admitted into an image render's
             # idle window — matched that slot at similarity 1.000 and cut the
@@ -17594,8 +18170,11 @@ class GhostAgent:
                 last_total = None
                 continue
             # §4TJ: saves marked off and llama now takes them — this tick's
-            # warm-up makes the plan and installs the save hooks
-            if await self._head_saves_back():
+            # warm-up makes the plan and installs the save hooks (§4UD: the
+            # recheck itself ran at the top of the tick; a tick skipped since
+            # then carries the answer here)
+            if saves_back:
+                saves_back = False
                 last_total = None
             # §4OT r3: a NAMED displacement skips the "nothing ran" check —
             # llama counts a prompt while it is still generating, so the
@@ -17670,6 +18249,12 @@ class GhostAgent:
             step = min(HEAD_POLL_S, left)
             await sleep(step)
             left -= step
+            if (_head_saves.enabled() and not isinstance(getattr(self, "_head_plan_last", None), dict)
+                    and isinstance(getattr(self, "_head_payload_last", None), dict)):
+                # §4UD (H3): no plan (llama was loading when the agent booted) —
+                # asked again here, at `_head_plan_retry`'s own bounded pace,
+                # not a whole tick later
+                await self._head_plan_retry(llm)
             if head_rewarm_due(llm, HEAD_SETTLE_S):
                 return str(getattr(llm, "_head_displaced_by", "") or "unlabelled")
             if left <= 0:
@@ -23647,7 +24232,7 @@ class GhostAgent:
                     # the new file. Keep the two op lists identical; the
                     # test asserts it.
                     is_sandbox_mutation = _cname in ["execute", "image_generation"] or \
-                                          (_cname == "lab" and str(t_args.get("action") or "").strip().lower() == "get") or \
+                                          (_cname == "lab" and str(t_args.get("action") or "").strip().lower() in _LAB_WS_WRITERS) or \
                                           (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"])
 
                     if is_sandbox_mutation:
@@ -31040,6 +31625,7 @@ class GhostAgent:
                         and not m["content"].lstrip().startswith(_FML_r)][-4:]
                 except Exception:  # noqa: BLE001
                     self.context.recent_user_contents = [last_user_content]
+                mood_note_foreign_rows(messages, req_id)        # §4UD (F4): another person's row is in this request
                 try:            # the user's own words, for content-provenance sinks (§4MB)
                     from ..utils.provenance import note_user_message as _note_um, note_recent_user_messages as _note_rum
                     _note_um(last_user_content, req_id)
@@ -32283,6 +32869,7 @@ class GhostAgent:
                         _ds_parts.append(("owner_rule_command", f"### OWNER RULE COMMAND\n{_owner_rule_note_ctx.get()}\n\n"))
                     _ds_parts.append(("owner_rules", _owner_rules_block(self.context)))    # §4NA
                     _ds_parts.append(("mood_tone", _mood_tone_block(self.context)))        # §4TC
+                    _ds_parts.append(("mood_shade", _mood_shade_block(self.context)))      # §4UG
                     _ds_parts.append(("self_image", _self_image_block(self.context)))      # §4TZ
                     try:
                         from .prompts import build_project_briefing
@@ -36460,14 +37047,11 @@ class GhostAgent:
         call). And when the owner SET the mood or the manner in this turn,
         `owner_set` says so: his word holds for the turn."""
         from ..selfhood.mood import TurnSignals
-        from ..tools.introspect import NO_CHANGE_NOTES as _no_change, is_write_call as _is_mood_write
         from .link_grounding import fetched_urls
         turn = list(msgs or [])[self._this_turn_boundary(msgs, real_request) + 1:]
-        owner_set = any(c.name == "introspect" and _is_mood_write(c.arguments)
-                        and c.result and not c.error
-                        # §4TX r4/r6: a call that changed nothing (its notes come last) is not his word
-                        and not str(c.result).startswith(_no_change)
-                        for c in self._reconstruct_tool_calls(turn))
+        # §4TX r4/r6: a set_mood call that changed nothing is not his word. §4UD (W2): read off what the tool
+        # DECLARED (`mood_write_changed`), not off how its sentence begins
+        owner_set = any(mood_write_changed(m) for m in turn)
         seen = [m for m in turn if not _mood_blind_row(m)]
         calls = [c for c in self._reconstruct_tool_calls(seen) if (c.result or c.error)]
         rows = [m for m in seen if isinstance(m, dict) and m.get("role") == "tool"]
@@ -37063,6 +37647,11 @@ class GhostAgent:
         _si = self_image_heard(req_id or "")                    # §4TZ: which Mirror sentence it heard
         if _si:
             _extra["self_image"] = _si
+        _shade_heard = mood_shade_heard(req_id or "")           # §4UG: the mood's shade this reply carried
+        if _shade_heard:
+            _extra["mood_shade"] = _shade_heard
+        with _MOOD_MEMO_LOCK:                                   # the request is over: a client that sends the
+            _MOOD_SHADE_BY_REQ.pop(str(req_id or ""), None)     # same id again starts a new one (review r3)
         # §4OG-2 (b): the DELIVERABLE decides before any shape rule — a green
         # last run, or a file this turn wrote that the reply hands over
         try:
@@ -37464,9 +38053,14 @@ class GhostAgent:
                 # length are not the owner's turn (`SelfModel.note_job_tasks_done`)
                 _sm_mood = _mood_model(self.context)
                 if _sm_mood is not None:
-                    _done = self._mood_turn_signals(msgs, user_request, req_id).tasks_done
+                    _job_sig = self._mood_turn_signals(msgs, user_request, req_id)
+                    _done = _job_sig.tasks_done
                     if _done:
                         _sm_mood.note_job_tasks_done(_done)
+                    if _job_sig.tool_calls > 0:
+                        # §4UD (F9): the job WORKED for the owner — not a quiet (the face read "bored" while
+                        # job turns ran all day). Only here: a probe, a member, a scheduled task never reach it
+                        _sm_mood.owner_job_worked()
         except Exception as e:
             logger.debug(
                 "mood turn update skipped: %s: %s",

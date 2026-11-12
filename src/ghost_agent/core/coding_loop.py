@@ -520,18 +520,32 @@ async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bo
     _want = project_id or getattr(context, "current_project_id", None)
     leaf_scope = RequestScope(project_id=_want, origin=ORIGIN_LEAF)
     # §4SX D4 review r2 #5/#7: the leaf's labs and its "no lab" answers are tagged with THIS leaf / build
-    from .lab_waits import BUILD_KEY, LEAF_ID
+    from .lab_waits import BUILD_KEY, LEAF_ID, RUNNING_LEAVES
     _tk = (BUILD_KEY.set(str(leaf_id).rsplit("-a", 1)[0]), LEAF_ID.set(str(leaf_id)))
+    # §4UD F1: THIS turn's deadline, where the lab tool reads what is left (`tools/labs._time_left_s`) — never past
+    # a caller's own (the unattended step's cap). It was not set, so a leaf with 4 minutes left sent `lab exec
+    # timeout_s=900`: the command outlived the turn, held its lab, and the leaf-end destroy was refused.
+    from .coding_executor import leaf_deadline_context as _ldc
+    _turn_s = max(30.0, float(timeout_s))
+    _outer = float(_ldc.get() or 0.0)
+    _mine = time.monotonic() + _turn_s
+    _tk_dl = _ldc.set(min(_mine, _outer) if _outer > 0 else _mine)
+    # the leaf counts as running until its end clean-up below has finished (the periodic leaf sweep skips it)
+    RUNNING_LEAVES.add(str(leaf_id))
+    _end_pending = False
     try:
         content, _, _ = await asyncio.wait_for(
             agent.handle_chat(body, background_tasks=None, request_id=f"sub-leaf-{leaf_id}",
                               scope=leaf_scope),
-            timeout=max(30.0, float(timeout_s)))
+            timeout=_turn_s)
     finally:
+        _ldc.reset(_tk_dl)
         BUILD_KEY.reset(_tk[0])
         LEAF_ID.reset(_tk[1])
         # §4SX D4: a leaf's labs are disposable and end with the leaf (a timeout or a crash too); bounded, and a
         # cancel that lands during it is re-raised (review r2 #11)
+        if not _want:
+            RUNNING_LEAVES.discard(str(leaf_id))
         if _want:
             _t_end = None
             try:
@@ -557,14 +571,20 @@ async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bo
                     # collected mid-run) and its error logged once, here (nobody awaits it any more)
                     _LEAF_END_TASKS.add(_t_end)
 
+                    _end_pending = True
+
                     def _seen(f, _lid=leaf_id):
                         _LEAF_END_TASKS.discard(f)
+                        RUNNING_LEAVES.discard(str(_lid))      # the end has run: the sweep may look at it now
                         if not f.cancelled() and f.exception() is not None:
                             logger.warning("leaf %s end: %s: %s", _lid, type(f.exception()).__name__, f.exception())
                     _t_end.add_done_callback(_seen)
                 raise
             except Exception as e:  # noqa: BLE001 — a cleanup never masks the turn's own outcome
                 logger.warning("leaf labs not cleaned up: %s: %s", type(e).__name__, e)
+            finally:
+                if not _end_pending:
+                    RUNNING_LEAVES.discard(str(leaf_id))
     # §4FH C1: the pin must have survived the turn — if anything moved it,
     # the leaf's files went somewhere other than the project and the
     # attempt is a failure, not a success with an empty diff.

@@ -260,6 +260,10 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                     _b += " · STALE (died with old sandbox — `run restart` it on demand)"
                 if r.get("at"):
                     _b += " (checked " + _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(float(r["at"]))) + ")"
+            if r.get("note"):
+                # §4UD F10: what the local record itself says about its age (a lab's latest end, a lab run past
+                # its time limit) — no host call
+                _b += f" · {r['note']}"
             lines.append(_b)
     if services:
         # review 11-05 W-m: these are services NO run row covers (registered before `run`) — `run` refuses their

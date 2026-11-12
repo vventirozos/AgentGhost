@@ -19,14 +19,13 @@ MUT = [
     ('CONTROL known-bad', L, '        if action in KEPT_ACTIONS:                 # production: refused before any host call', '        if False:'),
     ('CONTROL no-op', W, 'def holds_of(project: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:', 'def holds_of(project: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:  # no-op'),
     # leaf / autopilot lab access
-    ('L1 no-owner-refusal', L, '            why = await _autopilot_owner_refusal(context, lab_id, owner)\n            if why:', '            why = ""\n            if why:'),
+    ('L1 no-owner-refusal', L, '            why = await _autopilot_owner_refusal(context, lab_id, owner, action)\n            if why:', '            why = ""\n            if why:'),
     ('L2 all-owners-ok', L, '        if action == "list" and _truthy(all_owners):\n            return ToolOutcome("LAB ERROR (not_allowed): unattended', '        if False:\n            return ToolOutcome("LAB ERROR (not_allowed): unattended'),
-    ('L3 owner-404-unknown', L, '        theirs = str((row or {}).get("owner") or "")\n        if not theirs:', '        theirs = ""\n        if not theirs:'),
+    ('L3 owner-404-unknown', L, '        theirs = str((row or {}).get("owner") or "")\n        if who == "probe"', '        theirs = ""\n        if who == "probe"'),
     ('L4 no-wait-note', L, '    if origin == "autopilot":\n        _note_lab_wait(out, action)', '    if False:\n        _note_lab_wait(out, action)'),
     ('L5 kept-probe-anywhere', L, '        return "" if _probe_project(context) else ("a probe uses', '        return "" if True else ("a probe uses'),
     ('L6 secret-values-ok', L, '        if "secret_values" in p:', '        if False:'),
-    ('L7 probe-keep-any-owner', L, '        if origin == "probe" and str(det.get("owner") or "") != f"project:{_cur}":', '        if False:'),
-    ('L8 drop-data-always', L, '            if others == []:\n                params["drop_data"] = "1"', '            if True:\n                params["drop_data"] = "1"'),
+    ('L8 drop-data-always', L, '    if others == []:\n        params["drop_data"] = "1"\n        return params, ""', '    if True:\n        params["drop_data"] = "1"\n        return params, ""'),
     ('L9 tar-blocking-open', L, 'os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),', 'os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),'),
     ('L10 leaf-filter-gone', L, '            if r.get("origin") == "autopilot" and str(r.get("leaf") or "") == str(leaf_id)]', '            if r.get("origin") == "autopilot"]'),
     ('L11 destroy-kept-unattended', L, '            if _kept_refusal(origin, context):\n                return ToolOutcome(f"LAB ERROR (not_allowed): {lab_id} is KEPT', '            if False:\n                return ToolOutcome(f"LAB ERROR (not_allowed): {lab_id} is KEPT'),
@@ -86,7 +85,7 @@ MUT = [
     ('S8 holds-not-system', P, '                         "lab_waits", "lab_waits_rounds")', '                         )'),
 ]
 PINS = ["tests/test_4sx_d3_kept.py", "tests/test_4sx_d4_autopilot_labs.py", "tests/test_4sx_b_lab_tool.py",
-        "tests/test_4sx_c_run_battery.py"]
+        "tests/test_4sx_c_run_battery.py", "tests/test_4ud_labs.py"]
 
 
 def _tests():

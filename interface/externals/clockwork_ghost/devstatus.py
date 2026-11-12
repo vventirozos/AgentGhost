@@ -9,6 +9,7 @@ live here, where they can be executed in tests; ``client.py`` only draws.
 
 from __future__ import annotations
 
+import html
 import math
 import os
 import re
@@ -100,9 +101,18 @@ def wifi_bars(pct) -> str:
 
 # ── the status readout ──────────────────────────────────────────────────────
 
+MOOD_WORDS_MAX = 60
+
+
 def status_html(agent_ok, wifi_pct, bat_pct, bat_state, clock: str,
-                ok: str, danger: str, dim: str) -> str:
-    """The bottom-right readout: ``● ▂▄▆  ⚡ 100%  10:30 AM``.
+                ok: str, danger: str, dim: str, mood: str = "") -> str:
+    """The bottom-right readout: ``calm, 1 of 3  ● ▂▄▆  ⚡ 100%  10:30 AM``.
+
+    * ``mood`` (§4UD) is the agent's mood in words (``agentapi.mood_words``),
+      first and dim; nothing is printed for ``""``. It is the only place the
+      mood can be READ on this device, and it does not depend on the face, so
+      it stays with animations off. Escaped (the label is rich text) and cut
+      at ``MOOD_WORDS_MAX`` characters so it cannot push the chips;
 
     * the dot is the AGENT: green when it answered the last poll, red when it
       did not, dim before the first poll — the operator used to learn the
@@ -112,7 +122,13 @@ def status_html(agent_ok, wifi_pct, bat_pct, bat_state, clock: str,
       ``LOW_BATTERY_PCT`` on battery.
     """
     dot_color = dim if agent_ok is None else (ok if agent_ok else danger)
-    parts = [f"<span style='color:{dot_color};'>●</span>"]
+    parts = []
+    mood = " ".join(str(mood or "").split())
+    if mood:
+        if len(mood) > MOOD_WORDS_MAX:
+            mood = mood[:MOOD_WORDS_MAX - 1] + "…"
+        parts.append(f"<span style='color:{dim}; font-size:13px;'>{html.escape(mood)}</span>")
+    parts.append(f"<span style='color:{dot_color};'>●</span>")
     bars = wifi_bars(wifi_pct)
     if bars:
         parts.append(bars)

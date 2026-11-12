@@ -70,6 +70,7 @@
       <tr><td><code>blank-dev</code></td><td>dev (Debian)</td><td>Tor</td><td>anything else</td></tr>
     </tbody>
   </table></div>
+  <p>The templates ship with the labs service's code and are read from its own <code>templates/</code> folder, so deploying the code deploys them. <code>/etc/ghost-labs/templates/</code> on the host holds only templates the operator adds; a file there with a shipped template's name, or one that does not parse, is not loaded, and the service logs a warning when it starts. (Until 11-11 the service read a copy in <code>/etc</code> that only the installer refreshed, and a template fix synced with the code was not used.)</p>
   <p>"Tor" means the lab reaches the internet only through the labs host's Tor gateway, as the agent itself does. "None" means no route out at all. A lab never reaches the agent's Mac or the home network.</p>
 
   <h2 id="try">Try it</h2>
@@ -87,10 +88,13 @@
 
   <h2 id="how">How it works</h2>
   <ol class="flow">
-    <li><h4>Create</h4><p>The agent asks for a template and waits until the lab's readiness check passes (at most five minutes, never past the turn's own deadline). The lab is recorded in the agent's lab inventory: who made it, for which conversation or project.</p></li>
-    <li><h4>Use</h4><p>Run commands on a member, copy files in and out, read logs, call a member's HTTP port, start a long job, or inject faults: stop, start, restart, kill, pause, unpause, isolate, rejoin.</p></li>
-    <li><h4>End</h4><p>The agent destroys the lab when done. If it forgets, the host's reaper removes an idle lab: after 4 hours for an ad-hoc lab, 12 hours inside a project, 2 hours for an autopilot build's lab, 30 minutes for a test probe, or once it reaches its maximum age.</p></li>
+    <li><h4>Create</h4><p>The agent asks for a template and waits until the lab's readiness check passes (at most five minutes, never past the turn's own deadline). The database templates also check each member's own service (PostgreSQL: its socket; MySQL: a ping) inside the same wait. A member that is not ready when the wait ends does not fail the create: the result names it and the command that checks it, and says "not checked" instead when the wait ended before its check could run. The lab is recorded in the agent's lab inventory: who made it, for which conversation or project.</p></li>
+    <li><h4>Use</h4><p>Run commands on a member, copy files in and out, read logs, call a member's HTTP port, start a long job or a server, or inject faults: stop, start, restart, kill, pause, unpause, isolate, rejoin. A fault, or a destroy, does not wait for a command that is still running on the lab. A command that is still running can be cancelled: you can end any command on your lab, and an autopilot build can end only a command it started itself, never one on a kept lab. The answer says "killed" only when the labs host saw the command gone; when the kill could not be delivered it says so, and that the command may still be running. A folder copied out of a lab is checked entry by entry before anything is written: nothing lands in a released project or a <code>.git</code> directory, and nothing in the workspace is replaced to make room.</p></li>
+    <li><h4>End</h4><p>The agent destroys the lab when done. If it forgets, the host's reaper removes an idle lab: after 4 hours for an ad-hoc lab, 12 hours inside a project, 2 hours for an autopilot build's lab, 30 minutes for a test probe, or once it reaches its maximum age (1 day ad hoc, 3 days in a project). A lab with a command running on it is in use, not idle.</p></li>
   </ol>
+  <h3>Things that keep running on a lab</h3>
+  <p>The <code>run</code> tool starts a <strong>job</strong> (runs to its end, 45 minutes at most, then its result is collected) or a <strong>server</strong> on a lab member. A server gets its port in <code>$PORT</code> and must listen on <code>0.0.0.0</code>; it has no time limit of its own and runs until it is stopped or its lab goes. Right after the start the agent asks the port once and reports what it got: an answer, nothing yet, or a process that listens on <code>127.0.0.1</code> only. <code>run url</code> gives the tailnet address when the lab's template publishes that port (<code>python-app</code> publishes 8080, <code>web</code> 80).</p>
+  <p>Nothing automatic ends a workspace server you started. In your own chat, <code>run status all=true</code> lists the live runs of every conversation and project from the agent's records, and <code>run stop name=&lt;run id&gt;</code> stops any of them. A conversation's workspace server that has run for more than a day is listed there with its age and the stop command; it is not stopped.</p>
   <h3>Kept apps</h3>
   <p>A lab made inside a project can be <strong>kept</strong>. It then runs one app under a stable address with no expiry. A new version is a second lab of the same app: you deploy it, rehearse it on a throw-away twin with empty data and fake secrets, then switch the address over. A failed check reverses the switch, and you can roll back. App secrets are never tool arguments; the host masks them in every output.</p>
   <h3>Who may do what</h3>
@@ -98,7 +102,7 @@
     <thead><tr><th>Caller</th><th>Disposable labs</th><th>Kept apps</th></tr></thead>
     <tbody>
       <tr><td>You, in your own chat</td><td>everything</td><td>everything: keep, deploy, switch, rollback, backup, restore</td></tr>
-      <tr><td>Autopilot</td><td>only its own project's; destroyed when the build step ends</td><td>read status only</td></tr>
+      <tr><td>Autopilot</td><td>only its own project's; destroyed when the build step ends. A lab you used belongs to you from then on</td><td>read status and address only: no commands, files, pages or logs, through either tool</td></tr>
       <tr><td>Test probes</td><td>only labs a probe made</td><td>only inside a probe's own project</td></tr>
       <tr><td>Channel members (other people in Slack)</td><td>no lab tool at all</td><td>none</td></tr>
     </tbody>
@@ -109,8 +113,21 @@
 
   <h2 id="limits">Limits and switches</h2>
   <ul>
+    <li>Text sent to a command's stdin (a password piped to <code>psql</code>, say) goes to a private file on the member that the command's shell deletes before the command runs, and the host deletes it after the command too. If the member is paused in the few milliseconds between those steps, the file can stay on the member until the lab is destroyed.</li>
     <li>Space is limited: a RAM budget, at most four disposable labs at once, and a separate allowance for kept labs. When the pool is full, your create evicts the oldest autopilot lab, never one of your own.</li>
-    <li>Autopilot cannot destroy a lab you used in the last 30 minutes.</li>
+    <li>Autopilot cannot destroy a lab you used in the last 30 minutes. A build's lab that you used belongs to you: the build's end leaves it, nothing asks again, and it expires by its idle time, which each use moves.</li>
+    <li>When a build's lab could not be destroyed because the host was busy or did not answer, the agent asks again every five minutes. An outage is logged once when it starts and once when it ends.</li>
+    <li>A command the agent runs on a lab never gets more time than the turn has left. Inside an autopilot build that is the build turn's own 10 minutes.</li>
+    <li>While a command runs on a lab, a second command, a screenshot and every kept-app action wait 30 seconds and then answer "busy". Destroy and the fault actions go ahead.</li>
+    <li><code>lab http</code> waits 15 seconds in total. A stream or a slow page is cut there and marked as cut.</li>
+    <li>Logs and command output are the last part only: 6 KB in a result, and the host keeps at most 256 KB of each log. A cut result says so and names the full log file on the lab.</li>
+    <li>A kept app's data goes only with the app's last version. The labs host decides that when it deletes; the agent only reports what it did.</li>
+    <li>The labs key is sent only directly, and only to a loopback, tailnet or private IP address written in the usual form, or to a bare local name with no dot. A labs host configured by any dotted name (<code>ts.net</code> included), by an integer or hex address, with a <code>user:password@</code> part, or by an address outside the loopback, private and tailnet ranges (link-local addresses included) is refused: the agent logs that once and every lab call says so.</li>
+    <li>When the host cannot make a lab right now (no room, Tor gateway or firewall not up, no free port, busy), an autopilot task waits and starts again by itself. After three waits it asks you.</li>
+    <li>An idle time above the lab's maximum is cut to the maximum, on create and on extend, and the answer says so.</li>
+    <li>Times on another day are printed with their date.</li>
+    <li><code>lab put</code> and <code>lab get</code> move a file or a whole folder. A folder is at most 20 MB and 2000 files and folders. Symbolic links, devices and pipes are never moved; in a folder fetched with <code>lab get</code>, a second name for a file already sent (a hard link) arrives as a separate copy of that file and counts toward the 20 MB, <code>.env</code> files, <code>.git</code>, <code>node_modules</code>, virtualenvs and caches are never sent, and a folder archive with an absolute path or <code>..</code> in it is refused whole, on the host and on the agent.</li>
+    <li><code>lab screenshot</code> saves a picture of a member's web page as a <code>.png</code> in the workspace. The agent has not seen the picture until it looks at the file with its vision tool; the result says so. Resources the page loads from the internet do not appear, and a page that redirects is refused.</li>
     <li>The agent's browser cannot open a lab's ports; it uses the lab tool's HTTP call instead.</li>
     <li>The tool appears only when a labs host and its key are configured. With neither, it is simply not offered.</li>
     <li>Common refusals say what to do: the host did not answer, the lab limit is reached, not enough memory, an action only you may take, or an unknown (expired) lab.</li>

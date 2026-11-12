@@ -33,7 +33,7 @@ from ghost_agent.core import head_saves as H
 from ghost_agent.core import llm as L
 from ghost_agent.utils.logging import (Icons, request_id_context, requester_role_context,
                                        slot_session_context)
-from tests.test_4ro_head_saves import (_clean, _dir, _resp, _store, _switch_env,  # noqa: F401
+from tests.test_4ro_head_saves import (_bind_staged, _clean, _dir, _resp, _store, _switch_env,  # noqa: F401
                                        _turn, _warm_with_file, _with_tools, warm)
 from tests.test_4rp_slot_keep import _bare_client, _head
 from tests.test_4rv_conv_keep import _conv_env, conv, cwarm  # noqa: F401
@@ -255,6 +255,7 @@ async def test_a_slack_owner_request_restores_its_conversation_file(cwarm, monke
     _store(d, ckey, 36000)
     (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 36000, "kind": H.CONV, "head_in_slot": False}))
     st["order"].clear(); st["restores"].clear(); st["lines"].clear()
+    _bind_staged(_tools_turn(llm, st))   # §4UD (H1): the staged file was saved by a call like this one
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="slack:t1:U0", slot=30000)
     tok = request_id_context.set("req-s1")
     try:
@@ -276,6 +277,7 @@ async def test_a_conversation_file_with_the_head_clears_the_mark(cwarm, monkeypa
     (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True}))
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     llm._head_displaced = llm._slot_moved_on = True
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert st["restores"][-1] == ckey and llm._head_displaced is False and llm._slot_moved_on is False
 
@@ -587,6 +589,7 @@ async def test_a_request_started_from_another_requests_file_measures_its_growth(
     (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True,
                                                      "calls": 3, "start": 30000, "end": 31000, "rid": "req-8"}))
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     tok = request_id_context.set("req-9")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -766,6 +769,7 @@ async def test_a_restored_conversation_starts_its_count_afresh(cwarm, monkeypatc
                                                      "calls": 4, "start": 30000, "end": 31000, "rid": "req-8"}))
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     llm._slot_request_calls, llm._slot_request_start, llm._slot_request_end = 9, 27000, 60000
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     tok = request_id_context.set("req-9")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -792,6 +796,7 @@ async def test_its_own_file_carries_the_requests_count_and_growth_on(cwarm, monk
     agent._side_call_rid = "req-a"
     llm._head_displaced = llm._slot_moved_on = True
     llm._slot_request = "req-a"
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     tok = request_id_context.set("req-a")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -818,6 +823,7 @@ async def _own_file_restore(agent, llm, st, monkeypatch, *, rid, meta):
     agent._side_call_rid = rid
     llm._head_displaced = llm._slot_moved_on = True
     llm._slot_request = rid
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     tok = request_id_context.set(rid)
     try:
         await agent._slot_switch_before(_turn(st))
@@ -869,6 +875,7 @@ async def test_a_file_saved_after_a_long_request_is_left_for_the_head(cwarm, mon
                                                      **meta}))
     st["restores"].clear(); st["lines"].clear()
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     if restored:
         assert st["restores"] == [ckey]
@@ -888,6 +895,7 @@ async def test_a_file_without_the_head_mark_is_an_old_one_with_the_head(cwarm, m
     _store(d, ckey, 41000)                       # meta: n_tokens only
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     llm._head_displaced = llm._slot_moved_on = True
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert st["restores"][-1] == ckey and llm._head_displaced is False
 
@@ -904,6 +912,7 @@ async def test_the_slack_owners_reply_after_its_look_gets_its_thread_back(cwarm,
     _store(d, ckey, 36000)
     (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 36000, "kind": H.CONV, "head_in_slot": False}))
     st["restores"].clear()
+    _bind_staged(_tools_turn(llm, st))   # §4UD (H1): the staged file was saved by a call like this one
     _switch_env(agent, llm, st, monkeypatch, owner="slack:t1:U0", key="slack:t1:U0", slot=36400)
     _conv_env(agent, llm, st, monkeypatch)
     agent._switch_done = {"req-s3": {"tools"}}            # the request's first call decided already
@@ -965,6 +974,7 @@ async def test_a_conversation_restore_stamps_the_change_and_clears_the_early_mar
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     llm._head_displaced_early, llm._head_displaced_by, llm._slot_changed_at = True, "deferred-verdict", 1.0
     t0 = time.monotonic()
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert st["restores"][-1] == ckey
     assert llm._head_displaced_early is False and llm._head_displaced_by == "conversation restore"
@@ -1028,6 +1038,7 @@ async def test_a_level_file_is_restored_before_the_plain_one(cwarm, monkeypatch)
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     agent._head_plan_last["effort"] = "xhigh"
     p = _turn(st); p["chat_template_kwargs"] = {"reasoning_effort": "xhigh"}
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(p)
     assert st["restores"] == [lvl]
     # without the level's file, the plain one (a pre-§4SA save) still serves
@@ -1071,6 +1082,7 @@ async def test_the_file_gate_exempts_the_request_that_saved_it(cwarm, monkeypatc
     agent._side_call_rid = "req-a"
     llm._head_displaced = llm._slot_moved_on = True
     llm._slot_request = "req-a"
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     tok = request_id_context.set("req-a")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -1216,6 +1228,7 @@ async def test_a_claim_needs_the_same_file_as_the_last_save(cwarm, monkeypatch):
     st["slot"] = 41000                                     # what `slot_tokens` reports to the claim
     llm._last_main_call_end = time.monotonic() - 50
     llm._conv_last_saved = ("sess-b", 41000, time.monotonic() - 10, "someotherkey")
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert st["restores"] == [ckey]                        # not claimed: the count matched another file
     st["restores"].clear(); agent._switch_done = {}; llm._slot_session = None

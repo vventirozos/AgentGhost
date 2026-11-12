@@ -1654,10 +1654,19 @@ class Kept:
         final = None
         vols: List[str] = []
         note = None
+        shared_with: List[str] = []
         with self.mgr.locked(lab_id, timeout=60):
             row = self.mgr.get(lab_id)
             app = loads(row["app_json"])
-            if app.get("mounted"):
+            # review §4UD F13: decided HERE, under the app lock (a /keep of this app waits on it) — the agent used to
+            # decide from a list it read before its DELETE, so a keep landing in between lost the shared volume
+            sharing = self._other_versions(lab_id, row["lineage"], app["name"])
+            if app.get("mounted") and sharing and app["data"] != "fresh":
+                # another version of this app is kept and uses the same data volume: the lab goes, the data stays
+                note = (f"data volumes kept: {', '.join(sharing)} of the same app share(s) them — the data goes "
+                        "only with the app's last version")
+                shared_with = sharing
+            elif app.get("mounted"):
                 # the app stays stopped after this backup and the lab goes in the same lock: nothing writes after it
                 final = self._backup_locked(lab_id, "final", all_members=True, restart=False)
                 for m in self.store.members(lab_id):
@@ -1667,8 +1676,7 @@ class Kept:
                 # a staged / switched-out version owns no data: never remove volumes it did not back up (review r2 #2)
                 note = "this version had no data mounted; data volumes kept"
             out = self.mgr.destroy(lab_id, reason="deleted", by=origin, origin=origin, include_kept=True, _have_lock=True)
-        others = [l for l in self.store.labs() if l["lab_id"] != lab_id and l["lifetime"] == "kept"
-                  and l["lineage"] == row["lineage"] and l["app_json"] and loads(l["app_json"]).get("name") == app["name"]]
+        others = self._other_versions(lab_id, row["lineage"], app["name"])
         if not others:
             # the last version of this app: its stable port and Service name go too
             key = app.get("lease_key") or f"{row['lineage']}/{app['name']}"
@@ -1692,7 +1700,14 @@ class Kept:
         out["final_backups"] = final["members"] if final else []
         if note:
             out["note"] = note
+        if shared_with:
+            out["data_shared_with"] = shared_with
         return out
+
+    def _other_versions(self, lab_id: str, lineage: str, app_name: str) -> List[str]:
+        """The OTHER kept labs that hold a version of this (lineage, app) — read under the app lock."""
+        return [l["lab_id"] for l in self.store.labs() if l["lab_id"] != lab_id and l["lifetime"] == "kept"
+                and l["lineage"] == lineage and l["app_json"] and (loads(l["app_json"]) or {}).get("name") == app_name]
 
     # ------------------------------------------------------------ agent-api sidecar (v2 §6, §11.11)
     def _ensure_sidecar(self, lab_id: str) -> None:

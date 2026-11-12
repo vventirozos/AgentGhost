@@ -176,26 +176,96 @@ def _path(home) -> Optional[Path]:
 
 
 def load(home) -> List[dict]:
-    """Every diary row, oldest first. Never raises."""
+    """Every diary row with a sentence, oldest first. §4UD (F5): the shared
+    reader — a byte that is not UTF-8 costs its own line (review: one such
+    byte emptied the whole Mirror: no self-image, rest back to (0, 0), "No
+    sentence yet", and the next look would have started from the seed). A
+    row without a sentence is no look (a first cut of §4UD wrote "skip" rows
+    here; a diary that holds some reads as if they were not there). Never raises."""
     p = _path(home)
-    out: List[dict] = []
     if p is None:
-        return out
+        return []
     try:
-        text = p.read_text(encoding="utf-8")
-    except Exception:  # noqa: BLE001 — absent or unreadable: an empty diary
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+        from .schema import read_jsonl_rows
+        rows = read_jsonl_rows(p, what="mirror diary")
+    except Exception:  # noqa: BLE001 — unreadable: an empty diary
+        return []
+    return [row for row in rows if str(row.get("sentence") or "").strip()]
+
+
+#: §4UD (G4): a sentence whose look is older than this many days is said to be that old
+STALE_AFTER_DAYS = 2
+#: §4UD (G4): the LAST skipped look — one small file, overwritten (review r2: as rows of the diary there were
+#: eight in one day, the reason's wording carried a count that changed, and the diary has no compaction)
+SKIP_REL = "system/selfhood/mirror.skip.json"
+#: why a look had nothing to read, by kind — short, no counts (it goes into the owner's block)
+SKIP_REASONS = {"strong_mood": "replies written under a strong mood or a manner",
+                "no_replies": "no new replies"}
+
+
+def _mood_date(now: Optional[datetime.datetime] = None) -> datetime.date:
+    """The MOOD day of ``now`` (``mood.mood_day``: it ends at 04:00). A naive
+    time is this machine's local time, as the look writes its stamps."""
+    from . import mood as _M
+    if now is not None and now.tzinfo is None:
+        now = now.astimezone()
+    return _M.mood_day(now)
+
+
+def _note_skip(home, kind: str, now: Optional[datetime.datetime] = None) -> None:
+    """§4UD (G4): write down that today's look was skipped and why — the one
+    record of it, overwritten each time (unchanged: not rewritten)."""
+    if not home or kind not in SKIP_REASONS:
+        return
+    try:
+        p = Path(home) / SKIP_REL
+        text = json.dumps({"date": _today(now), "kind": kind})
         try:
-            row = json.loads(line)
-        except Exception:  # noqa: BLE001 — a torn tail line
-            continue
-        if isinstance(row, dict) and str(row.get("sentence") or "").strip():
-            out.append(row)
-    return out
+            if p.read_text(encoding="utf-8") == text:
+                return
+        except (OSError, UnicodeDecodeError):
+            pass
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(p)
+    except Exception as e:  # noqa: BLE001 — a note never costs the idle cycle
+        logger.debug("mirror: skip note not written: %s", e)
+
+
+def last_skip(home, since: str = "") -> str:
+    """§4UD (G4): why the last look was skipped, in a few words — "" when
+    there is no record, it cannot be read, or it is older than ``since`` (the
+    date of the latest look: a look has happened since)."""
+    try:
+        d = json.loads((Path(home) / SKIP_REL).read_text(encoding="utf-8"))
+        if not isinstance(d, dict) or str(d.get("date") or "") < str(since or ""):
+            return ""
+        return SKIP_REASONS.get(str(d.get("kind") or ""), "")
+    except Exception:  # noqa: BLE001 — absent or unreadable: nothing to say
+        return ""
+
+
+def stale_note(home, now: Optional[datetime.datetime] = None) -> str:
+    """§4UD (G4): "" while the latest sentence is at most ``STALE_AFTER_DAYS``
+    mood days old; else how old it is and, when the record says, why no look
+    has rewritten it: "6 days ago (skipped: replies written under a strong
+    mood or a manner)". (The Mirror stops for an owner who keeps a manner or
+    a set mood at 2 or more every day, and the block still said "rewritten
+    once a day".)"""
+    looks = load(home)
+    rows = current_rows(looks) or looks
+    if not rows:
+        return ""
+    try:
+        then = datetime.date.fromisoformat(str(rows[-1].get("date") or ""))
+    except ValueError:
+        return ""
+    days = (_mood_date(now) - then).days
+    if days <= STALE_AFTER_DAYS:
+        return ""
+    why = last_skip(home, since=then.isoformat())
+    return f"{days} days ago" + (f" (skipped: {why})" if why else "")
 
 
 def _append(home, row: dict) -> bool:
@@ -216,18 +286,24 @@ def _append(home, row: dict) -> bool:
 # ── one look ────────────────────────────────────────────────────────────────
 
 def _today(now: Optional[datetime.datetime] = None) -> str:
-    return (now or datetime.datetime.now()).date().isoformat()
+    """The day a look belongs to — the mood day (review r2: one day for everything about the mood)."""
+    return _mood_date(now).isoformat()
 
 
 def looked_today(home, now: Optional[datetime.datetime] = None) -> bool:
-    rows = load(home)
-    return bool(rows) and str(rows[-1].get("date") or "") == _today(now)
+    """Did a look already write today's sentence? Read off the newest row that carries a date (§4UD F5: a
+    line with a bad byte can parse into a row with a sentence and no date — it is not a look, and it must
+    not make the idle cycle look a second time)."""
+    last = next((r for r in reversed(load(home)) if str(r.get("date") or "").strip()), None)
+    return last is not None and str(last.get("date")) == _today(now)
 
 
 def _look_epoch(at) -> float:
-    """A diary row's "at" (local time, as `look` writes it) as an epoch, or 0.0."""
+    """A row's "at" as an epoch, or 0.0 — the diary's local time as `look` writes it, or the daily look's UTC
+    stamp ("…Z", `character._iso`: §4UH-m review — py3.10's ``fromisoformat`` refused the "Z", so every look
+    fell back to the plain 48 h window and could re-read replies the last look had rated)."""
     try:
-        return datetime.datetime.fromisoformat(str(at or "")).timestamp()
+        return datetime.datetime.fromisoformat(str(at or "").replace("Z", "+00:00")).timestamp()
     except (ValueError, OverflowError, OSError):
         return 0.0
 
@@ -290,18 +366,22 @@ def strong_mood_replies_since(home, now: Optional[datetime.datetime] = None, aft
 def written_under_strong_mood(turn: dict) -> bool:
     """§4UA: was this reply written under a mood at ``STRONG_MOOD_MIN`` or
     more, or under a manner? Read off the turn record's ``extra.mood_tone``
-    (§4TX: {"mood": "irritable, 2 of 3" | "neutral", "manner": "sarcastic, 2
-    of 3" | ""}). A record with no tone line was written under no mood."""
+    — its VALUES (§4UD: ``intensity``, ``manner_name``), never its two
+    sentences. A record with no tone line was written under no mood."""
     try:
         tone = (turn.get("extra") or {}).get("mood_tone")
     except AttributeError:
         return False
     if not isinstance(tone, dict):
         return False
-    if str(tone.get("manner") or "").strip():
+    # §4UD (W2): the VALUES the record carries (``intensity``, ``manner_name``), never the sentence
+    # ("irritable, 2 of 3" was parsed back with a regex). A record from before §4UD holds only the
+    # sentences: it is NOT read at all, so it counts as written under no strong mood (review r2: counting
+    # any mood in it as strong could skip the look for the two days after a deploy)
+    if isinstance(tone.get("manner_name"), str) and tone["manner_name"].strip():
         return True
-    m = re.search(r",\s*(\d)\s+of\s+3\s*$", str(tone.get("mood") or ""))
-    return bool(m) and int(m.group(1)) >= STRONG_MOOD_MIN
+    n = tone.get("intensity")
+    return isinstance(n, int) and not isinstance(n, bool) and n >= STRONG_MOOD_MIN
 
 
 def lasting_mood_note(home, now: Optional[datetime.datetime] = None) -> str:
@@ -315,21 +395,19 @@ def lasting_mood_note(home, now: Optional[datetime.datetime] = None) -> str:
     set moods, manners, decay steps and the quiet's boredom do not. ""
     when nothing lasted or the journal cannot be read. Never raises."""
     try:
+        from .schema import read_jsonl_rows
         from .state import MOOD_HISTORY_FILENAME
-        p = Path(home) / "system" / "selfhood" / MOOD_HISTORY_FILENAME
-        text = p.read_text(encoding="utf-8")
+        journal = read_jsonl_rows(Path(home) / "system" / "selfhood" / MOOD_HISTORY_FILENAME, what="mood journal")
     except Exception:  # noqa: BLE001 — no journal: nothing lasted
         return ""
     from . import mood as _M
-    today = (now.astimezone() if now is not None and now.tzinfo is not None
-             else (now or datetime.datetime.now())).date()
+    today = _mood_date(now)                      # review r2: mood days, like the rows' own day below
     first = today - datetime.timedelta(days=LASTING_WINDOW_DAYS - 1)
     days: dict = {}
-    for line in text.splitlines():
+    for row in journal:
         try:
-            row = json.loads(line)
             n = int(row.get("intensity") or 0)
-        except Exception:  # noqa: BLE001 — a torn or hand-edited row
+        except Exception:  # noqa: BLE001 — a hand-edited row
             continue
         label, kind = str(row.get("label") or ""), str(row.get("kind") or "")
         if n < STRONG_MOOD_MIN or kind not in _OWN_KINDS or label not in _M.LABELS or label == _M.BORED:
@@ -337,7 +415,7 @@ def lasting_mood_note(home, now: Optional[datetime.datetime] = None) -> str:
         at = _M.parse_iso_utc(str(row.get("at") or ""))
         if at is None:
             continue
-        day = at.astimezone().date()
+        day = _M.mood_day(at)
         if first <= day <= today:
             days.setdefault(label, set()).add(day)
     # most days first, a tie alphabetical; at most two named
@@ -478,9 +556,13 @@ async def look(home, llm_client: Any, now: Optional[datetime.datetime] = None,
         # §4UB (evaluation: "no reply of yours" was said when there were replies, all under a strong mood)
         n = await asyncio.to_thread(strong_mood_replies_since, home, now, after)
         if n:
-            return (f"skipped — {'the 1 reply' if n == 1 else f'all {n} replies'} of yours since the last look "
-                    "were written under a strong mood or a manner (the mood talking, not the character)")
-        return "skipped — no reply of yours since the last look (2 days back at most)"
+            why = (f"{'the 1 reply' if n == 1 else f'all {n} replies'} of yours since the last look "
+                   "were written under a strong mood or a manner (the mood talking, not the character)")
+        else:
+            why = "no reply of yours since the last look (2 days back at most)"
+        # §4UD (G4): the block and the banner say it — the KIND, not this sentence (its count changes)
+        await asyncio.to_thread(_note_skip, home, "strong_mood" if n else "no_replies", now)
+        return "skipped — " + why
     shown = current_rows(rows)
     prev = str(shown[-1]["sentence"]) if shown else SEED_SENTENCE
     replies = [p["text"][:REPLY_MAX_CHARS] for p in picked]
@@ -584,20 +666,61 @@ def self_image_line(home) -> str:
     if not rows:
         return ""
     last = rows[-1]
+    stale = stale_note(home)
     return (f"self-image: «{last['sentence']}» (my own one-sentence self-portrait, rewritten daily "
-            f"in the Mirror, last on {last.get('date', '?')}; the owner types \"mirror\" to see the diary. "
+            f"in the Mirror, last on {last.get('date', '?')}" + (f" — {stale}" if stale else "")
+            + "; the owner types \"mirror\" to see the diary. "
             "A self-description, not a report of work done and not a checked fact)")
 
 
 # ── the line every reply to the owner hears (§4TZ) ──────────────────────────
 
 SELF_IMAGE_HEADER = "### HOW YOU SEE YOURSELF"
-SELF_IMAGE_RULE = ("(Your character: your own one-sentence self-portrait, rewritten once a day in the Mirror "
+_RULE_FRESH = "rewritten once a day in the Mirror"
+#: §4UD (G4): … and when no look has rewritten it for more than ``STALE_AFTER_DAYS`` days
+RULE_STALE = "last rewritten in the Mirror {stale},"
+SELF_IMAGE_RULE = ("(Your character: your own one-sentence self-portrait, {when} "
                    "from the way you wrote to the owner. It is who you are under any mood or manner: when a "
                    "MOOD or MANNER line is present, that line comes first for this reply, and this is how you "
                    "carry it. Precedence: the owner's rules, then correctness, then the manner, then the mood, "
                    "then your character. Let it shape HOW you write where it is true of you; it changes no "
                    "fact, tool use or answer. Do not quote it or bring it up unless the owner asks.)")
+_RULE_TEMPLATE = SELF_IMAGE_RULE
+SELF_IMAGE_RULE = _RULE_TEMPLATE.format(when=_RULE_FRESH)
+
+
+#: §4UF: what the turn record's ``extra.self_image`` says when the sentence came from a probe's header
+PROBE_DATE = "probe"
+
+
+def probe_section(sentence: str, rule: str = "") -> str:
+    """§4UF: the state-block section for a self-image a PROBE supplied — the same header and shape as the
+    Mirror's own, the probe's sentence, and the probe's rule text or (without one) the standing rule.
+    "" without a sentence. Reads no file: the diary is not involved."""
+    sentence = " ".join(str(sentence or "").split())
+    if not sentence:
+        return ""
+    rule = " ".join(str(rule or "").split()) or SELF_IMAGE_RULE
+    return f"{SELF_IMAGE_HEADER}\n«{sentence}»\n{rule}\n\n"
+
+
+def probe_stamp(section: str) -> str:
+    """§4UF (review r1): what the turn record says a probe heard — ``probe:<6 hex of the section>``, so
+    a comparison can check each reply against the sentence and rule its arm was meant to bring."""
+    import hashlib
+    return f"{PROBE_DATE}:{hashlib.sha256(str(section or '').encode('utf-8')).hexdigest()[:6]}"
+
+
+def self_image_rule(stale: str = "") -> str:
+    """The rule under the sentence: "rewritten once a day", or how long ago it last was (``stale_note``)."""
+    return _RULE_TEMPLATE.format(when=(RULE_STALE.format(stale=stale) if stale else _RULE_FRESH))
+
+def _skip_stamp(home) -> int:
+    try:
+        return (Path(home) / SKIP_REL).stat().st_mtime_ns
+    except OSError:
+        return 0
+
 
 _BLOCK_MEMO: dict = {}
 _BLOCK_MEMO_LOCK = threading.Lock()
@@ -614,7 +737,9 @@ def self_image_section(home) -> Tuple[str, str]:
         return "", ""
     try:
         st = p.stat()
-        key = (str(p), st.st_mtime_ns, st.st_size)
+        # the day and the skip record are in the key: the sentence's age and why are in the text once it
+        # is stale (§4UD G4)
+        key = (str(p), st.st_mtime_ns, st.st_size, _today(), _skip_stamp(home))
     except OSError:
         return "", ""
     got = _memo(p, key)
@@ -633,7 +758,7 @@ def _memo(p: Path, key) -> dict:
     if rows:
         sentence = " ".join(str(rows[-1].get("sentence") or "").split())
         if sentence:
-            text = f"{SELF_IMAGE_HEADER}\n«{sentence}»\n{SELF_IMAGE_RULE}\n\n"
+            text = f"{SELF_IMAGE_HEADER}\n«{sentence}»\n{self_image_rule(stale_note(home))}\n\n"
             date = str(rows[-1].get("date") or "?")
             rest = _row_rest(rows[-1])
     got = dict(key=key, text=text, date=date, rest=rest)
@@ -655,7 +780,7 @@ def rest_pair(home) -> Tuple[float, float]:
         return 0.0, 0.0
     try:
         st = p.stat()
-        got = _memo(p, (str(p), st.st_mtime_ns, st.st_size))
+        got = _memo(p, (str(p), st.st_mtime_ns, st.st_size, _today(), _skip_stamp(home)))
     except Exception:  # noqa: BLE001
         return 0.0, 0.0
     a, b = got["rest"]
@@ -700,16 +825,7 @@ def _local_time(ts) -> str:
     return d.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
-def mirror_banner(home) -> str:
-    """The whole reply to ``mirror`` (§4PY: no model reads it)."""
-    rows = load(home)
-    head = ("**The Mirror** — once a day I rewrite one sentence about who I am, "
-            "from my earlier sentences plus a few replies I gave you since. My latest "
-            "sentence is in what I read before every reply to you, so it shapes the replies "
-            "the next look reads.")
-    if not rows:
-        return (head + "\n\nNo sentence yet — the first look happens in an idle "
-                f"window. Starting point:\n\n> {SEED_SENTENCE}")
+def _diary_lines(rows: List[dict]) -> List[str]:
     lines = []
     for r in rows[-SHOW_LAST:]:
         same = str(r.get("sentence")) == str(r.get("prev"))
@@ -720,6 +836,97 @@ def mirror_banner(home) -> str:
         mark = (" (unchanged)" if same else
                 f" (kept {round(kept * 100)}% of {against} words)" if kept is not None else "")
         lines.append(f"- **{r.get('date', '?')}**{mark} — {r['sentence']}")
+    return lines
+
+
+def _look_banner(home, character) -> str:
+    """§4UH: the reply to ``mirror`` while the character is on — what the agent sees when it looks at its
+    own replies (the daily look, ``selfview``), under the sentence its replies hear now; the old diary
+    below as history. Owner-only like every system command; no tastes, no reply text."""
+    from . import selfview as _selfview
+    state = character.load(home)
+    s = character.sentence(state["dials"])
+    now = (f"My character now: «{s}» ({character.describe(state['dials'])})." if s else
+           "My character now: every dial is at 0 — no trait is heard.")
+    if state.get("unreadable"):
+        now = (f"⚠ The character file cannot be read, so replies hear the STARTING character: «{s}». "
+               "Type \"character\" for what to do.")
+    head = ("**The Mirror** — once a day, in an idle window, I read a few of my latest replies to you "
+            "(without my dials) and rate how they sound on my three dials. \"Meant\" is my dial when I looked "
+            "(on a day a dial moved, the replies may have heard the step before), \"sounded\" is what the "
+            "replies showed.")
+    if _selfview.vote_enabled():
+        head += (" When they sit two steps from a dial, or on the other side of 0, the look adds one vote toward "
+                 "them to that day's own pull; a dial moves only when the days add up, and a pinned dial never "
+                 "by itself (type \"character\" for the dials and how they got here).")
+    else:
+        head += (" This is how I see myself, not what moves me: my dials move from what happens — what comes "
+                 "from you, how my own work goes, how my answers are judged — and by your commands (type "
+                 "\"character\" for the dials and how they got here).")
+    looks = _selfview.history_lines(home)
+    if looks:
+        n = len(looks)
+        body = (f"The latest look{'s' if n > 1 else ''}:\n\n" + "\n".join(looks))
+        seen = _selfview.line(home)
+        if seen:
+            body += "\n\n" + seen
+    else:
+        body = ("No look yet — today's could not be read on the first try; one more try comes in an idle "
+                "window." if _selfview.trying_today(home) else
+                "No look yet — the first happens in an idle window once there are at least "
+                f"{_selfview.MIN_REPLIES} replies of mine to you to read (from the last two days, not short, "
+                "not written under a strong mood or a manner).")
+    try:
+        if not state.get("unreadable"):
+            a, b = character.rest_units(state["dials"])
+            if (a, b) != (0, 0) and rest_enabled():
+                now += (f" Where my mood settles when nothing happens (set by my character): pleasantness "
+                        f"{_REST_WORDS[0][a]}, energy {_REST_WORDS[1][b]}.")
+    except Exception:  # noqa: BLE001
+        pass
+    out = f"{head}\n\n{now}\n\n{body}"
+    rows = load(home)
+    if rows:
+        # review: a fixed date was wrong for a row written ON it, and after any later off/on
+        out += (f"\n\n**Until {rows[-1].get('date', '?')}** the Mirror was a diary: one sentence a day about who "
+                "I am, from my own replies. Measured blind, it changed nothing in them, so replies no longer hear it. "
+                f"Kept as it stood ({len(rows)} day(s)"
+                + (f", the last {SHOW_LAST} shown" if len(rows) > SHOW_LAST else "") + "):\n\n"
+                + "\n".join(_diary_lines(rows)))
+    return out
+
+
+def mirror_banner(home) -> str:
+    """The whole reply to ``mirror`` (§4PY: no model reads it). With the character on (§4UH): the daily
+    look's history (``_look_banner``); off: the Mirror's diary as before."""
+    try:
+        from . import character as _character
+        on = _character.enabled()
+    except Exception:  # noqa: BLE001
+        on = False
+    if on:
+        try:
+            return _look_banner(home, _character)
+        except Exception:  # noqa: BLE001 — never a broken command
+            logger.warning("mirror: the look history could not be shown", exc_info=True)
+            # review: NOT the diary's own banner — it quotes replies and says replies hear the sentence,
+            # which is false while the character is on
+            try:
+                old = _diary_lines(load(home))
+            except Exception:  # noqa: BLE001
+                old = []
+            return ("**The Mirror** — my looks at my own replies could not be read just now (see the agent "
+                    "log); type \"character\" for the character replies hear."
+                    + ("\n\nThe old diary, kept as it stood:\n\n" + "\n".join(old) if old else ""))
+    rows = load(home)
+    head = ("**The Mirror** — once a day I rewrite one sentence about who I am, "
+            "from my earlier sentences plus a few replies I gave you since. My latest "
+            "sentence is in what I read before every reply to you, so it shapes the replies "
+            "the next look reads.")
+    if not rows:
+        return (head + "\n\nNo sentence yet — the first look happens in an idle "
+                f"window. Starting point:\n\n> {SEED_SENTENCE}")
+    lines = _diary_lines(rows)
     last = rows[-1]
     seen = row_replies(last)
     tail = ""
@@ -734,7 +941,9 @@ def mirror_banner(home) -> str:
             quoted.append(f"> {f'({when}) ' if when else ''}{r['excerpt']}…")
         tail += "\n" + "\n>\n".join(quoted)
     count = f"{len(rows)} day(s) so far" + (f", showing the last {SHOW_LAST}" if len(rows) > SHOW_LAST else "")
-    return f"{head}\n\n{count}:\n\n" + "\n".join(lines) + rest_line(rows) + tail
+    stale = stale_note(home)                       # §4UD (G4)
+    old = (f"\n\nMy latest sentence was last rewritten {stale}." if stale else "")
+    return f"{head}\n\n{count}:\n\n" + "\n".join(lines) + old + rest_line(rows) + tail
 
 
 _REST_WORDS = ({-2: "gloomy", -1: "a little low", 0: "even", 1: "a little sunny", 2: "sunny"},

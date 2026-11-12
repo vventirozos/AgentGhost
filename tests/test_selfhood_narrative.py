@@ -259,7 +259,8 @@ async def test_narrative_includes_state_in_prompt(tmp_path: Path):
     n = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
     await n.regenerate(autobio=autobio, state=state)
     # §4TC (review): the diary reads the mood from the day's journal rows
-    assert "My mood today: irritable 2 (the owner said so (set_mood))." in captured[0]
+    # §4UD (F2): the label only — never the cause (the diary is a second copy `introspect` prints)
+    assert "My mood today: irritable 2." in captured[0] and "the owner said so" not in captured[0]
 
 
 async def test_narrative_disabled_returns_empty(tmp_path: Path):

@@ -168,7 +168,7 @@ PostgreSQL 18.1 …</pre>
     <li><strong>Outside content</strong> (<code>utils.provenance.is_untrusted_source</code>): an <code>exec</code> whose command fetches (curl, wget, git clone …), every <code>http</code> answer and every <code>get</code> arm the request's outside-content rules, as an <code>execute</code> curl does. <code>status</code>, <code>list</code>, <code>logs</code> and <code>spec</code> are the labs host's own records (review r2).</li>
     <li><strong>Probes</strong> destroy only their own labs. The service restricts only <code>autopilot</code>, so the tool refuses a probe-origin destroy of another owner's lab.</li>
     <li><strong>Replays</strong> cannot call it (<code>isolation.REPLAY_FORBIDDEN_TOOLS</code>), and their args copy has <code>labs_host</code> cleared. Members do not get it (<code>_MEMBER_ALLOWED_TOOLS</code>), and leaves do not get it in Phase B. (Composed macros could not use it as a step; the macro engine was removed in &sect;4TA.)</li>
-    <li>Proxy: <code>core.llm.compute_tor_proxy</code>. A tailnet IP, a LAN address or a dotless name is reached directly; a public host would go over Tor. A <code>*.ts.net</code> FQDN is treated as public (it would go over Tor and fail), so configure the IP or the bare MagicDNS name.</li>
+    <li>No proxy, ever: the labs client is built with <code>proxy=None</code> and <code>trust_env=False</code>. The key goes only to a loopback, tailnet or private IP literal or a bare (dotless) name; anything else is refused before a request is built (<code>key_refusal</code>, see <a href="#4ud-rules">&sect;4UD</a>). Configure the labs host by its tailnet IP or its bare MagicDNS name.</li>
   </ul>
 
   <h2 id="loop">Loop sets that include <code>lab</code></h2>
@@ -225,6 +225,146 @@ PostgreSQL 18.1 …</pre>
   shortfalls evict the largest first. <code>/keep</code> needs a built lab. The r12/r13 probe-claims backfill was REMOVED in r14:
   it never fired, and the live host had no kept labs. See <code>interface/ghost-labs/README.md</code>.</p>
   <p>Tests: <code>tests/test_4sx_r12_review.py</code>, <code>test_4sx_r13_review.py</code>, <code>test_4sx_r14_review.py</code>, <code>test_4sx_r15_review.py</code>.</p>
+
+  <h2 id="4ud">Review &sect;4UD <span class="tag">2026-11-11 &sect;4UD</span></h2>
+  <p>An independent review of labs, the <code>lab</code> tool and the <code>run</code> registry: 4 MAJOR, 14 MINOR, 4 gaps. What changed, by mechanism.</p>
+  <h3 id="4ud-lock">The lab lock and a running command (F1)</h3>
+  <p>A foreground <code>exec</code> held the lab's lock for its whole run, so a destroy or a member op answered <code>busy</code> for as long as the command ran. A leaf whose last exec was still running lost its leaf-end destroy and kept the lab for up to two hours. The host's lock (<code>ghost_labs.labs.LabLock</code>) now has two holder kinds: a state change, and a running command. An exec takes the lock, checks the member, then turns its hold into a "command running" mark.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>While a command runs on the lab</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>destroy (owner, autopilot, a leaf's end, the reaper's maximum lifetime)</td><td>goes ahead; the command's exec answers <code>unknown_lab</code> (destroyed)</td></tr>
+      <tr><td>member stop / start / restart / kill / pause / unpause / isolate / rejoin</td><td>goes ahead</td></tr>
+      <tr><td>a second foreground exec, screenshot</td><td>waits 30 s, then <code>busy</code></td></tr>
+      <tr><td>kept actions (keep, deploy, rehearse, switch, rollback, backup, restore, app ops, destroy with data), the kept supervisor tick</td><td>wait, then <code>busy</code>; the tick skips the lab</td></tr>
+      <tr><td>eviction by an owner's create</td><td>the lab is not a victim</td></tr>
+      <tr><td>the reaper's idle TTL</td><td>skipped: in use is not idle (the exec touches the lab again when it ends)</td></tr>
+      <tr><td>put, get, status, list, logs, http, spec, extend, detached jobs</td><td>never took the lock</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two state changes still exclude each other. Agent side: <code>core/coding_loop.run_leaf_turn</code> puts the leaf turn's own deadline in <code>coding_executor.leaf_deadline_context</code>, which <code>_time_left_s</code> reads, so an exec inside a leaf is cut to the leaf's time left less 60 s. A leaf-end destroy the host answers with <code>busy</code>, or does not answer, leaves the row live and leaf-tagged. <code>core/leaf_reaper.sweep_ended_leaves</code> runs the boot reaper's own pass (<code>reap_orphan_leaf_work</code>) every 300 s for the leaves not in <code>lab_waits.RUNNING_LEAVES</code>.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>The host's answer to a leaf lab's destroy</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>200, or 404 <code>unknown_lab</code></td><td>the row is closed</td></tr>
+      <tr><td><code>owner_active</code> (the owner used the lab in the last 30 min) or <code>owner_only</code> (the owner kept it)</td><td>terminal: the row's leaf tag is cleared, one log line. The lab is the owner's; the host's idle TTL ends it. Neither the sweep nor the boot pass asks again</td></tr>
+      <tr><td><code>busy</code>, any other refusal</td><td>one WARNING; asked again by the sweep, at most <code>SWEEP_MAX_TRIES</code> = 24 answered passes per leaf and process</td></tr>
+      <tr><td>no answer</td><td>asked again; a pass with no answered labs call at all is not counted as a try. The sweep sets the outage flag once per pass from what the whole pass got: one line when an outage starts, one when any labs call answers again; a pass with nothing left to ask clears the flag without that line (nothing was asked, so nothing answered). The leaf's own end says one WARNING per lab it could not reach</td></tr>
+    </tbody>
+  </table></div>
+  <p>A lab found on the host by the leaf's tag is destroyed as "untracked" only when the inventory has no row for it at all, live or closed. On the host, exec, the member ops and screenshot take the lab lock and then check the kept guard on a row read inside it (<code>_acquire_guarded</code>), so a lab kept while the call waited is refused.</p>
+  <p>A run row counts as a leaf's only while its origin is <code>autopilot</code>. A restart keeps the leaf tag only when the same running leaf restarts its own run; any other restarter (the owner, a scheduled turn) takes the run over and the tag is dropped.</p>
+  <h3 id="4ud-run">Runs on a lab (F3, F5, F10, F11, G1)</h3>
+  <ul>
+    <li><strong><code>$PORT</code>:</strong> <code>run start</code> and <code>restart</code> of a lab server send <code>env: {"PORT": port}</code>. After <code>LAB_SERVER_SETTLE_S</code> (1.5 s) the port is asked once through <code>/http</code>. An answer gives <code>[run x started &hellip;] Port N answers</code>. No answer with the process running gives <code>[run x launched &hellip;] NOT ANSWERING YET</code> and one instruction: read the logs once. A process that already ended is a FAILED start with its output.</li>
+    <li><strong>Lifetime:</strong> a lab job keeps <code>timeout --foreground -k 30 2700</code>. A lab server has no wrap: it runs until <code>run stop</code> or until its lab goes.</li>
+    <li><strong><code>run url</code></strong> of a lab server reads the member's published ports from the lab detail and returns the port's URL, or "not published".</li>
+    <li><strong>Expiry in the records:</strong> the lab inventory row stores <code>expires_hard</code> (the host's <code>max_expires_at</code>, or 72 h from create for a host that does not send it; cleared by <code>lab keep</code>). A lab run's row stores <code>meta.expires_at</code>. The briefing's RUNNING block marks a lab or a lab run past it ("not checked") with no host call. The mark never closes a row.</li>
+    <li><strong>Output:</strong> a lab run's output is the last 6 KB of <code>/var/log/lab/jobs/&lt;job&gt;.log</code>. When that cut it, <code>logs</code> and <code>collect</code> say so and name the file. When the host answers <code>unknown_lab</code>, <code>logs</code> is refused with "its lab was destroyed" and <code>collect</code> carries the same note. The probe's status code decides this, never result text.</li>
+  </ul>
+  <h3 id="4ud-owner">Across conversations (F4)</h3>
+  <p><code>run status all=true</code> lists every owner's live rows from the local registry, unprobed. <code>run stop name=run_xxxxxxxx</code> stops that row whoever owns it. Both need the owner's own turn (<code>runs._owner_turn</code>: origin <code>owner</code>); a member, a probe, an autopilot build and scheduled work are refused. The run id reaches across owners for <code>stop</code> only; <code>logs</code>, <code>restart</code>, <code>collect</code> and <code>url</code> stay by name. Nothing automatic ends a conversation's workspace server: a sweep by age was built and removed in the same review, because age from the start says nothing about use. In the all-owners view such a server older than <code>OLD_CONV_SERVER_S</code> (24 h) carries its age and the stop command.</p>
+  <h3 id="4ud-rules">One rule, one place</h3>
+  <ul>
+    <li><strong>Batch order (F9):</strong> <code>tools/labs.LINEAGE_ACTIONS</code> = the kept actions that change something, plus <code>destroy</code>. <code>core/agent.py</code> imports it for both of its sets, so <code>app</code> and <code>backup</code> are ordered like the rest. Every <code>run</code> call waits behind every earlier lineage action in the batch, and a lineage action behind every earlier changing run: a run cannot be told from the kept app or from another version of its lineage. <code>ORDER_CLASSES</code> names a class for every action; a test fails when the schema has an action with no class, and another checks the whole action &times; action table.</li>
+    <li><strong>Kept reads (F12):</strong> <code>labs.kept_touch_refusal(origin, action)</code> answers for <code>lab logs</code> and for <code>run logs</code> of an app run: autopilot reads status and address only. The host refuses logs, files, pages, screenshots and job answers (they carry output) of a kept lab for a caller that may not touch it; the agent turns that 403 into the same refusal for <code>run logs</code> and <code>run collect</code>.</li>
+    <li><strong>Data of a kept lab (F13):</strong> <code>labs.kept_destroy_params</code> is the only code that asks for <code>drop_data</code>; the lab tool and project teardown call it. A host that names <code>drop_data_guard</code> in <code>/v1/health</code> is always asked, and keeps the volumes itself, under its app lock, while another kept version of the app exists. For an older host the list check stays.</li>
+    <li><strong>The key (F14):</strong> <code>labs.key_refusal</code>, called in <code>_call</code>, accepts only an <code>http(s)</code> URL (the scheme compares case-insensitively) whose host is an IP literal in its canonical form inside an allow-list (<code>_KEY_NETS</code>: 127/8, 10/8, 172.16/12, 192.168/16, 100.64/10, ::1, fc00::/7) or a bare name matching <code>^[a-z][a-z0-9-]*$</code> that is not a scheme word (<code>http</code>, <code>https</code>). The URL is matched against one exact shape first (<code>_KEY_URL_RE</code>: <code>http(s)://HOST[:PORT][/path]</code>, port 1&ndash;65535); the configured value is <code>host[:port]</code> or <code>http://host[:port]</code> and nothing is repaired. Refused: <code>user:pw@host</code>, <code>HTTP:/10.0.0.1</code> and <code>http:10.0.0.1</code> (a lenient parser read a host named "http"), link-local addresses (169.254/16 with the cloud metadata address, fe80::/10), dotted names, integer and hex addresses, and IPv6 forms that carry a public IPv4 address (6to4, NAT64, IPv4-mapped). A refused host is a configuration error: <code>config_refusal</code> logs one WARNING line per process, <code>lab</code> and <code>run</code> answer <code>labs_key_refused</code> (REJECTED), and <code>destroy_leaf_labs</code> sends nothing. The leaf sweep and the boot pass still stop the leaf's WORKSPACE runs (they need no labs host); the leaf's lab work is left, said once after <code>SWEEP_MAX_TRIES</code> passes. The client gets <code>proxy=None</code>, <code>trust_env=False</code> and follows no redirect.</li>
+    <li><strong>Holds (F15):</strong> <code>lab_tor_unavailable</code>, <code>lab_firewall_missing</code>, <code>lab_ports_exhausted</code> and a create's <code>lab_busy</code> are holds: <code>labs_not_ready</code> lifts on a healthy <code>/v1/health</code> at least 180 s later, and <code>labs_no_tor</code> (from <code>tor_unavailable</code>) also needs <code>tor: ok</code>. <code>needed_mb</code> is a field of the refusal (<code>LabReply.needed_mb</code>), not parsed from text.</li>
+  </ul>
+  <h3 id="4ud-small">Smaller changes</h3>
+  <ul>
+    <li><code>lab status</code> of a kept lab prints the app: state, URL, last error, whether this version serves or is staged, the version it was switched in from. The no-answer hints after keep, deploy and switch point there.</li>
+    <li>Times on another day print as <code>YYYY-MM-DD HH:MM</code> (<code>_when</code>).</li>
+    <li><code>ttl_idle_s</code> that is not a whole number of seconds is refused with the value given, before any host call. A value above the lab's maximum is cut by the host on create as on extend; the result says "capped at N s".</li>
+    <li><code>lab http</code> with no answer adds one line: bind to <code>0.0.0.0</code>, and when the host saw a listener on <code>127.0.0.1</code> only, it says that waiting will not help and the result is booked as unchanged, so the repeat guard can stop a retry. An answer cut at the host's 15 s deadline is marked.</li>
+  </ul>
+  <h3 id="4ud-compat">Old agent, new host and the reverse</h3>
+  <p>Every new request field is optional and every new answer field is read with a default. A new agent on an old host: no <code>features</code>, so the list check decides <code>drop_data</code>; no <code>max_expires_at</code>, so 72 h; no <code>output_truncated</code>/<code>log_path</code>, so a tail that fills the cap counts as cut and the fixed path is named; a create above the maximum is still refused by the host; a destroy behind a running exec still answers <code>busy</code> and is asked again by the leaf sweep.</p>
+  <h3 id="4ud-ready">Per-member readiness (F-A)</h3>
+  <p>A template member may declare <code>ready: "&lt;command&gt;"</code> (exit 0 = its service accepts work). The host's <code>wait_ready</code> polls the template's own check and every member's check in one loop under one deadline, the template's <code>readiness.timeout_s</code>. The template check alone decides the lab's state.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Template check</th><th>Member checks</th><th>Lab state</th><th>Member <code>ready</code></th><th>The agent's create result</th></tr></thead>
+    <tbody>
+      <tr><td>passes</td><td>all pass</td><td>ready</td><td>true</td><td>OK</td></tr>
+      <tr><td>passes</td><td>one still fails at the deadline</td><td>ready</td><td>false for that member</td><td>PARTIAL <code>lab_member_not_ready</code>: "NOT READY yet", names the member and its check command, "look once"; no poll, no retry</td></tr>
+      <tr><td>passes late</td><td>no time left to run one</td><td>ready</td><td>null for that member</td><td>PARTIAL <code>lab_member_not_ready</code>: "was NOT CHECKED: the labs host's wait ended before its readiness check ran"</td></tr>
+      <tr><td>never passes</td><td>none is run</td><td>unready</td><td>null</td><td>FAILED <code>lab_not_ready</code>, as before</td></tr>
+      <tr><td colspan="2">no member declares a check, or an older host</td><td>as before</td><td>absent</td><td>as before</td></tr>
+    </tbody>
+  </table></div>
+  <p>The member checks run only after the template's own check has passed, in the time that is left: a member check never takes a turn from the check that decides the lab's state, and never changes that state. Three values, three sentences: <code>true</code> (ready), <code>false</code> (the check ran and failed), <code>null</code> (the check did not run; the result says "not checked", never "not ready"). The agent reports it in the create result only; <code>lab status</code> and <code>lab list</code> carry no readiness word. <code>pg-single</code> and <code>patroni-3</code> use <code>pg_isready -q</code> (the socket a bare <code>psql</code> uses; the template check asks TCP), <code>mysql-single</code> uses <code>mysqladmin ping</code>. A PARTIAL create counts as "the build got its lab" for the lab-wait holds.</p>
+
+  <h3 id="4ud-cancel">Cancel a running exec (F-B)</h3>
+  <p><code>lab cancel lab_id=&hellip; [member=&hellip;]</code> posts to the host's <code>/v1/labs/{id}/exec/cancel</code>. The host keeps a list of the foreground commands running on each lab (member, origin, tag, start time). A cancel only marks the commands the caller may end; each command's own exec thread then kills its process group by its pid file, <strong>looks whether the group is gone</strong> (<code>kill -0</code>, up to 2 s), and answers <code>cancelled: true</code>, <code>killed: true|false</code>, no exit code. The group is not signalled when the member was restarted since the command began (the job rule: a pid file from an earlier start names nobody). A cancel takes no lab lock; it waits up to 8 s for the commands it marked to say what became of them.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>What happened on the member</th><th>exec answer</th><th>cancel's <code>outcome</code></th><th>The agent says</th><th>The lab's "command running" mark</th></tr></thead>
+    <tbody>
+      <tr><td>killed, and seen gone</td><td><code>killed: true</code></td><td><code>killed</code></td><td>"killed"</td><td>released</td></tr>
+      <tr><td>the kill could not be delivered (a paused member), the group is still there, the command has not written its pid file yet (nothing was signalled), or it was not sent (member restarted) and the stream is still open</td><td><code>killed: false</code></td><td><code>not_killed</code></td><td>"NOT killed &hellip; may still be running"; the exec result adds a NOT KILLED line. A cancel with none killed and one stuck is FAILED <code>lab_cancel_not_killed</code></td><td>kept until the command's stream really ends; the command stays listed, and a later <code>lab cancel</code> sends the same kill again</td></tr>
+      <tr><td>the command ended by itself first</td><td>its own exit code, no <code>killed</code></td><td><code>ended</code></td><td>"it had already ended by itself"</td><td>released</td></tr>
+      <tr><td>no word inside the wait, or a labs host from before this field</td><td>&ndash;</td><td><code>""</code> / absent</td><td>"asked to end; not confirmed yet"</td><td>&ndash;</td></tr>
+    </tbody>
+  </table></div>
+  <p>A timeout uses the same helper (<code>Manager._kill_group</code>) and the same <code>killed</code> field. The agent never writes "killed" for a command the host did not confirm, and a NOT KILLED result carries no sentence saying the command ended. The host removes a command's pid file only once its group is seen gone, so a retried cancel signals the same group instead of reading a missing file as "killed".</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Running command</th><th>Caller</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>none</td><td>anyone allowed on the lab</td><td>OK, "nothing is running", nothing changed</td></tr>
+      <tr><td>any</td><td>the owner</td><td>ended</td></tr>
+      <tr><td>started by a build (the exec carries the leaf's tag)</td><td>the same build, same tag</td><td>ended</td></tr>
+      <tr><td>started by another build, by the owner, or untagged</td><td>an autopilot caller</td><td>403 <code>owner_only</code>; unattended work that is not a build is refused before any host call</td></tr>
+      <tr><td>on a kept lab</td><td>an autopilot caller</td><td>refused (agent and host)</td></tr>
+      <tr><td>started by a probe</td><td>a probe</td><td>ended; a probe ends nothing else</td></tr>
+      <tr><td>any</td><td>any, on a labs host from before this</td><td>REJECTED <code>lab_not_supported</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The cancelled <code>lab exec</code> answers <code>[lab/member CANCELLED after N s]</code>, FAILED <code>lab_cancelled</code>, with the output it had produced. The four heads an exec result can have (<code>exit=</code>, <code>TIMED OUT</code>, <code>no exit code</code>, <code>CANCELLED</code>) are one list, <code>labs.EXEC_HEADS</code>; <code>core/strikes._LAB_EXEC_HEAD_RE</code> and <code>distill/outcome_heuristics._lab_result_failed</code> know each of them (a stored CANCELLED result was read as prose before), pinned by feeding real exec results to both. <code>cancel</code> is in the <code>lab</code> ordering class with one exemption in <code>_batch_call_depends</code>: a <code>cancel</code> written after an <code>exec</code> in the same batch does not wait for it, since it is how that exec is ended. Every other pair on the same lab keeps its written order.</p>
+
+  <h3 id="4ud-tree">Folders (F-C)</h3>
+  <p><code>lab put</code> with a workspace folder as <code>sandbox_path</code> packs it with the deploy walk (<code>tar_folder</code>: directory file descriptors, no link followed, links/devices/pipes skipped and named, <code>.env*</code> and <code>DEPLOY_EXCLUDE</code> never sent) and sends it to <code>PUT /v1/labs/{id}/tree</code>. <code>lab get</code> asks the file route first; when the host answers <code>kind: "directory"</code> it asks <code>GET /tree</code> and writes every file under <code>sandbox_path</code>. The host sends regular files and folders; a hard link to a file it already sent from the same folder arrives as a copy of that file (Docker sends one name of a hard-linked pair as the file and the other as a link; each copy counts toward the content the host builds, at most <code>file_max_bytes</code> (20&nbsp;MB, what the agent accepts), so many links to one large file are refused rather than built in memory), and symlinks, other links, devices and pipes are listed as skipped.</p>
+  <p><strong>One write check, one writer.</strong> <code>labs.write_refusal(context, path)</code> is the per-path rule for every workspace write of the lab tool: inside the workspace; an unattended build only inside its project; never into a RELEASED project (<code>file_system._released_write_block</code>); never under a <code>.git</code> directory in any case or Unicode form (the rule <code>file_system</code> applies inline, compared with the same <code>_fold</code>). <code>_ws_write</code> and <code>_ws_mkdir</code> ask it and then open every component <code>O_NOFOLLOW</code> from the workspace root; the single-file <code>get</code>, <code>screenshot</code> and the folder <code>get</code> write through them and nothing else in <code>tools/labs.py</code> writes a workspace file (an AST walk over the module pins the list of writing calls by function). A folder <code>get</code> asks the check for <strong>every entry's final path before the first write</strong>: one refusal refuses the whole archive. Before that, the folder check ran once on the destination folder and the lab's entry names chose the real paths.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Entry / state</th><th>put (host checks)</th><th>get (agent checks, before the first write)</th></tr></thead>
+    <tbody>
+      <tr><td>regular file, directory (empty ones too), clean relative name</td><td>written; the host rebuilds the archive from the checked entries (mode &amp; 0755, owner root)</td><td>written; the result counts the files written and the folders made</td></tr>
+      <tr><td>absolute name, <code>..</code>, empty name, a backslash in a name</td><td>the whole put is refused</td><td>the whole get is refused, nothing written (on the member such a name is left out by the host and named)</td></tr>
+      <tr><td>two names that are one path in the workspace (listed twice; <code>A</code> and <code>a</code>; another Unicode form), a file that another entry sits under (<code>x</code> and <code>x/evil</code>)</td><td>&ndash;</td><td>the whole get is refused, nothing written</td></tr>
+      <tr><td>an entry whose final path fails the write check (released project, <code>.git</code>, outside a build's project)</td><td>&ndash;</td><td>REJECTED, nothing of the folder written</td></tr>
+      <tr><td>a workspace file or link where one of the folder's directories must be; a workspace folder where a file goes</td><td>&ndash;</td><td>REJECTED and named, nothing written: nothing in the workspace is removed to make room</td></tr>
+      <tr><td>the member's archive is not named by the folder (first component differs)</td><td>&ndash;</td><td>the host answers an error for the whole call; <code>/data/.</code> and <code>/data/</code> are normalised to <code>/data</code> first, <code>/</code> is refused</td></tr>
+      <tr><td>symlink, hardlink, device, pipe</td><td>in the archive: refused whole. In the workspace: skipped by the walk and named</td><td>on the member: left out by the host and named. In the archive: refused whole</td></tr>
+      <tr><td>over 2000 entries (files and folders, counted the same on both sides), over 20 MB packed (host: 4&times; that unpacked); a gzip cut short or holding a second stream</td><td>refused</td><td>refused</td></tr>
+      <tr><td>a small archive that unpacks huge</td><td>refused by the bytes produced: the host decompresses under a byte bound before <code>tarfile</code> reads</td><td>the same on the agent (<code>tar_bytes_bounded</code>): never more than the bound plus one byte is produced</td></tr>
+      <tr><td>destination is an existing file</td><td>&ndash;</td><td>refused before the folder is fetched</td></tr>
+      <tr><td>a write fails part-way</td><td>&ndash;</td><td>FAILED <code>lab_write_failed</code>: how many were written, which one failed</td></tr>
+      <tr><td>kept lab</td><td>owner only (the put rule)</td><td>owner only (the kept-read rule); file contents pass the secret redactor</td></tr>
+      <tr><td>a labs host from before this</td><td>REJECTED <code>lab_not_supported</code>, with the one-archive way to do it</td><td>the file route's own "not a regular file"</td></tr>
+    </tbody>
+  </table></div>
+  <p>Every name that comes from a lab (an archive entry, the host's skipped list, a refused path, a cancelled command line) goes into a result through one helper, <code>labs._q</code>: quoted, escaped onto one line, capped. The skipped list shows ten names and the total. Only a 404 with no error body means "an older labs host"; a 404 that names an unknown lab or member is reported as that. Only the host's <code>kind: "directory"</code> turns a <code>get</code> into a folder get.</p>
+
+  <h3 id="4ud-shot">Screenshot (F-D)</h3>
+  <p><code>lab screenshot lab_id member [port] [path] sandbox_path=&lt;file&gt;.png</code> posts to the host's existing <code>/screenshot</code> route and writes the PNG with the write path of <code>lab get</code> (<code>write_refusal</code>, then <code>_ws_write</code>). The name must end in <code>.png</code> and the answer must be strict base64 of a PNG. The result names the workspace file, says the model has not seen it, and gives the <code>vision_analysis</code> call that looks at it: the way every tool that makes an image hands it over.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>State</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>the page rendered</td><td>OK: path, bytes, the page's HTTP status</td></tr>
+      <tr><td>the page did not answer the host's own request</td><td>OK, and says the picture is most likely the browser's error page</td></tr>
+      <tr><td><code>sandbox_path</code> missing, a folder, not <code>.png</code>, outside the workspace (a link out of it included)</td><td>REJECTED before any host call</td></tr>
+      <tr><td>the answer is not a PNG or is over 2 MB</td><td>FAILED, nothing written</td></tr>
+      <tr><td>redirect, bad path, <code>busy</code>, unknown lab</td><td>the host's refusal</td></tr>
+      <tr><td>unattended work on a kept lab</td><td>REJECTED before any host call</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>screenshot</code> is in <code>labs.FILE_ACTIONS</code> (ordered with <code>execute</code> and the other file-moving lab actions in a batch) and in <code>labs.WORKSPACE_WRITE_ACTIONS</code> (the loop drops its cached workspace listing after it, as after <code>get</code>). <code>core/agent.py</code> imports both sets; it holds no list of its own.</p>
+
+  <h3 id="4ud-open">Not built</h3>
+  <ul>
+    <li><strong><code>lan</code> and <code>agent_api_url</code> on keep:</strong> not passed by the tool (see PHASE_D.md). Each opens a network path, so the owner sets them on the host API.</li>
+    <li><strong>Previews:</strong> no agent surface.</li>
+  </ul>
+  <p>Tests: <code>tests/test_4ud_labs.py</code>; host <code>interface/ghost-labs/tests/unit/test_4ud_review.py</code>.</p>
 
   <h2 id="tests">Tests</h2>
   <p><code>tests/test_4sx_b_lab_tool.py</code> runs every action against a scripted fake at the <code>_call</code> seam. It checks <code>_call</code> itself against an httpx MockTransport (headers, no proxy for a tailnet host, unreachable mapping), plus the registry walls and the wiring.</p>

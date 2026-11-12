@@ -44,11 +44,11 @@ MUT = [
     ('L3 down-not-left', P, '            rep["live_left"].append(f"lab {r[\'lab_id\']} (the labs host did not answer: {e})")', '            pass'),
     ('L4 others-labs-destroyed', P, '                if isinstance(x, dict) and str(x.get("owner") or "") == owner]', '                if isinstance(x, dict)]'),
     ('L5 archive-destroys-kept', P, '        if kept and not hard:', '        if False:'),
-    ('L6 no-include-kept', P, '            params["include_kept"] = "1"', '            pass'),
-    ('L7 drop-always', P, '            if sharing == []:', '            if True:'),
-    ('L8 drop-never', P, '            if sharing == []:', '            if False:'),
-    ('L9 sibling-is-self', P, '                if str(x.get("lab_id")) != lid and str(x.get("lifetime") or "") == "kept"', '                if str(x.get("lifetime") or "") == "kept"'),
-    ('L10 sibling-any-lineage', P, '                and lineage and str(x.get("lineage") or "") == lineage]', '                and lineage]'),
+    ('L6 no-include-kept', 'src/ghost_agent/tools/labs.py', '    params = {"include_kept": "1"}', '    params = {}'),
+    ('L7 drop-always', 'src/ghost_agent/tools/labs.py', '    if others == []:\n        params["drop_data"] = "1"\n        return params, ""', '    if True:\n        params["drop_data"] = "1"\n        return params, ""'),
+    ('L8 drop-never', 'src/ghost_agent/tools/labs.py', '    if others == []:\n        params["drop_data"] = "1"\n        return params, ""', '    if False:\n        params["drop_data"] = "1"\n        return params, ""'),
+    ('L9 sibling-is-self', 'src/ghost_agent/tools/labs.py', '                   and str(x.get("lab_id")) != lab_id and str(x.get("lifetime") or "") == "kept"', '                   and str(x.get("lifetime") or "") == "kept"'),
+    ('L10 sibling-any-lineage', 'src/ghost_agent/tools/labs.py', '                   and lineage and str(x.get("lineage") or "") == lineage]', '                   and lineage]'),
     ('L11 lab-fail-not-left', P, '            rep["failed"].append(f"lab {lid}: HTTP {st} {b.get(\'error\') or \'\'}".rstrip())\n            rep["live_left"].append(f"lab {lid}")\n    for r in local:', '            rep["failed"].append(f"lab {lid}: HTTP {st} {b.get(\'error\') or \'\'}".rstrip())\n    for r in local:'),
     ('L12 any-404-ok', P, '        if st == 200 or (st == 404 and b.get("error") == "unknown_lab"):', '        if st in (200, 404):'),
     ('L13 destroy-not-recorded', P, '                inv.record_destroy(lid, by=f"project teardown {project_id}")', '                pass'),
@@ -67,10 +67,10 @@ MUT = [
     ('X4 patch-no-teardown', PR, '        td = await _teardown_project(_context(request), pid, hard=False, origin=origin)', '        td = {"stopped": [], "kept_up": [], "failed": [], "live_left": [], "notes": []}'),
     ('X5 route-no-episodes', PR, '        await asyncio.to_thread(_forget_project_episodes, ctx, pid, _title)', '        pass'),
     # review r2
-    ('N1 everyone-not-updated', P, '                everyone = [x for x in everyone if str(x.get("lab_id")) != lid]', '                pass'),
+    ('N1 everyone-not-updated', P, '            _destroyed.add(lid)\n', '            pass\n'),
     ('N2 data-claim-always', P, '                what = (f" with its data ({len(gone)} volume(s), final backup taken)" if gone', '                what = (f" with its data ({len(gone)} volume(s), final backup taken)" if True'),
     ('N3 tool-probe-allowed', P, '    if origin == "probe" and not (proj.get("metadata") or {}).get("probe_created"):\n        return f"a probe may', '    if False:\n        return f"a probe may'),
-    ('N4 tool-unattended-allowed', P, '    if origin in ("unattended", "leaf", "member", "replay"):', '    if origin in ("member", "replay"):'),
+    ('N4 tool-unattended-allowed', P, '    if origin in ("unattended", "leaf", "member"):', '    if origin in ("member",):'),
     ('N5 delete-refusal-unchecked', P, '            _tr = _teardown_refusal(context, store.get_project(rid) or {}, "delete")\n            if _tr:', '            _tr = _teardown_refusal(context, store.get_project(rid) or {}, "delete")\n            if False:'),
     ('N6 archive-refusal-unchecked', P, '            _tr = _teardown_refusal(context, store.get_project(rid) or {}, "archive")\n            if _tr:', '            _tr = _teardown_refusal(context, store.get_project(rid) or {}, "archive")\n            if False:'),
     ('N7 digest-no-kept', P, '    ids += [f"kept:{r.get(\'lab_id\')}" for r in inv.get("labs") or [] if r.get("lifetime") == "kept"]', '    pass'),
@@ -88,7 +88,7 @@ MUT = [
     ('N19 refusal-text', P, 'listed as stopped/destroyed above already is.', 'Nothing else was removed.'),
     # review r3
     ('M1 preview-not-recorded', P, '                inv.record_create(lid, owner=owner, origin=str(h.get("origin") or ""),', '                (lambda *a, **k: None)(lid, owner=owner, origin=str(h.get("origin") or ""),'),
-    ('M2 grew-any-id', P, '                  - set(plan.get("inventory") or []) if i.startswith(("kept:", "app:")))', '                  - set(plan.get("inventory") or []))'),
+    ('M2 grew-any-id', P, '                  - set(plan.get("inventory") or []) if i.startswith(("kept:", "app:", "sched:")))', '                  - set(plan.get("inventory") or []))'),
     ('M3 digest-no-app', P, '    ids += [f"app:{r.get(\'run_id\')}" for r in inv.get("runs") or [] if r.get("lifetime") == "app"]', '    pass'),
     ('M4 registry-unread-none', P, '            rep["live_left"].append("runs (the run registry could not be read)")', '            pass'),
     ('M5 registry-lenient', P, '            live_runs = reg.rows(owner, live_only=True, strict=True) if reg is not None else []', '            live_runs = reg.rows(owner, live_only=True) if reg is not None else []'),
@@ -125,7 +125,7 @@ MUT = [
     ('Y7 retry-probe-any-owner', 'src/ghost_agent/tools/labs.py', '                and (origin != "probe" or _row0.get("owner") == owner)):', '                and True):'),
     ('Y8 retry-other-host', 'src/ghost_agent/tools/labs.py', '                if _row0["host_id"] != _hnow:', '                if False:'),
 ]
-PINS = ["tests/test_4sx_d2_inventory.py", "tests/test_4sx_c_run_battery.py", "tests/test_4sx_b_lab_tool.py", "tests/test_project_delete_and_guard.py", "tests/test_project_delete_ungated.py"]
+PINS = ["tests/test_4sx_d2_inventory.py", "tests/test_4sx_c_run_battery.py", "tests/test_4sx_b_lab_tool.py", "tests/test_project_delete_and_guard.py", "tests/test_project_delete_ungated.py", "tests/test_4ud_labs.py"]
 
 
 def _tests():

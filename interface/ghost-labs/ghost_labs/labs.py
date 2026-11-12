@@ -2,6 +2,23 @@
 
 All methods are blocking; the API runs them in a thread pool. One lock per
 lab (busy after 30 s), creates serialised globally so budget checks can't race.
+
+The lab lock and a running foreground command (review §4UD F1). A foreground `exec` takes the lab lock, then
+turns its hold into a "command running" mark (`LabLock.to_exec`) for as long as the command runs. What each
+caller gets while a command runs on the lab:
+
+    destroy (owner, autopilot, a leaf's end, max_lifetime, create_failed) ... goes ahead; the command's
+                                                         containers go, its exec answers unknown_lab
+    member stop/start/restart/kill/pause/unpause/isolate/rejoin ............ goes ahead
+    a second foreground exec, screenshot .................................. waits 30 s, then busy
+    kept actions (keep, deploy, rehearse, switch, rollback, backup,
+      restore, app ops, destroy with drop_data), the kept supervisor tick .. wait, then busy / skip the tick
+    eviction by an owner's create ......................................... the lab is not a victim
+    the reaper retiring a kept version .................................... skipped this tick
+    the reaper's idle TTL .................................................. not idle: skipped this tick
+    put, get, status, list, logs, http, spec, extend, detached jobs ....... never took the lock
+
+Two state changes (destroy, member ops, kept actions, an exec's own start) still exclude each other.
 """
 from __future__ import annotations
 
@@ -35,6 +52,19 @@ CREATE_KEYS = ("template", "params", "members", "egress", "readiness", "env", "o
                "lineage", "ttl_idle_s")
 INFRA_IMAGES = ("ghost-lab/tor-gw:", "ghost-lab/agentapi:")
 HTTP_HEAD_BYTES = 16384
+#: review §4UD F2: ONE total deadline for a `lab http` probe — connect, headers and body together (monotonic).
+#: The old 15 s was per recv, so a stream that sent a byte now and then held an API thread for hours.
+HTTP_TOTAL_S = 15.0
+#: ... and for a whole screenshot (its probe, the browser's run and the copy of the picture)
+SHOT_TOTAL_S = 75.0
+#: agent §4UD F-C: a folder moved in one call (PUT/GET /tree) — entries, and unpacked bytes as a multiple of the
+#: archive limit (`file_max_bytes`)
+TREE_MAX_ENTRIES = 2000
+TREE_UNPACKED_FACTOR = 4
+#: how long a cancel waits for the commands it marked to say what became of them
+CANCEL_CONFIRM_S = 8.0
+#: how long a caller waits for a lab's lock before it answers busy
+LOCK_WAIT_S = 30.0
 MEM_HEADROOM_MB = 512       # MemAvailable a create leaves to the host
 STATS_DEADLINE_S = 5.0      # one overall budget for the eviction's docker stats calls (docker's own: 300 s)
 POOLS = ("disposable", "kept")
@@ -73,11 +103,204 @@ def as_int(body: Dict[str, Any], key: str, default: int, lo: int, hi: int) -> in
     return n
 
 
+def clamp_idle(body: Dict[str, Any], default: int, cap: int) -> Tuple[int, bool]:
+    """(idle TTL in seconds, was it clamped) — ONE rule for create and extend (review §4UD G3: create refused a
+    value above the class maximum while extend clamped it). A value above ``cap`` (the lab's hard lifetime) is
+    cut to it; below 1, or not an integer, is a bad_request."""
+    want = as_int(body, "ttl_idle_s", default, 1, 10 ** 9)
+    return min(want, int(cap)), want > int(cap)
+
+
 def _tail_keep(chunks: deque, cap: int) -> Tuple[bytes, bool]:
     data = b"".join(chunks)
     if len(data) > cap:
         return data[-cap:], True
     return data, False
+
+
+class LabLock:
+    """One lab's lock (review §4UD F1). It works like ``threading.Lock`` for every caller that changes the lab's
+    state — plus one more holder kind: a running foreground command. ``to_exec`` turns the caller's hold into a
+    "command running" mark and frees the lock for the two callers that must never wait behind a command:
+    ``acquire(over_exec=True)`` (destroy, member ops). Every other ``acquire`` still waits until no command runs,
+    as it did when the command held the lock itself."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition(threading.Lock())
+        self._held = False
+        self._execs = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1, over_exec: bool = False) -> bool:
+        deadline = None if (not blocking or timeout is None or timeout < 0) else time.monotonic() + timeout
+        with self._cv:
+            while self._held or (self._execs and not over_exec):
+                if not blocking:
+                    return False
+                if deadline is None:
+                    self._cv.wait()
+                    continue
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cv.wait(left)
+            self._held = True
+            return True
+
+    def release(self) -> None:
+        with self._cv:
+            self._held = False
+            self._cv.notify_all()
+
+    def to_exec(self) -> None:
+        """The holder starts its command: the lock is free for destroy / member ops from here."""
+        with self._cv:
+            self._execs += 1
+            self._held = False
+            self._cv.notify_all()
+
+    def exec_done(self) -> None:
+        with self._cv:
+            self._execs = max(0, self._execs - 1)
+            self._cv.notify_all()
+
+    @property
+    def execs(self) -> int:
+        """Foreground commands running on the lab now."""
+        return self._execs
+
+    def locked(self) -> bool:
+        return self._held or bool(self._execs)
+
+
+def http_probe(ip: str, port: int, method: str, path: str, host_header: str, want_bytes: int,
+               total_s: float = HTTP_TOTAL_S) -> Dict[str, Any]:
+    """One GET/HEAD to a member under ONE total deadline (review §4UD F2). Returns
+    ``{status, headers, raw, truncated, error}``: ``status`` None + ``error`` when no status line came (refused,
+    timed out, a URL http.client refuses, a bad status line); with a status, ``raw`` is what arrived of the first
+    ``want_bytes`` and ``truncated`` says the deadline cut the read. A watchdog shuts the socket at the deadline,
+    so a peer that drips bytes cannot keep any recv — header or body — going past it."""
+    import http.client
+    import socket as _socket
+    deadline = time.monotonic() + float(total_s)
+    conn = http.client.HTTPConnection(ip, port, timeout=max(0.05, float(total_s)))
+    hit = threading.Event()
+    held: Dict[str, Any] = {"sock": None}    # the socket itself: http.client drops ITS reference (conn.sock) once a
+    #                                          response that ends with the connection is handed out
+
+    def _cut() -> None:
+        hit.set()
+        try:
+            if held["sock"] is not None:
+                held["sock"].shutdown(_socket.SHUT_RDWR)
+        except OSError:
+            pass
+    dog: Optional[threading.Timer] = None
+    out: Dict[str, Any] = {"status": None, "headers": [], "raw": b"", "truncated": False, "error": "",
+                           "refused": False}
+    try:
+        try:
+            conn.connect()                   # bounded by the connection's own timeout (= the total)
+        except ConnectionRefusedError:
+            out["refused"] = True            # nothing listens on the member's lab address
+            raise
+        held["sock"] = conn.sock
+        dog = threading.Timer(max(0.0, deadline - time.monotonic()), _cut)
+        dog.daemon = True
+        dog.start()
+        conn.request(method, path, headers={"Host": host_header, "User-Agent": "ghost-labs-probe"})
+        resp = conn.getresponse()
+        out["status"], out["headers"] = resp.status, resp.getheaders()
+        buf = bytearray()
+        try:
+            while len(buf) < want_bytes:
+                left = deadline - time.monotonic()
+                if left <= 0 or hit.is_set():
+                    out["truncated"] = True
+                    break
+                try:
+                    held["sock"].settimeout(max(0.05, left))
+                except OSError:
+                    pass
+                chunk = resp.read1(min(65536, want_bytes - len(buf)))
+                if not chunk:
+                    # (a socket the watchdog shut reads as EOF: that is the deadline, not the end of the body)
+                    out["truncated"] = hit.is_set()
+                    break
+                buf += chunk
+        except (OSError, http.client.HTTPException) as e:
+            # the status line arrived: what came of the body is returned, marked
+            out["truncated"] = True
+            out["error"] = ("no more of the body within the deadline" if hit.is_set() or time.monotonic() >= deadline
+                            else f"{type(e).__name__}: {e}")[:200]
+        out["raw"] = bytes(buf)
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        # ValueError: a path that cannot be sent (UnicodeEncodeError for a non-ASCII one). HTTPException too: InvalidURL (a path http.client refuses) and BadStatusLine are not OSErrors and
+        # used to leave as 500 internal
+        out["status"] = None
+        out["error"] = (f"no answer within {float(total_s):g} s" if hit.is_set() or time.monotonic() >= deadline
+                        else f"{type(e).__name__}: {e}")[:300]
+    finally:
+        if dog is not None:
+            dog.cancel()
+        conn.close()
+    return out
+
+
+class TailBuf:
+    """The tail of a byte stream in bounded memory: at least the last ``keep`` bytes (whole chunks, so at most
+    ``keep`` plus one chunk). ``held`` is a RUNNING total — review §4UD F7: the exec pump re-summed its whole
+    buffer for every chunk it read, which is quadratic in the number of chunks (80,000 two-byte chunks: 62 s
+    under the service's GIL). ``total`` counts every byte seen."""
+
+    def __init__(self, keep: int) -> None:
+        self.keep, self.held, self.total = int(keep), 0, 0
+        self.chunks: deque = deque()
+
+    def add(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.chunks.append(chunk)
+        self.held += len(chunk)
+        self.total += len(chunk)
+        while len(self.chunks) > 1 and self.held - len(self.chunks[0]) >= self.keep:
+            self.held -= len(self.chunks.popleft())
+
+    def data(self) -> bytes:
+        return b"".join(self.chunks)
+
+
+def _bounded_tail(chunks, cap: int) -> Tuple[bytes, bool]:
+    """The last ``cap`` bytes of a byte stream (or of one bytes object), read with bounded memory, and whether
+    anything was dropped."""
+    if isinstance(chunks, (bytes, bytearray)):
+        return bytes(chunks[-cap:]), len(chunks) > cap
+    buf = TailBuf(cap)
+    for ch in chunks:
+        buf.add(ch)
+    return buf.data()[-cap:], buf.total > cap
+
+
+def tar_bytes_bounded(data: bytes, limit: int, slack: int = 0) -> bytes:
+    """An archive as plain tar bytes, DECOMPRESSED under a byte bound: never more than ``limit`` + ``slack`` + 1
+    bytes are produced (``slack`` = room for the tar headers). ValueError when it is more, or cannot be unpacked."""
+    import zlib
+    cap = limit + slack
+    if data[:2] != b"\x1f\x8b":
+        if len(data) > cap:
+            raise ValueError(f"the archive unpacks to more than {limit} bytes")
+        return data
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(data, cap + 1)
+    except zlib.error as e:
+        raise ValueError(f"the archive cannot be unpacked ({e})") from e
+    if len(out) > cap or d.unconsumed_tail:
+        raise ValueError(f"the archive unpacks to more than {limit} bytes")
+    if not d.eof or d.unused_data.strip(b"\0"):
+        # part-2 r2 N3: a gzip cut short gave the files before the cut with no error, and only the first of
+        # several gzip streams was read — both are refused here (zero padding after the stream is accepted)
+        raise ValueError("the archive is cut short or holds more than one gzip stream")
+    return out
 
 
 class _NullActions:
@@ -90,7 +313,9 @@ class Manager:
                  runner=subprocess.run, ports: Optional[Ports] = None):
         self.cfg, self.store, self.docker, self.templates, self.run = cfg, store, client, templates, runner
         self.ports = ports or Ports(cfg, store, runner)
-        self._locks: Dict[str, threading.Lock] = {}
+        self._locks: Dict[str, LabLock] = {}
+        #: lab id -> the foreground commands running on it now (agent §4UD F-B; guarded by _locks_guard)
+        self._fg: Dict[str, List[Dict[str, Any]]] = {}
         self._locks_guard = threading.Lock()
         # review r15: (lab, member) pairs whose docker stats call is still running (a LEAF lock, held for a set op)
         self._stats_inflight: set = set()
@@ -109,22 +334,49 @@ class Manager:
         self.kept = None
 
     # ------------------------------------------------------------------ locks
-    def lock(self, lab_id: str) -> threading.Lock:
+    def lock(self, lab_id: str) -> LabLock:
         with self._locks_guard:
-            return self._locks.setdefault(lab_id, threading.Lock())
+            return self._locks.setdefault(lab_id, LabLock())
 
-    def locked(self, lab_id: str, timeout: float = 30.0):
+    def locked(self, lab_id: str, timeout: Optional[float] = None):
+        """The lab's lock for a state change that must not run beside a foreground command (every caller but
+        destroy and the member ops: see the table in the module docstring)."""
+        return self._locked(lab_id, timeout, False)
+
+    def _locked(self, lab_id: str, timeout: Optional[float], over_exec: bool):
         lk = self.lock(lab_id)
+        timeout = LOCK_WAIT_S if timeout is None else timeout
 
         class _Ctx:
             def __enter__(s):
-                if not lk.acquire(timeout=timeout):
-                    raise LabError("busy", f"another operation holds lab {lab_id}", hint="retry shortly",
+                if not lk.acquire(timeout=timeout, over_exec=over_exec):
+                    raise LabError("busy", (f"a command is still running on lab {lab_id}" if lk.execs else
+                                            f"another operation holds lab {lab_id}"), hint="retry shortly",
                                    retry_after_s=10)
 
             def __exit__(s, *a):
                 lk.release()
         return _Ctx()
+
+    def _acquire_guarded(self, lab_id: str, guard: Callable[[Dict[str, Any]], None], over_exec: bool) -> LabLock:
+        """Take the lab's lock, THEN run ``guard`` on a row read inside it; returns the held lock (the caller
+        releases it). The one way exec, member ops and screenshot enter (review §4UD r2/r3): a guard that read the
+        row before the wait let an autopilot call through on a lab that was KEPT while it waited behind the
+        owner's /keep — it then ran on, or stopped, a production member. The callers' own guard before the wait
+        is only an early answer. A lab that went while this waited answers unknown_lab."""
+        lk = self.lock(lab_id)
+        if not lk.acquire(timeout=LOCK_WAIT_S, over_exec=over_exec):
+            raise LabError("busy", (f"a command is still running on lab {lab_id}" if lk.execs else
+                                    f"another operation holds lab {lab_id}"), hint="retry shortly", retry_after_s=10)
+        try:
+            guard(self.get(lab_id))
+        except BaseException:
+            lk.release()
+            raise
+        return lk
+
+    def exec_running(self, lab_id: str) -> bool:
+        return self.lock(lab_id).execs > 0
 
     # ----------------------------------------------------------- lookups
     def get(self, lab_id: str) -> Dict[str, Any]:
@@ -292,7 +544,7 @@ class Manager:
         if origin == "owner":
             b, used, live = self.budgets(), self._used(), self._disposable_labs()
             for l in sorted((l for l in live if l["origin"] == "autopilot"), key=lambda l: l["created_at"]):
-                if self.lock(l["lab_id"]).acquire(blocking=False):
+                if self.lock(l["lab_id"]).acquire(blocking=False):   # (False while a command runs on it too)
                     held.append(l["lab_id"])
                     auto.append(l)
             auto_mb = sum(m["mem_mb"] for l in auto for m in self.store.members(l["lab_id"]))
@@ -504,7 +756,7 @@ class Manager:
         spec = self.resolve_spec(body)
         cls = self._owner_class(owner, origin)
         ttl = self.cfg.ttl[cls]
-        idle = as_int(body, "ttl_idle_s", ttl["idle_s"], 1, ttl["max_s"])
+        idle, idle_clamped = clamp_idle(body, ttl["idle_s"], ttl["max_s"])
         need = sum(m["mem_mb"] for m in spec["members"])
         missing = self.check_firewall()
         if missing:
@@ -572,6 +824,8 @@ class Manager:
         out = self.detail(lab_id)
         if evicted:
             out["evicted"] = evicted
+        if idle_clamped:
+            out["clamped_to_s"] = int(ttl["max_s"])     # as extend says it
         return out
 
     def _labels(self, lab_id: str, owner: str, origin: str, member: Optional[str] = None,
@@ -676,10 +930,31 @@ class Manager:
         return (gw is None and not cur) or (gw is not None and f"via {gw}" in cur)
 
     def wait_ready(self, lab_id: str, spec: Dict[str, Any]) -> None:
+        """The lab's readiness, under ONE total deadline (the template's ``readiness.timeout_s``):
+
+        * the template's own check (one command on one member) decides the lab's STATE — ``ready`` / ``unready``,
+          as before;
+        * agent §4UD F-A: every member that declares ``ready`` gets its own check, polled in the same loop until
+          it exits 0 — but only AFTER the template's check has passed, so it never costs that check a turn. The
+          result is per member (``members: {name: true|false|null}`` in the readiness record, ``ready`` on the
+          member in the lab detail; null = its check never ran before the deadline). A member check NEVER changes
+          the lab's state or fails the create: the caller is told which member is not ready or was not checked,
+          and with which command to look. (pg: the template check asked TCP, the first `psql` used the socket.)
+
+            template check | member checks            | state   | members[*].ready
+            passes         | all pass                 | ready   | true
+            passes         | one still failing        | ready   | false for that one, at the deadline
+            passes late    | no time left to run one  | ready   | null for that one ("not checked")
+            never passes   | (none is run)            | unready | null
+            (no member declares one)                  | as before, no `ready` key anywhere
+        """
         rd = spec["readiness"]
         deadline = time.time() + int(rd["timeout_s"])
         last = {"passed": False, "output": "", "checked_at": 0}
         check = READY_CHECKS.get(rd.get("check", "exit_code"))
+        want = {m["name"]: str(m["ready"]) for m in spec.get("members") or [] if m.get("ready")}
+        # None = this member's check has not RUN (yet): reported as "not checked", never as "not ready"
+        got: Dict[str, Optional[bool]] = {name: None for name in want}
         while time.time() < deadline:
             if not self.store.lab(lab_id):
                 return
@@ -687,16 +962,30 @@ class Manager:
                 if self.store.lab(lab_id)["egress"] == "tor":
                     for m in self.store.members(lab_id):
                         self.apply_route(lab_id, m["name"])
-                r = self._exec(lab_id, rd["member"], rd["cmd"], timeout_s=30)
-                ok = (check(r["stdout"]) if check else r["exit_code"] == 0)
-                last = {"passed": bool(ok), "output": (r["stdout"] + r["stderr"])[-4000:], "checked_at": time.time()}
-                if ok:
-                    break
+                if not last["passed"]:
+                    r = self._exec(lab_id, rd["member"], rd["cmd"], timeout_s=30)
+                    ok = (check(r["stdout"]) if check else r["exit_code"] == 0)
+                    last = {"passed": bool(ok), "output": (r["stdout"] + r["stderr"])[-4000:], "checked_at": time.time()}
             except LabError as e:
                 last = {"passed": False, "output": e.message, "checked_at": time.time()}
             except Exception as e:  # noqa: BLE001 — a restarting member, a stale pid: keep polling
                 last = {"passed": False, "output": f"{type(e).__name__}: {e}"[:500], "checked_at": time.time()}
+            # the member checks run only once the template's own check has PASSED, and only in time that is left:
+            # they can never take a turn from the check that decides the lab's state (part-2 review m7: sharing the
+            # loop, a slow member check starved it and a lab that would have been ready ended `unready`)
+            for name, cmd in (want.items() if last["passed"] else ()):
+                left = deadline - time.time()
+                if got[name] or left < 1:
+                    continue
+                try:
+                    got[name] = self._exec(lab_id, name, cmd, timeout_s=int(min(30, left)))["exit_code"] == 0
+                except Exception:  # noqa: BLE001 — not up yet
+                    got[name] = False
+            if last["passed"] and all(got.values()):
+                break
             time.sleep(3)
+        if want:
+            last = {**last, "members": got}
         if self.store.lab(lab_id):
             self.store.update_lab(lab_id, state="ready" if last["passed"] else "unready", readiness_json=dumps(last))
 
@@ -755,7 +1044,9 @@ class Manager:
             if self.store.destroyed(lab_id, self.cfg.destroyed_memory_s):
                 return zero
             self.get(lab_id)  # raises unknown_lab
-        lk = self.locked(lab_id)
+        # review §4UD F1: over a running foreground command — a leaf's end, the owner and the reaper's hard
+        # limits never wait behind an exec (it answered busy for as long as the command ran)
+        lk = self._locked(lab_id, None, True)
         if not _have_lock:
             lk.__enter__()
         try:
@@ -787,6 +1078,14 @@ class Manager:
         if row["lifetime"] == "kept" and not self.may_touch_kept(row, origin):
             raise LabError("owner_only", f"lab {row['lab_id']} is kept (production): {action} is an owner action",
                            hint="ask the owner, or use a disposable lab")
+
+    def guard_kept_read(self, row: Dict[str, Any], origin: str, action: str) -> None:
+        """review §4UD F12: what a production member wrote or serves (logs, files, pages) is read by the owner —
+        unattended work reads a kept lab's STATUS only (GET /v1/labs/{id}). The agent refused this on its side
+        for `lab logs` and let `run logs` through; the host now refuses both."""
+        if row["lifetime"] == "kept" and not self.may_touch_kept(row, origin):
+            raise LabError("owner_only", f"lab {row['lab_id']} is kept (production): unattended work reads its "
+                                         f"status only, not its {action}", hint="ask the owner, or use a disposable lab")
 
     def _destroy_guard(self, row: Dict[str, Any], reason: str, origin: str, include_kept: bool, force: bool) -> None:
         lab_id = row["lab_id"]
@@ -835,7 +1134,10 @@ class Manager:
         return {"lab_id": row["lab_id"], "template": row["template"], "label": row["label"], "state": row["state"],
                 "owner": row["owner"], "origin": row["origin"], "lineage": row["lineage"], "lifetime": row["lifetime"],
                 "purpose": row["purpose"], "created_at": row["created_at"], "last_used_at": row["last_used_at"],
-                "expires_at": expires, "total_mem_mb": sum(m["mem_mb"] for m in mems), "ram_mb": sum(m["mem_mb"] for m in mems),
+                "expires_at": expires,
+                # agent §4UD F10: when the lab is gone at the latest, whatever is done to it (None: kept)
+                "max_expires_at": (float(row["created_at"]) + int(row["ttl_max_s"])) if row["lifetime"] != "kept" else None,
+                "total_mem_mb": sum(m["mem_mb"] for m in mems), "ram_mb": sum(m["mem_mb"] for m in mems),
                 # agent §4SX D3 code r1 #8: a project delete destroys the version holding the data LAST (with drop_data)
                 **({"app_mounted": bool((loads(row["app_json"], None) or {}).get("mounted"))}
                    if row["lifetime"] == "kept" and row["app_json"] else {})}
@@ -845,6 +1147,10 @@ class Manager:
         out = self.summary(row)
         members = []
         leases = self.ports.leases(lab_id)
+        readiness = loads(row["readiness_json"], {}) or {}
+        ready = readiness.get("members") if isinstance(readiness.get("members"), dict) else {}
+        ready_cmd = {str(x.get("name")): str(x.get("ready") or "")
+                     for x in (loads(row["spec_json"], {}) or {}).get("members") or [] if isinstance(x, dict)}
         for m in self.store.members(lab_id):
             status = "missing"
             try:
@@ -858,9 +1164,13 @@ class Manager:
                       **({"lan_url": self.ports.lan_url(p["port"])} if p["lan"] else {})}
                      for p in leases if p["member"] == m["name"]]
             members.append({"name": m["name"], "container_id": cid, "status": status, "ip": m["ip"], "image": m["image"],
-                            "mem_mb": m["mem_mb"], "ports": ports, "isolated": bool(m["isolated"])})
+                            "mem_mb": m["mem_mb"], "ports": ports, "isolated": bool(m["isolated"]),
+                            # agent §4UD F-A: what the member's own readiness check had reached when the create's
+                            # wait ended (absent: it declares none, or the wait is not over), and the check itself
+                            **({"ready": (None if ready[m["name"]] is None else bool(ready[m["name"]])),
+                                "ready_cmd": ready_cmd.get(m["name"], "")} if m["name"] in ready else {})})
         out.update({"members": members, "network": net.lab_network_name(lab_id), "egress": row["egress"],
-                    "readiness": loads(row["readiness_json"], {})})
+                    "readiness": readiness})
         if row["app_json"]:
             out["app"] = loads(row["app_json"])
         return out
@@ -880,7 +1190,8 @@ class Manager:
         return redact.apply(text, self.redactor())
 
     def _exec(self, lab_id: str, member: str, cmd: str, timeout_s: int = 0, workdir: str = "/root",
-              env: Optional[Dict[str, str]] = None, stdin: Optional[str] = None) -> Dict[str, Any]:
+              env: Optional[Dict[str, str]] = None, stdin: Optional[str] = None,
+              cancel: Optional[threading.Event] = None, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         self.member(lab_id, member)
         timeout_s = int(timeout_s or self.cfg.exec_default_timeout_s)
         if timeout_s > self.cfg.exec_max_timeout_s:
@@ -891,54 +1202,107 @@ class Manager:
             raise LabError("not_ready", f"member {member} is {c.status}", hint="start the member first", state=c.status)
         xid = uuid.uuid4().hex[:12]
         envs = {**(env or {}), "GHOST_CMD": cmd}
-        redir = ""
+        take_stdin = ""
         if stdin is not None:
             self._put_bytes(c, f"/run/ghost-exec/{xid}.stdin", stdin.encode(), 0o600)
-            redir = f' < /run/ghost-exec/{xid}.stdin'
-        inner = f'echo $$ > /run/ghost-exec/{xid}.pid; c="$GHOST_CMD"; unset GHOST_CMD; exec bash -lc "$c"{redir}'
+            # the command's own shell opens the file and deletes it before the command runs: no later cleanup has
+            # to reach the member (r4: on a paused member, or when the exec could not start, a password piped to
+            # psql stayed in /run/ghost-exec)
+            take_stdin = f'exec 0</run/ghost-exec/{xid}.stdin; rm -f /run/ghost-exec/{xid}.stdin; '
+        inner = (f'{take_stdin}echo $$ > /run/ghost-exec/{xid}.pid; c="$GHOST_CMD"; unset GHOST_CMD; '
+                 'exec bash -lc "$c"')
         argv = ["sh", "-c", f"mkdir -p /run/ghost-exec; exec setsid -w sh -c {shlex.quote(inner)}"]
         api = self.docker.api
-        ex = api.exec_create(c.id, argv, environment=envs, workdir=workdir or "/root", stdout=True, stderr=True)
-        out_chunks: deque = deque()
-        err_chunks: deque = deque()
+        try:
+            ex = api.exec_create(c.id, argv, environment=envs, workdir=workdir or "/root", stdout=True, stderr=True)
+        except Exception:
+            if stdin is not None:           # nothing started that would take it
+                try:
+                    c.exec_run(["sh", "-c", f"rm -f /run/ghost-exec/{xid}.stdin"])
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
         cap = int(self.cfg.output_cap_bytes)
-        sizes = {"out": 0, "err": 0}
+        # twice the cap of each stream is kept while it runs (redaction happens before the final cut)
+        out_buf, err_buf = TailBuf(cap * 2), TailBuf(cap * 2)
 
         def pump():
             for o, e in api.exec_start(ex["Id"], stream=True, demux=True):
-                for chunk, dq, key in ((o, out_chunks, "out"), (e, err_chunks, "err")):
-                    if chunk:
-                        dq.append(chunk)
-                        sizes[key] += len(chunk)
-                        while sum(len(x) for x in dq) > cap * 2 and len(dq) > 1:
-                            dq.popleft()
+                if o:
+                    out_buf.add(o)
+                if e:
+                    err_buf.add(e)
         t0 = time.time()
+        started = _started_at(c)
         th = threading.Thread(target=pump, daemon=True)
         th.start()
-        th.join(timeout_s)
-        timed_out = th.is_alive()
-        if timed_out:
-            try:
-                # bash: dash's kill rejects the `-- -PGID` form
-                c.exec_run(["bash", "-c", f"kill -KILL -- -$(cat /run/ghost-exec/{xid}.pid) 2>/dev/null"])
-            except Exception:  # noqa: BLE001
-                pass
-            th.join(5)
+        end = time.monotonic() + timeout_s
+        timed_out = cancelled = False
+        while th.is_alive():
+            left = end - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                break
+            if cancel is not None and cancel.is_set():
+                cancelled = True                    # `cancel_exec` asked (agent §4UD F-B)
+                break
+            th.join(min(0.2, left))
+        killed: Optional[bool] = None
+        if timed_out or cancelled:
+            sent = self._kill_group(c, xid, started)
+            th.join(5 if sent else 1)
+            # gone = the group was SEEN gone after the kill, or the command's stream has ended (whatever ended it)
+            killed = bool(sent) or not th.is_alive()
+            if not killed and state is not None:
+                state["pump"] = th          # the command is NOT gone: exec() keeps the lab's "command running" mark
+                state["kill"] = (c, xid, started)       # … and a later cancel tries the same kill again
+        # the stdin file is removed here too, whatever happened: the shell that deletes it may never have run (r5:
+        # a workdir that does not exist, a failed start). LIMIT (r6): a member PAUSED in the milliseconds between
+        # the file's write and the shell's start refuses this exec too, and the file stays until the member is
+        # removed — nothing sweeps /run/ghost-exec. A command NOT
+        # confirmed killed keeps its pid file: a later cancel's kill reads it (part-2 r2 N1: removing it here made
+        # the retry find no file and answer "killed" while the group still ran)
         try:
-            c.exec_run(["sh", "-c", f"rm -f /run/ghost-exec/{xid}.pid /run/ghost-exec/{xid}.stdin"])
+            c.exec_run(["sh", "-c", f"rm -f /run/ghost-exec/{xid}.stdin"
+                                    + ("" if killed is False else f" /run/ghost-exec/{xid}.pid")])
         except Exception:  # noqa: BLE001
             pass
-        code = None if timed_out else api.exec_inspect(ex["Id"]).get("ExitCode")
+        code = None if (timed_out or cancelled) else api.exec_inspect(ex["Id"]).get("ExitCode")
         rules = self.redactor()
         # redact BEFORE truncation (v2 §11.20): a secret straddling the cut must not leak half of itself
-        out = redact.apply(b"".join(out_chunks).decode("utf-8", "replace"), rules)
-        err = redact.apply(b"".join(err_chunks).decode("utf-8", "replace"), rules)
+        out = redact.apply(out_buf.data().decode("utf-8", "replace"), rules)
+        err = redact.apply(err_buf.data().decode("utf-8", "replace"), rules)
         out_tr, err_tr = len(out) > cap, len(err) > cap
         # the command text is echoed redacted too (review 11-05 #17: `cmd` carried the secret back)
         return {"lab_id": lab_id, "member": member, "cmd": redact.apply(cmd, rules), "exit_code": code,
                 "stdout": out[-cap:], "stderr": err[-cap:],
-                "stdout_truncated": out_tr or sizes["out"] > cap * 2, "stderr_truncated": err_tr or sizes["err"] > cap * 2,
-                "duration_s": round(time.time() - t0, 3), "timed_out": timed_out}
+                "stdout_truncated": out_tr or out_buf.total > cap * 2, "stderr_truncated": err_tr or err_buf.total > cap * 2,
+                "duration_s": round(time.time() - t0, 3), "timed_out": timed_out,
+                **({"cancelled": True} if cancelled else {}),
+                # is the command really gone? (false = the kill could not be delivered, or was not sent because the
+                # member restarted, and its stream is still open; absent = it was not asked to end)
+                **({"killed": bool(killed)} if (timed_out or cancelled) else {})}
+
+    def _kill_group(self, c, xid: str, started: str) -> Optional[bool]:
+        """End a foreground command's process GROUP by the pid file it wrote, and LOOK afterwards (part-2 review
+        m1: "killed" was said when the kill had raised, e.g. on a paused member). True: the group was seen gone
+        (its pid file is removed then). False: the kill could not be delivered, the group is still there, or there
+        is no pid file yet (the command's shell has not written it: nothing was signalled — r2 N1, it read as
+        "killed").
+        None: not signalled — the member was restarted since the command began (the job rule, review §4UD F6: a pid
+        file from an earlier start names nobody, and the command died with the restart)."""
+        try:
+            c.reload()
+            if _started_at(c) != started:
+                return None
+            # bash: dash's kill rejects the `-- -PGID` form
+            r = c.exec_run(["bash", "-c",
+                            f"f=/run/ghost-exec/{xid}; p=$(cat $f.pid 2>/dev/null) || exit 2; kill -KILL -- -$p 2>/dev/null; "
+                            "for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 -- -$p 2>/dev/null || { rm -f $f.pid $f.stdin; "
+                            "exit 0; }; sleep 0.2; done; exit 1"])
+            return r.exit_code == 0
+        except Exception:  # noqa: BLE001 — a paused / dying member: nothing was confirmed
+            return False
 
     def exec(self, lab_id: str, body: Dict[str, Any], origin: str) -> Dict[str, Any]:
         self.guard_kept_mutation(self.get(lab_id), origin, "exec")
@@ -948,11 +1312,123 @@ class Manager:
         if not cmd:
             raise LabError("bad_request", "cmd is required", field="cmd")
         if body.get("detach"):
-            return self.start_job(lab_id, member, cmd, body)
-        with self.locked(lab_id):
-            return self._exec(lab_id, member, cmd, as_int(body, "timeout_s", 0, 0, int(self.cfg.exec_max_timeout_s)),
-                              str(body.get("workdir") or "/root"),
-                              {str(k): str(v) for k, v in (body.get("env") or {}).items()}, body.get("stdin"))
+            # review §4UD r3 H9: the kept guard on a FRESH row, inside the lock, for a detached start too (it had
+            # only the guard above, read before any wait). Over a running command, and released as soon as the job
+            # is launched: the lock is never held while the job runs.
+            lk = self._acquire_guarded(lab_id, lambda row: self.guard_kept_mutation(row, origin, "exec"),
+                                       over_exec=True)
+            try:
+                return self.start_job(lab_id, member, cmd, body)
+            finally:
+                lk.release()
+        timeout_s = as_int(body, "timeout_s", 0, 0, int(self.cfg.exec_max_timeout_s))
+        lk = self._acquire_guarded(lab_id, lambda row: self.guard_kept_mutation(row, origin, "exec"), over_exec=False)
+        try:
+            self.member(lab_id, member)
+        except BaseException:
+            lk.release()
+            raise
+        # review §4UD F1: the hold becomes a "command running" mark — destroy and member ops do not wait for it
+        # (never release() after this: the lock may already be another caller's)
+        lk.to_exec()
+        # agent §4UD F-B: what `cancel_exec` needs to find this command and to decide who may end it
+        rec = {"member": member, "origin": origin, "tag": str(body.get("tag") or "")[:64], "cmd": cmd,
+               "started_at": time.time(), "cancel": threading.Event(), "ended": threading.Event(), "outcome": ""}
+        with self._locks_guard:
+            self._fg.setdefault(lab_id, []).append(rec)
+        try:
+            out = self._exec(lab_id, member, cmd, timeout_s, str(body.get("workdir") or "/root"),
+                             {str(k): str(v) for k, v in (body.get("env") or {}).items()}, body.get("stdin"),
+                             cancel=rec["cancel"], state=rec)
+            # what became of it, for a cancel that is waiting to say so: killed / not killed / ended by itself
+            rec["outcome"] = ("ended" if not (out.get("cancelled") or out.get("timed_out")) else
+                              "killed" if out.get("killed") else "not_killed")
+        except Exception:  # noqa: BLE001 — LabError too
+            # ONE answer for "the lab went under the command" (r3 m9): a destroy removes the containers first and
+            # the row last, so a command that failed in between (its exit code could not be read) waits for the
+            # state change in progress before it looks — it answered 500 internal while the row was still there
+            if lk.acquire(timeout=LOCK_WAIT_S, over_exec=True):
+                lk.release()
+            if not self.store.lab(lab_id):
+                self.get(lab_id)            # destroyed under the command: unknown_lab, with why
+            raise
+        finally:
+            rec["ended"].set()
+
+            def _release() -> None:
+                with self._locks_guard:
+                    self._fg[lab_id] = [r for r in self._fg.get(lab_id, []) if r is not rec]
+                    if not self._fg[lab_id]:
+                        self._fg.pop(lab_id, None)
+                lk.exec_done()
+            pump = rec.get("pump")
+            if pump is not None and pump.is_alive():
+                # the command could not be killed and still runs: the lab keeps its "command running" mark (and
+                # the command stays in the cancel list) until its stream really ends — this call answers now
+                threading.Thread(target=lambda: (pump.join(), _release()), daemon=True,
+                                 name=f"ghost-labs-exec-tail-{lab_id}").start()
+            else:
+                _release()
+        if not self.store.lab(lab_id):
+            self.get(lab_id)                # raises unknown_lab: destroyed at …, reason …
+        self.touch(lab_id, origin)          # idle time counts from the command's END
+        return out
+
+    def cancel_exec(self, lab_id: str, body: Dict[str, Any], origin: str) -> Dict[str, Any]:
+        """End the foreground command(s) running on a lab (agent §4UD F-B). The command's own exec thread does the
+        ending — it kills its process group by its pid file, under the stale-start rule — and answers
+        ``cancelled: true``; this only marks the commands the caller may end. No lab lock: it must work WHILE a
+        command runs, and it changes no lab state.
+
+            running command(s)            | caller                               | answer
+            none                          | anyone allowed on the lab            | 200, cancelled: []
+            on a KEPT lab                 | not owner / a probe on its own lab   | 403 owner_only (nothing marked)
+            started by anyone             | owner                                | marked
+            started with tag T            | autopilot with the same tag T        | marked
+            started with another/no tag   | autopilot (any tag, or none)         | not marked: 403 owner_only when
+                                          |                                      |   that leaves nothing marked
+            started by a probe            | probe                                | marked
+            started by owner/autopilot    | probe                                | not marked (403 as above)
+            ``member`` given              | —                                    | only that member's commands
+        """
+        row = self.get(lab_id)
+        self.guard_kept_mutation(row, origin, "cancel")
+        member = str(body.get("member") or "")
+        if member:
+            self.member(lab_id, member)
+        tag = str(body.get("tag") or "")[:64]
+        with self._locks_guard:
+            running = [r for r in self._fg.get(lab_id, []) if not member or r["member"] == member]
+
+        def may(r: Dict[str, Any]) -> bool:
+            if origin == "owner":
+                return True
+            if origin == "probe":
+                return r["origin"] == "probe"
+            return bool(tag) and r["origin"] == "autopilot" and r["tag"] == tag
+        mine = [r for r in running if may(r)]
+        if running and not mine:
+            raise LabError("owner_only", f"{len(running)} command(s) run on lab {lab_id} that this caller did not "
+                                         "start", hint="only the owner, or the build that started a command, ends it")
+        self.touch(lab_id, origin)
+        rules = self.redactor()
+        for r in mine:
+            r["cancel"].set()
+            pump = r.get("pump")
+            if r["ended"].is_set() and pump is not None and pump.is_alive() and r.get("kill"):
+                # its exec call has answered "not killed" and it still runs (a member that was paused then): the
+                # same kill, again, from here — the exec thread that would have sent it is gone
+                if self._kill_group(*r["kill"]):
+                    r["outcome"] = "killed"
+        # each command ends itself (its exec thread kills its group and looks): wait for it to say what happened,
+        # under ONE bound for all of them — "" = no word in time (never "killed" on a guess)
+        end = time.monotonic() + CANCEL_CONFIRM_S
+        for r in mine:
+            r["ended"].wait(max(0.0, end - time.monotonic()))
+        return {"lab_id": lab_id, "running": len(running),
+                "cancelled": [{"member": r["member"], "cmd": redact.apply(r["cmd"], rules)[:200],
+                               "running_s": round(time.time() - r["started_at"], 1),
+                               "outcome": r["outcome"] if r["ended"].is_set() else ""} for r in mine]}
 
     # ----------------------------------------------------------- jobs
     def start_job(self, lab_id: str, member: str, cmd: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -969,15 +1445,27 @@ class Manager:
         if r.exit_code != 0:
             raise LabError("internal", "could not start the job", hint="check the member's logs")
         self.store.x("INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?)", (job_id, lab_id, member, cmd, time.time(), None, "running", None))
+        # review §4UD F6: WHICH start of the container the job belongs to — its pid means nothing after a restart
+        self.store.x("INSERT OR REPLACE INTO job_starts VALUES (?,?,?)", (job_id, lab_id, _started_at(c)))
+        if not self.store.lab(lab_id):
+            # destroyed while the job was being started (the destroy deletes the lab's job rows, possibly BEFORE
+            # these were written): no row may outlive its lab, and "started" would be false
+            for t in ("jobs", "job_starts"):
+                self.store.x(f"DELETE FROM {t} WHERE job_id=?", (job_id,))
+            self.get(lab_id)
         return {"lab_id": lab_id, "member": member, "job_id": job_id, "cmd": self.redact_text(cmd)}
 
     def job(self, lab_id: str, job_id: str, tail_bytes: int = 65536, kill: bool = False,
-            origin: str = "autopilot") -> Dict[str, Any]:
+            origin: str = "autopilot", reader: Optional[str] = None) -> Dict[str, Any]:
         """kill=True is a mutation: a kept lab's job is killed by its owner only (review 11-05 #7). The
         origin defaults to autopilot (fail closed) for a caller that does not say."""
         row = self.get(lab_id)
         if kill:
             self.guard_kept_mutation(row, origin, "job kill")
+        elif reader is not None:
+            # review §4UD F12 (r2): a job's answer carries its OUTPUT — content of a production member, like its
+            # logs. Refused like them (an empty tail read as "the job printed nothing", exit 0)
+            self.guard_kept_read(row, reader, "job output")
         rows = self.store.q("SELECT * FROM jobs WHERE job_id=? AND lab_id=?", (job_id, lab_id))
         if not rows:
             raise LabError("unknown_job", f"no job {job_id} in {lab_id}", hint="list the lab's jobs")
@@ -986,28 +1474,41 @@ class Manager:
         want = max(1, min(int(tail_bytes), int(self.cfg.output_cap_bytes)))
         pairs = self._secret_pairs()
         extra = redact.margin(pairs)
+        killed = cut = False
         try:
             c = self.container(lab_id, j["member"])
-            if kill:
-                c.exec_run(["bash", "-c", f"p=$(cat {d}.pid); kill -TERM -- -$p 2>/dev/null; "
-                                          f"for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $p 2>/dev/null || break; sleep 0.3; done; "
-                                          f"kill -KILL -- -$p 2>/dev/null; sleep 0.3; true"])
-            alive = c.exec_run(["sh", "-c", f"kill -0 $(cat {d}.pid) 2>/dev/null && echo yes || echo no"]).output.decode().strip()
+            # review §4UD F6: `.rc` (written when the whole job group has ended) is read FIRST and decides; a job
+            # of an EARLIER start of the container is never "running" and its pid is never signalled (the pid
+            # file outlives a member restart, and the number may be another process's — or a newer run's leader)
             rc = c.exec_run(["sh", "-c", f"cat {d}.rc 2>/dev/null"]).output.decode().strip()
+            was = self.store.q("SELECT container_started FROM job_starts WHERE job_id=?", (job_id,))
+            c.reload()
+            stale = bool(was and was[0]["container_started"] and was[0]["container_started"] != _started_at(c))
+            alive = "no"
+            if rc == "" and not stale:
+                if kill:
+                    c.exec_run(["bash", "-c", f"p=$(cat {d}.pid); kill -TERM -- -$p 2>/dev/null; "
+                                              f"for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $p 2>/dev/null || break; sleep 0.3; done; "
+                                              f"kill -KILL -- -$p 2>/dev/null; sleep 0.3; true"])
+                    killed = True
+                alive = c.exec_run(["sh", "-c", f"kill -0 $(cat {d}.pid) 2>/dev/null && echo yes || echo no"]).output.decode().strip()
             # fetched with a margin, redacted, THEN cut (review 11-05 #9: `tail -c` halved a secret at the cut)
             raw = c.exec_run(["sh", "-c", f"tail -c {want + extra} {d}.log 2>/dev/null"]).output or b""
-            tail = redact.cut_tail(raw, want, redact.build_bytes(pairs), truncated=len(raw) >= want + extra) \
-                .decode("utf-8", "replace")
+            cut = len(raw) >= want + extra
+            tail = redact.cut_tail(raw, want, redact.build_bytes(pairs), truncated=cut).decode("utf-8", "replace")
             # contract states only: running | exited | lost (a kill ends as exited, exit_code null, killed: true)
-            state = "running" if alive == "yes" else ("exited" if (rc != "" or kill) else "lost")
+            # (a job this call did not signal — it had ended, or belongs to an earlier start — is not "killed")
+            state = "exited" if rc != "" else ("running" if alive == "yes" else ("exited" if killed else "lost"))
         except Exception:  # noqa: BLE001
-            state, rc, tail = "lost", "", ""
+            state, rc, tail, killed, cut = "lost", "", "", False, False
         code = int(rc) if rc.lstrip("-").isdigit() else None
         if state != "running" and j["state"] == "running":
             self.store.x("UPDATE jobs SET state=?, exit_code=?, ended_at=? WHERE job_id=?", (state, code, time.time(), job_id))
         return {"lab_id": lab_id, "job_id": job_id, "member": j["member"], "cmd": self.redact_text(j["cmd"]),
-                "state": state, **({"killed": True} if kill else {}),
+                "state": state, **({"killed": True} if killed else {}),
                 "exit_code": code, "output_tail": tail,
+                # review §4UD F11: the tail is the LAST tail_bytes of this file on the member — say when it was cut
+                "output_truncated": bool(cut), "log_path": f"{d}.log",
                 "started_at": j["started_at"], "ended_at": j["ended_at"] or (time.time() if state != "running" else None)}
 
     # ----------------------------------------------------------- files
@@ -1051,7 +1552,9 @@ class Manager:
             raise LabError("bad_request", f"no file {path} in {member}", field="path")
         mode = int(stat.get("mode", 0))
         if mode & (1 << 31) or mode & (1 << 27) or mode & (1 << 26) or mode & (1 << 25):   # dir, symlink, device, pipe
-            raise LabError("bad_request", f"{path} is not a regular file", field="path")
+            # `kind`: a client that can move folders asks GET /tree for a directory (agent §4UD F-C)
+            raise LabError("bad_request", f"{path} is not a regular file", field="path",
+                           **({"kind": "directory"} if mode & (1 << 31) and not mode & (1 << 27) else {}))
         if int(stat.get("size", 0)) > limit:
             raise LabError("bad_request", f"file is {stat['size']} bytes (max {limit}, {what})", field="path")
         buf, cap = bytearray(), limit + 64 * 1024
@@ -1066,7 +1569,7 @@ class Manager:
             return tar.extractfile(m).read()
 
     def get_file(self, lab_id: str, member: str, path: str, origin: str) -> Dict[str, Any]:
-        self.get(lab_id)
+        self.guard_kept_read(self.get(lab_id), origin, "files")
         self.touch(lab_id, origin)
         self.member(lab_id, member)
         data = self.read_raw(lab_id, member, path, int(self.cfg.file_max_bytes), "file_max_bytes")
@@ -1074,6 +1577,175 @@ class Manager:
         red = redact.apply_bytes(data, self.redactor_bytes())
         return {"lab_id": lab_id, "member": member, "path": path, "bytes": len(red),
                 "content_b64": base64.b64encode(red).decode()}
+
+    # ----------------------------------------------------------- folders (agent §4UD F-C)
+    @staticmethod
+    def _tree_name(name: str) -> str:
+        """A tar entry's name as a clean relative POSIX path, or '' when it is not one (absolute, `..`, empty)."""
+        from pathlib import PurePosixPath
+        raw = str(name or "")
+        if raw.startswith("/") or "\x00" in raw or "\\" in raw:
+            return ""
+        parts = [p for p in PurePosixPath(raw).parts if p not in (".", "")]
+        if not parts or any(p == ".." for p in parts):
+            return ""
+        return "/".join(parts)
+
+    def put_tree(self, lab_id: str, body: Dict[str, Any], origin: str) -> Dict[str, Any]:
+        """A folder into a member: a tar(.gz) archive unpacked UNDER ``path``.
+
+            entry in the archive                  | answer
+            regular file / directory, clean name  | written (mode kept & 0o755, owner root)
+            absolute name, `..`, empty name       | the WHOLE put is refused (bad_request), nothing written
+            symlink, hardlink, device, fifo       | the WHOLE put is refused, nothing written
+            more than TREE_MAX_ENTRIES entries    | refused
+            unpacked over 4 x file_max_bytes, or
+              the archive over file_max_bytes     | refused
+            a KEPT lab                            | the owner only (the rule of put, exec and deploy)
+
+        The archive the member receives is REBUILT here from the checked entries: nothing of the client's own
+        tar headers (links, owners, device numbers, pax records) reaches Docker's extractor."""
+        self.guard_kept_mutation(self.get(lab_id), origin, "put")
+        self.touch(lab_id, origin)
+        member, path = str(body.get("member") or ""), str(body.get("path") or "")
+        self.member(lab_id, member)
+        if not path.startswith("/") or ".." in Path(path).parts:
+            raise LabError("bad_request", "path must be an absolute folder path without `..`", field="path")
+        try:
+            data = base64.b64decode(str(body.get("archive_b64") or ""), validate=True)
+        except (ValueError, TypeError):
+            raise LabError("bad_request", "archive_b64 is not valid base64", field="archive_b64")
+        if len(data) > self.cfg.file_max_bytes:
+            raise LabError("bad_request", f"archive is {len(data)} bytes (max {self.cfg.file_max_bytes})",
+                           field="archive_b64")
+        limit = int(self.cfg.file_max_bytes) * TREE_UNPACKED_FACTOR
+        out, n, total = io.BytesIO(), 0, 0
+        try:
+            # DECOMPRESSED under a byte bound before tarfile reads anything (part-2 review m8: the per-entry size
+            # checks read headers; 300 KB of gzip inflated 300 MB first)
+            plain = tar_bytes_bounded(data, limit, slack=2048 * (TREE_MAX_ENTRIES + 2))
+            with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as src, tarfile.open(fileobj=out, mode="w") as dst:
+                for ti in src:
+                    n += 1
+                    if n > TREE_MAX_ENTRIES:
+                        raise LabError("bad_request", f"the folder has more than {TREE_MAX_ENTRIES} entries",
+                                       field="archive_b64")
+                    name = self._tree_name(ti.name)
+                    if not name:
+                        raise LabError("bad_request", f"entry {ti.name!r} is not a relative path inside the folder",
+                                       field="archive_b64")
+                    if not (ti.isfile() or ti.isdir()):
+                        raise LabError("bad_request", f"entry {ti.name!r} is a link or a device — a folder put "
+                                                      "carries regular files and directories only", field="archive_b64")
+                    clean = tarfile.TarInfo(name)
+                    clean.mtime = int(ti.mtime or time.time())
+                    if ti.isdir():
+                        clean.type, clean.mode = tarfile.DIRTYPE, 0o755
+                        dst.addfile(clean)
+                        continue
+                    total += int(ti.size)
+                    if total > limit:
+                        raise LabError("bad_request", f"the folder unpacks to more than {limit} bytes",
+                                       field="archive_b64")
+                    clean.size, clean.mode = int(ti.size), (int(ti.mode) & 0o755) or 0o644
+                    dst.addfile(clean, src.extractfile(ti))
+        except (tarfile.TarError, ValueError) as e:
+            raise LabError("bad_request", f"archive_b64 is not a usable tar archive ({e})"[:300], field="archive_b64")
+        c = self.container(lab_id, member)
+        c.exec_run(["mkdir", "-p", path])
+        c.put_archive(path, out.getvalue())
+        return {"lab_id": lab_id, "member": member, "path": path, "entries": n, "bytes": total}
+
+    def get_tree(self, lab_id: str, member: str, path: str, origin: str) -> Dict[str, Any]:
+        """A member's folder as a tar.gz: regular files and directories only, names relative to the folder, file
+        contents passed through the secret redactor (as `get_file` does). Links, devices and fifos are left out
+        and named in ``skipped``. The member's archive is read under `put_tree`'s unpacked bound; the content put
+        into the answer (hard links as copies) is held to ``file_max_bytes``, what the agent accepts. A KEPT lab's
+        files are read by the owner only."""
+        self.guard_kept_read(self.get(lab_id), origin, "files")
+        self.touch(lab_id, origin)
+        self.member(lab_id, member)
+        import posixpath
+        if not path.startswith("/"):
+            raise LabError("bad_request", "path must be absolute", field="path")
+        path = posixpath.normpath(path)            # `/data/.` and `/data/` are `/data` (Docker names entries by it)
+        if path == "/" or path.startswith("//"):
+            raise LabError("bad_request", "the root folder is not fetched — name a folder", field="path")
+        base = posixpath.basename(path)
+        c = self.container(lab_id, member)
+        try:
+            stream, stat = c.get_archive(path)
+        except Exception:  # noqa: BLE001
+            raise LabError("bad_request", f"no folder {path} in {member}", field="path")
+        mode = int(stat.get("mode", 0))
+        if not mode & (1 << 31) or mode & (1 << 27):
+            raise LabError("bad_request", f"{path} is not a folder", field="path", kind="file")
+        limit = int(self.cfg.file_max_bytes) * TREE_UNPACKED_FACTOR
+        buf = bytearray()
+        for chunk in stream:
+            buf += chunk
+            if len(buf) > limit + 1024 * (TREE_MAX_ENTRIES + 2):      # the files, plus a tar header per entry
+                raise LabError("bad_request", f"{path} is over {limit} bytes", field="path")
+        rules = self.redactor_bytes()
+        out, n, total, skipped = io.BytesIO(), 0, 0, []
+        sent: Dict[str, bytes] = {}         # rel -> the (redacted) bytes already sent, for hard links to them
+        # what the answer may carry: the agent writes at most file_max_bytes of a folder (its DEPLOY_MAX_BYTES), so
+        # nothing over that is built (r4: the read bound, 4×, let 80 MB be packed for an answer the agent refuses)
+        built_max, links = int(self.cfg.file_max_bytes), 0
+        from pathlib import PurePosixPath
+        with tarfile.open(fileobj=io.BytesIO(bytes(buf))) as src, tarfile.open(fileobj=out, mode="w:gz") as dst:
+            for ti in src:
+                # Docker names every entry <folder>/…: the FIRST component must be the folder's own name. Anything
+                # else is not this folder's archive — an error for the whole call, never an entry quietly dropped
+                # or moved up a level (part-2 review M4: "the first component" was stripped whatever it was, so
+                # `./top.txt` vanished and `./sub/b.txt` became `b.txt`)
+                parts = [p for p in PurePosixPath(str(ti.name or "")).parts if p != "."]
+                if not parts or parts[0] != base or ".." in parts:
+                    raise LabError("internal", f"the member's archive of {path} names an entry {str(ti.name)[:80]!r} "
+                                               f"that is not under {base}/ — nothing is returned",
+                                   hint="report this: the folder was not read")
+                if len(parts) == 1:
+                    continue                                           # the folder itself
+                rel = "/".join(parts[1:])
+                linked = None
+                if ti.islnk():
+                    # a HARD link is a second name of a file in this folder: Docker sends the file once, under
+                    # whichever name it met first, and the other name as a link to it (§4UD-c, seen on real Docker:
+                    # `top.txt` was dropped because `hard.txt` came first). It is sent as a copy of that file;
+                    # a link to anything not already sent here is skipped like a symlink
+                    tparts = [p for p in PurePosixPath(str(ti.linkname or "")).parts if p != "."]
+                    if tparts and tparts[0] == base:      # a `..` name never matches a key of `sent`
+                        linked = sent.get("/".join(tparts[1:]))
+                        links += linked is not None
+                if "\\" in rel or "\x00" in rel or not (ti.isfile() or ti.isdir() or linked is not None):
+                    skipped.append(rel)        # symlinks, unresolved hard links, devices, pipes, names no client accepts
+                    continue
+                n += 1
+                if n > TREE_MAX_ENTRIES:
+                    raise LabError("bad_request", f"{path} has more than {TREE_MAX_ENTRIES} entries", field="path")
+                clean = tarfile.TarInfo(rel)
+                clean.mtime = int(ti.mtime or 0)
+                if ti.isdir():
+                    clean.type, clean.mode = tarfile.DIRTYPE, 0o755
+                    dst.addfile(clean)
+                    continue
+                red = linked if linked is not None else redact.apply_bytes(src.extractfile(ti).read(), rules)
+                sent[rel] = red
+                total += len(red)
+                if total > built_max:
+                    # the bound on what is BUILT here, not only on what was read: a hard link costs one header in
+                    # the member's archive and a whole copy in ours (r3 MAJOR 1: 150 links to 1.5 MB built 226 MB)
+                    raise LabError("bad_request", f"{path} comes to more than {built_max} bytes"
+                                   + (" (hard links count as copies)" if links else ""), field="path")
+                clean.size, clean.mode = len(red), (int(ti.mode) & 0o755) or 0o644
+                dst.addfile(clean, io.BytesIO(red))
+        data = out.getvalue()
+        if len(data) > self.cfg.file_max_bytes:
+            raise LabError("bad_request", f"{path} packs to {len(data)} bytes (max {self.cfg.file_max_bytes})",
+                           field="path")
+        return {"lab_id": lab_id, "member": member, "path": path, "entries": n, "bytes": total,
+                "skipped": skipped[:50], "skipped_total": len(skipped),
+                "archive_b64": base64.b64encode(data).decode()}
 
     # ----------------------------------------------------------- members
     def member_action(self, lab_id: str, member: str, action: str, origin: str) -> Dict[str, Any]:
@@ -1083,7 +1755,11 @@ class Manager:
         acts = ("stop", "start", "restart", "kill", "pause", "unpause", "isolate", "rejoin")
         if action not in acts:
             raise LabError("bad_request", f"action must be one of {acts}", field="action")
-        with self.locked(lab_id):
+        # over a running command (review §4UD F1: fault injection while a command runs); the kept guard is read
+        # again inside the lock
+        lk = self._acquire_guarded(lab_id, lambda row: self.guard_kept_mutation(row, origin, f"member {action}"),
+                                   over_exec=True)
+        try:
             c = self.container(lab_id, member)
             netname = net.lab_network_name(lab_id)
             if action in ("stop", "start", "restart", "kill", "pause", "unpause"):
@@ -1113,20 +1789,44 @@ class Manager:
                 self.apply_route(lab_id, member)
             c.reload()
             m = self.member(lab_id, member)
+        finally:
+            lk.release()
         return {"lab_id": lab_id, "member": member, "action": action, "status": c.status, "isolated": bool(m["isolated"])}
 
     def logs(self, lab_id: str, member: str, tail: int, origin: str) -> Dict[str, Any]:
-        self.get(lab_id)
+        """The last ``tail`` lines of the member's output and of each /var/log/lab/*.log — bounded in BYTES too
+        (review §4UD F17: a line has no size limit, so `tail=1` of a log with one 2 GB line read 2 GB into this
+        process). Each part keeps its last ``output_cap_bytes``; the container's own log is read as a stream."""
+        self.guard_kept_read(self.get(lab_id), origin, "logs")
         self.touch(lab_id, origin)
         self.member(lab_id, member)
         c = self.container(lab_id, member)
-        parts = ["== container stdout/stderr ==", c.logs(tail=int(tail)).decode("utf-8", "replace")]
+        cap = int(self.cfg.output_cap_bytes)
+        pairs = self._secret_pairs()
+        want = cap + redact.margin(pairs)          # fetched with a margin, redacted, THEN cut (review 11-05 #9)
+        rules_b = redact.build_bytes(pairs)
+        n = max(1, int(tail))
         try:
-            r = c.exec_run(["sh", "-c", f"for f in /var/log/lab/*.log; do [ -e \"$f\" ] && echo \"== $f ==\" && tail -n {int(tail)} \"$f\"; done"])
-            parts.append(r.output.decode("utf-8", "replace"))
+            # follow=False SAID: the Docker SDK follows a streamed log by default, and a followed log of a
+            # running container never ends
+            stream = c.logs(tail=n, stream=True, follow=False)
+        except TypeError:                           # a client without stream=/follow=
+            stream = c.logs(tail=n)
+        raw, cut1 = _bounded_tail(stream, want)
+        parts = ["== container stdout/stderr ==", redact.cut_tail(raw, cap, rules_b, truncated=cut1).decode("utf-8", "replace")]
+        cut2 = False
+        try:
+            r = c.exec_run(["sh", "-c", f"for f in /var/log/lab/*.log; do [ -e \"$f\" ] && echo \"== $f ==\" && "
+                                        f"tail -n {n} \"$f\" | tail -c {want}; done 2>/dev/null | tail -c {want}"])
+            raw2, cut2 = _bounded_tail(r.output or b"", want)
+            cut2 = cut2 or len(raw2) >= want        # the member's own `tail -c` already cut it to `want`
+            parts.append(redact.cut_tail(raw2, cap, rules_b, truncated=cut2).decode("utf-8", "replace"))
         except Exception:  # noqa: BLE001
             pass
-        return {"lab_id": lab_id, "member": member, "logs": redact.apply("\n".join(parts), self.redactor())}
+        out = {"lab_id": lab_id, "member": member, "logs": "\n".join(parts)}
+        if cut1 or cut2:
+            out["truncated"] = True                 # only the last output_cap_bytes of a part were kept
+        return out
 
     def extend(self, lab_id: str, body: Dict[str, Any], origin: str) -> Dict[str, Any]:
         row = self.get(lab_id)
@@ -1134,18 +1834,18 @@ class Manager:
             raise LabError("bad_request", "kept labs have no TTL", field="ttl_idle_s")
         self.touch(lab_id, origin)
         cap = int(row["ttl_max_s"])
-        want = as_int(body, "ttl_idle_s", -1, 1, 10 ** 9)
-        if want < 0:
+        if body.get("ttl_idle_s") in (None, ""):
             raise LabError("bad_request", "ttl_idle_s is required", field="ttl_idle_s")
-        self.store.update_lab(lab_id, ttl_idle_s=min(want, cap))
+        idle, clamped = clamp_idle(body, 0, cap)
+        self.store.update_lab(lab_id, ttl_idle_s=idle)
         out = self.summary(self.store.lab(lab_id))
-        if want > cap:
+        if clamped:
             out["clamped_to_s"] = cap
         return out
 
     # ----------------------------------------------------------- http probe (no SSRF)
-    def http(self, lab_id: str, body: Dict[str, Any], origin: str) -> Dict[str, Any]:
-        self.get(lab_id)
+    def http(self, lab_id: str, body: Dict[str, Any], origin: str, total_s: float = HTTP_TOTAL_S) -> Dict[str, Any]:
+        self.guard_kept_read(self.get(lab_id), origin, "pages")
         self.touch(lab_id, origin)
         m = self.member(lab_id, str(body.get("member") or ""))
         port = as_int(body, "port", 80, 1, 65535)
@@ -1155,24 +1855,35 @@ class Manager:
         method = str(body.get("method") or "GET").upper()
         if method not in ("GET", "HEAD"):
             raise LabError("bad_request", "method must be GET or HEAD", field="method")
-        import http.client
-        conn = http.client.HTTPConnection(m["ip"], port, timeout=15)
+        pairs = self._secret_pairs()
+        # read past the 16 KB head by a margin, redact, then cut (review 11-05 #9); ONE total deadline (§4UD F2)
+        r = http_probe(m["ip"], port, method, path, f"{m['name']}:{port}", HTTP_HEAD_BYTES + redact.margin(pairs),
+                       total_s=total_s)
+        base = {"lab_id": lab_id, "member": m["name"], "port": port, "path": path}
+        if r["status"] is None:
+            out = {**base, "status": None, "error": r["error"]}
+            if r["refused"] and self._listens_on_loopback(lab_id, m["name"], port):
+                # review §4UD G3: `flask run` binds 127.0.0.1 — nothing outside the member can reach it
+                out["loopback_only"] = True
+            return out
+        rules = redact.build(pairs)
+        out = {**base, "status": r["status"],
+               "headers": {k: redact.apply(v, rules) for k, v in r["headers"]},
+               "body_head": redact.cut_head(r["raw"], HTTP_HEAD_BYTES, redact.build_bytes(pairs)).decode("utf-8", "replace")}
+        if r["truncated"]:
+            out["truncated"] = True          # the deadline cut the body: this is what arrived
+            out["deadline_s"] = float(total_s)
+        return out
+
+    def _listens_on_loopback(self, lab_id: str, member: str, port: int) -> bool:
+        """Does something inside the member accept on 127.0.0.1:port? One short exec (bash's /dev/tcp, 2 s);
+        False when it cannot be told."""
         try:
-            conn.request(method, path, headers={"Host": f"{m['name']}:{port}", "User-Agent": "ghost-labs-probe"})
-            resp = conn.getresponse()
-            pairs = self._secret_pairs()
-            # read past the 16 KB head by a margin, redact, then cut (review 11-05 #9)
-            raw = resp.read(HTTP_HEAD_BYTES + redact.margin(pairs))
-            body_head = redact.cut_head(raw, HTTP_HEAD_BYTES, redact.build_bytes(pairs)).decode("utf-8", "replace")
-            rules = redact.build(pairs)
-            return {"lab_id": lab_id, "member": m["name"], "port": port, "path": path, "status": resp.status,
-                    "headers": {k: redact.apply(v, rules) for k, v in resp.getheaders()},
-                    "body_head": body_head}
-        except OSError as e:
-            return {"lab_id": lab_id, "member": m["name"], "port": port, "path": path, "status": None,
-                    "error": f"{type(e).__name__}: {e}"}
-        finally:
-            conn.close()
+            c = self.container(lab_id, member)
+            r = c.exec_run(["bash", "-c", f"timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{int(port)}' 2>/dev/null"])
+            return r.exit_code == 0
+        except Exception:  # noqa: BLE001
+            return False
 
     def screenshot(self, lab_id: str, body: Dict[str, Any], origin: str) -> Dict[str, Any]:
         """Headless Chromium in a helper on the lab network (contract v2 §7, §11.19).
@@ -1180,14 +1891,17 @@ class Manager:
         can't make it fetch anything outside the lab (resources from the internet
         don't load in screenshots; documented)."""
         row = self.get(lab_id)
+        self.guard_kept_read(row, origin, "pages")
         self.touch(lab_id, origin)
+        deadline = time.monotonic() + SHOT_TOTAL_S       # review §4UD F2: one deadline for the whole screenshot
         m = self.member(lab_id, str(body.get("member") or ""))
         port = as_int(body, "port", 80, 1, 65535)
         path = str(body.get("path") or "/")
         if not path.startswith("/") or any(ch in path for ch in "\r\n \"'"):
             raise LabError("bad_request", "path must start with / and contain no spaces or quotes", field="path")
         w, h = as_int(body, "width", 1280, 200, 3840), as_int(body, "height", 800, 200, 4000)
-        probe = self.http(lab_id, {"member": m["name"], "port": port, "path": path, "method": "GET"}, origin)
+        probe = self.http(lab_id, {"member": m["name"], "port": port, "path": path, "method": "GET"}, origin,
+                          total_s=min(HTTP_TOTAL_S, max(1.0, deadline - time.monotonic())))
         if probe.get("status") and 300 <= int(probe["status"]) < 400:
             raise LabError("bad_request", f"{path} redirects (HTTP {probe['status']}); screenshots follow no redirects",
                            hint="screenshot the target path directly", field="path")
@@ -1195,10 +1909,15 @@ class Manager:
         ip = net.host_in(row["subnet"], net.MEMBER_LAST)
         if ip in used:
             raise LabError("internal", "no address left for the screenshot helper")
-        with self.locked(lab_id):   # one helper per lab at a time: it always takes .127
-            return self._shoot(lab_id, m, ip, port, path, w, h, probe)
+        # one helper per lab at a time (it always takes .127); the kept guard is read again inside the lock
+        lk = self._acquire_guarded(lab_id, lambda r: self.guard_kept_read(r, origin, "pages"), over_exec=False)
+        try:
+            return self._shoot(lab_id, m, ip, port, path, w, h, probe, deadline)
+        finally:
+            lk.release()
 
-    def _shoot(self, lab_id, m, ip, port, path, w, h, probe) -> Dict[str, Any]:
+    def _shoot(self, lab_id, m, ip, port, path, w, h, probe, deadline: Optional[float] = None) -> Dict[str, Any]:
+        deadline = time.monotonic() + SHOT_TOTAL_S if deadline is None else deadline
         netname = net.lab_network_name(lab_id)
         api = self.docker.api
         name = f"ghost-labs-shot-{lab_id}-{uuid.uuid4().hex[:6]}"
@@ -1219,9 +1938,19 @@ class Manager:
             pid = int(c.attrs.get("State", {}).get("Pid") or 0)
             if pid:
                 net.nsenter_route(pid, None, runner=self.run)
-            res = c.wait(timeout=60)
+            left = deadline - time.monotonic()
+            if left <= 1.0:
+                raise LabError("not_ready", f"the screenshot did not finish within {SHOT_TOTAL_S:g} s",
+                               hint="check the page with lab http", state="timeout")
+            res = c.wait(timeout=max(1, int(min(60.0, left))))
             stream, _stat = c.get_archive("/tmp/shot.png")
-            raw = b"".join(stream)
+            buf = bytearray()
+            for chunk in stream:                 # bounded: the picture is refused above 2 MB anyway
+                buf += chunk
+                if len(buf) > 4 * 1024 * 1024 or time.monotonic() > deadline:
+                    raise LabError("bad_request", "the screenshot is too large or took too long to copy",
+                                   hint="use a smaller window", field="width")
+            raw = bytes(buf)
             with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
                 png = tar.extractfile(tar.next()).read()
         except LabError:
@@ -1287,7 +2016,8 @@ class Manager:
         row = self.get(lab_id)
         spec = loads(row["spec_json"], {})
         body = {"template": spec.get("template")} if spec.get("template") else {
-            "members": [{k: m[k] for k in ("name", "image", "mem_mb", "cpus", "ports", "cap_add")} for m in spec["members"]],
+            "members": [{k: m[k] for k in ("name", "image", "mem_mb", "cpus", "ports", "cap_add", "ready") if k in m}
+                        for m in spec["members"]],
             "egress": spec["egress"], "readiness": spec["readiness"]}
         create = spec.get("create") or {**body, "label": row["label"], "purpose": row["purpose"]}
         return {"lab_id": lab_id, "create": create,
@@ -1308,9 +2038,19 @@ class Manager:
             elif lab["state"] == "creating" and now - float(lab["created_at"]) > self.cfg.stuck_creating_s:
                 reason = "create_failed"
             elif now - float(lab["last_used_at"]) > int(lab["ttl_idle_s"]):
-                reason = "idle_ttl"
+                if self.exec_running(lid):
+                    # review §4UD F1: a command is running on it — in use, not idle (the exec touches the lab
+                    # again when it ends). max_lifetime below still ends it
+                    log.debug("reap %s: idle TTL passed but a command is running — not idle", lid)
+                    if now - float(lab["created_at"]) > int(lab["ttl_max_s"]):
+                        reason = "max_lifetime"
+                else:
+                    reason = "idle_ttl"
             elif now - float(lab["created_at"]) > int(lab["ttl_max_s"]):
                 reason = "max_lifetime"
+            if reason == "retired" and self.exec_running(lid):
+                log.info("reap %s (retired): a command is running on it — next tick", lid)   # as before §4UD (busy)
+                continue
             if reason:
                 try:
                     if reason == "retired" and str(lab["origin"] or "") == "probe" and getattr(self, "kept", None):
@@ -1505,6 +2245,14 @@ class Manager:
             if lid and (n.attrs.get("Options") or {}).get(net.BRIDGE_OPT) != net.lab_bridge(lid):
                 out.append(lid)
         return sorted(out)
+
+
+def _started_at(c) -> str:
+    """The container's State.StartedAt (changes on every start/restart); "" when unreadable."""
+    try:
+        return str((c.attrs.get("State") or {}).get("StartedAt") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def job_script(d: str, workdir=None) -> str:

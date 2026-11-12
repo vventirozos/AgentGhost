@@ -355,8 +355,8 @@ def test_a_clean_multi_tool_turn_lifts_pleasantness_a_little():
     assert (ev.dp, ev.de) == (pytest.approx(0.10), 0.0) and M.EV_CLEAN_TURN[1] == 0.0
     assert ev.cause == "a turn of 3 tool calls went through without a failure"
     assert M.CLEAN_TURN_MIN_CALLS == 3
-    # §4UB: under CLEAN_TURN_MIN_CALLS it earns half (most owner turns use 0–1 calls)
-    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=2))] == [pytest.approx(0.08 * 0.5)]
+    # §4UB: under CLEAN_TURN_MIN_CALLS it earned half; §4UH-e2e: the full reward of its calls (replay)
+    assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=2))] == [pytest.approx(0.08 * M.CLEAN_TURN_SMALL_SHARE)]
     assert M.turn_events(M.TurnSignals(tool_calls=1))[0].cause == "a turn of 1 tool call went through without a failure"
     assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, failures=1))] == [pytest.approx(-0.048)]
     assert [e.dp for e in M.turn_events(M.TurnSignals(tool_calls=5, guards=1))] == [-0.12]        # a guard
@@ -448,7 +448,7 @@ def test_unreadable_signals_are_no_events(sig):
 @pytest.mark.parametrize("kind,move,cause", [
     (M.KIND_THUMB_UP, (0.25, 0.0), "the owner gave a thumbs-up"),
     (M.KIND_THUMB_DOWN, (-0.30, 0.0), "the owner gave a thumbs-down"),
-    (M.KIND_CORRECTION, (-0.20, 0.0), "the owner corrected my last reply"),
+    (M.KIND_CORRECTION, (-0.20, 0.0), "the owner corrected one of my replies"),
     (M.KIND_PRAISE, (0.10, 0.0), "the owner said thanks"),
 ])
 def test_each_reaction_has_its_sign_size_and_cause(tmp_path, kind, move, cause):
@@ -1017,22 +1017,31 @@ def test_todays_timeline_is_the_local_days_rows_with_their_local_time(tmp_path):
     # §4TX: the irritable the owner set is held until the day's end (04:00 machine time), then wears off
     end = M.parse_iso_utc(M.manner_ends_at("2026-11-05T22:10:00Z").strftime("%Y-%m-%dT%H:%M:%SZ"))
     off = (end + dt.timedelta(seconds=M.decay_step_s(M.ANCHOR_MAGNITUDE[2], 0))).astimezone(tz)
+    # §4UD (F7): "today" is the MOOD day — it began at 04:00, so the 00:10 row is the evening before's
+    # (this test pinned the calendar day: 00:10 was "today" and 23:30 was not)
     assert [(r["hhmm"], r["label"], r["intensity"]) for r in today] == [
-        ("00:10", "irritable", 2), (off.strftime("%H:%M"), "neutral", 0), ("12:05", "cheerful", 2)]
+        (off.strftime("%H:%M"), "neutral", 0), ("12:05", "cheerful", 2)]
+    eve = s.mood_timeline(now=dt.datetime(2026, 11, 5, 23, 0, tzinfo=UTC), tz=tz)          # 01:00 local
+    assert [(r["hhmm"], r["label"]) for r in eve] == [("23:30", "content"), ("00:10", "irritable")]
     assert s.mood_timeline(now=dt.datetime(2026, 11, 8, 12, 0, tzinfo=UTC), tz=tz) == []
 
 
 def test_today_is_the_local_day_not_the_utc_day(tmp_path):
-    """(A mutant the review found alive.) 23:30 UTC is already tomorrow two
-    hours east: the row of 22:10 UTC (00:10 local) is today's, the row of
-    21:30 UTC (23:30 local the day before) is not — and the UTC day would
-    say the opposite of both."""
+    """(A mutant the review found alive.) The day is read in LOCAL time. §4UD
+    (F7): and it is the mood day, which ends at 04:00 — at 01:30 local the
+    rows of 23:30 and 00:10 are both still "today" (the calendar day said
+    only the second was)."""
     s = SelfStateThread(tmp_path)
     east = dt.timezone(dt.timedelta(hours=2))
     s.set_owner_mood("content", M.ANCHOR_DIRECTION["content"], 1, now=dt.datetime(2026, 11, 5, 21, 30, tzinfo=UTC))
     s.set_owner_mood("down", M.ANCHOR_DIRECTION["down"], 2, now=dt.datetime(2026, 11, 5, 22, 10, tzinfo=UTC))
     near_midnight = dt.datetime(2026, 11, 5, 23, 30, tzinfo=UTC)       # 01:30 on the 6th, local
-    assert [(r["hhmm"], r["label"]) for r in s.mood_timeline(now=near_midnight, tz=east)] == [("00:10", "down")]
+    assert [(r["hhmm"], r["label"]) for r in s.mood_timeline(now=near_midnight, tz=east)] == [
+        ("23:30", "content"), ("00:10", "down")]
+    # five hours east it is 04:30: a new mood day began at 04:00 and has no row yet (the rows are 02:30 and
+    # 03:10 there) — the calendar day would show both
+    far_east = dt.timezone(dt.timedelta(hours=5))
+    assert s.mood_timeline(now=near_midnight, tz=far_east) == []
     west = dt.timezone(dt.timedelta(hours=-5))                         # 18:30 on the 5th, local
     assert [r["label"] for r in s.mood_timeline(now=near_midnight, tz=west)] == ["content", "down"]
     assert [r["label"] for r in s.mood_timeline(now=dt.datetime(2026, 11, 6, 0, 30, tzinfo=UTC), tz=west)] == [
@@ -1488,8 +1497,8 @@ def test_the_diarys_state_block_carries_the_days_timeline(tmp_path):
     assert n._format_state_block(s) == "(nothing on file)"
     s.nudge(0.3, 0.0, "the owner gave a thumbs-up", M.KIND_THUMB_UP)
     s.nudge(-0.9, 0.5, "4 tool calls failed in this turn", M.KIND_TURN)
-    assert n._format_state_block(s).splitlines() == [
-        "My mood today: content 1 (the owner gave a thumbs-up) → irritable 2 (4 tool calls failed in this turn)."]
+    # §4UD (F2): the labels only — the causes name what the owner did, and the diary is shown by `introspect`
+    assert n._format_state_block(s).splitlines() == ["My mood today: content 1 → irritable 2."]
 
 
 def test_the_diarys_block_does_not_move_with_the_clock_or_with_a_boredom_level(tmp_path):
@@ -1516,7 +1525,9 @@ def test_the_diarys_block_does_not_move_with_the_clock_or_with_a_boredom_level(t
     assert s.mood().label == "bored" and s.mood().intensity == 2       # a reader sees bored 2 right now …
     assert {r["kind"] for r in s.mood_history()} >= {"quiet"}          # … and its rows are in the journal
     settled, query = n._format_state_block(s), n._derive_recall_query(s)
-    assert settled.replace(wore_off, "") == first                      # only that row can be new
+    # only that row can be new — as " → neutral (it wore off)" in yesterday's line, or as " → neutral" closing
+    # today's arc when it wore off today (the hour this runs decides which: §4UH-e2e, a flake at evening hours)
+    assert settled.replace(wore_off, "").replace(" → neutral.", ".") == first.replace(" → neutral.", ".")
     assert s.mood().label == "bored"                                   # another read of the same quiet
     assert n._format_state_block(s) == settled and n._derive_recall_query(s) == query
     s.owner_arrived()

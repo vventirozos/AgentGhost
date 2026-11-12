@@ -62,9 +62,10 @@ def _fresh():
 
 # ── 1. small turns count; the automatic mood still has no cap ───────────────
 
-@pytest.mark.parametrize("calls,dp", [(1, 0.03), (2, 0.04)])
-def test_a_clean_turn_under_three_calls_earns_half(calls, dp):
-    assert M.CLEAN_TURN_SMALL_SHARE == 0.5
+@pytest.mark.parametrize("calls,dp", [(1, 0.06), (2, 0.08)])
+def test_a_clean_turn_under_three_calls_earns_its_calls_reward(calls, dp):
+    # §4UH-e2e: the full share (was half) — the replay of 30 real days, see mood.CLEAN_TURN_SMALL_SHARE
+    assert M.CLEAN_TURN_SMALL_SHARE == 1.0
     evs = M.turn_events(M.TurnSignals(tool_calls=calls))
     assert [e.dp for e in evs] == [pytest.approx(dp)]
 
@@ -762,27 +763,29 @@ def test_the_share_never_passes_the_cap_whatever_the_ledger_does(tmp_path):
         sm.note_owner_sentiment("positive", 0.95, now=t, request_id=f"web-elena-cap{i}")
     share = sm.state.private_share(now=t)[0]
     assert 0 < share <= M.SENTIMENT_SHARE_MAX + 1e-9
-    # a direct write past the cap (a stored share from an older version, a ledger adjust) is cut too
-    sm.state.nudge(0.10, 0.0, "the owner's message sounded pleased", M.KIND_SENTIMENT, now=t,
-                   private_adjust=(0.10, 0.0))
+    # a direct write past the cap (a ledger that asks for more than the room) is cut too
+    sm.state.nudge(0.0, 0.0, "the owner's message sounded pleased", M.KIND_SENTIMENT, now=t,
+                   tone=(0.10, 0.0, 0.0, 0.0))
     share2 = sm.state.private_share(now=t)[0]
     assert share2 <= M.SENTIMENT_SHARE_MAX + 1e-9
 
 
 def test_what_the_cap_cuts_leaves_the_pair_too(tmp_path):
-    from ghost_agent.selfhood.state import SelfStateThread
-    owner = {"private_p": M.SENTIMENT_SHARE_MAX + 0.05, "private_e": 0.0}
-    p, e = SelfStateThread._cap_share_locked(owner, 0.30, 0.10)
-    assert abs(p - 0.25) < 1e-9 and e == 0.10 and owner["private_p"] == M.SENTIMENT_SHARE_MAX
-    owner = {"private_p": -(M.SENTIMENT_SHARE_MAX + 0.05), "private_e": 0.0}
-    p, _ = SelfStateThread._cap_share_locked(owner, -0.30, 0.0)
-    assert abs(p + 0.25) < 1e-9 and owner["private_p"] == -M.SENTIMENT_SHARE_MAX
-    cap_e = M.SENTIMENT_SHARE_MAX * abs(M.EV_SENTIMENT_POSITIVE[1] / M.EV_SENTIMENT_POSITIVE[0])
-    owner = {"private_p": 0.0, "private_e": cap_e + 0.02}
-    _, e = SelfStateThread._cap_share_locked(owner, 0.0, 0.10)
-    assert abs(e - 0.08) < 1e-9 and abs(owner["private_e"] - cap_e) < 1e-9
-    owner = {"private_p": 0.05, "private_e": 0.0}                   # under the cap: untouched
-    assert SelfStateThread._cap_share_locked(owner, 0.30, 0.10) == (0.30, 0.10) and owner["private_p"] == 0.05
+    """§4UD (F1): the cap lives in ``state.tone_sink`` (it replaced ``_cap_share_locked``, which cut a signed
+    share): the pair is ``base + up − down``, so what a share is refused never reaches the pair."""
+    from ghost_agent.selfhood.state import tone_sink
+    cap, cap_e = M.SENTIMENT_SHARE_MAX, M.SENTIMENT_SHARE_MAX_E
+    p, e, sides, refused = tone_sink((0.10, 0.0, 0.0, 0.0), (0.07, 0.0, 0.0, 0.0), 0.13, 0.10)
+    assert abs(p - (0.13 + cap)) < 1e-9 and e == 0.10 and sides[0] == cap and abs(refused[0] - 0.05) < 1e-9
+    p, _e, sides, refused = tone_sink((0.0, 0.0, 0.10, 0.0), (0.0, 0.0, 0.07, 0.0), -0.13, 0.0)
+    assert abs(p + (0.13 + cap)) < 1e-9 and sides[2] == cap and abs(refused[2] - 0.05) < 1e-9
+    _p, e, sides, refused = tone_sink((0.0, cap_e, 0.0, 0.0), (0.0, 0.02, 0.0, 0.0), 0.0, 0.05)
+    assert abs(e - (0.05 + cap_e)) < 1e-9 and abs(sides[1] - cap_e) < 1e-9 and abs(refused[1] - 0.02) < 1e-9
+    # under the cap: untouched, nothing refused
+    assert tone_sink((0.05, 0.0, 0.0, 0.0), None, 0.25, 0.10) == (0.30, 0.10, (0.05, 0.0, 0.0, 0.0), (0.0,) * 4)
+    # the two sides never net: +0.12 and −0.12 are both at their cap and the pair is the base
+    p, _e, sides, refused = tone_sink((cap, 0.0, cap, 0.0), (0.05, 0.0, 0.05, 0.0), 0.30, 0.0)
+    assert abs(p - 0.30) < 1e-9 and sides[0] == sides[2] == cap and refused[0] == refused[2] == pytest.approx(0.05)
 
 
 # ── 21. battery 2 pins ──────────────────────────────────────────────────────
@@ -798,8 +801,12 @@ async def test_sarcasm_is_read_off_the_owners_own_words(client, tmp_path):
 def test_only_strong_mood_replies_are_counted_as_left_out(tmp_path, monkeypatch):
     import ghost_agent.core.failure_census as FC
     from tests.test_4ua_character_mood_tone import NOW as N2, _turn
-    turns = [_turn(1, {"mood": "irritable, 2 of 3", "manner": ""}), _turn(2), _turn(3, {"mood": "neutral",
-                                                                                         "manner": ""})]
+    # §4UD: the record's VALUES are read (a record with the sentences only is not read at all)
+    turns = [_turn(1, {"mood": "irritable, 2 of 3", "manner": "", "label": "irritable", "intensity": 2,
+                       "manner_name": ""}),
+             _turn(2), _turn(3, {"mood": "neutral", "manner": "", "label": "neutral", "intensity": 0,
+                                 "manner_name": ""}),
+             _turn(4, {"mood": "irritable, 3 of 3", "manner": "evil, 3 of 3"})]
     monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
     assert MI.strong_mood_replies_since(tmp_path, now=N2) == 1
 
@@ -864,7 +871,10 @@ def test_a_cut_by_the_cap_is_charged_to_the_tones_not_the_thumbed_reply(tmp_path
     assert _ledger_share(sm, t) == pytest.approx(M.SENTIMENT_SHARE_MAX, abs=1e-4)
     w = sm._owner_word()
     assert sm._booked_now(sm._applied["A"], t, w)[0] == pytest.approx(-0.30, abs=1e-4)   # A: its own move only
-    assert sm._booked_now(sm._private_booked["B"], t, w)[0] == pytest.approx(0.06, abs=1e-4)
+    # §4UD: C's tone was fitted to the room B's left (0.04) when it arrived, so nothing is cut at the thumb
+    # and B keeps its whole 0.08 (§4UB charged a proportional cut: 0.06 / 0.06)
+    assert sm._booked_now(sm._private_booked["B"], t, w)[0] == pytest.approx(0.08, abs=1e-4)
+    assert sm._booked_now(sm._private_booked["C"], t, w)[0] == pytest.approx(0.04, abs=1e-4)
     for kind, rid in ((M.KIND_THUMB_UP, "B"), (M.KIND_THUMB_UP, "A"), (M.KIND_THUMB_UP, "C")):
         sm.note_owner_reaction(kind, now=t, reply_id=rid)
         assert sm.state.private_share(now=t)[0] == pytest.approx(_ledger_share(sm, t), abs=1e-4)
@@ -877,18 +887,23 @@ def test_after_view_says_what_the_cap_took(tmp_path):
     s = SelfStateThread(tmp_path)
     s.nudge(0.10, 0.025, "upbeat", M.KIND_SENTIMENT, now=NOW)
     _b, a = s.nudge(0.08, 0.02, "upbeat", M.KIND_SENTIMENT, now=NOW)
-    assert a.capped == (pytest.approx(0.06), pytest.approx(0.015)) and a.moved == (pytest.approx(0.02),
-                                                                                    pytest.approx(0.005))
+    # §4UD: ``refused`` (up p, up e, down p, down e) replaced ``capped``
+    assert a.refused == (pytest.approx(0.06), pytest.approx(0.015), 0.0, 0.0)
+    assert a.moved == (pytest.approx(0.02), pytest.approx(0.005)) and a.base_moved == (0.0, 0.0)
 
 
-def test_a_step_down_never_grows_the_share():
+def test_a_step_down_never_grows_the_share(tmp_path):
     """Review r6: a step down carried the share over by new/old — an anchor larger than the pair on an axis
-    grew it (0.12 → 0.192)."""
-    from ghost_agent.selfhood.state import Mood, SelfStateThread
-    base = Mood(p=0.20, e=-0.50, label="calm", intensity=2, private_p=0.12, private_e=-0.03,
-                updated_at=NOW.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"))
-    out = SelfStateThread._share_after_step(base, 0.32, -0.24, NOW, True)
-    assert 0 < out["private_p"] <= 0.12 and -0.03 <= out["private_e"] < 0
+    grew it (0.12 → 0.192). §4UD (F1): a step down carries NO share (``_share_after_step`` is gone): the pair
+    the owner places holds none, on either axis."""
+    from ghost_agent.selfhood.state import SelfStateThread
+    s = SelfStateThread(tmp_path)
+    s.nudge(0.10, -0.50, "a long clean turn", M.KIND_TURN, now=NOW)
+    s.nudge(0.12, 0.03, "upbeat", M.KIND_SENTIMENT, now=NOW)
+    assert s.private_sides(now=NOW)[0] == pytest.approx(0.12)
+    s.set_owner_mood("calm", M.ANCHOR_DIRECTION["calm"], 1, now=NOW, hold=False)
+    assert s.private_sides(now=NOW) == (0.0, 0.0, 0.0, 0.0)
+    assert (s.state.mood.p, s.state.mood.e) == M.anchor_for(M.ANCHOR_DIRECTION["calm"], 1)
 
 
 # ── 23. battery 3 pins ──────────────────────────────────────────────────────

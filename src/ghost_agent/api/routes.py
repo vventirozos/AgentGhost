@@ -751,19 +751,121 @@ def _effort_default_known() -> str:
         return ""
 
 
-def _rest_label(state) -> str:
-    """§4UA: the region of the mood's resting point ("neutral" at (0, 0), with
-    no state, or when unreadable) — a label the face already has a look for."""
+_MOOD_NEUTRAL = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
+                 "held_until": "", "rest": "neutral",
+                 # §4UD: the manner's stepped level and end, the ONE label a face shows, why the state is unreadable
+                 "manner_intensity": 0, "manner_until": "", "face": "neutral", "problem": "",
+                 # §4UG: the pair's two numbers as the owner's view reads them (the face blends its looks by
+                 # them), and the mood's shade for a moment (relieved / chastened / proud) with when it was set
+                 "p": 0.0, "e": 0.0, "shade": "", "shade_at": "",
+                 # §4UG-f: the shade's age by the SERVER's clock (seconds; null without a shade) — a face judges
+                 # freshness from it, not from its own clock against the stamp (clock skew)
+                 "shade_age_s": None}
+
+
+def _level(value) -> int:
+    """An intensity as health sends it: an int 0–3, anything else 0."""
+    return max(0, min(3, value)) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _health_mood(context) -> dict:
+    """The ``mood`` block of ``/api/health`` (2026-09-11; §4TC: one shape, always
+    an object): label ("neutral" when there is none), intensity 0–3, the manner
+    the owner set with its level now and its end, since when, who set it ("auto"
+    | "owner"), the hold's end, where the mood rests, ``face`` — the one label a
+    face shows — and ``problem`` ("" unless the state file could not be read).
+
+    §4UD r2: the whole block is made from ONE ``state.mood()`` read (a second
+    read let a thumb land between the label and the face, and
+    ``SelfModel.stats()`` rebuilt a search index on the event loop — ~50 ms):
+    ``face`` is ``selfhood.mood.face_label`` of that view and the resting
+    point, the only rule for the look. A read: it never moves the mood. Every
+    field is read with a default, so a mock or a boot without a self-model
+    gives the neutral block; it never raises."""
+    mood = dict(_MOOD_NEUTRAL)
     try:
         from ..selfhood import mood as _M
-        rp, re_ = state.rest()
-        if not (rp or re_):
-            return "neutral"
-        got = _M.region(float(rp), float(re_))
-        # review r1 m2: a character that is only unhurried is not bored — boredom is a quiet, not a temperament
-        return "calm" if got == _M.BORED else got
-    except Exception:  # noqa: BLE001 — health must never raise
-        return "neutral"
+        _st = getattr(getattr(context, "self_model", None), "state", None)
+        # F12: an unreadable state.json reads as neutral — say so beside it
+        _problem = getattr(_st, "load_problem", "")
+        mood["problem"] = _problem.strip()[:120] if isinstance(_problem, str) else ""
+        _rest_fn = getattr(_st, "rest", None)
+        _rest = _rest_fn() if callable(_rest_fn) else (0.0, 0.0)
+        mood["rest"] = mood["face"] = _M.rest_label(_rest)
+        _read = getattr(_st, "mood", None)
+        _m = _read() if callable(_read) else None
+        _label = getattr(_m, "label", None)
+        _n = getattr(_m, "intensity", None)
+        if not (isinstance(_label, str) and isinstance(_n, int) and not isinstance(_n, bool)):
+            return mood
+        # a label no face knows is no mood: label, intensity and face always agree
+        _n = max(0, min(3, _n)) if _label in _M.LABELS else 0
+        _manner = getattr(_m, "manner", "")
+        _manner = _manner if isinstance(_manner, str) else ""
+        # the end of the manner's day: the last step still ahead (§4TS: ``(stamp, 0)``)
+        _steps = getattr(_m, "manner_steps", ()) or ()
+        _last = _steps[-1] if isinstance(_steps, (tuple, list)) and _steps else None
+        _until = _last[0] if isinstance(_last, (tuple, list)) and _last and isinstance(_last[0], str) else ""
+        _held = getattr(_m, "held_until", "")
+        _face = _M.face_label(_label, _n, _rest)
+        mood.update({
+            "label": _label if _n else "neutral", "intensity": _n,
+            "manner": _manner,
+            "manner_intensity": _level(getattr(_m, "manner_intensity", 0)) if _manner else 0,
+            "manner_until": _until[:40] if _manner else "",
+            "set_at": str(getattr(_m, "set_at", "") or "") if _n else "",
+            "source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto",
+            # §4TX: why, in the system's own words (never a message), and the owner's hold
+            "cause": str(getattr(_m, "cause", "") or "")[:200] if _n else "",
+            "held_until": (_held[:40] if isinstance(_held, str) else "") if _n else "",
+            "face": _face,
+        })
+        try:                                     # §4UG: additions — a failure here leaves the block as it was
+            def _unit(v) -> float:
+                v = float(v)                     # review (face): min(1.0, nan) is 1.0 — a NaN is 0, not "max"
+                return round(max(-1.0, min(1.0, v)), 3) if v == v else 0.0
+            mood["p"] = _unit(getattr(_m, "p", 0.0))
+            mood["e"] = _unit(getattr(_m, "e", 0.0))
+            _shade_store = getattr(getattr(context, "self_model", None), "shade", None)
+            _cur = _shade_store.current() if _shade_store is not None else None
+            if isinstance(_cur, dict):
+                mood["shade"], mood["shade_at"] = str(_cur.get("shade") or "")[:24], str(_cur.get("at") or "")[:40]
+                # §4UG-f review: the shade's age by the AGENT's clock — a client whose own clock is off judged
+                # freshness against the wrong now and dropped (or replayed) moments
+                try:
+                    import datetime as _dt
+                    from ..selfhood.mood import parse_iso_utc as _piso
+                    _at = _piso(mood["shade_at"])
+                    if _at is not None:
+                        mood["shade_age_s"] = round(max(0.0, (_dt.datetime.now(_dt.timezone.utc) - _at).total_seconds()), 1)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            mood["p"], mood["e"], mood["shade"], mood["shade_at"], mood["shade_age_s"] = 0.0, 0.0, "", "", None
+        return mood
+    except Exception as e:  # noqa: BLE001 — health must never raise
+        logger.debug("health: mood block unreadable (%s: %s); neutral sent", type(e).__name__, e)
+        return mood
+
+
+def _health_character(context) -> dict:
+    """§4UG: the ``character`` block of ``/api/health`` — the three dials (-2..2) a face reads to rest and
+    react in this character's way; {} when the character is off or cannot be read. A read; never raises."""
+    try:
+        from ..selfhood import character as _character
+        from ..selfhood.mirror import home_from_memory_dir
+        if not _character.enabled():
+            return {}
+        home = home_from_memory_dir(getattr(context, "memory_dir", None))
+        if home is None:
+            return {}
+        if _character.unreadable(home):
+            return {}                   # the file is there and cannot be read: no dials, not the starting ones
+        d = _character.dials(home)
+        return {name: _character.clamp(d.get(name, 0)) for name in _character.DIALS}
+    except Exception as e:  # noqa: BLE001 — health must never raise
+        logger.debug("health: character block unreadable (%s)", type(e).__name__)
+        return {}
 
 
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
@@ -843,34 +945,8 @@ async def api_health(request: Request):
     except Exception:  # noqa: BLE001 — health must never raise
         node_health = {}
 
-    # The mood (2026-09-11, for the web face's slow baseline tint; §4TC: one
-    # shape, always an object): label ("neutral" when there is none),
-    # intensity 0–3, the manner the owner set, since when, and who set it
-    # ("auto" | "owner"). A read — it never moves the mood. getattr-chained
-    # so a mock or a boot without a self-model can never 500 the endpoint.
-    mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
-            "held_until": "", "rest": "neutral"}
-    try:
-        _st = getattr(getattr(context, "self_model", None), "state", None)
-        _read = getattr(_st, "mood", None)
-        _m = _read() if callable(_read) else None
-        _label = getattr(_m, "label", None)
-        _n = getattr(_m, "intensity", None)
-        if isinstance(_label, str) and isinstance(_n, int) and not isinstance(_n, bool):
-            _n = max(0, min(3, _n))
-            _manner = getattr(_m, "manner", "")
-            mood = {"label": (_label if _n else "neutral") or "neutral", "intensity": _n,
-                    "manner": _manner if isinstance(_manner, str) else "",
-                    "set_at": str(getattr(_m, "set_at", "") or "") if _n else "",
-                    "source": "owner" if (_n and getattr(_m, "source", "") == "owner") else "auto",
-                    # §4TX: why, in the system's own words (never a message), and the owner's hold
-                    "cause": str(getattr(_m, "cause", "") or "")[:200] if _n else "",
-                    "held_until": str(getattr(_m, "held_until", "") or "") if _n else "",
-                    # §4UA: where the mood rests (the character) — the face shows it faintly while neutral
-                    "rest": _rest_label(_st)}
-    except Exception:  # noqa: BLE001 — health must never raise
-        mood = {"label": "neutral", "intensity": 0, "manner": "", "set_at": "", "source": "auto", "cause": "",
-            "held_until": "", "rest": "neutral"}
+    # The mood, for the faces and the status text: see `_health_mood`.
+    mood = _health_mood(context)
 
     # §4RQ: seconds the main slot is still kept for the conversation that last
     # used it (§4RP, GHOST_SLOT_KEEP_S); 0 when nothing owns it. Read by
@@ -888,6 +964,7 @@ async def api_health(request: Request):
     return JSONResponse({
         "status": "ok",
         "mood": mood,
+        "character": _health_character(context),
         "slot_keep_left_s": slot_keep_left_s,
         "rss_mb": rss_mb,
         "rss_limit_mb": float(os.environ.get("GHOST_MAX_RSS_MB", "0") or "0"),
@@ -1311,9 +1388,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
 
     # Extract Request ID if provided (for Slack Bot correlation)
     request_id = request.headers.get("X-Request-ID")
-    from ..utils.logging import prompt_arm_context, parse_prompt_arm, probe_rule_context
+    from ..utils.logging import (prompt_arm_context, parse_prompt_arm, probe_rule_context,
+                                 probe_self_image_context, parse_probe_self_image)
     prompt_arm_context.set("")                    # §4MV: production never carries an arm
     probe_rule_context.set("")                    # §4MW: …nor a rule under test
+    probe_self_image_context.set(("", ""))        # §4UF: …nor a self-image under test
     # §4FB (2026-09-06): `X-Ghost-Origin: probe` marks a DIAGNOSTIC turn —
     # an operator/Claude probe exercising the live path. It runs exactly
     # like a user turn but must never teach (no lesson, reflection,
@@ -1330,6 +1409,10 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         prompt_arm_context.set(_arm)
         # §4MW: a candidate rule under test (the replay-the-real-failure loop)
         probe_rule_context.set(str(request.headers.get("X-Ghost-Probe-Rule") or "")[:800])
+        # §4UF: a candidate self-image under test (sentence, and optionally the rule text under it)
+        probe_self_image_context.set(parse_probe_self_image(
+            request.headers.get("X-Ghost-Probe-Self-Image"),
+            request.headers.get("X-Ghost-Probe-Self-Image-Rule")))
         # (§4FF's `X-Ghost-Prompt-Variant` probe header was retired here on
         # 2026-09-21, §4JG — no prompt variant exists to select.)
     # Who is asking (multi-user surfaces only). Anything but "member" is the

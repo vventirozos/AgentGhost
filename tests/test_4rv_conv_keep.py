@@ -28,7 +28,7 @@ from ghost_agent.core import head_saves as H
 from ghost_agent.core import llm as L
 from ghost_agent.core.agent import GhostAgent
 from ghost_agent.utils.logging import Icons
-from tests.test_4ro_head_saves import (_clean, _dir, _store, _switch_env, _turn,  # noqa: F401
+from tests.test_4ro_head_saves import (_as_wait, _bind_staged, _clean, _dir, _store, _switch_env, _turn,  # noqa: F401
                                        _warm_with_file, warm)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -82,9 +82,11 @@ def test_a_conversation_save_takes_any_count_from_the_minimum(monkeypatch, tmp_p
     d = _dir(tmp_path)
 
     def http(url, body=None, timeout=5.0):
-        (d / body["filename"]).write_bytes(b"state")
+        with open(d / body["filename"], "wb") as f:
+            f.truncate(3_000_000_000)               # §4UD (H4): as long as llama says (sparse)
         return {"n_saved": 40100, "n_written": 3_000_000_000}
     monkeypatch.setattr(H, "_http", http)
+    monkeypatch.setattr(H, "server_identity", lambda base: "id")
     ok, detail = H.save("b", d, "cx", 29237, "id", H.CONV, 9.0, True)
     assert ok and "40100 tokens" in detail
     meta = json.loads((d / "head-cx.json").read_text())
@@ -178,13 +180,20 @@ async def test_the_same_conversations_next_request_keeps_the_slot(cwarm, monkeyp
     assert st["order"] == [] and llm._slot_session == "sess-a"
 
 
-async def test_a_returning_conversation_is_restored_not_the_head(cwarm, monkeypatch):
+@pytest.mark.parametrize("saved_on", ["this head", "the head before a deploy"])
+async def test_a_returning_conversation_is_restored_not_the_head(cwarm, monkeypatch, saved_on):
+    """§4UD (H15/H1): this test held in both worlds — it staged a file with no
+    record of its head, so "restored" was true whether or not the head had
+    changed since (req eaf6e7e8: the stale file went in, 174 s). The file now
+    says which head it was saved on, and the other half is asserted too."""
     from ghost_agent.utils.logging import request_id_context
     agent, llm, st = cwarm
     await _warm_with_file(agent, st, quiet=True)
     d = pathlib.Path(H.head_dir())
     ckey = H.conv_key("id", "sess-b")
     _store(d, ckey, 41000)
+    tag = L.head_bind_tag(_turn(st)) if saved_on == "this head" else "the-tool-list-before-a-deploy:" + llm._head_ref[1]
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head": tag}))
     st["order"].clear()
     st["restores"].clear()
     st["lines"].clear()
@@ -194,11 +203,81 @@ async def test_a_returning_conversation_is_restored_not_the_head(cwarm, monkeypa
         await agent._slot_switch_before(_turn(st))
     finally:
         request_id_context.reset(tok)
+    if saved_on != "this head":
+        assert st["restores"] == [agent._head_plan_last["key"]]       # the head's own file, not the stale one
+        assert llm._slot_session is None and not (d / f"head-{ckey}.bin").exists()
+        assert any("saved on another head" in m for m in st["lines"])
+        return
     assert st["restores"] == [ckey]
     assert llm._slot_session == "sess-b" and llm._slot_request == "req-9"
     assert llm._conv_saved == ("sess-b", llm._slot_session_used)       # on disk as it is
     assert any("restored from disk in" in m for m in st["lines"])
     assert [i for t, m, i in st["logged"] if "restored from disk in" in m] == [Icons.CONV_RESTORE]   # §4RW
+
+
+async def _as(key, rid, coro_fn):
+    from ghost_agent.utils.logging import request_id_context, slot_session_context
+    t1, t2 = slot_session_context.set(key), request_id_context.set(rid)
+    try:
+        return await coro_fn()
+    finally:
+        slot_session_context.reset(t1)
+        request_id_context.reset(t2)
+
+
+async def test_a_file_saved_before_the_bound_rule_is_discarded_once_then_saved_and_restored(cwarm, monkeypatch):
+    """§4UD r2 (F9): this ring's hand-staged files are stamped by `_bind_staged`
+    wherever a test is not about the bound rule — so here is the ring meeting
+    it unstamped: a file as the deployed code wrote it (no `head` field) is
+    refused and discarded the first time its conversation returns, the head
+    goes in instead; the conversation is then saved with what its own call
+    opened with, and THAT file is restored on its next return."""
+    agent, llm, st = cwarm
+    await _warm_with_file(agent, st, quiet=True)
+    d = pathlib.Path(H.head_dir())
+    head_key = agent._head_plan_last["key"]
+    ckey = H.conv_key("id", "sess-b")
+    _store(d, ckey, 41000)                                           # no `head`: saved before §4UD
+    _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    st["restores"].clear(); st["lines"].clear()
+    turn = _turn(st)
+    await _as("sess-b", "req-1", lambda: agent._slot_switch_before(turn))
+    assert st["restores"] == [head_key] and not (d / f"head-{ckey}.bin").exists()
+    assert sum("saved on an unrecorded head" in m and "discarded" in m for m in st["lines"]) == 1
+    # its request runs on the head (the real note), then another conversation needs the slot
+    async def call():
+        L.note_main_slot_prompt(llm, turn, "turn", usage=(41000, 20))
+    await _as("sess-b", "req-1", call)
+    assert llm._slot_session == "sess-b" and llm._slot_head_tag == L.head_bind_tag(turn)
+    _conv_env(agent, llm, st, monkeypatch, slot=41020)
+    monkeypatch.setattr(H, "_http", lambda url, body=None, timeout=5.0:
+                        [{"is_processing": False, "n_prompt_tokens": st["slot"]}])
+    st["restores"].clear()
+    await _as("sess-c", "req-2", lambda: agent._slot_switch_before(_turn(st, "someone else")))
+    meta = json.loads((d / f"head-{ckey}.json").read_text())
+    assert meta["head"] == L.head_bind_tag(turn)
+    assert st["restores"] == [head_key] and llm._slot_session is None
+    # sess-b returns: this time its file goes in
+    st["restores"].clear(); st["lines"].clear()
+    st["slot"] = 30000
+    await _as("sess-b", "req-3", lambda: agent._slot_switch_before(_turn(st, "and another thing")))
+    assert st["restores"] == [ckey] and llm._slot_session == "sess-b"
+    assert not any("discarded" in m for m in st["lines"])
+
+
+async def test_a_staged_file_this_ring_does_not_stamp_is_not_restored(cwarm, monkeypatch):
+    """The control for `_bind_staged`: without it the same staging that the
+    tests around this one use is refused."""
+    agent, llm, st = cwarm
+    await _warm_with_file(agent, st, quiet=True)
+    d = pathlib.Path(H.head_dir())
+    ckey = H.conv_key("id", "sess-b")
+    _store(d, ckey, 41000)
+    (d / f"head-{ckey}.json").write_text(json.dumps({"n_tokens": 41000, "kind": H.CONV, "head_in_slot": True}))
+    _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    st["restores"].clear()
+    await _as("sess-b", "req-1", lambda: agent._slot_switch_before(_turn(st)))
+    assert ckey not in st["restores"] and not (d / f"head-{ckey}.bin").exists()
 
 
 async def test_a_failed_conversation_restore_falls_back_to_the_head(cwarm, monkeypatch):
@@ -214,6 +293,7 @@ async def test_a_failed_conversation_restore_falls_back_to_the_head(cwarm, monke
         return (False, "Unable to restore", 0.1) if key == ckey else (True, "28213 tokens", 0.4)
     monkeypatch.setattr(H, "restore", restore)
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert calls[0] == ckey and calls[1] != ckey
 
@@ -460,7 +540,7 @@ async def test_a_save_stopped_by_a_new_request_keeps_the_owner(cwarm, monkeypatc
     async def idle(base, late, stop=None):
         llm.foreground_requests = 1                       # the next request arrived
         return not stop()
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     assert await agent._conv_before_background({}, "deferred-verdict") is True
     assert llm._slot_session == "sess-a" and st["conv_saves"] == []
 
@@ -480,7 +560,7 @@ async def test_the_conversations_own_call_ending_during_the_wait_is_still_saved(
         llm._last_main_call_end = time.monotonic()         # its reply ended meanwhile
         llm._slot_session_used = llm._last_main_call_end + 1e-6
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     await agent._conv_before_background({}, "deferred-verdict")
     assert [k for k, n, a in st["conv_saves"]] == [H.conv_key("id", "sess-a")]
     assert llm._slot_session is None
@@ -496,7 +576,7 @@ async def test_another_conversation_on_the_slot_meanwhile_is_not_saved_under_thi
         llm._slot_session = "sess-z"                         # another conversation took it
         llm._slot_session_used = llm._last_main_call_end = time.monotonic()
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     await agent._conv_before_background({}, "deferred-verdict")
     assert st["conv_saves"] == [] and llm._slot_session == "sess-z"
 
@@ -575,7 +655,7 @@ async def test_a_save_that_lost_the_slot_while_it_waited_is_not_made(cwarm, monk
         llm._slot_session = "sess-b"                      # another request took it meanwhile
         llm._slot_session_used = time.monotonic()
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     assert await agent._conv_save(llm, "x") is False
     assert st["conv_saves"] == []
 
@@ -594,7 +674,7 @@ async def test_saves_run_one_at_a_time(cwarm, monkeypatch):
         await asyncio.sleep(0.05)
         live["n"] -= 1
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     r = await asyncio.gather(agent._conv_save(llm, "a"), agent._conv_save(llm, "b"))
     assert r == [True, True] and live["max"] == 1 and len(st["conv_saves"]) == 1
 
@@ -610,6 +690,7 @@ async def test_a_conversation_still_in_the_slot_is_claimed_not_restored(cwarm, m
     st["slot"] = 41000
     llm._last_main_call_end = time.monotonic() - 50
     llm._conv_last_saved = ("sess-c", 41000, time.monotonic())   # another conversation, same size
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert st["restores"] == [ckey]                       # review r2: not claimed on a count alone
     st["restores"].clear()
@@ -793,7 +874,7 @@ async def test_the_idle_wait_stops_when_told(cwarm, monkeypatch):
     agent, llm, st = cwarm
     _switch_env(agent, llm, st, monkeypatch, busy=True)
     t0 = time.monotonic()
-    assert await agent._slot_idle("b", time.monotonic() + 30, lambda: True) is False
+    assert (await agent._slot_wait("b", time.monotonic() + 30, lambda: True))[0] == "stopped"   # §4UD (H5): says why
     assert time.monotonic() - t0 < 5
 
 
@@ -865,8 +946,9 @@ async def test_a_conversation_restore_that_timed_out_but_landed_is_kept(cwarm, m
 
     async def idle(base, late, stop=None):
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     assert calls == [ckey, ckey] and llm._slot_session == "sess-b"
 
@@ -891,9 +973,10 @@ async def test_a_timed_out_restore_that_did_not_land_falls_back_to_the_head(cwar
 
     async def idle(base, late, stop=None):
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     st["slot"] = 30000
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     # a timeout, then a retry that llama refused outright: the head
     assert calls[:2] == [ckey, ckey] and calls[2] != ckey
@@ -922,9 +1005,10 @@ async def test_a_second_timeout_is_a_landing_and_a_short_deadline_no_retry(cwarm
     async def idle(base, late, stop=None):
         waits.append(late)
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-b", slot=30000)
     t_before = time.monotonic()
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_turn(st))
     if fits:
         # r3: the wait before the retry leaves the retry its bound inside the deadline
@@ -952,6 +1036,7 @@ async def test_a_replaced_slot_does_not_count_as_the_owners_conversation(cwarm, 
     monkeypatch.setattr(H, "restore", restore)
     _switch_env(agent, llm, st, monkeypatch, owner="sess-a", key="sess-a", slot=9500)
     llm._head_displaced = llm._slot_moved_on = True        # a member's call ran since
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     tok = request_id_context.set("req-next")
     try:
         await agent._slot_switch_before(_turn(st))
@@ -1148,6 +1233,7 @@ async def test_a_conversation_saved_at_another_level_is_left_on_disk(cwarm, monk
     _level_env(agent, monkeypatch, slot_level=None, plan_level=call)
     calls = []
     monkeypatch.setattr(H, "restore", lambda b, dd, k: (calls.append(k), (True, "41000 tokens", 0.5))[1])
+    _bind_staged(_turn(st))       # §4UD (H1): the staged file was saved on the warm head
     await agent._slot_switch_before(_at(st, call))
     assert (ckey not in calls) is left
     if left:

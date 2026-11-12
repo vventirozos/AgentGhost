@@ -240,15 +240,17 @@ class NarrativeSummariser:
         # the mood comes from the day's journal rows below.
         block = state.format_as_prefix(include_mood=False)
         # §4TC: the day's mood timeline, so the diary can tell a day's arc
-        # ("content, then irritable after four failed calls") and not only
-        # where it ended. Steps and their causes, no times of day.
+        # ("content, then irritable") and not only where it ended. No times
+        # of day. §4UD (F2): the LABELS only — never a cause. The causes
+        # name what the owner did ("the owner's message sounded unhappy",
+        # "the owner gave a thumbs-down"); §4TX withheld them wherever other
+        # people read, and the diary was a second copy of them that
+        # `introspect` printed with no such check.
         try:
             steps = []
             for row in self._mood_steps(state)[-_MOOD_TIMELINE_STEPS:]:
                 n = int(row.get("intensity") or 0)
-                what = f"{row.get('label')} {n}" if n else "neutral"
-                cause = str(row.get("cause") or "").strip()
-                steps.append(what + (f" ({cause})" if cause else ""))
+                steps.append(f"{row.get('label')} {n}" if n else "neutral")
             if steps:
                 block = (block + "\n" if block else "") + f"My mood today: {' → '.join(steps)}."
         except Exception:

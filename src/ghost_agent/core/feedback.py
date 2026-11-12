@@ -45,7 +45,14 @@ logger = logging.getLogger("GhostAgent")
 # future graded signal ("partial"?) is an addition, not a migration.
 SIGNAL_POSITIVE = "positive"
 SIGNAL_NEGATIVE = "negative"
-VALID_SIGNALS = (SIGNAL_POSITIVE, SIGNAL_NEGATIVE)
+#: §4UD (G1): a thumb taken back (Slack `reaction_removed`; any client may send it) — which one it was is
+#: part of the signal, so a 👍 swapped for a 👎 (added, then the old one removed) takes back the right one.
+#: It is NOT a label: the corrections sidecar has no un-label (the turn keeps its last outcome); what it
+#: withdraws is the thumb's part of the MOOD (`retract_human_label`).
+SIGNAL_RETRACT_POSITIVE = "retract:positive"
+SIGNAL_RETRACT_NEGATIVE = "retract:negative"
+RETRACT_SIGNALS = (SIGNAL_RETRACT_POSITIVE, SIGNAL_RETRACT_NEGATIVE)
+VALID_SIGNALS = (SIGNAL_POSITIVE, SIGNAL_NEGATIVE) + RETRACT_SIGNALS
 
 # How far back the day-partition scan walks. Feedback almost always lands
 # within minutes of the turn; 8 days covers a long weekend plus clock skew
@@ -172,6 +179,50 @@ def _stamp_cache(ctx: Any, traj_id: str, outcome: str, reason: str) -> None:
         pass
 
 
+def retract_human_label(agent: Any, request_id: str, signal: str, source: str = "") -> Dict[str, Any]:
+    """§4UD (G1): the owner took a thumb back. The thumb's part of the mood
+    leaves the reaction ledger (`SelfModel.retract_owner_reaction`): the mood
+    moves back by what that thumb still held. The outcome LABEL of the turn
+    is left as it is: the sidecar is last-write-wins and has no un-label.
+
+    The LEDGER decides, and only it (review r2: gates copied from the thumb's
+    own path — the turn's age, whose turn it was — were second copies of what
+    the ledger already knows, and the age one was wrong: a thumb given at
+    23 h could not be taken back at 25 h). A thumb that moved the mood stands
+    in the ledger; one that never did (a member's turn, an old turn, another
+    source) does not, and taking it back is a no-op with one log line. So is
+    one given before the agent last restarted: the ledger is in memory. The
+    one gate here is the hand: the owner's (`is_owner_label_source`).
+    Idempotent. Returns ``{"ok": True, "retracted": bool, "why": str}`` — or
+    the same error shapes as ``apply_human_label``. Never raises."""
+    try:
+        rid = normalize_request_id(request_id)
+        if not rid:
+            return {"ok": False, "error": "request_id is required", "code": "bad_request"}
+        sig = str(signal or "").strip().lower()
+        if sig not in RETRACT_SIGNALS:
+            return {"ok": False, "code": "bad_request", "error": f"signal must be one of {list(RETRACT_SIGNALS)}"}
+
+        def _noop(why: str) -> Dict[str, Any]:
+            logger.info("thumb taken back on req %s — nothing withdrawn: %s", rid[:12], why)
+            return {"ok": True, "retracted": False, "why": why}
+        if not is_owner_label_source(source):
+            return _noop("not the owner's own thumb")
+        from ..selfhood import SelfModel as _SelfModel
+        sm = getattr(getattr(agent, "context", None), "self_model", None)
+        if not (isinstance(sm, _SelfModel) and getattr(sm, "enabled", False)):
+            return _noop("no mood to move (selfhood is off)")
+        _after, moved, why = sm.retract_owner_reaction(sig == SIGNAL_RETRACT_POSITIVE, reply_id=rid)
+        if why and not moved:
+            return _noop(why)
+        pretty_log("Human Feedback", f"{_SOURCE_PREFIX}:{str(source).strip()} took a thumb back on req {rid[:8]}"
+                   f" → mood {moved:+.2f}", icon=Icons.FEEDBACK_NEG if moved < 0 else Icons.FEEDBACK_POS)
+        return {"ok": True, "retracted": True, "why": ""}
+    except Exception as e:  # noqa: BLE001 — never 500 uncontrolled
+        logger.warning("retract_human_label failed: %s", e)
+        return {"ok": False, "error": "internal error taking the thumb back", "code": "unavailable"}
+
+
 def apply_human_label(agent: Any, request_id: str, signal: str,
                       note: str = "", source: str = "") -> Dict[str, Any]:
     """Apply an explicit human outcome label to the turn behind ``request_id``.
@@ -210,6 +261,9 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
             return {"ok": False, "error": "request_id is required",
                     "code": "bad_request"}
         sig = str(signal or "").strip().lower()
+        if sig in RETRACT_SIGNALS:
+            # §4UD (G1): a thumb taken back is not a label — its own function, no sidecar write
+            return retract_human_label(agent, rid, sig, source=source)
         if sig not in VALID_SIGNALS:
             logger.warning(
                 "human feedback REJECTED for req %s — signal %r is not one "
@@ -316,11 +370,21 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     # §4TC: the owner's thumb moves the mood — the OWNER's own
                     # label on a real owner turn (the gate above; a member's
                     # turn was refused earlier), sent by a client the owner
-                    # uses, once per label (a repeat is not a new thumb), and
+                    # uses, once per thumb (the ledger's rule, below), and
                     # on a RECENT turn (review: a thumb on last week's reply
                     # is housekeeping, not how the owner feels about now).
-                    if (not unchanged and is_owner_label_source(source)
-                            and turn_is_recent_enough(traj)):
+                    # Review r2: NOT "once per label" by the sidecar's `unchanged` — a thumb taken back
+                    # leaves its label, so the same thumb given again read "unchanged" and never moved the
+                    # mood. The reaction ledger decides (`SelfModel._react`: the same thumb again replaces
+                    # the one that stands for the reply — at most what the first has worn down by).
+                    # §4UD-b M1: … but a label that did NOT change moves it only when the ledger says that
+                    # thumb was taken back: the ledger is in memory, so after a restart the same 👍 re-sent
+                    # (the web retry and Slack's re-post on the restart's 5xx) counted again (0.25 → 0.50 →
+                    # 0.75). A thumb taken back before a restart and given again after it does not count —
+                    # the rarer loss.
+                    if (is_owner_label_source(source)
+                            and turn_is_recent_enough(traj)
+                            and (not unchanged or _sm.thumb_was_taken_back(str(rid or "")))):
                         from ..selfhood.mood import KIND_THUMB_DOWN, KIND_THUMB_UP
                         # §4UB: said to the owner when their own set mood keeps the thumb out
                         mood_note = _sm.reaction_hold_note()

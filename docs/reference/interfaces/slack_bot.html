@@ -115,13 +115,19 @@
     thumb on an unindexed message logs at INFO — the two silent-death
     modes an operator must be able to see. Error replies are never
     registered (a sympathy 👎 on "Agent returned 500" would label a turn
-    the agent never completed). <code>reaction_removed</code> is ignored —
-    a changed mind posts the opposite thumb and the sidecar's
-    last-write-wins resolves it. The correlation handle is the response's
+    the agent never completed). <code>reaction_removed</code> (§4UD) is sent
+    to <code>/api/feedback</code> as <code>retract:positive</code> /
+    <code>retract:negative</code>: the thumb leaves the agent's mood, the
+    turn's label stays (the sidecar has no un-label; a changed mind posts
+    the opposite thumb and last-write-wins resolves it). When the owner
+    thumbs a reply while their own set mood holds, the agent's answer
+    carries <code>mood_note</code>; the bot shows it to the owner once per
+    hold as an ephemeral message (<code>say_hold_note</code>, no model call). The correlation handle is the response's
     <code>id</code> (<code>chatcmpl-&lt;req_id&gt;</code>), not the locally
     generated <code>X-Request-ID</code>, which the agent may uniquify on
     collision. <em>Slack app config must grant <code>reactions:read</code>
-    and subscribe to the <code>reaction_added</code> bot event.</em></li>
+    and subscribe to the <code>reaction_added</code> and
+    <code>reaction_removed</code> bot events.</em></li>
   </ul>
 
   <h2>Owner lock (2026-07-11; the GHOST_SLACK_OPEN_CHANNEL=0 mode)</h2>
@@ -155,6 +161,7 @@
       <tr><td><code>app_mention</code></td><td><code>is_authorized_message</code> (owner, or any human member in open-channel mode) → filtered thread context → <code>_process_message()</code>.</td></tr>
       <tr><td><code>message</code> (DM only)</td><td>Same flow; <code>channel_type == "im"</code> plus the owner gate — owner-only in BOTH modes.</td></tr>
       <tr><td><code>reaction_added</code></td><td>👍/👎 on a registered bot reply → <code>POST /api/feedback</code> (owner or requester only; see above).</td></tr>
+      <tr><td><code>reaction_removed</code></td><td>§4UD: a 👍/👎 taken off a registered bot reply → <code>POST /api/feedback</code> with <code>signal=retract:positive|retract:negative</code> (same parties, same index, same maintenance rule).</td></tr>
     </tbody>
   </table></div>
 

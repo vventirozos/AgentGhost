@@ -27,7 +27,9 @@ def main() -> int:
     from .api import create_app, create_apps_page
     from .service import Service
     try:
-        svc = Service(cfg, docker.from_env(timeout=300), C.CONFIG_DIR / "templates", C.STATE_DIR)
+        from .templates import SHIPPED_DIR
+        svc = Service(cfg, docker.from_env(timeout=300), SHIPPED_DIR, C.STATE_DIR,
+                      extra_templates_dir=C.CONFIG_DIR / "templates")
     except RuntimeError as e:
         log.error("refusing to start: %s", e)
         return 2

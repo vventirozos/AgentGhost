@@ -19,8 +19,13 @@ Rules this module keeps (UNIFIED §11, §12, §13; PLAN §5):
 * **Output is capped here** (the tail of each stream), never exempted from the
   tool-output shield.
 * **Time is clamped to the turn**: `exec` timeouts and the `create` readiness
-  wait never outrun what the request has left; past it, `create` returns the
-  lab as ``creating`` with "check with lab status".
+  wait never outrun what the caller has left (`_time_left_s`): the request's
+  deadline, an unattended step's cap, and — inside an autopilot leaf — the leaf
+  turn's own deadline, which `core/coding_loop.run_leaf_turn` puts in
+  `coding_executor.leaf_deadline_context` (§4UD F1: it was not there, so a leaf
+  with 4 minutes left sent `timeout_s=900`; the command outlived the leaf and
+  held the lab). Past it, `create` returns the lab as ``creating`` with "check
+  with lab status".
 * **Origin and owner come from the request scope** (§4SX B0): owner turns are
   ``owner``, probes ``probe``, unattended/leaf work ``autopilot``; the owner key
   is ``project:<id>`` when the request has a project, else
@@ -63,7 +68,7 @@ CREATE_WAIT_MAX_S = 300.0
 PUT_MAX_BYTES = 8 * 1024 * 1024
 
 ACTIONS = ("templates", "create", "list", "status", "exec", "put", "get", "member", "logs",
-           "http", "extend", "destroy", "spec",
+           "http", "extend", "destroy", "spec", "cancel", "screenshot",
            # §4SX D3: kept machines (production) — the owner's; a probe only on a lab it made (host-side rule)
            "keep", "deploy", "rehearse", "switch", "rollback", "backup", "backups", "restore", "app")
 KEPT_ACTIONS = frozenset({"keep", "deploy", "rehearse", "switch", "rollback", "backup", "backups", "restore", "app"})
@@ -80,7 +85,19 @@ _LAB_ID_RE = re.compile(r"^lab_[0-9a-f]{8}$")
 _MEMBER_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 #: actions that only READ (a status question while work is live may run them)
 READ_ACTIONS = frozenset({"templates", "list", "status", "logs", "http", "spec", "backups"})
-_MEMBER_ACTIONS = frozenset({"exec", "put", "get", "member", "logs", "http"})
+_MEMBER_ACTIONS = frozenset({"exec", "put", "get", "member", "logs", "http", "screenshot"})
+#: §4UD F9 — the ONE source of the batch-order classes (core/agent.py `_batch_call_depends` imports these; it had
+#: two hand lists, and `app` was in neither, `backup` in one):
+#: actions on ONE APP's lineage — its data volume, its serving version, its stable address. Two of them in a batch
+#: run in written order across labs, and a `run` on a kept app is ordered with every one of them.
+LINEAGE_ACTIONS = frozenset((KEPT_ACTIONS - READ_ACTIONS) | {"destroy"})
+#: actions that move workspace files (ordered with `execute` and with each other, across labs)
+FILE_ACTIONS = frozenset({"put", "get", "deploy", "screenshot"})
+#: … and of those, the ones that WRITE into the workspace (core/agent.py drops its cached workspace listing after one)
+WORKSPACE_WRITE_ACTIONS = frozenset({"get", "screenshot"})
+#: every action is in at least one class; a new action in ACTIONS with no class fails tests/test_4ud_labs.py
+ORDER_CLASSES = {"read": READ_ACTIONS, "lineage": LINEAGE_ACTIONS, "files": FILE_ACTIONS,
+                 "lab": frozenset({"create", "exec", "member", "extend", "cancel"})}
 
 
 def is_read_call(args: Any) -> bool:
@@ -120,13 +137,20 @@ def labs_configured(context) -> bool:
 
 
 def _base_url(host: str) -> str:
+    """`http://` + the configured host, when the setting has no scheme of its own. Nothing is repaired here: what
+    this returns is judged by `key_refusal`, which accepts one exact shape and refuses everything else."""
     h = host.strip().rstrip("/")
-    return h if h.startswith(("http://", "https://")) else f"http://{h}"
+    low = h.lower()
+    for scheme in ("http://", "https://"):      # the scheme compares case-insensitively (`HTTP://100.64.0.5:8700`)
+        if low.startswith(scheme):
+            return scheme + h[len(scheme):]
+    return f"http://{h}"
 
 
 def host_part(host: str) -> str:
-    """The bare host (no scheme, no port) of the configured labs host."""
-    h = re.sub(r"^https?://", "", str(host or "").strip()).split("/", 1)[0]
+    """The bare host (no scheme, no userinfo, no port) of the configured labs host — for messages and the
+    workspace wall. Userinfo is dropped, never shown (a setting like `user:pw@host` is refused by the key rule)."""
+    h = re.sub(r"^https?://", "", str(host or "").strip(), flags=re.I).split("/", 1)[0].rsplit("@", 1)[-1]
     if h.startswith("["):
         return h[1:].split("]", 1)[0]
     return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
@@ -229,7 +253,9 @@ def _caller(context) -> Tuple[Optional[str], str, str]:
 
 
 def _time_left_s() -> Optional[float]:
-    """What the request (or the leaf it runs in) still has; None = no bound."""
+    """What the caller still has, in seconds; None = no bound. The least of: the request's deadline in force, and
+    the monotonic deadline in `coding_executor.leaf_deadline_context` — an unattended step's cap, and inside an
+    autopilot leaf the leaf turn's own deadline (`run_leaf_turn` sets it: §4UD F1)."""
     try:
         from ..core import coding_executor as ce
         from ..utils import logging as _glog
@@ -259,20 +285,79 @@ class LabsNoAnswer(Exception):
     connection): what it did there is unknown."""
 
 
+class LabsKeyRefused(LabsUnreachable):
+    """§4UD F14: nothing was sent — the labs key may only go DIRECTLY to a local address."""
+
+
+def _key_nets():
+    import ipaddress
+    return tuple(ipaddress.ip_network(n) for n in (
+        "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7"))
+
+
+#: the only address ranges the labs key is sent to: loopback, RFC1918, the tailnet's CGNAT range, unique-local.
+#: (Link-local is NOT one: 169.254.169.254 is a cloud metadata service, and nobody runs a labs host on fe80::.)
+_KEY_NETS = _key_nets()
+#: a bare local host name: no dot, starts with a letter — and not a scheme word (`http:10.0.0.1` parses as host "http")
+_BARE_HOST_RE = re.compile(r"^(?!https?$)[a-z][a-z0-9-]*$")
+#: the ONE shape a labs URL may have: http(s)://HOST[:PORT][/path] — HOST a dotted quad, a bracketed IPv6 literal or
+#: a bare name; no userinfo, nothing else in the authority
+_KEY_URL_RE = re.compile(r"^https?://(?P<host>\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::(?P<port>[0-9]{1,5}))?(?:/[^\s]*)?$", re.I)
+
+
+def key_refusal(url: str, tor_proxy: Optional[str] = None) -> str:
+    """Why the labs key must not be sent to ``url`` ('' = it may). The key goes out only on a DIRECT connection,
+    to a URL of ONE exact shape — ``http(s)://HOST[:PORT]/…`` — whose HOST is (a) an IP literal in its canonical
+    spelling inside `_KEY_NETS`, or (b) a bare local name with no dot. Everything else is refused: the rule is
+    closed, it names what may pass.
+    History (§4UD F14): `host.tailnet-example.ts.net` went through the Tor proxy with the key in plain http; the
+    Tor classifier let `http://134744072` and `http://0x08080808` through (r2); "not globally routable" let 6to4
+    forms of a public address through (r3); a lenient URL parser read `HTTP:/10.0.0.1` and `http:10.0.0.1` as a
+    host named "http", sent `user:pw@host`, and link-local was allowed (part-2 review). ``tor_proxy`` is unused."""
+    import ipaddress
+    m = _KEY_URL_RE.match(str(url or ""))
+    if not m:
+        return "it is not of the form host[:port] or http://host[:port] (no user:password@, nothing else)"
+    host = m.group("host").lower()
+    if m.group("port") is not None and not 0 < int(m.group("port")) < 65536:
+        return f"port {m.group('port')} is not a port"
+    literal = host[1:-1] if host.startswith("[") else host
+    try:
+        ip = ipaddress.ip_address(literal)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        # the text must be the address's own canonical spelling (what `ipaddress` prints), IPv6 in brackets
+        if str(ip) != literal or (ip.version == 6) != host.startswith("["):
+            return f"{host!r} is not a plain IP address"
+        if any(ip.version == n.version and ip in n for n in _KEY_NETS):
+            return ""
+        return ("it is not a loopback, private (10/8, 172.16/12, 192.168/16), tailnet (100.64/10) or unique-local "
+                "(fc00::/7) address")
+    if not host.startswith("[") and _BARE_HOST_RE.match(host):
+        return ""                       # a bare local name (no dot: it cannot be a public DNS name)
+    return ("it is not a local address: only a loopback / tailnet / private IP literal (like 100.64.0.5 or "
+            "[fd7a::5]) or a bare local name (no dots) is accepted — a dotted name, an integer or hex address "
+            "could resolve to a public host")
+
+
 async def _call(context, method: str, path: str, *, origin: str, json_body=None, params=None,
                 timeout: float = 30.0) -> Tuple[int, Any]:
     host, key_file = labs_settings(context)
     key = _read_key(key_file)
     url = _base_url(host) + path
-    try:
-        from ..core.llm import compute_tor_proxy
-        proxy = compute_tor_proxy(url, getattr(context, "tor_proxy", None))
-    except Exception:  # noqa: BLE001
-        proxy = None
+    # §4UD F14, at the sink: every labs request carries the key, so none is built for an address the key may not
+    # go to — and the client below never gets a proxy
+    why = key_refusal(url, getattr(context, "tor_proxy", None))
+    if why:
+        config_refusal(context)                 # one loud line per process (r3 m4), never one per call
+        raise LabsKeyRefused(f"NOT SENT: the labs key goes only directly to a local address, and for "
+                             f"{host_part(host)} {why}. Configure the labs host by its tailnet IP")
     import httpx
     headers = {"X-Labs-Key": key, "X-Labs-Origin": origin}
     try:
-        async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=False) as client:
+        # trust_env=False: no proxy from HTTP(S)_PROXY / ALL_PROXY in the agent's environment either
+        async with httpx.AsyncClient(proxy=None, trust_env=False, timeout=timeout, follow_redirects=False) as client:
             r = await client.request(method, url, headers=headers, json=json_body, params=params)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.UnsupportedProtocol) as e:
         raise LabsUnreachable(f"{type(e).__name__}: {e}"[:200]) from e
@@ -293,6 +378,12 @@ def _cap(text: str, what: str) -> str:
         return text
     return (f"[{what} truncated: {len(text)} chars, the last {OUT_CAP} kept — use `lab get` for a full log file]\n"
             + text[-OUT_CAP:])
+
+
+class LabReply(ToolOutcome):
+    """A labs-host refusal with the fields a reader needs AS DATA (§4UD F15: `core.lab_waits` used to parse
+    ``needed_mb`` back out of the result text). A plain ToolOutcome everywhere else."""
+    __slots__ = ("needed_mb",)
 
 
 def _service_reply(status: int, reply: Any, context=None, lab_id: str = "") -> ToolOutcome:
@@ -339,11 +430,16 @@ def _service_reply(status: int, reply: Any, context=None, lab_id: str = "") -> T
     # a lab that is still starting / busy is IN FLUX: booked as possibly
     # changing, so the pre-flight repeat guard never freezes a poll on it
     # (review r2 MAJOR E)
-    return ToolOutcome(text, status=OutcomeStatus.REJECTED if rejected else OutcomeStatus.FAILED,
-                       reason_code=f"lab_{code}",
-                       world_changed=True if (code in _IN_FLUX or (code == "not_ready"
-                                                                   and str(body.get("state") or "") in _COMING_UP))
-                       else False)
+    out = LabReply(text, status=OutcomeStatus.REJECTED if rejected else OutcomeStatus.FAILED,
+                   reason_code=f"lab_{code}",
+                   world_changed=True if (code in _IN_FLUX or (code == "not_ready"
+                                                               and str(body.get("state") or "") in _COMING_UP))
+                   else False)
+    try:
+        out.needed_mb = max(0, int(body.get("needed_mb") or 0))
+    except (TypeError, ValueError):
+        out.needed_mb = 0
+    return out
 
 
 #: service error codes that mean "not yet" rather than "this fails": `busy`
@@ -353,8 +449,39 @@ _IN_FLUX = frozenset({"busy"})
 _COMING_UP = frozenset({"creating", "created", "starting", "restarting"})
 
 
+#: labs hosts whose key refusal was already said (once per process and host)
+_KEY_REFUSAL_SAID: set = set()
+
+
+def config_refusal(context) -> str:
+    """'' when the configured labs host may get the key; else WHY not — a CONFIGURATION error, the same for every
+    call until the operator changes `--labs-host` (§4UD r3 m4: it was treated as "the host did not answer": the leaf
+    sweep retried it every 300 s for ever, two WARNINGs per lab per tick). Said loudly ONCE per process; the rule is
+    named, never the key."""
+    host, _ = labs_settings(context)
+    if not host:
+        return ""
+    why = key_refusal(_base_url(host) + "/")
+    if why and host not in _KEY_REFUSAL_SAID:
+        _KEY_REFUSAL_SAID.add(host)
+        pretty_log("Labs", f"labs host {host_part(host)} REFUSED by the key rule: {why}. Nothing is sent to it — "
+                           "`lab`/`run` on labs answer with this refusal and the leaf sweeps do not ask. Set "
+                           "--labs-host to its tailnet IP (or a bare local name).", level="WARNING", icon=Icons.WARN)
+    return why
+
+
 def _unreachable(context, detail: str) -> ToolOutcome:
     host, _ = labs_settings(context)
+    why = config_refusal(context)
+    if why:
+        # not "did not answer": nothing was sent, and no retry will change it (REJECTED, from the configuration
+        # itself — never read back out of the exception's text)
+        return ToolOutcome(
+            f"LAB ERROR (labs_key_refused): nothing was sent to the labs host {host_part(host)} — {why}. The labs "
+            "key is only sent directly to a loopback / private / tailnet IP address or a bare local name.\n"
+            "HINT: this is a configuration error of the agent (its labs host setting). Do not retry; tell the "
+            "user the labs host must be configured by its tailnet IP.",
+            status=OutcomeStatus.REJECTED, reason_code="lab_labs_key_refused", world_changed=False)
     return ToolOutcome(
         f"LAB ERROR (labs_unreachable): the labs host {host} did not answer ({detail}).\n"
         "HINT: nothing ran there. Do not retry the same call in a loop and do not fall back to the workspace: "
@@ -380,11 +507,16 @@ def _no_answer(context, action: str, detail: str) -> ToolOutcome:
         world_changed=False if _nothing else None)
 
 
-def _when(ts) -> str:
+def _when(ts, now: Optional[float] = None) -> str:
+    """A local time for a result: ``HH:MM`` when it is today, ``YYYY-MM-DD HH:MM`` on any other day (§4UD F16: an
+    expiry up to 72 h away, a rollback window and 30 days of backups all printed as a bare ``HH:MM``)."""
     try:
-        return time.strftime("%H:%M", time.localtime(float(ts)))
-    except (TypeError, ValueError):
+        t = time.localtime(float(ts))
+    except (TypeError, ValueError, OverflowError, OSError):
         return "?"
+    today = time.localtime(time.time() if now is None else float(now))
+    same_day = (t.tm_year, t.tm_yday) == (today.tm_year, today.tm_yday)
+    return time.strftime("%H:%M" if same_day else "%Y-%m-%d %H:%M", t)
 
 
 def _render_lab(d: Dict[str, Any]) -> str:
@@ -400,6 +532,8 @@ def _render_lab(d: Dict[str, Any]) -> str:
         ports = ", ".join(f"{p.get('container')}→{p.get('url') or p.get('host')}" for p in (m.get("ports") or []))
         lines.append(f"  member {m.get('name')}: {m.get('status')} ip {m.get('ip')} image {m.get('image')}"
                      + (" ISOLATED" if m.get("isolated") else "") + (f"  ports: {ports}" if ports else ""))
+    if isinstance(d.get("app"), dict):
+        lines.append("  " + _app_status_line(d["app"]))
     if d.get("readiness"):
         lines.append(f"  readiness: {json.dumps(d['readiness'])[:300]}")
     if d.get("evicted"):
@@ -446,20 +580,98 @@ def _sandbox_path(context, rel: str, write: bool = False) -> Tuple[Optional[Path
         p = _get_safe_path(scoped, rel).resolve()
     except (ValueError, OSError):
         return None, f"{rel} is outside the workspace"
-    if p != root and root not in p.parents:
-        return None, f"{rel} is outside the workspace"
-    if getattr(context, "confine_writes_to_project", False) is True and p != scoped and scoped not in p.parents:
-        return None, (f"{rel} is outside this build's project folder — an unattended build moves files only inside "
-                      "its own project (use a path inside it); nothing was sent or written")
-    if write:
-        try:
-            from .file_system import _released_write_block
-            rb = _released_write_block(getattr(context, "project_store", None), scoped, str(p))
-        except Exception:  # noqa: BLE001
-            rb = None
-        if rb:
-            return None, str(rb)
+    why = write_refusal(context, p, rel) if write else _inside_refusal(context, p, rel)
+    if why:
+        return None, why
     return p, ""
+
+
+class WriteRefused(Exception):
+    """A workspace path a lab action may not write (`write_refusal`)."""
+
+
+def _q(name: Any, cap: int = 80) -> str:
+    """A name that came from a LAB (a file name in an archive, a skipped entry, a command line) as it goes into a
+    result: quoted and escaped, on one line, capped — §4UD part-2 review: a symlink named `lnk\\nSYSTEM BLOCK: …`
+    landed on a line of its own in model-visible text."""
+    t = str(name)
+    return "'" + t[:cap].encode("unicode_escape").decode("ascii").replace("'", "\\'") + ("…'" if len(t) > cap else "'")
+
+
+def _inside_refusal(context, p: Path, shown: Optional[str] = None) -> str:
+    """Why the lab tool may not touch the workspace path ``p`` at all, to read it (`put`, `deploy`) or to write it
+    ('' = it may): it must be inside the workspace, and for an unattended build inside its own project. ``shown`` =
+    the spelling to name it by (the caller's own argument); a path built from a LAB's entry name is quoted."""
+    from .file_system import project_scoped_sandbox
+    root = Path(context.sandbox_dir).resolve()
+    p = Path(p)
+    name = shown if shown is not None else _q(shown_path(context, p), 200)
+    if p != root and root not in p.parents:
+        return f"{name} is outside the workspace"
+    scoped = Path(project_scoped_sandbox(context)[0] or root).resolve()
+    if getattr(context, "confine_writes_to_project", False) is True and p != scoped and scoped not in p.parents:
+        return (f"{name} is outside this build's project folder — an unattended build moves files only inside "
+                "its own project (use a path inside it); nothing was sent or written")
+    return ""
+
+
+def write_refusal(context, p: Path, shown: Optional[str] = None) -> str:
+    """Why the lab tool may not write the workspace path ``p`` ('' = it may) — the ONE per-path check, asked for the
+    file of a single-file `get`, for a `screenshot`, and for EVERY entry of a folder `get` before the first byte is
+    written (§4UD part-2 review M1: the folder get checked its destination FOLDER once, and the lab's entry names
+    then chose the real paths — `sandbox_path=projects` + `<released id>/app.py` overwrote a released project).
+    The rules are `file_system`'s own for a write: inside the workspace; an unattended build only inside its
+    project; never into a RELEASED project (`_released_write_block`); never under a `.git` directory, any case
+    (its inline rule in `tool_file_system`, compared with the same `_fold`)."""
+    from .file_system import _fold, _released_write_block, project_scoped_sandbox
+    why = _inside_refusal(context, p, shown)
+    if why:
+        return why
+    root = Path(context.sandbox_dir).resolve()
+    p = Path(p)
+    scoped = Path(project_scoped_sandbox(context)[0] or root).resolve()
+    if any(_fold(part) == ".git" for part in p.relative_to(root).parts):
+        return (f"{_q(shown_path(context, p), 200)} is inside a `.git` directory — repository internals are never written "
+                "by hand (use `execute` to run git)")
+    try:
+        rb = _released_write_block(getattr(context, "project_store", None), scoped, str(p))
+    except Exception:  # noqa: BLE001
+        rb = None
+    return str(rb) if rb else ""
+
+
+async def _ws_write(context, p: Path, data: bytes) -> None:
+    """THE write of a lab action into the workspace: `write_refusal`, then every component opened O_NOFOLLOW from
+    the workspace root (a link planted meanwhile is replaced, never followed). Raises WriteRefused / OSError /
+    ValueError. No other code in this module writes a workspace file (pinned by an AST walk)."""
+    why = write_refusal(context, p)
+    if why:
+        raise WriteRefused(why)
+    from .file_system import write_bytes_nofollow_rel
+    root = Path(context.sandbox_dir).resolve()
+    await asyncio.to_thread(write_bytes_nofollow_rel, root, str(Path(p).relative_to(root)), data)
+
+
+def _ws_mkdir(context, p: Path) -> None:
+    """THE directory creation of a lab action in the workspace (an empty folder of a folder `get`): the same check,
+    then each component made and opened O_NOFOLLOW|O_DIRECTORY from the workspace root."""
+    why = write_refusal(context, p)
+    if why:
+        raise WriteRefused(why)
+    root = Path(context.sandbox_dir).resolve()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(root), flags)
+    try:
+        for part in Path(p).relative_to(root).parts:
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nfd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+    finally:
+        os.close(fd)
 
 
 #: transcripts older than this are removed (once per process per memory dir)
@@ -614,9 +826,8 @@ async def _autopilot_owner_refusal(context, lab_id: str, owner: str, action: str
         return f"the labs host answered HTTP {st} to the ownership check of {lab_id} — nothing was sent; try again"
     theirs = str(d.get("owner") or "") if st == 200 and isinstance(d, dict) else ""
     if (who == "autopilot" and st == 200 and isinstance(d, dict) and str(d.get("lifetime") or "") == "kept"
-            and action != "status"):
-        return (f"{lab_id} is KEPT (production) — unattended work never runs commands on, reads files from or "
-                "changes a production machine; use a disposable lab of the project.")
+            and kept_touch_refusal("autopilot", action)):
+        return f"{lab_id} is KEPT (production) — {kept_touch_refusal('autopilot', action)}."
     if st == 404:
         from ..memory.lab_inventory import inventory_for
         inv = inventory_for(context)
@@ -634,12 +845,33 @@ async def _autopilot_owner_refusal(context, lab_id: str, owner: str, action: str
     return ""
 
 
+#: what unattended work may ask of a KEPT (production) machine: its status, nothing else
+AUTOPILOT_KEPT_READS = frozenset({"status", "url"})
+
+
+def kept_touch_refusal(origin: str, action: str) -> str:
+    """§4UD F12 — the ONE answer to "may this caller do ``action`` on a kept (production) machine or its app?",
+    asked by `lab <action>` and by `run <action>` of an `app` run ('' = yes). Unattended work reads a kept app's
+    STATUS only (docs/features/labs.html: "Autopilot … read status only"): where it runs, its state, its address.
+    Its logs, files and pages are content of a production machine, and commands and changes are the owner's.
+    `lab logs` refused them while `run logs` of the same app answered. The owner is never refused here; a probe's
+    limits (its own probe labs) are `_kept_refusal`'s and the host's."""
+    if origin != "autopilot" or action in AUTOPILOT_KEPT_READS:
+        return ""
+    return ("unattended work reads a production machine's status only (`lab status`, `run status`/`run url`): it "
+            "never runs commands on it, reads its logs, files or pages, or changes it; use a disposable lab of "
+            "the project")
+
+
 def _note_lab_wait(out, action: str) -> None:
     """§4SX D4: tell ``core.lab_waits`` what a build's lab call got (keyed by the build running in this context)."""
     try:
         from ..core.lab_waits import BUILD_KEY, note_outcome
         note_outcome(BUILD_KEY.get(), str(getattr(out, "reason_code", "") or ""),
-                     getattr(out, "status", None) is OutcomeStatus.OK, action=action, text=str(out))
+                     # a PARTIAL create MADE the lab too (still starting, or a member not ready yet: §4UD F-A)
+                     getattr(out, "status", None) in ((OutcomeStatus.OK, OutcomeStatus.PARTIAL) if action == "create"
+                                                      else (OutcomeStatus.OK,)), action=action,
+                     needed_mb=int(getattr(out, "needed_mb", 0) or 0))
     except Exception:  # noqa: BLE001
         logger.debug("lab wait note skipped", exc_info=True)
 
@@ -671,20 +903,50 @@ def leaf_tag(leaf_id: str) -> str:
     return f"#leaf-{hashlib.sha1(str(leaf_id).encode()).hexdigest()[:10]}" if leaf_id else ""
 
 
-async def destroy_leaf_labs(context, owner: str, leaf_id: str) -> List[str]:
+#: is the labs host in a "no answer to the leaf sweep" stretch? Set ONLY by `leaf_outage`, which the sweep calls
+#: once per pass with what that whole pass got (r3 m3: it was reset only by an answered leaf-lab DELETE, so it could
+#: stick on — and the next outage then logged nothing).
+_LEAF_OUTAGE = {"on": False}
+
+
+def leaf_outage(now_silent: bool, what: str = "", answered: bool = True) -> None:
+    """One line when an outage starts, one when it ends. ``now_silent`` False = the pass got an answer from the labs
+    host (any call), or had nothing to ask — ``answered`` False then: the flag is cleared WITHOUT saying "answers
+    again" (nothing was asked, so nothing answered)."""
+    if not now_silent and not answered:
+        _LEAF_OUTAGE["on"] = False
+        return
+    if now_silent and not _LEAF_OUTAGE["on"]:
+        _LEAF_OUTAGE["on"] = True
+        pretty_log("Labs", f"labs host not answering — leaf lab(s) not destroyed yet ({what[:80]}); asked again by "
+                           "the leaf sweep, this line is not repeated", level="WARNING", icon=Icons.WARN)
+    elif not now_silent and _LEAF_OUTAGE["on"]:
+        _LEAF_OUTAGE["on"] = False
+        pretty_log("Labs", "labs host answers again — leaf labs are being cleaned up", icon=Icons.LAB_DESTROY)
+
+
+async def destroy_leaf_labs(context, owner: str, leaf_id: str, report: Optional[Dict[str, int]] = None) -> List[str]:
     """§4SX D4: destroy the disposable labs THIS leaf (``leaf_id``, recorded on the inventory row at create) made
     and left up — never another leaf's or turn's (review r2 #5). Returns the ids destroyed. A host that does not
     answer leaves them to the host's idle TTL (said in the log)."""
     from ..memory.lab_inventory import inventory_for
     if not labs_configured(context) or not leaf_id:
         return []
+    if config_refusal(context):
+        return []          # a labs host the key rule refuses: nothing is sent (said once, in config_refusal)
     inv = inventory_for(context)
     rows = [r for r in (inv.rows(owner, live_only=True) if inv else [])
             if r.get("origin") == "autopilot" and str(r.get("leaf") or "") == str(leaf_id)]
     # review r4 #3: a create the host made but never answered has no inventory row — its host purpose has the tag
-    tag, known = leaf_tag(leaf_id), {str(r["lab_id"]) for r in rows}
+    # UNTRACKED means the inventory has NO row for the lab at all — live or closed, whatever its leaf tag (§4UD r3: a
+    # lab whose tag was cleared because the owner uses it still carries the tag on the HOST; it was found again
+    # here as "untracked" and destroyed after the owner's 30-minute grace)
+    tag = leaf_tag(leaf_id)
+    known = {str(r["lab_id"]) for r in (inv.rows(owner) if inv else [])}
     try:
         st, b = await _call(context, "GET", "/v1/labs", origin="autopilot", params={"owner": owner}, timeout=20)
+        if report is not None:
+            report["answered"] = report.get("answered", 0) + 1       # ANY answered call ends an outage (r3 m3)
         for x in ((b.get("labs") or []) if st == 200 and isinstance(b, dict) else []):
             if (isinstance(x, dict) and str(x.get("owner") or "") == owner and str(x.get("lab_id") or "") not in known
                     and str(x.get("origin") or "") == "autopilot"           # review r5 #3: never the owner's copy
@@ -694,13 +956,24 @@ async def destroy_leaf_labs(context, owner: str, leaf_id: str) -> List[str]:
     except (LabsUnreachable, LabsNoAnswer) as e:
         logger.info("leaf %s: labs host not listed (%s) — an untracked lab idles out on the host", leaf_id, e)
     gone: List[str] = []
+    swept = report is not None                  # the periodic sweep: it says an outage once, for the whole pass
+    report = report if report is not None else {}
     for r in rows:
         lid = r["lab_id"]
         try:
             st, body = await _call(context, "DELETE", f"/v1/labs/{lid}", origin="autopilot", timeout=60)
         except (LabsUnreachable, LabsNoAnswer) as e:
-            logger.warning("leaf lab %s not destroyed (%s) — the host's idle TTL ends it", lid, e)
+            # the row stays live and leaf-tagged: the leaf sweep asks again. Said ONCE per outage (§4UD r2: it
+            # was a WARNING per lab per five-minute pass for as long as the host was down)
+            report["no_answer"] = report.get("no_answer", 0) + 1
+            report.setdefault("what", f"{lid}: {e}")
+            if swept:
+                logger.info("leaf lab %s not destroyed: no answer (%s)", lid, e)
+            else:                               # the leaf's own end: one event, said where it happened
+                pretty_log("Labs", f"leaf lab {lid} NOT destroyed: no answer ({str(e)[:80]}) — asked again by the "
+                                   "leaf sweep", level="WARNING", icon=Icons.WARN)
             continue
+        report["answered"] = report.get("answered", 0) + 1
         left = body.get("leftovers") if isinstance(body, dict) else None
         if r.get("untracked"):
             if st in (200, 204) or left or (st == 404 and isinstance(body, dict)
@@ -720,8 +993,21 @@ async def destroy_leaf_labs(context, owner: str, leaf_id: str) -> List[str]:
                 continue
             inv.record_destroy(lid, by="leaf_end")
             gone.append(lid)
+        elif isinstance(body, dict) and body.get("error") in ("owner_active", "owner_only"):
+            # §4UD r2/r3 — TERMINAL: the owner is using this lab (`owner_active`) or KEPT it (`owner_only` — the
+            # error code, not any 403), so it is the owner's now. The leaf tag goes (no leaf
+            # sweep and no boot pass asks again); the row stays live for `lab list` and the project's teardown, and
+            # the host's idle TTL ends the lab, each use moving it. (Retrying destroyed it 30 min after the owner's
+            # last call.)
+            inv.clear_leaf(lid)
+            pretty_log("Labs", f"leaf lab {lid} is in use or kept by the owner — it is the owner's now: not destroyed, not "
+                               "asked again (the labs host's idle TTL ends it)", icon=Icons.LAB_CREATE)
         else:
-            logger.warning("leaf lab %s not destroyed: %s %s", lid, st, str(body)[:200])
+            # §4UD F1: any other refusal (busy, …) is said to the operator and NOT forgotten — the row stays live
+            # and leaf-tagged, and the periodic pass (core/leaf_reaper.sweep_ended_leaves) asks again
+            _code = str(body.get("error") or st) if isinstance(body, dict) else str(st)
+            pretty_log("Labs", f"leaf lab {lid} NOT destroyed: the labs host refused ({_code}) — retried by the "
+                               "leaf sweep", level="WARNING", icon=Icons.WARN)
     if gone:
         pretty_log("Labs", f"leaf ended: destroyed its lab(s) {', '.join(gone)}", icon=Icons.LAB_DESTROY)
     return gone
@@ -812,7 +1098,8 @@ def _open_inside(base: Path, root: Path) -> int:
     return fd
 
 
-def tar_folder(root: Path, base: Optional[Path] = None) -> Tuple[bytes, List[str], str]:
+def tar_folder(root: Path, base: Optional[Path] = None, max_entries: Optional[int] = None,
+               with_dirs: bool = False) -> Tuple[bytes, List[str], str]:
     """(tar.gz bytes, skipped, error) of a workspace folder for `lab deploy` (§4SX D3 r1 M9). Walks with dir fds and
     never follows a symlink (the workspace is writable by sandboxed code: a link swapped in mid-walk cannot make the
     agent read a host file); symlinks, devices and fifos are skipped and listed; DEPLOY_EXCLUDE and `.env*` never go.
@@ -823,13 +1110,14 @@ def tar_folder(root: Path, base: Optional[Path] = None) -> Tuple[bytes, List[str
     total = 0
     top = _open_inside(Path(base), Path(root)) if base is not None else None
     try:
-        return _tar_walk(buf, skipped, total, root, top)
+        return _tar_walk(buf, skipped, total, root, top, max_entries, with_dirs)
     finally:
         if top is not None:
             os.close(top)
 
 
-def _tar_walk(buf, skipped, total, root, top) -> Tuple[bytes, List[str], str]:
+def _tar_walk(buf, skipped, total, root, top, max_entries: Optional[int] = None,
+              with_dirs: bool = False) -> Tuple[bytes, List[str], str]:
     import io
     import stat as _stat
     from .file_system import _block_if_regular
@@ -837,6 +1125,7 @@ def _tar_walk(buf, skipped, total, root, top) -> Tuple[bytes, List[str], str]:
     walk = (os.fwalk(".", dir_fd=top, follow_symlinks=False) if top is not None
             else os.fwalk(str(root), follow_symlinks=False))
     start = "." if top is not None else str(root)
+    n_files = 0
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for dirpath, dirnames, filenames, dfd in walk:
             rel_dir = os.path.relpath(dirpath, start)
@@ -853,6 +1142,17 @@ def _tar_walk(buf, skipped, total, root, top) -> Tuple[bytes, List[str], str]:
                     skipped.append(os.path.normpath(os.path.join(rel_dir, d)))   # a symlinked dir
                     continue
                 keep_dirs.append(d)
+                if with_dirs:
+                    # a folder `put` carries the folders themselves too, so an EMPTY one arrives (a deploy archive
+                    # does not: its layout is the host's)
+                    di = tarfile.TarInfo(os.path.normpath(os.path.join(rel_dir, d)))
+                    di.type, di.mode, di.mtime = tarfile.DIRTYPE, 0o755, int(st.st_mtime)
+                    tar.addfile(di)
+                    # a folder is an ENTRY to the host's limit too (part-2 r2 N4: 1995 files + 10 folders passed
+                    # here and were refused there)
+                    n_files += 1
+                    if max_entries is not None and n_files > max_entries:
+                        return b"", skipped, f"the folder has more than {max_entries} files and folders"
             dirnames[:] = keep_dirs
             for f in filenames:
                 rel = os.path.normpath(os.path.join(rel_dir, f))
@@ -883,6 +1183,10 @@ def _tar_walk(buf, skipped, total, root, top) -> Tuple[bytes, List[str], str]:
                 total += len(data)
                 if total > DEPLOY_MAX_BYTES:
                     return b"", skipped, f"the folder is over {DEPLOY_MAX_BYTES // (1024 * 1024)} MB"
+                n_files += 1
+                if max_entries is not None and n_files > max_entries:
+                    return b"", skipped, (f"the folder has more than {max_entries} "
+                                          + ("files and folders" if with_dirs else "files"))
                 ti = tarfile.TarInfo(rel)
                 ti.size, ti.mode, ti.mtime = len(data), st.st_mode & 0o755, int(st.st_mtime)
                 tar.addfile(ti, io.BytesIO(data))
@@ -926,6 +1230,25 @@ def _app_view(a: Dict[str, Any]) -> str:
     if a.get("last_error") and a.get("state") != "up":
         bits.append(f"last error: {str(a['last_error'])[:200]}")
     return " — ".join(bits)
+
+
+def _app_status_line(a: Dict[str, Any]) -> str:
+    """The app line of a KEPT lab's `lab status` (§4UD F8: the status showed nothing of the app, and every
+    no-answer hint after keep/deploy/switch sends the model there). The lab's own detail only: whether THIS version
+    serves (its data is mounted) or is staged, where the app listens, and the version it was switched in from."""
+    bits = [_app_view(a),
+            "this version SERVES (the data is mounted here)" if a.get("mounted")
+            else "this version is STAGED — not serving, no data mounted (`lab switch` brings it in)"]
+    if a.get("member") or a.get("port"):
+        bits.append(f"member {a.get('member')} port {a.get('port')}")
+    if a.get("switched_from"):
+        bits.append(f"switched in from {a['switched_from']}"
+                    + (f" (rollback until {_when(a['rollback_until'])})" if a.get("rollback_until") else ""))
+    if a.get("restarts"):
+        bits.append(f"{a['restarts']} restart(s)")
+    if a.get("name"):
+        bits.append(f"`run status name={a['name']}` shows the version that serves now")
+    return "; ".join(bits)
 
 
 def _probe_view(p) -> str:
@@ -973,7 +1296,8 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
 
     def no_answer(what, e):
         return ToolOutcome(f"LAB ERROR (no_answer): the labs host did not answer the {what} ({e}) — its outcome is "
-                           f"UNKNOWN; check with `lab status lab_id={lab_id}` before retrying.",
+                           f"UNKNOWN; check with `lab status lab_id={lab_id}` (it shows the app: its state, and "
+                           "whether this version serves or is staged) before retrying.",
                            status=OutcomeStatus.UNRESOLVED, reason_code="lab_no_answer", world_changed=None)
 
     if action in ("keep", "deploy", "rehearse", "switch", "rollback", "restore", "backup") \
@@ -1013,15 +1337,13 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                                world_changed=False)
         if st != 200:
             return _service_reply(st, det, context, lab_id)
-        _cur = getattr(context, "current_project_id", None)
-        if origin == "probe" and str(det.get("owner") or "") != f"project:{_cur}":
-            # review r2 #10: a probe keeps only a lab of the probe project it is in
-            return ToolOutcome(f"LAB ERROR (not_allowed): {lab_id} belongs to {det.get('owner') or 'no project'} — a "
-                               "probe keeps only a lab of the probe project in focus.", status=OutcomeStatus.REJECTED,
-                               reason_code="lab_not_allowed", world_changed=False)
+        # (a probe keeps only a lab of the probe project it is in — review r2 #10: `tool_lab`'s probe wall has
+        # already refused any lab whose owner is not this request's project, so no second test of it here; the
+        # battery mutant on that test could not be killed)
         if str(det.get("lifetime") or "") == "kept" and isinstance(det.get("app"), dict):
             # code r1 #3: kept already (an earlier keep the agent never heard back from) — make sure `run` knows it
             note = await _record_app_run(context, str(det.get("origin") or origin), det)
+            _no_expiry(context, lab_id)
             return ToolOutcome(f"{lab_id} is already KEPT: {_app_view(det.get('app'))}{note}. Use `lab deploy` / "
                                "`lab app` on it.", status=OutcomeStatus.OK, world_changed=False)
         lab_owner = str(det.get("owner") or "")
@@ -1054,6 +1376,7 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
         if st != 200:
             return _service_reply(st, det2, context, lab_id)
         note = await _record_app_run(context, origin, det2)
+        _no_expiry(context, lab_id)                # §4UD F10: a kept machine has none
         a2 = det2.get("app") if isinstance(det2.get("app"), dict) else {}
         sec = list(a2.get("secrets") or [])
         pretty_log("Lab Kept", f"{lab_id} app {a2.get('name')} ({a2.get('state')}) by {origin}", icon=Icons.LAB_CREATE)
@@ -1094,7 +1417,7 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
         return ToolOutcome(("" if ok else "LAB ERROR (app_not_up): ")
                            + f"{lab_id}: deployed {folder} ({len(data)} bytes) — {_app_view(out.get('app'))}; "
                            f"{_probe_view(probe)}"
-                           + (f". Skipped (links/devices): {', '.join(skipped[:10])}" if skipped else ""),
+                           + (f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else ""),
                            status=OutcomeStatus.OK if ok else OutcomeStatus.FAILED,
                            reason_code=None if ok else "lab_app_not_up", world_changed=True)
 
@@ -1125,7 +1448,8 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
             if not out.get("switched"):
                 return ToolOutcome(f"LAB ERROR (switch_failed): {lab_id}: the switch FAILED and was "
                                    + ("reversed — the old version serves again" if out.get("reversed")
-                                      else "NOT reversed — check `lab status` of both labs now")
+                                      else f"NOT reversed — check `lab status lab_id={lab_id}` and `lab status "
+                                           f"lab_id={frm}` now (each shows whether that version serves)")
                                    + f": {str(out.get('error') or _probe_view(out.get('probe')))[:300]}",
                                    status=OutcomeStatus.FAILED, reason_code="lab_switch_failed", world_changed=True)
             return ToolOutcome(f"{lab_id} serves now (from {out.get('from_lab')}): {_app_view(out.get('app'))}; "
@@ -1173,6 +1497,46 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                        + f"{lab_id}: app {op} — {_app_view(out.get('app'))}; {_probe_view(out.get('probe'))}",
                        status=OutcomeStatus.OK if ok else OutcomeStatus.FAILED,
                        reason_code=None if ok else "lab_app_not_up", world_changed=True)
+
+
+def _no_expiry(context, lab_id: str) -> None:
+    from ..memory.lab_inventory import inventory_for
+    inv = inventory_for(context)
+    if inv is not None:
+        inv.set_expiry(lab_id, None)
+
+
+#: the longest a disposable lab can live on any labs host class (its `ttl.project.max_s`): the local record's hard
+#: expiry when the host does not say one (a host from before §4UD)
+LAB_HARD_MAX_S = 259200
+
+
+def _hard_expiry(d: Dict[str, Any]) -> Optional[float]:
+    """When the lab in a host answer ``d`` is gone AT THE LATEST (None = kept: no expiry). §4UD F10."""
+    if str(d.get("lifetime") or "") == "kept":
+        return None
+    try:
+        if d.get("max_expires_at"):
+            return float(d["max_expires_at"])
+        return float(d.get("created_at") or time.time()) + LAB_HARD_MAX_S
+    except (TypeError, ValueError):
+        return time.time() + LAB_HARD_MAX_S
+
+
+def ttl_arg(v) -> Tuple[Optional[int], str]:
+    """(seconds, error) of a ``ttl_idle_s`` argument. §4UD G3: junk became 0 here and the host then spoke of a
+    range — the refusal names the value given. None/"" = not given."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None, ""
+    try:
+        if isinstance(v, bool) or (isinstance(v, float) and v != int(v)):
+            raise ValueError
+        n = int(str(v).strip()) if isinstance(v, str) else int(v)
+    except (TypeError, ValueError):
+        return None, f"ttl_idle_s must be a whole number of seconds (like 7200), not {str(v)[:40]!r}"
+    if n < 1:
+        return None, f"ttl_idle_s must be at least 1 second, not {n}"
+    return n, ""
 
 
 def _truthy(v) -> bool:
@@ -1269,11 +1633,19 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
     if action == "exec":
         return await _exec(context, origin, owner, a)
 
+    if action == "cancel":
+        return await _cancel(context, origin, a)
+
+    if action == "screenshot":
+        return await _screenshot(context, origin, lab_id, a)
+
     if action == "put":
         src, err = _sandbox_path(context, a["sandbox_path"])
         if err:
             return ToolOutcome(f"LAB ERROR (bad_request): {err}", status=OutcomeStatus.REJECTED,
                                reason_code="lab_bad_request", world_changed=False)
+        if src.is_dir():
+            return await _put_tree(context, origin, lab_id, a, src)        # §4UD F-C: a folder
         try:
             # read through dir fds with O_NOFOLLOW (review 11-05 CRIT: a link swapped in after the path check made
             # `put` send a host file — e.g. the labs key — to a lab, where `lab exec cat` showed it)
@@ -1296,15 +1668,20 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
 
     if action == "get":
         dst, err = _sandbox_path(context, a["sandbox_path"], write=True)
-        if not err and dst.is_dir():
-            err = f"{shown_path(context, dst)} is a folder — name the file to write"
         if err:
             return ToolOutcome(f"LAB ERROR (bad_request): {err}", status=OutcomeStatus.REJECTED,
                                reason_code="lab_bad_request", world_changed=False)
         st, body = await _call(context, "GET", f"/v1/labs/{lab_id}/files", origin=origin, timeout=120,
                                params={"member": a["member"], "path": a["path"]})
+        if st == 400 and isinstance(body, dict) and body.get("kind") == "directory":
+            return await _get_tree(context, origin, lab_id, a, dst)        # §4UD F-C: the path is a folder
         if st != 200:
             return _service_reply(st, body, context, lab_id)
+        if dst.is_dir():
+            # (asked after the host's answer since §4UD F-C: a folder on the member goes INTO this folder)
+            return ToolOutcome(f"LAB ERROR (bad_request): {shown_path(context, dst)} is a folder and {a['path']} is "
+                               "a file — name the file to write; nothing was written",
+                               status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
         try:
             data = base64.b64decode(str(body.get("content_b64") or ""))
         except ValueError:
@@ -1315,10 +1692,10 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
             # every component opened O_NOFOLLOW from the workspace root (review 11-05 CRIT: the host call waits up
             # to 120 s between the path check and this write; a link planted in that window wrote lab bytes onto
             # the Mac). A planted link is replaced by the real file, never followed.
-            from .file_system import write_bytes_nofollow_rel
-            root = Path(context.sandbox_dir).resolve()
-            import asyncio as _aio
-            await _aio.to_thread(write_bytes_nofollow_rel, root, str(dst.relative_to(root)), data)   # off the loop
+            await _ws_write(context, dst, data)
+        except WriteRefused as e:
+            return ToolOutcome(f"LAB ERROR (bad_request): {e} — nothing was written", status=OutcomeStatus.REJECTED,
+                               reason_code="lab_bad_request", world_changed=False)
         except (OSError, ValueError) as e:
             return ToolOutcome(f"LAB ERROR (bad_request): could not write {shown_path(context, dst)} in the workspace "
                                f"({type(e).__name__}: {e})", status=OutcomeStatus.FAILED,
@@ -1345,7 +1722,9 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
                                params={"member": a["member"], "tail": _int(a["tail"], 200, 1, 2000)})
         if st != 200:
             return _service_reply(st, body, context, lab_id)
-        return ToolOutcome(f"[{lab_id}/{a['member']} logs]\n" + _cap(str(body.get("logs") or ""), "logs"),
+        return ToolOutcome(f"[{lab_id}/{a['member']} logs]\n" + _cap(str(body.get("logs") or ""), "logs")
+                           + ("\n[the labs host kept only the end of a very large log — `lab exec` with tail/grep "
+                              "reads the rest on the member]" if body.get("truncated") else ""),
                            status=OutcomeStatus.OK, world_changed=False)
 
     if action == "http":
@@ -1356,22 +1735,31 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
             return _service_reply(st, body, context, lab_id)
         if body.get("status") is None:
             return ToolOutcome(f"[{lab_id}/{body.get('member')}:{body.get('port')}{body.get('path')}] "
-                               f"no answer yet: {body.get('error')}", status=OutcomeStatus.FAILED,
-                               reason_code="lab_http_no_answer", world_changed=True)   # a booting app: in flux
+                               f"no answer yet: {body.get('error')}" + http_no_answer_hint(body),
+                               status=OutcomeStatus.FAILED, reason_code="lab_http_no_answer",
+                               # a booting app is IN FLUX (a repeat may answer). A listener bound to loopback is
+                               # not: the same call fails the same way until the command changes (§4UD r2)
+                               world_changed=not body.get("loopback_only"))
         return ToolOutcome(f"[{lab_id}/{body.get('member')}:{body.get('port')}{body.get('path')}] "
-                           f"HTTP {body.get('status')}\n" + _cap(str(body.get("body_head") or ""), "body"),
+                           f"HTTP {body.get('status')}\n" + _cap(str(body.get("body_head") or ""), "body")
+                           + (f"\n[the answer was cut after {body.get('deadline_s') or 15:g} s — a stream or a slow "
+                              "page: this is what had arrived]" if body.get("truncated") else ""),
                            status=OutcomeStatus.OK, world_changed=False)
 
     if action == "extend":
         if a["ttl_idle_s"] in (None, ""):
             return ToolOutcome("LAB ERROR (bad_request): extend needs ttl_idle_s (seconds)",
                                status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
+        _ttl, _terr = ttl_arg(a["ttl_idle_s"])
+        if _terr:
+            return ToolOutcome(f"LAB ERROR (bad_request): {_terr}", status=OutcomeStatus.REJECTED,
+                               reason_code="lab_bad_request", world_changed=False)
         st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/extend", origin=origin,
-                               json_body={"ttl_idle_s": _int(a["ttl_idle_s"], 0, 1, 10 ** 9)})
+                               json_body={"ttl_idle_s": _ttl})
         if st != 200:
             return _service_reply(st, body, context, lab_id)
         return ToolOutcome(f"{lab_id}: extended — now expires {_when(body.get('expires_at'))}"
-                           + (f" (capped at {body['clamped_to_s']} s)" if body.get("clamped_to_s") else ""),
+                           + _clamp_note(body),
                            status=OutcomeStatus.OK, world_changed=True)
 
     if action == "destroy":
@@ -1438,29 +1826,13 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
                 return ToolOutcome(f"LAB ERROR (not_allowed): {lab_id} is KEPT (production): "
                                    f"{_kept_refusal(origin, context)}.", status=OutcomeStatus.REJECTED,
                                    reason_code="lab_not_allowed", world_changed=False)
-            params["include_kept"] = "1"
-            lineage = str(d.get("lineage") or "")
-            try:
-                st_all, b_all = await _call(context, "GET", "/v1/labs", origin=origin)
-                others = ([str(x.get("lab_id")) for x in (b_all.get("labs") or []) if isinstance(x, dict)
-                           and str(x.get("lab_id")) != lab_id and str(x.get("lifetime") or "") == "kept"
-                           and lineage and str(x.get("lineage") or "") == lineage]
-                          if st_all == 200 and isinstance(b_all, dict) else None)
-            except (LabsUnreachable, LabsNoAnswer):
-                others = None
-            if others == []:
-                params["drop_data"] = "1"
-            else:
-                data_note = (" Its data volume is KEPT: " + (f"{', '.join(others)} of the same app share it."
-                                                             if others else "could not check for other versions."))
+            params, data_note = await kept_destroy_params(context, origin, lab_id, str(d.get("lineage") or ""))
         st, body = await _call(context, "DELETE", f"/v1/labs/{lab_id}", origin=origin, params=params or None,
                                timeout=120)
         if st != 200:
             return _service_reply(st, body, context, lab_id)
         if params.get("drop_data") and isinstance(body, dict):
-            gone = body.get("data_volumes_removed") or []
-            data_note = (f" Its data went with it ({len(gone)} volume(s); final backup {body.get('final_backup')})."
-                         if gone else f" Its data was KEPT ({body.get('note') or 'no data volume was removed'}).")
+            data_note = " " + kept_data_note(body)
         from ..memory.lab_inventory import inventory_for
         inv = inventory_for(context)
         left = body.get("leftovers") if isinstance(body, dict) else None
@@ -1494,6 +1866,43 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
     raise AssertionError(action)
 
 
+def members_not_ready(d: Dict[str, Any]) -> str:
+    """The lines a create adds for members whose readiness check had not passed when the host's wait ended
+    ('' = none, or a host that sends no per-member ``ready``)."""
+    out = []
+    for m in (d.get("members") or []) if isinstance(d, dict) else []:
+        # three cases: true = ready; false = its check RAN and failed; null (the key is there, the value is not) =
+        # its check never ran before the host's wait ended. A member with no `ready` key declares no check.
+        if isinstance(m, dict) and "ready" in m and m.get("ready") is not True:
+            cmd = str(m.get("ready_cmd") or "").strip()
+            out.append((f"Member {m.get('name')} is NOT READY yet: its service did not accept work when the labs "
+                        "host checked it." if m.get("ready") is False else
+                        f"Member {m.get('name')} was NOT CHECKED: the labs host's wait ended before its readiness "
+                        "check ran, so whether it accepts work is not known.") + " Before using it, look once"
+                       + (f" with `lab exec lab_id={d.get('lab_id')} member={m.get('name')} cmd=\"{cmd}\"` (exit 0 = "
+                          "ready)" if cmd else f" at `lab logs lab_id={d.get('lab_id')} member={m.get('name')}`")
+                       + "; a command sent now may fail to connect.")
+    return "\n".join(out)
+
+
+def _clamp_note(body: Dict[str, Any]) -> str:
+    """What create and extend say when the host cut the idle TTL to the lab's maximum (one wording, §4UD G3)."""
+    c = body.get("clamped_to_s") if isinstance(body, dict) else None
+    return f" (the idle TTL asked for is above this lab's maximum: capped at {c} s)" if c else ""
+
+
+def http_no_answer_hint(body: Dict[str, Any]) -> str:
+    """The line under a "no answer yet" (§4UD G3). The host says ``loopback_only`` when something inside the member
+    accepts on 127.0.0.1:<port> while the member's lab address refuses."""
+    port = body.get("port")
+    if body.get("loopback_only"):
+        return (f"\nA process inside the member DOES listen on 127.0.0.1:{port}, but not on the member's lab address "
+                f"— it is bound to loopback only. Start it on 0.0.0.0:{port} (flask: `--host 0.0.0.0`; gunicorn: "
+                f"`-b 0.0.0.0:{port}`); waiting will not change this.")
+    return (f"\nIf it is still starting, look ONCE more after reading its output (`lab logs` / `run logs`). A server "
+            f"must listen on 0.0.0.0:{port} — one bound to 127.0.0.1 never answers here.")
+
+
 #: inventory marks the tool itself wrote after reporting the row once
 _QUIET_DESTROYERS = frozenset({"expired", "host_changed"})
 #: a lab destroyed by ANOTHER owner key is named in lists for this long
@@ -1525,6 +1934,58 @@ async def _settle_unlisted(context, origin: str, inv, r) -> str:
         inv.record_destroy(lid, by="expired")
         return f"{lid} ({tpl}) — gone from the labs host (expired or removed)"
     return f"{lid} ({tpl}) — left out of the list; the labs host answered HTTP {st} about it (not retired)"
+
+
+async def kept_destroy_params(context, origin: str, lab_id: str, lineage: str,
+                              gone: Any = ()) -> Tuple[Dict[str, str], str]:
+    """(query params, note) for the DELETE of a KEPT lab — the ONE place that decides about its data (§4UD F13; it
+    was written twice, here and in project teardown, and both decided from a list read BEFORE the delete, so a
+    keep landing in between lost the shared volume).
+
+    The HOST decides: it is asked to drop the data (``drop_data=1``) and keeps the volumes itself, under its app
+    lock, while another kept version of the app exists; its answer says what it did (`kept_data_note`). That holds
+    for a host that names ``drop_data_guard`` in /v1/health. A host from before that removes the volumes whatever
+    else exists, so for it — and when /v1/health does not answer — the old check stays: drop_data only when the
+    host's list shows no other kept lab of the lineage (``gone``: labs this caller already destroyed in the same
+    pass — a project teardown — which no longer hold the lineage, whatever a list says)."""
+    _gone = {str(g) for g in (gone or ())}
+    params = {"include_kept": "1"}
+    if "drop_data_guard" in await host_features(context, origin):
+        params["drop_data"] = "1"
+        return params, ""
+    try:
+        st_all, b_all = await _call(context, "GET", "/v1/labs", origin=origin)
+        others = ([str(x.get("lab_id")) for x in (b_all.get("labs") or []) if isinstance(x, dict)
+                   and str(x.get("lab_id")) != lab_id and str(x.get("lifetime") or "") == "kept"
+                   and str(x.get("lab_id")) not in _gone
+                   and lineage and str(x.get("lineage") or "") == lineage]
+                  if st_all == 200 and isinstance(b_all, dict) else None)
+    except (LabsUnreachable, LabsNoAnswer):
+        others = None
+    if others == []:
+        params["drop_data"] = "1"
+        return params, ""
+    return params, (" Its data volume is KEPT: " + (f"{', '.join(others)} of the same app share it."
+                                                    if others else "could not check for other versions."))
+
+
+def kept_data_note(body: Dict[str, Any]) -> str:
+    """What the host did with a kept lab's data, from its DELETE answer."""
+    gone = body.get("data_volumes_removed") or []
+    if gone:
+        return f"Its data went with it ({len(gone)} volume(s); final backup {body.get('final_backup')})."
+    return f"Its data was KEPT ({body.get('note') or 'no data volume was removed'})."
+
+
+async def host_features(context, origin: str) -> frozenset:
+    """What the configured labs host says it does by itself (/v1/health ``features``); empty for a host from
+    before the field, or when it does not answer. Asked each time: the host can be replaced under a running agent."""
+    try:
+        hs, h = await _call(context, "GET", "/v1/health", origin=origin, timeout=10)
+    except (LabsUnreachable, LabsNoAnswer):
+        return frozenset()
+    f = h.get("features") if hs == 200 and isinstance(h, dict) else None
+    return frozenset(str(x) for x in f) if isinstance(f, (list, tuple)) else frozenset()
 
 
 async def lab_on_other_host(context, lab_id: str, origin: str = "autopilot") -> str:
@@ -1587,8 +2048,12 @@ async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
                            status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
     body: Dict[str, Any] = {"template": template, "params": params or {}, "label": a["label"] or "",
                             "purpose": a["purpose"] or "", "owner": owner, "wait": False}
-    if a["ttl_idle_s"] is not None:
-        body["ttl_idle_s"] = _int(a["ttl_idle_s"], 0, 1, 10 ** 9)
+    _ttl, _terr = ttl_arg(a["ttl_idle_s"])
+    if _terr:
+        return ToolOutcome(f"LAB ERROR (bad_request): {_terr}", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_bad_request", world_changed=False)
+    if _ttl is not None:
+        body["ttl_idle_s"] = _ttl
     from ..core.lab_waits import LEAF_ID as _LEAF
     _tag = leaf_tag(_LEAF.get()) if origin == "autopilot" else ""
     if _tag:
@@ -1611,13 +2076,15 @@ async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
     if st not in (200, 201):
         return _service_reply(st, d)
     lab_id = str(d.get("lab_id") or "")
+    _first = d                                   # the create's own answer (the readiness polls replace `d`)
     host_id = await _host_id(context, origin)
     from ..memory.lab_inventory import inventory_for
     inv = inventory_for(context)
     if inv is not None:
         from ..core.lab_waits import LEAF_ID
         inv.record_create(lab_id, owner=owner, origin=origin, template=template, label=a["label"] or "",
-                          purpose=a["purpose"] or "", host_id=host_id, leaf=LEAF_ID.get())
+                          purpose=a["purpose"] or "", host_id=host_id, leaf=LEAF_ID.get(),
+                          expires_hard=_hard_expiry(d))
         for e in (d.get("evicted") or []):
             # review 11-05 P-m5: an evicted (autopilot) lab is destroyed — its row says so, and by whom
             eid = str(e.get("lab_id") if isinstance(e, dict) else e or "")
@@ -1661,14 +2128,406 @@ async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
                                   f" The labs host did not say what is left of it — `lab destroy {lab_id}` asks again."),
                                status=OutcomeStatus.FAILED, reason_code="lab_create_failed", world_changed=True)
     state = str(d.get("state"))
-    text = _render_lab(d)
+    text = _render_lab(d) + (("\n " + _clamp_note(_first).strip()) if _clamp_note(_first) else "")
     if state == "creating":
         text += "\nStill starting — check with `lab status` before using it (the turn's time is limited)."
         return ToolOutcome(text, status=OutcomeStatus.PARTIAL, world_changed=True)
     if state != "ready":
         return ToolOutcome(text + f"\nThe lab is {state}: read `lab logs` for a member, then destroy it.",
                            status=OutcomeStatus.FAILED, reason_code="lab_not_ready", world_changed=True)
+    late = members_not_ready(d)
+    if late:
+        # §4UD F-A: the lab is up, but a member's own service did not accept work when the host's wait ended (the
+        # first `psql` right after a create failed on the socket). Said plainly, with the member's own check to run
+        # — ONE look, no polling here.
+        return ToolOutcome(text + "\n" + late, status=OutcomeStatus.PARTIAL, reason_code="lab_member_not_ready",
+                           world_changed=True)
     return ToolOutcome(text, status=OutcomeStatus.OK, world_changed=True)
+
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+#: the labs host refuses a bigger picture itself
+SHOT_MAX_BYTES = 2 * 1024 * 1024
+
+
+async def _screenshot(context, origin: str, lab_id: str, a: Dict[str, Any]) -> ToolOutcome:
+    """`lab screenshot lab_id member [port] [path] sandbox_path=<file>.png` (§4UD F-D): the labs host renders the
+    member's page in a headless browser on the lab network; the PNG is saved into the workspace by the write path
+    of `lab get`, and the result names the file. The model has NOT seen the picture: the result says to look at it
+    with the vision tool, as every other tool that makes an image does.
+
+        state                                         | answer
+        the page rendered                             | OK: the workspace path, bytes, the page's HTTP status
+        the page did not answer the host's probe      | OK, and it says so: the picture shows the browser's error page
+        sandbox_path missing / a folder / not *.png   | REJECTED before any host call
+        outside the workspace, a released project,
+          an unattended build outside its project     | REJECTED by `_sandbox_path` (as `get`)
+        the answer is not a PNG, or over 2 MB         | FAILED, nothing written
+        a redirect, a bad path, busy, unknown lab     | the host's refusal (`_service_reply`)
+        a KEPT lab, unattended work                   | REJECTED before any host call (status only)
+        the write fails                               | FAILED, says why"""
+    dst, err = _sandbox_path(context, a["sandbox_path"], write=True)
+    if not err and dst.is_dir():
+        err = f"{shown_path(context, dst)} is a folder — name the .png file to write"
+    if not err and dst.suffix.lower() != ".png":
+        err = f"sandbox_path must be a .png file (the screenshot is a PNG), not {dst.name!r}"
+    if err:
+        return ToolOutcome(f"LAB ERROR (bad_request): {err}", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_bad_request", world_changed=False)
+    port = _int(a["port"], 80, 1, 65535)
+    st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/screenshot", origin=origin, timeout=120,
+                           json_body={"member": a["member"], "port": port, "path": a["path"] or "/"})
+    if st != 200:
+        return _service_reply(st, body, context, lab_id)
+    body = body if isinstance(body, dict) else {}
+    try:
+        png = base64.b64decode(str(body.get("png_b64") or ""), validate=True)
+    except ValueError:
+        png = b""
+    if not png.startswith(_PNG_MAGIC) or len(png) > SHOT_MAX_BYTES:
+        return ToolOutcome("LAB ERROR (internal): the labs host sent no usable picture "
+                           f"({len(png)} bytes, {'a PNG' if png.startswith(_PNG_MAGIC) else 'not a PNG'}) — nothing "
+                           "was written.", status=OutcomeStatus.FAILED, reason_code="lab_internal", world_changed=False)
+    existed = os.path.lexists(dst)
+    try:
+        await _ws_write(context, dst, png)
+    except WriteRefused as e:
+        return ToolOutcome(f"LAB ERROR (bad_request): {e} — nothing was written", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_bad_request", world_changed=False)
+    except (OSError, ValueError) as e:
+        return ToolOutcome(f"LAB ERROR (bad_request): could not write {shown_path(context, dst)} in the workspace "
+                           f"({type(e).__name__}: {e})", status=OutcomeStatus.FAILED,
+                           reason_code="lab_bad_request", world_changed=False)
+    shown = shown_path(context, dst)
+    page = body.get("status")
+    return ToolOutcome(
+        f"[{lab_id}/{a['member']}:{port}{a['path'] or '/'}] screenshot → {shown} ({len(png)} bytes"
+        + (", REPLACED the file that was there" if existed else "") + "; "
+        + (f"the page answered HTTP {page}" if page is not None else
+           "the page did NOT answer the labs host's own request — the picture is most likely the browser's error page")
+        + f").\nYou have NOT seen this picture. To say what it shows, look at it first: vision_analysis "
+          f"action=describe_picture target=\"{shown}\" (or verify_ui with one question).",
+        status=OutcomeStatus.OK, world_changed=True)
+
+
+#: §4UD F-C: the most files one folder `put`/`get` moves (the labs host's own TREE_MAX_ENTRIES)
+TREE_MAX_ENTRIES = 2000
+_NO_TREE = ("this labs host moves single files only (an older build) — pack the folder yourself (`tar czf` in the "
+            "workspace, `lab put` the archive, `lab exec … tar xzf`), or the reverse for a get")
+
+
+async def _put_tree(context, origin: str, lab_id: str, a: Dict[str, Any], src: Path) -> ToolOutcome:
+    """`lab put` of a workspace FOLDER (§4UD F-C): packed by `tar_folder` — the deploy walk: dir fds, no symlink
+    followed, links/devices/fifos skipped and named, `.env*` and DEPLOY_EXCLUDE never sent — and unpacked by the
+    host under ``path``, which checks every entry again.
+
+        the workspace folder                       | answer
+        regular files and directories              | sent; the result counts the files
+        contains links, devices, fifos             | those are skipped and named; the rest is sent
+        `.env*`, .git, node_modules, caches        | never sent (the deploy rule)
+        over 20 MB, or more than 2000 files+folders | REJECTED, nothing sent
+        an unattended build, a folder outside its
+          project / a released project             | REJECTED by `_sandbox_path`, as for a file
+        a KEPT lab                                 | the owner only (the host's rule for put; unattended work is
+                                                   |   refused before any call)
+        an older labs host (no /tree)              | REJECTED: how to do it with one archive file"""
+    try:
+        data, skipped, err = await asyncio.to_thread(tar_folder, src, Path(context.sandbox_dir).resolve(),
+                                                     TREE_MAX_ENTRIES, True)
+    except OSError as e:
+        return ToolOutcome(f"LAB ERROR (bad_request): {shown_path(context, src)} could not be read "
+                           f"({type(e).__name__}: {e}) — try again", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_bad_request", world_changed=False)
+    if err:
+        return ToolOutcome(f"LAB ERROR (bad_request): {shown_path(context, src)}: {err} — nothing was sent",
+                           status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
+    st, body = await _call(context, "PUT", f"/v1/labs/{lab_id}/tree", origin=origin, timeout=180,
+                           json_body={"member": a["member"], "path": a["path"],
+                                      "archive_b64": base64.b64encode(data).decode()})
+    body = body if isinstance(body, dict) else {}
+    if st == 404 and "error" not in body:
+        return ToolOutcome(f"LAB ERROR (not_supported): {_NO_TREE}.", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_not_supported", world_changed=False)
+    if st != 200:
+        return _service_reply(st, body, context, lab_id)
+    return ToolOutcome(f"[{lab_id}/{a['member']}] put folder {shown_path(context, src)}/ → {a['path']}/ "
+                       f"({body.get('entries')} entries, {body.get('bytes')} bytes)"
+                       + (f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else "")
+                       + ". Not sent, by rule: .env*, .git, node_modules, virtualenvs, caches.",
+                       status=OutcomeStatus.OK, world_changed=True)
+
+
+def tar_bytes_bounded(data: bytes, limit: int) -> bytes:
+    """The archive as plain tar bytes, DECOMPRESSED under a byte bound (§4UD part-2 review m8): the size checks of the
+    entries read tar HEADERS, and `tarfile` inflates whatever precedes them — 300 KB of gzip unpacked 300 MB before
+    the first check. At most ``limit`` + 1 bytes are ever produced here. ValueError when it is more, or unreadable."""
+    import zlib
+    if data[:2] != b"\x1f\x8b":
+        if len(data) > limit:
+            raise ValueError(f"the archive is over {limit} bytes")
+        return data
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(data, limit + 1)
+    except zlib.error as e:
+        raise ValueError(f"the archive cannot be unpacked ({e})") from e
+    if len(out) > limit or d.unconsumed_tail:
+        raise ValueError(f"the archive unpacks to more than {limit} bytes")
+    if not d.eof or d.unused_data.strip(b"\0"):
+        # part-2 r2 N3: a gzip cut short gave the files before the cut with no error, and only the first of
+        # several gzip streams was read — both are refused here (zero padding after the stream is accepted)
+        raise ValueError("the archive is cut short or holds more than one gzip stream")
+    return out
+
+
+def _tree_limit() -> int:
+    """Plain tar bytes a folder may come to: its files (DEPLOY_MAX_BYTES) plus a header and padding per entry."""
+    return DEPLOY_MAX_BYTES + 2048 * (TREE_MAX_ENTRIES + 2)
+
+
+def tree_entries(data: bytes) -> Tuple[List[Tuple[str, bytes]], List[str], str]:
+    """([(relative path, bytes)], [empty-or-not directory paths], error) of a folder archive from a lab, checked
+    BEFORE anything is written — the archive is lab content, and this is the agent's own wall (the labs host filters
+    its answer too). One bad entry refuses the whole archive:
+
+    * a name that is absolute, has `..`, a NUL or a backslash, or is empty;
+    * anything but a regular file or a directory (symlink, HARD link, device, fifo);
+    * two entries whose names are the same after NFKC + case folding (the workspace disk is case-insensitive:
+      `A` and `a` are one file), or a file that is also the folder of another entry (`x` and `x/evil`);
+    * more than TREE_MAX_ENTRIES entries, or files over DEPLOY_MAX_BYTES together."""
+    import io
+    import tarfile
+    from pathlib import PurePosixPath
+    from .file_system import _fold
+    files: List[Tuple[str, bytes]] = []
+    dirs: List[str] = []
+    kinds: Dict[str, str] = {}             # folded path -> "file" | "dir"
+    spelled: Dict[str, str] = {}           # folded path (and every folder above it) -> the spelling first seen
+    total = n = 0
+    try:
+        plain = tar_bytes_bounded(data, _tree_limit())
+        with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
+            for ti in tar:
+                n += 1
+                if n > TREE_MAX_ENTRIES:
+                    return [], [], f"the folder has more than {TREE_MAX_ENTRIES} entries"
+                raw = str(ti.name or "")
+                parts = [p for p in PurePosixPath(raw).parts if p not in (".", "")]
+                if raw.startswith("/") or "\x00" in raw or "\\" in raw or not parts or ".." in parts:
+                    return [], [], f"entry {_q(raw)} is not a relative path inside the folder"
+                if not (ti.isdir() or ti.isfile()):
+                    return [], [], f"entry {_q(raw)} is a link or a device"
+                rel = "/".join(parts)
+                key = "/".join(_fold(p) for p in parts)
+                kind = "dir" if ti.isdir() else "file"
+                for i in range(1, len(parts) + 1):                   # one spelling per folded path, folders too
+                    _pk, _sp = "/".join(_fold(p) for p in parts[:i]), "/".join(parts[:i])
+                    if spelled.setdefault(_pk, _sp) != _sp:
+                        return [], [], (f"entry {_q(raw)} and {_q(spelled[_pk])} differ only by case or Unicode form "
+                                        "— they are ONE path in the workspace")
+                if kinds.get(key) == "file" or (kind == "file" and key in kinds):
+                    return [], [], f"entry {_q(raw)} is listed twice in the archive"
+                for i in range(1, len(parts)):                       # no entry may sit UNDER a file of the archive
+                    if kinds.get("/".join(_fold(p) for p in parts[:i])) == "file":
+                        return [], [], f"entry {_q(raw)} is inside {_q('/'.join(parts[:i]))}, which the archive also has as a file"
+                if kind == "file" and any(k.startswith(key + "/") for k in kinds):
+                    return [], [], f"entry {_q(raw)} is a file, and the archive also has entries inside it"
+                kinds[key] = kind
+                if kind == "dir":
+                    dirs.append(rel)
+                    continue
+                total += int(ti.size)
+                if total > DEPLOY_MAX_BYTES:
+                    return [], [], f"the folder is over {DEPLOY_MAX_BYTES // (1024 * 1024)} MB"
+                files.append((rel, tar.extractfile(ti).read()))
+    except (tarfile.TarError, OSError, EOFError, ValueError) as e:
+        return [], [], f"the labs host sent an archive that cannot be used ({type(e).__name__}: {str(e)[:120]})"
+    return files, dirs, ""
+
+
+def _tree_place_refusal(context, dst: Path, rel: str, is_dir: bool) -> str:
+    """Why the entry ``rel`` of a folder `get` may not land under ``dst`` ('' = it may): `write_refusal` of its FINAL
+    path, and nothing in the way — a workspace FILE (or a link) where one of its folders must be is never removed to
+    make room, and a folder where the file goes is not replaced."""
+    final = dst.joinpath(*rel.split("/"))
+    why = write_refusal(context, final)
+    if why:
+        return why
+    walk = dst
+    for part in rel.split("/")[:-1]:
+        walk = walk / part
+        if os.path.lexists(walk) and (walk.is_symlink() or not walk.is_dir()):
+            return (f"{_q(shown_path(context, walk), 200)} is a file (or a link) in the workspace and the folder needs a "
+                    "directory there — it is not replaced; move it away or name another folder")
+    if os.path.lexists(final):
+        if final.is_symlink() and is_dir:
+            return f"{_q(shown_path(context, final), 200)} is a link in the workspace — a folder is not put through it"
+        if not is_dir and final.is_dir() and not final.is_symlink():
+            return f"{_q(shown_path(context, final), 200)} is a folder in the workspace and the lab's entry is a file"
+        if is_dir and not final.is_dir():
+            return f"{_q(shown_path(context, final), 200)} is a file in the workspace and the lab's entry is a folder"
+    return ""
+
+
+async def _get_tree(context, origin: str, lab_id: str, a: Dict[str, Any], dst: Path) -> ToolOutcome:
+    """`lab get` of a member's FOLDER into the workspace folder ``sandbox_path`` (§4UD F-C).
+
+        the member's folder / the archive          | answer
+        regular files and directories              | every file written and every (empty) folder made under
+                                                   |   sandbox_path; the result counts what is on disk
+        links, devices, fifos, odd names on the
+          member                                   | left out by the host and named (quoted) in the result
+        an entry with an absolute name, `..`, a
+          backslash, a link/device, a name that
+          collides with another after case folding,
+          or a file that another entry sits under  | REJECTED, NOTHING written (`tree_entries`)
+        an entry whose final path may not be
+          written (released project, `.git`, outside
+          a build's project) or that needs a
+          workspace file/link moved out of its way | REJECTED, NOTHING written — every entry is checked first
+        over 20 MB or 2000 entries (unpacked bytes
+          are bounded before the archive is read)  | REJECTED (host and agent)
+        sandbox_path is an existing FILE           | REJECTED before the folder is fetched
+        a write that fails part-way                | FAILED: how many were written, which one failed
+        a KEPT lab                                 | the owner only; unattended work is refused before any call
+        an older labs host                         | never reaches here (it answers a plain "not a regular file")"""
+    if os.path.lexists(dst) and (dst.is_symlink() or not dst.is_dir()):
+        return ToolOutcome(f"LAB ERROR (bad_request): {a['path']} is a folder and {shown_path(context, dst)} is a "
+                           "file — name a folder to put it in; nothing was written", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_bad_request", world_changed=False)
+    st, body = await _call(context, "GET", f"/v1/labs/{lab_id}/tree", origin=origin, timeout=180,
+                           params={"member": a["member"], "path": a["path"]})
+    body = body if isinstance(body, dict) else {}
+    if st == 404 and "error" not in body:
+        return ToolOutcome(f"LAB ERROR (not_supported): {_NO_TREE}.", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_not_supported", world_changed=False)
+    if st != 200:
+        return _service_reply(st, body, context, lab_id)
+    try:
+        data = base64.b64decode(str(body.get("archive_b64") or ""), validate=True)
+    except ValueError:
+        data = b""
+
+    def unpack_and_check():
+        # off the event loop (part-2 r2 N5: 0.7 s for 1950 entries ran on it); the request's context goes along
+        fs, ds, bad = tree_entries(data) if data else ([], [], "the labs host sent no archive")
+        if bad:
+            return fs, ds, bad, ""
+        # EVERY entry's own final path, before the first write (M1): one hit refuses the whole archive
+        for rel, is_dir in [(d, True) for d in ds] + [(f, False) for f, _ in fs]:
+            why = _tree_place_refusal(context, dst, rel, is_dir)
+            if why:
+                return fs, ds, "", f"entry {_q(rel)}: {why}"
+        return fs, ds, "", write_refusal(context, dst)
+
+    files, dirs, err, refused = await asyncio.to_thread(unpack_and_check)
+    if refused:
+        return ToolOutcome(f"LAB ERROR (bad_request): {refused} — nothing of the folder was written.",
+                           status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
+    if err:
+        return ToolOutcome(f"LAB ERROR (bad_archive): {err} — nothing was written to the workspace.",
+                           status=OutcomeStatus.FAILED, reason_code="lab_bad_archive", world_changed=False)
+    done = 0
+    try:
+        _ws_mkdir(context, dst)
+        for rel in dirs:
+            _ws_mkdir(context, dst.joinpath(*rel.split("/")))
+    except (WriteRefused, OSError, ValueError) as e:
+        return ToolOutcome(f"LAB ERROR (write_failed): could not make a folder under {shown_path(context, dst)} "
+                           f"({type(e).__name__}: {e}) — no file was written.", status=OutcomeStatus.FAILED,
+                           reason_code="lab_write_failed", world_changed=None)
+    for rel, blob in files:
+        try:
+            await _ws_write(context, dst.joinpath(*rel.split("/")), blob)
+            done += 1
+        except (WriteRefused, OSError, ValueError) as e:
+            return ToolOutcome(f"LAB ERROR (write_failed): wrote {done} of {len(files)} file(s) under "
+                               f"{shown_path(context, dst)}, then could not write {_q(rel)} ({type(e).__name__}: {e}).",
+                               status=OutcomeStatus.FAILED, reason_code="lab_write_failed", world_changed=True)
+    skipped = [str(x) for x in (body.get("skipped") or [])]
+    more = body.get("skipped_total")
+    return ToolOutcome(f"[{lab_id}/{a['member']}] got folder {a['path']}/ → {shown_path(context, dst)}/ "
+                       f"({done} file(s), {len(dirs)} folder(s), {sum(len(b) for _, b in files)} bytes; files of the "
+                       "same name were replaced)"
+                       + (f". Left out by the labs host (links, devices, odd names): {', '.join(_q(x) for x in skipped[:10])}"
+                          + (f" … {more} in all" if isinstance(more, int) and more > 10 else "") if skipped else ""),
+                       status=OutcomeStatus.OK, world_changed=True)
+
+
+def _exec_tag(origin: str) -> str:
+    """The tag an unattended build's foreground command carries on the labs host: the leaf's own (`leaf_tag`), so
+    that leaf — and no other unattended caller — may cancel it. '' for the owner (who may cancel anything on the
+    lab) and for unattended work outside a leaf (which may cancel nothing): only a leaf's turn has a leaf id."""
+    try:
+        from ..core.lab_waits import LEAF_ID
+        return leaf_tag(LEAF_ID.get())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+#: what the labs host says became of a command it was asked to end → the words for it ('' = a host from before the
+#: field, or no confirmation in time: never "killed" on a guess)
+_CANCEL_OUTCOME = {"killed": "killed",
+                   "ended": "it had already ended by itself",
+                   "not_killed": "NOT killed: the kill could not be delivered (a paused or broken member?) — it may "
+                                 "still be running; `lab member op=restart` ends everything on that member",
+                   "": "asked to end; not confirmed yet"}
+#: every head the exec path writes after `[<lab>/<member> ` — core/strikes._LAB_EXEC_HEAD_RE must know each one (a
+#: head it does not know turns a stored exec result into prose: §4UD part-2 review M3, CANCELLED was missing there)
+EXEC_HEADS = ("exit=", "TIMED OUT", "no exit code", "CANCELLED")
+
+
+async def _cancel(context, origin: str, a: Dict[str, Any]) -> ToolOutcome:
+    """`lab cancel lab_id=… [member=…]` (§4UD F-B): end the foreground command(s) running on the lab.
+
+        caller                         | lab                    | answer
+        owner                          | any it may touch       | every running command (of `member`, if given) ends
+        the leaf that started it       | its project's, not kept| its own commands end (the host matches the leaf's tag)
+        another leaf / other unattended| —                      | REJECTED (here when it has no leaf; else the host's 403)
+        unattended                     | KEPT                   | REJECTED before any host call (`_autopilot_owner_refusal`)
+        a probe                        | a probe's lab          | the probe's own commands
+        anyone                         | nothing is running     | OK, "nothing is running", nothing changed
+        anyone                         | an older labs host     | REJECTED: that host has no cancel
+    """
+    lab_id, member = a["lab_id"], str(a["member"] or "").strip()
+    if member and not _MEMBER_RE.match(member):
+        return ToolOutcome("LAB ERROR (bad_request): member is a member name like `db` (or leave it out to cancel "
+                           "every command running on the lab)", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_bad_request", world_changed=False)
+    tag = _exec_tag(origin)
+    if origin == "autopilot" and not tag:
+        return ToolOutcome("LAB ERROR (not_allowed): unattended work cancels only a command its own build started — "
+                           "this request is not a build.", status=OutcomeStatus.REJECTED,
+                           reason_code="lab_not_allowed", world_changed=False)
+    body: Dict[str, Any] = {}
+    if member:
+        body["member"] = member
+    if tag:
+        body["tag"] = tag
+    st, r = await _call(context, "POST", f"/v1/labs/{lab_id}/exec/cancel", origin=origin, json_body=body, timeout=30)
+    r = r if isinstance(r, dict) else {}
+    if st == 404 and "error" not in r:
+        return ToolOutcome("LAB ERROR (not_supported): this labs host has no `cancel` (an older build) — the "
+                           "command ends at its own timeout, or with `lab member op=restart` / `lab destroy`.",
+                           status=OutcomeStatus.REJECTED, reason_code="lab_not_supported", world_changed=False)
+    if st != 200:
+        return _service_reply(st, r, context, lab_id)
+    done = [x for x in (r.get("cancelled") or []) if isinstance(x, dict)]
+    where = f"{lab_id}" + (f"/{member}" if member else "")
+    if not done:
+        return ToolOutcome(f"[{where}] nothing is running — no foreground command to cancel (a `run` job or server "
+                           "is stopped with `run stop`).", status=OutcomeStatus.OK, world_changed=False)
+    pretty_log("Lab Exec", f"{where} cancel of {len(done)} command(s) by {origin}", icon=Icons.LAB_EXEC)
+    lines = [f"- {x.get('member')}: {_q(x.get('cmd') or '', 120)} (ran {x.get('running_s')} s) — "
+             + _CANCEL_OUTCOME.get(str(x.get("outcome") or ""), _CANCEL_OUTCOME[""]) for x in done]
+    killed = sum(1 for x in done if x.get("outcome") == "killed")
+    stuck = [x for x in done if x.get("outcome") == "not_killed"]
+    head = (f"[{where}] asked {len(done)} running command(s) to end: {killed} confirmed killed (whole process group)"
+            + (f", {len(stuck)} could NOT be killed and may still run" if stuck else "") + ".")
+    return ToolOutcome(head + " A killed command's own `lab exec` call answers CANCELLED; what it had done by then "
+                       "stays done.\n" + "\n".join(lines),
+                       status=OutcomeStatus.FAILED if stuck and not killed else OutcomeStatus.OK,
+                       reason_code="lab_cancel_not_killed" if stuck and not killed else None, world_changed=True)
 
 
 async def _exec(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
@@ -1688,6 +2547,9 @@ async def _exec(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
         if room < want:
             want, clamped = room, f" (timeout cut to {room} s: the turn's remaining time)"
     body: Dict[str, Any] = {"member": member, "cmd": cmd, "timeout_s": want}
+    _tag = _exec_tag(origin)
+    if _tag:
+        body["tag"] = _tag                      # §4UD F-B: who may `lab cancel` it besides the owner
     if a["workdir"]:
         body["workdir"] = str(a["workdir"])
     if a["stdin"] is not None:
@@ -1705,16 +2567,29 @@ async def _exec(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
     trunc = " (the labs host also cut this stream)"
     body_txt = (("STDOUT:\n" + _cap(out, "stdout") + (trunc if r.get("stdout_truncated") else "") + "\n") if out else "") \
         + (("STDERR:\n" + _cap(err, "stderr") + (trunc if r.get("stderr_truncated") else "") + "\n") if err else "")
-    if r.get("timed_out"):
-        return ToolOutcome(f"[{lab_id}/{member} TIMED OUT after {want} s]{clamped}\n"
-                           f"TIMED OUT: the command was killed after {want} s — it has no exit code.\n{body_txt}",
-                           status=OutcomeStatus.FAILED, reason_code="lab_timed_out", world_changed=True)
+    if r.get("cancelled") or r.get("timed_out"):
+        # §4UD F-B: ended by `lab cancel`, or by the deadline — no exit code, not a result. ONE sentence about the
+        # kill, chosen by `killed` (part-2 r2 N2: "NOT KILLED … may STILL be running" was followed by "the command
+        # was killed / ended")
+        why = "by `lab cancel`" if r.get("cancelled") else f"by its {want} s deadline"
+        word = "CANCELLED" if r.get("cancelled") else "TIMED OUT"
+        if r.get("killed") is False:
+            fate = (f"NOT KILLED: it was asked to end {why}, but the labs host could not confirm that it ended — it "
+                    "may STILL be running on the member (`lab cancel` again, or `lab member op=restart`, ends it).")
+        else:
+            fate = f"{word}: the command was ended {why}."
+        head = f"[{lab_id}/{member} {EXEC_HEADS[3]} after {dur} s]" if r.get("cancelled") else \
+            f"[{lab_id}/{member} {EXEC_HEADS[1]} after {want} s]"
+        return ToolOutcome(f"{head}{clamped}\n{fate} It has no exit code, and what it had done by then "
+                           f"stays done.\n{body_txt}",
+                           status=OutcomeStatus.FAILED,
+                           reason_code="lab_cancelled" if r.get("cancelled") else "lab_timed_out", world_changed=True)
     code = r.get("exit_code")
     if not isinstance(code, int):
-        return ToolOutcome(f"[{lab_id}/{member} no exit code {dur}s]{clamped}\n"
+        return ToolOutcome(f"[{lab_id}/{member} {EXEC_HEADS[2]} {dur}s]{clamped}\n"
                            f"The labs host reported no exit code for this command.\n{body_txt}",
                            status=OutcomeStatus.UNRESOLVED, reason_code="lab_no_exit_code", world_changed=True)
-    head = f"[{lab_id}/{member} exit={code} {dur}s]{clamped}\nEXIT CODE: {code}\n"
+    head = f"[{lab_id}/{member} {EXEC_HEADS[0]}{code} {dur}s]{clamped}\nEXIT CODE: {code}\n"
     # a failing command is booked like `execute`'s: not known to have changed
     # anything, so the repeat guard can see the same failure twice (r3 minor 2)
     return ToolOutcome(head + body_txt, status=OutcomeStatus.OK if code == 0 else OutcomeStatus.FAILED,
@@ -1732,7 +2607,9 @@ LAB_TOOL_DEFINITION = {
             "anything that needs root, ports or network faults. You build in the workspace (file_system/execute) "
             "and RUN systems in a lab; labs expire, so save recipes and results to the workspace (`spec`, `get`). "
             "The workspace and the browser cannot reach a lab — use exec/http here. Start with `templates`, then "
-            "`create`; every exec names lab_id + member; `destroy` when done. A PROJECT's lab can be KEPT as production "
+            "`create`; every exec names lab_id + member (`cancel` ends one that is still running; `screenshot` saves a "
+            "picture of a member's web page to a workspace .png); `destroy` when "
+            "done. A PROJECT's lab can be KEPT as production "
             "(the owner's call only): `keep` (params.app {name, member, port, cmd}) → `deploy` (params.folder) → it "
             "serves on a stable tailnet URL; a new version = a second kept lab, `deploy`, then `switch` "
             "(params.from_lab = the one serving); `rollback`, `backup`/`backups`/`restore` (params.backup_id), "
@@ -1747,15 +2624,18 @@ LAB_TOOL_DEFINITION = {
                            "keep/deploy/switch/rollback/restore: that action's inputs"},
                 "label": {"type": "string"},
                 "purpose": {"type": "string", "description": "create: one line, why this lab exists"},
-                "member": {"type": "string", "description": "exec/put/get/logs/http/member: the member name"},
+                "member": {"type": "string", "description": "exec/put/get/logs/http/member/screenshot: the member name"},
                 "cmd": {"type": "string", "description": "exec: a bash command run on the member"},
                 "timeout_s": {"type": "integer", "description": "exec: default 120"},
                 "workdir": {"type": "string"},
                 "stdin": {"type": "string"},
-                "path": {"type": "string", "description": "put/get: absolute path on the member; http: URL path"},
-                "sandbox_path": {"type": "string", "description": "put: workspace file to send; get: where to save it"},
+                "path": {"type": "string", "description": "put/get: absolute path on the member (a file, or a folder "
+                         "for a folder put/get); http: URL path"},
+                "sandbox_path": {"type": "string", "description": "put: workspace file or FOLDER to send; get: where "
+                                 "to save it (a folder on the member goes into this folder); screenshot: "
+                                 "the .png file to write"},
                 "op": {"type": "string", "enum": list(MEMBER_OPS), "description": "member: what to do to it; app: start|stop|restart"},
-                "port": {"type": "integer", "description": "http: the member's port (default 80)"},
+                "port": {"type": "integer", "description": "http/screenshot: the member's port (default 80)"},
                 "method": {"type": "string", "enum": ["GET", "HEAD"], "description": "http: default GET"},
                 "tail": {"type": "integer", "description": "logs: lines (default 200)"},
                 "ttl_idle_s": {"type": "integer", "description": "create/extend: idle lifetime in seconds"},

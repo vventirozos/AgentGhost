@@ -9,8 +9,14 @@ the unattended pick skips a held task until ``/v1/health`` answers with room, th
 run never skips it (it takes the task, and the claim clears the hold).
 
 Codes: ``labs_down`` (the host could not be reached), ``labs_no_answer`` (a create the host took and never
-answered) and ``lab_capacity`` (``lab_limit`` / ``budget_exceeded`` /
-``disk_low``). Nothing here reads prose: the lab tool's ``reason_code`` decides.
+answered), ``lab_capacity`` (``lab_limit`` / ``budget_exceeded`` / ``disk_low``) and ``labs_not_ready`` / ``labs_no_tor`` (§4UD F15:
+the host answered that it cannot make a lab RIGHT NOW — its firewall rules are being re-applied, its published
+ports are all leased, the create met a ``busy`` lock; or its Tor gateway is not up. These failed the task, and a
+FAILED task is never retried unattended). Nothing here reads prose: the lab tool's ``reason_code`` decides, and
+the size a refused create needed arrives as a number (``needed_mb``), not as a line of the result text.
+
+The codes a reader outside this module branches on are ``lab_capacity`` and "anything else" (the batch's stop
+reason, `project_advancer`): a new code is a "the labs host could not make a lab now" stop.
 """
 from __future__ import annotations
 
@@ -31,6 +37,11 @@ REASON_TO_WAIT = {
     "lab_lab_limit": "lab_capacity",
     "lab_budget_exceeded": "lab_capacity",
     "lab_disk_low": "lab_capacity",
+    # §4UD F15: transient host conditions — a hold, not a failed task
+    "lab_tor_unavailable": "labs_no_tor",
+    "lab_firewall_missing": "labs_not_ready",
+    "lab_ports_exhausted": "labs_not_ready",
+    "lab_busy": "labs_not_ready",
 }
 WAIT_CODES = frozenset(REASON_TO_WAIT.values())
 META_KEY = "lab_waits"
@@ -41,6 +52,9 @@ ROOM_MB = 1024
 ROOM_DISK_MB = 10240
 DISK_MARGIN_MB = 1024
 NO_ANSWER_COOLDOWN_S = 900
+#: a ``labs_not_ready`` hold waits at least this long (a Tor bootstrap, the firewall re-apply on the host's next
+#: reaper tick, a lease freed by a destroy) before the health answer may lift it — never a tight retry loop
+NOT_READY_COOLDOWN_S = 180
 PREFIX = "waiting for the labs host"
 #: review r2 #6: a task that waited this many times and still could not get a lab goes to the owner
 MAX_ROUNDS = 3
@@ -51,26 +65,31 @@ _LOCK = threading.Lock()
 _SEEN: Dict[str, tuple] = {}
 
 import contextvars as _cv
-import re as _re
 #: the build key of the leaf running in this context ("<leaf_base>"); set by core/coding_loop.run_leaf_turn
 BUILD_KEY: "_cv.ContextVar[str]" = _cv.ContextVar("lab_build_key", default="")
 #: the leaf (attempt) id running in this context — the lab inventory row of a lab it creates carries it, and only
 #: those labs are destroyed when the leaf ends (review r2 #5)
 LEAF_ID: "_cv.ContextVar[str]" = _cv.ContextVar("lab_leaf_id", default="")
-_NEEDED_RE = _re.compile(r"\nneeded_mb: (\d+)")
+#: the leaf ids whose turn (or its end clean-up) is running in THIS process — `leaf_reaper.sweep_ended_leaves`
+#: never touches these (§4UD F1). Added and removed by core/coding_loop.run_leaf_turn.
+RUNNING_LEAVES: Set[str] = set()
 
 
-def note_outcome(build_key: Optional[str], reason_code: str, ok: bool, action: str = "", text: str = "") -> None:
+def note_outcome(build_key: Optional[str], reason_code: str, ok: bool, action: str = "", needed_mb: int = 0) -> None:
     """Called by the lab tool for autopilot calls inside a build: remember a "no lab" answer to a CREATE; only a lab
     that was actually created clears it (review r2 #3: a `lab list` after a refused create must not). review r3 #3:
-    only a create is noted — a `lab templates` during a blip must not turn a build's real failure into a lab wait."""
+    only a create is noted — a `lab templates` during a blip must not turn a build's real failure into a lab wait.
+    ``needed_mb``: the host's own number for a refused create (§4UD F15: it was parsed out of the result text)."""
     if not build_key or action != "create":
         return
     code = REASON_TO_WAIT.get(str(reason_code or ""))
     with _LOCK:
         if code:
-            m = _NEEDED_RE.search(str(text or ""))
-            _SEEN[build_key] = (code, int(m.group(1)) if m else 0)
+            try:
+                _need = max(0, int(needed_mb or 0))
+            except (TypeError, ValueError):
+                _need = 0
+            _SEEN[build_key] = (code, _need)
             while len(_SEEN) > 256:                       # a build that later succeeded never takes its note
                 _SEEN.pop(next(iter(_SEEN)))
         elif ok and action == "create":
@@ -164,11 +183,20 @@ def has_room(health: Any, code: str, needed_mb: int = 0, held_at: Optional[float
     """Does a ``/v1/health`` answer lift a hold of ``code``? ``labs_down``: the host answers and is ok.
     ``labs_no_answer``: also ``NO_ANSWER_COOLDOWN_S`` since the hold and a free lab slot. ``lab_capacity``: a free
     lab slot, ``ROOM_MB`` (or the size the create needed) in the disposable pool and in the host's memory, and disk
-    above the host's floor."""
+    above the host's floor. ``labs_not_ready``: ``NOT_READY_COOLDOWN_S`` since the hold, the host ok (its ``ok``
+    is false while firewall rules are missing) and its Tor gateway up (``tor`` == "ok"; a host that does not say
+    is not held on it)."""
     if not isinstance(health, dict) or health.get("ok") is not True:
         return False
     if code == "labs_down":
         return True
+    if code in ("labs_not_ready", "labs_no_tor"):
+        try:
+            waited = time.time() - float(held_at or 0) >= NOT_READY_COOLDOWN_S
+        except (TypeError, ValueError):
+            return False
+        # only the hold a missing Tor gateway caused waits for it (a lab with no internet needs none)
+        return waited and (code != "labs_no_tor" or str(health.get("tor", "ok") or "") == "ok")
     try:
         if code == "labs_no_answer":
             return (time.time() - float(held_at or 0) >= NO_ANSWER_COOLDOWN_S

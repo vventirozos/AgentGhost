@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { createTemperament, logRowIcon } from './temperament.js?v=1.7';
+import { createTemperament, logRowIcon } from './temperament.js?v=1.8';
 export { logRowIcon };
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -1224,13 +1224,216 @@ export function moodLook(label, intensity) {
     if (PREFERS_REDUCED_MOTION) for (const f of ['flow', 'spin', 'pulse', 'breath', 'wob']) out[f] = MOOD_NEUTRAL[f];
     return out;
 }
+
+// §4UG (2026-11-11): the mood as its TWO NUMBERS. The agent's mood is a point
+// (p pleasantness, e energy, each −1..1); a label is the region the point is
+// in and an intensity is how far out it is, in three steps — so the look
+// jumped between nine fixed looks at 0.35 / 0.7 / 1. With the numbers the look
+// is BLENDED: the point's direction mixes the two region looks it lies
+// between (by angle), its size sets the strength continuously.
+//   * The regions sit where the agent's own anchors are (selfhood/mood.py
+//     ANCHOR_DIRECTION) and the strength passes through today's three shares
+//     at the anchors' sizes (ANCHOR_MAGNITUDE 0.32 / 0.60 / 0.90), so at an
+//     anchor point the blend IS that label's look at that intensity.
+//   * `curious` is a tag on a pleasant, energetic mood, not a region: while
+//     the label says curious it stands where cheerful stands.
+//   * A mood that has a level never fades under MOOD_POINT_FLOOR (the resting
+//     point can pull the shown numbers toward 0 while the mood is still said).
+//   * When the label is not one of the two looks the point lies between (the
+//     resting point pushed a small mood across a region), the label wins:
+//     its own look, at the point's strength.
+//   * No numbers (an older agent), no level (neutral, the resting point), an
+//     unknown label: exactly `moodLook(label, intensity)`.
+const MOOD_POINT_FLOOR = 0.2;
+const _MOOD_K_AT = [[0, 0], [0.32, MOOD_STRENGTH[1]], [0.60, MOOD_STRENGTH[2]], [0.90, MOOD_STRENGTH[3]]];
+// The share of a look shown at size m = max(|p|, |e|). Pure, continuous, never falling.
+export function moodStrengthAt(m) {
+    m = Math.abs(Number(m));
+    if (!(m > 0)) return 0;
+    for (let i = 1; i < _MOOD_K_AT.length; i++) {
+        const [x0, y0] = _MOOD_K_AT[i - 1], [x1, y1] = _MOOD_K_AT[i];
+        if (m <= x1) { const t = (m - x0) / (x1 - x0); return y0 * (1 - t) + y1 * t; }
+    }
+    return MOOD_STRENGTH[3];
+}
+// The eight regions by angle, `down` at both ends of (−π, π].
+const _MOOD_RING_OF_LABELS = [['down', -1, 0], ['tired', -0.75, -1], ['bored', 0, -1], ['calm', 1, -0.75],
+    ['content', 1, 0], ['cheerful', 1, 0.75], ['restless', 0, 1], ['irritable', -1, 0.75], ['down', -1, 0]]
+    .map(([label, ap, ae], i) => ({ label, a: i === 0 ? -Math.PI : Math.atan2(ae, ap) }));
+// Which two looks the direction of (p, e) lies between, and how far along. Pure.
+function _moodBracket(p, e) {
+    const th = Math.atan2(e, p), R = _MOOD_RING_OF_LABELS;
+    let i = 0;
+    while (i < R.length - 2 && th > R[i + 1].a) i++;
+    let t = (th - R[i].a) / (R[i + 1].a - R[i].a);
+    t = t < 1e-9 ? 0 : t > 1 - 1e-9 ? 1 : t;
+    return { a: R[i].label, b: R[i + 1].label, t };
+}
+function _moodMix(a, b, t, k) {
+    const A = MOOD_LOOKS[a], B = MOOD_LOOKS[b], out = {};
+    for (const f of MOOD_FIELDS) {
+        const v = t === 0 ? A[f] : t === 1 ? B[f] : A[f] + (B[f] - A[f]) * t;
+        out[f] = MOOD_NEUTRAL[f] + (v - MOOD_NEUTRAL[f]) * k;
+    }
+    out.ring = MOOD_NEUTRAL.ring.map((c, i) => {
+        const to = new THREE.Color(t === 1 ? MOOD_RINGS[b][i] : MOOD_RINGS[a][i]);
+        if (t > 0 && t < 1) to.lerp(new THREE.Color(MOOD_RINGS[b][i]), t);
+        return new THREE.Color(c).lerp(to, k);
+    });
+    if (PREFERS_REDUCED_MOTION) for (const f of ['flow', 'spin', 'pulse', 'breath', 'wob']) out[f] = MOOD_NEUTRAL[f];
+    return out;
+}
+// THE look for a mood. Pure. `moodLookAt(p, e)` alone is the blend at the
+// point; with the label and intensity the agent reports, the rules above.
+export function moodLookAt(p, e, label, intensity) {
+    const ok = (v) => typeof v === 'number' && isFinite(v);
+    if (!ok(p) || !ok(e)) return moodLook(label, intensity);
+    p = Math.max(-1, Math.min(1, p)); e = Math.max(-1, Math.min(1, e));
+    const m = Math.max(Math.abs(p), Math.abs(e));
+    if (label == null && intensity == null) {
+        if (m <= 0) return MOOD_NEUTRAL;
+        const B = _moodBracket(p, e);
+        return _moodMix(B.a, B.b, B.t, moodStrengthAt(m));
+    }
+    const key = String(label || '').toLowerCase(), n = Number(intensity);
+    // review (face): "bored" is read off the CLOCK (a long quiet), not off the pair, whose numbers stay near
+    // 0 — at the point's floor it showed at a third of its strength while the words said "bored, 2 of 3"
+    if (key === 'bored') return moodLook(label, intensity);
+    if (!Object.prototype.hasOwnProperty.call(MOOD_LOOKS, key) || !(n === 1 || n === 2 || n === 3) || m <= 0) {
+        return moodLook(label, intensity);
+    }
+    const k = Math.max(MOOD_POINT_FLOOR, moodStrengthAt(m));
+    const B = _moodBracket(p, e);
+    const as = (l) => (key === 'curious' && l === 'cheerful' ? 'curious' : l);
+    const a = as(B.a), b = as(B.b);
+    if ((a === key && B.t < 1) || (b === key && B.t > 0)) return _moodMix(a, b, B.t, k);
+    return _moodMix(key, key, 0, k);
+}
 const _moodNow = { ...MOOD_NEUTRAL };     // the eased look, read per frame
 let _moodLive = MOOD_NEUTRAL, _moodPreview = null;
+// What the agent last reported: the label and intensity (setMoodHue) and the
+// two numbers (setMoodPoint, null without them).
+let _moodLabel = null, _moodLevel = null, _moodP = null, _moodE = null;
 // Try a look by hand, from the console: __ghostFace.previewMood('irritable', 3);
 // previewMood() goes back to the agent's real mood. Not saved anywhere.
 export function previewMood(label, intensity) {
     _moodPreview = label == null ? null : moodLook(label, intensity == null ? 3 : intensity);
     return { ...(_moodPreview || _moodLive) };
+}
+// §4UG: the same for a point — __ghostFace.previewMoodAt(-0.5, 0.6) is a look
+// between irritable and restless at about two thirds; previewMoodAt() goes back.
+export function previewMoodAt(p, e) {
+    _moodPreview = p == null || e == null ? null : moodLookAt(Number(p), Number(e));
+    return { ...(_moodPreview || _moodLive) };
+}
+// §4UG: the mood's two numbers from the health poll, sent just before the
+// label (setMoodHue). null / anything unreadable = none: the label's look.
+export function setMoodPoint(p, e) {
+    const ok = (v) => typeof v === 'number' && isFinite(v);
+    const had = _moodP !== null;
+    if (ok(p) && ok(e)) { _moodP = Math.max(-1, Math.min(1, p)); _moodE = Math.max(-1, Math.min(1, e)); }
+    else { _moodP = null; _moodE = null; }
+    if (_moodLabel != null && (had || _moodP !== null)) _moodLive = moodLookAt(_moodP, _moodE, _moodLabel, _moodLevel);
+    return _moodP !== null;
+}
+
+// §4UG: MOMENTS. When the mood takes a shade the face plays ONE eased gesture,
+// a few seconds long — relieved lets go (swells, lifts, brightens), proud
+// sends a warm bright front OUT from the kernel and stands a little taller,
+// chastened droops and dims. The movement is the temperament's eased body
+// (temperament.js `moment`), the light its `light` field; under reduced motion
+// only the light and the colour play. The agent sends the shade with the
+// stamp it was set at on every poll while it lasts (up to 30 min): each stamp
+// plays once. The first reading after the page opens plays only a fresh one
+// (SHADE_FRESH_MS), so a reload does not replay an old moment.
+export const SHADES = Object.freeze(['relieved', 'chastened', 'proud']);
+const SHADE_FRESH_MS = 120000;
+const WARM_S = 3.2;                    // seconds, kernel → rim
+let warmT = -1.0, _warmFront = 0.0, _warmEnv = 0.0;
+function _warmAt(d) {
+    if (_warmEnv <= 0.001) return 0.0;
+    const x = (d - _warmFront) / 0.09;
+    return _warmEnv * Math.exp(-x * x);
+}
+// review (face): the last stamp seen survives a reload in this tab (sessionStorage), so a reload inside
+// SHADE_FRESH_MS does not replay a moment already played; a stamp that arrives while the face is PAUSED
+// (hidden tab, the handheld's idle tier) is held and played on resume only if it is still fresh
+const _SHADE_KEY = 'ghostFace.shadeSeen';
+function _loadSeen() { try { return (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(_SHADE_KEY)) || null; } catch (e) { return null; } }
+function _saveSeen(v) { try { if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(_SHADE_KEY, v); } catch (e) { /* no storage */ } }
+let _shadeSeen = _loadSeen(), _shadeFirst = true, _momentCount = 0, _shadePending = null, _shadeLastPoll = 0;
+const SHADE_GAP_MS = 60000;            // no reading for this long: the next one is checked for age like a first
+// Play one by hand, from the console: __ghostFace.playMoment('proud').
+export function playMoment(kind) {
+    const k = String(kind || '').toLowerCase();
+    if (!temper.moment(k)) return false;
+    // the front is that form's; under reduced motion nothing travels (review: the moments show in light only)
+    if (k === 'proud' && FORMS[formIndex] === 'moodtesseract' && !PREFERS_REDUCED_MOTION) warmT = 0.0;
+    _momentCount++;
+    return true;
+}
+const _STAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})?$/;
+// An ISO stamp as epoch ms (no zone = UTC, as the agent writes them), or NaN. Pure.
+export function shadeStampMs(iso) {
+    const m = typeof iso === 'string' ? _STAMP_RE.exec(iso) : null;
+    if (!m) return NaN;
+    let off = 0;
+    if (m[7] && m[7] !== 'Z') off = (m[7][0] === '-' ? -1 : 1) * (Number(m[7].slice(1, 3)) * 60 + Number(m[7].slice(4, 6)));
+    return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) - off * 60000;
+}
+// One poll's shade. True when it played a moment.
+// ageS (optional): the shade's age by the AGENT's clock (health `shade_age_s`). With it, freshness never
+// depends on this device's clock being right (§4UG-f review: a clock 2 min off dropped moments); the
+// stamp's local time is then now − age.
+export function noteShade(shade, shadeAt, ageS) {
+    const nowMs = Date.now();
+    const first = _shadeFirst || (nowMs - _shadeLastPoll > SHADE_GAP_MS);   // a frozen PWA, a long gap
+    _shadeFirst = false;
+    _shadeLastPoll = nowMs;
+    const kind = String(shade || '').toLowerCase();
+    if (typeof shadeAt !== 'string' || !shadeAt || !SHADES.includes(kind)) return false;
+    if (shadeAt === _shadeSeen) return false;
+    _shadeSeen = shadeAt;
+    _saveSeen(shadeAt);
+    const agentAge = (typeof ageS === 'number' && Number.isFinite(ageS) && ageS >= 0) ? ageS * 1000 : NaN;
+    const localAt = Number.isFinite(agentAge) ? nowMs - agentAge : shadeStampMs(shadeAt);
+    if (first && !_shadeFresh(localAt)) return false;            // old, or unreadable: seen, not played
+    if (_animationPaused) { _shadePending = { kind, localAt }; return false; }
+    return playMoment(kind);
+}
+// On resume: the moment held while paused, if it is still the moment it was (else it passed unseen).
+// (Kept out of setAnimationPaused itself: a test lifts that function's source alone.)
+function _playPendingShade() {
+    if (!_shadePending) return;
+    const p = _shadePending;
+    _shadePending = null;
+    if (!_shadeFresh(p.localAt)) return;                  // it passed unseen
+    // §4UG-f review r2: bring the temperament's clock to NOW first — else the moment is stamped with the
+    // clock as the pause left it, the first frame jumps the clock across the pause, and the moment is over
+    // before it is drawn
+    const w = Date.now();
+    _temperNow = Math.max(_temperNow, w);
+    _temperWall = w;
+    TS = temper.step(0, _temperNow);
+    playMoment(p.kind);
+}
+// localAt: when the shade was set, in this device's ms (NaN when unknown)
+function _shadeFresh(localAt) {
+    return Math.abs(Date.now() - localAt) <= SHADE_FRESH_MS;
+}
+
+// §4UG: the CHARACTER's three dials ({warmth, humour, directness}, −2..2) →
+// small bounded biases inside the temperament (temperament.js characterBias).
+// null or {} = none. previewCharacter({humour: 2}) holds one by hand from the
+// console until previewCharacter() gives the agent's own back.
+let _charLive = null, _charPreview = null;
+export function setCharacter(dials) {
+    _charLive = dials && typeof dials === 'object' ? { ...dials } : null;
+    return { ...temper.setCharacter(_charPreview || _charLive) };
+}
+export function previewCharacter(dials) {
+    _charPreview = dials && typeof dials === 'object' ? { ...dials } : null;
+    return { ...temper.setCharacter(_charPreview || _charLive) };
 }
 
 // Mood → a slow baseline shift of the COLD pole only (never competes
@@ -1262,7 +1465,10 @@ export function setMoodHue(label, intensity) {
     targetMoodHue = moodHueFor(label) * moodHueScale(intensity);
     // A failed health poll passes null: keep the last look through the blip (it
     // would drop to neutral within seconds and come back on the next good poll).
-    if (label != null) _moodLive = moodLook(label, intensity);
+    if (label != null) {
+        _moodLabel = label; _moodLevel = intensity;
+        _moodLive = moodLookAt(_moodP, _moodE, label, intensity);      // §4UG: by the numbers when it has them
+    }
     return targetMoodHue;
 }
 
@@ -1617,7 +1823,8 @@ export function getDebugState() {
         bob: _bob,
         anatomy: FORMS[formIndex],
         phase, gait: { ...gait }, toolPulse, toolFlash, recallSpark, verdict, verdictEnv,
-        backgroundBusy, moodHue, moodLook: { ..._moodNow }, pulsePhase, gazeY, errorKind, errorKindEnv, body: { ..._bodyPrev },
+        backgroundBusy, moodHue, moodLook: { ..._moodNow }, moodPoint: _moodP === null ? null : [_moodP, _moodE],
+        moments: _momentCount, shadeSeen: _shadeSeen, pulsePhase, gazeY, errorKind, errorKindEnv, body: { ..._bodyPrev },
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
         dtF, clock: time, cube2Flow, cube2Travel,
         linkBudget: _linkBudget, maxLines: MAX_LINES,
@@ -1627,6 +1834,7 @@ export function getDebugState() {
                  shells: C2_SHELLS, kernelVerts: C2_KERNEL, kernelEdges: C2_HYPER_EDGES.length, hyper: { xw: _c2HyperXW, zw: _c2HyperZW }, stream: _c2StreamCount, roll: c2Roll,
                  path: { phase: c2PathPhase, amp: c2PathAmp, kx: _c2K.x, ky: _c2K.y, kz: _c2K.z },
                  success: { t: successT, amp: successAmp, front: _successFront, env: _successEnv },
+                 warm: { t: warmT, front: _warmFront, env: _warmEnv },
                  cam: { x: camera ? camera.position.x : 0, y: camera ? camera.position.y : 0, bank: _camBank } },
     };
 }
@@ -1920,6 +2128,7 @@ export function setAnimationPaused(paused) {
         _lastFrameTs = null;   // the first resumed frame steps dtF = 1
         return false;
     }
+    _playPendingShade();
     if (renderer && !animationFrameId) animate();
     return !!animationFrameId;
 }
@@ -2079,6 +2288,7 @@ function animate(ts) {
         pulseT = Math.min(1.0, pulseT + 0.6 * toolFlash + 0.15 * c2n);
     } else {
         cube2Travel = 0.0;
+        warmT = -1.0; _warmEnv = 0.0;      // §4UG: a front does not wait for the form to come back
     }
 
     // Accumulate time for lines at steady pace — except inside the
@@ -2266,6 +2476,15 @@ function animate(ts) {
                 _successEnv = successAmp * Math.min(1, successT / 0.1) * (1 - _smooth01(Math.max(0, (successT - 0.67) / 0.33)));
             }
         }
+        // §4UG: the proud moment's warm front, the other way: kernel → rim.
+        if (warmT >= 0) {
+            warmT += (frameMs / 1000) / WARM_S;     // wall time (review: dtF is clamped, so on a slow tier the front lagged the body)
+            if (warmT >= 1) { warmT = -1.0; _warmEnv = 0.0; }
+            else {
+                _warmFront = 0.05 + 0.85 * _smooth01(warmT);
+                _warmEnv = Math.min(1, warmT / 0.1) * (1 - _smooth01(Math.max(0, (warmT - 0.67) / 0.33)));
+            }
+        }
         // Verdict grammar (v2): a pass CRYSTALLISES — the wobble collapses
         // and the inherited twists unwind fast (edges a touch brighter via
         // the global formDim pass lift); a refute SHUDDERS — a fast jitter
@@ -2330,6 +2549,9 @@ function animate(ts) {
             // The green front pulls this shell's colour to the green stop as it passes.
             sh.green = _successAt(d);
             sh.seed *= 1.0 - sh.green;
+            // …and the warm front pulls it to the hot stop.
+            sh.warm = _warmAt(d);
+            sh.seed += (0.62 - sh.seed) * sh.warm;
         }
         const _dust = _c2Dust;   // scratch frame; _c2Frame rewrites every field it reads
         const km = _c2KernelM;
@@ -2342,7 +2564,7 @@ function animate(ts) {
                 _c2Pt(P, sh, bp.ux, bp.uy, bp.uz);
                 const corner = bp.ux !== 0 && bp.uy !== 0 && bp.uz !== 0;
                 // Corner sparks (v2): a tool call flashes the corners.
-                bp.sz = (corner ? 1.0 + 0.6 * gaitFlash : 0.8) * sh.fade * (1.0 + 0.5 * sh.green);
+                bp.sz = (corner ? 1.0 + 0.6 * gaitFlash : 0.8) * sh.fade * (1.0 + 0.5 * sh.green + 0.5 * sh.warm);
                 nodeSeeds[i] = sh.seed;
             } else if (bp.kind === 2) {
                 // 4D: rotate in XW, then ZW; project with the eye at w = C2_HYPER_D.
@@ -2372,6 +2594,7 @@ function animate(ts) {
                 bp.sz = 0.9 * _dust.fade * (1.0 + 0.3 * c2n);
                 nodeSeeds[i] = (Math.min(0.62, Math.max(0.0, 0.60 - d * C2_HUE_SPAN * c2Slope + c2Cold) + 0.06 * c2n * (1.0 - d)))
                     * (1.0 - _successAt(d));
+                nodeSeeds[i] += (0.62 - nodeSeeds[i]) * _warmAt(d);
             }
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
@@ -2613,6 +2836,9 @@ function animate(ts) {
     // under reduced motion (a steady face)
     if (!PREFERS_REDUCED_MOTION && !errorKind) formDim *= TS.bright;
     formDim *= _moodNow.bright;
+    // §4UG: the character's baseline light and a moment's — eased inside the
+    // temperament, exactly 1 without either; light, so reduced motion keeps it.
+    formDim *= TS.light;
 
     const nUniforms = instancedMesh.material.uniforms;
     const clk = shaderClock(time);   // wrapped / CPU-side phases (§4PR)
@@ -2672,7 +2898,7 @@ function animate(ts) {
         + (verdict === 'pass' ? 0.2 * verdictEnv : 0)
         + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9))
         + 0.35 * TS.glow)
-        * BLOOM_SCALE * 0.65 * _moodNow.bright;
+        * BLOOM_SCALE * 0.65 * _moodNow.bright * TS.light;
 
     composer.render();
 

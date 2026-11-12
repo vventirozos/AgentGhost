@@ -15,7 +15,7 @@ rsync -a ghost-labs/ <host>:/opt/ghost-labs/        # as root
 sudo /opt/ghost-labs/install.sh                     # idempotent, parameterless
 ```
 
-It installs socat + a venv, writes `/etc/ghost-labs/{api_key,host_id,fw.env,config.yaml,templates/}`, sets Docker's
+It installs socat + a venv, writes `/etc/ghost-labs/{api_key,host_id,fw.env,config.yaml,templates/}` (templates/ = your own only), sets Docker's
 `default-address-pools` to the lab pool and log rotation, installs `ghost-labs-fw.service` (before Docker),
 `ghost-labs.service` and `ghost-labs-fwd@.service`, builds every image, starts the service and prints the
 `GHOST_LABS_HOST` value. Setup is the only time the host uses the clearnet (image builds).
@@ -105,7 +105,12 @@ Errors: `{"error","message","hint",...}` with the codes in `ghost_labs/errors.py
 
 ## Templates
 
-YAML in `/etc/ghost-labs/templates/` (shipped: blank-dev, web, python-app, mysql-single = tor; pg-single, patroni-3 = none).
+Shipped templates are read from the code's own `templates/` folder (`/opt/ghost-labs/templates/`), so syncing the
+code deploys them (shipped: blank-dev, web, python-app, mysql-single = tor; pg-single, patroni-3 = none).
+`/etc/ghost-labs/templates/` holds only templates you add: a file there whose `name` is a shipped one is NOT loaded,
+and the service logs a warning at start (rename it). A file there that does not load, for any reason, is also skipped with a
+warning; it never stops the service (a shipped template that does not parse does). Two files there with one
+name: the first (by file name) is loaded, the other is named in a warning. `install.sh` removes old identical copies of shipped ones there.
 Keys: `name, description, egress, members[{name,image,mem_mb,cpus,ports,cap_add,env}], env, readiness{member,cmd,check,timeout_s}, params`.
 `check` is `exit_code` or a predicate registered with `@ready_check` in `ghost_labs/labs.py`. Add a file, then
 `systemctl restart ghost-labs`. Images must be `ghost-lab/*` and built (add `images/<name>/Dockerfile` + an entry in `cli.IMAGES`).
@@ -199,6 +204,99 @@ Reboot: `make itest-reboot-pre`, reboot, `make itest-reboot-post`.
   blocked every create. A container that does not answer in time, or errors, counts 0 MB freed.
 - r15: a container whose earlier stats call is still running is not asked again (counts 0 MB, logged as such);
   each create used to start one more stuck thread per member.
+
+## Review 11-11 (§4UD) — what changed on the host
+
+- **The lab lock and a running command.** A foreground exec no longer keeps the lab's lock while its command
+  runs (`labs.LabLock`: `to_exec` turns the hold into a "command running" mark). While a command runs: destroy
+  (any caller, the reaper's max lifetime) and every member op go ahead, and the exec then answers `unknown_lab`;
+  a second exec, a screenshot and every kept action wait and answer `busy` as before; the kept tick and an owner
+  create's eviction skip the lab as before; the idle TTL does not fire (the exec touches the lab when it ends).
+  The table is in the module docstring of `ghost_labs/labs.py` and pinned in `tests/unit/test_4ud_review.py`.
+- **`POST /http` has one total deadline** (`HTTP_TOTAL_S`, 15 s: connect, headers and body). A watchdog shuts the
+  socket at the deadline. What arrived is returned with `truncated: true` and `deadline_s`. `http.client`
+  errors (a path it refuses, a bad status line) answer `status: null` with the reason, not 500. A refused
+  connection is followed by one check inside the member (`/dev/tcp/127.0.0.1/<port>`): `loopback_only: true`
+  when something listens there. `POST /screenshot` has one deadline for the probe, the browser and the copy
+  (`SHOT_TOTAL_S`, 75 s).
+- **Job state.** `.rc` present means `exited`, whatever the pid file says. `job_starts` stores the container's
+  `StartedAt` per job: a job of an earlier start is `exited` (with `.rc`) or `lost`, and its pid is never
+  signalled. `killed: true` only when this call sent the signal. The entrypoint removes
+  `/var/log/lab/jobs/*.pid` at start and keeps `.log` and `.rc`. A job answer adds `output_truncated` and
+  `log_path`.
+- **`GET /logs` is bounded in bytes**: each part keeps its last `output_cap_bytes`; the container log is read
+  as a stream with `follow=False`; the member cuts each file with `tail -c`. `truncated: true` when cut.
+- **Kept labs.** `DELETE ?drop_data=1` keeps the data volumes while another kept version of the same app
+  exists (decided under the app lock; `note`, `data_shared_with`), except a `data: fresh` version, which owns
+  its volume. Logs, files, `/http`, screenshots and `GET /jobs/{id}` (its answer carries the output) of a kept
+  lab are refused (`owner_only`) for a caller that may not touch it; its status stays readable. An exec re-reads
+  the kept guard after it waited for the lab lock. A detached job whose lab is destroyed while it starts
+  answers `unknown_lab` and leaves no job row. A detached start takes the lab lock for the launch only (over a
+  running command) and checks the kept guard on the row read inside it. An exec whose exit code cannot be
+  read while a state change holds the lock waits for it: a lab destroyed under the command answers
+  `unknown_lab`, not 500.
+- **TTL.** `ttl_idle_s` above the lab's maximum is clamped on create as on extend (`clamped_to_s`); below 1 or
+  not an integer is `bad_request`. A lab summary adds `max_expires_at`.
+- **`/v1/health` adds `features`** (`drop_data_guard`, `exec_free_lock`, `job_env`), so a client can tell this
+  build from an older one.
+- **Templates.** `pg-single` and `patroni-3` set `PGUSER=postgres`: a bare `psql` works. `python-app` says the
+  app must listen on `0.0.0.0:8080`.
+- **Compatibility with the agent deployed before this.** It sees: a create above the maximum succeed clamped
+  (it refused); an exec whose lab was destroyed answer 404 (it answered after the command); `drop_data` leave the
+  data when another version exists (the old agent asks for it only when its own list shows none); `run logs`
+  of a kept app by autopilot answer 403; `killed` absent for a job that had already ended. New answer fields
+  are ignored by it.
+
+## Per-member readiness (§4UD F-A)
+
+A template member may carry `ready: "<one command line>"`. `wait_ready` polls it with the template's own check
+under the template's single `readiness.timeout_s`. The template check decides `state` (`ready`/`unready`) as
+before; a member check never fails a create. The readiness record gains `members: {name: bool}`, and each
+member in `GET /v1/labs/{id}` gains `ready` and `ready_cmd` when it declares a check. An older client ignores
+both. The member checks run only after the template's check has passed (they never take a turn from it);
+`ready` is `true`, `false` (the check ran and failed) or `null` (it never ran before the deadline; with a
+template check that never passes, every member is `null`). Shipped: `pg_isready -q` (pg-single, patroni-3), `mysqladmin ping` (mysql-single).
+
+## Cancel a foreground exec (§4UD F-B)
+
+`POST /v1/labs/{id}/exec/cancel` with optional `{member, tag}`. `POST /exec` accepts an optional `tag`. The owner
+ends any running command; an autopilot caller only commands that autopilot started with the same non-empty
+tag, and none on a kept lab; a probe only a probe's. Nothing running: `200 {running: 0, cancelled: []}`.
+Running but none the caller may end: `403 owner_only`. The exec that was cancelled answers `cancelled: true`,
+`exit_code: null`, `killed: true|false`. The process group is killed by the command's pid file only when the
+member's container `StartedAt` is the one the command began in, and `_kill_group` then looks (`kill -0`, up to
+2 s): `killed` is true when the group was seen gone or the command's stream ended, false when the kill could not
+be delivered (a paused member), the group is still there, there is no pid file yet (the command's shell has not
+written it: nothing was signalled), or it was not sent and the stream is still open. The pid file is removed only
+once the group is seen gone (or the command ended): a command not confirmed killed keeps it, so the retry below
+reads it. A command's stdin (`stdin` in the body) goes to a 0600 file that the command's own shell opens and
+deletes before anything else (before the command runs); the host also removes it after every exec, and when the
+exec could not be created, because the shell may never have run (a missing workdir, a failed start). Limits: a
+member paused in the milliseconds between the file's write and the shell's start refuses the host's removal too,
+and the file stays until the member is removed; a pid file kept for a command that was not confirmed killed is
+not removed when that command later ends by itself (small, harmless: ids are random). A timeout or cancel that
+lands before the shell has started reads `killed: false`; the command then never runs (its stdin file is gone). A
+timeout uses the same helper and field. While a command that could not be killed still runs, the lab keeps its
+"command running" mark and the command stays in the cancel list: a later cancel sends the same kill again. Each `cancelled[]` item carries `outcome`:
+`killed`, `not_killed`, `ended` (it ended by itself first) or `""` (no word within `CANCEL_CONFIRM_S`, 8 s).
+An older client ignores both fields. `/v1/health` `features` names `exec_cancel` and `member_ready`.
+
+## Folders (§4UD F-C)
+
+`PUT /v1/labs/{id}/tree` `{member, path, archive_b64}` unpacks a tar(.gz) under `path`; `GET /v1/labs/{id}/tree
+?member&path` returns a folder as `archive_b64` (tar.gz) with `entries`, `bytes`, `skipped`. Regular files and
+directories only. A put with an absolute name, `..`, a backslash, a link, a device or a pipe is refused whole;
+a get sends a hard link to a file already sent from the same folder as a copy of that file (Docker sends one
+name of a hard-linked pair as the file and the other as a link to it), and those copies count while the answer is built: an answer
+over `file_max_bytes` of content (what the agent accepts) is refused before more is built; it leaves symlinks, other hard links,
+devices, pipes and names with a backslash out and names them (`skipped` holds the first 50, `skipped_total` the count). The get normalises `path` (`/data/.` is `/data`), refuses `/`,
+and requires every archive entry's first component to be the folder's own name: anything else is an `internal`
+error for the whole call, never an entry dropped or moved up a level. Both directions decompress under a byte
+bound before `tarfile` reads (`tar_bytes_bounded`). Limits: `TREE_MAX_ENTRIES` (2000), the archive within
+`file_max_bytes`, unpacked within four times that. The member receives an archive rebuilt from the checked
+entries. Kept labs: put is the owner's (`guard_kept_mutation`), get is the owner's (`guard_kept_read`); file
+contents are redacted as in `GET /files`. `GET /files` of a directory now adds `kind: "directory"` to its
+`bad_request`. `/v1/health` `features` names `tree`.
 
 ## Known limitations
 

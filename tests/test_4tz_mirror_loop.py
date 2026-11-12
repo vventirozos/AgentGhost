@@ -19,9 +19,28 @@ from ghost_agent.core.agent import GhostAgent
 from ghost_agent.selfhood import SelfModel
 from ghost_agent.selfhood import mirror as M
 from ghost_agent.utils.logging import (
+
+
     ORIGIN_PROBE, reply_surface_context, request_id_context, request_origin_context, requester_role_context)
 
 SENTENCE = "I am the one who checks twice and then says it plainly."
+
+
+
+# dates relative to the mood day (§4UH-e2e: these were fixed dates, written on 11-10 — after 11-12 the diary read stale and the block wording changed)
+import datetime as _dt_rel  # noqa: E402
+from ghost_agent.selfhood import mirror as _MI_rel  # noqa: E402
+D04 = (_MI_rel._mood_date() + _dt_rel.timedelta(days=-6)).isoformat()
+D05 = (_MI_rel._mood_date() + _dt_rel.timedelta(days=-5)).isoformat()
+D08 = (_MI_rel._mood_date() + _dt_rel.timedelta(days=-2)).isoformat()
+D09 = (_MI_rel._mood_date() + _dt_rel.timedelta(days=-1)).isoformat()
+D10 = (_MI_rel._mood_date() + _dt_rel.timedelta(days=0)).isoformat()
+
+@pytest.fixture(autouse=True)
+def _the_mirrors_own_path(monkeypatch):
+    """§4UG: these tests are about the Mirror's own sentence — what a reply hears with the character
+    switched off (``GHOST_CHARACTER=0``). The character has its tests in test_4ug_character.py."""
+    monkeypatch.setenv("GHOST_CHARACTER", "0")
 
 
 def _home(tmp_path) -> Path:
@@ -38,7 +57,7 @@ def _write(home, *rows):
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def _row(sentence, prev=M.SEED_SENTENCE, date="2026-11-09", replies=True):
+def _row(sentence, prev=M.SEED_SENTENCE, date=D09, replies=True):
     r = {"at": f"{date}T00:30:00", "date": date, "sentence": sentence, "prev": prev}
     if replies:
         r["replies"] = [{"at": f"{date}T09:00:00Z", "excerpt": "Bruno's match is at six."}]
@@ -81,7 +100,7 @@ def test_no_diary_no_home_or_only_first_prompt_rows_is_zero_bytes(tmp_path):
 
 def test_the_section_is_the_latest_sentence_header_and_rule(tmp_path):
     home = _home(tmp_path)
-    _write(home, _row("I am older.", date="2026-11-08"), _row(SENTENCE, prev="I am older."))
+    _write(home, _row("I am older.", date=D08), _row(SENTENCE, prev="I am older."))
     assert M.self_image_block(home) == EXPECT
     assert M.self_image_block(home) == EXPECT      # same bytes on every turn
 
@@ -90,7 +109,7 @@ def test_a_new_look_is_heard_at_once_despite_the_memo(tmp_path):
     home = _home(tmp_path)
     _write(home, _row(SENTENCE))
     assert SENTENCE in M.self_image_block(home)
-    _write(home, _row("I am the one who asks before guessing.", prev=SENTENCE, date="2026-11-10"))
+    _write(home, _row("I am the one who asks before guessing.", prev=SENTENCE, date=D10))
     got = M.self_image_block(home)
     assert "asks before guessing" in got and SENTENCE not in got
 
@@ -235,7 +254,7 @@ async def test_the_owner_hears_it_in_the_state_block_and_the_head_does_not_move(
     assert state.index("### DYNAMIC SYSTEM STATE") < state.index(line) < state.index("</system_state_update>")
     for m in after["messages"][:-1]:                 # review r1: not in the stable first message either
         assert SENTENCE not in (m["content"] if isinstance(m["content"], str) else json.dumps(m["content"]))
-    assert A.self_image_heard("web-4tz-loop-2") == "2026-11-09"     # the turn record's field
+    assert A.self_image_heard("web-4tz-loop-2") == D09     # the turn record's field
 
 
 @pytest.mark.asyncio
@@ -274,7 +293,7 @@ def test_the_seed_alone_is_not_long():
 
 
 def test_the_note_counts_the_last_sentence_not_an_earlier_one():
-    p = M.build_prompt([_row(_words(35), date="2026-11-08"), _row("I am short now.", prev=_words(35))],
+    p = M.build_prompt([_row(_words(35), date=D08), _row("I am short now.", prev=_words(35))],
                        ["a", "b"])
     assert "words long" not in p
 
@@ -292,12 +311,12 @@ def test_the_banner_shows_how_much_each_sentence_kept(tmp_path):
     home = _home(tmp_path)
     a = "I check twice and answer plainly."
     b = "I check twice and answer warmly."
-    _write(home, _row(a, date="2026-11-08"), _row(b, prev=a, date="2026-11-09"),
-           _row(b, prev=b, date="2026-11-10"))
+    _write(home, _row(a, date=D08), _row(b, prev=a, date=D09),
+           _row(b, prev=b, date=D10))
     banner = M.mirror_banner(home)
     kept = round(M.kept_share(a, b) * 100)
-    assert f"**2026-11-09** (kept {kept}% of the day before's words) — {b}" in banner
-    assert f"**2026-11-10** (unchanged) — {b}" in banner
+    assert f"**{D09}** (kept {kept}% of the day before's words) — {b}" in banner
+    assert f"**{D10}** (unchanged) — {b}" in banner
     assert "before every reply to you" in banner
 
 
@@ -309,15 +328,16 @@ def test_the_section_is_frozen_for_the_request_that_first_heard_it(tmp_path, mon
     ctx = _ctx(home)
     with _req(rid="web-4tz-freeze"):
         assert A._self_image_block(ctx) == EXPECT
-        _write(home, _row("I am the one who asks before guessing.", prev=SENTENCE, date="2026-11-10"))
+        _write(home, _row("I am the one who asks before guessing.", prev=SENTENCE, date=D10))
         assert A._self_image_block(ctx) == EXPECT                     # a look landed mid-request
         monkeypatch.setattr(M, "_path", lambda h: None)               # … or the diary went unreadable
         assert A._self_image_block(ctx) == EXPECT
         monkeypatch.undo()
-    assert A.self_image_heard("web-4tz-freeze") == "2026-11-09"
+        monkeypatch.setenv("GHOST_CHARACTER", "0")          # §4UG: undo() also took the file's own switch back
+    assert A.self_image_heard("web-4tz-freeze") == D09
     with _req(rid="web-4tz-freeze-2"):
         assert "asks before guessing" in A._self_image_block(ctx)    # the next request hears the new one
-    assert A.self_image_heard("web-4tz-freeze-2") == "2026-11-10"
+    assert A.self_image_heard("web-4tz-freeze-2") == D10
     with _req(rid="slack-4tz-m", role="member"):
         assert A._self_image_block(ctx) == ""
     assert A.self_image_heard("slack-4tz-m") == ""                     # nothing recorded for a member
@@ -332,7 +352,7 @@ def test_a_reused_client_request_id_hears_the_new_sentence_after_the_freeze_wind
     monkeypatch.setattr(_t, "monotonic", lambda: clock[0])
     with _req(rid="slack-reused-id"):
         assert A._self_image_block(ctx) == EXPECT
-        _write(home, _row("I am the one who asks before guessing.", prev=SENTENCE, date="2026-11-10"))
+        _write(home, _row("I am the one who asks before guessing.", prev=SENTENCE, date=D10))
         clock[0] += A._SELF_IMAGE_FREEZE_S - 1
         assert A._self_image_block(ctx) == EXPECT                     # still the same request
         clock[0] += 2
@@ -354,7 +374,7 @@ async def test_a_look_that_lands_mid_request_changes_nothing_the_model_sees(tmp_
 
     async def introspect(**kw):
         if kw.get("action") == "recent":
-            _write(home, _row(new, prev=SENTENCE, date="2026-11-10"))
+            _write(home, _row(new, prev=SENTENCE, date=D10))
         return "ok"
     agent.available_tools = {"introspect": introspect}
     steps = [{"action": "stats"}, {"action": "recent"}, {"action": "narrative"}, "Done."]
@@ -385,7 +405,7 @@ async def test_a_look_that_lands_mid_request_changes_nothing_the_model_sees(tmp_
 
 def test_the_banner_measures_a_looks_first_row_against_the_seed(tmp_path):
     home = _home(tmp_path)
-    _write(home, _row("I am a faithful sentinel.", replies=False, date="2026-11-04"),
-           _row("I answer what is asked, plainly.", date="2026-11-05"))
+    _write(home, _row("I am a faithful sentinel.", replies=False, date=D04),
+           _row("I answer what is asked, plainly.", date=D05))
     banner = M.mirror_banner(home)
-    assert "**2026-11-05** (kept " in banner and "of the starting sentence's words)" in banner
+    assert f"**{D05}** (kept " in banner and "of the starting sentence's words)" in banner

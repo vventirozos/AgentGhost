@@ -26,7 +26,9 @@ install -d -m 0700 "$ETC/fwd" "$VAR/backups" "$VAR/archives"
 [ -s "$ETC/api_key" ] || (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/api_key")
 chmod 0600 "$ETC/api_key"
 [ -s "$ETC/host_id" ] || python3 -c 'import uuid;print(uuid.uuid4())' > "$ETC/host_id"
-cp -f "$OPT"/templates/*.yaml "$ETC/templates/"
+# shipped templates are read from $OPT/templates (the code's tree); $ETC/templates holds only the operator's own.
+# A copy of a shipped one left there by an older install is ignored by name (the service logs it) — remove them:
+for f in "$OPT"/templates/*.yaml; do b="$ETC/templates/$(basename "$f")"; [ ! -e "$b" ] || ! cmp -s "$f" "$b" || rm -f "$b"; done
 [ -e "$ETC/config.yaml" ] || printf '# ghost-labs config; every key optional (see README)\n{}\n' > "$ETC/config.yaml"
 
 POOL=$("$OPT/venv/bin/python" -c 'import sys;sys.path.insert(0,"'"$OPT"'");from ghost_labs import config as C;c=C.load();print(c.address_pool, c.gw_subnet, c.api_subnet)')

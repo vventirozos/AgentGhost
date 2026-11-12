@@ -253,16 +253,33 @@ def _turn(h, tone=None, text=None):
     return t
 
 
+def _tone(label, n, manner="", mn=0):
+    """A turn record's ``extra.mood_tone`` as the agent writes it (§4UD W2: the values beside the sentences)."""
+    return {"mood": (f"{label}, {n} of 3" if n else "neutral"), "manner": (f"{manner}, {mn} of 3" if manner else ""),
+            "label": label, "intensity": n, "manner_name": manner, "manner_intensity": mn}
+
+
 @pytest.mark.parametrize("tone,kept", [
     (None, True),
-    ({"mood": "content, 1 of 3", "manner": ""}, True),
-    ({"mood": "neutral", "manner": ""}, True),
-    ({"mood": "irritable, 2 of 3", "manner": ""}, False),
-    ({"mood": "cheerful, 3 of 3", "manner": ""}, False),
-    ({"mood": "neutral", "manner": "sarcastic, 1 of 3"}, False),
-    ({"mood": "content, 1 of 3", "manner": "terse, 2 of 3"}, False),
+    (_tone("content", 1), True),
+    (_tone("neutral", 0), True),
+    (_tone("irritable", 2), False),
+    (_tone("cheerful", 3), False),
+    (_tone("neutral", 0, "sarcastic", 1), False),
+    (_tone("content", 1, "terse", 2), False),
     ("garbage", True),
+    # the VALUES decide, never the sentence (it was parsed back with a regex): a record whose sentence
+    # says 3 and whose value says 1 was written under a faint mood
+    ({"mood": "cheerful, 3 of 3", "manner": "", "label": "cheerful", "intensity": 1, "manner_name": ""}, True),
+    ({"mood": "neutral", "manner": "", "label": "down", "intensity": 2, "manner_name": ""}, False),
+    ({"mood": "neutral", "manner": "", "label": "neutral", "intensity": True, "manner_name": ""}, True),
+    # a record from before §4UD has only the sentences: they are not read at all (review r2: counting any
+    # mood in them as strong could skip the look for two days after a deploy)
+    ({"mood": "content, 1 of 3", "manner": ""}, True),
+    ({"mood": "irritable, 3 of 3", "manner": ""}, True),
+    ({"mood": "neutral", "manner": "sarcastic, 1 of 3"}, True),
     ({"mood": 7}, True),
+    ({"mood": "neutral", "manner": "", "manner_name": 7, "intensity": "3"}, True),
 ])
 def test_a_reply_written_under_a_strong_mood_or_a_manner_is_never_shown(tmp_path, monkeypatch, tone, kept):
     import ghost_agent.core.failure_census as FC
@@ -285,8 +302,13 @@ def _journal(home, rows):
     p.write_text("".join(json.dumps(r) + "\n" for r in rows) + "{torn", encoding="utf-8")
 
 
+#: §4UD review r2: the lasting note counts MOOD days (they end at 04:00) — NOW is 03:00 on the 10th, which is
+#: still the 9th's (these fixtures counted calendar days from NOW.date())
+MOOD_TODAY = datetime.date(2026, 11, 9)
+
+
 def _jrow(days_ago, label="irritable", n=2, kind="turn", hour=14):
-    local = datetime.datetime.combine(NOW.date() - datetime.timedelta(days=days_ago), datetime.time(hour))
+    local = datetime.datetime.combine(MOOD_TODAY - datetime.timedelta(days=days_ago), datetime.time(hour))
     at = local.astimezone(UTC).replace(tzinfo=None).isoformat() + "Z"
     return {"label": label, "intensity": n, "at": at, "cause": "x", "kind": kind}
 
@@ -315,9 +337,10 @@ def test_what_does_not_count_as_a_mood_that_lasted(tmp_path, rows):
 
 
 def test_days_are_local_days_not_utc_days(tmp_path):
-    """Review r1 n5: a row 30 min after local midnight belongs to that local day. Read as a UTC date
-    (east of UTC) the oldest of these falls 8 days back and nothing lasted."""
-    rows = [_jrow(0, hour=0), _jrow(3, hour=0), _jrow(6, hour=0)]
+    """Review r1 n5: the day is read in LOCAL time. §4UD review r2: and it is the mood day — a row 30 min
+    after it begins (04:30 local) belongs to it. Read as a UTC date the oldest of these can fall out of the
+    window and nothing lasted."""
+    rows = [_jrow(0, hour=4), _jrow(3, hour=4), _jrow(6, hour=4)]
     for r in rows:
         r["at"] = (datetime.datetime.fromisoformat(r["at"][:-1]) + datetime.timedelta(minutes=30)).isoformat() + "Z"
     _journal(tmp_path, rows)
@@ -488,7 +511,8 @@ def test_the_lasting_note_reaches_the_look_and_the_row(home):
     assert MI.load(home)[-1]["lasting"].startswith("Your own mood over the last 7 days")
 
 
-def test_the_banner_says_where_the_mood_settles(home):
+def test_the_banner_says_where_the_mood_settles(home, monkeypatch):
+    monkeypatch.setenv("GHOST_CHARACTER", "0")       # §4UH-e2e: the diary's rest is the character-off path
     _look(home, _LLM(["I am bright."], ["1 -1"]), 10)
     b = MI.mirror_banner(home)
     assert "Where my mood settles when nothing happens (set by the latest sentence): pleasantness a little " \
@@ -531,14 +555,17 @@ def test_the_character_section_states_the_ranking_and_yields_to_mood_and_manner(
 # ── (4) the face and the handheld ────────────────────────────────────────────
 
 def test_health_carries_the_rest_label(tmp_path):
+    # §4UD r2: routes._rest_label is gone — the rule is the engine's `mood.rest_label`, read through health
     from ghost_agent.api import routes
-    st = _state(tmp_path, rest=(0.12, -0.06))
-    assert routes._rest_label(st) == "calm"
-    assert routes._rest_label(_state(tmp_path / "z")) == "neutral"
-    assert routes._rest_label(SimpleNamespace()) == "neutral"
+
+    def rest_of(st):
+        return routes._health_mood(SimpleNamespace(self_model=SimpleNamespace(state=st)))["rest"]
+    assert rest_of(_state(tmp_path, rest=(0.12, -0.06))) == "calm"
+    assert rest_of(_state(tmp_path / "z")) == "neutral"
+    assert rest_of(SimpleNamespace()) == "neutral"
     # review r1 m2: an unhurried character is not bored (boredom is a quiet, not a temperament)
-    assert routes._rest_label(_state(tmp_path / "b", rest=(0.0, -0.12))) == "calm"
-    assert routes._rest_label(_state(tmp_path / "d", rest=(-0.12, 0.0))) == "down"
+    assert rest_of(_state(tmp_path / "b", rest=(0.0, -0.12))) == "calm"
+    assert rest_of(_state(tmp_path / "d", rest=(-0.12, 0.0))) == "down"
 
 
 def test_introspect_names_the_resting_point_for_the_owner_only(tmp_path, monkeypatch):

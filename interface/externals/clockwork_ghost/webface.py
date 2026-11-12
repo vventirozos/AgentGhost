@@ -290,6 +290,15 @@ class WebFaceWidget(QWidget):
         level = "'rest'" if intensity == "rest" else str(int(intensity))
         self._js(f"window.ghostFace && ghostFace.agentMood({label!r}, {level})")
 
+    def set_agent_extras(self, extras):
+        """§4UG: the mood's two numbers, its shade and the character's dials
+        (``agentapi.MoodWatch.extras``), sent just BEFORE ``set_agent_mood`` so
+        the look is computed from both. A face page without the hook skips it."""
+        if not isinstance(extras, dict):
+            return
+        self._js("window.ghostFace && ghostFace.agentExtras && ghostFace.agentExtras("
+                 + json.dumps(extras, allow_nan=False) + ")")
+
     def animations_on_at_start(self) -> bool:
         """Will the face open with animations on? For the chip's first label."""
         return facestate.startup_form(FACE_DIR) != "empty"

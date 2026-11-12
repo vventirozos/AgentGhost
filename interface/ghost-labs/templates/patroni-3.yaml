@@ -2,10 +2,11 @@ name: patroni-3
 description: 3-node Patroni cluster (etcd colocated), PostgreSQL 18, no internet
 egress: none
 members:
-  - {name: pg1, image: "ghost-lab/patroni:18", mem_mb: 512, cpus: 1.0}
-  - {name: pg2, image: "ghost-lab/patroni:18", mem_mb: 512, cpus: 1.0}
-  - {name: pg3, image: "ghost-lab/patroni:18", mem_mb: 512, cpus: 1.0}
-env: {PATRONI_MEMBERS: "pg1,pg2,pg3"}
+  - {name: pg1, image: "ghost-lab/patroni:18", mem_mb: 512, cpus: 1.0, ready: "pg_isready -q"}
+  - {name: pg2, image: "ghost-lab/patroni:18", mem_mb: 512, cpus: 1.0, ready: "pg_isready -q"}
+  - {name: pg3, image: "ghost-lab/patroni:18", mem_mb: 512, cpus: 1.0, ready: "pg_isready -q"}
+# PGUSER: a bare `psql` connects as the superuser (the exec user is root)
+env: {PATRONI_MEMBERS: "pg1,pg2,pg3", PGUSER: postgres}
 readiness:
   member: pg1
   cmd: "patronictl -c /etc/patroni.yml list --format json"

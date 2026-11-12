@@ -420,20 +420,10 @@ def log_rating(answer: Dict[str, object], nudge: float = 0.0, held: str = "") ->
 
 def journal_rows(root, *, limit: int = 0):
     """The journal's rows, oldest first (the newest ``limit`` when given). Unreadable lines are skipped."""
-    path = Path(root) / JOURNAL_FILENAME
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    rows = []
-    for line in lines[-limit:] if limit else lines:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
+    # §4UD (F5): the shared reader — one byte that is not UTF-8 raised UnicodeDecodeError here
+    from .schema import read_jsonl_rows
+    rows = read_jsonl_rows(Path(root) / JOURNAL_FILENAME, what="sentiment journal")
+    return rows[-limit:] if limit else rows
 
 
 def _ago(seconds: float) -> str:

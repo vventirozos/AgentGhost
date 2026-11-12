@@ -10,7 +10,12 @@ agent's memory of what it CREATED, for whom, on which host:
   whose host changed is shown as ``missing (host changed)``, never silently
   dropped;
 * ``destroyed_at`` / ``destroyed_by`` — a lab destroyed by ANOTHER owner key is
-  named in the owner's next listing (UNIFIED §12 finding 13).
+  named in the owner's next listing (UNIFIED §12 finding 13);
+* ``expires_hard`` — when the lab is gone AT THE LATEST (the host's maximum
+  lifetime, written at create; NULL = unknown, or a kept machine). §4UD F10:
+  a reader with no host call (the briefing's RUNNING block) marks a row past
+  it instead of listing a lab that cannot exist any more. It never closes the
+  row: only the host's answer does that.
 
 Stored references are ids, never URLs (UNIFIED §11: every URL comes from the
 labs API at read time). Small and synchronous; every method swallows its own
@@ -40,7 +45,8 @@ CREATE TABLE IF NOT EXISTS labs (
     destroyed_at REAL,
     destroyed_by TEXT NOT NULL DEFAULT '',
     leftovers    TEXT NOT NULL DEFAULT '',
-    leaf         TEXT NOT NULL DEFAULT ''
+    leaf         TEXT NOT NULL DEFAULT '',
+    expires_hard REAL
 );
 CREATE INDEX IF NOT EXISTS labs_owner ON labs(owner);
 """
@@ -60,6 +66,8 @@ class LabInventory:
                 c.execute("ALTER TABLE labs ADD COLUMN leftovers TEXT NOT NULL DEFAULT ''")
             if "leaf" not in cols:                      # §4SX D4 r2 #5: the autopilot leaf that made the lab
                 c.execute("ALTER TABLE labs ADD COLUMN leaf TEXT NOT NULL DEFAULT ''")
+            if "expires_hard" not in cols:              # §4UD F10: when the lab is gone at the latest
+                c.execute("ALTER TABLE labs ADD COLUMN expires_hard REAL")
 
     def _connect(self) -> sqlite3.Connection:
         c = sqlite3.connect(str(self.path), timeout=5)
@@ -67,14 +75,16 @@ class LabInventory:
         return c
 
     def record_create(self, lab_id: str, *, owner: str, origin: str, template: str,
-                      label: str = "", purpose: str = "", host_id: str = "", leaf: str = "") -> None:
+                      label: str = "", purpose: str = "", host_id: str = "", leaf: str = "",
+                      expires_hard: Optional[float] = None) -> None:
         try:
             now = time.time()
             with self._lock, self._connect() as c:
                 c.execute("INSERT OR REPLACE INTO labs (lab_id, owner, origin, template, label, purpose, host_id, "
-                          "created_at, leaf) VALUES (?,?,?,?,?,?,?,?,?)",
+                          "created_at, leaf, expires_hard) VALUES (?,?,?,?,?,?,?,?,?,?)",
                           (lab_id, owner or "", origin or "", template or "", (label or "")[:80],
-                           (purpose or "")[:120], host_id or "", now, (leaf or "")[:80]))
+                           (purpose or "")[:120], host_id or "", now, (leaf or "")[:80],
+                           float(expires_hard) if expires_hard else None))
                 c.execute("DELETE FROM labs WHERE destroyed_at IS NOT NULL AND destroyed_at < ?",
                           (now - PRUNE_AFTER_S,))
         except Exception:  # noqa: BLE001
@@ -87,6 +97,24 @@ class LabInventory:
                           "AND destroyed_at IS NULL", (time.time(), by or "", lab_id))
         except Exception:  # noqa: BLE001
             logger.warning("lab inventory: destroy not recorded", exc_info=True)
+
+    def set_expiry(self, lab_id: str, expires_hard: Optional[float]) -> None:
+        """§4UD F10: the hard expiry of a live row; None clears it (`lab keep`: a kept machine has none)."""
+        try:
+            with self._lock, self._connect() as c:
+                c.execute("UPDATE labs SET expires_hard = ? WHERE lab_id = ? AND destroyed_at IS NULL",
+                          (float(expires_hard) if expires_hard else None, lab_id))
+        except Exception:  # noqa: BLE001
+            logger.warning("lab inventory: expiry not recorded", exc_info=True)
+
+    def clear_leaf(self, lab_id: str) -> None:
+        """§4UD r2: the lab is no longer its leaf's (the owner took it over): no leaf end, sweep or boot pass
+        acts on it again. The row itself stays live."""
+        try:
+            with self._lock, self._connect() as c:
+                c.execute("UPDATE labs SET leaf = '' WHERE lab_id = ?", (lab_id,))
+        except Exception:  # noqa: BLE001
+            logger.warning("lab inventory: leaf tag not cleared", exc_info=True)
 
     def mark_leftovers(self, lab_id: str, leftovers: str) -> None:
         """§4SX D2 r5: the host destroyed the lab but could not remove everything. The row stays LIVE with the

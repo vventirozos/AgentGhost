@@ -469,6 +469,7 @@ let animationFrameId = 7, renderer = {renderer}, _animationPaused = false, _last
 const cancelled = [], started = [];
 globalThis.cancelAnimationFrame = (id) => cancelled.push(id);
 function animate() {{ started.push(1); animationFrameId = 9; }}
+const resumed = []; function _playPendingShade() {{ resumed.push(1); }}   // §4UG review: a held moment, on resume
 """ + fn, expr)
 
     def test_pause_cancels_the_frame_and_resume_restarts_it(self, graph_js):
@@ -577,7 +578,8 @@ globalThis.window = {}; globalThis.setInterval = () => 0;
 globalThis.fetch = async (url) => ({ ok: true, status: 200, json: async () => url.includes('interface')
     ? { ok: true, tls: { days_left: 6 } } : { memory_system_loaded: true, biological_watchdog_alive: true } });
 """
-        out = eval_js(harness + extract_js_function(status_js, "initStatus")
+        from tests.test_4ud_mood_ui import status_mood_scope      # §4UD: initStatus reads the mood through these
+        out = eval_js(harness + status_mood_scope(status_js) + extract_js_function(status_js, "initStatus")
                       + "\ninitStatus({});\nawait new Promise(r => setTimeout(r, 30));\n",
                       "({ degraded: indicator.classes.has('degraded'), title: indicator.title })")
         assert out["degraded"] is True
@@ -589,6 +591,6 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=19.21" in index
-    assert "workspace.js?v=9.7" in app and "matrix_graph.js?v=19.21" in app
-    assert "sessions.js?v=7.13" in ws and "status.js?v=7.9" in ws
+    assert "app.js?v=19.25" in index
+    assert "workspace.js?v=9.11" in app and "matrix_graph.js?v=19.25" in app
+    assert "sessions.js?v=7.13" in ws and "status.js?v=8.3" in ws

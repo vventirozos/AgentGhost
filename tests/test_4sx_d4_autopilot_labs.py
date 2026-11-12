@@ -55,8 +55,8 @@ def test_a_no_lab_answer_is_remembered_per_build_and_only_a_create_clears_it():
     assert W.take_seen("b1") == ("labs_down", 0) and W.take_seen("b1") == ("", 0)     # taken once
     W.note_outcome("b2", "", True, action="create")                 # the build got its lab
     assert W.take_seen("b2") == ("", 0)
-    W.note_outcome("b3", "lab_budget_exceeded", False, action="create",
-                   text="LAB ERROR (budget_exceeded): x\nneeded_mb: 3072\navailable_mb: 100")
+    # §4UD F15: the size is passed as a number (this pinned the parse of "needed_mb: 3072" out of the result text)
+    W.note_outcome("b3", "lab_budget_exceeded", False, action="create", needed_mb=3072)
     assert W.take_seen("b3") == ("lab_capacity", 3072)
     for rc in ("lab_lab_limit", "lab_disk_low"):
         W.note_outcome("b4", rc, False, action="create")
@@ -178,7 +178,7 @@ async def test_held_ids_lifts_everything_when_labs_are_no_longer_configured(stor
 
 async def test_the_lab_tool_tells_lab_waits_under_the_running_build(monkeypatch):
     seen = []
-    monkeypatch.setattr(W, "note_outcome", lambda key, rc, ok, action="", text="": seen.append((key, rc, ok, action)))
+    monkeypatch.setattr(W, "note_outcome", lambda key, rc, ok, action="", needed_mb=0: seen.append((key, rc, ok, action)))
     tok = W.BUILD_KEY.set("bld1")
     try:
         L._note_lab_wait(ToolOutcome("x", status=OutcomeStatus.FAILED, reason_code="lab_lab_limit"), "create")
@@ -739,8 +739,7 @@ async def test_a_failed_agentic_build_carries_the_lab_wait_its_leaves_hit(tmp_pa
     from ghost_agent.core import coding_loop as CL
 
     async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        W.note_outcome(str(leaf_id).rsplit("-a", 1)[0], "lab_lab_limit", False, action="create",
-                       text="LAB ERROR\nneeded_mb: 2048")
+        W.note_outcome(str(leaf_id).rsplit("-a", 1)[0], "lab_lab_limit", False, action="create", needed_mb=2048)
         return "SUMMARY: could not get a lab"
     monkeypatch.setattr(CL, "run_leaf_turn", fake_turn)
 

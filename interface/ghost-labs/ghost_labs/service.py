@@ -17,6 +17,12 @@ from .store import Store
 
 log = logging.getLogger("ghost_labs")
 
+#: review §4UD — behaviours a client may rely on only when the host names them in /v1/health:
+#:   drop_data_guard — DELETE ?drop_data=1 keeps the data volumes while another kept version of the app exists
+#:   exec_free_lock  — destroy and member ops do not wait behind a running foreground exec
+#:   job_env         — a detached exec passes body.env to the job (it always did; named for clients that probe)
+FEATURES = ("drop_data_guard", "exec_free_lock", "job_env", "exec_cancel", "member_ready", "tree")
+
 
 class ActionLog:
     """JSON lines in /var/lib/ghost-labs/actions.log (contract v1 §10). Never output, never keys.
@@ -54,11 +60,13 @@ class ActionLog:
 
 class Service:
     def __init__(self, cfg: C.Config, client, templates_dir: Path, state_dir: Path, runner=None,
-                 start_threads: bool = True):
+                 start_threads: bool = True, extra_templates_dir: Optional[Path] = None):
         import subprocess
         self.cfg = cfg
         self.store = Store(Path(state_dir) / "labs.sqlite")
-        self.templates = T.load_dir(templates_dir)
+        self.templates, notes = T.load_all(templates_dir, extra_templates_dir)
+        for note in notes:
+            log.warning("template file in %s is NOT used — %s", extra_templates_dir, note)
         self.mgr = Manager(cfg, self.store, client, self.templates, runner=runner or subprocess.run)
         self.actions = ActionLog(Path(state_dir) / "actions.log", redactor=self.mgr.redact_text)
         self.mgr.actions = self.actions
@@ -190,4 +198,6 @@ class Service:
                 # review 11-05 #5: labs whose bridge the interface rules don't cover (recreate them)
                 "legacy_lab_networks": self.mgr.legacy_lab_networks(),
                 "apps": self.kept.apps_health() if self.kept else [],
-                "url_host": self.cfg.resolved_dns_name}
+                "url_host": self.cfg.resolved_dns_name,
+                # review §4UD: what this build decides by itself, so a client need not (read with a default)
+                "features": list(FEATURES)}

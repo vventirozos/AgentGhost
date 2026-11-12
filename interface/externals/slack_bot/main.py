@@ -794,7 +794,8 @@ async def post_feedback(payload: dict) -> int | None:
     flush) AND on 5xx (the agent restarting — the exact window this ship's
     deploy creates; reactions are never replayed, so a dropped label is
     gone for good). Returns the final HTTP status, or None on transport
-    failure."""
+    failure. §4UD: the status carries the agent's JSON answer as ``.body``
+    (`FeedbackStatus`; {} when it is not a JSON object) — ``mood_note``."""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             for attempt in (1, 2):
@@ -806,10 +807,46 @@ async def post_feedback(payload: dict) -> int | None:
                                      or r.status_code >= 500):
                     await asyncio.sleep(5.0)
                     continue
-                return r.status_code
+                status = FeedbackStatus(r.status_code)
+                try:
+                    body = r.json()
+                except Exception:  # noqa: BLE001 — no body is no note
+                    body = {}
+                status.body = body if isinstance(body, dict) else {}
+                return status
     except Exception as e:  # noqa: BLE001 — feedback must never crash the bot
         logger.warning("feedback POST failed: %s", e)
     return None
+
+
+class FeedbackStatus(int):
+    """An HTTP status that also carries the response body (a dict)."""
+    body: dict = {}
+
+
+#: §4UD (F15): the hold note already said — (the note's text, the day it was said). The text names the
+#: hold's end, so one text on one day is one hold
+_HOLD_NOTE_SAID: dict = {"key": None}
+
+
+async def say_hold_note(note, channel: str | None, user: str | None, poster=None) -> bool:
+    """§4UD (F15): the owner thumbed a reply while their own set mood holds —
+    the agent answers the label with ``mood_note`` ("Your set mood holds
+    until 04:00 — this thumb is saved but doesn't move the mood", the text
+    the web client shows). Said ONCE per hold, to the owner only (an
+    ephemeral message: nobody else in the channel sees that a mood was
+    set), with no model call. True when it was posted. Never raises."""
+    text = " ".join(str(note or "").split())
+    key = (text, time.strftime("%Y-%m-%d", time.localtime(time.time() - 4 * 3600)))
+    if not text or not channel or not user or _HOLD_NOTE_SAID.get("key") == key:
+        return False
+    try:
+        await (poster or app.client.chat_postEphemeral)(channel=channel, user=user, text=text)
+    except Exception as e:  # noqa: BLE001 — a note never costs the label
+        logger.info("hold note not posted: %s: %s", type(e).__name__, e)
+        return False
+    _HOLD_NOTE_SAID["key"] = key
+    return True
 
 
 async def resolve_owner_id() -> str | None:
@@ -1716,16 +1753,33 @@ async def handle_direct_message(event, say, body=None):
                            requester=event.get("user"))
 
 
+@app.event("reaction_removed")
+async def handle_reaction_removed(event, say=None):
+    """§4UD (G1): a 👍/👎 taken off a bot reply → the thumb is withdrawn from
+    the agent's mood (`/api/feedback` signal ``retract:positive`` /
+    ``retract:negative``). The turn's outcome LABEL stays (the sidecar has
+    no un-label; a changed mind posts the opposite reaction). Same parties,
+    same index, same maintenance rule as `handle_reaction`. Needs the
+    ``reaction_removed`` bot event in the Slack app config."""
+    await _on_reaction(event, removed=True)
+
+
 @app.event("reaction_added")
 async def handle_reaction(event, say=None):
     """👍/👎 on a bot reply → human outcome label via /api/feedback.
 
     Accepted only from the OWNER or the REQUESTER of that specific reply.
     Reactions on messages the bot didn't post (or whose index entry was
-    evicted) are ignored silently. ``reaction_removed`` is deliberately
-    not handled — a changed mind posts the opposite reaction and the
-    sidecar's last-write-wins resolves it. Requires the ``reactions:read``
+    evicted) are ignored silently. Requires the ``reactions:read``
     scope + ``reaction_added`` bot event in the Slack app config."""
+    await _on_reaction(event, removed=False)
+
+
+async def _on_reaction(event, removed: bool):
+    """Both reaction events. ``removed`` (§4UD, `reaction_removed`): the
+    thumb was taken off — sent as a retract, which withdraws it from the
+    mood and leaves the label. (Not a parameter of the handlers themselves:
+    Bolt injects their arguments by name.)"""
     try:
         item = event.get("item") or {}
         if item.get("type") != "message":
@@ -1776,14 +1830,20 @@ async def handle_reaction(event, say=None):
             logger.warning("maintenance: %s reaction by %s on req %s NOT sent to the agent "
                            "(label dropped)", signal, reactor, entry.get("req_id"))
             return
+        if removed:
+            signal = f"retract:{signal}"
         payload = build_feedback_payload(
             entry, signal, reactor, OWNER_ID,
             reaction_name=str(event.get("reaction") or ""))
         status = await post_feedback(payload)
+        body = getattr(status, "body", None) or {}
         if status is not None and 200 <= status < 300:
             logger.info("feedback %s for req %s by %s (:%s:) → HTTP %s",
                         signal, entry.get("req_id"), reactor,
                         event.get("reaction"), status)
+            if reactor == OWNER_ID and body.get("mood_note"):
+                # §4UD (F15): the thumb is saved but the owner's set mood holds — said once per hold
+                await say_hold_note(body.get("mood_note"), item.get("channel"), reactor)
         elif status == 403:
             # The agent refused the label BY DESIGN (a thumb on a channel
             # member's turn, §4KJ R10) — not a failure; .err stays quiet.

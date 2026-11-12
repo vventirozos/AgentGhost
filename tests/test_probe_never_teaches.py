@@ -92,7 +92,8 @@ def test_every_opt_in_states_its_reason():
     # 9: §4NE — the regression suite reads its own test runs back by id
     # §4NM: the three ontology-purity opt-ins left with optim/tool_ontology.py → 6
     # §4SZ: 8 and 9 above left with the replay loop and the regression suite → 4
-    assert found == 4, f"{found} opt-ins — a new one is a decision, record it here"
+    # §4UG: scripts/character_probe.py reads its OWN probes back by request id (what each heard, its tool calls) → 5
+    assert found == 5, f"{found} opt-ins — a new one is a decision, record it here"
 
 
 # --- the perfection protocol ----------------------------------------------

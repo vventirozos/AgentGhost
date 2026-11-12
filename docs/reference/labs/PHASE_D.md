@@ -102,8 +102,11 @@ live app run; state crashloop, or stopped with `last_error` and not `stopped_by_
 (autonomous_activity SEVERITY_NOTIFY, `notify_tool` rate limit) per down period; the period ends when state is `up`
 again. Down period kept on the run row (note field `down_since`), so a restart does not re-notify.
 
-**E. Not in D3:** agent_api sidecar (`agent_api_url`), `cron`/`backup` hook authoring help, `lan`. They pass through as
-plain fields of `keep` but nothing in the agent depends on them.
+**E. Not in D3:** agent_api sidecar (`agent_api_url`), `cron`/`backup` hook authoring help, `lan`. Of these, the tool
+forwards only `data`, `secrets`, `cron` and `backup` to the host's `keep` (`tools/labs.py` `_kept_action`). `lan` and
+`agent_api_url` are NOT passed (corrected 2026-11-11, review §4UD F18: this line said they pass through): each opens
+a network path (the home LAN with no login; the agent's API through a sidecar), so the owner sets them on the host
+API directly.
 
 ### D3-design review r1 (independent reader, 11-04): 5 HIGH, 6 MED, 3 LOW — these OVERRIDE D3-design
 - **H1** no `lineage` argument: the agent always sends lineage = the lab owner's project id; the HOST also refuses a

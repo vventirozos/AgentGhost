@@ -52,7 +52,8 @@ def test_self_state_roundtrip():
     )
     d = s.to_dict()
     assert set(d) == {"schema_version", "mood", "last_session_at",
-                      "last_owner_turn_at"}                           # §4TB: no question / thread lists; §4TC: the owner stamp
+                      "last_owner_turn_at",                          # §4TB: no question / thread lists; §4TC: the owner stamp
+                      "last_owner_job_at"}                           # §4UD (F9): when a job of the owner's last worked
     s2 = SelfState.from_dict(d)
     assert s2.mood is not None
     assert (s2.mood.label, s2.mood.intensity, s2.mood.p, s2.mood.e) == ("cheerful", 2, 0.6, 0.45)

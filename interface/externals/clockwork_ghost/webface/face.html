@@ -44,6 +44,9 @@ const API = {
   wake() { call('wake'); },
   form(name) { call('form', name); },
   agentMood(label, intensity) { call('agentMood', [label, intensity]); },
+  // §4UG: the mood's two numbers, its shade (one moment per stamp) and the
+  // character's dials; sent just before agentMood.
+  agentExtras(x) { call('agentExtras', x); },
   cycle() { call('cycle'); },
   // The signal layer the browser has had since 2026-09-11 (see
   // turnstatus.face_signals_for_ticker for where these come from).
@@ -85,6 +88,12 @@ function apply(op, arg) {
     // Two forms: this is animations on / off, like the browser's button.
     case 'cycle':   face.cycleForm(); break;
     case 'agentMood': fn('setMoodHue', arg[0], arg[1]); break;
+    case 'agentExtras': {
+      const x = arg || {};
+      fn('setMoodPoint', x.p, x.e);
+      if (x.live) { fn('noteShade', x.shade, x.shadeAt, x.shadeAgeS); fn('setCharacter', x.character || null); }
+      break;
+    }
     case 'phase':   fn('setPhase', arg || null); break;
     case 'tool':    fn('noteToolCall'); break;
     case 'recall':  fn('noteRecall'); break;

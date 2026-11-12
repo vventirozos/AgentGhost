@@ -134,7 +134,7 @@ def test_a_clean_turn_of_several_calls_lifts_it_a_little(tmp_path, owner):
     assert (_mood(agent).p, _mood(agent).e) == (pytest.approx(0.10), 0.0)          # §4TX: 0.04 + 0.02 x 3
     two = _traj_agent(tmp_path / "two")
     _record(two, _turn([("execute", OK)] * 2))
-    assert _mood(two).p == pytest.approx(0.04)                                      # §4UB: half of 0.08
+    assert _mood(two).p == pytest.approx(0.08)                                      # §4UH-e2e: all of 0.08
 
 
 def test_a_designed_stop_is_not_a_failure(tmp_path, owner):
@@ -715,7 +715,7 @@ async def test_a_confirmed_correction_lowers_the_mood(tmp_path, owner):
     await agent._promote_prior_turn_after_judge(HISTORY, "no, he is nine")
     v = _mood(agent)
     assert (v.p, v.e, v.label, v.intensity) == (-0.20, 0.0, "down", 1)
-    assert v.cause == "the owner corrected my last reply"
+    assert v.cause == "the owner corrected one of my replies"
     agent._maybe_promote_prior_turn_via_user_correction.assert_called_once()      # the promotion is untouched
 
 
@@ -889,11 +889,15 @@ def test_a_request_that_is_not_the_owners_neither_ends_the_quiet_nor_stamps_a_tu
     try:
         agent._mood_owner_arrived()
         _record(agent, _turn(BAD_TURN), rid=rid)
-        assert _mood(agent).label == "bored"                              # still read off the running quiet
+        # §4UD (F9): the wake-up of a job the OWNER started that did work is the one exception — the agent is
+        # working for the owner, so the quiet is measured from there (this test pinned "bored" for it too)
+        assert _mood(agent).label == ("neutral" if rid.startswith("job-") else "bored")
     finally:
         request_id_context.reset(tok)
-    assert _stamp(st) == before
-    assert [r["kind"] for r in _rows(agent)] == ["quiet", "quiet"]       # no "quiet ended"
+    assert _stamp(st) == before                                           # the OWNER's stamp: never moved
+    assert bool(st.state.last_owner_job_at) is rid.startswith("job-")
+    # no "quiet ended" (the job's stamp came before any reader saw the quiet: no row of it at all)
+    assert [r["kind"] for r in _rows(agent)] == ([] if rid.startswith("job-") else ["quiet", "quiet"])
 
 
 def test_a_members_request_neither_ends_the_quiet_nor_stamps_a_turn(tmp_path, owner):
@@ -1068,3 +1072,46 @@ def test_the_owner_clock_is_written_in_one_place_and_never_by_the_mood():
                     if isinstance(t, ast.Attribute) and t.attr == "last_owner_activity_time":
                         writes.append(str(path.relative_to(src)))
     assert writes == ["core/agent.py"]
+
+
+# ── §4UD-b M1: a thumb sent again after a restart ────────────────────────────
+
+def test_the_same_thumb_resent_after_a_restart_does_not_count_again(tmp_path):
+    agent, sm = _labelled(tmp_path)
+    assert F.apply_human_label(agent, "r1", "positive", source="web")["ok"]
+    assert sm.mood().p == 0.25
+    for _ in range(2):                                   # restart: the in-memory ledger is gone
+        agent.context.self_model = sm = SelfModel(root=tmp_path / "self")
+        assert F.apply_human_label(agent, "r1", "positive", source="web")["ok"]   # the client's retry
+    assert sm.mood().p == pytest.approx(0.25, abs=0.01)  # before: 0.25 → 0.50 → 0.75
+
+
+def test_a_thumb_taken_back_and_given_again_still_counts(tmp_path):
+    agent, sm = _labelled(tmp_path)
+    F.apply_human_label(agent, "r1", "positive", source="web")
+    F.retract_human_label(agent, "r1", F.SIGNAL_RETRACT_POSITIVE, source="web")
+    assert sm.mood().p == pytest.approx(0.0, abs=0.01) and sm.thumb_was_taken_back("r1")
+    F.apply_human_label(agent, "r1", "positive", source="web")          # its label never changed
+    assert sm.mood().p == pytest.approx(0.25, abs=0.01) and not sm.thumb_was_taken_back("r1")
+    F.apply_human_label(agent, "r1", "positive", source="web")          # and again: no second thumb
+    assert sm.mood().p == pytest.approx(0.25, abs=0.01)
+
+
+def test_a_changed_thumb_after_a_restart_still_counts(tmp_path):
+    agent, sm = _labelled(tmp_path)
+    F.apply_human_label(agent, "r1", "positive", source="web")
+    agent.context.self_model = sm = SelfModel(root=tmp_path / "self")
+    F.apply_human_label(agent, "r1", "negative", source="web")          # the label changed: a new verdict
+    assert sm.mood().p < 0.25
+
+
+def test_a_take_back_marks_only_its_own_reply_and_the_marks_are_bounded(tmp_path):
+    sm = SelfModel(root=tmp_path / "self")
+    for r in ("r1", "r2"):
+        sm.note_owner_reaction(M.KIND_THUMB_UP, reply_id=r)
+    sm.retract_owner_reaction(True, reply_id="r2")
+    assert sm.thumb_was_taken_back("r2") and not sm.thumb_was_taken_back("r1")
+    for i in range(SelfModel.LEDGER_REPLIES + 10):
+        sm.note_owner_reaction(M.KIND_THUMB_UP, reply_id=f"x{i}")
+        sm.retract_owner_reaction(True, reply_id=f"x{i}")
+    assert len(sm._taken_back) <= SelfModel.LEDGER_REPLIES

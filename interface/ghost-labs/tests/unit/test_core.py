@@ -380,10 +380,14 @@ def test_create_refused_without_firewall(env):
     assert e.value.code == "firewall_missing"
 
 
-def test_ttl_caps(env):
+def test_ttl_caps(env, monkeypatch):
+    # §4UD G3: create clamps to the class maximum as extend does (it refused; the test pinned the refusal)
     m = env
+    monkeypatch.setattr(m, "wait_ready", lambda *a, **k: None)
+    out = m.create({"template": "pg-single", "owner": "conversation:c", "ttl_idle_s": 90000}, "owner")
+    assert out["clamped_to_s"] == 86400 and m.store.lab(out["lab_id"])["ttl_idle_s"] == 86400
     with pytest.raises(LabError) as e:
-        m.create({"template": "pg-single", "owner": "conversation:c", "ttl_idle_s": 90000}, "owner")
+        m.create({"template": "pg-single", "owner": "conversation:c", "ttl_idle_s": 0}, "owner")
     assert e.value.extra["field"] == "ttl_idle_s"
 
 

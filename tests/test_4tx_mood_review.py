@@ -149,8 +149,8 @@ def test_a_turn_that_closed_a_task_lifts_the_mood(tmp_path, owner):
     assert agent._mood_turn_signals(msgs, ASK, OWNER_RID).tasks_done == 1
     _record(agent, msgs)
     v = agent.context.self_model.mood()
-    # §4UB: the one clean call earns the small-turn reward (half of 0.06) next to the task
-    assert (v.p, v.e) == (pytest.approx(0.15 + 0.03), pytest.approx(0.10))
+    # §4UB: the one clean call earns the small-turn reward (§4UH-e2e: all of 0.06) next to the task
+    assert (v.p, v.e) == (pytest.approx(0.15 + 0.06), pytest.approx(0.10))
     assert v.recent[-1]["cause"].startswith("finished 1 project task")
 
 
@@ -398,7 +398,10 @@ def test_the_turn_record_carries_the_tone_the_reply_was_given(tmp_path, owner):
     with _req(rid=OWNER_RID, conv="c-rec"):
         A._mood_tone_block(agent.context)
     assert A.mood_tone_heard(OWNER_RID) == {"mood": "irritable, 2 of 3", "manner": "", "remarked": False,
-                                            "audience": "owner"}
+                                            "audience": "owner",
+                                            # §4UD (W2): the same as values, for readers that must not parse
+                                            "label": "irritable", "intensity": 2, "manner_name": "",
+                                            "manner_intensity": 0}
     traj = _record(agent, [{"role": "user", "content": ASK}])
     assert traj.extra["mood_tone"]["mood"] == "irritable, 2 of 3"
     assert A.mood_tone_heard("web-nobody") is None
@@ -979,12 +982,12 @@ async def test_a_step_down_does_not_hand_others_a_mood_the_owners_share_made(tmp
         sm.state.nudge(*M.EV_SENTIMENT_NEGATIVE, "the owner's message sounded unhappy", M.KIND_SENTIMENT)
     assert (sm.mood().label, sm.mood().intensity) == ("down", 2)
     assert (sm.mood(audience="others").label, sm.mood(audience="others").intensity) == ("down", 1)
-    old_p, old_share = sm.state._state.mood.p, sm.state._state.mood.private_p
     await _set(sm, mood="down", step=-1)                                 # "don't be so down"
     assert (sm.mood().label, sm.mood().intensity) == ("down", 1)
     assert sm.mood(audience="others").intensity <= 1                     # not raised by the step
-    new_p = sm.state._state.mood.p
-    assert sm.state._state.mood.private_p == pytest.approx(old_share * new_p / old_p, abs=2e-3)   # the same PART
+    # §4UD (F1): the pair the owner places holds no tone share (this test pinned "the same PART carried
+    # over" — a share of nothing; the cap is what keeps others from a mood the owner's messages made)
+    assert sm.state.private_sides() == (0.0, 0.0, 0.0, 0.0)
 
 
 async def test_an_explicit_set_is_the_owners_word_and_clears_the_share(tmp_path, owner):

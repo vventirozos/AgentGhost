@@ -73,8 +73,10 @@ class FakeContainer:
         return {"memory_stats": {"usage": self.mem_usage, "stats": {"inactive_file": self.mem_inactive_file,
                                                                    "active_file": self.mem_active_file}}}
 
-    def logs(self, tail=200):
-        return b"log line\n"
+    def logs(self, tail=200, stream=False, follow=None):
+        # like the Docker SDK: a streamed log FOLLOWS unless told not to — and a followed log never ends
+        assert not (stream and follow is not False), "a streamed log must say follow=False"
+        return iter([b"log line\n"]) if stream else b"log line\n"
 
     def put_archive(self, path, data):
         self.client.archives.append((self.name, path, len(data)))

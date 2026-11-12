@@ -801,6 +801,31 @@ def shares_head_tools(payload, ref) -> bool:
         return False
 
 
+def head_bind_tag(payload) -> Optional[str]:
+    """§4UD (H1; r2: by CONTENT): what a main call's prompt OPENS WITH, as one
+    tag — ``<hash of its tool list>:<hash of its system text>``, the two
+    hashes `head_shape` already takes of a payload (the template renders the
+    tools, then the system text, then the conversation; the per-request state
+    block rides in the last messages, never in the system slot, which the
+    agent keeps byte-stable). None when the payload cannot be read.
+
+    A saved conversation carries the tag of the call that built its state,
+    and a request restores a file only when its own call has the same tag. A
+    conversation saved before the head changed (a deploy, a profile edit, a
+    disabled tool) parts from the new prompt inside the head, before every
+    checkpoint, and llama re-read head and conversation from token 0 (req
+    eaf6e7e8, 11-08: 26,193 tokens, 174 s).
+
+    The tag reads only the call's own payload. Round 1 derived it from the
+    warm-up's reference (`_head_ref`), which is a tick old: a request sent
+    after a profile edit and before the next tick was tagged by its tools
+    only, its follow-up after the tick by the whole head, and a file that
+    opened with exactly the follow-up's prompt was discarded. The effort level
+    is not in the tag: it is in the file's key and its ``effort`` field."""
+    shape = head_shape(payload)
+    return f"{shape[3]}:{shape[1]}" if shape is not None else None
+
+
 def note_head_reference(llm, payload) -> None:
     """The re-warm's payload IS the head: remember its shape."""
     shape = head_shape(payload)
@@ -883,6 +908,12 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
                     llm._slot_changed_at = time.monotonic()        # §4SA review: a change of hands
                 llm._slot_session = key
                 llm._slot_session_used = time.monotonic()
+                if not llm._slot_moved_on:
+                    # §4UD (H1): what this conversation's state opens with, read
+                    # from the call that just built it. A call of the owner
+                    # that is not the conversation's own (its picture look:
+                    # "moved on") leaves the tag of the state before it.
+                    llm._slot_head_tag = head_bind_tag(payload)
                 # §4RP-b: and which request of it — its next request re-reads
                 # from just past the head (the first message's label changes)
                 from ..utils.logging import request_id_context
@@ -954,8 +985,10 @@ def slot_kept(llm, now: Optional[float] = None) -> bool:
         if not getattr(llm, "_slot_session", None):
             return False
         if conv_keep_enabled() and callable(getattr(llm, "before_background_dispatch", None)):
-            # (review: only while the agent's hook can free it — no head-save
-            # plan, no hook, and the window applies as before)
+            # (review: only while the agent's hook can free it — no hook, and
+            # the window applies as before. §4UD: the hook is installed whenever
+            # head saves are on, with or without a save plan; without one it
+            # asks for a plan before it saves, and says so when it cannot)
             return True
         used = getattr(llm, "_slot_session_used", None)
         if not isinstance(used, (int, float)):
@@ -1072,6 +1105,127 @@ def usage_tokens(obj) -> Optional[tuple]:
         return None
 
 
+def usage_cached(obj) -> Optional[int]:
+    """§4UD (H12): how many prompt tokens llama took from its cache for a
+    completion or one raw SSE line — ``usage.prompt_tokens_details.cached_tokens``,
+    else ``timings.cache_n``; None when the reply does not say."""
+    try:
+        if isinstance(obj, (bytes, bytearray)):
+            obj = obj.decode("utf-8", "replace")
+        if isinstance(obj, str):
+            body = obj.strip()
+            if body.startswith("data:"):
+                body = body[5:].strip()
+            if not body or body == "[DONE]" or not ('"usage"' in body or '"timings"' in body):
+                return None
+            obj = json.loads(body)
+        if not isinstance(obj, dict):
+            return None
+        u = obj.get("usage")
+        det = u.get("prompt_tokens_details") if isinstance(u, dict) else None
+        v = det.get("cached_tokens") if isinstance(det, dict) else None
+        if v is None:
+            t = obj.get("timings")
+            v = t.get("cache_n") if isinstance(t, dict) else None
+        return int(v) if v is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+#: §4UD (H12): a restored HEAD that gave less than this share of its tokens
+#: to the call it was restored for is said in one line
+RESTORE_REUSE_MIN = 0.5
+#: §4UD (H12, r3): a restored CONVERSATION was not reused when llama's cached
+#: count is at most the head plus this many tokens — nothing past the head.
+#: Not a share: a correct resume re-reads its last state block (0.9k–3.3k
+#: live), which is most of a small conversation's part past the head, while
+#: the wrong file (H1) lands at or below the head
+RESTORE_PAST_HEAD_MIN = 256
+
+
+def expect_restore_reuse(llm, payload, key: str, what: str, n: int, head_n: Optional[int] = None) -> None:
+    """§4UD (H12): a file was just restored into the slot for THE CALL that
+    sends ``payload`` (the dispatch hook runs right before it) — that call's
+    reply will say whether llama reused it. The record is held by the payload
+    object itself: no other call can answer for it, a later request with the
+    same id cannot inherit it, and it ends with that call (`check_restore_reuse`
+    with or without a count, `drop_restore_check` when the call failed).
+    ``n``: the restored tokens; for a conversation, ``head_n`` is the head's
+    size as the file's meta recorded it at the save."""
+    try:
+        llm._restore_check = {"payload": payload, "key": str(key), "what": str(what),
+                              "n": int(n), "head_n": head_n}
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def drop_restore_check(llm, payload) -> None:
+    """The call a restore was made for ended without a reply (an error, a
+    cancel): its expectation ends with it."""
+    try:
+        rec = getattr(llm, "_restore_check", None)
+        if isinstance(rec, dict) and rec.get("payload") is payload:
+            llm._restore_check = None
+            logger.info("head disk: reuse of the restored %s (head-%s) not checked — its call did not finish",
+                        rec.get("what"), rec.get("key"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def check_restore_reuse(llm, payload, cached: Optional[int]) -> None:
+    """§4UD (H12): called when a main call ends, with llama's cached-token
+    count for it (None: not reported). "It resumes at its last message" was
+    logged from the restore's token count alone; whether the call REUSED the
+    state was never read (in H1 it reused nothing, for 174 s). No network.
+
+    LOG ONLY (r3): it writes one WARNING line and deletes nothing. The wrong
+    file is refused before the restore by the bound tag (`head_bind_tag`); a
+    file deleted here was written again under the same key at the next
+    displacement. Only the call the restore was made for is judged.
+
+    A CONVERSATION: nothing past the head came from the cache —
+    ``cached <= head_n + RESTORE_PAST_HEAD_MIN`` (the head alone is most of a
+    file, live 24.4k of 28.9k–33.5k, so a share of the whole file says
+    nothing). A meta without ``head_n`` (a file saved before this) is not
+    judged. A HEAD: under `RESTORE_REUSE_MIN` of its tokens.
+
+    Not seen by this check: a conversation whose history was rewritten AFTER
+    its first messages (the 500-message window, a compression summary) reuses
+    more than the margin past the head and re-reads the rest — no line. A
+    stream reports its count on a chunk that carries ``usage`` or ``timings``;
+    one that carries neither is "not checked"."""
+    try:
+        rec = getattr(llm, "_restore_check", None)
+        if not isinstance(rec, dict) or rec.get("payload") is not payload:
+            return
+        llm._restore_check = None
+        what, key, n = rec.get("what"), rec.get("key"), int(rec.get("n") or 0)
+        if cached is None:
+            logger.info("head disk: reuse of the restored %s (head-%s) not checked — llama's reply "
+                        "carried no cached-token count", what, key)
+            return
+        if what == "conversation":
+            head_n = rec.get("head_n")
+            if not isinstance(head_n, int) or isinstance(head_n, bool) or head_n <= 0:
+                logger.info("head disk: reuse of the restored conversation (head-%s) not judged — its "
+                            "file does not record the head's size", key)
+                return
+            low = cached <= head_n + RESTORE_PAST_HEAD_MIN
+            how = f"nothing past the head ({head_n:,} tokens)"
+        else:
+            low = cached < n * RESTORE_REUSE_MIN
+            how = "under half of the head"
+        if not low:
+            logger.info("head disk: the restored %s was reused (restored %d, reused %d)", what, n, cached)
+            return
+        pretty_log("Head Disk",
+                   f"the restored {what} was not reused: restored {n:,} tokens, reused {cached:,} — {how}; "
+                   f"llama re-read the rest (file head-{key} kept)",
+                   icon=Icons.HEAD_FAIL, level="WARNING")
+    except Exception:  # noqa: BLE001 — a check must never fail a call
+        pass
+
+
 def release_slot_session(llm, stamp: bool = True) -> None:
     """§4RP: the head is back in the slot — no conversation owns it. §4SA
     review: ``stamp`` marks the change of hands, so a stream that opened before
@@ -1083,6 +1237,7 @@ def release_slot_session(llm, stamp: bool = True) -> None:
         llm._slot_request = None
         llm._slot_request_calls = 0           # §4SA review: a count never outlives its request
         llm._slot_request_start = llm._slot_request_end = None   # §4SO: nor its growth
+        llm._slot_head_tag = None             # §4UD: nor what its state opened with
         if stamp:
             llm._slot_changed_at = time.monotonic()
     except Exception:  # noqa: BLE001
@@ -3927,6 +4082,7 @@ class LLMClient:
                 try:
                     _result = await self._do_chat_completion(payload, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 except BaseException:
+                    drop_restore_check(self, payload)        # §4UD (H12): ends with its call
                     if _side:
                         # §4RW-g review: a look that timed out mid-prefill left
                         # its own tokens in the slot — counted as displaced, so
@@ -3944,8 +4100,12 @@ class LLMClient:
                 # (R2 lenses A and C).
                 _leg = served_leg(_result)
                 _served = _leg.get("served_by") or ""
-                if self._served_on_main_box(_served):
+                _on_main_box = self._served_on_main_box(_served)
+                if _on_main_box:
                     note_main_slot_prompt(self, payload, task_label, usage=usage_tokens(_result))   # §4OT, §4SO
+                # §4UD (H12): the call a restore was made for has ended (a reply
+                # another node served says nothing about the slot: no count)
+                check_restore_reuse(self, payload, usage_cached(_result) if _on_main_box else None)
                 self._maybe_record_call(payload, _result,
                                         use_worker=(_served == "worker"),
                                         use_vision=(_served == "vision"),
@@ -4808,6 +4968,11 @@ class LLMClient:
                         if _on_main and ('"usage"' in chunk if isinstance(chunk, str) else
                                          isinstance(chunk, (bytes, bytearray)) and b'"usage"' in chunk):
                             _state["usage"] = usage_tokens(chunk) or _state.get("usage")   # §4SO
+                        if _on_main and isinstance(getattr(self, "_restore_check", None), dict):
+                            # §4UD (H12): only while a restore waits for its verdict —
+                            # the count rides on a chunk with `usage` or `timings`
+                            _c = usage_cached(chunk)
+                            _state["cached"] = _c if _c is not None else _state.get("cached")
                         yield chunk
                 finally:
                     async with self._foreground_lock:
@@ -4817,6 +4982,10 @@ class LLMClient:
         finally:
             if _state["open"]:
                 self._main_streams_open = max(0, int(getattr(self, "_main_streams_open", 1) or 1) - 1)
+            # §4UD (H12): the stream ended — with its cached count, or (cut,
+            # failed, never opened) without one: either way the expectation
+            # armed for THIS payload ends here (no other call's is touched)
+            check_restore_reuse(self, payload, _state.get("cached"))
             # §4SD: a side stream that failed mid-prefill left its own tokens
             # in the slot — counted as displaced (as `chat_completion`'s side path)
             if _on_main and (_state["answered"] or (side_main and not is_background and _state["open"])):

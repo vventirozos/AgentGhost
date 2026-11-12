@@ -4,7 +4,12 @@
 Each mutant is an exact (file, old, new) replacement that undoes or weakens one fix. A fresh copy
 of interface/ghost-labs is made OUTSIDE the repo per mutant (src is never touched), the unit suite
 runs there, and the mutant is KILLED when any test fails. Survivors are printed; the score is the
-convergence signal. Usage: python3 scripts/mutate_4sx_labs.py [name-substring]
+convergence signal. Usage: python3 scripts/mutate_4sx_labs.py [-jN] [--no-shell] [name-substring]
+
+`-jN` runs N mutants at a time (each has its own tree copy). `--no-shell` SKIPS the mutants judged by the
+integration test on the real labs host (tagged "shell") instead of ssh-ing there, and lists them. Every mutant is
+py_compile'd first (NOCOMP is never a kill). Both controls are always run: the known-bad one must be KILLED and
+the no-op must SURVIVE, or the run is void.
 """
 import os
 import shutil
@@ -17,6 +22,9 @@ SRC = os.path.join(ROOT, "interface", "ghost-labs")
 K, L, S = "ghost_labs/kept.py", "ghost_labs/labs.py", "ghost_labs/service.py"
 
 MUTANTS = [
+    # controls (protocol §R2): the known-bad one must DIE and the no-op ("D34 CONTROL no-op", below) must SURVIVE,
+    # or the run is void
+    ("CONTROL known-bad", L, '        return f"ghost-lab-{lab_id}-{member}"', '        return f"ghost-lab-{member}"'),
     # K1
     # K2
     ("K2 switch no reverse", K, 'back = self._reverse(from_lab, lab_id, old_last, f"switch to {lab_id} failed")',
@@ -84,8 +92,7 @@ MUTANTS = [
     # K11
     ("K11 read_raw size unchecked", L, '        if int(stat.get("size", 0)) > limit:', "        if False:"),
     ("K11 read_raw stream unbounded", L, "            if len(buf) > cap:", "            if False:"),
-    ("K11 read_raw dirs allowed", L, "        if mode & (1 << 31) or mode & (1 << 27) or mode & (1 << 26) or mode & (1 << 25):   # dir, symlink, device, pipe\n            raise LabError(\"bad_request\", f\"{path} is not a regular file\", field=\"path\")\n        if int(stat.get(\"size\", 0)) > limit:",
-     "        if False:\n            raise LabError(\"bad_request\", f\"{path} is not a regular file\", field=\"path\")\n        if int(stat.get(\"size\", 0)) > limit:"),
+    ('K11 read_raw dirs allowed', L, '        if mode & (1 << 31) or mode & (1 << 27) or mode & (1 << 26) or mode & (1 << 25):   # dir, symlink, device, pipe\n            # `kind`', '        if False:   # dir, symlink, device, pipe\n            # `kind`'),
     ("deploy b64 lenient", K, 'data = base64.b64decode(str(body["archive_b64"]), validate=True)', 'data = base64.b64decode(str(body["archive_b64"]))'),
     # twin
     ("twin real secrets", K, '            tapp = {**app, "lineage": tlin,', '            tapp = {**app, "lineage": app["lineage"],'),
@@ -96,12 +103,12 @@ MUTANTS = [
      "        pass"),
     # core pins
     ("core preemption evicts when infeasible", L, "                auto = []        # evicting everything still wouldn't fit: evict nothing", "                pass"),
-    ("core extend 0 allowed", L, '        want = as_int(body, "ttl_idle_s", -1, 1, 10 ** 9)', '        want = as_int(body, "ttl_idle_s", -1, 0, 10 ** 9)'),
-    ("core extend not clamped", L, "        self.store.update_lab(lab_id, ttl_idle_s=min(want, cap))", "        self.store.update_lab(lab_id, ttl_idle_s=want)"),
+    ('core extend 0 allowed', L, '    want = as_int(body, "ttl_idle_s", default, 1, 10 ** 9)', '    want = as_int(body, "ttl_idle_s", default, 0, 10 ** 9)'),
+    ('core extend not clamped', L, '    return min(want, int(cap)), want > int(cap)', '    return want, want > int(cap)'),
     ("core reconcile drops kept", L, '            if lid not in seen and lab["lifetime"] == "kept":', '            if False:'),
-    ("core creating stays", L, '            if lab["state"] == "creating":\n                # the build finished', "            if False:\n                # the build finished"),
+    ('core creating stays', L, '            if lab["state"] == "creating" or (lab["lifetime"] == "kept" and lab["state"] == "destroying"):', '            if False:'),
     ("core destroy_owner stops", L, '            except LabError as e:\n                failed.append(', '            except KeyError as e:\n                failed.append('),
-    ("core retire mounted", L, '                if loads(row["app_json"], {}).get("mounted"):', "                if False:"),
+    ('core retire mounted', L, '                if loads(row["app_json"], {}).get("mounted") and str(row.get("origin") or "") != "probe":', '                if False:'),
     # ---- anchors refreshed after review r2
     ("K2 rollback no snapshot precheck", K, '                if not r or not Path(r[0]["path"]).exists():\n                    raise LabError("unknown_backup"',
      '                if False:\n                    raise LabError("unknown_backup"'),
@@ -129,7 +136,7 @@ MUTANTS = [
     ("r2#6 reconcile keeps switching", L, '            if lab["state"] in ("switching", "rehearsing"):', "            if False:"),
     ("r2#7 cross-project name", K, '            if l["lifetime"] == "kept" and l["lineage"] != lineage and l["app_json"] \\',
      '            if False and l["lineage"] != lineage and l["app_json"] \\'),
-    ("r2#8 keep unlocked", K, "        with self._app_locked(name):\n            return self._keep(lab_id, body)", "        return self._keep(lab_id, body)"),
+    ('r2#8 keep unlocked', K, '        with self._app_locked(name):\n            return self._keep(lab_id, body, origin)', '        return self._keep(lab_id, body, origin)'),
     ("r2#8 app lock never blocks", K, "        if not lk.acquire(timeout=timeout):", "        if not lk.acquire(blocking=False) and False:"),
     ("r2#9 snapshot app member", K, '"pre_restore", only_member=m)', '"pre_restore")'),
     ("r2#11 member down ignored", K, "                if not running:", "                if False:"),
@@ -160,8 +167,7 @@ MUTANTS = [
      '                    if True:\n                        app.update(state="stopped", last_error=MEMBER_DOWN)'),
     ("r3#9 staged installs cron", K, '            if app.get("mounted"):\n                self._install_cron(lab_id, app)       # a staged version', '            if True:\n                self._install_cron(lab_id, app)       # a staged version'),
     ("r3#12 adopted row KeyError", K, '        if not a.get("name"):\n            # an adopted row', '        if False:\n            # an adopted row'),
-    ("K1 retire_at kept on new", K, '                self.store.update_lab(lab_id, retire_at=None)\n                self._clear_marks(from_lab)',
-     '                self._clear_marks(from_lab)'),
+    ('K1 retire_at kept on new', K, '                self.store.update_lab(lab_id, retire_at=self._live_retire(lab_id))\n                self._clear_marks(from_lab)', '                self._clear_marks(from_lab)'),
     ("K2 switch raise not caught", K, '            except Exception as e:  # noqa: BLE001\n                res, err = {"ok": False, "error": _msg(e)}, _msg(e)\n            if res.get("ok"):\n                # the switch is done',
      '            except LabError:\n                raise\n            if res.get("ok"):\n                # the switch is done'),
     ("K7 marker not read back", K, '            known = sorted(marked or app.get("data_seed") or [])', '            known = sorted(app.get("data_seed") or [])'),
@@ -189,19 +195,7 @@ MUTANTS = [
     ("r4#3 undo failure not held", K, 'o.update(state="stopped", stopped_by_owner=True, last_error=f"rollback failed', 'o.update(state="stopped", last_error=f"rollback failed'),
     ("r4#4 lease error escapes", K, "        except Exception as e:  # noqa: BLE001\n            log.exception(\"lease move to %s\", lab_id)",
      "        except KeyError as e:  # noqa: BLE001\n            log.exception(\"lease move to %s\", lab_id)"),
-    ("r4#4 switched_from saved after lease", K, '''                new.update(switched_from=from_lab, switch_snapshot=snap["backup_id"],
-                           switch_snapshots=[x["backup_id"] for x in snap["members"]])
-                self._save(lab_id, new)
-                self.store.update_lab(from_lab, retire_at=time.time() + 86400, state="stopped")
-                self.store.update_lab(lab_id, retire_at=None)
-                self._clear_marks(from_lab)
-                lease_err = self._lease_or_note(lab_id, new, "switched")''', '''                lease_err = self._lease_or_note(lab_id, new, "switched")
-                new.update(switched_from=from_lab, switch_snapshot=snap["backup_id"],
-                           switch_snapshots=[x["backup_id"] for x in snap["members"]])
-                self._save(lab_id, new)
-                self.store.update_lab(from_lab, retire_at=time.time() + 86400, state="stopped")
-                self.store.update_lab(lab_id, retire_at=None)
-                self._clear_marks(from_lab)'''),
+    ('r4#4 switched_from saved after lease', K, '                new.update(switched_from=from_lab, switch_snapshot=snap["backup_id"],\n                           switch_snapshots=[x["backup_id"] for x in snap["members"]])\n                self._save(lab_id, new)\n                self.store.update_lab(from_lab, retire_at=time.time() + 86400, state="stopped")\n                self.store.update_lab(lab_id, retire_at=self._live_retire(lab_id))\n                self._clear_marks(from_lab)\n                lease_err = self._lease_or_note(lab_id, new, "switched")', '                lease_err = self._lease_or_note(lab_id, new, "switched")\n                new.update(switched_from=from_lab, switch_snapshot=snap["backup_id"],\n                           switch_snapshots=[x["backup_id"] for x in snap["members"]])\n                self._save(lab_id, new)\n                self.store.update_lab(from_lab, retire_at=time.time() + 86400, state="stopped")\n                self.store.update_lab(lab_id, retire_at=self._live_retire(lab_id))\n                self._clear_marks(from_lab)'),
     # ---- review r5
     ("r5#1 recovery switch snapshots unmounted", K, '                if self._app(from_lab).get("mounted") else {"backup_id": None, "members": []}',
      '                if True else {"backup_id": None, "members": []}'),
@@ -217,7 +211,7 @@ MUTANTS = [
      "        if now - self._last_daily"),
     ("r5#4 recover leaves app running", K, "                    try:\n                        self._stop_proc(lid, a)\n                    except Exception:  # noqa: BLE001\n                        pass\n                    a.pop",
      "                    a.pop"),
-    ("r5#5 recover keeps retire_at", K, "                    self.store.update_lab(lid, retire_at=None)\n", ""),
+    ('r5#5 recover keeps retire_at', K, '                    self.store.update_lab(lid, retire_at=self._live_retire(lid))\n', ''),
     ("r5#6 seed precheck off", K, "                if r[\"exit_code\"] != 0:\n                    raise LabError(\"bad_request\", f\"data_seed path {p!r} is in neither",
      "                if False:\n                    raise LabError(\"bad_request\", f\"data_seed path {p!r} is in neither"),
     # ---- review r6
@@ -249,10 +243,8 @@ MUTANTS = [
      "                    and (not self.mgr.may_touch_kept(l, origin))):"),
     ("D34 live retire none", K, "        return time.time() + 86400 if r and str(r[\"origin\"] or \"\") == \"probe\" else None",
      "        return None"),
-    ("D34 retire keeps secrets", K, "        if lineage and not others:\n            self.store.x(\"DELETE FROM secrets WHERE lineage=?\", (lineage,))",
-     "        if False:\n            self.store.x(\"DELETE FROM secrets WHERE lineage=?\", (lineage,))"),
-    ("D34 retire keeps lease", K, "            self.store.x(\"DELETE FROM ports WHERE lease_key=?\", (key,))\n            if self.cfg.ts_services:\n                try:\n                    self.mgr.ports.unserve_service(app[\"name\"])\n                except Exception:  # noqa: BLE001\n                    log.exception(\"unserve %s\", app[\"name\"])\n            try:\n                vols +=",
-     "            if self.cfg.ts_services:\n                try:\n                    self.mgr.ports.unserve_service(app[\"name\"])\n                except Exception:  # noqa: BLE001\n                    log.exception(\"unserve %s\", app[\"name\"])\n            try:\n                vols +="),
+    ('D34 retire keeps secrets', K, '                self.store.x("DELETE FROM secrets WHERE lineage=? AND app=?", (lineage, app["name"]))', '                pass'),
+    ('D34 retire keeps lease', K, '                self.store.x("DELETE FROM ports WHERE lease_key=?", (key,))\n                try:\n                    vols +=', '                try:\n                    vols +='),
     ("D34 retire fresh vol kept", K, "        vols = [data_volume_name(lineage, app[\"name\"], m, lab_id) for m in members] if app.get(\"name\") and fresh else []",
      "        vols = []"),
     ("D34 retire shared vol kept", K, "                vols += [v.name for v in self.docker.volumes.list(", "                vols += [] and [v.name for v in self.docker.volumes.list("),
@@ -277,15 +269,123 @@ MUTANTS = [
      "            if False:"),
     ("D34 no app_mounted", L, "                **({\"app_mounted\": bool((loads(row[\"app_json\"], None) or {}).get(\"mounted\"))}",
      "                **({\"app_mounted\": False}"),
+    ('UD Q1 exec no wait for state change', L, '            if lk.acquire(timeout=LOCK_WAIT_S, over_exec=True):\n                lk.release()\n', ''),
+    ('UD Q3 detach no guard', L, '            lk = self._acquire_guarded(lab_id, lambda row: self.guard_kept_mutation(row, origin, "exec"),\n                                       over_exec=True)', '            lk = self._acquire_guarded(lab_id, lambda row: None,\n                                       over_exec=True)'),
+    ('UD Q5 detach keeps lock', L, '                return self.start_job(lab_id, member, cmd, body)\n            finally:\n                lk.release()', '                return self.start_job(lab_id, member, cmd, body)\n            finally:\n                pass'),
+    ('UD G4 member op guard stale', L, '        lk = self._acquire_guarded(lab_id, lambda row: self.guard_kept_mutation(row, origin, f"member {action}"),', '        lk = self._acquire_guarded(lab_id, lambda row: None,'),
+    ('UD G5 screenshot guard stale', L, '        lk = self._acquire_guarded(lab_id, lambda r: self.guard_kept_read(r, origin, "pages"), over_exec=False)', '        lk = self._acquire_guarded(lab_id, lambda r: None, over_exec=False)'),
+    ('UD G6 exec guard stale', L, '        lk = self._acquire_guarded(lab_id, lambda row: self.guard_kept_mutation(row, origin, "exec"), over_exec=False)', '        lk = self._acquire_guarded(lab_id, lambda row: None, over_exec=False)'),
+    ('UD J1 job read unguarded', L, '            self.guard_kept_read(row, reader, "job output")', '            pass'),
+    ('UD J2 job start rows outlive lab', L, '            for t in ("jobs", "job_starts"):\n                self.store.x(f"DELETE FROM {t} WHERE job_id=?", (job_id,))\n            self.get(lab_id)', '            pass'),
+    ('UD FA2 member fails the create', L, '            self.store.update_lab(lab_id, state="ready" if last["passed"] else "unready", readiness_json=dumps(last))', '            self.store.update_lab(lab_id, state="ready" if (last["passed"] and all(got.values())) else "unready", readiness_json=dumps(last))'),
+    ('UD FA5 wait ends on template only', L, '            if last["passed"] and all(got.values()):\n                break', '            if last["passed"]:\n                break'),
+    ('UD FA8 detail drops ready', L, '"ready_cmd": ready_cmd.get(m["name"], "")} if m["name"] in ready else {})})', '"ready_cmd": ready_cmd.get(m["name"], "")} if False else {})})'),
+    ('UD FB1 cancel never seen', L, '            if cancel is not None and cancel.is_set():', '            if False:'),
+    ('UD FB2 stale pid signalled', L, '            if _started_at(c) != started:\n                return None', '            if False:\n                return None'),
+    ('UD FB6 anyone may cancel', L, '            return bool(tag) and r["origin"] == "autopilot" and r["tag"] == tag', '            return True'),
+    ('UD FB7 empty tag matches', L, '            return bool(tag) and r["origin"] == "autopilot" and r["tag"] == tag', '            return r["origin"] == "autopilot" and r["tag"] == tag'),
+    ('UD FB10 cancel no kept guard', L, '        self.guard_kept_mutation(row, origin, "cancel")', '        pass'),
+    ('UD FB12 cancel silent refusal', L, '        if running and not mine:', '        if False:'),
+    ('UD FC2 tree dotdot ok', L, '        if not parts or any(p == ".." for p in parts):', '        if not parts:'),
+    ('UD FC3 tree links ok', L, '                    if not (ti.isfile() or ti.isdir()):\n                        raise LabError("bad_request", f"entry {ti.name!r} is a link or a device', '                    if False:\n                        raise LabError("bad_request", f"entry {ti.name!r} is a link or a device'),
+    ('UD FC5 tree no unpacked bound', L, '                    if total > limit:', '                    if False:'),
+    ('UD FC8 tree put kept guard', L, '        self.guard_kept_mutation(self.get(lab_id), origin, "put")\n        self.touch(lab_id, origin)\n        member, path = str(body.get("member") or ""), str(body.get("path") or "")\n        self.member(lab_id, member)\n        if not path.startswith("/") or ".."', '        self.get(lab_id)\n        self.touch(lab_id, origin)\n        member, path = str(body.get("member") or ""), str(body.get("path") or "")\n        self.member(lab_id, member)\n        if not path.startswith("/") or ".."'),
+    ('UD FC11 tree get keeps links', L, '                if "\\\\" in rel or "\\x00" in rel or not (ti.isfile() or ti.isdir() or linked is not None):', '                if False:'),
+    ('UD FC12 tree get no redact', L, '                red = linked if linked is not None else redact.apply_bytes(src.extractfile(ti).read(), rules)', '                red = linked if linked is not None else src.extractfile(ti).read()'),
+    ('UD H1a destroy waits', L, 'lk = self._locked(lab_id, None, True)', 'lk = self._locked(lab_id, None, False)'),
+    ('UD H1c exec holds the lock (old world)', L, '            while self._held or (self._execs and not over_exec):', '            while self._held or self._execs:'),
+    ('UD H2 reaper idle', L, '                if self.exec_running(lid):', '                if False:'),
+    ('UD H2b exec end touch', L, "        self.touch(lab_id, origin)          # idle time counts from the command's END", '        pass'),
+    ('UD H3a no watchdog', L, '        dog.start()\n', '        pass\n'),
+    ('UD H3c body loop unbounded', L, '                chunk = resp.read1(min(65536, want_bytes - len(buf)))', '                conn.sock.settimeout(15); hit.clear(); chunk = resp.read(want_bytes - len(buf))'),
+    ('UD H3d screenshot fresh 60', L, '            res = c.wait(timeout=max(1, int(min(60.0, left))))', '            res = c.wait(timeout=60)'),
+    ('UD H4a stale ignored', L, '            stale = bool(was and was[0]["container_started"] and was[0]["container_started"] != _started_at(c))', '            stale = False'),
+    ('UD H4c signal though ended', L, '            if rc == "" and not stale:', '            if not stale:'),
+    ('UD H5 pump re-sum', L, '        while len(self.chunks) > 1 and self.held - len(self.chunks[0]) >= self.keep:', '        while len(self.chunks) > 1 and sum(len(x) for x in self.chunks) - len(self.chunks[0]) >= self.keep:'),
+    ('UD H5b pump total wrong', L, '        self.held += len(chunk)\n', '        self.held += 1\n'),
+    ('UD H6 kept read guard', L, '        if row["lifetime"] == "kept" and not self.may_touch_kept(row, origin):\n            raise LabError("owner_only", f"lab {row[\'lab_id\']} is kept (production): unattended', '        if False:\n            raise LabError("owner_only", f"lab {row[\'lab_id\']} is kept (production): unattended'),
+    ('UD H7 host drops shared data', K, '            sharing = self._other_versions(lab_id, row["lineage"], app["name"])', '            sharing = []'),
+    ('UD H7b fresh kept', K, '            if app.get("mounted") and sharing and app["data"] != "fresh":', '            if app.get("mounted") and sharing:'),
+    ('UD H8 logs unbounded', L, '        want = cap + redact.margin(pairs)          # fetched', '        want = cap = 10 ** 9          # fetched'),
+    ('UD H9a create refuses above max', L, '    return min(want, int(cap)), want > int(cap)', '    return want, False'),
+    ('UD H9b loopback never', L, '            return r.exit_code == 0\n        except Exception:  # noqa: BLE001\n            return False', '            return False\n        except Exception:  # noqa: BLE001\n            return False'),
+    ('UD H11 job tail flag', L, '"output_truncated": bool(cut), "log_path": f"{d}.log",', '"output_truncated": False, "log_path": f"{d}.log",'),
+    ('UD H12 loopback asked without refused', L, '            if r["refused"] and self._listens_on_loopback(lab_id, m["name"], port):', '            if self._listens_on_loopback(lab_id, m["name"], port):'),
+    ('UD H14 clamp boundary', L, '    return min(want, int(cap)), want > int(cap)', '    return min(want, int(cap)), want >= int(cap)'),
+    ('UD H17 job_starts not cleared', 'ghost_labs/store.py', 'for t in ("labs", "members", "jobs", "job_starts"):', 'for t in ("labs", "members", "jobs"):'),
+    ('UD H22 job read: autopilot only', L, '            self.guard_kept_read(row, reader, "job output")', '            if reader == "autopilot":\n                self.guard_kept_read(row, reader, "job output")'),
+    ('UD H31 max_expires_at for kept', L, '(float(row["created_at"]) + int(row["ttl_max_s"])) if row["lifetime"] != "kept" else None,', '(float(row["created_at"]) + int(row["ttl_max_s"])),'),
+    ('UD H35 features not in health', S, '                "features": list(FEATURES)}', '                }'),
+    ('UD H36 reader not passed', 'ghost_labs/api.py', '        return mgr.job(lab_id, job_id, tail_bytes, reader=_origin(x_origin))', '        return mgr.job(lab_id, job_id, tail_bytes)'),
+    ('UD H42 post-check keeps rows', L, '            for t in ("jobs", "job_starts"):\n                self.store.x(f"DELETE FROM {t} WHERE job_id=?", (job_id,))\n            self.get(lab_id)', '            self.get(lab_id)'),
+    ('UD G1 guard not re-read', L, '            guard(self.get(lab_id))', '            self.get(lab_id)'),
+    ('UD G2 lock kept on refusal', L, '            guard(self.get(lab_id))\n        except BaseException:\n            lk.release()\n            raise', '            guard(self.get(lab_id))\n        except ZeroDivisionError:\n            raise'),
+    ('UD G3 member lock not released', L, '            m = self.member(lab_id, member)\n        finally:\n            lk.release()', '            m = self.member(lab_id, member)\n        finally:\n            pass'),
+    ('UD2 m7 member checks share the turn', L, '            for name, cmd in (want.items() if last["passed"] else ()):', '            for name, cmd in want.items():'),
+    ('UD2 m7 a check with no time left runs', L, '                if got[name] or left < 1:', '                if got[name]:'),
+    ('UD2 m7 unchecked starts as not ready', L, 'got: Dict[str, Optional[bool]] = {name: None for name in want}', 'got: Dict[str, Optional[bool]] = {name: False for name in want}'),
+    ('UD2 m7 detail turns null into false', L, '(None if ready[m["name"]] is None else bool(ready[m["name"]]))', 'bool(ready[m["name"]])'),
+    ('UD2 M4 path not normalised', L, '        path = posixpath.normpath(path)', '        path = path'),
+    ('UD2 M4 root fetched', L, '        if path == "/" or path.startswith("//"):', '        if False:'),
+    ('UD2 M4 any first component', L, '                if not parts or parts[0] != base or ".." in parts:', '                if not parts or ".." in parts:'),
+    ('UD2 M4 dotdot entry', L, '                if not parts or parts[0] != base or ".." in parts:', '                if not parts or parts[0] != base:'),
+    ('UD2 H21 skipped unbounded', L, '"skipped": skipped[:50], "skipped_total": len(skipped),', '"skipped": skipped, "skipped_total": len(skipped),'),
+    ('UD2 H21 skipped total wrong', L, '"skipped": skipped[:50], "skipped_total": len(skipped),', '"skipped": skipped[:50], "skipped_total": len(skipped[:50]),'),
+    ('UD2 H28 hardlink sent as a file', L, '                if "\\\\" in rel or "\\x00" in rel or not (ti.isfile() or ti.isdir() or linked is not None):', '                if "\\\\" in rel or "\\x00" in rel or not (ti.isfile() or ti.isdir() or ti.islnk()):'),
+    ('UD2 m4 backslash name sent', L, '                if "\\\\" in rel or "\\x00" in rel or not (ti.isfile() or ti.isdir() or linked is not None):', '                if not (ti.isfile() or ti.isdir()):'),
+    ('UD2 H26 mode bits kept', L, 'clean.size, clean.mode = len(red), (int(ti.mode) & 0o755) or 0o644', 'clean.size, clean.mode = len(red), int(ti.mode)'),
+    ('UD2 m8 unbounded inflate', L, '        out = d.decompress(data, cap + 1)', '        out = d.decompress(data)'),
+    ('UD2 m8 plain tar unbounded', L, '        if len(data) > cap:', '        if False:'),
+    ('UD2 m8 put reads the archive unbounded', L, '            plain = tar_bytes_bounded(data, limit, slack=2048 * (TREE_MAX_ENTRIES + 2))\n            with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as src,', '            plain = data\n            with tarfile.open(fileobj=io.BytesIO(plain), mode="r:*") as src,'),
+    ('UD2 m1 kill never looked at', L, '            return r.exit_code == 0\n        except Exception:  # noqa: BLE001 — a paused', '            return True\n        except Exception:  # noqa: BLE001 — a paused'),
+    ('UD2 m1 failed kill reads as killed', L, 'nothing was confirmed\n            return False', 'nothing was confirmed\n            return True'),
+    ('UD2 m1 always killed', L, '            killed = bool(sent) or not th.is_alive()', '            killed = True'),
+    ('UD2 m1 mark dropped while it runs', L, '            if pump is not None and pump.is_alive():', '            if False:'),
+    ('UD2 m1 cancel guesses killed', L, '"outcome": r["outcome"] if r["ended"].is_set() else ""} for r in mine]}', '"outcome": "killed"} for r in mine]}'),
+    ('UD2 m1 cancel does not wait', L, '            r["ended"].wait(max(0.0, end - time.monotonic()))', '            pass'),
+    ('UD2 H2 put backslash name', L, 'if raw.startswith("/") or "\\x00" in raw or "\\\\" in raw:', 'if raw.startswith("/") or "\\x00" in raw:'),
+    ('UD2 H19 ready command unbounded', 'ghost_labs/templates.py', 'len(ready) > 500', 'len(ready) > 5000'),
+    ('UD2 H24 cancel is not a use', L, '        self.touch(lab_id, origin)\n        rules = self.redactor()\n        for r in mine:', '        rules = self.redactor()\n        for r in mine:'),
+    ('UD2 m1 second cancel does not retry', L, '                if self._kill_group(*r["kill"]):', '                if False:'),
+    ('UD2 m1 retry forgets the mark', L, '                state["kill"] = (c, xid, started)', '                pass'),
+    ('UD3 hard link never resolved', L, '                        linked = sent.get("/".join(tparts[1:]))', '                        linked = None'),
+    ('UD3 hard link to another folder', L, '                    if tparts and tparts[0] == base:', '                    if tparts:'),
+    ('UD3 hard link target not remembered', L, '                sent[rel] = red', '                pass'),
+    ('UD3 link bytes re-read unredacted', L, '                red = linked if linked is not None else redact', '                red = redact'),
+    ('UD3 etc template wins', 'ghost_labs/templates.py', '        if t["name"] in shipped_names:\n', '        if False:\n'),
+    ('UD3 etc templates ignored', 'ghost_labs/templates.py', '            out[t["name"]] = t\n', '            pass\n'),
+    ('UD3 shadow silent', 'ghost_labs/service.py', '            log.warning("template file in %s is NOT used', '            log.debug("template file in %s is NOT used'),
+    ('UD3 server reads etc', 'ghost_labs/server.py', 'svc = Service(cfg, docker.from_env(timeout=300), SHIPPED_DIR, C.STATE_DIR,', 'svc = Service(cfg, docker.from_env(timeout=300), C.CONFIG_DIR / "templates", C.STATE_DIR,'),
+    ('UD3 N1 pid file dropped when not killed', L, '+ ("" if killed is False else f" /run/ghost-exec/{xid}.pid")])', '+ f" /run/ghost-exec/{xid}.pid"])'),
+    ('UD3 r4 pid never removed', L, '+ ("" if killed is False else f" /run/ghost-exec/{xid}.pid")])', '+ ""])'),
+    ('UD3 r5 host stdin rm dropped', L, 'c.exec_run(["sh", "-c", f"rm -f /run/ghost-exec/{xid}.stdin"\n', 'c.exec_run(["sh", "-c", "true" + f""\n'),
+    ('UD3 r5 links any', L, '                        links += linked is not None', '                        links += 1'),
+    ('UD3 r4 stdin file left by the shell', L, "rm -f /run/ghost-exec/{xid}.stdin; '", "'"),
+    ('UD3 r4 stdin left when exec cannot start', L, '            if stdin is not None:           # nothing started', '            if False:           # nothing started'),
+    ('UD3 r3 built bytes unbounded', L, '                if total > built_max:', '                if False:'),
+    ('UD3 r4 built bound 4x', L, '                if total > built_max:', '                if total > limit:'),
+    ('UD3 r4 links blamed always', L, '+ (" (hard links count as copies)" if links else "")', '+ " (hard links count as copies)"'),
+    ('UD3 r3 zero padding refused', L, 'd.unused_data.strip(b"\\0"):', 'd.unused_data:'),
+    ('UD3 r3 broken etc file fatal', 'ghost_labs/templates.py', '        except Exception as e:  # noqa: BLE001 — any failure of ONE', '        except (LabError, ValueError) as e:  # noqa: BLE001 — any failure of ONE'),
+    ('UD3 r4 etc clash called shipped', 'ghost_labs/templates.py', '        if t["name"] in shipped_names:', '        if t["name"] in out:'),
+    ('UD3 N1 no pid file reads killed', L, '2>/dev/null) || exit 2;', '2>/dev/null) || exit 0;'),
+    ('UD3 N1 pid file kept after the kill', L, '|| { rm -f $f.pid $f.stdin; "', '|| { "'),
+    ('UD3 N3 host cut gzip accepted', L, '    if not d.eof or d.unused_data.strip(b"\\0"):', '    if False:'),
+    ('UD3 N3 host second gzip ignored', L, '    if not d.eof or d.unused_data.strip(b"\\0"):', '    if not d.eof:'),
 ]
 
 
 REMOTE = "disorder"     # mutants tagged "shell" are judged by tests/integration/test_seed_cmd.py there (real GNU shell)
 
 
+NO_SHELL = False
+
+
 def run(m, base):
     name, f, old, new = m[:4]
     shell = len(m) > 4 and m[4] == "shell"
+    if shell and NO_SHELL:
+        return name, "SKIPPED(shell)"
     itest = m[5] if len(m) > 5 else "tests/integration/test_seed_cmd.py"
     work = tempfile.mkdtemp(prefix="mut4sx-", dir=base)
     tree = os.path.join(work, "gl")
@@ -297,9 +397,20 @@ def run(m, base):
         shutil.rmtree(work)
         return name, f"BAD-ANCHOR({n})"
     open(p, "w").write(s.replace(old, new))
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "tests/unit"],
-                       cwd=tree, capture_output=True, text=True, timeout=300)
-    killed = r.returncode != 0
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    if f.endswith(".py") and subprocess.run([sys.executable, "-m", "py_compile", p], capture_output=True,
+                                            env=env).returncode != 0:
+        shutil.rmtree(work)
+        return name, "NOCOMP"
+    try:
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "tests/unit"],
+                           cwd=tree, capture_output=True, text=True, timeout=300, env=env)
+        killed = r.returncode != 0
+        if r.returncode in (4, 5):
+            shutil.rmtree(work)
+            return name, f"HARNESS(pytest exit {r.returncode})"
+    except subprocess.TimeoutExpired:
+        killed = True                      # a mutant that wedges the suite is caught by it
     if not killed and shell:
         dst = f"/tmp/mut4sx-{os.getpid()}-{os.path.basename(work)}"   # one per mutant; sudo pytest leaves root files
         subprocess.run(["rsync", "-a", "--delete", tree + "/", f"{REMOTE}:{dst}/"], check=True, capture_output=True)
@@ -312,16 +423,31 @@ def run(m, base):
 
 
 def main():
-    sel = sys.argv[1] if len(sys.argv) > 1 else ""
-    base = tempfile.mkdtemp(prefix="battery4sx-")         # outside the repo
-    ms = [m for m in MUTANTS if sel in m[0]]
-    res = [run(m, base) for m in ms]
+    global NO_SHELL
+    args = sys.argv[1:]
+    jobs = 1
+    for a in list(args):
+        if a.startswith("-j"):
+            jobs = int(a[2:]); args.remove(a)
+        elif a == "--no-shell":
+            NO_SHELL = True; args.remove(a)
+    sel = args[0] if args else ""
+    base = tempfile.mkdtemp(prefix="battery4sx-")         # outside the repo (TMPDIR decides where)
+    ms = [m for m in MUTANTS if sel in m[0] or "CONTROL" in m[0]]
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        res = list(ex.map(lambda m: run(m, base), ms))
     shutil.rmtree(base, ignore_errors=True)
     for name, st in res:
         print(f"{st:14s} {name}")
-    killed = sum(st == "KILLED" for _, st in res)
-    print(f"\nscore {killed}/{len(res)}")
-    return 0 if killed == len(res) else 1
+    by = dict(res)
+    ctl_ok = by.get("CONTROL known-bad") == "KILLED" and by.get("D34 CONTROL no-op") == "SURVIVED"
+    judged = [(n, st) for n, st in res if "CONTROL" not in n and not st.startswith("SKIPPED")]
+    killed = sum(st == "KILLED" for _, st in judged)
+    print(f"\ncontrols: known-bad {by.get('CONTROL known-bad')}, no-op {by.get('D34 CONTROL no-op')}"
+          f" -> {'OK' if ctl_ok else 'VOID RUN'}")
+    print(f"score {killed}/{len(judged)}  skipped(shell) {sum(st.startswith('SKIPPED') for _, st in res)}")
+    return 0 if ctl_ok and killed == len(judged) else 1
 
 
 if __name__ == "__main__":

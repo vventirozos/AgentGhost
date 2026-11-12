@@ -19,6 +19,8 @@ double in tests), so the contracts are executed off the device:
 from __future__ import annotations
 
 import asyncio
+import calendar
+import math
 import os
 import re
 import tempfile
@@ -312,29 +314,226 @@ async def fetch_turns(client, base: str, key: str):
     return data if isinstance(data, dict) else None
 
 
-async def fetch_mood(client, base: str, key: str):
-    """``(label, intensity)`` from ``/api/health``, or None when the agent did
-    not answer or sent something else: the face then keeps the look it has.
-    §4UA: ``(rest_label, "rest")`` while the mood is neutral and the
-    character's resting point is not."""
+# ── the agent's mood ────────────────────────────────────────────────────────
+# §4UD. ``mood_view`` is the only reader of health's ``mood`` block here: the
+# face's look, the words on the status line and "unknown" after too many polls
+# without one are all made from what it returns. These are the web UI's rules
+# (interface/static/status.js ``moodView``, ``moodWords``, ``moodClock``,
+# ``moodTrack``, ``faceLookFor``) in Python; tests/test_4ud_mood_ui.py runs one
+# table of payloads through both and they must give the same look and words.
+
+#: the labels a face has a look for (matrix_graph.js MOOD_LOOKS) + neutral
+MOOD_LABELS = ("neutral", "cheerful", "content", "calm", "restless", "bored",
+               "curious", "irritable", "down", "tired")
+#: polls in a row that may come back without a mood before it is unknown
+MOOD_STALE_POLLS = 3
+_MOOD_WORD_RE = re.compile(r"[a-z]{1,24}")
+_MOOD_STAMP_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})?", re.ASCII)
+
+
+def _mood_level(value):
+    """A whole number 0–3 (as JSON gives it), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return value if isinstance(value, int) and 0 <= value <= 3 else None
+
+
+def mood_clock(iso) -> str:
+    """``HH:MM`` in this device's time for an ISO stamp, ``""`` for anything
+    else. A stamp without a zone is already a wall-clock time."""
+    m = _MOOD_STAMP_RE.fullmatch(iso) if isinstance(iso, str) else None
+    if not m:
+        return ""
+    y, mo, d, h, mi, sec = (int(m.group(i) or 0) for i in range(1, 7))
+    if not (2000 <= y <= 2999 and 1 <= mo <= 12 and 1 <= d <= 31 and h <= 23 and mi <= 59 and sec <= 59):
+        return ""
+    zone = m.group(7)
+    if not zone:
+        return f"{h:02d}:{mi:02d}"
+    off = 0
+    if zone != "Z":
+        oh, om = int(zone[1:3]), int(zone[4:6])
+        if oh > 23 or om > 59:
+            return ""
+        off = (-1 if zone[0] == "-" else 1) * (oh * 60 + om)
+    try:
+        at = time.localtime(calendar.timegm((y, mo, d, h, mi, sec)) - off * 60)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return f"{at.tm_hour:02d}:{at.tm_min:02d}"
+
+
+#: §4UG: the shades a face has a moment for, and the character's dials
+MOOD_SHADES = ("relieved", "chastened", "proud")
+CHARACTER_DIALS = ("warmth", "humour", "directness")
+
+
+def _unit(value) -> bool:
+    """A number in [-1, 1] (a bool is not a number here)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and -1 <= value <= 1)
+
+
+def character_view(character):
+    """§4UG: health's ``character`` block as the face takes it — the dials it
+    carries as numbers in [-2, 2] — or None when there is none (the character
+    is off, an older agent, nothing readable). Never raises."""
+    if not isinstance(character, dict):
+        return None
+    out = {}
+    for name in CHARACTER_DIALS:
+        v = character.get(name)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+            out[name] = max(-2, min(2, v))
+    return out or None
+
+
+def mood_view(mood):
+    """Health's ``mood`` block as this client uses it, or None when it is
+    absent or malformed (not an object, an unknown label, an intensity that
+    is not a whole number 0–3, a label that contradicts the intensity). A bad
+    OPTIONAL field is dropped on its own. Never raises.
+
+    ``face`` + ``strength`` are the look: the server's ``face`` when it sends
+    one (the engine's rule), else this client's rule for an older agent (the
+    mood, or while it is neutral the resting point). ``strength`` is 1–3,
+    ``"rest"`` (the resting point, faint) or 0 (neutral).
+
+    §4UG: ``p`` + ``e`` are the mood's two numbers (−1..1), both or None (an
+    older agent, a bad value) — the face blends its looks by them; ``shade``
+    + ``shade_at`` are "relieved" | "chastened" | "proud" with the stamp it
+    was set at, or "" and "" (the face plays one moment per stamp)."""
+    if not isinstance(mood, dict):
+        return None
+
+    def is_label(v):
+        return isinstance(v, str) and v in MOOD_LABELS
+
+    label, n = mood.get("label"), _mood_level(mood.get("intensity"))
+    if n is None or not is_label(label):
+        return None
+    if (n > 0) != (label != "neutral"):
+        return None
+    face, rest = mood.get("face"), mood.get("rest")
+    if n > 0 and is_label(face) and face != label:
+        return None                  # r2: a mood has ONE label; a face that names another is a miss
+    if not is_label(face):
+        face = label if n else (rest if is_label(rest) else "neutral")
+    manner, problem = mood.get("manner"), mood.get("problem")
+    manner = manner if isinstance(manner, str) and _MOOD_WORD_RE.fullmatch(manner) else ""
+    p, e = mood.get("p"), mood.get("e")
+    point = _unit(p) and _unit(e)
+    shade, shade_at = mood.get("shade"), mood.get("shade_at")
+    shade = shade if isinstance(shade, str) and shade in MOOD_SHADES and mood_clock(shade_at) else ""
+    return {
+        "p": float(p) if point else None,
+        "e": float(e) if point else None,
+        "shade": shade,
+        "shade_at": shade_at if shade else "",
+        # §4UG-f: the shade's age by the agent's clock (None without it)
+        "shade_age_s": (float(mood.get("shade_age_s")) if shade and isinstance(mood.get("shade_age_s"), (int, float))
+                        and not isinstance(mood.get("shade_age_s"), bool) and 0 <= mood.get("shade_age_s") < 1e7 else None),
+        "face": face,
+        "strength": 0 if face == "neutral" else (n or "rest"),
+        "problem": isinstance(problem, str) and re.search(r"[^ \t\r\n]", problem) is not None,
+        "manner": manner,
+        "manner_level": (_mood_level(mood.get("manner_intensity")) or 0) if manner else 0,
+        "manner_until": mood_clock(mood.get("manner_until")) if manner else "",
+    }
+
+
+def mood_words(view, unknown: bool = False) -> str:
+    """The mood as one short phrase for the status line, made from the SAME
+    label and strength the face shows: ``calm, 1 of 3`` · ``rests calm``
+    (neutral; the look is the resting point's) · ``neutral`` · ``mood unknown``
+    (too many polls without one). When the agent could not read its state
+    file: ``… · state file was unreadable at start`` beside a mood or manner
+    the block carries, ``mood unreadable`` alone when it carries neither.
+    ``""`` before the first reading."""
+    if unknown:
+        return "mood unknown"
+    if not view:
+        return ""
+    face, strength = view["face"], view["strength"]
+    if view["problem"] and not strength and not view["manner"]:
+        return "mood unreadable"     # nothing else to say: this neutral may be an emptied state
+    parts = [f"rests {face}" if strength == "rest" else f"{face}, {strength} of 3" if strength else "neutral"]
+    if view["manner"]:
+        parts.append("manner " + view["manner"]
+                     + (f", {view['manner_level']} of 3" if view["manner_level"] else "")
+                     + (f" — until {view['manner_until']}" if view["manner_until"] else ""))
+    if view["problem"]:
+        parts.append("state file was unreadable at start")       # beside a mood the block does carry
+    return " · ".join(parts)
+
+
+class MoodWatch:
+    """The last mood reading across polls. A poll with a mood resets it; one
+    without (agent down, no block, a malformed block) keeps the last reading
+    for now, and the ``MOOD_STALE_POLLS``-th in a row drops it: the face is
+    told neutral (it eases there on its usual path) and the words say the
+    mood is unknown — the last look is never kept for ever."""
+
+    def __init__(self):
+        self.misses, self.view, self.unknown = 0, None, False
+
+    def step(self, view):
+        """Take one poll's result. ``(look, words)``: ``look`` is ``(label,
+        strength)`` for the face, or None when it should keep the look it has."""
+        if view:
+            self.misses, self.view, self.unknown = 0, view, False
+        else:
+            self.misses += 1
+            self.unknown = self.misses >= MOOD_STALE_POLLS
+            if self.unknown:
+                self.view = None
+        if self.view:
+            look = (self.view["face"], self.view["strength"])
+        else:
+            look = ("neutral", 0) if self.unknown else None
+        return look, mood_words(self.view, self.unknown)
+
+    def extras(self):
+        """§4UG: what the face is told beside the look, after ``step`` — the
+        mood's two numbers, its shade and the character's dials — or None
+        when it should keep what it has. ``live`` is False for a reading kept
+        through a failed poll: its numbers still hold, a moment and the dials
+        are taken only from a poll that answered. Once the mood is unknown
+        the numbers are dropped (the look is the label's: neutral)."""
+        if self.view:
+            return {"p": self.view.get("p"), "e": self.view.get("e"), "shade": self.view.get("shade") or "",
+                    "shadeAt": self.view.get("shade_at") or "", "shadeAgeS": self.view.get("shade_age_s"),
+                    "character": self.view.get("character"),
+                    "live": self.misses == 0}
+        return {"p": None, "e": None, "live": False} if self.unknown else None
+
+
+async def fetch_mood_view(client, base: str, key: str):
+    """``mood_view`` of ``/api/health``, or None when the agent did not answer
+    or sent no usable mood block."""
     try:
         r = await client.get(f"{base}/api/health", headers=headers(key))
         if r.status_code != 200:
             return None
-        mood = r.json().get("mood")
-        label, n = mood.get("label"), mood.get("intensity")
-        rest = mood.get("rest")
-    except Exception:  # noqa: BLE001
+        body = r.json()
+        view = mood_view(body.get("mood")) if isinstance(body, dict) else None
+        if view is not None:
+            view["character"] = character_view(body.get("character"))    # §4UG: rides the same read
+        return view
+    except Exception:  # noqa: BLE001 — the caller counts it as one poll without a mood (MoodWatch)
         return None
-    if not (isinstance(label, str) and re.fullmatch(r"[a-z]{1,24}", label)):
-        return None
-    if not (isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 3):
-        return None
-    # §4UA: while the mood is neutral, the character's resting point at the faint
-    # 'rest' strength (the web UI's status.js `faceMoodFrom` does the same)
-    if n == 0 and isinstance(rest, str) and rest != "neutral" and re.fullmatch(r"[a-z]{1,24}", rest):
-        return rest, "rest"
-    return label, n
+
+
+async def fetch_mood(client, base: str, key: str):
+    """``(label, strength)`` — the look for ``/api/health``'s mood — or None
+    when the agent did not answer or sent something else. §4UA: ``(rest_label,
+    "rest")`` while the mood is neutral and the character's resting point is
+    not. §4UD: the same look the web UI's ``faceMoodFrom`` gives."""
+    view = await fetch_mood_view(client, base, key)
+    return (view["face"], view["strength"]) if view else None
 
 
 CANCEL_RETRY_S = 1.0
@@ -389,18 +588,23 @@ async def cancel_turn(client, base: str, key: str, request_id,
 # ── feedback ────────────────────────────────────────────────────────────────
 
 FEEDBACK_RETRY_S = 4.0
+#: a thumb, and the same thumb taken back (the agent's core/feedback.py VALID_SIGNALS)
+FEEDBACK_SIGNALS = ("positive", "negative", "retract:positive", "retract:negative")
 
 
 async def send_feedback(client, base: str, key: str, request_id: str,
                         signal: str, note: str = "", sleep=asyncio.sleep):
-    """Label a finished turn ``positive`` / ``negative``. ``(ok, detail)``.
+    """Label a finished turn ``positive`` / ``negative``, or take that thumb
+    back (``retract:positive`` / ``retract:negative``, §4UD). ``(ok, detail)``:
+    on failure ``detail`` is why; on success it is the agent's note to show
+    (its ``mood_note``, usually ``""``).
 
     One delayed retry on 404/429/5xx, exactly as the web UI does: the
     trajectory is written moments AFTER the stream ends, so a thumb pressed
     the instant the reply lands gets a 404 that a second attempt four seconds
     later does not; and a 503 is the agent restarting.
     """
-    if signal not in ("positive", "negative"):
+    if signal not in FEEDBACK_SIGNALS:
         return False, "bad signal"
     if not request_id:
         return False, "no reply to rate"
@@ -417,7 +621,13 @@ async def send_feedback(client, base: str, key: str, request_id: str,
             detail = f"{type(e).__name__}: {e}"
         else:
             if 200 <= r.status_code < 300:
-                return True, ""
+                # §4UD F15: the agent's own note for the person who pressed ("your set mood
+                # holds…"), "" when it has none — the web UI shows the same line
+                try:
+                    said = r.json().get("mood_note")
+                except Exception:  # noqa: BLE001 — recorded; a body that is not JSON has no note
+                    said = ""
+                return True, (said.strip()[:300] if isinstance(said, str) else "")
             try:
                 detail = str(r.json().get("error") or "")
             except Exception:  # noqa: BLE001

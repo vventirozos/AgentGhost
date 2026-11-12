@@ -40,6 +40,15 @@ logger = logging.getLogger("GhostSelfhood")
 CritiqueFn = Callable[[str], Awaitable[str]]
 
 
+def _iso_ago(seconds: float) -> str:
+    """The on-disk stamp of the moment ``seconds`` ago (UTC, "Z")."""
+    try:
+        at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=max(0.0, float(seconds)))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    return at.replace(tzinfo=None, microsecond=0).isoformat() + "Z"
+
+
 def owner_quiet_seconds(context, now=None) -> Optional[float]:
     """How long the owner has been quiet, from the clock the agent already
     keeps (``context.last_owner_activity_time`` — written by the turn loop's
@@ -97,18 +106,33 @@ class SelfModel:
             self.narrative = None
         # §4TX: the reaction ledger — what the owner's reactions to ONE reply have already done to the mood
         self._ledger_lock = threading.Lock()
-        #: reply (request id) → {slot: (dp, de, at, pair epoch)} — the reactions standing for it
+        #: reply (request id) → {slot: (dp, de, at, pair epoch)} — the reactions standing for it. §4UD (F1):
+        #: the thumb, the correction and the thanks only — the message's TONE has a book of its own
+        #: (``_tones``), so this one is byte for byte what a run that never read a tone holds (eviction included)
         self._standing: "OrderedDict[str, Dict[str, Tuple[float, float, datetime.datetime, int]]]" = OrderedDict()
-        #: reply → what its reactions REALLY moved the pair by so far, and when, and under which word of the
-        #: owner (``(dp, de, at, owner_at)``) — it decays with the pair (review r2: a thumb changed after the
-        #: first one wore off overshot), and an owner's set or reset since makes it void
+        #: reply → what its reactions REALLY moved the pair-without-tone by so far, and when, and under which
+        #: word of the owner (``(dp, de, at, owner_at)``) — it decays with the pair (review r2: a thumb changed
+        #: after the first one wore off overshot), and an owner's set or reset since makes it void
         self._applied: Dict[str, Tuple[float, float, datetime.datetime, str]] = {}
-        #: reply → the part of ``_applied`` the owner's message sentiment put in (same shape): it is the
-        #: "private share" others do not hear, and it comes back out when a stronger reaction replaces it
+        #: §4UD: reply → the tone of the owner's message about it (same shape as a slot), newest last
+        self._tones: "OrderedDict[str, Tuple[float, float, datetime.datetime, int]]" = OrderedDict()
+        #: reply → what that tone holds of the state's tone shares now (signed like the tone, same shape): the
+        #: tone's MARGINAL part of the reply's verdict — what the verdict is worth with it minus without it —
+        #: no bigger than the room the other replies' tones left. It comes back out when a stronger reaction
+        #: replaces the tone. Dropped with its ``_tones`` row
         self._private_booked: Dict[str, Tuple[float, float, datetime.datetime, str]] = {}
+        #: §4UD-b M1: replies whose thumb the owner took back (in memory, bounded) — the ONE case where the
+        #: same thumb sent again (its label unchanged) is a new thumb. Cleared when a thumb is booked again
+        self._taken_back: "OrderedDict[str, bool]" = OrderedDict()
         #: §4UB: when the agent last had trouble the owner saw — a turn that lowered the mood, a thumbs-down, a
         #: correction (in memory). An upbeat tone right after it may be sarcasm (``sentiment.doubtful``)
         self._trouble_at: Optional[datetime.datetime] = None
+        #: §4UG: when a turn of the agent's OWN last went badly (not a thumb, not a correction) — a good
+        #: turn soon after it is relief (``shade.for_turn``). In memory: a restart forgets it
+        self._own_trouble_at: Optional[datetime.datetime] = None
+        #: §4UG: the mood's shade — relieved / chastened / proud, for one moment, beside the label
+        from .shade import ShadeStore
+        self.shade = ShadeStore(self.root if self.enabled else None, enabled=self.enabled)
         #: an owner message (its request id) → the reply it answers (the owner's previous request id)
         self._answers: "OrderedDict[str, str]" = OrderedDict()
         #: conversation → its last owner reply (review r2: one global "last reply" booked a Slack correction
@@ -281,16 +305,35 @@ class SelfModel:
             self.state.attach_owner_clock(quiet_fn)
 
     def attach_rest(self, rest_fn) -> None:
-        """§4UA: where the mood rests — the character's resting point, read
-        from the Mirror (``mirror.rest_pair``). The mood only reads it."""
+        """§4UA: where the mood rests — the character's resting point, from
+        its dials (``character.rest_pair``, §4UH-e2e). The mood only reads it."""
         if self.enabled and self.state is not None:
             self.state.attach_rest(rest_fn)
 
-    def _apply(self, ev: Optional["M.Event"], *, now=None) -> Optional[MoodView]:
-        """Put one event through ``SelfStateThread.nudge``. Never raises —
-        the mood is secondary to everything."""
+    def _lean(self, ev: Optional["M.Event"]) -> Optional["M.Event"]:
+        """§4UH: the event as the character feels it (``character.lean``) — scaled ON ARRIVAL, before it is
+        booked anywhere. Unchanged with the character off, its file unreadable, or on any error."""
+        if ev is None:
+            return None
+        try:
+            from . import character as _C
+            if not _C.lean_enabled():
+                return ev
+            home = self.root.parent.parent
+            if _C.unreadable(home):
+                return ev
+            return _C.lean(ev, _C.lean_dials(home))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("mood lean skipped: %s: %s", type(e).__name__, e)
+            return ev
+
+    def _apply(self, ev: Optional["M.Event"], *, now=None, leaned: bool = False) -> Optional[MoodView]:
+        """Put one event through ``SelfStateThread.nudge`` (leaned by the character unless the caller
+        already did). Never raises — the mood is secondary to everything."""
         if ev is None or not self.enabled or self.state is None:
             return None
+        if not leaned:
+            ev = self._lean(ev)
         try:
             _before, after = self.state.nudge(ev.dp, ev.de, ev.cause, ev.kind,
                                              novelty=ev.novelty, now=now)
@@ -310,11 +353,53 @@ class SelfModel:
         except Exception as e:
             logger.debug("mood turn events skipped: %s: %s", type(e).__name__, e)
             return None
+        # §4UH: the character leans how hard the turn LANDS (what is booked); whether it was trouble, a
+        # relief or a good turn is a fact about the turn and is judged on its own size (review r2: a playful
+        # character no longer registered a failed call as trouble, and the upbeat-doubt check went blind)
+        booked = self._lean(ev)
+        own_age = None
+        try:
+            if self._own_trouble_at is not None:
+                own_age = (self._now_of(now) - self._own_trouble_at).total_seconds()
+        except Exception:  # noqa: BLE001
+            own_age = None
         if ev is not None and ev.dp <= self.TROUBLE_MIN_DP:
             self._trouble_at = self._now_of(now)
         elif ev is not None and ev.dp > 0:
             self._trouble_at = None          # review r3: a good turn after it — the trouble is over
-        return self._apply(ev, now=now)
+        after = self._apply(booked, now=now, leaned=True)
+        if ev is not None:
+            from . import shade as _shade
+            self._set_shade(_shade.for_turn(signals, moved_dp=ev.dp, own_trouble_age_s=own_age),
+                            ev.cause, after, now)
+            # §4UG (review r1): the agent's own trouble, for relief, is a bad turn that MOVED the mood —
+            # one the owner's set mood held is not something to be relieved about later, and a held
+            # good turn does not end it
+            if self._moved(after):
+                if ev.dp <= self.TROUBLE_MIN_DP:
+                    self._own_trouble_at = self._now_of(now)
+                elif ev.dp > 0:
+                    self._own_trouble_at = None
+        return after
+
+    @staticmethod
+    def _moved(after: Optional[MoodView]) -> bool:
+        """Did the event behind this after-view move the stored pair at all?"""
+        try:
+            moved = getattr(after, "moved", (0.0, 0.0))
+            return abs(float(moved[0])) > 0.0 or abs(float(moved[1])) > 0.0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _set_shade(self, name: str, cause: str, after: Optional[MoodView], now) -> None:
+        """§4UG: set the mood's shade — only for an event that MOVED the mood (one the owner's set mood
+        held sets none). Never raises."""
+        try:
+            if not name or after is None or not self.enabled or not self._moved(after):
+                return
+            self.shade.set(name, cause, now=self._now_of(now))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("mood shade skipped: %s: %s", type(e).__name__, e)
 
     #: §4UB: how long after the agent's trouble an upbeat message is doubted
     TROUBLE_RECENT_S = 1800.0
@@ -347,7 +432,11 @@ class SelfModel:
         ev = M.merge_events(M.turn_events(M.TurnSignals(tasks_done=n)))
         if ev is not None:
             ev = M.Event(ev.dp, ev.de, ev.cause + " (in a background job)", ev.kind, novelty=ev.novelty)
-        return self._apply(ev, now=now)
+        after = self._apply(ev, now=now)
+        if ev is not None:
+            from . import shade as _shade
+            self._set_shade(_shade.PROUD, ev.cause, after, now)
+        return after
 
     #: how many replies the ledger remembers (in memory: a restart forgets it, and a later reaction counts in full)
     LEDGER_REPLIES = 200
@@ -397,17 +486,6 @@ class SelfModel:
                 out[slot] = v
         return out
 
-    @staticmethod
-    def _sentiment_counts(standing: Dict[str, Tuple[float, float]]) -> bool:
-        """Is the message sentiment one of the two reactions ``_total`` keeps for this reply?"""
-        v = standing.get(M.KIND_SENTIMENT)
-        if not v or not v[0]:
-            return False
-        rest = [w[0] for k, w in standing.items() if k != M.KIND_SENTIMENT]
-        if v[0] > 0:
-            return all(v[0] >= w for w in rest if w > 0)
-        return all(v[0] <= w for w in rest if w < 0)
-
     def note_owner_reaction(self, kind: str, *, now=None, request_id: str = "",
                             reply_id: str = "") -> Optional[MoodView]:
         """A thumbs-up / thumbs-down (``reply_id``: the reply it rates), a
@@ -418,8 +496,12 @@ class SelfModel:
             self._trouble_at = self._now_of(now)
         elif kind in (M.KIND_THUMB_UP, M.KIND_PRAISE):
             self._trouble_at = None
-        return self._react(M.reaction_event(str(kind or "")), now=now, request_id=request_id,
-                           reply_id=reply_id)[0]
+        after = self._react(M.reaction_event(str(kind or "")), now=now, request_id=request_id,
+                            reply_id=reply_id)[0]
+        from . import shade as _shade
+        _ev = M.reaction_event(str(kind or ""))
+        self._set_shade(_shade.for_reaction(str(kind or "")), _ev.cause if _ev else "", after, now)
+        return after
 
     #: §4UB (evaluation: a thumb given while the owner's set mood held was dropped without a word)
     HOLD_NOTE = "Your set mood holds until {until} — this thumb is saved but doesn't move the mood."
@@ -432,7 +514,7 @@ class SelfModel:
                 return ""
             if self.state.hold_reason(now=now) != self.state.HELD_OWNER_HOLD:
                 return ""
-            end = self.state._held_until(self.state._state.mood, now)
+            end = self.state.held_until_now(now=now)
             until = end.astimezone().strftime("%H:%M") if end is not None else "the day ends"
             return self.HOLD_NOTE.format(until=until)
         except Exception:  # noqa: BLE001
@@ -444,61 +526,18 @@ class SelfModel:
         OWNER's message. ``(mood after or None, pleasantness applied, why none)`` — §4TX: through the reaction
         ledger, and held (not applied) when the owner set the mood after the message ``arrived``.
 
-        §4UB: what sentiment has in the pair (the state's decayed private share) stays under
-        ``mood.SENTIMENT_SHARE_MAX`` on its side —
-        an event is cut to the room left, and held when there is none: sentiment alone never makes a heard mood."""
-        ev = M.sentiment_event(label, score)
-        if ev is None or not self.enabled or self.state is None:
-            return self._react(ev, now=now, request_id=request_id, arrived=arrived)
-        # review r1: the share the STATE keeps (``private_p``: stored, so a restart keeps it, and rebuilt by the
-        # ledger when a thumb or a correction replaces a tone) — not a list of this process's own moves
-        share = self.state.private_share(now=now)[0]
-        # review r2: the tone REPLACES what this reply's earlier tone booked (a queued message answers the same
-        # reply as the request's own) — the room is what the OTHER replies' tones leave, and the cut never takes
-        # this reply's slot below what it already holds on the same side (that moved the mood the wrong way)
-        at = self._now_of(now)
-        with self._ledger_lock:
-            target = self._target(request_id, "")
-            mine = self._booked_now(self._private_booked.get(target), at, self._owner_word())[0] if target else 0.0
-        sign = 1.0 if ev.dp > 0 else -1.0
-        others = (share - mine) * sign                   # the others' share on this event's side (may be < 0)
-        room = round(M.SENTIMENT_SHARE_MAX - max(0.0, others), 4)
-        floor = max(0.0, mine * sign)                    # what this reply already holds on this side
-        size = max(min(abs(ev.dp), room), min(floor, abs(ev.dp)))
-        if size <= 0.0:
-            self.state.note_held(ev.kind, ev.cause, ev.dp, ev.de, self.HELD_SENTIMENT_FULL, now=now)
-            return None, 0.0, self.HELD_SENTIMENT_FULL
-        if size < abs(ev.dp):
-            k = size / abs(ev.dp)
-            ev = M.Event(round(ev.dp * k, 4), round(ev.de * k, 4), ev.cause, ev.kind, novelty=ev.novelty)
-        return self._react(ev, now=now, request_id=request_id, arrived=arrived)
+        §4UB: what sentiment has in the pair (the state's tone shares) stays under
+        ``mood.SENTIMENT_SHARE_MAX`` on each side — a tone gets the room left, and is held when there is none:
+        sentiment alone never makes a heard mood. §4UD: the fit is ``_react``'s (one for every path)."""
+        return self._react(M.sentiment_event(label, score), now=now, request_id=request_id, arrived=arrived)
 
-    def _charge_cap_cut(self, cp: float, ce: float, at: datetime.datetime, word: int) -> None:
-        """§4UB review r6: the state's cap took ``(cp, ce)`` of the owner's tone out of the pair. That share
-        belongs to the replies whose tones the ledger booked on that side — each gives up its part, in
-        proportion, from what it holds privately and from what it moved, so the ledger's share stays the
-        state's (a thumbs-down that stopped one tone counting exposed two others: the cut was booked against
-        the thumbed reply, and members later heard part of the owner's tone). Called under the ledger lock."""
-        for axis, cut in ((0, cp), (1, ce)):
-            if not cut:
-                continue
-            held = {}
-            for rid, entry in self._private_booked.items():
-                v = self._booked_now(entry, at, word)[axis]
-                if v * cut > 0:
-                    held[rid] = v
-            total = sum(held.values())
-            if not total:
-                continue
-            k = min(1.0, cut / total)
-            for rid, v in held.items():
-                take = v * k
-                pb = list(self._booked_now(self._private_booked.get(rid), at, word))
-                ap = list(self._booked_now(self._applied.get(rid), at, word))
-                pb[axis] -= take
-                ap[axis] -= take
-                self._private_booked[rid] = (pb[0], pb[1], at, word)
-                self._applied[rid] = (ap[0], ap[1], at, word)
+    def thumb_was_taken_back(self, reply_id: str) -> bool:
+        """§4UD-b M1: did the owner take back the thumb on this reply (since the agent started)? The feedback
+        route lets a thumb whose label did not change move the mood only then: the reaction ledger is in
+        memory, so after a restart the same thumb sent again (a client's retry on the restart's 5xx) would
+        otherwise count again."""
+        with self._ledger_lock:
+            return str(reply_id or "") in self._taken_back
 
     def _target(self, request_id: str, reply_id: str) -> str:
         if reply_id:
@@ -519,100 +558,191 @@ class SelfModel:
         down = min(downs, key=lambda v: v[0]) if downs else (0.0, 0.0)
         return up[0] + down[0], up[1] + down[1]
 
-    def _fit_returning_tone(self, entries: dict, target: str, at: datetime.datetime, word: int, now) -> None:
-        """§4UB review r4: a thumb changed can make a reply's replaced tone count again — it comes back no
-        bigger than the room the OTHER replies' tones leave under ``mood.SENTIMENT_SHARE_MAX`` (the cap of
-        ``note_owner_sentiment``; a thumb flip put the share at +0.196 and the owner heard "content, 1").
-        The slot is cut in place. Called under the ledger lock."""
-        sent = entries.get(M.KIND_SENTIMENT)
-        if not sent:
-            return
-        d = self._standing_now({"s": sent}, at, word).get("s", (0.0, 0.0))[0]
-        if not d:
-            return
-        mine = self._booked_now(self._private_booked.get(target), at, word)[0]
-        share = self.state.private_share(now=now)[0]
-        sign = 1.0 if d > 0 else -1.0
-        room = max(0.0, M.SENTIMENT_SHARE_MAX - max(0.0, (share - mine) * sign))
-        if abs(d) > room:
-            k = room / abs(d)
-            entries[M.KIND_SENTIMENT] = (round(sent[0] * k, 4), round(sent[1] * k, 4), sent[2], sent[3])
+    #: §4UD (G1): a thumb taken back
+    THUMB_OFF_CAUSE = "the owner took a thumb back"
+    NOTHING_TO_TAKE_BACK = ("no thumb of that kind stands for this reply (never given, already taken back, given "
+                            "before the agent last restarted, or before the owner last set the mood)")
+
+    @classmethod
+    def _marginal(cls, standing: Dict[str, Tuple[float, float]], tone: Tuple[float, float]) -> Tuple[float, float]:
+        """§4UD (F1): what a reply's TONE adds to its verdict — the verdict with it (``_total``) minus the
+        verdict without it, per axis, on the tone's own side only. Nothing when a stronger reaction of the same
+        side stands (a thumbs-up over an upbeat message); the difference when the tone is the stronger (an
+        upbeat message over a thumbs-up that has worn down to 0.06 adds 0.02, not its whole 0.08 — review F1:
+        the whole size was booked as the owner's private share, and that phantom share was then netted against
+        real unhappy tone)."""
+        if not tone or not tone[0]:
+            return 0.0, 0.0
+        with_tone = cls._total({**standing, M.KIND_SENTIMENT: tone})
+        without = cls._total(standing)
+        sign = 1.0 if tone[0] > 0 else -1.0
+        return (sign * max(0.0, sign * (with_tone[0] - without[0])),
+                sign * max(0.0, sign * (with_tone[1] - without[1])))
+
+    def _fit(self, want: Tuple[float, float], booked: Tuple[float, float], now) -> Tuple[float, float]:
+        """§4UB/§4UD: a reply's tone share no bigger than the room the OTHER replies' tones leave under the cap on
+        its side — for a new tone, a second tone on the same reply, and a tone a changed or withdrawn thumb
+        brings back alike. (The sink caps too; fitting here keeps what is reported and booked honest.)"""
+        up_p, up_e, dn_p, dn_e = self.state.private_sides(now=now)
+        out = []
+        for want_i, booked_i, up, dn, cap in ((want[0], booked[0], up_p, dn_p, M.SENTIMENT_SHARE_MAX),
+                                              (want[1], booked[1], up_e, dn_e, M.SENTIMENT_SHARE_MAX_E)):
+            if not want_i:
+                out.append(0.0)
+                continue
+            sign = 1.0 if want_i > 0 else -1.0
+            mine = max(0.0, booked_i * sign)                    # what this reply already holds on that side
+            others = max(0.0, (up if sign > 0 else dn) - mine)
+            out.append(sign * max(0.0, min(abs(want_i), cap - others)))
+        return out[0], out[1]
+
+    @staticmethod
+    def _side_delta(want: Tuple[float, float], booked: Tuple[float, float]) -> Tuple[float, float, float, float]:
+        """The change of the four tone shares (up p, up e, down p, down e) that takes a reply from ``booked`` to ``want``."""
+        return (max(0.0, want[0]) - max(0.0, booked[0]), max(0.0, want[1]) - max(0.0, booked[1]),
+                max(0.0, -want[0]) - max(0.0, -booked[0]), max(0.0, -want[1]) - max(0.0, -booked[1]))
+
+    @staticmethod
+    def _booked_after(want: float, booked: float, got_up: float, got_dn: float) -> float:
+        """One axis of a reply's tone booking after the sink: where it asked for MORE, what really got in; where
+        it gave back, what it asked (a share the sink no longer had is not owed)."""
+        up_w, up_b, dn_w, dn_b = max(0.0, want), max(0.0, booked), max(0.0, -want), max(0.0, -booked)
+        up = min(up_w, max(0.0, up_b + got_up)) if up_w > up_b else up_w
+        dn = min(dn_w, max(0.0, dn_b + got_dn)) if dn_w > dn_b else dn_w
+        return up - dn
+
+    def retract_owner_reaction(self, positive: bool, *, now=None, reply_id: str = "") -> Tuple[Optional[MoodView], float, str]:
+        """§4UD (G1): the owner took a thumb back (the 👍 when ``positive``, else the 👎) — it leaves the
+        reply's verdict, and the mood moves by what that changes: back by what the thumb still held, less what
+        the reply's other reactions now count for. A thumb that does not stand for the reply (never given,
+        already taken back, of the other kind, from before the owner replaced the pair, forgotten by a restart —
+        the ledger is in memory, so a thumb can be taken back only until the agent restarts) is a no-op with
+        a log line. The caller decides that it was the OWNER's."""
+        kind = M.KIND_THUMB_OFF
+        return self._react(M.Event(0.0, 0.0, self.THUMB_OFF_CAUSE, kind), now=now, reply_id=str(reply_id or ""),
+                           retract=(1.0 if positive else -1.0))
 
     def _react(self, ev: Optional["M.Event"], *, now=None, request_id: str = "", reply_id: str = "",
-               arrived: str = "") -> Tuple[Optional[MoodView], float, str]:
+               arrived: str = "", retract: float = 0.0) -> Tuple[Optional[MoodView], float, str]:
         """§4TX (review: a thumbs-down, the correction and the unhappy tone of
         the same message counted three times; toggling a thumb drifted the
         mood down): an owner's reaction is booked against the REPLY it is
         about. The mood moves by the difference its arrival makes to that
-        reply's total (``_total``), never by the reaction on its own."""
+        reply's total (``_total``), never by the reaction on its own.
+
+        §4UD (F1): two books per reply. The thumb, the correction and the
+        thanks move the pair-without-tone by the change in THEIR total — the
+        same arithmetic, on the same numbers, as a run that never read a
+        tone. The message's tone holds its marginal part of the verdict
+        (``_marginal``) in the state's tone shares, fitted to the room left
+        (``_fit``); a tone event never moves the other book. ``retract`` (±1):
+        take the thumb of that sign out of the reply's slots."""
         if ev is None or not self.enabled or self.state is None:
             return None, 0.0, ""
+        ev = self._lean(ev)
         try:
             why = self.state.hold_reason(now=now, arrived=arrived)
             if why:
-                self.state.nudge(ev.dp, ev.de, ev.cause, ev.kind, novelty=ev.novelty, now=now, arrived=arrived)
+                if retract:
+                    self.state.note_held(ev.kind, ev.cause, 0.0, 0.0, why, now=now)
+                else:
+                    self.state.nudge(ev.dp, ev.de, ev.cause, ev.kind, novelty=ev.novelty, now=now, arrived=arrived)
                 return None, 0.0, why
             at = self._now_of(now)
+            is_tone = ev.kind == M.KIND_SENTIMENT
             with self._ledger_lock:
                 target = self._target(request_id, reply_id)
                 word = self._owner_word()
-                was = booked = (0.0, 0.0)
-                adjust: Optional[Tuple[float, float]] = None
-                private = (0.0, 0.0)
                 if not target:
-                    dp, de = ev.dp, ev.de
+                    if retract:
+                        logger.info("mood: a thumb taken back names no reply — nothing to take back")
+                        return None, 0.0, self.NOTHING_TO_TAKE_BACK
+                    # no reply to book it against: it counts as it is (a tone still goes through the sink's cap)
+                    before, after = self.state.nudge(ev.dp, ev.de, ev.cause, ev.kind, novelty=ev.novelty, now=now,
+                                                     arrived=arrived)
+                    if after is before:
+                        return None, 0.0, self.state.hold_reason(now=now, arrived=arrived)
+                    return after, after.moved[0], ("" if any(after.moved) else self.HELD_AT_LIMIT)
+                entries = dict(self._standing.get(target) or {})
+                tone = self._tones.get(target)
+                if retract:
+                    thumb = self._standing_now({"thumb": entries["thumb"]}, at, word).get("thumb") \
+                        if "thumb" in entries else None
+                    if thumb is None or thumb[0] * retract <= 0:
+                        logger.info("mood: thumb taken back on reply %s — %s (nothing changed)",
+                                    str(target)[:12], self.NOTHING_TO_TAKE_BACK)
+                        return None, 0.0, self.NOTHING_TO_TAKE_BACK
+                    del entries["thumb"]
+                    self._taken_back[str(target)] = True
+                    self._taken_back.move_to_end(str(target))
+                    while len(self._taken_back) > self.LEDGER_REPLIES:
+                        self._taken_back.popitem(last=False)
+                elif is_tone:
+                    tone = (ev.dp, ev.de, at, word)
                 else:
                     slot = "thumb" if ev.kind in (M.KIND_THUMB_UP, M.KIND_THUMB_DOWN) else ev.kind
-                    entries = dict(self._standing.get(target) or {})
+                    if slot == "thumb":
+                        self._taken_back.pop(str(target), None)
+                    # review r2: the ledger alone says whether a thumb counts (the label store cannot: a thumb
+                    # taken back leaves its label). The same thumb again REPLACES the one that stands: the
+                    # mood moves by what the first has worn down by, never by a second thumb
                     entries[slot] = (ev.dp, ev.de, at, word)
-                    if ev.kind != M.KIND_SENTIMENT:
-                        self._fit_returning_tone(entries, target, at, word, now)
-                    standing = self._standing_now(entries, at, word)
+                standing = self._standing_now(entries, at, word)
+                dp = de = 0.0
+                was = (0.0, 0.0)
+                if not is_tone:
+                    # the reply's own verdict, without any tone: byte for byte a tone-free run's arithmetic
                     total = self._total(standing)
                     was = self._booked_now(self._applied.get(target), at, word)
                     dp, de = round(total[0] - was[0], 4), round(total[1] - was[1], 4)
-                    # the owner's own message tone is private while it is one of the two that count
-                    # (review r3: rebuilt on every reaction — a thumb changed back brings it back)
-                    if self._sentiment_counts(standing):
-                        private = standing[M.KIND_SENTIMENT]
-                    booked = self._booked_now(self._private_booked.get(target), at, word)
-                    adjust = (round(private[0] - booked[0], 4), round(private[1] - booked[1], 4))
+                    if abs(dp) < 0.0005 and abs(de) < 0.0005:
+                        dp = de = 0.0            # already counted (a tone-free run holds it here, below)
                     self._standing[target] = entries
                     self._standing.move_to_end(target)
                     while len(self._standing) > self.LEDGER_REPLIES:
                         old, _ = self._standing.popitem(last=False)
                         self._applied.pop(old, None)
+                booked = (0.0, 0.0)
+                want = full = (0.0, 0.0)
+                if tone is not None:
+                    # the tone's part of the verdict NOW (rebuilt on every reaction — a thumb changed back, or
+                    # taken back, brings it back), fitted to the room the other replies' tones leave
+                    full = self._marginal(standing, self._booked_now(tone, at, word))
+                    booked = self._booked_now(self._private_booked.get(target), at, word)
+                    want = self._fit(full, booked, now)
+                    self._tones[target] = tone
+                    if is_tone:
+                        self._tones.move_to_end(target)
+                    while len(self._tones) > self.LEDGER_REPLIES:
+                        # a forgotten tone keeps its share in the state (it decays there, under the cap); it
+                        # can no longer be taken back out
+                        old, _ = self._tones.popitem(last=False)
                         self._private_booked.pop(old, None)
-                if abs(dp) < 0.0005 and abs(de) < 0.0005:
+                delta = self._side_delta(want, booked)
+                if abs(dp) < 0.0005 and abs(de) < 0.0005 and all(abs(v) < 0.0005 for v in delta):
                     # (review r3: a re-booked slot of about the same size moved ±0.0001 the wrong way by rounding)
-                    self.state.note_held(ev.kind, ev.cause, ev.dp, ev.de, self.HELD_ALREADY_COUNTED, now=now)
-                    return None, 0.0, self.HELD_ALREADY_COUNTED
+                    full_up = is_tone and abs(full[0]) - abs(want[0]) >= 0.0005
+                    held = self.HELD_SENTIMENT_FULL if full_up else self.HELD_ALREADY_COUNTED
+                    self.state.note_held(ev.kind, ev.cause, ev.dp, ev.de, held, now=now)
+                    return None, 0.0, held
                 before, after = self.state.nudge(dp, de, ev.cause, ev.kind, novelty=ev.novelty, now=now,
-                                                 arrived=arrived, private_adjust=adjust)
+                                                 arrived=arrived, tone=(delta if tone is not None else None))
                 if after is before:
                     # held after all (the owner set the mood in between): nothing booked
                     return None, 0.0, (self.state.hold_reason(now=now, arrived=arrived)
                                        or self.HELD_ALREADY_COUNTED)
-                # §4UA review r2: the STORED move, not the views' (rest + deviation clamps at ±1)
+                if dp or de:
+                    # review r2: what REALLY moved (the clamp may have absorbed it), not the event's size —
+                    # §4UD: of the pair WITHOUT the tone (``base_moved``)
+                    self._applied[target] = (was[0] + after.base_moved[0], was[1] + after.base_moved[1], at, word)
+                if tone is not None:
+                    got = after.toned
+                    self._private_booked[target] = (self._booked_after(want[0], booked[0], got[0], got[2]),
+                                                    self._booked_after(want[1], booked[1], got[1], got[3]),
+                                                    at, word)
                 ap, ae = after.moved
-                # §4UB review r6: what the sentiment-share cap took out is booked against the tones that held
-                # that share (below), not against this reply — the event's own move is the move before the cap
-                cp, ce = getattr(after, "capped", (0.0, 0.0)) or (0.0, 0.0)
-                rap, rae = ap + cp, ae + ce
-                if ev.kind == M.KIND_SENTIMENT:
-                    # review r5/r6: book what the state really stored — the change scaled by what the clamp
-                    # let through, on top of what was booked
-                    rp = max(0.0, min(1.0, rap / dp)) if dp else 0.0
-                    re_ = max(0.0, min(1.0, rae / de)) if de else 0.0
-                    private = (booked[0] + (private[0] - booked[0]) * rp,
-                               booked[1] + (private[1] - booked[1]) * re_)
-                if target:
-                    # review r2: what REALLY moved (the clamp may have absorbed it), not the event's size
-                    self._applied[target] = (was[0] + rap, was[1] + rae, at, word)
-                    self._private_booked[target] = (private[0], private[1], at, word)
-                if cp or ce:
-                    self._charge_cap_cut(cp, ce, at, word)
                 if ap == 0.0 and ae == 0.0:
+                    # the pair is at ±1 (a tone with no room under its cap was held above, before the write)
                     return after, 0.0, self.HELD_AT_LIMIT
                 return after, ap, ""
         except Exception as e:
@@ -664,6 +794,17 @@ class SelfModel:
         except Exception as e:
             logger.debug("mood owner-turn stamp skipped: %s: %s", type(e).__name__, e)
 
+    def owner_job_worked(self, *, now=None) -> None:
+        """§4UD (F9): a background job the OWNER started did work in the turn that just ended — the quiet is
+        measured from here (``SelfStateThread.mark_owner_job``). The caller decides that the job is the
+        owner's and that the turn did work. Never raises."""
+        if not self.enabled or self.state is None:
+            return
+        try:
+            self.state.mark_owner_job(now=now)
+        except Exception as e:
+            logger.debug("mood owner-job stamp skipped: %s: %s", type(e).__name__, e)
+
     # -----------------------------------------------------------------
     # Idle-path APIs (called by biological watchdog phase 2.8)
     # -----------------------------------------------------------------
@@ -697,6 +838,16 @@ class SelfModel:
         if not self.enabled:
             return {"enabled": False}
         _mood = self.mood(audience=audience) if audience != "owner" else self.mood()
+        _st = self.state
+        try:
+            _rest = _st.rest() if _st is not None else (0.0, 0.0)
+        except Exception:  # noqa: BLE001
+            _rest = (0.0, 0.0)
+        _steps = [list(x) for x in _mood.manner_steps]
+        try:
+            _quiet = _st.quiet_seconds() if _st is not None else None
+        except Exception:  # noqa: BLE001
+            _quiet = None
         return {
             "enabled": True,
             "root": str(self.root),
@@ -715,9 +866,20 @@ class SelfModel:
             "last_mood_set_at": _mood.set_at,
             "last_mood_cause": _mood.cause,
             "manner": _mood.manner,
+            # the CURRENT, stepped level (0–3) — not the level it was set at
             "manner_intensity": _mood.manner_intensity,
             # §4TS: the manner's steps still ahead, (on-disk stamp, level)
-            "manner_steps": [list(x) for x in _mood.manner_steps],
+            "manner_steps": _steps,
+            # §4UD: when the manner's day is over (the last step), "" with no manner
+            "manner_until": (str(_steps[-1][0]) if _mood.manner and _steps else ""),
+            # §4UD (F6): the end of the owner's hold while it is on, "" otherwise
+            "held_until": _mood.held_until,
+            # §4UD (W1): THE label a face shows — the mood's, else the resting region, else "neutral"
+            "face": M.face_label(_mood.label, _mood.intensity, _rest),
+            # since when the owner (or a job of theirs) has been quiet, ISO; "" when unknown
+            "quiet_since": (_iso_ago(_quiet) if _quiet is not None else ""),
+            # §4UD (F12): "" when state.json was read; else why it was not (the state started empty)
+            "load_problem": str(getattr(_st, "load_problem", "") or ""),
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),

@@ -88,9 +88,22 @@ class Mood:
     §4TX: ``held_until`` — a mood the owner SET does not decay and is not
     moved by events until then (the next 04:00, like a manner); ``owner_at``
     — when the owner last set, reset or changed the manner (an event about a
-    message older than that is not applied); ``private_p`` / ``private_e`` —
-    the part of the pair the owner's own sentiment put there, which decays
-    with it and is left out of the mood other people hear.
+    message older than that is not applied).
+
+    §4UD: the part of the pair the owner's own message tone put there is
+    FOUR non-negative numbers — ``private_up_p`` / ``private_up_e`` (what
+    upbeat messages added) and ``private_dn_p`` / ``private_dn_e`` (what
+    unhappy ones took off). They decay with the pair and are left out of
+    the mood other people hear. Kept apart so one side can never be netted
+    against the other (review F1: one signed number hid −0.18 of tone behind
+    a +0.08 that was never in the pair). The pair without them is
+    ``p − private_up_p + private_dn_p`` (same for ``e``): what the mood would
+    be had no message tone ever been read. ``private_p`` / ``private_e`` are
+    the NET, read-only; a file written before §4UD carries them as its only
+    share and loads onto the side of their sign. ``tone_touched`` — a tone
+    had a part in this pair since it was last neutral or set by the owner
+    (then other people get a fresh reading of the level, never the held one).
+    ``prev`` — what the owner's last set mood replaced (``set_mood`` undo).
 
     Before §4TC a mood was ``{"label", "evidence", "set_at", "source":
     "self"|"derived"}``. Such a record has no pair: ``SelfState.from_dict``
@@ -111,8 +124,21 @@ class Mood:
     manner_set_at: str = ""
     held_until: str = ""
     owner_at: str = ""
-    private_p: float = 0.0
-    private_e: float = 0.0
+    private_up_p: float = 0.0
+    private_up_e: float = 0.0
+    private_dn_p: float = 0.0
+    private_dn_e: float = 0.0
+    tone_touched: bool = False
+    prev: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def private_p(self) -> float:
+        """The owner's tone in the pleasantness, NET (up − down). Read-only."""
+        return self.private_up_p - self.private_dn_p
+
+    @property
+    def private_e(self) -> float:
+        return self.private_up_e - self.private_dn_e
 
     @classmethod
     def from_dict(cls, d: Any) -> Optional["Mood"]:
@@ -145,8 +171,15 @@ class Mood:
                   for r in (d.get("recent") if isinstance(d.get("recent"), list) else [])
                   if isinstance(r, dict)][-MOOD_RECENT_CAUSES:]
         manner = resolve_manner(d.get("manner")) if isinstance(d.get("manner"), str) else ""
+        shares = cls._shares_from(d)
+        # a share an older version stored OVER the cap is cut on its way in — with the pair, so that what the
+        # tones hold in the pair is what the shares say (the cut part leaves both)
+        over_p = clamp(d.get("private_p")) - (shares["private_up_p"] - shares["private_dn_p"]) \
+            if "private_up_p" not in d else 0.0
+        over_e = clamp(d.get("private_e")) - (shares["private_up_e"] - shares["private_dn_e"]) \
+            if "private_up_e" not in d else 0.0
         return cls(
-            p=clamp(d.get("p")), e=clamp(d.get("e")),
+            p=clamp(clamp(d.get("p")) - over_p), e=clamp(clamp(d.get("e")) - over_e),
             updated_at=_text("updated_at", 40),
             label=label, intensity=intensity,
             novelty=d.get("novelty") is True,
@@ -158,8 +191,43 @@ class Mood:
             manner_set_at=_text("manner_set_at", 40) if manner else "",
             held_until=_text("held_until", 40) if d.get("source") == SOURCE_OWNER else "",
             owner_at=_text("owner_at", 40),
-            private_p=clamp(d.get("private_p")), private_e=clamp(d.get("private_e")),
+            **shares,
+            prev=cls._prev_from(d.get("prev")),
         )
+
+    @staticmethod
+    def _shares_from(d: Dict[str, Any]) -> Dict[str, Any]:
+        """The four tone shares of a stored record, each in [0, its cap]. A
+        record from before §4UD holds one signed number per axis: it goes to
+        the side of its sign, so the cap that held it still does."""
+        from .mood import SENTIMENT_SHARE_MAX, SENTIMENT_SHARE_MAX_E, clamp
+
+        def _side(key: str, legacy: str, sign: float, cap: float) -> float:
+            v = clamp(d.get(key)) if key in d else max(0.0, sign * clamp(d.get(legacy)))
+            return max(0.0, min(cap, v))
+        out = dict(
+            private_up_p=_side("private_up_p", "private_p", 1.0, SENTIMENT_SHARE_MAX),
+            private_up_e=_side("private_up_e", "private_e", 1.0, SENTIMENT_SHARE_MAX_E),
+            private_dn_p=_side("private_dn_p", "private_p", -1.0, SENTIMENT_SHARE_MAX),
+            private_dn_e=_side("private_dn_e", "private_e", -1.0, SENTIMENT_SHARE_MAX_E),
+        )
+        touched = d.get("tone_touched")
+        out["tone_touched"] = (touched is True) if "tone_touched" in d else any(out.values())
+        return out
+
+    @staticmethod
+    def _prev_from(v: Any) -> Dict[str, Any]:
+        """What the owner's last set mood replaced, or {} (anything else)."""
+        from .mood import LABELS, clamp
+        if not isinstance(v, dict) or not isinstance(v.get("at"), str) or not v["at"].strip():
+            return {}
+        prev: Dict[str, Any] = {"p": clamp(v.get("p")), "e": clamp(v.get("e")), "at": v["at"][:40]}
+        n = v.get("intensity")
+        # the label and level of what was replaced are kept only for a mood the owner had set and still held
+        if (v.get("owner") is True and v.get("label") in LABELS and isinstance(n, int) and not isinstance(n, bool)
+                and 1 <= n <= 3 and isinstance(v.get("held_until"), str) and v["held_until"].strip()):
+            prev.update(label=v["label"], intensity=n, owner=True, held_until=v["held_until"][:40])
+        return prev
 
 
 #: how many of the latest events ``Mood.recent`` keeps
@@ -182,6 +250,10 @@ class SelfState:
     #: length of a quiet is measured from it, so a restart does not change
     #: it. Distinct from `last_session_at`, which every captured turn stamps.
     last_owner_turn_at: str = ""
+    #: §4UD (F9): when a background job the OWNER started last did work — the
+    #: quiet is measured from the later of the two (the face read "bored"
+    #: while the agent worked for the owner all day)
+    last_owner_job_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -203,4 +275,53 @@ class SelfState:
             last_session_at=str(d.get("last_session_at") or ""),
             last_owner_turn_at=(d.get("last_owner_turn_at")
                                 if isinstance(d.get("last_owner_turn_at"), str) else ""),
+            last_owner_job_at=(d.get("last_owner_job_at")
+                               if isinstance(d.get("last_owner_job_at"), str) else ""),
         )
+
+
+def read_jsonl_rows(path, *, what: str = "") -> List[Dict[str, Any]]:
+    """§4UD (F5): THE reader of the selfhood jsonl files (the Mirror's diary,
+    the sentiment journal, the mood journals): every line that is a JSON
+    object, oldest first. A byte that is not UTF-8 costs its own line, never
+    the file (it is replaced, and the line then parses or is skipped); a
+    torn or hand-edited line is skipped. The number of skipped lines is
+    logged once per file state. [] when the file is absent or unreadable.
+    Never raises."""
+    import logging
+    from pathlib import Path
+    p = Path(path)
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        logging.getLogger("GhostSelfhood").warning("%s unreadable: %s", what or p.name, e)
+        return []
+    out: List[Dict[str, Any]] = []
+    bad = 0
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            row = json.loads(s)
+        except (ValueError, RecursionError):
+            bad += 1
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+        else:
+            bad += 1
+    if bad:
+        key = (str(p), len(raw), bad)
+        if key not in _BAD_LINES_LOGGED:
+            if len(_BAD_LINES_LOGGED) > 64:
+                _BAD_LINES_LOGGED.clear()
+            _BAD_LINES_LOGGED.add(key)
+            logging.getLogger("GhostSelfhood").warning(
+                "%s: %d line(s) could not be read and were skipped (%d kept)", what or p.name, bad, len(out))
+    return out
+
+
+_BAD_LINES_LOGGED: set = set()

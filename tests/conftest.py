@@ -165,6 +165,16 @@ def _logging_handlers_are_per_test():
 
 
 @pytest.fixture(autouse=True)
+def _no_character_lean(monkeypatch):
+    """§4UH: the character scales how hard mood events land (``character.lean``). The mood tests pin
+    the events' own sizes, so the lean reads dials at 0 in every test — its code still runs on every
+    event (review r1: switching it off hid the path from the whole mood suite). A test of the lean puts
+    the real ``character.lean_dials`` back."""
+    from ghost_agent.selfhood import character as _character
+    monkeypatch.setattr(_character, "lean_dials", lambda home: {d: 0 for d in _character.DIALS})
+
+
+@pytest.fixture(autouse=True)
 def _no_quiet_hours_by_clock(monkeypatch):
     """§4LI: quiet hours read the WALL CLOCK (default 23-07); five
     notification tests failed when the suite ran at night. Off for every

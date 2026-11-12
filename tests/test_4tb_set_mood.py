@@ -757,7 +757,7 @@ def test_the_fold_shrinks_what_the_model_is_shown():
     `manner_intensity` and `step`): still far under what the two tools took
     together."""
     size = len(json.dumps(_defn("introspect")))
-    assert size <= 3508 + 500 < 3527 + 1922
+    assert size <= 3508 + 660 < 3527 + 1922          # §4UD: + 'days' and 'undo' (160 characters)
 
 
 def test_the_prompt_rule_names_the_write_and_no_removed_surface():
@@ -858,7 +858,8 @@ def test_the_first_rewrite_drops_the_removed_lists_and_the_old_mood(tmp_path):
     sm.state.touch_session()                                # what every captured turn does
     on_disk = json.loads((tmp_path / "state.json").read_text())
     assert on_disk["mood"] is None
-    assert set(on_disk) == {"schema_version", "mood", "last_session_at", "last_owner_turn_at"}   # §4TC: the owner stamp
+    assert set(on_disk) == {"schema_version", "mood", "last_session_at", "last_owner_turn_at",   # §4TC: the owner stamp
+                            "last_owner_job_at"}                                                # §4UD (F9)
     assert _lab(SelfModel(root=tmp_path)) is None
 
 

@@ -53,6 +53,43 @@ def _store(d, key, n=28213):
     (d / f"head-{key}.json").write_text(json.dumps({"n_tokens": n}))
 
 
+def _as_wait(idle):
+    """§4UD (H5): `_slot_idle` (a bool) became `_slot_wait` ((why, slot record)).
+    An old-style stub's True is an idle slot as llama reports it now, its
+    False a slot that stayed busy."""
+    async def wait(base, late, stop=None):
+        if not await idle(base, late, stop):
+            return ("stopped" if stop is not None and stop() else "busy", {})
+        try:
+            slot = (H._http(base + "/slots", timeout=3.0) or [{}])[0]
+        except Exception:  # noqa: BLE001 — a test without a /slots stub
+            slot = {}
+        return ("", slot if isinstance(slot, dict) and slot else {"is_processing": False, "n_prompt_tokens": 1})
+    return wait
+
+
+def _bind_staged(payload, d=None):
+    """§4UD (H1): a conversation file is bound to what its state opens with
+    (its meta's `head`); one without the field is refused and discarded. A
+    test that stages a file by hand and is NOT about that rule calls this to
+    say "saved by a call like ``payload``" — the tag is `L.head_bind_tag` of
+    that real payload. A meta that already has the field is left as written."""
+    tag = L.head_bind_tag(payload)
+    d = d or H.head_dir()
+    assert tag and d is not None and d.is_dir()
+    for m in d.glob("head-*.json"):
+        try:
+            meta = json.loads(m.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(meta, dict) or "head" in meta:
+            continue
+        meta["head"] = tag
+        at = m.stat().st_mtime
+        m.write_text(json.dumps(meta))
+        os.utime(m, (at, at))
+
+
 def _http_error(code, text):
     return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(text.encode()))
 
@@ -274,7 +311,8 @@ def _llama_saves(d, n, written=1_726_869_452):
     """llama writes the .part file it was asked for and reports n_saved."""
     def http(url, body=None, timeout=5.0):
         assert url == BASE + "/slots/0?action=save"
-        (d / body["filename"]).write_bytes(b"state")
+        with open(d / body["filename"], "wb") as f:
+            f.truncate(written)                 # §4UD (H4): the file is as long as llama says (sparse)
         return {"n_saved": n, "n_written": written, "timings": {"save_ms": 676.6}}
     return http
 
@@ -282,6 +320,7 @@ def _llama_saves(d, n, written=1_726_869_452):
 def test_a_save_of_exactly_the_head_becomes_the_head(monkeypatch, tmp_path):
     d = _dir(tmp_path)
     monkeypatch.setattr(H, "_http", _llama_saves(d, 28213))
+    monkeypatch.setattr(H, "server_identity", lambda base: "id")     # §4UD: read again after the save
     ok, detail = H.save(BASE, d, "k", 28213, "id")
     assert ok and "1.73 GB" in detail
     assert sorted(p.name for p in d.iterdir()) == ["head-k.bin", "head-k.json"]
@@ -734,7 +773,19 @@ async def test_a_plan_failure_never_breaks_the_warmup(warm, monkeypatch):
         raise OSError("props down")
     monkeypatch.setattr(H, "server_identity", boom)
     await agent.warm_up_main_prefix(quiet=True)
-    assert "before_dispatch" not in st["kw"] and not st["saves"]
+    assert "before_dispatch" not in st["kw"] and not st["saves"] and st["sent"] == 1
+    # §4UD (F6): only when llama did NOT ANSWER the plan's reads does the tick
+    # send nothing (a bare prefill would go over a conversation nothing could
+    # save); the next tick plans again. With the loop off: the prefill, as before
+    def gone(base):
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(H, "server_identity", gone)
+    agent._head_rewarm_retry = False
+    await agent.warm_up_main_prefix(quiet=True)
+    assert st["sent"] == 1 and agent._head_rewarm_retry is True
+    monkeypatch.setenv("GHOST_MAIN_PREFIX_REWARM_S", "0")
+    await agent.warm_up_main_prefix(quiet=True)
+    assert st["sent"] == 2 and "before_dispatch" not in st["kw"] and not st["saves"]
 
 
 # ── r2: the llama launcher restores at start ───────────────────────────
@@ -1024,6 +1075,9 @@ def _switch_env(agent, llm, st, monkeypatch, *, slot=38213, busy=False, owner="s
     monkeypatch.setattr(H, "_http", lambda url, body=None, timeout=5.0:
                         [{"is_processing": busy, "n_prompt_tokens": slot}])
     llm._slot_session = owner
+    # §4UD (H1): an owned slot's state was built by that conversation's call,
+    # which recorded what it opens with — here, the warmed head
+    llm._slot_head_tag = L.head_bind_tag(_turn(st)) if owner and "payload" in st else None
     slot_session_context.set(key)
 
 
@@ -1208,6 +1262,11 @@ async def test_a_failed_head_plan_clears_the_switch_target(warm, monkeypatch):
     def boom(base, payload):
         raise OSError("apply-template timed out")
     monkeypatch.setattr(H, "render", boom)
+    # §4UD (H3): "the reference moved on" is now part of the rule — the plan is
+    # cleared only when the warm-up's head payload CHANGED; with the same
+    # payload the last good plan stays for restores (pinned in test_4ud_head_saves)
+    from ghost_agent.core import agent as A
+    monkeypatch.setattr(A, "_STABLE_SKILL_INSTRUCTION", A._STABLE_SKILL_INSTRUCTION + " (changed)")
     await agent.warm_up_main_prefix(quiet=True)
     assert agent._head_plan_last is None
     _switch_env(agent, llm, st, monkeypatch)
@@ -1480,6 +1539,7 @@ def _kmeta(d, key, kind, at, identity="id", n=8000):
 def test_a_save_names_its_kind(monkeypatch, tmp_path):
     d = _dir(tmp_path)
     monkeypatch.setattr(H, "_http", _llama_saves(d, 8000))
+    monkeypatch.setattr(H, "server_identity", lambda base: "id")     # §4UD: read again after the save
     ok, _ = H.save(BASE, d, "m1", 8000, "id", H.MEMBER)
     assert ok and json.loads((d / "head-m1.json").read_text())["kind"] == "member"
     assert H.kind_of(d, "m1") == H.MEMBER and H.has_kind(d, H.MEMBER)
@@ -2243,7 +2303,7 @@ async def test_a_members_first_request_with_no_file_saves_it_for_the_next(member
 
     async def idle(base, late, stop=None):
         return True
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     monkeypatch.setattr(H, "_http", _member_http(st))
     st["saves"].clear(); st["kinds"].clear(); st["restores"].clear(); st["logged"].clear()
     await agent._slot_switch_before(_member_turn(hs))
@@ -2268,7 +2328,7 @@ async def test_a_members_save_that_cannot_happen_leaves_the_call_as_before(membe
 
     async def idle(base, late, stop=None):
         return case != "busy"
-    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(agent, "_slot_wait", _as_wait(idle))
     monkeypatch.setattr(H, "_http", _member_http(st, prompt=0 if case == "no_count" else 8000))
     if case == "save_refused":
         monkeypatch.setattr(H, "save", lambda *a, **k: (False, "slot held 9000 tokens, expected 8000"))
@@ -2319,6 +2379,11 @@ def test_prune_drops_saves_of_another_server_only_when_told_which_is_running(tmp
     _meta(d, "mine", "id", 1)
     _meta(d, "gone", "old-model", 2)
     _store(d, "legacy")                              # a meta without an identity: kept
+    # §4UD (H8): another server's save leaves by AGE (it was: at once — trying
+    # another model once deleted every save of the usual one)
+    old = time.time() - H.FOREIGN_KEEP_S - 60
+    for n in ("head-gone.bin", "head-gone.json", "head-mine.bin", "head-mine.json"):
+        os.utime(d / n, (old, old))                  # ours is as old: only the foreign one is judged by it
     H.prune(d)
     assert (d / "head-gone.bin").exists()            # no identity given: nothing judged
     H.prune(d, identity="id")
@@ -2361,9 +2426,14 @@ def test_llama_start_frees_the_saves_of_a_previous_model(monkeypatch, tmp_path):
     d = _dir(tmp_path)
     _meta(d, "k", _ident(), 1)
     _meta(d, "was", "/old|b|x", 2)
+    _meta(d, "tried", "/other|b|x", 3)
+    old = time.time() - H.FOREIGN_KEEP_S - 60         # §4UD (H8): by age, not at once
+    for n in ("head-was.bin", "head-was.json"):
+        os.utime(d / n, (old, old))
     _server(monkeypatch)
     H.restore_on_start(BASE, d, sleep=lambda s: None)
     assert (d / "head-k.bin").exists() and not (d / "head-was.bin").exists()
+    assert (d / "head-tried.bin").exists()            # a model tried today keeps its saves for now
 
 
 def test_a_save_never_judges_identity_from_its_callers_plan(monkeypatch, tmp_path):
@@ -2374,8 +2444,11 @@ def test_a_save_never_judges_identity_from_its_callers_plan(monkeypatch, tmp_pat
     _meta(d, "new-owner", "NEW", 2)
     _meta(d, "new-member", "NEW", 3)
     monkeypatch.setattr(H, "_http", _llama_saves(d, 5))
+    # §4UD (H2): such a save is no longer kept at all — llama's identity is read
+    # after it, and the file of a plan from before the restart is dropped
+    monkeypatch.setattr(H, "server_identity", lambda base: "NEW")
     ok, detail = H.save(BASE, d, "cstale", 5, identity="OLD", kind=H.CONV, at_least=True)
-    assert ok, detail
+    assert not ok and "another model" in detail and not list(d.glob("head-cstale*"))
     assert (d / "head-new-owner.bin").exists() and (d / "head-new-member.bin").exists()
 
 
@@ -2432,8 +2505,9 @@ def test_a_save_whose_file_was_pruned_meanwhile_reports_failure(monkeypatch, tmp
 
     def http(url, body=None, timeout=5.0):
         (d / body["filename"]).write_bytes(b"state")
-        return {"n_saved": 5}
+        return {"n_saved": 5, "n_written": 5}          # §4UD (H4): llama says what it wrote
     monkeypatch.setattr(H, "_http", http)
+    monkeypatch.setattr(H, "server_identity", lambda base: "id")
     real = os.replace
 
     def gone(src, dst):
@@ -2466,6 +2540,7 @@ def test_a_meta_that_cannot_be_written_fails_the_save_without_raising(monkeypatc
     _store(d, "k", n=99)                               # the previous save of this key
     monkeypatch.setattr(H, "_http", _llama_saves(d, 5))
     (d / "head-k.json.tmp").mkdir()                    # stands in for a full disk
+    monkeypatch.setattr(H, "server_identity", lambda base: "id")
     ok, detail = H.save(BASE, d, "k", 5, "id")
     assert not ok and "meta not written" in detail
     assert H.stored_tokens(d, "k") is None and not (d / "head-k.bin").exists()
@@ -2504,7 +2579,8 @@ def test_a_file_re_saved_while_the_prune_runs_is_left_for_the_next_one(tmp_path,
     assert (d / "head-ck.bin").exists() and (d / "head-ca.bin").exists()
 
 
-@pytest.mark.parametrize("reply", ["not json", ["a"], {"n_saved": "x"}, {"n_saved": 5, "timings": "?"}])
+@pytest.mark.parametrize("reply", ["not json", ["a"], {"n_saved": "x"}, {"n_saved": 5, "n_written": "?"},
+                                   {"n_saved": 5, "n_written": 5, "timings": "?"}])
 def test_an_odd_llama_reply_never_raises_out_of_save(monkeypatch, tmp_path, reply):
     d = _dir(tmp_path)
 
@@ -2512,8 +2588,9 @@ def test_an_odd_llama_reply_never_raises_out_of_save(monkeypatch, tmp_path, repl
         (d / body["filename"]).write_bytes(b"state")
         return reply
     monkeypatch.setattr(H, "_http", http)
+    monkeypatch.setattr(H, "server_identity", lambda base: "id")
     ok, _ = H.save(BASE, d, "k", 5, "id")
-    assert ok == (reply == {"n_saved": 5, "timings": "?"})
+    assert ok == (reply == {"n_saved": 5, "n_written": 5, "timings": "?"})   # §4UD (H4): n_written is required
 
 
 @pytest.mark.parametrize("reply", ["not json", ["a"]])

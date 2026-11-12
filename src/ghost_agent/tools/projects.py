@@ -1250,9 +1250,12 @@ _ADVANCE_STOP_BLURB = {
                    "is open again (READY). Any file it finished is on disk, not verified yet; "
                    "a file it had not finished is written again from the start next time. "
                    "Tell the user.",
-    "labs_down": "Stopped: the build needed a lab and the labs host did not answer — the task is open "
+    "labs_down": "Stopped: the build needed a lab and the labs host did not answer, or answered that it cannot "
+                 "make one right now (its Tor gateway or firewall is not up, its ports are all in use, or it was "
+                 "busy) — the task is open "
                  "again (PENDING) and the autopilot starts it again by itself once the labs host answers (after "
-                 "a host that took the request and went silent: at least 15 minutes and a free lab slot). "
+                 "a host that took the request and went silent: at least 15 minutes and a free lab slot; after "
+                 "a host that was not ready: at least 3 minutes). "
                  "Tell the user; nothing failed in the project itself.",
     "lab_owner_hold": "Stopped: the build could not get a lab, and the task was one the user had put on hold — it "
                       "is back ON HOLD and WAITS FOR THE USER (it does not start again by itself). Tell the user "
@@ -2672,7 +2675,6 @@ async def _teardown_labs(context, project_id, owner, *, hard, origin, rep) -> No
         st, body = await _call(context, "GET", "/v1/labs", origin=origin, params={"owner": owner})
         if st != 200:
             raise LabsNoAnswer(f"HTTP {st}")
-        everyone = None
         mine = [x for x in (body if isinstance(body, dict) else {}).get("labs") or []
                 if isinstance(x, dict) and str(x.get("owner") or "") == owner]
     except (LabsUnreachable, LabsNoAnswer) as e:
@@ -2682,6 +2684,7 @@ async def _teardown_labs(context, project_id, owner, *, hard, origin, rep) -> No
             rep["notes"].append(f"labs host did not answer ({e}); no lab of this project is on record")
         return
     seen = set()
+    _destroyed: set = set()                # labs this pass destroyed: they no longer hold a lineage (review r2 #1)
     try:
         from .labs import _host_id
         host_now = await _host_id(context, origin)
@@ -2699,25 +2702,13 @@ async def _teardown_labs(context, project_id, owner, *, hard, origin, rep) -> No
             continue
         params = {}
         if kept:
-            params["include_kept"] = "1"
-            lineage = str(lab.get("lineage") or "")
-            if everyone is None:
-                try:
-                    st2, b2 = await _call(context, "GET", "/v1/labs", origin=origin)
-                    everyone = ([x for x in b2.get("labs") or [] if isinstance(x, dict)]
-                                if st2 == 200 and isinstance(b2, dict) else None)
-                except Exception:  # noqa: BLE001
-                    everyone = None
-            sharing = None if everyone is None else [
-                str(x.get("lab_id")) for x in everyone
-                if str(x.get("lab_id")) != lid and str(x.get("lifetime") or "") == "kept"
-                and lineage and str(x.get("lineage") or "") == lineage]
-            if sharing == []:
-                params["drop_data"] = "1"
-            else:
-                rep["notes"].append(f"kept lab {lid}: its data volume is KEPT — "
-                                    + (f"the lineage {lineage!r} is shared with {', '.join(sharing)}" if sharing
-                                       else "could not check whether another version shares it"))
+            # §4UD F13: the ONE decision (tools/labs.kept_destroy_params) — the host keeps the data while another
+            # kept version of the app exists and says so in its answer; this copy of the list check is gone
+            from .labs import kept_destroy_params
+            params, _dnote = await kept_destroy_params(context, origin, lid, str(lab.get("lineage") or ""),
+                                                       gone=_destroyed)
+            if _dnote:
+                rep["notes"].append(f"kept lab {lid}:{_dnote}")
         try:
             st, b = await _call(context, "DELETE", f"/v1/labs/{lid}", origin=origin, params=params, timeout=120)
         except Exception as e:  # noqa: BLE001
@@ -2742,8 +2733,7 @@ async def _teardown_labs(context, project_id, owner, *, hard, origin, rep) -> No
             else:
                 what = ""
             rep["stopped"].append(f"{'kept ' if kept else ''}lab {lid} destroyed{what}")
-            if everyone is not None:            # it no longer holds the lineage for the next one (review r2 #1)
-                everyone = [x for x in everyone if str(x.get("lab_id")) != lid]
+            _destroyed.add(lid)
             if inv is not None:
                 inv.record_destroy(lid, by=f"project teardown {project_id}")
         else:

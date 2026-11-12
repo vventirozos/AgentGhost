@@ -236,9 +236,23 @@ async def test_the_manner_goes_through_the_same_guards(tmp_path):
 # ── the read action: the mood's story ───────────────────────────────────────
 
 def _today(h, m):
-    """A UTC stamp for local time h:m today."""
-    local = dt.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-    return local.astimezone(dt.timezone.utc)
+    """A UTC stamp h hours m minutes into the current MOOD day (§4UD F7: it
+    begins at local 04:00 — "today" in the mood's story is that day, not the
+    calendar day these tests used to stamp at 00:01)."""
+    start = M.mood_day_end(M.mood_day() - dt.timedelta(days=1))
+    return start + dt.timedelta(hours=h, minutes=m)
+
+
+def _hm(h, m):
+    """That stamp as the timeline prints it (local HH:MM)."""
+    return _today(h, m).astimezone().strftime("%H:%M")
+
+
+def _when(h, m):
+    """That stamp as "since" and "why" print it: the story's stamps lie in the current mood day, and a stamp
+    of the current mood day prints as its time alone (review r2: this helper used to ask the function under
+    test for the expected text)."""
+    return _hm(h, m)
 
 
 def _fresh(sm, age_s=5.0):
@@ -253,8 +267,9 @@ def _story(tmp_path):
     st = sm.state
     st.nudge(0.30, 0.0, "a turn of 5 tool calls went through without a failure", M.KIND_TURN, now=_today(0, 1))
     st.nudge(-0.85, 0.45, "4 tool calls failed in this turn", M.KIND_TURN, now=_today(0, 2))
+    # hold=False: the story is about a mood that wears off (a held one is `tests/test_4ud_mood.py`'s)
     st.set_owner_mood("cheerful", M.ANCHOR_DIRECTION["cheerful"], 2, note="Elena said Bruno is home",
-                      now=_today(0, 3))
+                      now=_today(0, 3), hold=False)
     return sm
 
 
@@ -263,12 +278,13 @@ async def test_the_mood_action_says_what_why_since_when_and_today(tmp_path):
     _fresh(sm)
     out = await tool_introspect(action="mood", self_model=sm)
     lines = out.split("\n")
-    assert lines[0] == "My mood now: cheerful, 2 of 3 — since 00:03 (set by the owner)."
-    assert lines[1] == ("Why: a turn of 5 tool calls went through without a failure (00:01); "
-                        "4 tool calls failed in this turn (00:02); the owner said so (set_mood) (00:03).")
-    assert lines[2] == ("Today: 00:01 content 1 — a turn of 5 tool calls went through without a failure → "
-                        "00:02 irritable 2 — 4 tool calls failed in this turn → "
-                        "00:03 cheerful 2 — the owner said so (set_mood) (Elena said Bruno is home)")
+    assert lines[0] == f"My mood now: cheerful, 2 of 3 — since {_when(0, 3)} (set by the owner)."
+    assert lines[1] == (f"Why: a turn of 5 tool calls went through without a failure ({_when(0, 1)}); "
+                        f"4 tool calls failed in this turn ({_when(0, 2)}); "
+                        f"the owner said so (set_mood) ({_when(0, 3)}).")
+    assert lines[2] == (f"Today: {_hm(0, 1)} content 1 — a turn of 5 tool calls went through without a failure → "
+                        f"{_hm(0, 2)} irritable 2 — 4 tool calls failed in this turn → "
+                        f"{_hm(0, 3)} cheerful 2 — the owner said so (set_mood) (Elena said Bruno is home)")
     assert lines[3] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2)}"'
     assert lines[4] == I.MOOD_HOW_IT_MOVES and len(lines) == 5
     assert "half every 2 hours" in lines[4] and "action='set_mood'" in lines[4]
@@ -322,11 +338,15 @@ async def test_on_a_public_surface_the_story_has_no_causes_and_no_note(tmp_path)
         public = (await tool_introspect(action="mood", self_model=sm)).split("\n")
     finally:
         reply_surface_context.reset(tok)
-    assert public[0] == private[0] == "My mood now: cheerful, 2 of 3 — since 00:03 (set by the owner)."
-    assert public[1] == private[1] and public[1].startswith("Manner (set by the owner): terse, 2 of 3")
+    assert private[0] == f"My mood now: cheerful, 2 of 3 — since {_when(0, 3)} (set by the owner)."
+    # §4UD (F14, review r2): where other people read, the label and the level only — not who set the mood or
+    # the manner, not since when, not until when (this line pinned `public[0] == private[0]`: the leak)
+    assert public[0] == "My mood now: cheerful, 2 of 3."
+    assert private[1].startswith("Manner (set by the owner): terse, 2 of 3 — since ")
+    assert public[1] == "Manner: terse, 2 of 3."
     assert public[2] == "Why: the reasons are shown in a private conversation."
     # §4TX r4: every journal row holds the owner's pair — the public story has no timeline
-    assert public[3] == f"Today: {I.MOOD_STEPS_PRIVATE}." and private[3].startswith("Today: 00:01 content 1")
+    assert public[3] == f"Today: {I.MOOD_STEPS_PRIVATE}." and private[3].startswith(f"Today: {_hm(0, 1)} content 1")
     assert private[4] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2, "terse", 2)}"'
     # §4TX r3: on a public surface, the line the public reply really gets
     assert public[4] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2, "terse", 2, audience="public")}"'
@@ -365,10 +385,12 @@ async def test_on_a_public_surface_overview_summary_and_stats_withhold_the_cause
     finally:
         reply_surface_context.reset(tok)
     assert "  mood: irritable, 2 of 3 — the reasons are shown in a private conversation\n" in over
-    assert re.search(r"\n  manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", over), over
+    # §4UD (F14): on a public surface the manner is shown without who set it
+    assert "\n  manner: gentle, 1 of 3\n" in over, over
     for out in (stats, summ):
         assert "Mood: irritable, 2 of 3 — the reasons are shown in a private conversation\n" in out
-        assert re.search(r"Manner \(set by the owner\): gentle, 1 of 3 — off at (?:\w{3} \d\d )?\d\d:\d\d\n", out)
+        assert "\nManner: gentle, 1 of 3\n" in out
+    assert "set by the owner" not in over + stats + summ and "off at" not in over + stats + summ
     assert "tool calls failed" not in over + stats + summ
     private = await tool_introspect(action="stats", self_model=sm, context=ctx)
     assert "Mood: irritable, 2 of 3 — 4 tool calls failed (of 6) in this turn\n" in private
@@ -452,7 +474,7 @@ async def test_a_fault_in_the_mood_view_is_a_declared_failure(tmp_path, monkeypa
 
     def boom(*a, **k):
         raise OSError("store gone")
-    monkeypatch.setattr(sm.state, "mood_timeline", boom)
+    monkeypatch.setattr(sm.state, "mood_days", boom)
     out = await tool_introspect(action="mood", self_model=sm)
     assert out.status is OutcomeStatus.FAILED and "store gone" in out
 
@@ -809,7 +831,15 @@ async def test_the_story_of_a_boredom_is_the_quiet_and_the_owner_never_reads_one
         request_id_context.reset(tok)
     assert lines[0].startswith("My mood now: bored, 1 of 3 — since ") and lines[0].endswith(" (automatic).")
     assert lines[1] == "Why: quiet for 6 hours."                         # not the thumb of yesterday
-    assert "bored 1 — quiet for 6 hours" in lines[2] and "Mood: bored, 1 of 3 — quiet for 6 hours" in stats
+    # the boredom began an hour ago — on today's line, unless the mood day began after it (run in the hour
+    # after 04:00 the onset is yesterday's, and today has no change yet: §4UH-e2e, a flake at that hour)
+    _now = dt.datetime.now(dt.timezone.utc)
+    _day_start = M.mood_day_end(M.mood_day(_now) - dt.timedelta(days=1))
+    if _now - dt.timedelta(hours=1) >= _day_start:
+        assert "bored 1 — quiet for 6 hours" in lines[2]
+    else:
+        assert lines[2] == "Today: no change so far."
+    assert "Mood: bored, 1 of 3 — quiet for 6 hours" in stats
     assert "quiet for 6 hours or more a neutral mood reads as bored (here and on the face, not in replies)" in lines[-1]
     own = (await tool_introspect(action="mood", self_model=sm)).split("\n")          # the fixture's id is the owner's
     assert own[0] == "My mood now: neutral."

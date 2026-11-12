@@ -24,6 +24,7 @@ from ghost_agent.core.agent import GhostAgent
 from ghost_agent.tools import file_system as FS
 from ghost_agent.utils import logging as GL
 from ghost_agent.utils.logging import request_id_context, slot_session_context
+from ghost_agent.core.head_saves import save as _REAL_SAVE
 from tests.test_4ro_head_saves import warm  # noqa: F401
 from tests.test_4rv_conv_keep import conv, cwarm  # noqa: F401
 
@@ -924,8 +925,22 @@ async def test_the_incident_path_is_logged_and_saves_nothing(cwarm, monkeypatch,
     agent, llm, st = await _stale(cwarm, monkeypatch)
     agent._conv_plan_last, agent._head_plan_last = agent._head_plan_last, None
     monkeypatch.setattr(H, "server_identity", lambda base: "the model after the swap")
+    # §4UD r3: a hook with a deadline no longer reads /props BEFORE the save (a
+    # hanging /props spent the room the save needs); the refusal is the save's
+    # own check after llama answered — so this runs the real `save`, against a
+    # llama that writes the file, and the file must not stay
+    d = H.head_dir()
+
+    def http(url, body=None, timeout=5.0):
+        if "action=save" in url:
+            (d / body["filename"]).write_bytes(b"s" * 10)
+            return {"n_saved": st["slot"], "n_written": 10}
+        return [{"is_processing": False, "n_prompt_tokens": st["slot"]}]
+    monkeypatch.setattr(H, "_http", http)
+    monkeypatch.setattr(H, "save", _REAL_SAVE)
+    before = sorted(p.name for p in d.iterdir())
     await agent._side_call_before(LOOK)
-    assert st["conv_saves"] == []
+    assert sorted(p.name for p in d.iterdir()) == before
     assert any("not saved before this request's picture look" in m and "another model" in m for m in st["lines"])
 
 
@@ -942,6 +957,12 @@ async def test_no_plan_at_all_is_logged(cwarm, monkeypatch, rid):
     from tests.test_4rwg_side_call import LOOK
     agent, llm, st = await _stale(cwarm, monkeypatch)
     agent._conv_plan_last = agent._head_plan_last = None
+
+    def down(base):
+        raise TimeoutError("timed out")
+    # §4UD (H3): with no plan the hook now asks for one (bounded) — "no plan at
+    # all" is the case where that attempt fails too
+    monkeypatch.setattr(H, "server_identity", down)
     await agent._side_call_before(LOOK)
     assert st["conv_saves"] == [] and any("no save plan yet" in m for m in st["lines"])
 
@@ -960,7 +981,9 @@ async def test_after_the_mark_lifts_a_real_warm_up_installs_the_hooks(cwarm, mon
     H._unsupported.add(base)
     llm.before_side_main_dispatch = None
     await agent.warm_up_main_prefix(quiet=True)
-    assert agent._head_plan_last is None and llm.before_side_main_dispatch is None
+    # §4UD (H3): the hooks are installed with no plan too (a request asks for
+    # the plan itself); before, no plan meant no hook for a whole tick
+    assert agent._head_plan_last is None and llm.before_side_main_dispatch == agent._side_call_before
     _serve(monkeypatch, _http_error(400, FLAG))
     assert await agent._head_saves_back() is True
     await agent.warm_up_main_prefix(quiet=True)

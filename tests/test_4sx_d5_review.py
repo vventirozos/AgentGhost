@@ -586,18 +586,23 @@ async def test_a_leaf_cancelled_mid_start_still_stops_that_run_at_its_end(tmp_pa
 
 
 async def test_a_restart_outside_the_leaf_keeps_the_rows_leaf(tmp_path, scope):
-    """r2 minor 3: the restart carries the OLD row's leaf (the current context's would be none here)."""
+    """r2 minor 3 said: the restart carries the OLD row's leaf. §4UD r2 (decided by the operator's lead): only the
+    SAME running leaf keeps it — a restart from outside the leaf takes the run over and DROPS the tag (the leaf
+    sweep stopped an owner's restarted server). The name is kept for the history; the assertion is the new rule."""
     sb = SvcSandbox(tmp_path / "ws", happy_handler())
     c = _ctx(tmp_path, sandbox=sb)
     scope(c, origin="autopilot")
     tok = _leaf("t4-a1")
     try:
         await R.tool_run(c, action="start", name="web", command="python3 a.py", where="workspace", lifetime="server")
+        r = await R.tool_run(c, action="restart", name="web")            # the leaf itself: still its run
+        assert r.status is OutcomeStatus.OK, str(r)
+        assert RunRegistry.meta_of(registry_for(c).live_by_name("conversation:conv1", "web")).get("leaf") == "t4-a1"
     finally:
         W.LEAF_ID.reset(tok)
-    r = await R.tool_run(c, action="restart", name="web")
+    r = await R.tool_run(c, action="restart", name="web")                # outside the leaf
     assert r.status is OutcomeStatus.OK, str(r)
-    assert RunRegistry.meta_of(registry_for(c).live_by_name("conversation:conv1", "web")).get("leaf") == "t4-a1"
+    assert RunRegistry.meta_of(registry_for(c).live_by_name("conversation:conv1", "web")).get("leaf") is None
 
 
 async def test_a_lab_server_restart_keeps_the_rows_leaf(tmp_path, scope, fake):
@@ -615,7 +620,11 @@ async def test_a_lab_server_restart_keeps_the_rows_leaf(tmp_path, scope, fake):
     fake.on("GET", f"/v1/labs/{LAB}/jobs/job_ee00000001", (200, {"state": "running"}))
     fake.on("DELETE", f"/v1/labs/{LAB}/jobs/job_ee00000001", (200, {"state": "exited", "killed": True}))
     fake.on("POST", f"/v1/labs/{LAB}/exec", (202, {"job_id": "job_ee00000002"}))
-    r = await R.tool_run(c, action="restart", name="api")
+    tok = _leaf("t6-a1")             # §4UD r2: the tag stays only when the SAME leaf restarts its own run
+    try:
+        r = await R.tool_run(c, action="restart", name="api")
+    finally:
+        W.LEAF_ID.reset(tok)
     row = registry_for(c).live_by_name("conversation:conv1", "api")
     assert row is not None and row["backend_ref"].endswith("job_ee00000002"), str(r)
     assert RunRegistry.meta_of(row).get("leaf") == "t6-a1"
@@ -1345,3 +1354,16 @@ def test_the_alias_path_heads_a_result_once():
         assert str(R._headed(once)) == str(once), str(once)
         hinted = str(R._with_hint(once, "(hint)"))
         assert hinted == f"{once}\n(hint)" and hinted.count("RUN UNRESOLVED") + hinted.count("RUN ERROR") <= 1
+
+
+# ------------------------------------------------------------------ §4UD-d battery pins (d5 survivor R48; R49 is equivalent: the run-tool guard lets only the row's own leaf or no leaf restart a lab server, and both give the same tag)
+
+def test_run_name_for_job_finds_an_ENDED_row(tmp_path, scope):
+    """R48: the reaper ends the row BEFORE it writes the hint — the lookup must read ended rows too."""
+    c = _ctx(tmp_path, pid="41f745517fe4")
+    scope(c)
+    R.record_promoted_job(c, {"id": "job-1a2b3c4d"})
+    assert R.end_landed_job_runs(c, [{"id": "job-1a2b3c4d", "state": "done", "exit_code": 0}]) == 1
+    assert registry_for(c).live_by_name("project:41f745517fe4", "job-1a2b3c4d") is None
+    assert R.run_name_for_job(c, "job-1a2b3c4d") == "job-1a2b3c4d"
+

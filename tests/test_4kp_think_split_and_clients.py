@@ -761,6 +761,9 @@ def _clockwork_send(lines, **attrs):
         def _refresh_rating_chips(self):
             pass
 
+        def refresh_mood(self):          # §4UD: a finished turn asks for one mood re-read
+            self.mood_rereads = getattr(self, "mood_rereads", 0) + 1
+
         def _note(self, text, tone=None):
             self.notes.append(text)
 

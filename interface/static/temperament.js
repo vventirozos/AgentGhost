@@ -27,7 +27,7 @@
 // object whose `step(dt, nowMs)` returns the outputs the renderer reads.
 // Executed under node by tests/test_interface_face_temperament.py.
 
-export const TEMPERAMENT_VERSION = '1.6';
+export const TEMPERAMENT_VERSION = '1.7';
 export const DEFAULT_INTENSITY = 1.5;
 
 // v1.2 (operator: "can't say i saw a huge difference"): v1.1 kept every
@@ -129,6 +129,38 @@ const DRIVES = ['arousal', 'focus', 'strain', 'curiosity', 'fatigue', 'valence']
 // Decay time constants (s) toward each drive's baseline.
 const TAU = { arousal: 9, focus: 25, strain: 45, curiosity: 14, valence: 70 };
 
+// §4UG (2026-11-11) — moments and character.
+//   * A MOMENT is one eased gesture a few seconds long, played when the agent's
+//     mood takes a shade (`moment(kind)`): relieved lets go (the relief pulse,
+//     longer and larger), proud lifts and brightens, chastened droops and dims.
+//     The movement goes through the eased body channels like everything else;
+//     the light goes out on its own field (`light`), which the renderer also
+//     applies under reduced motion — there a moment is light only.
+//   * The CHARACTER's three dials (−2..2, `setCharacter`) are small bounded
+//     biases on what is already here: humour → how often the idle actions come
+//     and which (light ones when playful, heavy ones when serious); warmth → a
+//     steady lighter/warmer or dimmer/cooler baseline; directness → how hard
+//     events land (the gain, and so the startle). No dials = nothing changes.
+export const MOMENTS = ['relieved', 'proud', 'chastened'];
+const MOMENT_S = { relieved: 4.0, proud: 4.5, chastened: 5.0 };
+const CHAR_TAU = 2.0;           // s: the character's baseline light arrives slowly
+const CHAR_NEUTRAL = Object.freeze({ gap: 1, light: 1, heavy: 1, react: 1, bright: 0, hue: 0 });
+// The biases of a set of dials. Pure. Anything unreadable is the middle (0).
+export function characterBias(dials) {
+    if (!dials || typeof dials !== 'object') return CHAR_NEUTRAL;
+    const dial = (v) => (typeof v === 'number' && isFinite(v) ? clamp(v, -2, 2) : 0);
+    const w = dial(dials.warmth), h = dial(dials.humour), b = dial(dials.directness);
+    if (!w && !h && !b) return CHAR_NEUTRAL;
+    return {
+        gap: Math.pow(0.6, h / 2),          // playful +2: idle actions 1.67× as often; serious −2: 0.6×
+        light: Math.pow(2, h / 2),          // weight of glance / look-around / stretch
+        heavy: Math.pow(2, -h / 2),         // weight of sigh / doze
+        react: Math.pow(1.4, b / 2),        // blunt +2: events land 1.4× as hard; diplomatic −2: 0.71×
+        bright: 0.08 * w,                   // warm +2: 16 % more light; dry −2: 16 % less
+        hue: 0.015 * w,                     // …and the colour a little warmer / cooler
+    };
+}
+
 export const IDLE_ACTIONS = ['glance', 'stretch', 'sigh', 'twitch', 'lookaround', 'doze'];
 // Duration (s) of each idle action.
 const IDLE_DUR = { glance: 2.6, stretch: 4.5, sigh: 3.5, twitch: 0.6, lookaround: 6.0, doze: 16.0 };
@@ -178,6 +210,9 @@ export function createTemperament(opts = {}) {
     // The agent's mood on the form that shows it (setMoodBias): how often idle
     // actions come, how likely a doze, how strongly events land. Neutral changes nothing.
     let moodBias = { gap: 1, doze: 0, react: 1 };
+    let char = CHAR_NEUTRAL;    // §4UG: the character's biases (setCharacter)
+    let momentKind = null, momentAt = -1e12;
+    const light = { base: 0, moment: 0 };   // eased, see CHAR_TAU / BODY_TAU
     let reliefAt = -1e12, wakeAt = -1e12, startleAt = -1e12, curiousAt = -1e12, curiousSign = 1;
     let syllable = 0;           // a glow kick per streamed chunk, decays ~120 ms
 
@@ -207,6 +242,9 @@ export function createTemperament(opts = {}) {
         speedMul: 1, ampMul: 1, breath: 0, lean: 0, gazeX: 0, gazeY: 0,
         hueShift: 0, stillness: 0, jitter: 0, anticipation: 0, speech: 0,
         thinking: 0, startleKick: 0, twitch: false, idle: null, idleEnv: 0,
+        // §4UG: steady light (the character's baseline × a moment's), 1 at rest;
+        // applied under reduced motion too. `moment` names the gesture playing.
+        light: 1, moment: null, momentEnv: 0,
         // body (radians / scene units / multipliers), all 0 / 1 at rest
         yaw: 0, pitch: 0, roll: 0, offX: 0, offY: 0, scaleMul: 1, bright: 1, glow: 0,
     };
@@ -246,7 +284,7 @@ export function createTemperament(opts = {}) {
         const h = hab[kind] || 0;
         const surprise = 1 / (1 + 0.35 * rate[kind]);          // rare → ~1, frequent → small
         const noise = Math.exp(0.18 * gauss());                // ~[0.7, 1.4]
-        const g = clamp((1 - 0.72 * h) * (0.55 + 0.75 * surprise) * noise * (0.8 + 0.5 * d.arousal) * moodBias.react, 0.25, 1.8);
+        const g = clamp((1 - 0.72 * h) * (0.55 + 0.75 * surprise) * noise * (0.8 + 0.5 * d.arousal) * moodBias.react * char.react, 0.25, 1.8);
         hab[kind] = Math.min(1, h + 0.22);
         if (kind === 'turn:start') {
             const away = t - lastTurnEndAt;
@@ -286,8 +324,9 @@ export function createTemperament(opts = {}) {
     function _pickIdle() {
         const night = nightness(new Date(now));
         const w = {
-            glance: 3, stretch: 1.4, sigh: 1.4, twitch: 2, lookaround: 1.2,
-            doze: 0.25 + 2.5 * Math.max(d.fatigue, night) + moodBias.doze,
+            glance: 3 * char.light, stretch: 1.4 * char.light, sigh: 1.4 * char.heavy, twitch: 2,
+            lookaround: 1.2 * char.light,
+            doze: (0.25 + 2.5 * Math.max(d.fatigue, night) + moodBias.doze) * char.heavy,
         };
         if (lastIdle) w[lastIdle] = 0;                        // never the same twice running
         let sum = 0;
@@ -351,7 +390,10 @@ export function createTemperament(opts = {}) {
             idle = { name, t0: now, dur: IDLE_DUR[name] * (0.75 + 0.5 * rnd()), gx: Math.cos(a), gy: Math.sin(a) * 0.6 };
             if (name === 'twitch') twitch = true;
             // mean gap 14 s, longer when tired or at night
-            nextIdleAt = now + (7000 + rnd() * 14000) * (1 + d.fatigue + 0.6 * night) * moodBias.gap;
+            // §4UG: the character shortens or stretches it; a quick mood and a playful
+            // character together never bring the mean gap under 0.4 of it (calm at rest)
+            const gapMul = char.gap === 1 ? moodBias.gap : Math.max(0.4, moodBias.gap * char.gap);
+            nextIdleAt = now + (7000 + rnd() * 14000) * (1 + d.fatigue + 0.6 * night) * gapMul;
         }
         if (!resting && now > nextIdleAt) nextIdleAt = now + 6000 + rnd() * 6000;
 
@@ -384,7 +426,8 @@ export function createTemperament(opts = {}) {
         if (doze) gy -= 0.12 * doze;                        // head drops
         const nod = 0.02 * speech * Math.sin(now / 1000 * 7.0);   // a faint nod while it talks
         out.gazeX = gx; out.gazeY = gy + nod;
-        out.hueShift = clamp(-0.025 * d.valence + 0.03 * d.strain + 0.012 * d.curiosity + ou.hue, -0.05, 0.06);
+        out.hueShift = clamp(-0.025 * d.valence + 0.03 * d.strain + 0.012 * d.curiosity + ou.hue, -0.05, 0.06)
+            + char.hue;
         out.stillness = clamp(0.30 * thinking * (1 - speech) + 0.5 * doze
             + (N === 'sigh' ? 0.35 * idleEnv : 0) + 0.15 * anticipation, 0, 0.85);
         out.anticipation = anticipation; out.speech = speech; out.thinking = thinking;
@@ -394,8 +437,18 @@ export function createTemperament(opts = {}) {
         syllable *= Math.exp(-dt / 0.12);
         const shake = startle * Math.sin(now * 0.044) ;                      // ~7 Hz, fades with the startle
         const wake = pulse(wakeAt, 3.0), relief = pulse(reliefAt, 1.6), cur = pulse(curiousAt, 2.5);
+        // §4UG: a moment's envelopes — pure functions of the time since it began,
+        // 0 at both ends, so nothing steps; the easing below smooths the rest.
+        let mRel = 0, mProud = 0, mChast = 0;
+        if (momentKind) {
+            const x = since(momentAt) / MOMENT_S[momentKind];
+            if (x < 0 || x >= 1) momentKind = null;
+            else if (momentKind === 'relieved') mRel = Math.sin(Math.PI * x) * (1 - x);   // the relief pulse's shape
+            else { const s = Math.sin(Math.PI * x); if (momentKind === 'proud') mProud = s * s; else mChast = s * s; }
+        }
         const G = IDLE_BODY;
         let yaw = 1.6 * G * gx, pitch = 1.4 * G * gy;                        // the gaze, as a head turn
+        pitch += 0.10 * mChast - 0.04 * mProud;                              // the head drops / lifts
         if (N === 'stretch') pitch -= 0.10 * G * idleEnv;
         if (doze) pitch += 0.20 * G * doze;                                  // the head drops
         yaw += 0.06 * Math.sin(now / 1000 * 0.9) * thinking;                 // a slow pondering sway
@@ -406,12 +459,14 @@ export function createTemperament(opts = {}) {
         body.yaw += (K * yaw - body.yaw) * ease;
         body.pitch += (K * pitch - body.pitch) * ease;
         body.roll += (K * tilt - body.roll) * ease;
-        body.offY += (K * (G * (-0.16 * doze - 0.04 * (N === 'sigh' ? idleEnv : 0)) + 0.05 * wake + 0.03 * relief) - body.offY) * ease;
+        body.offY += (K * (G * (-0.16 * doze - 0.04 * (N === 'sigh' ? idleEnv : 0)) + 0.05 * wake + 0.03 * relief
+            + 0.07 * mRel + 0.05 * mProud - 0.10 * mChast) - body.offY) * ease;
         body.scale += (1 + K * (0.012 * breathBody * 2.5
             - 0.10 * anticipation * (1 - relief)                             // coils while it waits…
             + 0.08 * relief                                                  // …and lets go on the first words
             + G * (0.09 * (N === 'stretch' ? idleEnv : 0) - 0.05 * (N === 'sigh' ? idleEnv : 0) - 0.05 * doze)
-            + 0.08 * wake + 0.025 * speech) - body.scale) * ease;
+            + 0.08 * wake + 0.025 * speech
+            + 0.16 * mRel + 0.07 * mProud - 0.06 * mChast) - body.scale) * ease;
         body.bright += (1 + K * (0.35 * wake + 0.18 * speech + 0.10 * cur
             - 0.35 * G * doze - 0.12 * thinking * (1 - speech) + 0.12 * relief) - body.bright) * ease;
         out.yaw = body.yaw;
@@ -422,6 +477,10 @@ export function createTemperament(opts = {}) {
         out.scaleMul = body.scale;
         out.bright = clamp(body.bright + K * 0.35 * startle, 0.45, 1.9);
         out.glow = K * Math.min(1, syllable * speech + 0.4 * syllable);      // text rhythm on the bloom
+        light.base += (char.bright - light.base) * (1 - Math.exp(-dt / CHAR_TAU));
+        light.moment += (0.45 * mRel + 0.30 * mProud - 0.35 * mChast - light.moment) * ease;
+        out.light = clamp(1 + light.base + light.moment, 0.55, 1.6);
+        out.moment = momentKind; out.momentEnv = mRel + mProud + mChast;
         out.startleKick = startleQueued; startleQueued = 0;
         out.twitch = twitch;
         out.idle = N; out.idleEnv = idleEnv;
@@ -434,6 +493,16 @@ export function createTemperament(opts = {}) {
     }
 
     function setMoodBias(b) { moodBias = b; }
+    // §4UG. The character's dials ({warmth, humour, directness}, each −2..2);
+    // null, {} or all zeros = no bias at all.
+    function setCharacter(dials) { char = characterBias(dials); return char; }
+    // §4UG. Play one moment from now; a moment already playing is replaced (the
+    // eased channels carry the body over, so the change cannot step).
+    function moment(kind) {
+        if (!Object.prototype.hasOwnProperty.call(MOMENT_S, kind)) return false;
+        momentKind = kind; momentAt = now;
+        return true;
+    }
 
-    return { event, ingestLog, ingestChunk, step, debug, setMoodBias, DRIVES };
+    return { event, ingestLog, ingestChunk, step, debug, setMoodBias, setCharacter, moment, DRIVES };
 }

@@ -72,9 +72,13 @@ slot_session_context = contextvars.ContextVar("slot_session", default="")
 #: §4QX: `look_owned` — the system shows the look line; the model writes only what is missing.
 #: §4QZ: `effort_low` / `effort_medium` / `effort_xhigh` — the main server's chat-template
 #: `reasoning_effort` for this request (core/llm.py `with_probe_effort`).
+#: §4UE: `no_self_image` — the Mirror's self-image section is left out of this probe's state block
+#: (core/agent.py `self_image_is_heard_on_this_request`), so paired probes can measure whether the
+#: section is audible in a reply. The prompt, the tools and the mood line are what an owner's probe
+#: gets; like every arm, its name is in the turn record (`extra.prompt_arm`) and the prefill log line.
 PROMPT_ARMS: frozenset = frozenset({"no_lessons", "quote_bound", "experience", "fact_history", "render_look",
                                     "look_critic", "check_critic", "look_owned",
-                                    "effort_low", "effort_medium", "effort_xhigh"})
+                                    "effort_low", "effort_medium", "effort_xhigh", "no_self_image"})
 
 
 #: §4MW: a candidate RULE under test, sent by an operator probe
@@ -94,6 +98,56 @@ def probe_rule() -> str:
     except Exception:  # noqa: BLE001
         return ""
     return rule[:800]
+
+
+#: §4UF: a candidate SELF-IMAGE under test, sent by an operator probe — `X-Ghost-Probe-Self-Image` is the
+#: sentence, `X-Ghost-Probe-Self-Image-Rule` (optional) the rule text under it; both percent-encoded
+#: UTF-8, honoured only with `X-Ghost-Origin: probe`. The probe hears them in the place of the Mirror's
+#: sentence and rule (core/agent.py `_self_image_block`), so paired probes can tell whether a character
+#: line is audible at all, and which wording makes it so. (sentence, rule).
+probe_self_image_context = contextvars.ContextVar("probe_self_image", default=("", ""))
+PROBE_SELF_IMAGE_MAX = 300          # the Mirror's own SENTENCE_MAX_CHARS
+PROBE_SELF_IMAGE_RULE_MAX = 900
+
+
+def _probe_text(value, cap: int) -> str:
+    """A probe header's text: percent-decoded, on one line, no guillemets or chat-template tokens."""
+    try:
+        from urllib.parse import unquote
+        text = unquote(str(value or ""), errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    # review r1: guillemets and control characters go FIRST (a token wrapped in them survived the token
+    # pass), and the token pass repeats until nothing is left (a token nested in a token left one behind)
+    text = "".join(ch for ch in text.replace("«", "").replace("»", "")
+                   if ch.isprintable() or ch.isspace())
+    for _ in range(8):
+        cleaned = re.sub(r"<\|[^|>]{0,40}\|>", "", text)
+        if cleaned == text:
+            break
+        text = cleaned
+    else:
+        return ""                      # still a token after eight passes: not a sentence anybody wrote
+    return " ".join(text.split())[:cap]
+
+
+def parse_probe_self_image(sentence, rule) -> tuple:
+    """(sentence, rule) from the two headers; a rule without a sentence is nothing."""
+    s = _probe_text(sentence, PROBE_SELF_IMAGE_MAX)
+    return (s, _probe_text(rule, PROBE_SELF_IMAGE_RULE_MAX)) if s else ("", "")
+
+
+def probe_self_image() -> tuple:
+    """The self-image under test for THIS request as (sentence, rule) — ("", "") unless it is a probe."""
+    try:
+        got = probe_self_image_context.get()
+        if not (isinstance(got, tuple) and len(got) == 2 and got[0]):
+            return "", ""
+        if not is_probe_request_id(request_id_context.get()):
+            return "", ""
+        return str(got[0])[:PROBE_SELF_IMAGE_MAX], str(got[1] or "")[:PROBE_SELF_IMAGE_RULE_MAX]
+    except Exception:  # noqa: BLE001
+        return "", ""
 
 
 def parse_prompt_arm(value) -> str:

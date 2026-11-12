@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY, lab_id TEXT, member TEXT, cmd TEXT,
   started_at REAL, ended_at REAL, state TEXT, exit_code INTEGER
 );
+CREATE TABLE IF NOT EXISTS job_starts (job_id TEXT PRIMARY KEY, lab_id TEXT, container_started TEXT);
 CREATE TABLE IF NOT EXISTS destroyed (
   lab_id TEXT PRIMARY KEY, at REAL, reason TEXT, by TEXT, owner TEXT
 );
@@ -110,7 +111,7 @@ class Store:
 
     def delete_lab(self, lab_id: str) -> None:
         with self._lock:
-            for t in ("labs", "members", "jobs"):
+            for t in ("labs", "members", "jobs", "job_starts"):
                 self._db.execute(f"DELETE FROM {t} WHERE lab_id=?", (lab_id,))
             self._db.execute("DELETE FROM subnets WHERE lab_id=?", (lab_id,))
 

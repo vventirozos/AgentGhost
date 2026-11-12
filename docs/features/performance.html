@@ -87,7 +87,8 @@
     <li><h4>Warm the head</h4><p>When the agent starts, or the head changes, it reads the head once and saves it to a file.</p></li>
     <li><h4>Track who owns the slot</h4><p>Every request carries a conversation key (the web client's session, or the Slack thread). The agent remembers which conversation the slot holds.</p></li>
     <li><h4>Save before giving it up</h4><p>When another call needs the slot, the current conversation is saved to disk first (2–4 GB with the model's checkpoints). There is no timer: it stays until something needs the space.</p></li>
-    <li><h4>Restore on the follow-up</h4><p>When that conversation speaks again, its file is loaded back (0.4–0.8 s) and only the new text is processed.</p></li>
+    <li><h4>Restore on the follow-up</h4><p>When that conversation speaks again, its file is loaded back (0.4–0.8 s) and only the new text is processed. A file is loaded only if the call that built it sent the same tool list and the same instructions as the new request. Otherwise it is deleted and the head's own file is loaded.</p></li>
+    <li><h4>Check that it helped</h4><p>The model server reports how many tokens of each prompt it took from memory. If the call a restore was made for took nothing past the head from memory, one warning line is logged. Nothing is deleted on this signal.</p></li>
     <li><h4>Keep small jobs away</h4><p>Side calls run on the helper model on nova, which has four slots of its own. If nova is down, a circuit breaker sends them back to the main model.</p></li>
   </ol>
   <p>For effort, the level is written near the end of the system text by a modified chat template, so changing it re-reads only the conversation, not the whole head. When a request gets stuck, the agent adds one short “think harder” note at the end of the history for the rest of that request; a level you picked yourself always wins.</p>
@@ -99,7 +100,11 @@
   <ul>
     <li>Saves are switched by <code>GHOST_HEAD_SAVES</code> and conversation keeping by <code>GHOST_CONV_KEEP</code>. Off, everything still works, just slower.</li>
     <li>The effort menu exists only when <code>GHOST_REASONING_EFFORT=1</code> (set by the launcher while the 27B model is the main model). There is no automatic level choice; it was removed because a level change before tools forced a large re-read.</li>
-    <li>Save files are large (gigabytes each). A changed head (new tools, new instructions) makes old files useless; they cost time, not correctness.</li>
+    <li>Save files are large (gigabytes each). A changed head (new tools, new instructions) makes old files useless; they cost time, not correctness. Such a conversation file is deleted the first time its conversation returns. Conversation files saved before this rule existed (at most 6) are deleted the same way, once.</li>
+    <li>A file is kept only when the disk had room for it, the server wrote all of it, and the server confirmed after the save that it is still the one the save was planned for (model path, build, chat template).</li>
+    <li>The model is known by its path. A model file replaced in place under the same path is not detected.</li>
+    <li>The save directory holds at most 3 owner heads, 3 members' heads and 6 conversations (24 GB). Files unused for 14 days (conversations, members' heads) or 30 days (owner heads) are deleted. Files made by another model are kept for 3 days after their last use, so trying another model once does not delete the usual model's files. Files are readable by the owner's account only.</li>
+    <li>If the model server was still loading when the agent started, the agent has no save plan. It tries again when a request needs one and every 10 to 120 seconds, and logs each distinct reason once. A re-warm tick that could not reach the model server to make a plan sends nothing, so it cannot replace a conversation that was not saved.</li>
     <li>Requests with no conversation key (health probes, scheduled jobs) skip the owner slot paths entirely.</li>
     <li>The deadline extension applies to web requests, and only coding progress earns it.</li>
   </ul>

@@ -1,5 +1,5 @@
 name: python-app
-description: One Python app box (/opt/venv with flask + gunicorn), port 8080 published, Tor egress
+description: One Python app box (/opt/venv with flask + gunicorn), port 8080 published, Tor egress. The app must listen on 0.0.0.0:8080 (a server bound to 127.0.0.1 is not reachable from outside the member)
 egress: tor
 members:
   - {name: app, image: "ghost-lab/python-app:1", mem_mb: 512, cpus: 1.0, ports: [8080]}

@@ -62,6 +62,9 @@ def build_map(src_files, test_files, log=print):
     args = [PY, "-m", "pytest", *sorted(set(test_files)), "-q", "--no-header", "-p", "no:cacheprovider",
             "-n", "8", "--dist", "loadfile", "--cov-context=test", "--cov-report="]
     args += [f"--cov={m}" for m in mods]
+    # §4UD: the same exclusions as the mutant runs (a battery run from a COPY of the repo — the only place one may
+    # run now — failed its coverage baseline on the real-install test, so no mutant was ever judged)
+    args += [f"--deselect={d}" for d in TREE_DESELECT]
     log(f"coverage map: building over {len(set(test_files))} test files ({len(mods)} modules)…")
     r = subprocess.run(args, capture_output=True, text=True, env=env, cwd=ROOT, timeout=3600)
     tail = (r.stdout.strip().splitlines() or ["?"])[-1]
@@ -172,7 +175,13 @@ TREE_ITEMS = ["src", "tests", "scripts", "interface", "docs", "sandbox", "bin", 
               "PROJECT_JOURNAL.md"]   # §4ST: test_cognitive_redesign_doc reads it — killed the no-op
 #: §4ST: tests of the REAL install (ROOT/../bin/ghost → this repo); a tree can never satisfy them,
 #: so a file-level selection carrying them killed every no-op control
-TREE_DESELECT = ["tests/test_ghost_cli.py::TestLocation::test_bin_symlink_points_into_repo"]
+TREE_DESELECT = ["tests/test_ghost_cli.py::TestLocation::test_bin_symlink_points_into_repo",
+                 # §4UD: reads <repo>/../bin/ghost — there is no such file beside a tree copy (it failed every
+                 # full no-op control of batteries c and d, and the coverage baseline of d5)
+                 "tests/test_4sd_no_ceiling_budget.py::test_the_cli_sends_inf_on_both_chat_paths"]
+#: §4UD: more node ids to leave out of ONE run (comma-separated), for a test that is known to fail for a reason the
+#: battery is not about — it must be NAMED in the run's report, never added here silently
+TREE_DESELECT += [d for d in os.environ.get("BATTERY_DESELECT", "").split(",") if d.strip()]
 
 
 def make_trees(n, log=print):

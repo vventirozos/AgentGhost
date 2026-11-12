@@ -131,7 +131,7 @@ def test_the_line_depends_on_the_label_the_intensity_and_the_manner_only(tmp_pat
     a, b = SelfModel(root=tmp_path / "a"), SelfModel(root=tmp_path / "b")
     a.state.set_owner_mood("irritable", M.ANCHOR_DIRECTION["irritable"], 2, note="Elena said so")
     b.state.nudge(-0.50, 0.33, "4 tool calls failed in this turn", M.KIND_TURN)
-    b.state.nudge(-0.02, 0.0, "the owner corrected my last reply", M.KIND_CORRECTION)
+    b.state.nudge(-0.02, 0.0, "the owner corrected one of my replies", M.KIND_CORRECTION)
     va, vb = a.mood(), b.mood()
     assert (va.p, va.cause, va.source) != (vb.p, vb.cause, vb.source)
     assert va.tone() == vb.tone() == M.tone_line("irritable", 2)
@@ -497,7 +497,7 @@ def test_the_tool_definition_is_static_text():
 
 def test_the_introspect_definition_grew_by_no_more_than_the_allowance():
     size = len(json.dumps(next(t for t in R.TOOL_DEFINITIONS if t["function"]["name"] == "introspect")))
-    assert 3508 < size <= 3508 + 500          # §4TX: + manner_intensity and step
+    assert 3508 < size <= 3508 + 660          # §4TX: + manner_intensity and step; §4UD: + days and undo
 
 
 # ── the state block mechanics (§4RC) ────────────────────────────────────────

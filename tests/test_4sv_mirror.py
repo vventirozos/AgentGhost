@@ -11,6 +11,14 @@ import pytest
 
 from ghost_agent.selfhood import mirror as M
 
+
+@pytest.fixture(autouse=True)
+def _the_mirrors_own_path(monkeypatch):
+    """§4UG: these tests are about the Mirror's own sentence — what a reply hears with the character
+    switched off (``GHOST_CHARACTER=0``). The character has its tests in test_4ug_character.py."""
+    monkeypatch.setenv("GHOST_CHARACTER", "0")
+
+
 NOW = datetime.datetime(2026, 11, 3, 14, 0, 0)
 
 
@@ -269,7 +277,14 @@ def test_the_sentence_reaches_introspect_and_the_owner_state_block_only():
             if ident in ("self_image_block", "self_image_section", "_self_image_block"):
                 block_namers.add(rel)
     # §4UA: main.py attaches the character's resting point to the mood (`rest_pair`)
-    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py", "memory/experience.py",
+    assert importers - {"selfhood/mirror.py"} == {"core/agent.py", "tools/introspect.py", "api/routes.py",  # §4UG: health's character block
+                                                  "memory/experience.py",
+                                                  # §4UH: the look borrows `pick_replies` (the owner's
+                                                  # replies since a time), never the diary or the sentence
+                                                  "selfhood/selfview.py",
+                                                  # §4UH-e2e: the character's resting point falls back to the
+                                                  # Mirror's (`rest_pair`, `REST_UNIT`) only with the character off
+                                                  "selfhood/character.py",
                                                  "main.py"}
     assert taken["tools/introspect.py"] == {"home_from_memory_dir", "self_image_line"}   # the one-line reader only
     # §4SZ: the experience store asks whether a message is the "mirror" COMMAND (a system command is
@@ -583,7 +598,9 @@ def test_introspect_overview_and_summary_carry_the_line_the_phase_wrote(tmp_path
     monkeypatch.setattr(M, "pick_replies", lambda h, now=None, rng=None, after="": [_reply(
         "A reply long enough to be shown, about the weather in Athens this week.")])
     asyncio.run(a._mirror_phase(ctx, [], {}))
-    today = datetime.datetime.now().date().isoformat()
+    # the diary dates a look by its MOOD day (it ends at 04:00 local), not the calendar day (§4UH-e2e: a flake
+    # between midnight and 04:00)
+    today = M._mood_date().isoformat()
     want = (f"self-image: «I check, then answer.» (my own one-sentence self-portrait, rewritten daily "
             f"in the Mirror, last on {today}; the owner types \"mirror\" to see the diary. "
             "A self-description, not a report of work done and not a checked fact)")

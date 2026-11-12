@@ -70,6 +70,9 @@ CHIME_AFTER_S = _env_float("GHOST_CHIME_AFTER_S", 20)
 LINK_POLL_S = _env_float("GHOST_LINK_POLL_S", 15)
 NOTIFY_POLL_S = _env_float("GHOST_NOTIFY_POLL_S", 60)
 MOOD_POLL_S = _env_float("GHOST_MOOD_POLL_S", 25)
+# §4UD: the agent moves the mood just after a reply's stream ends, so the one
+# extra read at the end of a turn (or after a thumb) waits this long.
+MOOD_REFRESH_DELAY_S = 1.5
 # Camera capture size. It was forced to 1920x1080@60 with a 16 ms timer: a
 # 6 MB frame decoded and colour-converted on the UI thread, on a CM4, up to
 # 60 times a second, to show a 640x480 preview. 720p is ample for the vision
@@ -723,6 +726,13 @@ class MainWindow(QWidget):
         self.faces = (self.web_face,)
         # Face state the client owns (the face itself is async JS now).
         self._face_mood = "idle"
+        # §4UD: the agent's mood across polls, and its words on the status line
+        self._mood_watch = agentapi.MoodWatch()
+        self._mood_words = ""
+        self._mood_refresh_due = False
+        self._mood_note_shown = False
+        self._mood_reading = False       # one mood read at a time (`_mood_once`)
+        self._mood_again = False
 
         # Everything else lives on a transparent sheet ON TOP of the face.
         self.overlay = QWidget(self)
@@ -1297,7 +1307,7 @@ class MainWindow(QWidget):
         self._on_battery = devstatus.on_battery(state)
         self.stats_label.setText(devstatus.status_html(
             self._agent_ok, devstatus.read_wifi(), pct, state, now,
-            ok=T.OK, danger=T.DANGER, dim=T.TEXT_DIM))
+            ok=T.OK, danger=T.DANGER, dim=T.TEXT_DIM, mood=self._mood_words))
 
     def _scroll_key(self, event):
         """PgUp / PgDn (and Shift+Up / Shift+Down, for keyboards where the
@@ -1541,7 +1551,8 @@ class MainWindow(QWidget):
             self._note("no reply to rate yet (a quick greeting cannot be rated)")
             return
         if self._rated == signal and not note:
-            return
+            # §4UD: the lit thumb pressed again takes it back (as in the web UI)
+            signal = "retract:" + signal
         asyncio.ensure_future(self._send_rating(self._last_reply_rid, signal, note))
 
     async def _send_rating(self, rid, signal, note):
@@ -1551,10 +1562,17 @@ class MainWindow(QWidget):
         if rid != self._last_reply_rid:
             return              # a newer reply owns the chips now
         if ok:
-            self._rated = signal
+            # a thumb taken back leaves no chip lit
+            self._rated = None if signal.startswith("retract:") else signal
             self._refresh_rating_chips()
+            # §4UD F15: "your set mood holds…" — said once, as the web UI does
+            if detail and not self._mood_note_shown:
+                self._mood_note_shown = True
+                self._note(detail)
+            self.refresh_mood()          # a thumb is when the mood moves
         else:
-            self._note(f"rating not recorded: {detail}", NOTE_ERR)
+            self._note(("thumb not taken back: " if signal.startswith("retract:") else "rating not recorded: ")
+                       + str(detail), NOTE_ERR)
 
     # ── device controls ──────────────────────────────────────────────────
     def _set_brightness(self, arg):
@@ -1890,6 +1908,7 @@ class MainWindow(QWidget):
             else:
                 self.set_face_mood("idle")
             self._last_input_at = time.monotonic()
+            self.refresh_mood()          # §4UD: the end of a turn is when the mood moves
             asyncio.ensure_future(self._reply_landed(time.monotonic() - started))
 
     # ── when a reply lands: wake the panel, and say so ───────────────────
@@ -1988,19 +2007,79 @@ class MainWindow(QWidget):
                 await asyncio.sleep(NOTIFY_POLL_S)
 
     async def mood_loop(self):
-        """Every MOOD_POLL_S: hand the agent's mood to the face, as the web UI's
-        status poll does. A failed poll keeps the look it has."""
+        """Every MOOD_POLL_S: read the agent's mood, as the web UI's status
+        poll does (`_mood_once`)."""
         if MOOD_POLL_S <= 0:
             return
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            await self._mood_once()
+            await asyncio.sleep(MOOD_POLL_S)
+
+    async def _mood_once(self):
+        """Read the mood, ONE read at a time (§4UD r2): the poll and the extra
+        read after a turn both come through here, and a call while a read is in
+        flight asks for one more when it ends instead of a second request
+        beside it. So a slow older answer cannot land over a newer one, and a
+        burst against a dead agent is one missed poll. After a read without a
+        mood the asked-for re-read is dropped (the next poll is soon enough)."""
+        if self._mood_reading:
+            self._mood_again = True
+            return
+        self._mood_reading = True
+        try:
             while True:
-                mood = await agentapi.fetch_mood(client, AGENT_BASE, GHOST_API_KEY)
-                if mood:
-                    try:
-                        self.web_face.set_agent_mood(*mood)
-                    except Exception:  # noqa: BLE001 — a face must never break the client
-                        pass
-                await asyncio.sleep(MOOD_POLL_S)
+                self._mood_again = False
+                await self._mood_read()
+                if not (self._mood_again and self._mood_watch.misses == 0):
+                    break
+        finally:
+            self._mood_reading = False
+            self._mood_again = False
+
+    async def _mood_read(self):
+        """One mood read: the look goes to the face and the words to the status
+        line. `agentapi.MoodWatch` decides both — a failed read keeps the look
+        it has, the third in a row eases the face to neutral and the line says
+        the mood is unknown. The words do not need the face (animations off)."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                view = await agentapi.fetch_mood_view(client, AGENT_BASE, GHOST_API_KEY)
+        except Exception as e:  # noqa: BLE001
+            print(f"[mood] read failed: {type(e).__name__}: {e}", flush=True)
+            view = None
+        look, words = self._mood_watch.step(view)
+        # §4UG: the two numbers, the shade and the character go first (the look
+        # is computed from them and the label together); a face without the hook skips them
+        send_extras = getattr(getattr(self, "web_face", None), "set_agent_extras", None)
+        if callable(send_extras):
+            try:
+                send_extras(self._mood_watch.extras())
+            except Exception:  # noqa: BLE001 — a face must never break the client
+                pass
+        if look is not None:
+            try:
+                self.web_face.set_agent_mood(*look)
+            except Exception:  # noqa: BLE001 — a face must never break the client
+                pass
+        if words != self._mood_words:
+            self._mood_words = words
+            self.update_stats()
+
+    def refresh_mood(self):
+        """One extra mood read a moment from now (the end of a turn, a thumb);
+        calls inside the wait share it. Not a faster poll."""
+        if MOOD_POLL_S <= 0 or self._mood_refresh_due:
+            return
+        self._mood_refresh_due = True
+
+        async def _later():
+            try:
+                await asyncio.sleep(MOOD_REFRESH_DELAY_S)
+            finally:
+                self._mood_refresh_due = False
+            await self._mood_once()
+
+        asyncio.ensure_future(_later())
 
     def _animate_thinking(self):
         if getattr(self, 'is_thinking', False):

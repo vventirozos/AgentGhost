@@ -104,7 +104,7 @@ _JOB_COLLECT_HEAD_RE = re.compile(r"^(?:--- job-[0-9a-f]{6,16}(?: \[[A-Z_]+\])?:
 #: lab/member and the exit); `logs`, `status`, `http`, `spec` return CONTENT —
 #: a Postgres log's "ERROR: relation x does not exist" is its subject (review
 #: MAJOR 2, the §4KT class)
-_LAB_EXEC_HEAD_RE = re.compile(r"^\[lab_[0-9a-f]{8}/[a-z][a-z0-9-]{0,30} (?:exit=|TIMED OUT|no exit code)")
+_LAB_EXEC_HEAD_RE = re.compile(r"^\[lab_[0-9a-f]{8}/[a-z][a-z0-9-]{0,30} (?:exit=|TIMED OUT|no exit code|CANCELLED)")
 #: §4SX D5: only a `run collect` result is program output (its head names the run and the exit, then the
 #: EXIT CODE line); `logs` / `status` / `url` return CONTENT — a server log's "ERROR" is its subject
 _RUN_COLLECT_HEAD_RE = re.compile(r"^\[run [a-z][a-z0-9-]{0,30} (?!logs\b|app\b)[^\]\n]*\]\s*\nEXIT CODE: ")

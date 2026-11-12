@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -17,7 +17,7 @@ ALLOWED_CAPS = ("NET_ADMIN", "NET_RAW")
 def _member(m: Dict[str, Any], where: str) -> Dict[str, Any]:
     if not isinstance(m, dict):
         raise LabError("bad_request", f"{where}: member must be a mapping", field="members")
-    unknown = set(m) - {"name", "image", "mem_mb", "cpus", "ports", "cap_add", "env"}
+    unknown = set(m) - {"name", "image", "mem_mb", "cpus", "ports", "cap_add", "env", "ready"}
     if unknown:
         raise LabError("bad_request", f"{where}: unknown member keys {sorted(unknown)}", field="members")
     name = str(m.get("name", ""))
@@ -33,9 +33,14 @@ def _member(m: Dict[str, Any], where: str) -> Dict[str, Any]:
     mem = int(m.get("mem_mb") or 0)
     if mem < 64:
         raise LabError("bad_request", f"{where}: mem_mb must be >= 64", field="mem_mb")
+    # `ready`: a command that exits 0 once THIS member's service accepts work (agent §4UD F-A). Optional.
+    ready = str(m.get("ready") or "").strip()
+    if "\n" in ready or len(ready) > 500:
+        raise LabError("bad_request", f"{where}: ready must be one command line (500 characters at most)", field="ready")
     return {"name": name, "image": str(m.get("image") or ""), "mem_mb": mem,
             "cpus": float(m.get("cpus") or 1.0), "ports": ports, "cap_add": cap_add,
-            "env": {str(k): str(v) for k, v in (m.get("env") or {}).items()}}
+            "env": {str(k): str(v) for k, v in (m.get("env") or {}).items()},
+            **({"ready": ready} if ready else {})}
 
 
 def parse(doc: Dict[str, Any], where: str = "template") -> Dict[str, Any]:
@@ -68,6 +73,41 @@ def load_dir(path: Path) -> Dict[str, Dict[str, Any]]:
         t = parse(yaml.safe_load(f.read_text()) or {}, where=f.name)
         out[t["name"]] = t
     return out
+
+
+# The templates that ship with the code: read from the code's own tree, so a deploy of the code IS a deploy of the
+# templates (§4UD-c: the service read a copy in /etc that only install.sh refreshed; a template fix synced to
+# /opt was dead for hours).
+SHIPPED_DIR = Path(__file__).resolve().parent.parent / "templates"
+
+
+def load_all(shipped: Path, extra: Optional[Path] = None) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """The shipped templates, plus the operator's own from ``extra`` (/etc/ghost-labs/templates). A shipped name
+    always wins: an ``extra`` file with that name is NOT loaded. Only new names come from ``extra``; two ``extra``
+    files with one name: the first by file name. The second value lists, for the caller to log, each ``extra``
+    file that was not loaded and why. A file there that does not load, for ANY reason, is one of those, never a
+    reason the service cannot start (r3 m3, r4: a stale copy, `.inf`, deep nesting each raised out of the
+    constructor). A shipped template that does not parse still raises."""
+    out = load_dir(shipped)
+    shipped_names = set(out)
+    seen: Dict[str, str] = {}                      # an /etc name -> the file that gave it
+    notes: List[str] = []
+    if extra is None or not Path(extra).is_dir():
+        return out, notes
+    for f in sorted(Path(extra).glob("*.yaml")):
+        try:
+            t = parse(yaml.safe_load(f.read_text()) or {}, where=f.name)
+        except Exception as e:  # noqa: BLE001 — any failure of ONE operator file is a note
+            notes.append(f"{f.name}: does not load ({type(e).__name__}: {str(e)[:120]})")
+            continue
+        if t["name"] in shipped_names:
+            notes.append(f"{f.name}: a shipped template is named {t['name']} (rename it to add one)")
+        elif t["name"] in seen:
+            notes.append(f"{f.name}: {seen[t['name']]} already gives a template named {t['name']}")
+        else:
+            seen[t["name"]] = f.name
+            out[t["name"]] = t
+    return out, notes
 
 
 _PARAM_RE = re.compile(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}")

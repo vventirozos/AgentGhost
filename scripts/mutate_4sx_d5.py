@@ -30,7 +30,7 @@ MUT = [
     ('R1 promoted-leaf-tag', R, 'meta={"started_leaf": _leaf_meta().get("leaf")})', 'meta={"started_leaf": _leaf_meta().get("leaf"), **_leaf_meta()})'),
     ('R2 ws-job-no-leaf', R, 'origin=origin, backend="jobs", backend_ref=str(entry["id"]), meta=_leaf_meta())', 'origin=origin, backend="jobs", backend_ref=str(entry["id"]))'),
     ('R3 ws-server-no-leaf', R, 'backend_token=str(row.get("token")), meta=_leaf_meta())', 'backend_token=str(row.get("token")))'),
-    ('R5 restart-drops-leaf', R, '                              meta={"leaf": _row_leaf(row) or None})', '                              meta=None)'),
+    ('R5 restart-drops-leaf', R, '                              meta={"leaf": _restart_leaf(row)})', '                              meta=None)'),
     ('R6 registry-meta-ignored', RR, '            _m = _json.dumps({k: v for k, v in (meta or {}).items() if v is not None}, sort_keys=True)', '            _m = "{}"'),
     ('R6b registry-keeps-none', RR, '{k: v for k, v in (meta or {}).items() if v is not None}', '{k: v for k, v in (meta or {}).items()}'),
     # M3 collect
@@ -38,7 +38,7 @@ MUT = [
     ('R8 collect-keeps-marker', R, '            tail, _ = _take_pipestatus(str(tail or ""))', '            pass'),
     ('R9 collect-no-woken', R, '                await asyncio.to_thread(jobs.mark_woken, row["backend_ref"])', '                pass'),
     # M4 owner-less
-    ('R10 ownerless-refuse-job', R, '        if action in ("status", "collect", "stop") and re.fullmatch(r"job-[0-9a-f]{6,16}", _jn):', '        if False:'),
+    ('R10 ownerless-refuse-job', R, '        if (action == "collect" and not _jn) or (action in ("status", "collect", "stop") and _JOB_ID_RE.fullmatch(_jn)):', '        if False:'),
     ('R12 ownerless-stop-not-cancel', R, 'action={"stop": "cancel"}.get(action, action)', 'action=action'),
     ('R13 ownerless-status-refused', R, '        if action == "status" and not _jn:\n            from .delegate import tool_jobs', '        if False:\n            from .delegate import tool_jobs'),
     ('R18 name-any-owner', R, '        for r in reversed(reg.rows(owner) if reg is not None else []):\n            if r["backend"] == "jobs" and r["backend_ref"] == str(job_id):\n                # review r3', '        for r in reversed(reg.rows(None) if reg is not None else []):\n            if r["backend"] == "jobs" and r["backend_ref"] == str(job_id):\n                # review r3'),
@@ -68,9 +68,9 @@ MUT = [
     ('R32 batch-run-after-execute', AG, '    if name == "run":\n        if prev_name == "execute":\n            return True', '    if name == "run":\n        if prev_name == "execute":\n            return False'),
     ('R33 batch-lab-after-run', AG, '        return bool(m and lid and m.group(1) == lid) or act in _LAB_APP_ACTIONS', '        return act in _LAB_APP_ACTIONS'),
     ('R33b batch-read-blocks', AG, '    # prev_name == "run"\n    if _rd(pa):\n        return False', '    # prev_name == "run"\n    if False:\n        return False'),
-    ('R34 leaf-runs-not-ended', CL, '                    await stop_leaf_runs(context, f"project:{_want}", str(leaf_id))', '                    pass'),
+    ('R34 leaf-runs-not-ended', CL, '                        await asyncio.wait_for(stop_leaf_runs(context, f"project:{_want}", str(leaf_id)),\n                                               LEAF_RUN_STOP_BOUND_S)', '                        pass'),
     ('R35 leaf-no-run', CL, 'LEAF_ALLOWED_TOOLS = ("file_system", "execute", "lab", "run")', 'LEAF_ALLOWED_TOOLS = ("file_system", "execute", "lab")'),
-    ('R38 strike-any-run-output', ST, '        return bool(_RUN_COLLECT_HEAD_RE.match(_o.strip()))', '        return True'),
+    ('R38 strike-any-run-output', ST, '        return bool(_RUN_COLLECT_HEAD_RE.match(_o) or _JOB_COLLECT_HEAD_RE.match(_o))', '        return True'),
     ('R39 egress-run-free', EG, '    "run": "url_literals",', ''),
     ('R40 replay-may-run', IS, '    "lab", "run",', '    "lab",'),
     # review r2
@@ -82,12 +82,12 @@ MUT = [
     ('R46 started-leaf-ignored', R, 'action in ("stop", "restart") and _leaf not in (_row_leaf(row), _row_started_leaf(row))', 'action in ("stop", "restart") and _leaf != _row_leaf(row)'),
     ('R47 promoted-no-started-leaf', R, 'meta={"started_leaf": _leaf_meta().get("leaf")})', 'meta=None)'),
     ('R48 name-live-only', R, '        for r in reversed(reg.rows(owner) if reg is not None else []):\n            if r["backend"] == "jobs" and r["backend_ref"] == str(job_id):\n                # review r3', '        for r in reversed(reg.rows(owner, live_only=True) if reg is not None else []):\n            if r["backend"] == "jobs" and r["backend_ref"] == str(job_id):\n                # review r3'),
-    ('R49 lab-restart-context-leaf', R, 'row["port"], meta={"leaf": _row_leaf(row) or None})', 'row["port"])'),
+    ('R49 lab-restart-context-leaf', R, 'row["lifetime"], row["port"], meta={"leaf": _restart_leaf(row)})', 'row["lifetime"], row["port"])'),
     ('R50 only-live-ignored', RR, '+ (" AND ended_at IS NULL" if only_live else "")', '+ ""'),
     ('R51 landed-overwrites', R, '                          only_live=True)', '                          only_live=False)'),
     ('R52 hint-above', R, '    return ToolOutcome(f"{out}\\n{hint}",', '    return ToolOutcome(f"{hint}\\n{out}",'),
     ('R53 stored-expired-ok', OH, '    if state != "exited":\n        return True', '    if False:\n        return True'),
-    ('R54 ownerless-stop-row-stale', R, '            if action == "stop":\n                # review r2', '            if False:\n                # review r2'),
+    ('R54 ownerless-stop-row-stale', R, '    if action == "stop":\n        # review r2: a cancel stamps no report', '    if False:\n        # review r2: a cancel stamps no report'),
     # review r3 + §4SX E
     ('R55 live-unknown-failed', R, 'OutcomeStatus.OK if ok else OutcomeStatus.UNRESOLVED if unknown else OutcomeStatus.FAILED', 'OutcomeStatus.OK if ok else OutcomeStatus.FAILED'),
     ('R56 alias-rows-generic', OH, '    if _tn == "run" or (_tn in ("jobs", "manage_services")', '    if _tn == "run" or (False and _tn in ("jobs", "manage_services")'),
@@ -101,10 +101,10 @@ MUT = [
     ('R63 reused-old-row-not-used', R, '        if row is not None:\n            # review r4', '        if False:\n            # review r4'),
     ('R64 old-row-cancel-allowed', R, '    if row["ended_at"] is not None:\n        return _refuse(f"job {row[\'backend_ref\']} is not running', '    if False:\n        return _refuse(f"job {row[\'backend_ref\']} is not running'),
     ('R65 late-stops-unlocked', R, '    async with lock:\n        return await _stop_leaf_rows(context, owner, leaf_id, gone)', '    return await _stop_leaf_rows(context, owner, leaf_id, gone)'),
-    ('R66 unknown-is-running', AG, '                                       and getattr(_outcome, "reason_code", None)\n                                       != "run_exit_unknown"),', '                                       ),'),
+    ('R66 unknown-is-running', AG, '                                       and getattr(_outcome, "reason_code", None)\n                                       != "run_exit_unknown"\n', '                                       and True\n'),
     ('R67 hint-reuse-label', MN, '        if (entry or {}).get("started_via") == "run":\n            # review r4', '        if False:\n            # review r4'),
     ('R69 unknown-head-note', R, '            + (" — the exit code was not recorded: judge it by the output" if state == "exited" and code is None\n               else "") + "]")', '            + "]")'),
-    ('R70 unknown-still-in-ok', TF, '                   and not o.get("exit_unknown")]', '                   ]'),
+    ('R70 unknown-still-in-ok', TF, '                   and not o.get("exit_unknown") and not o.get("unanswered")]', '                   and not o.get("unanswered")]'),
     ('R71 unknown-line-dropped', TF, '    if unknown_ops:\n        stopped +=', '    if False:\n        stopped +='),
     ('R72 agent-exit-unknown-flag', AG, '"exit_unknown": getattr(_outcome, "reason_code", None) == "run_exit_unknown",', '"exit_unknown": False,'),
     ('R73 banner-not-stripped', OH, '    h = _without_banner_lines(result)\n    # review r7', '    h = str(result or "").strip()\n    # review r7'),
@@ -114,8 +114,8 @@ MUT = [
     ('R76b reused-cancel-leaf-guard', R, '    if origin == "probe" and row["origin"] != "probe":\n        return _refuse(f"job {row[\'backend_ref\']} was started by {row[\'origin\'] or \'the owner\'} — a probe changes "\n                       "only its own runs", "run_not_allowed")\n    _leaf = str(_leaf_meta().get("leaf") or "")\n    if _leaf and _leaf not in (_row_leaf(row), _row_started_leaf(row)):', '    if origin == "probe" and row["origin"] != "probe":\n        return _refuse(f"job {row[\'backend_ref\']} was started by {row[\'origin\'] or \'the owner\'} — a probe changes "\n                       "only its own runs", "run_not_allowed")\n    _leaf = str(_leaf_meta().get("leaf") or "")\n    if False and _leaf not in (_row_leaf(row), _row_started_leaf(row)):'),
     ('R77 sql-hint-ignores-config', LB, '                if labs_configured(context) else', '                if True else'),
     ('R79 alias-runs-prefix', OH, '"RUN:", "RUNS", "No runs here"', '"RUN:", "No runs here"'),
-    ('R80 finished-count-unknown', TF, 'for o in op_outcomes + unknown_ops) or "none"', 'for o in op_outcomes) or "none"'),
-    ('R81 finished-n-unknown', TF, '{len(op_outcomes) + len(unknown_ops)} finished', '{len(op_outcomes)} finished'),
+    ('R80 finished-count-unknown', TF, 'for o in op_outcomes + unknown_ops) or "none"\n        return (f"MULTI-STEP OUTCOME — {len(running_ops)} call(s) STILL "', 'for o in op_outcomes) or "none"\n        return (f"MULTI-STEP OUTCOME — {len(running_ops)} call(s) STILL "'),
+    ('R81 finished-n-unknown', TF, '                f"RUNNING, {len(op_outcomes) + len(unknown_ops)} finished.\\n"', '                f"RUNNING, {len(op_outcomes)} finished.\\n"'),
     ('R82 head-failed-off', R, '    if failed and not (text.startswith(_FAILED_HEAD) or _COLLECT_HEAD_RE.match(text)):', '    if False:'),
     ('R83 head-unresolved-off', R, '    elif not failed and text.startswith(_FAILED_HEAD):', '    elif False:'),
     ('R84 head-any-run-prefix', R, 'or _COLLECT_HEAD_RE.match(text)):', 'or text.startswith("[run ")):'),
@@ -138,7 +138,7 @@ MUT = [
     ('R103 head-twice', R, '    elif (out.status is OutcomeStatus.UNRESOLVED and not text.startswith(_UNRESOLVED_HEAD)', '    elif (out.status is OutcomeStatus.UNRESOLVED'),
 ]
 PINS = ["tests/test_4sx_d5_review.py", "tests/test_4sx_b_lab_tool.py", "tests/test_4sx_d5_switch.py", "tests/test_4sx_c_run_tool.py",
-        "tests/test_4sx_c_run_battery.py"]
+        "tests/test_4sx_c_run_battery.py", "tests/test_4ud_labs.py"]
 
 
 def _tests():

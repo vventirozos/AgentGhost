@@ -385,7 +385,8 @@ const okHealth = (h) => ({ ok: true, status: 200, json: async () => h });
 
 
 def _run_chip(status_js: str, world: str):
-    src = (_CHIP_HARNESS + f"globalThis.__health = {world};\n"
+    from tests.test_4ud_mood_ui import status_mood_scope      # §4UD: initStatus reads the mood through these
+    src = (_CHIP_HARNESS + f"globalThis.__health = {world};\n" + status_mood_scope(status_js)
            + extract_js_function(status_js, "initStatus")
            + "\nconst api = initStatus({});\n"
              "await new Promise(r => setTimeout(r, 30));\n")
@@ -439,7 +440,8 @@ class TestStatusChip:
     def test_recovery_clears_the_tag_and_the_reason(self, status_js):
         """Degraded → healthy on the next poll must clear BOTH the class and
         the title; a stale reason on a calm chip is a lie."""
-        src = (_CHIP_HARNESS + "globalThis.__health = ({ ok: false, status: 503 });\n"
+        from tests.test_4ud_mood_ui import status_mood_scope      # §4UD
+        src = (_CHIP_HARNESS + "globalThis.__health = ({ ok: false, status: 503 });\n" + status_mood_scope(status_js)
                + extract_js_function(status_js, "initStatus")
                + "\nconst api = initStatus({});\n"
                  "await new Promise(r => setTimeout(r, 20));\n"

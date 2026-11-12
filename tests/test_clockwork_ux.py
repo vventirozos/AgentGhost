@@ -1191,7 +1191,7 @@ def test_every_signal_the_python_side_sends_exists_on_the_page():
     sync = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_sync")
     sent |= {c.value for c in ast.walk(sync) if isinstance(c, ast.Constant)
              and c.value in ("rate", "busy", "gaze")}
-    assert len(sent) == 16, sorted(sent)
+    assert len(sent) == 17, sorted(sent)      # §4UG: + agentExtras
     api = _FACE_HTML[_FACE_HTML.index("const API = {"):]
     defined = set(re.findall(r"^\s{2}(\w+)\(", api[:api.index("};")], re.M))
     handled = set(re.findall(r"case '(\w+)':", extract_js_function(_FACE_HTML, "apply")))

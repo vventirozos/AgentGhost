@@ -1,16 +1,18 @@
 """§4SX Phase C: the `run` tool — everything that keeps running, anywhere (UNIFIED_DESIGN §3.2/§4,
 docs/reference/labs/PHASE_C.md).
 
-Built ALONGSIDE `manage_services` / `jobs`, which are unchanged. It is NOT advertised to the model in
-Phase C (design r1 M2: a different tool list re-prefills the head); the Phase D switch advertises it,
-adds aliases and removes the old tools.
+It IS the advertised tool for anything that keeps running (since the Phase D5 switch: `RUN_TOOL_DEFINITION` is in
+the registry's TOOL_DEFINITIONS). `manage_services` / `jobs` are no longer advertised; a model that remembers them
+is mapped here by the aliases at the end of this module.
 
 Where a run lives decides who runs it — no third launcher (design C1):
 
 * ``server`` @ ``workspace`` → the services supervisor (same lease, token, project scoping);
 * ``job``    @ ``workspace`` → the jobs supervisor's ``start_detached`` (same script, TTL, cap);
-* ``job`` / ``server`` @ ``lab_<id>/<member>`` → the labs host's detached job (``exec detach``),
-  wrapped in ``timeout`` (45 min, the workspace job TTL — design r1 M4);
+* ``job`` @ ``lab_<id>/<member>`` → the labs host's detached job (``exec detach``), wrapped in
+  ``timeout --foreground`` (45 min, the workspace job TTL — design r1 M4);
+* ``server`` @ ``lab_<id>/<member>`` → the same detached job with NO time limit of its own (§4UD G1): it
+  runs until `run stop` or until its lab goes (the lab's own expiry bounds it); it gets ``$PORT``;
 * ``app`` → Phase D (kept machines, ``/keep``; design r1 M1).
 
 The run registry (``memory/run_registry.py``) is a host-side POINTER; every state shown is probed from
@@ -37,8 +39,14 @@ LIFETIMES = ("job", "server", "app")
 READ_ACTIONS = frozenset({"status", "logs", "url", "collect"})
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 _LAB_WHERE_RE = re.compile(r"^(lab_[0-9a-f]{8})/([a-z][a-z0-9-]{0,30})$")
-#: a lab job is killed after this (the workspace job TTL, design r1 M4)
+#: a lab JOB is killed after this (the workspace job TTL, design r1 M4). A lab SERVER has no limit of its own
 LAB_JOB_TTL_S = 2700
+#: §4UD F3: how long a just-started lab server gets before its port is asked ONCE
+LAB_SERVER_SETTLE_S = 1.5
+#: §4UD F4: in the owner's all-owners view a CONVERSATION's workspace server older than this carries its age and how
+#: to stop it. Text only: nothing automatic ends an owner's server (a sweep by age stopped servers in use — removed).
+OLD_CONV_SERVER_S = 24 * 3600
+_RUN_ID_RE = re.compile(r"^run_[0-9a-f]{8}$")
 LOG_LINES_DEFAULT = 60
 LOG_LINES_MAX = 400
 OUT_CAP = 6 * 1024
@@ -196,13 +204,24 @@ async def _probe(context, row: Dict[str, Any], origin: str) -> Tuple[str, str, D
             if other:                                            # review 11-05 M3: not ours to call destroyed
                 from .labs import other_host_phrase
                 return "unknown", f"its lab was made on {other_host_phrase(other)}", {}
-            return "lost", "its lab was destroyed", {}           # design r1 L1
+            # ``gone``: the STATUS CODE said the lab is gone (§4UD F11) — `logs`/`collect` read this, never the note
+            return "lost", "its lab was destroyed", {"gone": "lab"}           # design r1 L1
         if st == 404 and body.get("error") == "unknown_job":
             return "lost", "the lab no longer knows the job", {}  # review r1 minor 3
+        if st == 403 and body.get("error") == "owner_only":
+            # §4UD F12 (r2): the host refuses a job's answer (it carries the output) on a KEPT lab to a caller
+            # that may not touch it. ``refused``: `logs`/`collect` answer with the kept rule, never an empty OK
+            return "unknown", "its lab is kept (production): its jobs are read by the owner", {"refused": "owner_only"}
         if st >= 300:
             return "unknown", f"labs host answered {st} {body.get('error') or ''}".strip(), {}
         state = str(body.get("state") or "")
-        detail = {"exit_code": body.get("exit_code"), "output_tail": body.get("output_tail") or ""}
+        _tail = body.get("output_tail") or ""
+        detail = {"exit_code": body.get("exit_code"), "output_tail": _tail,
+                  # §4UD F11: was the tail cut, and where the whole log is (a host from before the fields: the
+                  # tail filling the cap says it was cut; the path is the host's fixed one)
+                  "output_truncated": (bool(body["output_truncated"]) if "output_truncated" in body
+                                       else len(str(_tail).encode("utf-8", "replace")) >= OUT_CAP),
+                  "log_path": str(body.get("log_path") or f"/var/log/lab/jobs/{job_id}.log")}
         if state == "running":
             return "running", "", detail
         if body.get("killed"):
@@ -344,6 +363,7 @@ def _line(row, state, note, detail) -> str:
     return "  " + "  ".join(bits) + f"  [{row['run_id']}]"
 
 
+
 # ------------------------------------------------------------------ the tool
 
 _FAILED_HEAD = "RUN ERROR"
@@ -471,6 +491,21 @@ async def _tool_run(context=None, action: str = None, name: str = None, command:
     if refusal:
         return _refuse(refusal, "run_not_allowed")
     _jn = str(name or "").strip()
+    from .labs import _truthy
+    _all = action == "status" and _truthy(kwargs.get("all"))
+    if _all or (action == "stop" and _RUN_ID_RE.match(_jn)):
+        # §4UD F4: the two things that reach ACROSS conversations and projects — the owner's own turn only (a
+        # member is refused above; an autopilot build, a probe and scheduled work are refused here)
+        if not _owner_turn(origin):
+            return _refuse("`run status all=true` and `run stop name=<run id>` reach every conversation's and "
+                           "project's runs — only the owner's own turn uses them; stop a run of this "
+                           "conversation/project by its name", "run_not_allowed")
+        from ..memory.run_registry import registry_for as _rf
+        _reg = _rf(context)
+        if _reg is None:
+            return _out("RUN ERROR: the run registry is unavailable — nothing was read or changed.",
+                        OutcomeStatus.FAILED, changed=False, code="run_registry_unavailable")
+        return _status_all(_reg) if _all else await _stop_by_run_id(context, _reg, owner, origin, _jn)
     if not owner:
         # review: a job's wake turn and a scheduled task run with no project and no conversation — they still read,
         # collect and cancel the workspace jobs THEY may reach (the jobs tool's own §4NS rule: the owner's turn, or
@@ -572,12 +607,90 @@ async def _tool_run(context=None, action: str = None, name: str = None, command:
     if action == "collect":
         return await _collect(context, reg, row, origin)
     if action == "url":
-        return _url(row)
+        return await _url(context, row, origin)
     if action == "stop":
         # shielded (review 11-05 R-m9): a cancelled turn still records what the backend stop did — unshielded, the row
         # stayed "running" and the next probe booked "stopped outside `run`"
         return await asyncio.shield(_stop(context, reg, row, origin))
     return await _locked(owner, name, _restart(context, reg, row, origin))
+
+
+def _owner_turn(origin: Optional[str]) -> bool:
+    """Is this the OWNER's own turn? (`_caller`'s origin: "owner" only for an owner request; a probe is "probe";
+    unattended work — an autopilot build, a wake, a scheduled task, no request scope — is "autopilot"; a member
+    never gets past `_caller`.) The one test for the owner-only `run` actions."""
+    return origin == "owner"
+
+
+def _past_limit(row, now: Optional[float] = None) -> bool:
+    """§4UD F10: a live LAB run past the time its record says it can last (a job's 45 minutes, a server's lab's
+    maximum lifetime) — told from the local record, with no host call."""
+    try:
+        from ..memory.run_registry import RunRegistry
+        exp = RunRegistry.meta_of(row).get("expires_at")
+        return bool(row.get("backend") == "labs_job" and row.get("ended_at") is None and exp
+                    and (time.time() if now is None else now) > float(exp))
+    except (TypeError, ValueError):
+        return False
+
+
+_PAST_LIMIT_NOTE = "past its time limit — not checked; `run status` settles it"
+
+
+def _old_conv_server_note(row, now: Optional[float] = None) -> str:
+    """The all-owners view's line for a conversation's workspace server that has run a long time (text only)."""
+    try:
+        age = (time.time() if now is None else now) - float(row.get("started_at") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not (str(row.get("owner") or "").startswith("conversation:") and row.get("backend") == "services"
+            and row.get("lifetime") == "server" and age > OLD_CONV_SERVER_S):
+        return ""
+    return (f"\n      running for {int(age // 3600)} h — stop it with `run stop name={row['run_id']}` if it is no "
+            "longer needed")
+
+
+def _status_all(reg) -> ToolOutcome:
+    """`run status all=true` (owner only): every owner's LIVE rows from the local registry — the state each had
+    when last checked. Nothing is probed (one call must not touch every lab and the sandbox N times)."""
+    rows = reg.rows(live_only=True)
+    if not rows:
+        return _out("No live runs in any conversation or project.", OutcomeStatus.OK, changed=False)
+    from .labs import _when
+    by_owner: Dict[str, list] = {}
+    for r in rows:
+        by_owner.setdefault(str(r.get("owner") or "(no owner)"), []).append(r)
+    out = [f"RUNS of every conversation and project: {len(rows)} live (local records — the state each had when "
+           "last checked, NOT probed now). Stop one with `run stop name=<run id>`:"]
+    for o in sorted(by_owner):
+        out.append(f"{o}:")
+        for r in by_owner[o]:
+            note = "; ".join(x for x in (r["state_note"], _PAST_LIMIT_NOTE if _past_limit(r) else "") if x)
+            out.append(_line(r, r["state"], note, {}) + f"  started {_when(r.get('started_at'))}"
+                       + (f", checked {_when(r['last_probe_at'])}" if r.get("last_probe_at") else "")
+                       + _old_conv_server_note(r))
+    return _out("\n".join(out), OutcomeStatus.OK, changed=False)
+
+
+async def _stop_by_run_id(context, reg, owner, origin, run_id) -> ToolOutcome:
+    """`run stop name=run_xxxxxxxx` (owner only): stop that row, whichever conversation or project started it."""
+    row = reg.get(run_id)
+    if row is None:
+        return _refuse(f"no run {run_id} — `run status all=true` lists every live run with its id", "run_unknown")
+    whose = f" (a run of {row['owner']})" if str(row.get("owner") or "") != owner else ""
+    if row["ended_at"] is not None:
+        return _refuse(f"{run_id} ({row['name']}){whose} is not running — it is {row['state']}"
+                       + (f" ({row['state_note']})" if row["state_note"] else ""), "run_ended")
+    async with _start_lock(str(row["owner"]), str(row["name"])):
+        pass                                   # a start of that name still in flight (review 11-05 R-m9)
+    if row["lifetime"] == "app":           # an app's ops run under its name lock, as the named path's do
+        out = await _locked(str(row["owner"]), str(row["name"]), _stop(context, reg, row, origin))
+    else:
+        out = await asyncio.shield(_stop(context, reg, row, origin))
+    if not whose:
+        return out
+    return ToolOutcome(f"{out}\n{run_id} was{whose}.", status=out.status, world_changed=out.world_changed,
+                       reason_code=out.reason_code)
 
 
 async def _job_row_op(context, reg, row, origin, action, lines) -> ToolOutcome:
@@ -606,14 +719,25 @@ async def _job_row_op(context, reg, row, origin, action, lines) -> ToolOutcome:
     return await asyncio.shield(_stop(context, reg, row, origin))
 
 
-#: §4SX D5: kept apps are production — unattended work reads them (status/logs/url), never starts/stops them
-_AUTOPILOT_APP = ("a kept app is production (the owner's) — unattended work reads it (`run status/logs/url`), "
-                  "never starts, stops or restarts it")
+#: §4SX D5: kept apps are production — unattended work reads their status and address, never starts/stops them
+#: (§4UD F12: nor reads their logs — `labs.kept_touch_refusal` is the one rule for `lab logs` and `run logs`)
+_AUTOPILOT_APP = ("a kept app is production (the owner's) — unattended work reads its status and address (`run "
+                  "status` / `run url`), never its logs, and never starts, stops or restarts it")
 
 
 def _row_leaf(row) -> str:
     from ..memory.run_registry import RunRegistry
     return str(RunRegistry.meta_of(row).get("leaf") or "")
+
+
+def _restart_leaf(row) -> Optional[str]:
+    """The leaf tag a restarted run carries: the old row's ONLY when the restarter is that same leaf, running now
+    (it restarts its own run: still its run, ended with it). Anyone else who restarts it — the owner bringing back
+    a server a build left, a scheduled turn, another build — takes the run over: no tag, so no leaf's end, no leaf
+    sweep and no boot pass stops it (§4UD r2: an owner's restart kept the dead leaf's tag and the sweep stopped
+    the server again within five minutes)."""
+    old = _row_leaf(row)
+    return old if old and old == str(_leaf_meta().get("leaf") or "") else None
 
 
 def _row_started_leaf(row) -> str:
@@ -669,12 +793,17 @@ async def _stop_leaf_rows(context, owner: str, leaf_id: str, gone: list) -> list
         for row in (reg.rows(owner, live_only=True) if reg is not None else []):
             if row["lifetime"] == "app" or str(RunRegistry.meta_of(row).get("leaf") or "") != str(leaf_id):
                 continue
+            if row.get("origin") != "autopilot":
+                continue        # a leaf's run is origin autopilot; a tagged row of any other origin is not its
             try:
                 out = await _stop(context, reg, row, "autopilot")
                 if getattr(out, "status", None) is OutcomeStatus.OK:
                     gone.append(row["name"])
                 else:
-                    logger.warning("leaf run %s not stopped: %s", row["name"], str(out)[:200])
+                    # INFO while the labs host is in a known outage (said once there), else a WARNING
+                    from .labs import _LEAF_OUTAGE, config_refusal
+                    logger.log(logging.INFO if (_LEAF_OUTAGE["on"] or config_refusal(context)) else logging.WARNING,
+                               "leaf run %s not stopped: %s", row["name"], str(out)[:200])
             except Exception:  # noqa: BLE001
                 logger.warning("leaf run %s not stopped", row["name"], exc_info=True)
     except Exception:  # noqa: BLE001
@@ -764,8 +893,9 @@ async def _start(context, reg, owner, origin, name, command, where, lifetime, po
             return _refuse(f"a run named {name!r} is already {state} ({existing['place']}) — stop or restart it",
                            "run_exists")
     if where == "workspace":
-        # review: the guards `execute` runs first — a workspace command naming the labs host (or carrying its
-        # key) and one probing the agent's own ports are refused here too
+        # review: the guards `execute` runs first — a workspace command naming the labs HOST (its address or
+        # name in a network shape; `lab_reach_refusal` matches the host only, it does not look for the key) and
+        # one probing the agent's own ports are refused here too
         from .labs import lab_reach_refusal
         _refused = lab_reach_refusal(context, {"command": command}, "run")
         if _refused is not None:
@@ -973,7 +1103,10 @@ async def _start_lab(context, reg, owner, origin, name, command, lab_id, member,
     # --foreground (live acceptance 11-04): plain `timeout` makes its OWN process group, so the host's
     # group kill on `run stop` missed the server — it kept running (and its port) while the stop said
     # "stopped". In the foreground it stays in the job's group; the TTL still kills the command.
-    wrapped = f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}"
+    # §4UD G1: a SERVER has no time limit of its own (it was killed after 45 min like a job, on a lab that lives
+    # 4–72 h): it runs until `run stop` or until its lab goes. A JOB keeps its bound.
+    wrapped = (f"bash -c {shlex.quote(command)}" if lifetime == "server" else
+               f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}")
     # whose lab (review r1 minor 5, the lab tool's rule): a probe changes only a probe's lab;
     # another owner's lab is named in the result
     try:
@@ -992,14 +1125,26 @@ async def _start_lab(context, reg, owner, origin, name, command, lab_id, member,
         return _no
     other = f" (this lab belongs to {theirs})" if theirs and theirs != owner else ""
     place = f"{lab_id}/{member}"
+    # §4UD F3: the command reads $PORT, as a workspace server's does (the services supervisor sets it there; here
+    # it was never set, so the schema's own example bound another port and the result still named this one)
+    post: Dict[str, Any] = {"member": member, "cmd": wrapped, "detach": True}
+    if port is not None:
+        post["env"] = {"PORT": str(port)}
+    # §4UD F10: when this run is over AT THE LATEST, from records alone — a job's own limit, never past its lab's
+    # maximum lifetime; a server's is its lab's (none on a kept machine)
+    from .labs import _hard_expiry
+    _lab_end = _hard_expiry(det)
+    _run_end = _lab_end if lifetime == "server" else min(
+        x for x in (time.time() + LAB_JOB_TTL_S + 60, _lab_end) if x is not None)
+    _meta = dict(_leaf_meta() if meta is None else meta)
+    _meta["expires_at"] = _run_end
 
     async def _go():
         # shielded (review r2 M2): POST → record → (rollback) completes even if the turn is cancelled
         if _stop_asked():
             return "error", "stopped by the user before it began", None, None
         try:
-            st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/exec", origin=origin,
-                                   json_body={"member": member, "cmd": wrapped, "detach": True})
+            st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/exec", origin=origin, json_body=post)
         except LabsUnreachable as e:
             return "unreachable", str(e), None, None
         except LabsNoAnswer as e:
@@ -1012,8 +1157,7 @@ async def _start_lab(context, reg, owner, origin, name, command, lab_id, member,
         if not job_id:
             return "no_id", "", None, None
         rid = reg.add(name=name, place=place, lifetime=lifetime, command=command, port=port, owner=owner,
-                      origin=origin, backend="labs_job", backend_ref=f"{lab_id}/{job_id}",
-                      meta=_leaf_meta() if meta is None else meta)
+                      origin=origin, backend="labs_job", backend_ref=f"{lab_id}/{job_id}", meta=_meta)
         if rid is not None:
             return "ok", "", job_id, rid
         try:
@@ -1039,14 +1183,60 @@ async def _start_lab(context, reg, owner, origin, name, command, lab_id, member,
                     changed=None, code="run_start_failed")
     if kind == "unrecorded":
         what = (f"so {job_id} was killed again" if info else
-                f"and killing {job_id} again was NOT confirmed — it may still run (killed after "
-                f"{LAB_JOB_TTL_S // 60} min); check `lab status {lab_id}`")
+                f"and killing {job_id} again was NOT confirmed — it may still run ("
+                + ("until its lab goes" if lifetime == "server" else f"killed after {LAB_JOB_TTL_S // 60} min")
+                + f"); check `lab status {lab_id}`")
         return _out(f"RUN ERROR: the run registry did not record the start, {what}.", OutcomeStatus.FAILED,
                     changed=None, code="run_registry_unavailable")
     pretty_log("Run Start", f"{name} {lifetime} {place} {job_id} [{rid}] by {origin} {owner}", icon=Icons.LAB_EXEC)
-    reach = f" Reach port {port} with `lab http lab_id={lab_id} member={member} port={port}`." if port else ""
-    return _out(f"[run {name} started — {lifetime} on {place}{other}, {job_id}, {rid}]\n"
-                f"Still running: this is not a result. Killed after {LAB_JOB_TTL_S // 60} min.{reach}",
+    if lifetime != "server":
+        return _out(f"[run {name} started — {lifetime} on {place}{other}, {job_id}, {rid}]\n"
+                    f"Still running: this is not a result. Killed after {LAB_JOB_TTL_S // 60} min. `run collect "
+                    f"name={name}` reads it when it ends.", OutcomeStatus.OK, changed=True)
+    from .labs import _when
+    life = ("It has no time limit of its own: it runs until `run stop name=" + name + "` or until its lab goes"
+            + (f" (the lab is removed when unused — now due {_when(det['expires_at'])}; any lab call or `lab extend` "
+               "moves that)" if det.get("expires_at") else " (a kept machine: no expiry)") + ".")
+    return await _lab_server_started(context, reg, origin, name, lab_id, member, port, job_id, rid, other, life)
+
+
+async def _lab_server_started(context, reg, origin, name, lab_id, member, port, job_id, rid, other, life) -> ToolOutcome:
+    """The result of a lab SERVER start (§4UD F3): the port is asked ONCE, and the result says what answered. It
+    said "started … Reach port N" for a command that had bound another port (or none), and the "no answer yet" of
+    the `lab http` that followed is booked as in flux — the repeat guard never stopped that polling."""
+    from .labs import LabsNoAnswer, LabsUnreachable, _call, http_no_answer_hint
+    place = f"{lab_id}/{member}"
+    head = f"server on {place}{other}, {job_id}, {rid}"
+    await asyncio.sleep(LAB_SERVER_SETTLE_S)
+    try:
+        st, body = await _call(context, "POST", f"/v1/labs/{lab_id}/http", origin=origin, timeout=40,
+                               json_body={"member": member, "port": int(port), "path": "/", "method": "GET"})
+    except (LabsUnreachable, LabsNoAnswer) as e:
+        st, body = 0, {"error": str(e)}
+    body = body if isinstance(body, dict) else {}
+    if st == 200 and body.get("status") is not None:
+        return _out(f"[run {name} started — {head}]\n"
+                    f"Port {port} answers (HTTP {body.get('status')}); $PORT was set to {port} for the command. "
+                    f"{life} `run url name={name}` gives its address; `run logs name={name}` its output.",
+                    OutcomeStatus.OK, changed=True)
+    if st != 200:
+        return _out(f"[run {name} started — {head}]\n"
+                    f"Its port {port} was NOT checked (the labs host answered {st or 'nothing'}: "
+                    f"{str(body.get('error') or body.get('message') or '')[:160]}). {life} Check it once with "
+                    f"`lab http lab_id={lab_id} member={member} port={port}`.", OutcomeStatus.OK, changed=True)
+    # nothing answers on the port: is the process still there?
+    row = reg.get(rid)
+    state, note, detail = await _probed(context, reg, row, origin) if row is not None else ("unknown", "", {})
+    if state in _ENDED:
+        return _out(f"RUN ERROR: the server {name} ended right after its start ({state}"
+                    + (f", {note}" if note else "") + f") — nothing listens on port {port}.\n"
+                    + _cap(str(detail.get("output_tail") or "")), OutcomeStatus.FAILED, changed=True,
+                    code="run_start_failed")
+    return _out(f"[run {name} launched — {head}]\n"
+                f"NOT ANSWERING YET: the process is {state}, but nothing answers on port {port} "
+                f"({str(body.get('error') or '')[:160]}). $PORT was set to {port} for the command."
+                + http_no_answer_hint(body) + f"\nRead `run logs name={name}` ONCE to see where it listens or why "
+                f"it failed, then fix the command — do not poll `lab http` or `run status` in a loop. {life}",
                 OutcomeStatus.OK, changed=True)
 
 
@@ -1106,13 +1296,40 @@ async def _logs(context, row, origin, lines) -> ToolOutcome:
         text = await asyncio.to_thread(jobs.log_tail, row["backend_ref"], n)
         return _out(f"[run {row['name']} logs]\n{_cap(str(text))}", OutcomeStatus.OK, changed=False)
     state, note, detail = await _probe(context, row, origin)
+    if detail.get("refused"):
+        return _kept_job_refusal(row)
+    if detail.get("gone"):
+        # §4UD F11: the host's 404 unknown_lab (the probe's status-code path) — this was an EMPTY OK
+        return _refuse(f"{row['name']!r}: its lab was destroyed — the log went with the lab"
+                       + (f" (the run had ended: {row['state']}"
+                          + (f", {row['state_note']}" if row["state_note"] else "") + ")"
+                          if row["ended_at"] is not None else ""), "run_ended")
     if row["ended_at"] is not None and state != "unknown":
         state = row["state"]                       # r2 minor 4: its recorded end, not a re-probe's guess
     if state == "unknown":
         return _out(f"RUN ERROR: could not read the logs — {note}.", OutcomeStatus.FAILED, changed=False,
                     code="run_unreachable")
-    tail = "\n".join(str(detail.get("output_tail") or "").splitlines()[-n:])
-    return _out(f"[run {row['name']} logs — {state}]\n{_cap(tail)}", OutcomeStatus.OK, changed=False)
+    got = str(detail.get("output_tail") or "").splitlines()
+    tail = "\n".join(got[-n:])
+    cut = _lab_log_cut_note(row, detail) if (detail.get("output_truncated") and len(got) <= n) else ""
+    return _out(f"[run {row['name']} logs — {state}]\n{_cap(tail)}{cut}", OutcomeStatus.OK, changed=False)
+
+
+def _kept_job_refusal(row) -> ToolOutcome:
+    """`logs`/`collect` of a job on a kept lab the host refused to read out (403 owner_only)."""
+    from .labs import kept_touch_refusal
+    return _refuse(f"{row['name']!r} runs on a kept machine (production) — "
+                   f"{kept_touch_refusal('autopilot', 'logs')}", "run_not_allowed")
+
+
+def _lab_log_cut_note(row, detail) -> str:
+    """§4UD F11: a lab run's output is read as the LAST 6 KB of its log file — said when that cut it, with the
+    file's path (it was cut silently and the path was never named)."""
+    lab_id, _, member = str(row["place"]).partition("/")
+    path = str(detail.get("log_path") or "")
+    return (f"\n[only the last {OUT_CAP // 1024} KB of the log are shown. The full log is {path} on {row['place']}: "
+            f"`lab exec lab_id={lab_id} member={member} cmd=\"grep -n … {path}\"` reads parts of it, `lab get` "
+            "copies it to the workspace]")
 
 
 def _delivers(jobs, job_id: str) -> bool:
@@ -1138,6 +1355,8 @@ async def _collect(context, reg, row, origin) -> ToolOutcome:
         # r2 minor 4: an ended run keeps its recorded end (a stopped lab job re-probes as `lost`);
         # the probe only fetches its output
         _s, _n, detail = await _probe(context, row, origin)
+        if detail.get("refused"):
+            return _kept_job_refusal(row)
         if _s == "unknown":
             return _out(f"[run {row['name']} {row['state']}] could not read its result now ({_n}).",
                         OutcomeStatus.UNRESOLVED, changed=False, code="run_unreachable")
@@ -1150,10 +1369,13 @@ async def _collect(context, reg, row, origin) -> ToolOutcome:
                 detail = {**detail, "exit_code": int(_m.group(1))}
     else:
         state, note, detail = await _probed(context, reg, row, origin)
+        if detail.get("refused"):
+            return _kept_job_refusal(row)
     if state in ("running", "unknown"):
         return _out(f"[run {row['name']} — {state}{(': ' + note) if note else ''}] no result yet; collect it "
                     "when it has ended.", OutcomeStatus.UNRESOLVED, changed=False, code="run_still_running")
     code = detail.get("exit_code")
+    cut_note = ""
     if row["backend"] == "jobs":
         _, jobs = _supervisors(context)
         tail = await asyncio.to_thread(jobs.log_tail, row["backend_ref"], 80) if jobs is not None else ""
@@ -1174,15 +1396,20 @@ async def _collect(context, reg, row, origin) -> ToolOutcome:
                 await asyncio.to_thread(jobs.mark_woken, row["backend_ref"])
             except Exception:  # noqa: BLE001
                 logger.debug("collect: wake not marked", exc_info=True)
+    elif detail.get("gone"):
+        # §4UD F11: the lab went (the probe's 404) — say it; an empty result read as "no output"
+        tail = "[its lab was destroyed — the job's output went with the lab]"
     else:
         tail = str(detail.get("output_tail") or "")
+        if detail.get("output_truncated"):
+            cut_note = _lab_log_cut_note(row, detail)
     head = (f"[run {row['name']} {state}" + (f" exit={code}" if code is not None else "")
             + (" — the exit code was not recorded: judge it by the output" if state == "exited" and code is None
                else "") + "]")
     ok = state == "exited" and code == 0
     # review r3: an `exited` job whose exit nobody knows is unresolved, not failed (the stored verdict agrees)
     unknown = state == "exited" and code is None
-    return _out(f"{head}\nEXIT CODE: {code if code is not None else 'none'}\n{_cap(str(tail))}",
+    return _out(f"{head}\nEXIT CODE: {code if code is not None else 'none'}\n{_cap(str(tail))}{cut_note}",
                 OutcomeStatus.OK if ok else OutcomeStatus.UNRESOLVED if unknown else OutcomeStatus.FAILED,
                 changed=False, code=None if ok else "run_exit_unknown" if unknown else "run_job_failed")
 
@@ -1200,7 +1427,10 @@ async def _app_url(context, reg, row, origin) -> ToolOutcome:
 
 
 async def _app_logs(context, row, origin, lines) -> ToolOutcome:
-    from .labs import LabsNoAnswer, LabsUnreachable, _call
+    from .labs import LabsNoAnswer, LabsUnreachable, _call, kept_touch_refusal
+    _why = kept_touch_refusal(origin, "logs")           # §4UD F12: BEFORE any host call, as `lab logs` does
+    if _why:
+        return _refuse(f"{row['name']!r} is a kept app (production) — {_why}", "run_not_allowed")
     state, note, detail = await _probe(context, row, origin)
     if not detail.get("lab_id"):
         return _out(f"RUN ERROR: {row['name']!r} has no serving lab ({state}{': ' + note if note else ''}).",
@@ -1218,7 +1448,7 @@ async def _app_logs(context, row, origin, lines) -> ToolOutcome:
                 + _cap(str(body.get("logs") or "")), OutcomeStatus.OK, changed=False)
 
 
-def _url(row) -> ToolOutcome:
+async def _url(context, row, origin) -> ToolOutcome:
     if row["lifetime"] != "server":
         return _refuse(f"{row['name']!r} is a {row['lifetime']} — only a server has an address")
     if not row["port"]:
@@ -1226,9 +1456,38 @@ def _url(row) -> ToolOutcome:
     if row["place"] == "workspace":
         return _out(f"{row['name']}: http://127.0.0.1:{row['port']}/ inside the workspace (the browser tool "
                     "reaches it; it is not published on the tailnet).", OutcomeStatus.OK, changed=False)
+    # §4UD F5: a lab port its template publishes HAS a tailnet URL (the lab's own detail lists it) — this said
+    # "not exposed" for every lab server
+    from .labs import LabsNoAnswer, LabsUnreachable, _call
     lab_id, _, member = row["place"].partition("/")
-    return _out(f"{row['name']}: not exposed (a disposable lab). Probe it with `lab http lab_id={lab_id} "
-                f"member={member} port={row['port']}`.", OutcomeStatus.OK, changed=False)
+    probe = f"`lab http lab_id={lab_id} member={member} port={row['port']}`"
+    try:
+        st, det = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin)
+    except (LabsUnreachable, LabsNoAnswer) as e:
+        return _out(f"RUN ERROR: could not read {row['name']!r}'s address — the labs host did not answer ({e}).",
+                    OutcomeStatus.UNRESOLVED, changed=False, code="run_unreachable")
+    det = det if isinstance(det, dict) else {}
+    if st == 404 and det.get("error") == "unknown_lab":
+        return _refuse(f"{row['name']!r}: its lab {lab_id} is gone — it has no address", "run_ended")
+    if st != 200:
+        return _out(f"RUN ERROR: the labs host answered {st} for {lab_id} — {row['name']!r}'s address was not read.",
+                    OutcomeStatus.FAILED, changed=False, code="run_unreachable")
+    for m in det.get("members") or []:
+        if not isinstance(m, dict) or str(m.get("name") or "") != member:
+            continue
+        for p in m.get("ports") or []:
+            try:
+                same = isinstance(p, dict) and int(p.get("container")) == int(row["port"])
+            except (TypeError, ValueError):
+                same = False
+            if same and p.get("url"):
+                return _out(f"{row['name']}: {p['url']} (published on the tailnet by the lab"
+                            + (f"; home network: {p['lan_url']}" if p.get("lan_url") else "")
+                            + f"; the address goes when the lab does). From here, probe it with {probe}.",
+                            OutcomeStatus.OK, changed=False)
+    return _out(f"{row['name']}: not published — the lab's template publishes no port {row['port']} of {member} "
+                f"(`lab status lab_id={lab_id}` lists the published ports). Probe it with {probe}.",
+                OutcomeStatus.OK, changed=False)
 
 
 async def _stop(context, reg, row, origin) -> ToolOutcome:
@@ -1358,7 +1617,7 @@ async def _restart(context, reg, row, origin) -> ToolOutcome:
                               backend_ref=row["backend_ref"], backend_token=str(e.get("token")),
                               # review: a leaf's server keeps its leaf tag across a restart (else its end
                               # skipped it — a workspace server has no TTL)
-                              meta={"leaf": _row_leaf(row) or None})
+                              meta={"leaf": _restart_leaf(row)})
                 if rid is None:
                     # r3 minor 2: never left running untracked
                     gone = await _svc_undo(svc, row["backend_ref"])
@@ -1422,7 +1681,7 @@ async def _restart(context, reg, row, origin) -> ToolOutcome:
     lab_id, _, member = row["place"].partition("/")
     # review r2: a restart is the same run — it keeps the old row's leaf on both paths (workspace and lab)
     started = await _start_lab(context, reg, row["owner"], origin, row["name"], row["command"], lab_id, member,
-                               row["lifetime"], row["port"], meta={"leaf": _row_leaf(row) or None})
+                               row["lifetime"], row["port"], meta={"leaf": _restart_leaf(row)})
     if started.status is not OutcomeStatus.OK:
         was = bool(getattr(stopped, "world_changed", False))
         lead = ("The old server WAS stopped; starting it again failed:" if was
@@ -1674,16 +1933,29 @@ def _notify_owner(context, msg: str, run_ids) -> bool:
         return False
 
 
+async def background_sweep(context) -> None:
+    """One tick of the runs/labs background loop. Each step stands alone; none raises."""
+    try:
+        from .labs import labs_configured
+        if labs_configured(context):
+            await app_down_sweep(context)
+    except Exception:  # noqa: BLE001
+        logger.warning("kept-app sweep failed", exc_info=True)
+    try:
+        from ..core.leaf_reaper import sweep_ended_leaves      # §4UD F1: a refused leaf-end destroy is asked again
+        await sweep_ended_leaves(context)
+    except Exception:  # noqa: BLE001
+        logger.warning("leaf sweep failed", exc_info=True)
+
+
 async def watch_kept_apps(context) -> None:
-    """The background loop (main.py): one sweep every APP_WATCH_EVERY_S; never raises."""
+    """The background loop (main.py): one `background_sweep` every APP_WATCH_EVERY_S; never raises."""
     while True:
         await asyncio.sleep(APP_WATCH_EVERY_S)
         try:
-            from .labs import labs_configured
-            if labs_configured(context):
-                await app_down_sweep(context)
+            await background_sweep(context)
         except Exception:  # noqa: BLE001
-            logger.warning("kept-app sweep failed", exc_info=True)
+            logger.warning("runs/labs background sweep failed", exc_info=True)
 
 
 # ------------------------------------------------------------------ the schema (§4SX D5: advertised; replaces
@@ -1698,8 +1970,9 @@ RUN_TOOL_DEFINITION = {
             "command (`job`), or a kept app (`app`). Each run has a NAME, unique in this project (or "
             "conversation), and lives WHERE you say: `workspace` (the sandbox) or `lab_<id>/<member>` (a lab "
             "machine from the `lab` tool). NEVER background a process in execute ('cmd &') — start it here. "
-            "start: a `server` gets a port (the command reads $PORT; ask for one with `port`); a `job` runs to "
-            "its end (45 min at most) and `collect` reads its result. An `app` is made by `lab keep` and is "
+            "start: a `server` gets a port (the command reads $PORT — in the workspace and on a lab; it must "
+            "listen on 0.0.0.0, not 127.0.0.1); a `job` runs to its end (45 min at most) and `collect` reads its "
+            "result; a server on a lab runs until stopped or its lab goes. An `app` is made by `lab keep` and is "
             "started/stopped/restarted here by name. status: every run with its probed state (or one by "
             "`name`). logs: the run's recent output. url: where a server/app answers. A start is NOT proof the "
             "work is done — check its logs/collect/url before saying it works."
@@ -1710,7 +1983,8 @@ RUN_TOOL_DEFINITION = {
                 "action": {"type": "string", "enum": list(ACTIONS)},
                 "name": {"type": "string",
                          "description": "The run's name, ^[a-z][a-z0-9-]{0,30}$ (e.g. `api`, `bench-1`). Required "
-                                        "except for status."},
+                                        "except for status. stop also takes a run id (run_xxxxxxxx) from "
+                                        "`status all=true`."},
                 "command": {"type": "string",
                             "description": "start: the foreground shell command, e.g. 'python3 -m http.server "
                                            "$PORT' or 'cd app && node server.js'."},
@@ -1722,7 +1996,11 @@ RUN_TOOL_DEFINITION = {
                                             "end; read it with collect)."},
                 "port": {"type": "integer",
                          "description": "start a workspace server: OPTIONAL preferred port (a free one is given "
-                                        "and reported if it is taken); the command reads $PORT."},
+                                        "and reported if it is taken); the command reads $PORT. A server on a "
+                                        "lab: REQUIRED — $PORT is set to it."},
+                "all": {"type": "boolean",
+                        "description": "status: the live runs of EVERY conversation and project, from local "
+                                       "records (the owner's own turn only)."},
                 "lines": {"type": "integer", "description": "logs: how many recent lines (default 60)."},
             },
             "required": ["action"],
@@ -1991,19 +2269,31 @@ def project_running_summary(context, project_id: str) -> list:
         except Exception:  # noqa: BLE001
             logger.debug("running summary: job states not read", exc_info=True)
         # review: the NEWEST twelve (oldest-first hid a new run behind old ones)
+        _now = time.time()
         for r in sorted(_rows, key=lambda x: float(x.get("started_at") or 0), reverse=True)[:12]:
             out.append({"kind": "run", "name": r["name"], "lifetime": r["lifetime"], "place": r["place"],
                         "state": r["state"], "at": r.get("last_probe_at"), "port": r.get("port"),
-                        "service_key": r["backend_ref"] if r["backend"] == "services" else ""})
+                        "service_key": r["backend_ref"] if r["backend"] == "services" else "",
+                        # §4UD F10: a lab run weeks past its 45 minutes read "running" here until someone ran
+                        # `run status` — the record's own limit marks it, with no host call
+                        "note": _PAST_LIMIT_NOTE if _past_limit(r, _now) else ""})
     except Exception:  # noqa: BLE001 — the briefing never breaks a turn
         logger.debug("running summary: runs skipped", exc_info=True)
     try:
         from ..memory.lab_inventory import inventory_for
         inv = inventory_for(context)
+        from .labs import _when
+        _now = time.time()
         for r in (inv.rows(owner, live_only=True) if inv is not None else [])[:8]:
+            _exp = r.get("expires_hard")
+            _note = ""
+            if _exp and not r.get("leftovers"):
+                # §4UD F10: the hard expiry written at create — a lab cannot outlive it (a kept machine has none)
+                _note = (f"past its maximum lifetime ({_when(_exp, _now)}) — gone unless it was kept; not checked, "
+                         "`lab list` settles it" if _now > float(_exp) else f"gone by {_when(_exp, _now)} at the latest")
             out.append({"kind": "lab", "name": r["lab_id"], "lifetime": "", "place": r.get("template") or "",
                         "state": "leftovers" if r.get("leftovers") else "", "at": None, "port": None,
-                        "label": r.get("label") or "", "service_key": ""})
+                        "label": r.get("label") or "", "service_key": "", "note": _note})
     except Exception:  # noqa: BLE001
         logger.debug("running summary: labs skipped", exc_info=True)
     return out

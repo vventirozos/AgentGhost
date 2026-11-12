@@ -127,6 +127,12 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
                   cmd=str(body.get("cmd") or ""), detach=bool(body.get("detach")))
         return JSONResponse(status_code=202, content=out) if body.get("detach") else out
 
+    @app.post("/v1/labs/{lab_id}/exec/cancel")
+    def exec_cancel(lab_id: str, body: Dict[str, Any] = Body(default={}), x_origin: Optional[str] = O):
+        origin = _origin(x_origin)
+        return act(lab_id, "exec_cancel", origin, lambda: mgr.cancel_exec(lab_id, body or {}, origin),
+                   member=str((body or {}).get("member") or ""))
+
     @app.get("/v1/labs/{lab_id}/jobs")
     def jobs(lab_id: str, x_origin: Optional[str] = O):
         mgr.get(lab_id)
@@ -139,7 +145,7 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
     @app.get("/v1/labs/{lab_id}/jobs/{job_id}")
     def job(lab_id: str, job_id: str, tail_bytes: int = 65536, x_origin: Optional[str] = O):
         mgr.touch(lab_id, _origin(x_origin)) if svc.store.lab(lab_id) else None
-        return mgr.job(lab_id, job_id, tail_bytes)
+        return mgr.job(lab_id, job_id, tail_bytes, reader=_origin(x_origin))
 
     @app.delete("/v1/labs/{lab_id}/jobs/{job_id}")
     def kill_job(lab_id: str, job_id: str, x_origin: Optional[str] = O):
@@ -156,6 +162,16 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
     @app.get("/v1/labs/{lab_id}/files")
     def get_file(lab_id: str, member: str, path: str, x_origin: Optional[str] = O):
         return mgr.get_file(lab_id, member, path, _origin(x_origin))
+
+    @app.put("/v1/labs/{lab_id}/tree")
+    def put_tree(lab_id: str, body: Dict[str, Any] = Body(...), x_origin: Optional[str] = O):
+        origin = _origin(x_origin)
+        return act(lab_id, "put_tree", origin, lambda: mgr.put_tree(lab_id, body, origin),
+                   member=str(body.get("member") or ""), path=str(body.get("path") or ""))
+
+    @app.get("/v1/labs/{lab_id}/tree")
+    def get_tree(lab_id: str, member: str, path: str, x_origin: Optional[str] = O):
+        return mgr.get_tree(lab_id, member, path, _origin(x_origin))
 
     @app.post("/v1/labs/{lab_id}/members/{member}/{action}")
     def member_action(lab_id: str, member: str, action: str, x_origin: Optional[str] = O):

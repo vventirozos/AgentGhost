@@ -60,6 +60,11 @@ HALF_LIFE_S = 2 * 3600.0
 INTENSITY_THRESHOLDS = (0.20, 0.45, 0.75)
 #: an intensity already held is given up only below its threshold MINUS this
 INTENSITY_MARGIN = 0.04
+#: §4UD (review r2): a magnitude this close under a threshold is ON it. The events are round numbers (a
+#: correction is −0.20, the first threshold 0.20) and the stored pair keeps 12 decimals, so the same history
+#: with and without the owner's message tone can stand at 0.2 and at 0.199999999999 — one reads "down, 1",
+#: the other "neutral", and a member would hear a level the tone-free run never had (his fuzz, seeds 300, 943)
+LEVEL_EPS = 1e-9
 
 #: the smaller of |P|, |E| divided by the larger: under this the smaller one
 #: is "near 0" and the label is an axis label (content / down / restless /
@@ -154,7 +159,7 @@ def level_for(magnitude: float, held: int = 0) -> int:
     threshold minus ``INTENSITY_MARGIN`` — so a mood that only decays reads
     the same whenever it is looked at."""
     m = abs(float(magnitude))
-    raw = sum(1 for t in INTENSITY_THRESHOLDS if m >= t)
+    raw = sum(1 for t in INTENSITY_THRESHOLDS if m >= t - LEVEL_EPS)
     try:
         h = int(held)
     except (TypeError, ValueError):
@@ -289,6 +294,7 @@ KIND_THUMB_UP = "thumb_up"
 KIND_THUMB_DOWN = "thumb_down"
 KIND_CORRECTION = "correction"
 KIND_PRAISE = "praise"
+KIND_THUMB_OFF = "thumb_off"  # §4UD (G1): the owner took a thumb back
 KIND_SENTIMENT = "sentiment"  # §4TW: the tone of the owner's message (the sentiment service)
 KIND_OWNER = "owner"          # the owner said so in chat (set_mood)
 KIND_QUIET = "quiet"          # a reader first saw the boredom of a long quiet
@@ -312,7 +318,10 @@ EV_CLEAN_TURN = (+0.08, 0.0)
 CLEAN_TURN_MIN_CALLS = 3
 #: §4UB (evaluation 11-10: 29 owner turns of 0–1 calls moved nothing, so the mood was a thumbs-up counter): a
 #: clean turn of 1 or 2 calls earns this share of the reward its calls would — small, but the work counts
-CLEAN_TURN_SMALL_SHARE = 0.5
+#: §4UH-e2e (replay of 581 real owner turns over 30 days, turn events only, 10-min samples): at 0.5 the agent's
+#: own work held the mood off neutral 13.9 % of all hours; at 1.0, 19.4 % (content 1 most of the gain; the
+#: irritable/down hours unchanged). 279 of the 374 tool turns are 1–2 calls — most of what the agent does
+CLEAN_TURN_SMALL_SHARE = 1.0
 CLEAN_TURN_BASE = 0.04
 CLEAN_TURN_PER_CALL = 0.02
 CLEAN_TURN_MAX = 0.16
@@ -351,6 +360,8 @@ SENTIMENT_MIN_SCORE = 0.85
 #: a steady tone held a level 1 it did not make, by floating point), so sentiment alone never makes or keeps a
 #: mood anyone hears; it only adds to one the agent's work or the owner's reactions made
 SENTIMENT_SHARE_MAX = 0.12
+#: … and on the energy: the same fraction of the tone's own energy (a quarter of its pleasantness)
+SENTIMENT_SHARE_MAX_E = SENTIMENT_SHARE_MAX * abs(EV_SENTIMENT_POSITIVE[1] / EV_SENTIMENT_POSITIVE[0])
 
 
 @dataclass(frozen=True)
@@ -466,7 +477,7 @@ def reaction_event(kind: str) -> Optional[Event]:
     if kind == KIND_THUMB_DOWN:
         return Event(EV_THUMB_DOWN[0], EV_THUMB_DOWN[1], "the owner gave a thumbs-down", kind)
     if kind == KIND_CORRECTION:
-        return Event(EV_CORRECTION[0], EV_CORRECTION[1], "the owner corrected my last reply", kind)
+        return Event(EV_CORRECTION[0], EV_CORRECTION[1], "the owner corrected one of my replies", kind)
     if kind == KIND_PRAISE:
         return Event(EV_PRAISE[0], EV_PRAISE[1], "the owner said thanks", kind)
     return None
@@ -600,6 +611,10 @@ SYNONYMS = {
     "sleepy": ("tired", None), "exhausted": ("tired", None), "weary": ("tired", None),
     "interested": (CURIOUS, None), "inquisitive": (CURIOUS, None),
 }
+#: §4UD (review r2): the phrasings the `introspect` tool description teaches for a relative ask → the label
+#: they mean. ONE table: the description's examples are checked against it (`tests/test_4ud_mood.py`), and
+#: `tools.introspect._owner_named` accepts them as the owner naming that label
+TAUGHT_PHRASES = {"cheer up": "cheerful", "don't be so grumpy": "irritable"}
 #: the ONLY words that take the mood off (matched stripped, case-folded)
 CLEAR_WORDS = frozenset({"clear", "none", "neutral"})
 
@@ -768,6 +783,31 @@ def parse_iso_utc(ts: str) -> Optional[datetime.datetime]:
     return dt.astimezone(datetime.timezone.utc)
 
 
+#: §4UD (F3): how far AHEAD of the clock a stored stamp may lie and still be read. A stamp of something that
+#: happened (when the pair was written, when the owner spoke, when a manner was set) can be ahead only by a
+#: clock that was set back — a day at most; the end of the owner's hold is the next 04:00 that is at least an
+#: hour away, so 25 h (a daylight-saving night: 26), never more than this
+STAMP_AHEAD_MAX_S = 24 * 3600.0
+HOLD_AHEAD_MAX_S = 28 * 3600.0
+
+
+def sane_future(ts, *, now: Optional[datetime.datetime] = None,
+                ahead_s: float = STAMP_AHEAD_MAX_S) -> Optional[datetime.datetime]:
+    """§4UD (F3): THE read of a stored stamp — parsed, or None when it does
+    not parse OR lies more than ``ahead_s`` ahead of ``now`` (a clock that
+    was wrong when it was written, a hand edit): such a stamp is no time
+    anyone can read, and what hangs on it has expired. (Review: a hold end
+    in 2036 held "irritable, 3 of 3" for ever, for everyone.)"""
+    dt = parse_iso_utc(ts)
+    if dt is None:
+        return None
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    return dt if (dt - now).total_seconds() <= float(ahead_s) else None
+
+
 def age_seconds(
     ts: str, *, now: Optional[datetime.datetime] = None,
 ) -> Optional[float]:
@@ -813,19 +853,39 @@ def _local_at(day: datetime.date, hour: int, tz) -> datetime.datetime:
     return datetime.datetime.combine(day, datetime.time(hour), tzinfo=tz)
 
 
+def mood_day(when: Optional[datetime.datetime] = None, *, tz=None) -> datetime.date:
+    """§4UD (F7): THE day a moment belongs to, for everything about the mood
+    — the owner's hold, the manner, "today" in the timeline and the diary.
+    It ends at local ``MANNER_DAY_END_HOUR``:00, not at midnight: 00:10 is
+    still the evening before. (Review: the hold and the manner ended at
+    04:00 while the timeline cut at midnight — a mood set at 23:30 and asked
+    about at 00:10 read "Today: no change so far".) ``when`` None = now; a
+    naive time is UTC."""
+    if when is None:
+        when = datetime.datetime.now(datetime.timezone.utc)
+    elif when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    local = when.astimezone(tz) if tz is not None else when.astimezone()
+    return (local - datetime.timedelta(hours=MANNER_DAY_END_HOUR)).date()
+
+
+def mood_day_end(day: datetime.date, *, tz=None) -> datetime.datetime:
+    """When mood day ``day`` ends: the next calendar day's local 04:00 (UTC, aware)."""
+    return _local_at(day + datetime.timedelta(days=1), MANNER_DAY_END_HOUR, tz).astimezone(datetime.timezone.utc)
+
+
 def manner_ends_at(set_at: str, *, tz=None) -> Optional[datetime.datetime]:
-    """When a manner set at ``set_at`` (the on-disk stamp) is over: the first
-    local ``MANNER_DAY_END_HOUR``:00 at least ``MANNER_MIN_LIFE_S`` after it.
-    None when the stamp does not parse."""
+    """When a manner set at ``set_at`` (the on-disk stamp) is over: the end
+    of its mood day (``mood_day``) — or of the next one when that is less
+    than ``MANNER_MIN_LIFE_S`` away. None when the stamp does not parse."""
     start = parse_iso_utc(set_at)
     if start is None:
         return None
-    local = start.astimezone(tz) if tz is not None else start.astimezone()
-    day = local.date()
+    day = mood_day(start, tz=tz)
     for _ in range(3):
-        end = _local_at(day, MANNER_DAY_END_HOUR, tz)
+        end = mood_day_end(day, tz=tz)
         if (end - start).total_seconds() >= MANNER_MIN_LIFE_S:
-            return end.astimezone(datetime.timezone.utc)
+            return end
         day += datetime.timedelta(days=1)
     return None                                  # unreachable for a sane clock
 
@@ -862,15 +922,48 @@ def manner_level(intensity, set_at: str, *, now: Optional[datetime.datetime] = N
         now = datetime.datetime.now(datetime.timezone.utc)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=datetime.timezone.utc)
-    start = parse_iso_utc(set_at)
+    # §4UD (F3): one rule for every stored stamp — more than a day ahead is no time anyone can read
+    start = sane_future(set_at, now=now)
+    if start is None:
+        return 0
     level = max(0, min(3, int(intensity)))
-    if start is not None and (start - now).total_seconds() > MANNER_MIN_LIFE_S:
+    if (start - now).total_seconds() > MANNER_MIN_LIFE_S:
         # set in the FUTURE: a clock set back keeps the manner at its set level until the clock catches up
-        # (§4TX review: it read 0 and the next write dropped it for good); a stamp a day or more ahead is a
-        # hand edit, and no day is read from it
-        return level if (start - now).total_seconds() < 86400.0 else 0
+        # (§4TX review: it read 0 and the next write dropped it for good)
+        return level
     for at, lvl in steps:
         if now >= at:
             level = lvl
     return level
 
+
+
+# ── the one label a face shows (§4UD, W1) ───────────────────────────────────
+
+def rest_label(rest) -> str:
+    """§4UA: the region of a resting point — ``NEUTRAL`` at (0, 0) or when
+    unreadable. A character that is only unhurried is not bored (boredom is a
+    quiet, not a temperament): that region reads "calm"."""
+    try:
+        rp, re_ = rest
+        rp, re_ = float(rp), float(re_)
+    except (TypeError, ValueError):
+        return NEUTRAL
+    if not (rp or re_) or rp != rp or re_ != re_:
+        return NEUTRAL
+    got = region(rp, re_)
+    return "calm" if got == BORED else got
+
+
+def face_label(label, intensity, rest=(0.0, 0.0)) -> str:
+    """THE label a face shows: the mood's while it has a level; with no mood,
+    the region its resting point lies in (shown faintly by the faces); else
+    ``NEUTRAL``. One rule for the health endpoint, the web face and the
+    handheld (review W1: it lived in three places)."""
+    try:
+        n = int(intensity)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0 and isinstance(label, str) and label in LABELS:
+        return label
+    return rest_label(rest)

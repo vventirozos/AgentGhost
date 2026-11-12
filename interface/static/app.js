@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.21';
+import * as matrixGraphFace from './matrix_graph.js?v=19.25';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -1868,10 +1868,15 @@ let _moodNoteShown = false;   // §4UB: "your set mood holds" speaks once per pa
 
 async function sendFeedback(div, signal, retryReqId) {
     const reqId = div.dataset.reqId;
-    // Same-signal repeats are a no-op CLIENT-side too (the server also
-    // dedupes — first live test: three 👍 in 2s appended three sidecar
-    // rows). Switching to the opposite thumb re-labels.
-    if (!reqId || div.dataset.feedback === signal) return;
+    if (!reqId) return;
+    // §4UD: the ACTIVE thumb clicked again takes it back — `retract:<signal>`
+    // withdraws the thumb's part of the mood (the turn's label stays: the
+    // agent has no un-label) and the button goes back to unlit. Switching to
+    // the opposite thumb re-labels, as before. (Until §4UD a same-signal
+    // repeat was a client-side no-op; three quick 👍 still make one request,
+    // because the buttons are disabled while one is in flight.) An armed
+    // retry never retracts: with a label latched it stands down just below.
+    const retract = !retryReqId && div.dataset.feedback === signal;
     // An ARMED RETRY fires blind 4s later — it must stand down if the
     // operator labeled in the meantime (either thumb: a 👎 landed after
     // the pending 👍 would otherwise be silently overwritten server-side)
@@ -1892,7 +1897,7 @@ async function sendFeedback(div, signal, retryReqId) {
         const r = await fetch('/api/feedback', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ request_id: reqId, signal: signal, source: 'web' })
+            body: JSON.stringify({ request_id: reqId, signal: retract ? 'retract:' + signal : signal, source: 'web' })
         });
         if (!r.ok) {
             // 404 = the trajectory can flush moments AFTER the stream ends
@@ -1906,7 +1911,7 @@ async function sendFeedback(div, signal, retryReqId) {
             // retries these; the web UI silently did not.
             const _retryable = (r.status === 404 || r.status === 429
                                 || r.status >= 500);
-            if (_retryable && !div.dataset.fbRetried) {
+            if (!retract && _retryable && !div.dataset.fbRetried) {
                 div.dataset.fbRetried = '1';
                 div._fbTimer = setTimeout(() => {
                     div._fbTimer = null;
@@ -1915,7 +1920,7 @@ async function sendFeedback(div, signal, retryReqId) {
                 return;
             }
             const err = await r.json().catch(() => ({}));
-            _noteFeedbackFailure(div, `Feedback not recorded: ${err.error || err.detail || ('HTTP ' + r.status)}`);
+            _noteFeedbackFailure(div, `${retract ? 'Thumb not taken back' : 'Feedback not recorded'}: ${err.error || err.detail || ('HTTP ' + r.status)}`);
             return;
         }
         delete div.dataset.fbRetried;
@@ -1933,17 +1938,18 @@ async function sendFeedback(div, signal, retryReqId) {
             target = chatLog.querySelector(
                 `.message.agent[data-req-id="${CSS.escape(reqId)}"]`) || div;
         }
-        target.dataset.feedback = signal;
+        if (retract) delete target.dataset.feedback; else target.dataset.feedback = signal;
+        if (retract && target !== div) delete div.dataset.feedback;
         const fbRow = target.querySelector(':scope > .msg-feedback');
-        if (fbRow) fbRow.classList.add('fb-decided');
+        if (fbRow) fbRow.classList.toggle('fb-decided', !retract);
         target.querySelectorAll('.msg-fb-btn').forEach(b => {
             b.classList.toggle('fb-active',
-                b.classList.contains(`msg-fb-${signal}`));
+                !retract && b.classList.contains(`msg-fb-${signal}`));
         });
-        // Persist the latch so a reload re-renders the chosen thumb.
+        // Persist the latch so a reload re-renders the chosen thumb (or none).
         for (let i = chatHistory.length - 1; i >= 0; i--) {
             if (chatHistory[i].reqId === reqId) {
-                chatHistory[i].feedback = signal;
+                if (retract) delete chatHistory[i].feedback; else chatHistory[i].feedback = signal;
                 break;
             }
         }
@@ -1952,6 +1958,10 @@ async function sendFeedback(div, signal, retryReqId) {
         // and only after the label is latched (a hint that fails to parse
         // must not report a recorded label as lost)
         const done = await r.json().catch(() => ({}));
+        // §4UD: a recorded thumb is when the mood moves — status.js re-reads it now, not at the next poll
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('mood-changed'));
+        } catch (e) { /* workspace modules not loaded */ }
         if (done && typeof done.hint === 'string' && done.hint && !_ruleHintShown) {
             _ruleHintShown = true;
             addMessage('system', done.hint);
@@ -7527,7 +7537,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.7').catch(e => {
+import('./workspace.js?v=9.11').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

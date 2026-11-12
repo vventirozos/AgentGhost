@@ -491,19 +491,27 @@ def test_the_handheld_opens_on_the_mood_tesseract_and_toggles():
     class _Stop(Exception):
         pass
 
-    async def fetch_mood(*_):
-        return ("irritable", 2)
+    import agentapi
+
+    async def fetch_mood_view(*_):
+        return agentapi.mood_view({"label": "irritable", "intensity": 2})
 
     async def stop(_):
         raise _Stop
 
+    # §4UD: the loop reads through `_mood_once` (fetch_mood_view + MoodWatch), which also draws the words
     ns = {"MOOD_POLL_S": 60, "httpx": SimpleNamespace(AsyncClient=_Client), "AGENT_BASE": "a", "GHOST_API_KEY": "k",
-          "agentapi": SimpleNamespace(fetch_mood=fetch_mood), "asyncio": SimpleNamespace(sleep=stop)}
-    exec(compile(_window_methods(tree, "mood_loop"), "client.py", "exec"), ns)
-    win = SimpleNamespace(web_face=SimpleNamespace(set_agent_mood=lambda *m: told.append(m)))
+          "agentapi": SimpleNamespace(fetch_mood_view=fetch_mood_view), "asyncio": SimpleNamespace(sleep=stop)}
+    exec(compile(_window_methods(tree, "mood_loop", "_mood_once", "_mood_read"), "client.py", "exec"), ns)
+    drawn = []
+    win = SimpleNamespace(web_face=SimpleNamespace(set_agent_mood=lambda *m: told.append(m)),
+                          _mood_watch=agentapi.MoodWatch(), _mood_words="", update_stats=lambda: drawn.append(1),
+                          _mood_reading=False, _mood_again=False)
+    win._mood_once = lambda: ns["_mood_once"](win)
+    win._mood_read = lambda: ns["_mood_read"](win)
     with pytest.raises(_Stop):
         asyncio.run(ns["mood_loop"](win))
-    assert told == [("irritable", 2)]
+    assert told == [("irritable", 2)] and win._mood_words == "irritable, 2 of 3" and drawn == [1]
     started = [ast.unparse(c.args[0]) for c in ast.walk(tree) if isinstance(c, ast.Call)
                and isinstance(c.func, ast.Attribute) and c.func.attr == "create_task" and c.args]
     assert "window.mood_loop()" in started

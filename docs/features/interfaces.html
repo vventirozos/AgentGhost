@@ -130,8 +130,11 @@ rm ~/Data/AI/Logs/ghost-slack-maintenance                                       
   <h2 id="where">Where it runs</h2>
   <p>The agent, the API, the web console server and the Slack bot all run on the Mac Studio (eva), each supervised so it restarts if it dies. Browsers, phones, the handheld and Slack reach them over a private network. Voice requests are passed on to the Mac mini (nova) for speech-to-text and speech.</p>
 
+  <p>The agent's mood is shown twice in the web console and on the handheld: as the face's look, and as a short phrase of text (<em>calm, 1 of 3</em>, <em>rests calm</em>, <em>mood unknown</em>) under the message box in the console and on the status line of the handheld. The text does not depend on the face, so it stays when animations are off. On the handheld, a thumb pressed while a mood you set is held is answered with the same line the console shows ("Your set mood holds until&hellip;"), once. Clicking a lit thumb again takes it back (console and handheld). See <a href="selfhood.html#how">Selfhood</a>.</p>
+
   <h2 id="limits">Limits and switches</h2>
   <ul>
+    <li>The mood text follows the agent's health reading: every 25 seconds and once after each reply or thumb. After three readings without a mood it says <em>mood unknown</em> and the face goes back to neutral.</li>
     <li>Installing the console on a phone needs HTTPS with a certificate the phone trusts.</li>
     <li><code>GHOST_SLACK_OPEN_CHANNEL=0</code> restricts Slack to the owner; <code>GHOST_SLACK_SHADOW_BAN</code> is read once at start, so a ban needs a bot restart.</li>
     <li>A shared Slack channel is not a security boundary in itself: the member wall in the agent is what keeps the owner's data private.</li>

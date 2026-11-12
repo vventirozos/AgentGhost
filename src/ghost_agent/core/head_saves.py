@@ -27,6 +27,14 @@ prompt + profile) and the channel members' (the 6 allowed tools + the system
 prompt with the member placeholder). The meta file names the kind; llama-start
 restores only the owner's, and pruning keeps each kind's newest separately.
 
+§4UD (review 11-11): a file is kept only when it is whole and the running
+server's (`save`: free space first, ``n_written`` equal to the file's size,
+llama's identity read again before the rename); any slot action that succeeds
+lifts the "saves off" mark; the directory is pruned by age as well as by count
+and bytes, another server's saves leave by age instead of at once, and files
+are owner-only. This file runs standalone at llama start (`python -I`): it
+imports the standard library only.
+
 Off unless GHOST_HEAD_SAVES=1. The directory is $GHOST_HOME/system/head_saves
 and MUST be llama-server's --slot-save-path (llama only takes a file name).
 One slot (-np 1): slot id 0.
@@ -37,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -91,6 +100,20 @@ PARK_TIMEOUT_S = 120.0
 #: for a BOS) — far below any conversation or the head
 PARK_MAX_TOKENS = 4
 
+#: §4UD (H8): a save made on ANOTHER model, build or template is kept
+#: this long after its last use — trying another model once must not delete the
+#: usual model's saves (it did: llama start dropped every foreign file at once)
+FOREIGN_KEEP_S = 3 * 86400.0
+#: §4UD (H14): a save not used (saved or restored) for this long is dropped,
+#: per kind — the directory was bounded by count and bytes only, so a members'
+#: head for a prompt that no longer exists never left
+MAX_AGE_S = {OWNER: 30 * 86400.0, MEMBER: 14 * 86400.0, CONV: 14 * 86400.0}
+#: §4UD (H4): free space a save needs beyond the state's own estimated size
+FREE_MARGIN_BYTES = 2 << 30
+#: §4UD (H14): the states hold the owner's tokens — owner-only files and directory
+FILE_MODE = 0o600
+DIR_MODE = 0o700
+
 #: servers that answered "does not support slots action" (no --slot-save-path)
 _unsupported: set = set()
 
@@ -129,9 +152,59 @@ def _error_text(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"
 
 
+def restore_timed_out(detail: Any) -> bool:
+    """§4UD r2: did a POSTED restore end in a client timeout? Read from the
+    detail `restore` returned — `_error_text` above writes it, and this is the
+    one place that reads it back (llama may still be applying such a restore)."""
+    t = str(detail or "").lower()
+    return "timeout" in t or "timed out" in t
+
+
 def _note_unsupported(base: str, e: Exception, text: str) -> None:
     if isinstance(e, urllib.error.HTTPError) and "does not support slots action" in text:
         _unsupported.add(base)
+
+
+def _note_supported(base: str) -> None:
+    """§4UD (H7): llama just answered a slot action — it takes them, whatever
+    an earlier 501 said (the mark was lifted only by an idle tick's probe, so
+    a working owner kept "saves off" for the whole session)."""
+    _unsupported.discard(base)
+
+
+def secure_dir(d: Path) -> None:
+    """§4UD (H14): the save directory is the owner's alone (0700). Best
+    effort: a directory another user owns is left as it is."""
+    try:
+        if (d.stat().st_mode & 0o777) != DIR_MODE:
+            os.chmod(d, DIR_MODE)
+    except OSError:
+        pass
+
+
+def _secure_file(p: Path) -> None:
+    try:
+        if (p.stat().st_mode & 0o777) != FILE_MODE:
+            os.chmod(p, FILE_MODE)
+    except OSError:
+        pass
+
+
+def free_bytes(d: Path) -> Optional[int]:
+    """Free bytes on the save directory's volume; None when unknown."""
+    try:
+        return int(shutil.disk_usage(d).free)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def state_bytes(n_tokens: int) -> int:
+    """The estimated size of a saved slot holding ``n_tokens`` (§4SA's figures)."""
+    try:
+        n = max(0, int(n_tokens or 0))
+    except (TypeError, ValueError):
+        n = 0
+    return n * STATE_BYTES_PER_TOKEN + CHECKPOINTS_BYTES
 
 
 def recheck_supported(base: str, timeout: float = 3.0) -> bool:
@@ -156,11 +229,38 @@ def recheck_supported(base: str, timeout: float = 3.0) -> bool:
 
 
 def server_identity(base: str) -> str:
-    """Model file, build and chat template of the running server — part of the
-    file key, so a model, build or template change never restores old state."""
+    """What the RUNNING server says it is, read from its /props now: model
+    file path, build and chat template — part of every file key and stored in
+    every meta, so a model, build or template change never restores old state.
+
+    A value held in a plan is only what the server WAS when the plan was made
+    (§4UD, H2: llama can restart on another model between a plan and a save).
+    `save` therefore reads it again after llama answered and before the file
+    is kept, and the agent's restore reads it again before it posts.
+
+    Limit (§4UD r2): the model is known by its PATH. A model file replaced in
+    place under the same path is not detected. (Round 1 added the file's size
+    and mtime, read from the path: that is the file on disk, not the one llama
+    has open, so a replaced file filed the old model's state under the new
+    one's identity — worse than not looking. Removed; the format is the one
+    every existing file was saved under.)"""
     p = _http(base + "/props")
     tmpl = hashlib.sha1(str(p.get("chat_template") or "").encode("utf-8", "ignore")).hexdigest()[:16]
     return f"{p.get('model_path') or ''}|{p.get('build_info') or ''}|{tmpl}"
+
+
+def confirmed_identity(base: str) -> Tuple[Optional[str], str]:
+    """§4UD r3: the running server's identity, asked TWICE before "no answer"
+    — ``(identity, "")``, or ``(None, why)``. The one rule for both sides: the
+    save's check after llama answered and the agent's check before a restore
+    (it asked once there, so one slow /props cost a whole restore)."""
+    err = ""
+    for _try in (1, 2):
+        try:
+            return (server_identity(base), "")
+        except Exception as e:  # noqa: BLE001
+            err = _error_text(e)
+    return (None, err)
 
 
 def render(base: str, payload: dict) -> str:
@@ -360,7 +460,7 @@ def save_timeout_s(n_tokens: int) -> float:
         n = max(0, int(n_tokens or 0))
     except (TypeError, ValueError):
         n = 0
-    gb = (n * STATE_BYTES_PER_TOKEN + CHECKPOINTS_BYTES) / 1e9
+    gb = state_bytes(n) / 1e9
     return max(SAVE_TIMEOUT_S, RESTORE_S_PER_GB * gb)
 
 
@@ -384,12 +484,20 @@ def restore(base: str, d: Path, key: str) -> Tuple[bool, str, float]:
     if not isinstance(r, dict):
         # review r5: an odd reply says nothing about the file — keep it
         return (False, f"llama answered {type(r).__name__}, not the restore result", dt)
+    _note_supported(base)       # §4UD (H7): llama takes slot actions
     n = _count(r, "n_restored")
     if n != expected:
         discard(d, key)
         return (False, f"restored {n} tokens, saved head has {expected}", dt)
     touch(d, key)       # §4RW-e: every restore is a use (prune keeps by last use)
     return (True, f"{n} tokens", dt)
+
+
+def _drop(part: Path) -> None:
+    try:
+        part.unlink()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def save(base: str, d: Path, key: str, expected_n: int, identity: str = "",
@@ -401,10 +509,25 @@ def save(base: str, d: Path, key: str, expected_n: int, identity: str = "",
     (the slot moved on before llama ran it) never becomes the head.
     §4RV: ``kind=CONV`` saves a conversation the same way; ``at_least``:
     any count from ``expected_n`` up is the state wanted (llama's /slots
-    count and its saved count differ by the generated tokens)."""
+    count and its saved count differ by the generated tokens).
+
+    §4UD — what "verified" means, all checked HERE (the one place a file is kept):
+    H4: the volume must hold the estimated state plus `FREE_MARGIN_BYTES`
+    before anything is posted; llama must report ``n_written`` > 0 and the
+    .part must be exactly that long — an empty or short file (a full disk)
+    never replaces a good one. H2: ``identity`` is what the caller's key was
+    built from; the running server's is read again after llama answered, and
+    a different one drops the .part (llama restarted on another model between
+    the caller's plan and this save — the state is that model's). When /props
+    does not answer (asked twice) the .part is dropped too (r2): a state whose
+    server could not be confirmed is not kept."""
     if expected_n <= 0:
         return (False, "no prompt token count")
     prune(d)            # review 10-27: a run of failed saves left .part files behind
+    need, free = state_bytes(expected_n) + FREE_MARGIN_BYTES, free_bytes(d)
+    if free is not None and free < need:
+        return (False, f"the disk has {free / 1e9:.1f} GB free, the state needs about "
+                       f"{need / 1e9:.1f} GB with its margin — nothing posted")
     try:
         r = _http(f"{base}/slots/{SLOT_ID}?action=save", {"filename": _part(key)},
                   timeout=timeout)
@@ -413,65 +536,108 @@ def save(base: str, d: Path, key: str, expected_n: int, identity: str = "",
         _note_unsupported(base, e, text)
         return (False, text)
     n = _count(r, "n_saved")
+    if isinstance(r, dict):
+        _note_supported(base)       # §4UD (H7): llama takes slot actions
     r = r if isinstance(r, dict) else {}
     part = d / _part(key)
     if n < expected_n if at_least else n != expected_n:
-        try:
-            part.unlink()
-        except Exception:  # noqa: BLE001
-            pass
+        _drop(part)
         return (False, f"slot held {n} tokens, expected {expected_n}")
     if not part.is_file():
         return (False, f"llama saved outside {d} — its --slot-save-path must be this directory")
+    written = _count(r, "n_written")
+    try:
+        size = part.stat().st_size
+    except OSError:
+        size = -1
+    if written <= 0 or size != written:
+        _drop(part)
+        return (False, f"llama reported {written} bytes written and the file holds {max(size, 0)} — "
+                       f"not kept (a full disk?); the previous save, if any, stays")
+    if identity:
+        running, err = confirmed_identity(base)
+        if running is None:
+            _drop(part)
+            return (False, f"llama's /props did not answer after the save ({err}) — the state's server "
+                           f"could not be confirmed, not kept")
+        if running != identity:
+            _drop(part)
+            return (False, "llama now runs another model, build or template than the one "
+                           "this save was planned for — not kept")
+    _secure_file(part)
     try:
         os.replace(part, d / _bin(key))
     except FileNotFoundError:            # the llama-start helper's prune took it meanwhile
         return (False, "the saved file was removed before it was kept")
     except OSError as e:
         return (False, f"the saved file was not kept: {type(e).__name__}: {e}")
-    meta = {"n_tokens": n, "bytes": _count(r, "n_written"),
+    meta = {"n_tokens": n, "bytes": written,
             "save_ms": (r.get("timings") if isinstance(r.get("timings"), dict) else {}).get("save_ms"),
-            "identity": identity, "saved_at": time.time(), "kind": kind, **(extra or {})}
+            "identity": identity,
+            "saved_at": time.time(), "kind": kind, **(extra or {})}
     tmp = d / (_meta(key) + ".tmp")
     try:
-        tmp.write_text(json.dumps(meta))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(meta))
         os.replace(tmp, d / _meta(key))
-    except OSError as e:
+    except (OSError, TypeError, ValueError) as e:
         # review r3 (a full disk): the new state beside the OLD meta would
         # restore as a token mismatch — drop both, report, never raise
+        # (§4UD: a meta field json cannot write is the same loss, not a raise)
         discard(d, key)
         try:
             tmp.unlink()
         except OSError:
             pass
         return (False, f"meta not written: {type(e).__name__}: {e}")
-    # never prune(identity=…) here: a caller's identity can be a plan's, read
-    # before a llama restart on another model (fresh-eye review 10-27) — it
-    # would discard the running server's files; llama start judges identity
-    prune(d)
-    return (True, f"{n} tokens, {meta['bytes'] / 1e9:.2f} GB")
+    # §4UD (H8): the identity given to prune was read from the running server
+    # just above and found equal — never a caller's plan identity unchecked
+    # (fresh-eye review 10-27: read before a llama restart on another model, it
+    # marked the running server's files as the foreign ones)
+    prune(d, identity=identity)
+    return (True, f"{n} tokens, {written / 1e9:.2f} GB")
+
+
+def _last_use(p: Path) -> float:
+    # §4RW review: saved (.bin) or used (`touch` on the .json) — by the
+    # save time alone a restored conversation counted as old and went first
+    try:
+        return max(p.stat().st_mtime, p.with_suffix(".json").stat().st_mtime)
+    except Exception:  # noqa: BLE001
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
 
 
 def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
     """Keep the ``keep`` newest heads of each kind (§4RU: owner effort
     changes never push out the members' head; §4RV: conversations keep
     ``KEEP_CONV`` within ``CONV_BYTES_MAX``); drop stale .part files. Touches
-    only this module's own file names.
+    only this module's own file names. No llama call: stats and the small
+    meta files only, so it can run on every idle tick.
 
-    10-27 (operator: "this directory should be maintenance free"): given the
-    running server's ``identity`` — only one just read from its /props, never
-    a cached plan's — a save made on another model, build or template is
-    dropped: its key can never be asked for again, yet it held a place in its
-    kind's count until newer saves pushed it out. A meta whose state file is
-    gone and a stale ``.json.tmp`` are dropped too. One file vanishing under
-    us (the agent and the llama-start helper both prune) skips that file only."""
+    §4UD (H14): every save also has an AGE cap by kind (`MAX_AGE_S`, counted
+    from its last save or restore), and files and the directory are made
+    owner-only.
+
+    Given the running server's ``identity`` — only one just read from its
+    /props, never a cached plan's — a save made on another model, build
+    or template is FOREIGN. §4UD (H8): a foreign save is no longer
+    dropped at once (10-27 did that, and trying another model once deleted
+    every save of the usual one); it is kept `FOREIGN_KEEP_S` after its last
+    use, and it ranks BEHIND every save of the running server in its kind's
+    count and in the conversations' byte budget — so the bounds of the
+    directory are the same as before, and the running server's saves are never
+    the ones pushed out by another model's. A meta that names no identity (a
+    save from before identities were stored) is not foreign.
+    A meta whose state file is gone and a stale ``.json.tmp`` are dropped too.
+    One file vanishing under us (the agent and the llama-start helper both
+    prune) skips that file only."""
     try:
         now = time.time()
-        if identity:
-            for m in d.glob("head-*.json"):
-                other = meta_field(d, m.name[len("head-"):-len(".json")], "identity")
-                if other and other != identity:
-                    discard(d, m.name[len("head-"):-len(".json")], keep_part=True)
+        secure_dir(d)
         for m in list(d.glob("head-*.json")) + list(d.glob("head-*.json.tmp")):
             try:
                 orphan = m.name.endswith(".json") and not (d / (m.name[:-len(".json")] + ".bin")).exists()
@@ -480,23 +646,18 @@ def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
             except Exception:  # noqa: BLE001
                 continue
 
-        def _last_use(p):
-            # §4RW review: saved (.bin) or used (`touch` on the .json) — by the
-            # save time alone a restored conversation counted as old and went first
-            try:
-                return max(p.stat().st_mtime, p.with_suffix(".json").stat().st_mtime)
-            except Exception:  # noqa: BLE001
-                try:
-                    return p.stat().st_mtime
-                except OSError:
-                    return 0.0
-        ranked = sorted(((_last_use(p), p) for p in d.glob("head-*.bin")
+        def _foreign(p: Path) -> bool:
+            if not identity:
+                return False
+            other = meta_field(d, p.name[len("head-"):-len(".bin")], "identity")
+            return bool(other) and other != identity
+        ranked = sorted(((not _foreign(p), _last_use(p), p) for p in d.glob("head-*.bin")
                          if not p.name.endswith(".part.bin")),
-                        key=lambda t: t[0], reverse=True)
+                        key=lambda t: (t[0], t[1]), reverse=True)
         kept: dict = {}
         conv_seen: set = set()  # §4SA r2: conversations (the meta's `conv`), not their per-level files
         conv_bytes = 0          # of the conversations kept so far, newest first
-        for used_at, p in ranked:
+        for ours, used_at, p in ranked:
             if _last_use(p) != used_at:
                 # review r4: saved or used again since the ranking (a re-save
                 # by another thread or process) — the next prune judges it
@@ -514,6 +675,9 @@ def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
                 kind = kind_of(d, key)
             except OSError:
                 continue
+            if now - used_at > (MAX_AGE_S.get(kind, MAX_AGE_S[OWNER]) if ours else FOREIGN_KEEP_S):
+                discard(d, key, keep_part=True)       # §4UD: H14 (age), H8 (another server's)
+                continue
             n = kept.get(kind, 0)
             # §4SA review r2: conversation files are per conversation AND effort
             # level — the count is of conversations (the meta's `conv`, the
@@ -526,6 +690,8 @@ def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
                     or (kind == CONV and n >= 1 and conv_bytes + size > CONV_BYTES_MAX)):
                 discard(d, key, keep_part=True)   # a dropped big one leaves room for an older, smaller one
                 continue
+            _secure_file(p)
+            _secure_file(d / _meta(key))
             if kind == CONV:
                 if not same_conv:
                     conv_seen.add(cid)
@@ -592,7 +758,7 @@ def restore_on_start(base: str, d: Path, wait_s: float = 600.0, sleep=time.sleep
         ident = server_identity(base)
     except Exception as e:  # noqa: BLE001
         return f"cannot read /props ({_error_text(e)}) — nothing restored"
-    prune(d, identity=ident)        # 10-27: a model/build change frees the old saves here
+    prune(d, identity=ident)        # §4UD: another server's saves leave by age (FOREIGN_KEEP_S), not at once
     key = newest_head_for(d, ident)
     if key is None:
         return "no saved head for this model/build/template — the agent's warm-up will process it"

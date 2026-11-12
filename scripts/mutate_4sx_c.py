@@ -17,7 +17,7 @@ MUT = [
     ('CONTROL no-op', R, 'def _cap(text: str) -> str:', 'def _cap(text: str) -> str:  # no-op'),
     # who / owner / input
     ('W1 refusal-ignored', R, '    if refusal:\n        return _refuse(refusal, "run_not_allowed")', '    if False:\n        return _refuse(refusal, "run_not_allowed")'),
-    ('W2 no-owner-allowed', R, '    if not owner:\n        return _refuse("this request has no owner', '    if False:\n        return _refuse("this request has no owner'),
+    ('W2 no-owner-allowed', R, "    if not owner:\n        # review: a job's wake turn", "    if False:\n        # review: a job's wake turn"),
     ('W3 name-unchecked', R, '    if not _NAME_RE.match(name):\n        return _refuse("`name` must match', '    if False:\n        return _refuse("`name` must match'),
     ('W4 probe-stops-owner', R, '    if origin == "probe" and row["origin"] != "probe" and action in ("stop", "restart"):', '    if False:'),
     ('W5 bad-action', R, '    if action not in ACTIONS:\n        return _refuse(f"unknown action', '    if False:\n        return _refuse(f"unknown action'),
@@ -25,7 +25,7 @@ MUT = [
     ('K1 conv-key-bare', R, '        return "c-" + hashlib.sha1(ident.encode("utf-8")).hexdigest()[:12]', '        return ident'),
     ('K2 project-key-unchecked', R, '        return ident if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", ident) else None', '        return ident'),
     ('S1 where-defaulted', R, '    if not where:\n        return _refuse("`where` is required', '    if not where:\n        where = "workspace"\n    if False:\n        return _refuse("`where` is required'),
-    ('S2 app-allowed', R, '    if lifetime == "app":\n        return _refuse("`app` runs live', '    if False:\n        return _refuse("`app` runs live'),
+    ('S2 app-allowed', R, '    if lifetime == "app":\n        return _refuse("an `app` run is made by', '    if False:\n        return _refuse("an `app` run is made by'),
     ('S3 dup-name-started', R, '        if state in ("running", "unknown"):\n            return _refuse(f"a run named', '        if False:\n            return _refuse(f"a run named'),
     ('S4 unknown-not-dup', R, '        if state in ("running", "unknown"):\n            return _refuse(f"a run named', '        if state in ("running",):\n            return _refuse(f"a run named'),
     ('S5 lab-server-portless', R, '    if lifetime == "server" and port is None:\n        return _refuse("a `server` on a lab', '    if False:\n        return _refuse("a `server` on a lab'),
@@ -47,13 +47,13 @@ MUT = [
     ('J4 dup-is-ok', R, '    if entry.get("duplicate"):\n        # (no id', '    if False:\n        # (no id'),
     ('J5 project-wd-dropped', R, '    wd = f"/workspace/projects/{proj}" if proj else None', '    wd = None'),
     # lab start
-    ('L1 ttl-wrap-dropped', R, '    wrapped = f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}"', '    wrapped = command'),
-    ('L2 wrap-unquoted', R, '    wrapped = f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}"', '    wrapped = f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {command}"'),
-    ('L11 own-process-group', R, '    wrapped = f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}"', '    wrapped = f"timeout -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}"'),
+    ('L1 ttl-wrap-dropped', R, '               f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}")', '               command)'),
+    ('L2 wrap-unquoted', R, '               f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}")', '               f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {command}")'),
+    ('L11 own-process-group', R, '               f"timeout --foreground -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}")', '               f"timeout -k 30 {LAB_JOB_TTL_S} bash -c {shlex.quote(command)}")'),
     ('L3 probe-on-owner-lab', R, '    if origin == "probe" and str(det.get("origin") or "") != "probe":', '    if False:'),
     ('L4 other-owner-unnamed', R, '    other = f" (this lab belongs to {theirs})" if theirs and theirs != owner else ""', '    other = ""'),
     ('L5 unconfigured-tries', R, '    if not labs_configured(context):\n        return _refuse("no labs host is configured', '    if False:\n        return _refuse("no labs host is configured'),
-    ('L6 not-detached', R, 'json_body={"member": member, "cmd": wrapped, "detach": True})', 'json_body={"member": member, "cmd": wrapped})'),
+    ('L6 not-detached', R, '    post: Dict[str, Any] = {"member": member, "cmd": wrapped, "detach": True}', '    post: Dict[str, Any] = {"member": member, "cmd": wrapped}'),
     ('L7 unrecorded-not-killed', R, '        if rid is not None:\n            return "ok", "", job_id, rid\n        try:', '        if True:\n            return "ok", "", job_id, rid\n        try:'),
     ('L8 kill-unconfirmed-claimed', R, '            killed = dst < 300 and isinstance(dbody, dict) and dbody.get("state") != "running"', '            killed = True'),
     ('L9 no-answer-is-failed', R, '    if kind == "no_answer":\n        return _out(f"RUN ERROR (no_answer): the labs host did not answer ({info}) — the run may have started; "\n                    f"check with `lab status {lab_id}` before starting it again.", OutcomeStatus.UNRESOLVED,', '    if kind == "no_answer":\n        return _out(f"RUN ERROR (no_answer): the labs host did not answer ({info}) — the run may have started; "\n                    f"check with `lab status {lab_id}` before starting it again.", OutcomeStatus.FAILED,'),
@@ -65,7 +65,7 @@ MUT = [
     ('P4 unknown-job-unknown', R, '        if st == 404 and body.get("error") == "unknown_job":\n            return "lost"', '        if False:\n            return "lost"'),
     ('P5 killed-is-exited', R, '        if body.get("killed"):\n            return "stopped", "killed", detail', '        if False:\n            return "stopped", "killed", detail'),
     ('P6 unknown-recorded', R, '    if state != "unknown":\n        reg.set_state(row["run_id"], state, note)', '    if True:\n        reg.set_state(row["run_id"], state, note)'),
-    ('P7 destroyed-lab-unknown', R, '        if st == 404 and body.get("error") == "unknown_lab":\n            return "lost", "its lab was destroyed", {}', '        if False:\n            return "lost", "its lab was destroyed", {}'),
+    ('P7 destroyed-lab-unknown', R, '            return "lost", "its lab was destroyed", {"gone": "lab"}', '            return "unknown", "its lab was destroyed", {"gone": "lab"}'),
     # logs / collect / url / status
     ('G1 replaced-logs-shown', R, '        if state == "replaced" or (state == "lost" and row["ended_at"] is None):', '        if False:'),
     ('G2 ended-reprobed', R, '        state = row["state"]                       # r2 minor 4', '        state = state                       # r2 minor 4'),
@@ -85,7 +85,7 @@ MUT = [
     ('T6 ws-running-after-stop-ok', R, '    if state in ("running",):\n        return _out(f"RUN ERROR: {row[\'name\']!r} is still running after the stop.\\n', '    if False:\n        return _out(f"RUN ERROR: {row[\'name\']!r} is still running after the stop.\\n'),
     ('T7 unknown-after-stop-ok', R, '    if state == "unknown":\n        return _out(f"[run {row[\'name\']}] stop sent', '    if False:\n        return _out(f"[run {row[\'name\']}] stop sent'),
     ('T8 lost-note-kept', R, '"stopped by run" if state == "lost" else note)', 'note)'),
-    ('T9 lab-destroyed-fail', R, '        if st == 404 and body.get("error") == "unknown_lab":\n            reg.set_state(row["run_id"], "lost", "its lab was destroyed")', '        if False:\n            reg.set_state(row["run_id"], "lost", "its lab was destroyed")'),
+    ('T9 lab-destroyed-fail', R, '            reg.set_state(row["run_id"], "lost", "its lab was destroyed")', '            pass'),
     # restart
     ('X1 job-restarted', R, '    if row["lifetime"] == "job":\n        return _refuse("a job is not restarted', '    if False:\n        return _refuse("a job is not restarted'),
     ('X2 survived-is-failed', R, '            if not new_token and alive is True:', '            if False:'),
@@ -99,11 +99,11 @@ MUT = [
     ('X10 restart-unrecorded-left', R, '                    gone = await _svc_undo(svc, row["backend_ref"])', '                    gone = False'),
     # lock
     ('Q1 lock-stop-ignored', R, '            if _stop_asked():\n                coro.close()', '            if False:\n                coro.close()'),
-    ('Q2 lock-not-shielded', R, '    return await asyncio.shield(_task())', '    return await _task()'),
+    ('Q2 lock-not-shielded', R, '    return await asyncio.shield(t)', '    return await t'),
     ('Q3 lock-error-raises', R, '            except Exception as e:  # noqa: BLE001\n                return _out(f"RUN ERROR: {type(e).__name__}: {e}", OutcomeStatus.FAILED, changed=None,\n                            code="run_internal")', '            except ZeroDivisionError as e:\n                return _out(f"RUN ERROR: {type(e).__name__}: {e}", OutcomeStatus.FAILED, changed=None,\n                            code="run_internal")'),
     # registry
     ('R1 ended-not-stamped', RR, '                if state in ENDED:\n                    c.execute("UPDATE runs SET state=?, state_note=?, last_probe_at=?, "', '                if False:\n                    c.execute("UPDATE runs SET state=?, state_note=?, last_probe_at=?, "'),
-    ('R2 end-restamped', RR, '                              "ended_at=COALESCE(ended_at, ?) WHERE run_id=?",', '                              "ended_at=? WHERE run_id=?",'),
+    ('R2 end-restamped', RR, '                              "ended_at=COALESCE(ended_at, ?) WHERE run_id=?"', '                              "ended_at=? WHERE run_id=?"'),
     ('R3 live-includes-ended', RR, '            if r["name"] == name and r["state"] not in ENDED:', '            if r["name"] == name:'),
     ('R4 rows-all-owners', RR, '            if owner is not None:\n                where.append("owner = ?")\n                a.append(owner)', '            if False:\n                where.append("owner = ?")\n                a.append(owner)'),
     ('R5 latest-is-first', RR, '        return rows[-1] if rows else None', '        return rows[0] if rows else None'),
@@ -118,7 +118,7 @@ MUT = [
     ('RC5 orphan-any-job', R, '                if (e.get("started_via") == "run" and e.get("state") == "running"', '                if (e.get("state") == "running"'),
     ('RC6 orphan-ended-job', R, '                if (e.get("started_via") == "run" and e.get("state") == "running"', '                if (e.get("started_via") == "run"'),
     ('RC7 orphan-tracked', R, '                        and ("jobs", str(e.get("id"))) not in live_refs):', '                        and True):'),
-    ('RC8 unknown-uncounted', R, '        if state == "unknown":\n            out["unknown"] += 1', '        if False:\n            out["unknown"] += 1'),
+    ('RC8 unknown-uncounted', R, '        out["probed"] += 1\n        if state == "unknown":\n            out["unknown"] += 1\n        elif state in _ENDED:', '        out["probed"] += 1\n        if False:\n            out["unknown"] += 1\n        elif state in _ENDED:'),
     ('RC9 ended-unreported', R, '        elif state in _ENDED:\n            out["ended"][r["run_id"]]', '        elif False:\n            out["ended"][r["run_id"]]'),
     ('RC10 boot-never-warns', R, '        warn = bool(rep["ended"] or rep["orphan_run_jobs"] or rep.get("error"))', '        warn = False'),
     ('RC11 boot-raises', R, '    except Exception as e:  # noqa: BLE001 — a background boot task never raises', '    except ZeroDivisionError as e:'),
@@ -132,15 +132,10 @@ MUT = [
     ('B5 crash-leaves-process', J, '        except BaseException:\n            # same guard as run(): no live process without a row\n            pid = self._read_pid(jid) or launcher_pid\n            if pid:', '        except BaseException:\n            # same guard as run(): no live process without a row\n            pid = self._read_pid(jid) or launcher_pid\n            if False:'),
     ('B6 no-ttl', J, '        self._write_script(jid, cmd, job_ttl_s())\n        launcher_pid = None\n        try:\n            launcher_pid = self._launch(jid, {"workdir": wd})', '        self._write_script(jid, cmd, 10 ** 9)\n        launcher_pid = None\n        try:\n            launcher_pid = self._launch(jid, {"workdir": wd})'),
     ('B7 delegate-adopts-run', D, '        if entry.get("started_via"):\n            continue        # §4SX C', '        if False:\n            continue        # §4SX C'),
-    ('B8 hint-always-jobs', MN, '    if (entry or {}).get("started_via") == "run":', '    if False:'),
-    ('B9 resume-hint-jobs', MN, '(_collect_hint(entry) if entry.get("started_via")', '("jobs(action=\'collect\', job_id=…)" if entry.get("started_via")'),
-    ('O1 route-no-probe-check', RT, '    if str(request.headers.get("x-ghost-origin") or "").strip().lower() != "probe":\n        return JSONResponse({"error": "probe only', '    if False:\n        return JSONResponse({"error": "probe only'),
-    ('O2 route-during-request', RT, '    if int(getattr(llm, "foreground_requests", 0) or 0) > 0:\n        return JSONResponse({"error": "a user request is live"}', '    if False:\n        return JSONResponse({"error": "a user request is live"}'),
-    ('O3 route-rid-not-probe', RT, '    if not rid.startswith("probe-"):\n        rid = f"probe-{rid}"', '    if False:\n        rid = f"probe-{rid}"'),
-    ('O4 route-origin-owner', RT, 't_rid, t_org = request_id_context.set(rid), request_origin_context.set("probe")', 't_rid, t_org = request_id_context.set(rid), request_origin_context.set("owner")'),
-    ('O5 route-scope-owner', RT, 'tok = install(RequestScope(conversation_key="probe:run-acceptance", origin=ORIGIN_PROBE, context=ctx))', 'tok = install(RequestScope(conversation_key="probe:run-acceptance", context=ctx))'),
+    ('B8 hint-always-jobs', MN, '    if (entry or {}).get("started_via") == "run":\n        return f"run(action=\'collect\', name=\'{str((entry or {}).get(\'label\')', '    if False:\n        return f"run(action=\'collect\', name=\'{str((entry or {}).get(\'label\')'),
+    ('B9 resume-hint-jobs', MN, '_line + ". Read it with " + _collect_hint(entry, context) + ".",', '_line + ". Read it with jobs(action=\'collect\', job_id=…).",'),
 ]
-PINS = ["tests/test_4sx_c_run_tool.py", "tests/test_4sx_c_run_battery.py", "tests/test_sandbox_job_promotion.py", "tests/test_sandbox_services.py"]
+PINS = ["tests/test_4sx_c_run_tool.py", "tests/test_4sx_c_run_battery.py", "tests/test_sandbox_job_promotion.py", "tests/test_sandbox_services.py", "tests/test_4ud_labs.py"]
 
 
 def _tests():

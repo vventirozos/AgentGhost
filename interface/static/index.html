@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=8.7">
+    <link rel="stylesheet" href="/static/style.css?v=8.8">
 </head>
 
 <body>
@@ -290,6 +290,12 @@
                      reply's context ↑ and generation ↓ tokens, from the agent's usage frame
                      (tokens.js). Hidden until a turn reports one. -->
                 <span id="token-count" class="hidden" aria-live="off"></span>
+                <!-- §4UD: the agent's mood in words ("calm, 1 of 3", "rests calm", "mood
+                     unknown"), at the left end of the token counter's line. Visible text
+                     because a tooltip cannot be reached by touch, and it stays with
+                     animations disabled. status.js writes it from /api/health; empty
+                     until the first reading. Out of the flow: it moves nothing. -->
+                <span id="mood-text" aria-live="off"></span>
                 <!-- §4RZ step 6a: stop the tool call the running turn is waiting on (the turn
                      goes on). Shown while a chat turn runs; app.js toggles it. -->
                 <button id="interrupt-btn" class="hidden" type="button"
@@ -396,7 +402,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=19.21"></script>
+    <script type="module" src="/static/app.js?v=19.25"></script>
 </body>
 
 </html>
