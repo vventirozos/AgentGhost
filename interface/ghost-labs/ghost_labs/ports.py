@@ -72,7 +72,9 @@ class Ports:
         p = self.fwd_dir / f"{instance}.env"
         p.write_text(f"BIND={bind}\nPORT={port}\nTARGET={target}\n")
 
-    def publish(self, port: int, member_ip: str, cport: int, lan: bool = False) -> None:
+    def publish(self, port: int, member_ip: str, cport: int, lan: bool = False, tcp: bool = False) -> None:
+        """tcp (§4UL: a kept database, any app with no HTTP health path): the tailnet side is a raw TCP forward
+        (`tailscale serve --tcp`), reached as host:port — an HTTPS proxy in front of postgres answers nothing."""
         target = f"{member_ip}:{cport}"
         self._write_env(str(port), "127.0.0.1", port, target)
         self._systemctl("enable", "--now", f"ghost-labs-fwd@{port}.service")
@@ -83,11 +85,20 @@ class Ports:
                 self._write_env(f"{port}-lan", ip, port, target)
                 self._systemctl("enable", "--now", f"ghost-labs-fwd@{port}-lan.service")
                 self._systemctl("restart", f"ghost-labs-fwd@{port}-lan.service")
+        if tcp:
+            # an HTTPS entry left on the port (the app's health changed) would take the port first
+            self.run(["tailscale", "serve", f"--https={port}", "off"], capture_output=True, text=True, timeout=30)
+            self.run(["tailscale", "serve", "--bg", "--yes", f"--tcp={port}", f"tcp://127.0.0.1:{port}"],
+                     capture_output=True, text=True, timeout=30)
+            return
+        # round 3: a raw TCP entry left on the port (an app whose health went TCP → HTTP, or across a switch)
+        self.run(["tailscale", "serve", f"--tcp={port}", "off"], capture_output=True, text=True, timeout=30)
         self.run(["tailscale", "serve", "--bg", "--yes", f"--https={port}", f"http://127.0.0.1:{port}"],
                  capture_output=True, text=True, timeout=30)
 
     def unpublish(self, port: int) -> None:
         self.run(["tailscale", "serve", f"--https={port}", "off"], capture_output=True, text=True, timeout=30)
+        self.run(["tailscale", "serve", f"--tcp={port}", "off"], capture_output=True, text=True, timeout=30)
         for inst in (str(port), f"{port}-lan"):
             self._systemctl("disable", "--now", f"ghost-labs-fwd@{inst}.service")
             try:
@@ -95,12 +106,19 @@ class Ports:
             except FileNotFoundError:
                 pass
 
-    def serve_service(self, name: str, port: int) -> None:
-        self.run(["tailscale", "serve", f"--service=svc:{name}", "--https=443", "--yes", f"http://127.0.0.1:{port}"],
-                 capture_output=True, text=True, timeout=30)
+    def serve_service(self, name: str, port: int) -> bool:
+        """True when tailscale took it (round 4: the name fields are set only then)."""
+        r = self.run(["tailscale", "serve", f"--service=svc:{name}", "--https=443", "--yes", f"http://127.0.0.1:{port}"],
+                     capture_output=True, text=True, timeout=30)
+        return getattr(r, "returncode", 0) == 0
 
-    def unserve_service(self, name: str) -> None:
-        self.run(["tailscale", "serve", "clear", f"svc:{name}"], capture_output=True, text=True, timeout=30)
+    def unserve_service(self, name: str) -> bool:
+        """True when the name is no longer served: tailscale took it, or there was nothing to clear (round 4)."""
+        r = self.run(["tailscale", "serve", "clear", f"svc:{name}"], capture_output=True, text=True, timeout=30)
+        if getattr(r, "returncode", 0) == 0:
+            return True
+        said = f"{getattr(r, 'stdout', '') or ''} {getattr(r, 'stderr', '') or ''}".lower()
+        return any(w in said for w in ("not found", "no such", "does not exist", "not exist", "nothing to"))
 
     def serve_page(self, local_port: int) -> None:
         """The Apps page on the host's own 443 (v2 §12)."""
@@ -113,19 +131,24 @@ class Ports:
         st = self.serve_status()
         rng = self.cfg.port_range()
         removed = []
-        for hp in (st.get("TCP") or {}):
+        for hp, h in (st.get("TCP") or {}).items():
             try:
                 port = int(hp)
             except ValueError:
                 continue
             if port in rng and port not in wanted:
-                self.run(["tailscale", "serve", f"--https={port}", "off"], capture_output=True, text=True, timeout=30)
+                flag = f"--tcp={port}" if isinstance(h, dict) and h.get("TCPForward") else f"--https={port}"
+                self.run(["tailscale", "serve", flag, "off"], capture_output=True, text=True, timeout=30)
                 removed.append(f"serve off {port}")
         return removed
 
     def url(self, port: int) -> str:
         host = self.cfg.resolved_dns_name or self.cfg.resolved_bind_host
         return f"https://{host}:{port}/"
+
+    def address(self, port: int) -> str:
+        """A TCP app's tailnet address (host:port; no scheme — a client such as psql takes it as is)."""
+        return f"{self.cfg.resolved_dns_name or self.cfg.resolved_bind_host}:{port}"
 
     def lan_url(self, port: int) -> Optional[str]:
         ip = C.lan_ipv4()

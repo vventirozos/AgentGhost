@@ -43,7 +43,8 @@ def notes(monkeypatch):
 
 
 def _autopilot_project(store, n_tasks=3, **meta):
-    pid = store.create_project("Long job", metadata={"autopilot": True, **meta})
+    # §4UL: seeded counters are TODAY's (a new day starts a fresh unattended allowance)
+    pid = store.create_project("Long job", metadata={"autopilot": True, "unattended_day": PA._today(), **meta})
     store.update_project(pid, status="ACTIVE")
     tids = [store.add_task(pid, f"Write chapter {i}") for i in range(n_tasks)]
     return pid, tids
@@ -74,15 +75,25 @@ def _step(store, pid, *, done: bool, delay: float = 0.0):
     return fake
 
 
-async def test_three_steps_without_progress_pause_autopilot_and_tell_the_owner_once(store, ctx, notes, monkeypatch):
+async def test_three_steps_without_progress_rest_until_tomorrow_without_asking(store, ctx, notes, monkeypatch):
+    """§4UL (decision 3B): no pause, no message — the project rests and goes on the next day."""
     pid, _ = _autopilot_project(store)
-    monkeypatch.setattr(PA, "advance_once", _step(store, pid, done=False))
-    for _ in range(3):
-        await advance_unattended(ctx, pid)
+    ran = []
+    inner = _step(store, pid, done=False)
+
+    async def counting(*a, **k):
+        ran.append(1)
+        return await inner(*a, **k)
+    monkeypatch.setattr(PA, "advance_once", counting)
+    for _ in range(4):
+        res = await advance_unattended(ctx, pid)
     m = _meta(store, pid)
-    assert m["autopilot"] is False and m["autopilot_paused"]["reason"] == "no progress"
-    assert PA.idle_candidates(store) == []                       # the idle loop no longer picks it
-    assert len(notes) == 1 and "autopilot paused" in notes[0][1] and notes[0][2]["severity"] == "notify"
+    assert len(ran) == 3 and res.classification == "blocked" and res.summary.startswith("resting until tomorrow")
+    assert m["autopilot"] is True and not m.get("autopilot_paused") and notes == []
+    assert len(store.list_events(pid, event_type="autopilot_resting")) == 1     # one quiet line a day
+    monkeypatch.setattr(PA, "_today", lambda: "2999-01-01")                     # the next day
+    await advance_unattended(ctx, pid)
+    assert len(ran) == 4
 
 
 async def test_a_step_that_closes_its_task_resets_the_streak(store, ctx, notes, monkeypatch):
@@ -143,24 +154,28 @@ async def test_a_step_lost_to_a_restart_is_charged_on_the_next_tick(store, ctx, 
     res = await advance_unattended(ctx, pid)
     m = _meta(store, pid)
     assert m["steps_used"] == 5                                   # the lost step is charged
-    assert m["autopilot"] is False and res.classification == "blocked" and not ran
+    # §4UL: the third step without progress rests the project (autopilot stays on)
+    assert m["autopilot"] is True and res.classification == "blocked" and not ran
+    assert "resting until tomorrow" in res.summary
     assert not m.get("step_in_flight")
 
 
-async def test_the_default_runtime_cap_pauses_unattended_work(store, ctx, notes, monkeypatch):
+async def test_the_default_runtime_cap_rests_unattended_work_for_the_day(store, ctx, notes, monkeypatch):
     pid, _ = _autopilot_project(store, unattended_runtime_seconds=PA.DEFAULT_UNATTENDED_RUNTIME_CAP_S + 1)
     ran = []
     monkeypatch.setattr(PA, "advance_once", lambda *a, **k: ran.append(1))
     res = await advance_unattended(ctx, pid)
-    assert not ran and res.classification == "blocked"
-    assert _meta(store, pid)["autopilot_paused"]["reason"] == "runtime budget used"
+    assert not ran and res.classification == "blocked" and "unattended work today" in res.summary
+    assert _meta(store, pid)["autopilot"] is True and notes == []           # §4UL: a rest, not a pause
 
 
 async def test_an_unattended_batch_stops_when_the_gates_pause(store, ctx, notes, monkeypatch):
     pid, _ = _autopilot_project(store, n_tasks=8)
     monkeypatch.setattr(PA, "advance_once", _step(store, pid, done=False))
     batch = await PA.advance_many(ctx, pid, max_tasks=None, owner_requested=False, stop_on_fail=False)
-    assert batch.stop_reason == "autopilot_paused" and batch.count == 3
+    # §4UL: the third step without progress rests the project — the batch stops, autopilot stays on
+    assert batch.stop_reason == "budget_or_inactive" and batch.count == 3
+    assert _meta(store, pid)["autopilot"] is True
 
 
 async def test_an_owner_batch_stops_before_a_step_that_would_cross_the_deadline(store, ctx, monkeypatch):
@@ -204,18 +219,18 @@ async def test_only_the_owners_turn_sets_a_budget(ctx, store):
     tok = request_id_context.set("probe-9")
     try:
         res = await tool_manage_projects_for_model(ctx, action="budget", project_id=pid,
-                                                   metadata={"steps_cap": 200})
+                                                   metadata={"unattended_per_day": 200})
         assert "only the owner" in res
         request_id_context.set("req-owner")
         res = json.loads(await tool_manage_projects_for_model(
             ctx, action="budget", project_id=pid,
-            metadata={"steps_cap": 200, "runtime_cap_hours": 2, "checkpoint_every": 5}))
+            metadata={"unattended_per_day": 200, "runtime_cap_hours": 2, "checkpoint_every": 5}))
     finally:
         request_id_context.reset(tok)
     m = _meta(store, pid)
-    assert m["steps_cap"] == 200 and m["unattended_runtime_cap_seconds"] == 7200 and m["checkpoint_every"] == 5
+    assert m["unattended_per_day"] == 200 and m["unattended_runtime_cap_seconds"] == 7200 and m["checkpoint_every"] == 5
     assert "runtime_cap_seconds" not in m          # the lifetime cap would block the owner's own runs (r2 M3)
-    assert res["budget"]["steps"] == "0/200" and res["budget"]["unattended_hours"].endswith("/2.0")
+    assert res["budget"]["unattended_today"] == "0/200 tasks"
 
 
 async def test_the_owners_resume_resets_the_gates(ctx, store):
@@ -246,9 +261,10 @@ async def test_one_command_pauses_every_project_and_never_turns_them_all_on(ctx,
 
 
 async def test_status_shows_the_budget_and_the_gates(ctx, store):
-    pid, _ = _autopilot_project(store, steps_used=7, no_progress_streak=1)
+    pid, _ = _autopilot_project(store, steps_used=7, no_progress_streak=1, unattended_steps_today=4)
     res = json.loads(await tool_manage_projects(ctx, action="status", project_id=pid, title="Long job"))
-    assert res["budget"]["steps"] == "7/50" and res["budget"]["no_progress_streak"] == "1/3"
+    assert res["budget"]["steps_done"] == 7 and res["budget"]["no_progress_streak"] == "1/3"
+    assert res["budget"]["unattended_today"] == f"4/{PA.DAILY_UNATTENDED_TASKS} tasks"
 
 
 def test_the_idle_loop_uses_the_gated_step():
@@ -269,9 +285,9 @@ def test_the_idle_loop_uses_the_gated_step():
 
 # ── r2 (fresh reader) ─────────────────────────────────────────────────
 
-async def test_a_paused_project_is_not_advanced_by_a_background_run_and_notifies_once(store, ctx, notes, monkeypatch):
+async def test_a_resting_project_is_not_advanced_by_a_background_run_and_says_nothing(store, ctx, notes, monkeypatch):
     """r2 C1: after the pause, each scheduled run still built one step and
-    sent another "paused" message."""
+    sent another "paused" message. §4UL: a rest (no pause), and no message."""
     pid, _ = _autopilot_project(store, n_tasks=8)
     ran = []
     inner = _step(store, pid, done=False)
@@ -281,11 +297,11 @@ async def test_a_paused_project_is_not_advanced_by_a_background_run_and_notifies
         return await inner(*a, **k)
     monkeypatch.setattr(PA, "advance_once", counting)
     b = await PA.advance_many(ctx, pid, max_tasks=None, owner_requested=False, stop_on_fail=False)
-    assert b.stop_reason == "autopilot_paused" and len(ran) == 3
+    assert b.stop_reason == "budget_or_inactive" and len(ran) == 3
     for _ in range(3):
         b = await PA.advance_many(ctx, pid, max_tasks=None, owner_requested=False, stop_on_fail=False)
-        assert b.stop_reason == "autopilot_off"
-    assert len(ran) == 3 and len(notes) == 1
+        assert b.stop_reason == "budget_or_inactive"
+    assert len(ran) == 3 and notes == []
 
 
 async def test_the_owners_off_switch_stops_a_running_background_batch(store, ctx, notes, monkeypatch):
@@ -489,7 +505,7 @@ async def test_a_real_timeout_reopens_the_leaf_the_real_claim_reported(store, ct
     assert res.task_id == tid and store.get_task(tid)["status"] == "PENDING"
 
 
-async def test_a_crashed_build_reopens_its_task_and_three_crashes_pause(store, ctx, notes):
+async def test_a_crashed_build_reopens_its_task_and_three_crashes_rest(store, ctx, notes):
     """§4MR M1: the crash path "left the leaf open" as IN_PROGRESS — no tick
     could retry it, the gate scored nothing, the owner's batch said done."""
     pid, tids = _coding_project(store, ["Build the login page", "Build the signup page"])
@@ -498,7 +514,9 @@ async def test_a_crashed_build_reopens_its_task_and_three_crashes_pause(store, c
     for _ in range(2):
         await advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=_executor(raise_=True))
     m = _meta(store, pid)
-    assert m["autopilot"] is False and m["autopilot_paused"]["reason"] == "no progress" and len(notes) == 1
+    assert m["autopilot"] is True and m["no_progress_streak"] == 3 and notes == []      # §4UL: rests
+    res = await advance_unattended(ctx, pid, tool_runner=_runner, coding_executor=_executor(raise_=True))
+    assert res.summary.startswith("resting until tomorrow")
 
 
 async def test_an_owner_batch_over_a_crashing_build_says_it_crashed(store, ctx, notes):
@@ -595,16 +613,25 @@ def test_a_pause_appears_in_the_while_you_were_away_digest(store, ctx, notes):
 
 
 
-async def test_an_exhausted_step_budget_pauses_autopilot_and_says_so(store, ctx, notes, monkeypatch):
-    """§4MR: the budget stop blocked every tick silently with autopilot ON."""
-    pid, _ = _autopilot_project(store, steps_used=50, steps_cap=50)
+async def test_a_used_daily_allowance_rests_until_tomorrow_and_says_nothing(store, ctx, notes, monkeypatch):
+    """§4MR: the budget stop blocked every tick silently with autopilot ON. §4UL (decision 3B): the
+    lifetime step cap is gone; the daily allowance rests the project, autopilot stays on, nobody is asked."""
+    pid, _ = _autopilot_project(store, steps_used=500, steps_cap=50,
+                                unattended_steps_today=PA.DAILY_UNATTENDED_TASKS)
     ran = []
-    monkeypatch.setattr(PA, "advance_once", lambda *a, **k: ran.append(1))
+
+    async def body(*a, **k):
+        ran.append(1)
+        return AdvanceResult(True, None, "idle", "x")
+    monkeypatch.setattr(PA, "advance_once", body)
     for _ in range(3):
-        await advance_unattended(ctx, pid)
+        res = await advance_unattended(ctx, pid)
     m = _meta(store, pid)
-    assert not ran and m["autopilot"] is False and m["autopilot_paused"]["reason"] == "step budget used"
-    assert len(notes) == 1
+    assert not ran and m["autopilot"] is True and not m.get("autopilot_paused") and notes == []
+    assert res.summary.startswith("resting until tomorrow")
+    monkeypatch.setattr(PA, "_today", lambda: "2999-01-01")
+    await advance_unattended(ctx, pid)
+    assert ran == [1]                                   # the lifetime count (500 of a 50 cap) is no cap
 
 
 

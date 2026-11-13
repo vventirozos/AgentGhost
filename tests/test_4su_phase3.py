@@ -492,7 +492,8 @@ def test_a_dependency_waiting_for_the_owner_is_not_the_model_s_to_close(store):
     b = plan.add_task("report", depends_on=[a])
     plan.update_status(a, TaskStatus.NEEDS_USER, wait=("owner", "asked", "which?"))
     r = gate_dependencies(plan.tree, b)
-    assert r and "stop" in r.fix and "close the task(s) it depends on first" not in r.fix
+    # §4UL: no "stop and wait" — say in one line what only the owner has
+    assert r and "say what, in one line" in r.fix and "close the task(s) it depends on first" not in r.fix
 
 
 # ───────────────────────────── review r4 ─────────────────────────────
@@ -557,8 +558,8 @@ def test_the_dependency_fix_names_every_kind(store):
     plan.update_status(asked, TaskStatus.NEEDS_USER, wait=("owner", "asked", "who?"))
     fix = gate_dependencies(plan.tree, rep).fix
     assert f"{ph} is held up by failed task(s) {k}" in fix
-    assert f"{held} is held for the owner's own run" in fix
-    assert f"{asked} waits for the owner" in fix
+    assert f"{held} was held from an unattended run — do it now" in fix          # §4UL
+    assert f"{asked} waits for something only the owner has" in fix
 
 
 # ───────────────────────────── review r5 ─────────────────────────────

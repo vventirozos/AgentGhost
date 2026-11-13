@@ -1214,8 +1214,8 @@ _ADVANCE_STOP_BLURB = {
     "needs_user": "Stopped: nothing else can run — the task(s) in needs_user_tasks "
                   "wait for the owner (something only they have — a file, a login, an "
                   "answer); autoadvance does not run them.",
-    "budget_or_inactive": "Paused: the project's step budget is exhausted "
-                          "(the owner raises it with action=budget) or it is not ACTIVE.",
+    "budget_or_inactive": "Not run: the project is not ACTIVE, or its unattended allowance for "
+                          "today is used (it continues by itself tomorrow).",
     "deadline": "Stopped before the next task: this request's time is nearly up and "
                 "another task would end inside the time reserved for the report. "
                 "Tell the user what is done; they can continue in a new message.",
@@ -1224,7 +1224,9 @@ _ADVANCE_STOP_BLURB = {
                    "complete; tell the user which tasks are open.",
     "open_but_waiting": "Not done: open tasks remain, but none could run in this batch — "
                         "they wait on other tasks (BLOCKED, PAUSED or not yet done), are parents "
-                        "whose children are closed, or are follow-ups this run does not pick "
+                        "whose children are closed, wait behind an EARLIER task in plan order that "
+                        "waits or is still running (§4UL: plan order counts unless a task declares "
+                        "depends_on: [] — independent), or are follow-ups this run does not pick "
                         "(see task_list: status and depends_on). Do NOT report the project as "
                         "complete; tell the user which tasks are open and what holds them.",
     "busy": "Not run: another unattended step on this project is still running — "
@@ -1252,12 +1254,14 @@ _ADVANCE_STOP_BLURB = {
                     "need makes room.",
     "step_crashed": "Stopped: the build step crashed before it could finish (the task "
                     "is open again, ready to retry) — tell the user what failed.",
+    "model_server_failed": "Stopped: the model server failed during the task's build (it answered with an "
+                           "error or dropped the request) — the task is open again (or back on the user's hold, if it was "
+                           "one) and nothing in the project failed. Tell the user; the build can run again once the model server answers.",
     "autopilot_off": "Not run: autopilot is off for this project. Only the owner turns it on "
                      "(action=autopilot enabled=true in their own turn) — a scheduled or background "
                      "run cannot.",
-    "autopilot_paused": "Stopped: the unattended safety gates paused this project "
-                        "(no progress, a check-in, or its runtime budget) — tell the "
-                        "user why; only their own turn resumes it.",
+    "autopilot_paused": "Stopped: autopilot is paused on this project (see task_list for why); "
+                        "the owner's own run is never limited — advance it in their turn.",
     "failed": "Stopped: a task FAILED — review it before continuing.",
     "model_experiment": "A task may RUN something on a model — the batch went past it (and ran what "
                         "does not wait on it). If its data are model answers they must be real ones, "
@@ -1299,7 +1303,7 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     # manual build thrashed ~700s and broke project scoping).
     stopped_early = batch.stop_reason in (
         "failed", "repeated_failures", "budget_or_inactive", "needs_user",
-        "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "out_of_time",
+        "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "model_server_failed", "out_of_time",
         "in_progress", "open_but_waiting", "labs_down", "lab_capacity", "lab_gave_up", "lab_owner_hold")
     if batch.stop_reason == "model_experiment":
         # §4SU Phase 5: the batch carries on past an experiment — name IT,
@@ -1429,12 +1433,17 @@ def _is_subtask_object(obj) -> bool:
                                                              "kind", "task_kind", "deliverable"))
 
 
-def _split_declared_subtasks(value):
+def _split_declared_subtasks(value, deps_out: Optional[Dict[str, Any]] = None):
     """§4SU Phase 2: ``subtasks`` items may be objects
     ``{"description", "kind", "deliverable"}``. Returns (the value with each
     object turned into its description — ``→ deliverable`` appended — and
     {description: kind}). Strings pass through (undeclared). Raises
-    ValueError on an unknown kind or an object with no description."""
+    ValueError on an unknown kind or an object with no description.
+
+    §4UL: an object may also carry ``depends_on`` — task ids, or 1-based
+    positions in the same list; ``[]`` declares the task independent of plan
+    order. When ``deps_out`` is given it receives ``{"order": [desc, …],
+    "deps": {desc: [refs]}}`` (only the objects that declared one)."""
     from ..core.task_kind import normalize_kind, with_deliverable
     raw = value
     if isinstance(raw, str) and raw.strip().startswith("{"):
@@ -1472,10 +1481,77 @@ def _split_declared_subtasks(value):
             k = normalize_kind(item.get("kind") or item.get("task_kind"))
             if k:
                 kinds.setdefault(desc, k)
+            if deps_out is not None and "depends_on" in item:     # §4UL
+                _d = item.get("depends_on")
+                _d = [] if _d in (None, "", [], "none") else (_d if isinstance(_d, list) else [_d])
+                deps_out.setdefault("deps", {})[desc] = [str(x).strip() for x in _d
+                                                         if str(x).strip()]
             out.append(desc)
         else:
             out.append(item)
+    if deps_out is not None:
+        deps_out["order"] = [str(x or "").strip() for x in out]
     return out, kinds
+
+
+def _set_independent(store, project_id: str, add=(), drop=()) -> None:
+    """§4UL: the ids declared independent of plan order (metadata ``independent_tasks``)."""
+    add, drop = {str(x) for x in add}, {str(x) for x in drop}
+    if not add and not drop:
+        return
+    from ..core.project_advancer import _bump_meta
+
+    def _m(m):
+        cur = [x for x in (m.get("independent_tasks") or []) if x not in drop]
+        cur += [x for x in sorted(add) if x not in cur]
+        if cur:
+            m["independent_tasks"] = cur
+        else:
+            m.pop("independent_tasks", None)
+        return m
+    _bump_meta(store, project_id, _m)
+
+
+def _apply_declared_deps(store, project_id: str, pairs, declared) -> List[str]:
+    """§4UL: write the ``depends_on`` the subtask objects declared, after the
+    tasks exist. ``pairs`` = [(task_id, description)] in creation order;
+    ``declared`` = the ``deps_out`` of :func:`_split_declared_subtasks`. A
+    number is a 1-based position in the subtasks list; anything else must be
+    a task id of this project. Returns notes for refs that resolved to nothing."""
+    deps = (declared or {}).get("deps") or {}
+    if not deps or not pairs:
+        return []
+    order = (declared or {}).get("order") or []
+    by_desc: Dict[str, str] = {}
+    for tid, d in pairs:
+        by_desc.setdefault(str(d or "").strip(), tid)
+    from ..memory.projects import _canon_id as _canon_pid
+    known = {str(t.get("id")) for t in (store.list_tasks(project_id) or [])}
+    notes: List[str] = []
+    independent: List[str] = []
+    for desc, refs in deps.items():
+        tid = by_desc.get(str(desc).strip())
+        if not tid:
+            continue                       # dropped (blank or a duplicate of an existing task)
+        if not refs:
+            independent.append(tid)
+            store.update_task(tid, depends_on=[])
+            continue
+        resolved: List[str] = []
+        for r in refs:
+            if re.fullmatch(r"\d{1,3}", r):
+                i = int(r) - 1
+                tgt = by_desc.get(order[i]) if 0 <= i < len(order) else None
+            else:
+                tgt = _canon_pid(r) if _canon_pid(r) in known else None
+            if tgt and tgt != tid and tgt not in resolved:
+                resolved.append(tgt)
+            elif not tgt:
+                notes.append(f"'{desc[:50]}': depends_on {r!r} matches no task — ignored")
+        if resolved:                       # none resolved: the plan's own order stands
+            store.update_task(tid, depends_on=resolved)
+    _set_independent(store, project_id, add=independent)
+    return notes
 
 
 def _coerce_str_list(value) -> Optional[List[str]]:
@@ -1822,16 +1898,115 @@ def _owner_turn_now() -> bool:
     return not _not_the_user(rid)
 
 
+def _owner_task_turn(context=None) -> bool:
+    """§4UL review M4: a project task's turn (`core/project_turns`, ``sub-ptask-…``) run by the OWNER's own
+    request — it acts with the owner's authority (a stated constraint exception goes through, recorded), like
+    the owner's turn it runs inside. An unattended, scheduled or probe batch's turn is not the owner."""
+    try:
+        from ..utils.logging import request_id_context
+        from ..core.project_turns import TASK_TURN_RID_PREFIX
+        from ..core.request_scope import ORIGIN_OWNER, current_scope
+        from ..memory.projects import request_root
+        rid = str(request_id_context.get() or "")
+        if not rid.startswith(TASK_TURN_RID_PREFIX):
+            return False
+        _sc = current_scope()                     # the turn's own scope (`run_leaf_turn` installs it)
+        if _sc is None or getattr(_sc, "origin", "") != ORIGIN_OWNER:
+            return False
+        root = request_root(rid)
+        from .memory import _not_the_user
+        return bool(root and root != rid and not _not_the_user(root))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _project_of_path(store, path) -> tuple:
+    """(project_id, path relative to the project folder) for a path inside
+    ``<sandbox>/projects/<id>/``, else ("", "")."""
+    root = getattr(store, "sandbox_root", None)
+    if not root or not path:
+        return "", ""
+    p = Path(str(path))
+    if not p.is_absolute():
+        p = Path(root) / p
+    try:
+        rel = p.resolve(strict=False).relative_to((Path(root) / "projects").resolve(strict=False))
+    except (ValueError, OSError):
+        return "", ""
+    if len(rel.parts) < 2:                      # the folder itself, not a file in it
+        return "", ""
+    from ..memory.projects import _canon_id
+    return _canon_id(rel.parts[0]), Path(*rel.parts[1:]).as_posix()
+
+
+def note_project_write(context, path) -> str:
+    """§4UL (2d): a file the owner's turn wrote into ``projects/<id>/`` is
+    work on that project, whatever the focus was. Call it after every
+    successful write (``path`` absolute, or relative to the sandbox root).
+
+    * nothing focused → this conversation's focus becomes that project;
+    * the project is DONE → it reopens with an IN_PROGRESS task
+      ``Change: <the owner's first words>`` and a ledger line (the DONE
+      close's constraints come back with the reopen — store.add_task);
+    * anything else (ACTIVE, a background/member/probe/simulated turn, a
+      path outside projects/) → nothing.
+
+    Returns a one-line note for the tool result when it reopened the
+    project, else "". Never raises."""
+    try:
+        store = _resolve_store(context)
+        if store is None:
+            return ""
+        pid, rel = _project_of_path(store, path)
+        if not pid or not _owner_turn_now() or getattr(context, "simulated", False):
+            return ""
+        try:
+            from ..core.request_scope import ORIGIN_OWNER, current_scope
+            _sc = current_scope(context)
+            if _sc is not None and getattr(_sc, "origin", ORIGIN_OWNER) != ORIGIN_OWNER:
+                return ""
+        except Exception:  # noqa: BLE001
+            pass
+        proj = store.get_project(pid)
+        if not proj:
+            return ""
+        if not getattr(context, "current_project_id", None):
+            _set_current(context, pid)
+        if str(proj.get("status") or "").upper() != "DONE":
+            return ""
+        rid = _current_request_id()
+        # the close happened in THIS request (its last task closed, then the
+        # turn wrote its notes): that is the same work, not a change
+        # §4UL review M5: a project task's turn (`sub-ptask-…`) that ran inside THIS request closed it — its
+        # parent is this request (`memory.projects.request_root`)
+        from ..memory.projects import request_root as _rroot
+        if rid and any(_c and (_c == rid or _rroot(_c) == rid)
+                       for _c in (str(t.get("closed_req_id") or "") for t in (store.list_tasks(pid) or []))):
+            return ""
+        words = " ".join(str(getattr(context, "last_user_content", "") or "").split()[:10])
+        desc = f"Change: {words[:120] or rel[:80]}"
+        tid = store.add_task(pid, desc, status="IN_PROGRESS")
+        store.log_event(pid, tid, "project_write_reopen", {"path": rel[:200], "req": rid})
+        store.append_ledger(pid, f"REOPENED (request {rid or '?'}): {rel[:120]} was written — {desc}")
+        return (f"Project {pid} was DONE; writing {rel} reopened it with task {tid} ('{desc}'). "
+                f"Close it with task_update DONE when the change is done.")
+    except Exception:  # noqa: BLE001
+        logger.warning("project write not noted for %s", path, exc_info=True)
+        return ""
+
+
 def _budget_view(store, project_id) -> Dict[str, Any]:
     """§4MQ: the unattended budget and the gates' state, for status/budget."""
-    from ..core.project_advancer import (DEFAULT_STEPS_CAP, DEFAULT_CHECKPOINT_EVERY,
-                                         DEFAULT_UNATTENDED_RUNTIME_CAP_S, NO_PROGRESS_PAUSE_AT)
+    from ..core.project_advancer import (DEFAULT_CHECKPOINT_EVERY, DEFAULT_UNATTENDED_RUNTIME_CAP_S,
+                                         NO_PROGRESS_PAUSE_AT, daily_cap, _today)
     m = ((store.get_project(project_id) or {}).get("metadata") or {})
     cap_s = m.get("unattended_runtime_cap_seconds")
+    _fresh = m.get("unattended_day") == _today()           # §4UL: the daily allowance (another day reads 0)
     return {
         "autopilot": bool(m.get("autopilot")),
-        "steps": f"{int(m.get('steps_used') or 0)}/{int(m.get('steps_cap') or DEFAULT_STEPS_CAP)}",
-        "unattended_hours": f"{float(m.get('unattended_runtime_seconds') or 0) / 3600:.1f}/"
+        "steps_done": int(m.get("steps_used") or 0),
+        "unattended_today": f"{int(m.get('unattended_steps_today') or 0) if _fresh else 0}/{daily_cap(m)} tasks",
+        "unattended_hours_today": f"{(float(m.get('unattended_runtime_seconds') or 0) if _fresh else 0.0) / 3600:.1f}/"
                          f"{float(cap_s if cap_s is not None else DEFAULT_UNATTENDED_RUNTIME_CAP_S) / 3600:.1f}",
         "checkpoint_every": int(m.get("checkpoint_every") if m.get("checkpoint_every") is not None
                                 else DEFAULT_CHECKPOINT_EVERY),
@@ -1991,7 +2166,8 @@ def _lifecycle_confirmation(store, act, rid, token, context=None, host_labs=None
 #: deleted it with no confirmation). §4QA r8: the brief hashes decide what
 #: the brief writer may overwrite — a forged hash would make it "ours"
 _SYSTEM_METADATA_KEYS = ("probe_created", "autopilot", "research_brief_shas",
-                         "quote_check_tasks",
+                         "quote_check_tasks", "independent_tasks",      # §4UL: set via depends_on: []
+                         "constraints_done_retired",                     # §4UL: re-armed on a reopen
                          "lab_waits", "lab_waits_rounds")      # §4SX D4 r2 #13: the labs-host holds      # §4QA-e r34: the quote check's own count
 #: §4MQ: the budget and the unattended gates' state — written by the system or
 #: by the owner's `action=budget`, never by the model's `metadata=` (a
@@ -3036,8 +3212,9 @@ async def tool_manage_projects(
     # sees real lists. The `is None` checks downstream still work
     # because _coerce_str_list returns None when the input is None.
     # §4SU Phase 2: object subtasks carry a declared kind + deliverable
+    _subtask_deps: Dict[str, Any] = {}       # §4UL: depends_on declared in subtask objects
     try:
-        subtasks, _subtask_kinds = _split_declared_subtasks(subtasks)
+        subtasks, _subtask_kinds = _split_declared_subtasks(subtasks, deps_out=_subtask_deps)
         from ..core.task_kind import normalize_kind as _norm_kind
         _task_kind_given = bool(str(task_kind or "").strip())   # "none" clears a kind
         task_kind = _norm_kind(task_kind)
@@ -3418,6 +3595,7 @@ async def tool_manage_projects(
                     created_task_ids.append(tid)
                     pairs.append((tid, desc.strip()))
                     prev_id = tid
+                _dep_notes = _apply_declared_deps(store, pid, pairs, _subtask_deps)   # §4UL
                 for tid, desc in pairs:
                     _link_task_in_graph(context, pid, tid, desc)
                 instruction = (
@@ -3432,6 +3610,8 @@ async def tool_manage_projects(
                         + " | ".join(d[:80] for d in _create_dropped[:6])
                         + ". If any is genuinely distinct work, re-add it "
                         "with task_add and a more specific description.")
+                if _dep_notes:
+                    instruction += " NOTE: " + "; ".join(_dep_notes[:4]) + "."
             else:
                 instruction = (
                     "Project created. Break the goal into tasks with "
@@ -3440,7 +3620,9 @@ async def tool_manage_projects(
                     "file per feature behind a thin shell), NOT N tasks that "
                     "all edit the same file. Give each task as an object "
                     "{description, kind, deliverable} (kind: build | write | "
-                    "research | model_run | owner). Pacing: follow the PACING "
+                    "research | model_run | owner). Tasks run in plan order; a task that "
+                    "does not need the ones before it gets depends_on: [] (or the 1-based "
+                    "positions it needs, e.g. [1, 3]). Pacing: follow the PACING "
                     "rule in the CURRENT PROJECT block. As you work, "
                     "record durable facts (file "
                     "layout, key APIs) with action=ledger so later turns don't "
@@ -3457,12 +3639,11 @@ async def tool_manage_projects(
                 _ago = max(0, int(time.time() - float(
                     tombstone.get("deleted_at") or 0)))
                 instruction = (
-                    f"CORRECTION CONTEXT: the user DELETED a similar project "
-                    f"('{tombstone.get('title')}', {_ago // 60} min ago) before "
-                    f"re-asking. Deleting a build is a rejection of the "
-                    f"previous approach — plan from the CURRENT message only; "
-                    f"do NOT reuse the remembered decomposition or deliverable "
-                    f"shape from the deleted attempt. " + instruction
+                    f"EARLIER ATTEMPT: a similar project ('{tombstone.get('title')}') "
+                    f"was deleted {_ago // 60} min ago. Plan from the CURRENT "
+                    f"message; reuse what worked from the earlier attempt only if "
+                    f"it fits (§4UL: a delete is not always a rejection — it may "
+                    f"have followed a fix). Ask only if it matters. " + instruction
                 )
             if req_constraints:
                 instruction = (
@@ -3893,8 +4074,12 @@ async def tool_manage_projects(
                 return _err(f"project not found: {project_id}")
             _want = metadata if isinstance(metadata, dict) else {}
             _set = {}
-            for _k, _cast, _lo, _hi in (("steps_cap", int, 0, 1000), ("checkpoint_every", int, 0, 1000),
-                                        ("runtime_cap_hours", float, 0.0, 24.0 * 30)):
+            if "steps_cap" in _want and "unattended_per_day" not in _want:
+                # §4UL: the lifetime step cap is gone — the old name sets the daily unattended allowance
+                _want = {**{k: v for k, v in _want.items() if k != "steps_cap"},
+                         "unattended_per_day": _want["steps_cap"]}
+            for _k, _cast, _lo, _hi in (("unattended_per_day", int, 0, 1000), ("checkpoint_every", int, 0, 1000),
+                                        ("runtime_cap_hours", float, 0.0, 24.0)):
                 if _k in _want and _want[_k] is not None:
                     try:
                         _v = _cast(_want[_k])
@@ -3903,10 +4088,10 @@ async def tool_manage_projects(
                     if not (_lo <= _v <= _hi):
                         return _err(f"{_k} must be between {_lo} and {_hi} — nothing changed")
                     _set[_k] = _v
-            _unknown = sorted(set(_want) - {"steps_cap", "checkpoint_every", "runtime_cap_hours"})
+            _unknown = sorted(set(_want) - {"unattended_per_day", "checkpoint_every", "runtime_cap_hours"})
             if _unknown:
-                return _err(f"budget takes steps_cap, runtime_cap_hours, checkpoint_every — not "
-                            f"{', '.join(_unknown)}; nothing changed")
+                return _err(f"budget takes unattended_per_day (tasks per day), runtime_cap_hours (per day), "
+                            f"checkpoint_every (0 = no check-in) — not {', '.join(_unknown)}; nothing changed")
             if _set:
                 if not _owner_turn_now():
                     return _err("only the owner's own turn changes a budget — a probe or "
@@ -4319,7 +4504,7 @@ async def tool_manage_projects(
                                         "fix": "fix the files so they honour the constraints"})
                         continue
                     if (_task_files and _task_audit is not None and not _task_audit[0]
-                            and _c_over and _owner_turn_now()):
+                            and _c_over and (_owner_turn_now() or _owner_task_turn(context))):
                         # §4UK (operator 11-12: no confirmations): in the owner's own turn the agent's stated
                         # exception goes through at once and is RECORDED (event + ledger) — never parked for
                         # an approval. An unattended turn still cannot go over a constraint.
@@ -4492,6 +4677,16 @@ async def tool_manage_projects(
                     extras["postconditions"] = list(postconditions)
                 if constraints is not None:
                     extras["constraints"] = constraints
+                if depends_on is not None:
+                    # §4UL: [] = independent of plan order; ids = these first
+                    _known = set(plan.tree.nodes)
+                    _given = [d.strip().lower() for d in depends_on
+                              if d.strip().lower() not in ("none", "[]")]
+                    _deps = [d for d in dict.fromkeys(_given) if d in _known and d != tid]
+                    if not _given or _deps:          # ids that match no task change nothing
+                        extras["depends_on"] = _deps
+                        _set_independent(store, project_id, add=() if _deps else (tid,),
+                                         drop=(tid,) if _deps else ())
                 if _task_kind_given:
                     extras["kind"] = task_kind          # §4SU Phase 2
                     # §4UI: a retype is remembered — the model-run gate trusts
@@ -4536,6 +4731,27 @@ async def tool_manage_projects(
                                        "count": len(updated)}
             if closed_now:
                 payload["closed"] = closed_now
+                # §4UL: DONE work built on a task that only closed now may predate it — a re-check
+                # note, not a reopen
+                try:
+                    from ..core.planning import independent_task_ids, later_done_dependents
+                    _plan_now = ProjectPlan(store, project_id)
+                    _indep = independent_task_ids((store.get_project(project_id) or {}).get("metadata"))
+                    _stale: List[str] = []
+                    for _c in closed_now:
+                        for _s in later_done_dependents(_plan_now, _c, _indep):
+                            if _s not in _stale and _s not in closed_now:
+                                _stale.append(_s)
+                                store.log_event(project_id, _s, "stale_dependent",
+                                                {"closed": _c, "req": _current_request_id()})
+                    if _stale:
+                        payload["stale_dependents"] = _stale
+                        payload["agent_instruction_stale"] = (
+                            f"{len(_stale)} DONE task(s) ({', '.join(_stale[:6])}) were built before "
+                            "the task(s) they follow closed — re-check them against what changed; "
+                            "fix what no longer fits (task_update back to PENDING if it needs a rebuild).")
+                except Exception:  # noqa: BLE001
+                    logger.debug("stale-dependent check skipped", exc_info=True)
             if missing:
                 payload["missing"] = missing
                 # Name the ids that DO exist (2026-08-01): a bare
@@ -4585,21 +4801,11 @@ async def tool_manage_projects(
                 # r4 L1: one entry per task, its LAST state (a bulk close re-judges a parent per child)
                 not_closed = list({n["task_id"]: n for n in not_closed}.values())
                 payload["not_closed"] = not_closed
-                # r4 M2: a gate park is a human gate; a roll-up refusal is not — it is fixed, not approved
-                # §4SU Phase 3: the wait field, not the "human gate:" text
-                _parked = [n["task_id"] for n in not_closed if n.get("waiting") == "human_gate"]
-                _other = len(_parked) < len(not_closed)
+                # §4UL: no human-gate parks exist since §4UK — the approve-by-name branch is gone
                 payload["agent_instruction_not_closed"] = (
                     f"{len(not_closed)} task(s) did NOT close DONE: "
                     + " | ".join(f"{n['task_id']} → {n['status']}: {n['why'][:160]}" for n in not_closed)
-                    + (". A human-gated task (\"human gate:\") closes only when the OWNER approves it BY NAME in a "
-                       "later message: ask them now to reply \"approve <task id>\" with the id shown here. "
-                       "A plain yes does not approve it. Do not call task_update again for a gated task in this turn."
-                       if _parked else "")
-                    + ((" For every other task listed" if _parked else ".")
-                       + (": fix what the reason names, then close it again." if _parked
-                          else " Fix what the reason names, then close it again.")
-                       if _other else ""))
+                    + ". Fix what the reason names, then close it again.")
             if misquoted:
                 payload["quote_warnings"] = misquoted
                 payload["agent_instruction_quote_check"] = (
@@ -4779,6 +4985,7 @@ async def tool_manage_projects(
                                      exc_info=True)
             for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
+            _dep_notes = _apply_declared_deps(store, project_id, pairs, _subtask_deps)   # §4UL
             if _replan is not None and ids:
                 # the new plan is down — now the old open tasks go (a subtree
                 # with its root); the project has open work throughout, so it
@@ -4841,14 +5048,19 @@ async def tool_manage_projects(
                         # round-trip. `created` keeps its shape (bare ids)
                         # for existing consumers.
                         "tasks": [{"id": tid, "description": desc,
-                                   "kind": (plan.tree.nodes[tid].kind if tid in plan.tree.nodes else "")}
+                                   "kind": (plan.tree.nodes[tid].kind if tid in plan.tree.nodes else ""),
+                                   **({"depends_on": list((store.get_task(tid) or {}).get("depends_on") or [])}
+                                      if _subtask_deps.get("deps") else {})}
                                   for tid, desc in pairs],
                         "parent_id": target_id,
                         "sequential": bool(sequential),
                         **({"replanned": _replanned} if _replanned else {}),
+                        **({"depends_on_notes": _dep_notes} if _dep_notes else {}),
                         "constraints": decompose_constraints,
                         "agent_instruction": (
-                            f"Plan created with {len(ids)} task(s). Pacing: "
+                            f"Plan created with {len(ids)} task(s). Tasks run in plan order "
+                            "(a task waits while an earlier one waits or runs, unless it "
+                            "declared depends_on; a failed one does not hold it). Pacing: "
                             "follow the PACING rule in the CURRENT "
                             "PROJECT block."
                         )})
@@ -5852,9 +6064,8 @@ async def tool_manage_projects(
                     _adv_payload["needs_user_tasks"] = _gates
                     if batch.stop_reason != "needs_user":
                         _adv_payload["agent_instruction"] += (
-                            " Also waiting on the owner: the task(s) in needs_user_tasks — "
-                            "name them and ask; a request to run all tasks is not their "
-                            "answer.")
+                            " Also waiting: the task(s) in needs_user_tasks need something only "
+                            "the owner has — say what, in one line.")
                 elif batch.stop_reason == "needs_user":
                     # only holds wait: nothing for the user to answer. The
                     # base text is rebuilt, not dropped (tally, no_reload).
@@ -6032,10 +6243,10 @@ async def tool_manage_projects(
 #: callable (API, tests, an old habit) — none of them is named by a system
 #: message the model reads (every one that is, is here).
 _VISIBLE_ACTIONS = (
-    "create", "switch", "status", "get", "list", "update", "archive", "resume", "delete",
+    "create", "switch", "exit", "status", "get", "list", "update", "archive", "resume", "delete",
     "replan", "task_decompose", "task_add", "task_update", "task_delete", "task_list",
     "autoadvance", "autopilot", "budget", "ledger", "config", "describe_file",
-    "unregister_file", "artifact_list", "research", "release", "create_version",
+    "unregister_file", "artifact_list", "research", "release", "unrelease", "create_version",
     "constraint_retire", "promote_from_context",
 )
 
@@ -6060,13 +6271,13 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "release, unrelease and delete run at once when the user asks (no confirmation). Prefer archive "
             "(reversible) to delete when the user did not say delete. autopilot and budget only on the "
             "user's request. "
-            "Actions: create · switch · status · get · list · update · archive · resume · delete · "
+            "Actions: create · switch · exit (leave the active project) · status · get · list · update · archive · resume · delete · "
             "replan (subtasks = the NEW plan; keeps done tasks, their files and the research) · "
             "task_decompose (subtasks=[…]; task_id = break that task down; ANY list of 2+ tasks goes here in ONE call, not N task_add) · task_add (one task) · "
             "task_update (task_ids=[…] for many) · task_delete · task_list · autoadvance (count) · "
             "autopilot (enabled) · budget · ledger · config · describe_file (when you create or work out a "
             "file) · unregister_file · artifact_list · research (topic/topics) · release (DONE→RELEASED "
-            "when the user says it works or asks for it; directions) · create_version (change a RELEASED project) · "
+            "when the user says it works or asks for it; directions) · unrelease (RELEASED→DONE, editable again) · create_version (change a RELEASED project) · "
             "constraint_retire · promote_from_context (after the user accepted the offer)."
         ),
         "parameters": {
@@ -6089,7 +6300,8 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "constraints": {"type": "array", "items": {"type": "string"},
                                 "description": "The user's explicit requirements, near-verbatim; they gate DONE."},
                 "depends_on": {"type": "array", "items": {"type": "string"},
-                               "description": "task_add: task ids that must be DONE first."},
+                               "description": "task_add/task_update: task ids that must be DONE first; "
+                                              "task_update [] = independent of plan order."},
                 "sequential": {"type": "boolean"},
                 "topic": {"type": "string"},
                 "topics": {"type": "array", "items": {"type": "string"}},
@@ -6105,12 +6317,16 @@ MANAGE_PROJECTS_TOOL_DEF = {
                                  {"type": "object", "properties": {
                                      "description": {"type": "string"},
                                      "kind": {"type": "string", "enum": ["build", "write", "research", "model_run", "owner"]},
-                                     "deliverable": {"type": "string"}},
+                                     "deliverable": {"type": "string"},
+                                     "depends_on": {"type": "array", "items": {"anyOf": [{"type": "string"},
+                                                                                         {"type": "integer"}]}}},
                                   "required": ["description"]}]},
                              "description": "Ordered tasks, each one file or a bounded module (never split the same file into N tasks). Objects "
-                                            "{description, kind, deliverable}: kind = build | write (a document) | "
+                                            "{description, kind, deliverable, depends_on}: kind = build | write (a document) | "
                                             "research | model_run (a model must answer: probe_model) | owner (only "
-                                            "the user can); deliverable = the file it produces."},
+                                            "the user can); deliverable = the file it produces; depends_on = 1-based "
+                                            "positions in this list or task ids it needs ([] = needs none; omitted = "
+                                            "waits while an earlier task waits or runs)."},
                 "task_kind": {"type": "string", "enum": ["build", "write", "research", "model_run", "owner", "none"]},
                 "payload": {"type": "string", "description": "constraint_retire: the constraint, its index or 'all'."},
                 "deliverables": {"type": "array", "items": {"type": "string"},

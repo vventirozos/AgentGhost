@@ -3264,3 +3264,9 @@ async def build_coding_task(
         raise
 
     return CodingResult(False, _short(last, 280), files=last_written, detail=feedback)
+
+
+# §4UL (decision 1A): the production executor — the advancer runs a task wired with it as a full agent turn
+# (`core/project_turns.py`) and keeps this build only as the fallback
+from .project_turns import mark_real_executor as _mark_real_executor  # noqa: E402
+_mark_real_executor(build_coding_task)

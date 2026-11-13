@@ -13,7 +13,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from ..sandbox.jobs import PROMOTED_RESULT_MARKER
 from ..utils.logging import Icons, pretty_log
 from ..utils.sanitizer import sanitize_code
@@ -2562,3 +2562,254 @@ if has_error:
                     await asyncio.to_thread(runner_path.unlink, missing_ok=True)
                 except Exception as ce:
                     _logger.debug(f"execute cleanup (jupyter runner): {ce}")
+
+
+# ── §4UL (projects hook) ────────────────────────────────────────────────────
+_PROJECT_PATH_RE = re.compile(r"(?<![\w/.-])(?:\./)?(projects/[A-Za-z0-9_-]+/[^\s'\"`;|&<>()]+)")
+_PROJECT_DIR_RE = re.compile(r"(?:\./)?projects/[A-Za-z0-9_-]+/?")
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", ">&"})
+_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", ";;", "|&"})
+
+
+def _strip_heredocs(command: str) -> str:
+    """The command without its here-document BODIES (their text is data, not shell)."""
+    out, rest = [], command
+    while True:
+        m = _HEREDOC_RE.search(rest)
+        if not m:
+            out.append(rest)
+            return "".join(out)
+        nl = rest.find("\n", m.end())
+        if nl < 0:
+            out.append(rest)
+            return "".join(out)
+        out.append(rest[:nl + 1])
+        body = rest[nl + 1:]
+        end = re.search(rf"(?m)^\s*{re.escape(m.group(2))}\s*$", body)
+        rest = body[end.end():] if end else ""
+
+
+#: §4UL re-review m3: a command prefix that runs the rest — with the flags that take a value
+_SHELL_PREFIX_FLAGS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "--user", "--group", "--chdir"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "nohup": set(), "time": set(), "command": set(), "exec": set(), "xvfb-run": {"-s", "-n", "-a"},
+}
+_INPUT_REDIRECTS = frozenset({"<", "<<", "<<<", "<<-", "<&", "<>"})
+
+
+def _shell_tokens(command: str) -> Optional[List[str]]:
+    """The command's shell tokens, here-document bodies dropped, a glued punctuation run (``)>``, ``;>``) split
+    into its separator and its redirect; None when shlex cannot split it."""
+    text = _strip_heredocs(str(command or ""))
+    # §4UL round 3: a backslash-newline joins two lines, and a newline right after `&&` / `||` / `|` continues the
+    # command — only a bare newline ends one
+    text = re.sub(r"\\\r?\n", " ", text)
+    text = re.sub(r"(&&|\|\||\|)[ \t]*\r?\n", r"\1 ", text)
+    try:
+        lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        raw = list(lex)
+    except ValueError:
+        return None
+    toks: List[str] = []
+    for t in raw:
+        if (t and set(t) <= set("();<>|&") and t not in _SEPARATORS and t not in _REDIRECTS
+                and t not in _INPUT_REDIRECTS and not (t.startswith(">") and set(t) <= set(">|&"))):
+            i = min((t.find(c) for c in "<>" if c in t), default=-1)
+            if i > 0:
+                toks += [t[:i], t[i:]]
+                continue
+        toks.append(t)
+    return toks
+
+
+def strip_command_prefixes(cmd: List[str]) -> List[str]:
+    """``VAR=x``, ``sudo -u x``, ``env -i``, ``timeout 30``, ``nice -n 5`` … dropped from a simple command: what
+    is left starts with the program that really runs (§4UL re-review m3)."""
+    cmd = list(cmd)
+    while cmd:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", cmd[0]):
+            cmd = cmd[1:]                                # VAR=x cmd …
+            continue
+        head = os.path.basename(cmd[0])
+        if head not in _SHELL_PREFIX_FLAGS:
+            break
+        takes = _SHELL_PREFIX_FLAGS[head]
+        cmd = cmd[1:]
+        while cmd and cmd[0].startswith("-") and cmd[0] != "-":
+            flag = cmd[0]
+            cmd = cmd[1:]
+            if flag in takes and cmd:
+                cmd = cmd[1:]                            # the flag's value (`sudo -u www`)
+            if flag == "--":
+                break
+        if head == "timeout" and cmd and re.fullmatch(r"[0-9.]+[smhd]?", cmd[0]):
+            cmd = cmd[1:]                                # the duration
+    return cmd
+
+
+def workspace_relative(path: str) -> str:
+    """``/workspace/projects/x/a`` and ``~/projects/x/a`` as the workspace-relative ``projects/x/a`` the project
+    hook names (§4UL re-review m3); any other path unchanged."""
+    p = str(path or "")
+    for pre in ("/workspace/", "~/"):
+        if p.startswith(pre):
+            return p[len(pre):]
+    return p
+
+
+def _opt_values(args: List[str], short: str, long: str = "") -> List[str]:
+    """The values of ``-o FILE`` / ``-oFILE`` / ``-sSo FILE`` / ``--output FILE`` / ``--output=FILE`` in ``args``
+    (a short option's letter ends a cluster: the value is the rest of the cluster, else the next argument)."""
+    out = []
+    letter = short[1:] if short else ""
+    for j, a in enumerate(args):
+        if long and a == long:
+            out += args[j + 1:j + 2]
+        elif long and a.startswith(long + "="):
+            out.append(a.split("=", 1)[1])
+        elif letter and len(a) > 1 and a[0] == "-" and a[1] != "-" and letter in a[1:]:
+            k = a.index(letter, 1)
+            out += args[j + 1:j + 2] if k == len(a) - 1 else [a[k + 1:]]
+    return [v for v in out if v and v != "-"]
+
+
+def _shell_write_targets(command: str) -> List[str]:
+    """§4UL review M6: the paths a shell command WRITES — redirect targets, `tee` files, the destination of
+    `cp`/`mv`/`install`/`rsync`/`git clone`/`ln`, `sed -i`/`touch`/`mkdir` operands, `unzip -d` / `tar -C` dirs,
+    and (§4UL re-review m3) `curl -o`, `wget -O`, `dd of=`, `cp/mv -t DIR`, through a `sudo -u x` / `timeout 9`
+    prefix — never a path it only reads (`python projects/x/app.py 2>&1 | tail`, `cp projects/x/a /tmp/b`,
+    `grep 'x >= 1' projects/x/app.py`). A command shlex cannot split names nothing (advisory). A path relative
+    to an earlier `cd` is returned as written (not resolved against the cd)."""
+    toks = _shell_tokens(command)
+    if toks is None:
+        return []
+    simple: List[List[str]] = [[]]
+    targets: List[str] = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in _SEPARATORS:
+            simple.append([])
+        elif t in _REDIRECTS or (t.startswith(">") and set(t) <= set(">|&")):
+            if i + 1 < len(toks) and toks[i + 1] not in _SEPARATORS:
+                tgt = toks[i + 1]
+                if not tgt.isdigit() and tgt != "-":
+                    targets.append(tgt)
+                i += 1
+        elif t in _INPUT_REDIRECTS:
+            i += 1                                       # an input (or a here-doc word): read, not written
+        elif t.isdigit() and i + 1 < len(toks) and toks[i + 1][:1] in "<>":
+            pass                                         # the fd number of `2>…`
+        else:
+            simple[-1].append(t)
+        i += 1
+    for cmd in simple:
+        cmd = strip_command_prefixes(cmd)
+        if not cmd:
+            continue
+        head = os.path.basename(cmd[0])
+        args = [a for a in cmd[1:]]
+        ops = [a for a in args if not a.startswith("-")]
+        if head == "tee":
+            targets += ops
+        elif head in ("cp", "mv", "install", "ln") and _opt_values(args, "-t", "--target-directory"):
+            dest = _opt_values(args, "-t", "--target-directory")[0]
+            srcs = [a for a in ops if a != dest]
+            targets += [dest.rstrip("/") + "/" + os.path.basename(src.rstrip("/")) for src in srcs]
+        elif head in ("cp", "mv", "install", "rsync", "ln") and len(ops) >= 2:
+            dest = ops[-1]
+            if _PROJECT_DIR_RE.fullmatch(workspace_relative(dest)) or dest.endswith("/") or len(ops) > 2:
+                targets += [dest.rstrip("/") + "/" + os.path.basename(src.rstrip("/")) for src in ops[:-1]]
+            else:
+                targets.append(dest)
+        elif head == "git" and len(ops) >= 3 and ops[0] == "clone":
+            targets.append(ops[-1])
+        elif head == "sed" and any(a == "-i" or a.startswith("-i") or a.startswith("--in-place") for a in args):
+            targets += ops[1:] if not any(a in ("-e", "-f") for a in args) else ops
+        elif head in ("touch", "mkdir", "truncate"):
+            targets += ops
+        elif head == "unzip" and "-d" in args:
+            j = args.index("-d")
+            targets += args[j + 1:j + 2]
+        elif head == "tar":
+            for flag in ("-C", "--directory"):
+                if flag in args:
+                    j = args.index(flag)
+                    targets += args[j + 1:j + 2]
+            if args and re.fullmatch(r"-?[A-Za-z]*c[A-Za-z]*f", args[0]) and len(args) > 1:
+                targets.append(args[1])                  # tar -czf OUT …: the archive it writes
+        elif head == "curl":
+            targets += _opt_values(args, "-o", "--output")
+        elif head == "wget":
+            targets += _opt_values(args, "-O", "--output-document")
+        elif head == "dd":
+            targets += [a[3:] for a in args if a.startswith("of=") and len(a) > 3]
+    return targets
+
+
+def _note_execute_project_writes(kwargs, result) -> str:
+    """§4UL: an `execute` run from the workspace ROOT (no project pinned) that
+    wrote into ``projects/<id>/…`` is that project's work — each such path
+    the command names after a write construct, and an inline script saved
+    there, go to `tools.projects.note_project_write` (via the file_system
+    hook, which finds the request's context). Returns the hook's notes for
+    the result. Advisory bookkeeping: a failed run, a pinned run or any
+    error notes nothing."""
+    try:
+        if kwargs.get("container_workdir"):
+            return ""           # pinned: the turn's own project, relative paths
+        st = getattr(getattr(result, "status", None), "value", None)
+        if st is not None:
+            if st not in ("ok", "partial"):
+                return ""
+        else:
+            from .tool_failure import exec_exit_code
+            _code = exec_exit_code(str(result or ""))
+            if _code is not None and _code != 0:
+                return ""
+        sandbox_dir = kwargs.get("sandbox_dir")
+        if sandbox_dir is None:
+            return ""
+        paths = []
+        command = str(kwargs.get("command") or kwargs.get("cmd") or "")
+        if command:                         # §4UL review M6: the paths it WRITES, never ones it reads
+            for tgt in _shell_write_targets(command):
+                m = _PROJECT_PATH_RE.fullmatch(workspace_relative(tgt))
+                if m:
+                    paths.append(m.group(1))
+        fname = str(kwargs.get("filename") or kwargs.get("file") or "")
+        if fname and (kwargs.get("content") or kwargs.get("code")) and _PROJECT_PATH_RE.fullmatch(fname):
+            paths.append(_PROJECT_PATH_RE.fullmatch(fname).group(1))
+        if not paths:
+            return ""
+        from .file_system import note_project_write_hook
+        notes = [note_project_write_hook(sandbox_dir, p.rstrip("/")) for p in list(dict.fromkeys(paths))[:20]]
+        return "\n".join(n for n in notes if n)
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a run
+        logging.getLogger("GhostAgent").debug("execute project-write note skipped", exc_info=True)
+    return ""
+
+
+_tool_execute_impl = tool_execute
+
+
+async def _tool_execute_noting(*args, **kwargs):
+    res = await _tool_execute_impl(*args, **kwargs)
+    _note = _note_execute_project_writes(kwargs, res)
+    if _note:
+        from .outcome import append_note
+        res = append_note(res, "\n" + _note)
+    return res
+
+
+import functools as _functools  # noqa: E402
+_functools.update_wrapper(_tool_execute_noting, _tool_execute_impl)
+tool_execute = _tool_execute_noting

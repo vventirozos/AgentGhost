@@ -206,8 +206,8 @@ async def test_a_narration_only_tool_turn_is_refuted_without_consulting_the_judg
 # this digest — the digest's "the task is NOT finished" was false there
 # (tests/test_4qa_project_task_integrity.py pins that case). A dead-end
 # refusal forces the final the same way with no task closed.
-DEAD_END = ToolOutcome.rejected("Error: NOT done: the user has not answered yet. STOP calling it.",
-                                world_changed=False, reason_code="confirm_dead_end")
+DEAD_END = ToolOutcome.rejected("NOT deleted: a background turn may not delete. That list is withdrawn.",
+                                world_changed=False, reason_code="forget_not_confirmed")
 SEARCH_RESULT = ("### 1. Reuters — Revolut confirms breach\nRevolut said the request came "
                  "from a spoofed government domain.\n[Source: https://reuters.example/a]\n")
 

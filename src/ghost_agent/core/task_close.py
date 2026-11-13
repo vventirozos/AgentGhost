@@ -136,13 +136,14 @@ def gate_dependencies(tree, task_id: str) -> Optional[Refusal]:
                 # to PENDING is not a leaf and strands; replan is always safe
                 lines.append(f"{d} failed — replan it (its subtasks give no single task to redo)")
         elif st == "NEEDS_USER" and on == "owner_turn":
-            lines.append(f"{d} is held for the owner's own run — it runs when the owner asks to advance; "
-                         "tell the owner")
+            # §4UL: held only from UNATTENDED runs — in the owner's own conversation, do it
+            lines.append(f"{d} was held from an unattended run — do it now (or task_update it back to PENDING)")
         elif st == "BLOCKED":
+            # §4UL: fix it yourself when you can; only what the owner alone has (a file, a login) waits
             lines.append(f"{d} is blocked ({(getattr(n, 'wait_why', '') or n.failure_reason or 'no reason')[:80]}) "
-                         "— tell the owner what it waits on and stop")
+                         "— remove the cause yourself if you can, else say what only the owner can give")
         elif st == "NEEDS_USER":
-            lines.append(f"{d} waits for the owner — tell the owner what it waits on and stop")
+            lines.append(f"{d} waits for something only the owner has — say what, in one line")
         elif st == "IN_PROGRESS":
             lines.append(f"{d} is running now — wait for it")
         else:

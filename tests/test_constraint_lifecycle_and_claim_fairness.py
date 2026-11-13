@@ -80,12 +80,23 @@ class TestConstraintLifecycle:
                   if e["type"] == "constraints_retired"]
         assert len(events) == 1
 
-    def test_refute_reopen_does_not_resurrect(self, store):
-        """The incident loop: DONE → late refute files a follow-up task →
-        project reopens. The retired constraint must stay retired."""
+    def test_any_reopen_rearms_what_done_retired(self, store):
+        """§4UL (operator 11-12): a reopened project is still the owner's project — what its DONE
+        close retired comes back with ANY reopen (a task added here)."""
         pid = _make_project_with_constraint(store)
         store.update_project(pid, status="DONE")
         store.add_task(pid, "Verifier follow-up: some leftover")
+        meta = store.get_project(pid)["metadata"]
+        assert meta["constraints"] == [f"Start with: {PHRASE}"]
+        assert f"Start with: {PHRASE}" not in (meta.get("constraints_retired") or [])
+        assert not meta.get("constraints_done_retired")
+        assert [e for e in store.list_events(pid) if e["type"] == "constraints_rearmed"]
+
+    def test_an_owner_retired_constraint_stays_retired_on_a_reopen(self, store):
+        pid = _make_project_with_constraint(store)
+        store.retire_constraints(pid, reason="owner retired it")
+        store.update_project(pid, status="DONE")
+        store.add_task(pid, "A change")
         meta = store.get_project(pid)["metadata"]
         assert meta["constraints"] == []
         assert f"Start with: {PHRASE}" in meta["constraints_retired"]

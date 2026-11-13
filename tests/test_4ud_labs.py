@@ -2054,6 +2054,7 @@ def test_m1_no_workspace_write_in_the_lab_tool_goes_around_the_helper():
         "_ws_mkdir": {"mkdir", "open"},                     # THE folder creation (os.open of directories, read-only)
         "_open_inside": {"open"},                           # read-only directory fds of the deploy / put walk
         "_tar_walk": {"open", "fdopen"},                    # reads the files it packs; tarfile.open on a BytesIO
+        "_read_deployignore": {"open", "fdopen"},           # §4UL: reads the folder's .deployignore (no follow)
         "tree_entries": {"open"},                           # tarfile.open on the bounded bytes: reads
         # not the workspace:
         "_transcript": {"mkdir", "open"},                   # a probe's transcript, under the agent's memory dir

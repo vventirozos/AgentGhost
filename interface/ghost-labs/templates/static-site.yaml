@@ -1,0 +1,13 @@
+name: static-site
+description: "A static web site (HTML/CSS/JS): nginx serves /app on port 8080, no directory listing, dotfiles hidden, no internet. Kept: lab keep (app defaults filled in: member site, port 8080), then deploy the folder (params.app.subdir deploys e.g. dist/ only). A disposable lab serves /app at once"
+egress: none
+members:
+  - {name: site, image: "ghost-lab/static:1", mem_mb: 128, cpus: 0.5, ports: [8080]}
+readiness: {member: site, cmd: "curl -fsS http://localhost:8080/ >/dev/null", timeout_s: 60}
+# the kept app: a watchdog that keeps the image's nginx running (stopping the app stops nginx)
+app:
+  member: site
+  port: 8080
+  cmd: "trap 'nginx -s quit; exit 0' TERM; pgrep -x nginx >/dev/null || nginx; while sleep 5; do pgrep -x nginx >/dev/null || nginx; done"
+  health: {http: "/"}
+  build: none

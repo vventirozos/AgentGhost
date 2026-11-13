@@ -2552,6 +2552,14 @@ def _store_plan(plan: dict) -> str:
     except Exception:  # noqa: BLE001
         plan.setdefault("conv", "")
     plan.setdefault("mono", _t.monotonic())      # §4RZ s2-r4: compared with request starts
+    # §4UK r3 MAJOR: a list made in a request that read outside content (a page could order "list X") is
+    # never run — not by that request, and not by a clean later one holding its token
+    if "tainted" not in plan:
+        try:
+            from ..utils.provenance import untrusted_seen
+            plan["tainted"] = list(untrusted_seen(str(plan.get("rid") or ""))[:3]) if plan.get("rid") else []
+        except Exception:  # noqa: BLE001
+            plan["tainted"] = []
     with _PLANS_LOCK:
         now = _t.time()
         for k in [k for k, v in _FORGET_PLANS.items() if now - v["ts"] > _PLAN_TTL_S]:
@@ -2616,9 +2624,8 @@ def _miss(reason: str, *, log: bool = True) -> None:
 
 
 def retire_declined_previews(message: str) -> int:
-    """§4PF (K10): the user answered a preview with a bare no — every live
-    preview of this conversation is withdrawn, so a later yes to something
-    else (plus a bare call) cannot run it. Only a BARE deny retires: "wait,
+    """§4PF (K10), §4UK: a bare "no" from the user withdraws every live forget
+    list of this conversation, so its token cannot run afterwards. Only a BARE deny retires: "wait,
     only item 1" is a narrowing, not a no. Returns how many were dropped."""
     try:
         from ..memory.profile import _fold
@@ -2839,9 +2846,17 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
                                     project_store=project_store, episodic_memory=episodic_memory)
         from .outcome import OutcomeStatus as _OS
         if getattr(done, "status", _OS.OK) == _OS.REJECTED:
+            if getattr(done, "reason_code", "") in ("forget_bad_selection", "forget_empty_selection"):
+                # r3 m1: only the numbers were wrong — the list and its token stay, and are shown
+                _all = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1)]
+                from .outcome import with_text as _wt0
+                return _wt0(done, "\n".join([str(done), f"The list (token {token}):"] + _all))
             _drop_plan(token)                    # r2: a refused plan never stays live for a later call
             return done
-        out = [f"forget {target!r} — done:", str(done)]
+        # r4 MAJOR: a ⚠️ line can follow a deletion that happened ("Forgot X, but its search copy…"), so a
+        # FAILED/PARTIAL status does not say what was deleted — the lines below do, one per item
+        _head = "done" if getattr(done, "status", _OS.OK) == _OS.OK else "result, item by item"
+        out = [f"forget {target!r} — {_head}:", str(done)]
         # §4UK review CRIT: `forget_execute` spent `token` — the kept items get a plan (and numbers) of their own
         _kept_items = ([it for it in plan.items if not it["default"]]
                        if str(run_now).strip().lower() in ("all", "*", "yes", "") else [])
@@ -3072,6 +3087,9 @@ def _confirm_allowed(plan: dict, selection=None):
         rid = ""
     if _not_the_user(str(plan.get("rid") or "")):
         return "that list was made outside a conversation with the user — run it again in one"
+    if plan.get("tainted"):
+        return (f"that list was made in a request that read outside content ({', '.join(plan['tainted'])}) — "
+                f"run the forget again in a request that did not")
     if _not_the_user(rid):
         return "only the user's own conversation can delete memory — a background, scheduled or test turn cannot"
     from ..utils.provenance import untrusted_seen
@@ -3116,11 +3134,13 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
     if plan is None:
         _why = plan_miss_reason()
         return ToolOutcome.rejected("Error: unknown or expired confirmation token"
-                                    + (f" ({_why})" if _why else "") + " — run the forget preview again.",
+                                    + (f" ({_why})" if _why else "") + " — run the forget again.",
                                     reason_code="forget_token_unknown")
     why = _confirm_allowed(plan, selection)
     if why:
-        return ToolOutcome.rejected(f"NOT deleted: {why}.", reason_code="forget_not_confirmed")
+        _drop_plan(token)        # §4UK r4: a token a wall refused never runs later (a page could have asked for it)
+        return ToolOutcome.rejected(f"NOT deleted: {why}. That list is withdrawn — run the forget again in a "
+                                    f"request that may.", reason_code="forget_not_confirmed")
     chosen, bad = _pick(plan["items"], selection)
     if bad:
         return ToolOutcome.rejected(

@@ -4007,8 +4007,12 @@ _STRUCK_BLOCK_CODES = frozenset({"tool_disabled", "tool_call_parse_error", "bad_
 #: Tool refusals that cannot change within the request (§4LV): retrying is
 #: pointless, so the turn loop ends the tool phase on the first one.
 
-_DEAD_END_REFUSALS = frozenset({"not_owner_write", "confirm_dead_end",
-                                "forget_not_confirmed", "reset_not_confirmed"})
+#: §4UL: `confirm_dead_end` (the project preview's wait) is gone with §4UK —
+#: it stays in DESIGNED_STOP_REASONS only to read rows already recorded.
+_DEAD_END_REFUSALS = frozenset({"not_owner_write", "forget_not_confirmed", "reset_not_confirmed"})
+
+#: §4UL: the request-end DONE sweeps still running (held so none is collected mid-run)
+_DEFERRED_SWEEP_TASKS: set = set()
 
 
 def _defuse_tool_text(content) -> str:
@@ -4206,117 +4210,8 @@ def _dead_end_reply(refusal: str) -> str:
     return f"Not done: {t}"
 
 
-#: §4PN: a forget / reset_all refused ONLY because the user has not answered
-#: the preview yet (the preview and the confirm were made in one request)
-_CONFIRM_WAIT_CODES = frozenset({"forget_not_confirmed", "reset_not_confirmed"})
-#: §4PS: the code a refusal takes once the takeover answered it (a designed stop)
-_CONFIRM_WAIT_SHOWN = {"forget_not_confirmed": "forget_wait_shown", "reset_not_confirmed": "reset_wait_shown"}
-_CONFIRM_WAIT_RE = re.compile(r"the user has not answered yet", re.I)
-_PREVIEW_HEAD_RE = re.compile(r"^\s*PREVIEW — nothing was deleted\.\s*", re.M)
-
-
-#: a preview token as `memory._store_plan` mints it (secrets.token_hex(4))
-_PLAN_TOKEN_RE = re.compile(r"[0-9a-f]{8}")
-_TRAILER_RE = re.compile(r"(?:^|\n)Show this list to the user\.|(?:^|[ \n])Ask the user to\s+confirm\.")
-
-
-def _quiet_kb_result(res) -> bool:
-    """A knowledge_base result that neither changed anything nor answered
-    anything the owner asked: a forget/reset PREVIEW, or a REFUSAL. A read
-    (a document answer) is not quiet — the owner asked for it (r2 M2), and a
-    FAILED deletion may have run part-way (r2 m2)."""
-    if _PREVIEW_HEAD_RE.match(str(res or "")):
-        return True
-    # only the forget/reset flow's own refusals (r3 m2: a refused INGEST is
-    # work the owner asked for, and the model must say it did not happen)
-    return (getattr(getattr(res, "status", None), "value", None) == "rejected"
-            and str(getattr(res, "reason_code", "") or "").startswith(("forget_", "reset_")))
-
-
-def _confirm_wait_reply(refusal, rows, call_args=None, code: str = "forget_not_confirmed",
-                        batch=None) -> str:
-    """§4PN: the direct answer when a forget / reset_all was refused because
-    the USER has not seen the preview yet — the preview's own list and one
-    question that says exactly what "yes" will do — or "" (the caller keeps
-    the model-written wrap-up). Census + gold 10-16: all 3 such turns in 14
-    days told the owner the item was deleted or about to be. The project
-    wait (its own question) was right 4/4 and is not touched.
-
-    Takes over ONLY a turn whose every real call — the rows so far AND
-    every call of this batch, which all ran before any result is processed
-    (r2 M1) — was a knowledge_base preview or refusal (r1 M3/M5: an earlier
-    deletion, a write, or an answer the owner asked for must not be hidden
-    by "Nothing has been deleted yet"), and shows ONLY the preview the
-    refused call named — by its token, or the one preview of that kind when
-    the call gave none (r1 M4) — and only when the request holds exactly
-    one preview of that kind (r3 M1). ``batch``: (tool name, result) per call."""
-    if not _CONFIRM_WAIT_RE.search(str(refusal or "")):
-        return ""
-    want_reset = code == "reset_not_confirmed"
-    previews = []
-    for t in list(rows or []):
-        if not isinstance(t, dict) or t.get("_synthetic"):
-            continue
-        if str(t.get("name") or "").strip().lower() != "knowledge_base" or not _quiet_kb_result(t.get("content")):
-            return ""                                   # other work this turn: the model reports it
-        if _PREVIEW_HEAD_RE.match(str(t.get("content") or "")):
-            previews.append(str(t.get("content") or ""))
-    for name, res in list(batch or []):
-        # (r3 m1: a call blocked before dispatch has no slot here at all — a
-        # None result is a tool that RAN and returned nothing: not quiet)
-        if str(name or "").strip().lower() != "knowledge_base" or not _quiet_kb_result(res):
-            return ""                                   # a later call in this batch did something
-        if _PREVIEW_HEAD_RE.match(str(res)) and str(res) not in previews:
-            previews.append(str(res))
-    kind_previews = [p for p in previews
-                     if bool(re.match(r"\s*PREVIEW — nothing was deleted\.\s*reset_all\b", p)) == want_reset]
-    # r3 M1: exactly ONE preview of this kind in the request — the owner's
-    # "yes" next turn resolves to the NEWEST live preview, so with two the
-    # list shown could differ from the list deleted
-    if len(kind_previews) != 1:
-        return ""
-    token = str((call_args or {}).get("confirm") or "").strip().strip("'\"").strip()
-    named = kind_previews
-    if _PLAN_TOKEN_RE.fullmatch(token) and f"confirm='{token}'" not in kind_previews[0]:
-        return ""                                       # the refused call named another preview
-    if len(named) != 1 or "[TRUNCATED" in named[0]:
-        return ""                                       # cannot say exactly what "yes" deletes
-    preview = named[0]
-    cut = [m.start() for m in _TRAILER_RE.finditer(preview)]
-    if not cut:
-        return ""
-    shown = _PREVIEW_HEAD_RE.sub("", preview[:cut[-1]], count=1).strip()     # the LAST trailer (r1 M2)
-    if not shown:
-        return ""
-    # model-facing advice in the sweep's notes is not for the owner
-    shown = re.sub(r"\s*Re-issue with [^\n]*", "", shown)
-    shown = shown.replace("Notes from the search:", "Notes:")
-    shown = shown.replace("(kept unless the user picks them by number)", "(kept unless you pick them by number)")
-    if want_reset:
-        shown = re.sub(r"^reset_all would erase", "Resetting the memory would erase", shown, count=1)
-        ask = "Reply **yes** to go ahead, or tell me to stop. This stays open for an hour."
-    else:
-        shown = re.sub(r"^forget (.+?) would remove:", r"Forgetting \1 would remove:", shown, count=1)
-        main = shown.split("\nAlso found", 1)[0].split("\nNotes:", 1)[0]
-        # numbered 1..N without a gap (r2 m4: a label's own "3. …" line is not an item)
-        defaults = []
-        for d in re.findall(r"(?m)^(\d+)\. ", main):
-            if int(d) == len(defaults) + 1:
-                defaults.append(d)
-        extra = bool(re.search(r"(?m)^Also found", shown))
-        if not defaults:                                 # "yes" alone selects nothing (r1 M1)
-            ask = "Nothing is selected by default: reply with the numbers of the ones to delete."
-        else:
-            which = (f"item {defaults[0]}" if len(defaults) == 1
-                     else f"items {defaults[0]}–{defaults[-1]}")
-            ask = (f"Reply **yes** to delete {which}"
-                   + (", or give the numbers of exactly the ones to delete (any from either group)." if extra
-                      else ", or give the numbers of exactly the ones to delete." if len(defaults) > 1
-                      else ", or tell me to keep it.")
-                   )
-        ask += " This stays open for an hour."
-    from .receipt_marks import CONFIRM_WAIT_REPLY_HEAD as _CWH  # §4QO: one home for the literal
-    return f"{_CWH}\n\n{shown}\n\n{ask}"
+#: §4UL: the §4PN confirm-wait takeover (`_confirm_wait_reply`) is gone with
+#: §4UK's previews — a forget/reset refusal now is a wall, and the model says it.
 
 
 #: shell-like tool names a model reaches for — the work runs through `execute`
@@ -10229,6 +10124,41 @@ def _program_failed_on_its_own(tool_name, exit_code, result_text, is_rejection) 
             and "timed out / killed" not in text)
 
 
+_LAB_EXIT_RE = re.compile(r"^\[[^\]\n]*\bexit=(-?\d+)\b[^\]\n]*\]", re.M)
+
+
+def _is_project_task_turn(context) -> bool:
+    """§4UL review m3: the context is a project task's turn (`core/project_turns`, label ``ptask``)."""
+    try:
+        from .project_turns import TASK_TURN_LABEL
+        return str(getattr(context, "turn_origin_label", "") or "") == TASK_TURN_LABEL
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _lab_program_failed(tool_name, outcome, result_text) -> bool:
+    """§4UL (1d): a `lab exec` whose command RAN on the member and exited
+    non-zero, or a `run collect` of a job that EXITED non-zero — the same
+    fix-and-retry step as `execute`'s program failure. Read from the tools'
+    own reason codes, then the exit in the head: a refusal, a deadline or
+    cancel kill (no exit code), a lost/expired job and the sandbox's own
+    kills (124/137) are not the program's failure."""
+    if tool_name not in ("lab", "run"):
+        return False
+    code = str(getattr(outcome, "reason_code", "") or "")
+    text = str(result_text or "")
+    if tool_name == "lab":
+        if code != "lab_exit_nonzero" or not ("STDOUT:" in text or "STDERR:" in text):
+            return False
+    elif code != "run_job_failed" or not re.search(r"^\[run \S+ exited exit=", text, re.M):
+        return False
+    m = _LAB_EXIT_RE.search(text)
+    try:
+        return m is not None and int(m.group(1)) not in (0, 124, 137)
+    except ValueError:
+        return False
+
+
 _DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:s|ms|sec|secs|seconds)\b|\(\d+:\d\d:\d\d(?:\.\d+)?\)")
 
 
@@ -15061,6 +14991,11 @@ class GhostAgent:
                             # mid-build isn't stuck behind a 8K-token spec call.
                             kw.setdefault("is_background", True)
                             return await _bct(*a, **kw)
+
+                        # §4UL: the idle loop's executor — a task runs as an agent
+                        # turn, started only while no user request is active
+                        from .project_turns import mark_real_executor as _mre
+                        _mre(_aa_build, idle=True)
 
                         # Pin the EVENT stamp too: the pinned context above
                         # only scopes sandbox writes (context.current_project_id);
@@ -25183,7 +25118,6 @@ class GhostAgent:
                 # fewer than N tool replies — a dangling `tool_call_id` — and
                 # recorded a tool that really ran as an empty success.
                 _batch_short_circuit = False
-                _cw_shown_this_batch = False   # §4PS r2 m1: the takeover answered a confirm wait
                 # Cleared ONCE, after the loop. Clearing inside a loop over
                 # concurrently-gathered results erased only the trips EARLIER
                 # results had recorded, so whether a turn hard-aborted
@@ -25536,31 +25470,6 @@ class GhostAgent:
                         force_stop = True
                         _batch_short_circuit = True
                         logger.info("dead-end refusal (%s) — answered directly", _dead_code)
-                    elif (_dead_code in _CONFIRM_WAIT_CODES and not _batch_short_circuit
-                          and (_cw_reply := _confirm_wait_reply(
-                              _outcome, tools_run_this_turn,
-                              _recorded_args if isinstance(_recorded_args, dict) else {}, _dead_code,
-                              [(tool_call_metadata[_j][0], results[_j]) for _j in range(len(results))
-                               if _j != i]))):
-                        # §4PN: the preview awaits the USER — the answer is the
-                        # list and the question, not a model-written reply
-                        # (3 of 3 such replies said it was being deleted)
-                        final_ai_content = _cw_reply
-                        force_stop = True
-                        _batch_short_circuit = True
-                        logger.info("confirmation wait (%s) — answered with the preview's question", _dead_code)
-                        # §4PS: the system asked the user — a designed stop, not a
-                        # strike or a failed turn (live 15f54e1b). Renamed only here:
-                        # a refusal the model must explain itself stays a failure.
-                        _outcome.reason_code = _CONFIRM_WAIT_SHOWN[_dead_code]
-                        last_was_failure = False
-                        _cw_shown_this_batch = True
-                    elif _dead_code in _CONFIRM_WAIT_CODES and _cw_shown_this_batch:
-                        # §4PS r2 m1: a second confirm of the same batch (another
-                        # selection, or forget + reset) — the answer is already the
-                        # system's question, so it is the same designed stop
-                        _outcome.reason_code = _CONFIRM_WAIT_SHOWN[_dead_code]
-                        last_was_failure = False
                     elif _dead_code in _DEAD_END_REFUSALS and _dead_code != "not_owner_write":
                         force_final_response = True
                         logger.info("dead-end refusal (%s) — wrapping up the turn", _dead_code)
@@ -26465,6 +26374,10 @@ class GhostAgent:
                             # outer validator re-runs the solution itself.
                             if _is_sim and _res_unresolved:
                                 _is_sim = False
+                            # §4UL review m3: a project task turn is simulated (no owner memory) but
+                            # it is no self-play solver — a `test_solution.py` run must not end it
+                            if _is_sim and _is_project_task_turn(self.context):
+                                _is_sim = False
                             if _is_sim:
                                 # Pull the command text from the
                                 # assistant message that emitted this
@@ -26558,7 +26471,8 @@ class GhostAgent:
                         # §4UI: the latest failure decides; a syntax-guard
                         # rollback is a fix-and-resend step like a red test
                         failure_was_program = (str(getattr(_outcome, "reason_code", "") or "")
-                                               == "syntax_regression_rolled_back")
+                                               == "syntax_regression_rolled_back"
+                                               or _lab_program_failed(fname, _outcome, str_res))
                         failure_was_partial = (
                             _outcome.status is _OutcomeStatus.PARTIAL)
                         last_error_preview = str_res.replace("Error:", "").strip()
@@ -26951,7 +26865,7 @@ class GhostAgent:
                                    f"{last_error_preview[:100]}",
                                    icon=Icons.VERDICT_NOTE, level="INFO")
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
-                    elif (failure_was_program and _fail_fname in ("execute", "file_system")
+                    elif (failure_was_program and _fail_fname in ("execute", "file_system", "lab", "run")
                           and not _program_fail_repeats(strikes, failure_text)):
                         # §4UI (coding review A1): a write-and-run batch whose
                         # test is still red is how debugging goes — counting it
@@ -27401,7 +27315,8 @@ class GhostAgent:
         # §4PG (R2-8): a coding LEAF is one step of the advancer, which writes
         # its own `[autoadvance]` row — the leaf's turn must not add an
         # "interactive" row beside it
-        if str(getattr(self.context, "turn_origin_label", "") or "") == "leaf":
+        # §4UL: a project task's turn too (`project_turns`) — the advancer writes its row
+        if str(getattr(self.context, "turn_origin_label", "") or "") in ("leaf", "ptask"):
             return
         try:
             _snap = None
@@ -33894,6 +33809,23 @@ class GhostAgent:
                     _rd_forget(_nrid)
             except Exception:  # noqa: BLE001
                 pass
+            # §4UL: a task closed DONE during this request has its clean-up
+            # sweep run now, at the request's end (`memory.projects`) — a later
+            # call of the same request may still have needed the files
+            try:
+                from ..memory import projects as _pj_mod
+                _flush_sweeps = getattr(_pj_mod, "flush_deferred_sweeps", None)
+                if _flush_sweeps is not None:
+                    for _srid in dict.fromkeys((request_id_context.get(), req_id)):
+                        _fs_res = _flush_sweeps(_srid)
+                        if asyncio.iscoroutine(_fs_res):
+                            # never awaited here: a cancel landing in this
+                            # finally would skip the scope resets below
+                            _fs_task = asyncio.ensure_future(_fs_res)
+                            _DEFERRED_SWEEP_TASKS.add(_fs_task)
+                            _fs_task.add_done_callback(_DEFERRED_SWEEP_TASKS.discard)
+            except Exception:  # noqa: BLE001 — a sweep never breaks the request's end
+                logger.warning("deferred DONE sweeps not flushed", exc_info=True)
             # Queued messages: the loop is over — nothing more is read, even
             # while a streamed final still drains. Pending ones → leftovers.
             # §4SB: and the ones drained for a model call that never completed

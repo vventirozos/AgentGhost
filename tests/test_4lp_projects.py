@@ -532,6 +532,8 @@ async def test_one_owner_step_takes_back_exactly_the_task_it_runs(store):
     v2 = store.add_task(pid, "Verify the signup flow")
     for t in (v1, v2):
         store.update_task(t, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}", wait_on="owner_turn")
+    # §4UL: the build fails here (no generator) — the checks were declared independent of it
+    store.update_project(pid, metadata={"independent_tasks": [v1, v2]})
     ctx = SimpleNamespace(project_store=store, workspace_model=None, current_project_id=None)
 
     async def runner(name, args):

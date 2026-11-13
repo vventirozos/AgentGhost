@@ -119,6 +119,15 @@ class ToolOutcome(str):
 
     __slots__ = ("status", "world_changed", "reason_code", "declared",
                  "call_args", "duration_s")
+    # set in __new__ (a str subclass has no __init__ to set them in); declared
+    # here, unassigned, so a linter sees the members (§4UL: pylint's no-member
+    # had leaned on assignments elsewhere in the tree)
+    status: "OutcomeStatus"
+    world_changed: Optional[bool]
+    reason_code: Optional[str]
+    declared: bool
+    call_args: Optional[dict]
+    duration_s: Optional[float]
 
     def __new__(cls, text: Any = "", status: "OutcomeStatus" = OutcomeStatus.OK,
                 world_changed: Optional[bool] = None,

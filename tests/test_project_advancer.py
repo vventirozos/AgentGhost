@@ -273,10 +273,12 @@ async def test_budget_increments_on_each_tick(context, store):
     assert proj["metadata"]["steps_used"] == 2
 
 
-async def test_budget_exhaustion_blocks_further_advance(context, store):
+async def test_a_steps_cap_no_longer_blocks_further_advance(context, store):
+    """§4UL (decision 3B): the lifetime step count is a record, not a cap."""
     pid = store.create_project("P", metadata={"steps_cap": 1})
-    store.add_task(pid, "Research A")
-    store.add_task(pid, "Research B")
+    a = store.add_task(pid, "Research A")
+    store.add_task(pid, "Research B", depends_on=[])
+    store.update_project(pid, metadata={"independent_tasks": [t["id"] for t in store.list_tasks(pid)]})
 
     async def runner(name, args):
         return "x"
@@ -284,10 +286,8 @@ async def test_budget_exhaustion_blocks_further_advance(context, store):
     r1 = await advance_once(context, pid, tool_runner=runner)
     assert r1.classification == "research"
     r2 = await advance_once(context, pid, tool_runner=runner)
-    assert r2.classification == "blocked"
-    assert "budget" in r2.summary.lower()
-    evs = store.list_events(pid, event_type="budget_exhausted")
-    assert evs
+    assert r2.classification != "blocked"
+    assert not store.list_events(pid, event_type="budget_exhausted")
 
 
 async def test_default_budget_applied(context, store):
@@ -300,7 +300,7 @@ async def test_default_budget_applied(context, store):
     await advance_once(context, pid, tool_runner=runner)
     proj = store.get_project(pid)
     assert proj["metadata"]["steps_used"] == 1
-    assert proj["metadata"]["steps_cap"] == DEFAULT_STEPS_CAP
+    assert "steps_cap" not in proj["metadata"]           # §4UL: no lifetime cap is set
 
 
 # --------------------------------------------------------------------- in-progress guard

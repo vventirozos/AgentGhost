@@ -225,18 +225,14 @@ async def test_no_runner_self_analysis_still_completes(store, tmp_path):
 
 # ------------------------------------------------- round-robin rotation stamp
 
-async def test_budget_exhausted_tick_stamps_and_bounds_events(context, store):
+async def test_a_lifetime_steps_cap_no_longer_blocks_a_tick(context, store):
+    """§4UL (decision 3B): `steps_cap` is no cap — the unattended limit is a daily allowance
+    (advance_unattended); the stamp/bound rule is pinned by the secondary-rail test below."""
     pid = store.create_project("P", metadata={"steps_cap": 0})
     store.add_task(pid, "Research x")
-
-    for _ in range(3):
-        res = await advance_once(context, pid)
-        assert res.classification == "blocked"
-
-    meta = store.get_project(pid)["metadata"] or {}
-    assert float(meta.get("last_autoadvance_ts", 0)) > 0
-    # one exhaustion episode → ONE event, not one per pick
-    assert len(store.list_events(pid, event_type="budget_exhausted")) == 1
+    res = await advance_once(context, pid)
+    assert res.task_id is not None and "budget" not in res.summary.lower()     # the leaf was picked
+    assert not store.list_events(pid, event_type="budget_exhausted")
 
 
 async def test_secondary_rail_block_stamps_and_bounds_events(context, store):

@@ -15,6 +15,7 @@ IMAGES = [  # build order: parents first
     ("base", "ghost-lab/base:1"), ("tor-gw", "ghost-lab/tor-gw:1"), ("pg", "ghost-lab/pg:18"),
     ("patroni", "ghost-lab/patroni:18"), ("web", "ghost-lab/web:1"), ("python-app", "ghost-lab/python-app:1"),
     ("mysql", "ghost-lab/mysql:8"), ("browser", "ghost-lab/browser:1"), ("agentapi", "ghost-lab/agentapi:1"),
+    ("static", "ghost-lab/static:1"), ("node-app", "ghost-lab/node-app:1"),
 ]
 
 

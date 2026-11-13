@@ -192,7 +192,8 @@ accepts it on an explicit `--subnet … --ip-range …` network. The FORWARD cha
 ### MED
 13. **Backups:** `backup: {cmd, restore_cmd}`. Volumes are read with `get_archive` from the member and restored with `put_archive`
     (no host bind mounts), then `restore_cmd` runs. No hook → stop app → archive → start app. The manager's sqlite
-    (config, leases, secrets) is backed up daily as well, next to the data backups.
+    (config, leases, secrets) is backed up daily as well, next to the data backups. (§4UL round 3: postgres members
+    are copied stopped even with a hook, and a restore that put back postgres files does not run `restore_cmd`.)
 14. **App control:**
     - `POST /v1/labs/{id}/app/{start|stop|restart}` (owner origin for kept labs); `start` is the way out of `crashloop`.
     - Lab detail gains `app: {name, member, state: staged|starting|up|restarting|crashloop|stopped, port, url, restarts, last_probe_at, last_error}`.
@@ -249,3 +250,16 @@ accepts it on an explicit `--subnet … --ip-range …` network. The FORWARD cha
   never secrets or ids beyond lab ids). `PUT /v1/previews` (agent, X-Labs-Key) replaces the preview list shown there.
 - Tests: an app reachable over HTTPS on the tailnet name with a valid certificate, and not on the tailnet IP's plain port; LAN off → not
   reachable on the LAN IP; LAN on → reachable; serve entries removed on destroy; the Apps page lists apps and previews.
+
+
+## 13. §4UL (2026-11-12): templates, owner composition, build step, in-place deploy
+
+- `POST /v1/labs` adds `overrides {mem_mb, ports, cap_add, cpus, egress}` (a plain value or `{member: value}`) on a template; the
+  members are validated again with the template rules. `members` and `overrides` are **owner origin only** (`owner_only`).
+- A template may carry `app {member, port, cmd, health, build, service}`; `keep` fills what the caller left out; `/v1/templates` lists it.
+- Kept app fields added: `build` (null = auto, "" = none, else a command), `subdir` (the agent ships `<folder>/<subdir>`), `service`.
+- Deploy: the build runs in `<workdir>.new` before the swap; `requirements.build` overrides it per deploy. New error `build_failed` (422).
+- Deploy answer adds `rolled_back` (+ `failed_probe`, `rollback_error`) when the previous archive was redeployed, and `still_starting`.
+  `probe.build_log` carries the build's tail.
+- `PUT /v1/labs/{id}/app/config {cmd?, health?, port?, workdir?, build?, subdir?}` → `{lab_id, app, probe, changed}`.
+- Images added: `ghost-lab/static:1`, `ghost-lab/node-app:1`.

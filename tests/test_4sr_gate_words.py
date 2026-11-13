@@ -529,7 +529,8 @@ async def test_tool_names_a_waiting_task_on_any_stop(tctx, monkeypatch):
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))
     assert out["stop_reason"] == "deadline"
     assert [t["task_id"] for t in out["needs_user_tasks"]] == [tid]
-    assert "not their answer" in out["agent_instruction"]
+    # §4UL: no "name them and ask" — say in one line what only the owner has
+    assert "say what, in one line" in out["agent_instruction"] and "and ask" not in out["agent_instruction"]
 
 
 # ------------------------------------------------------------- the idle loop's wiring
@@ -712,7 +713,7 @@ async def test_a_hold_on_another_stop_is_named_as_a_hold(tctx, monkeypatch):
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))
     assert [t["task_id"] for t in out["needs_user_tasks"]] == [gid]
     assert [t["task_id"] for t in out["held_tasks"]] == [tid]
-    assert "not their answer" in out["agent_instruction"]
+    assert "say what, in one line" in out["agent_instruction"]                      # §4UL
     assert "Held for the owner's own run" in out["agent_instruction"]
 
 

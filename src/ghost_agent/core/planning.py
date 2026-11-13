@@ -1279,3 +1279,104 @@ class ProjectPlan:
 
     def generate_retrospective(self) -> Dict[str, Any]:
         return self.tree.generate_retrospective()
+
+
+# §4UL (review: req c6b9f65d wrote findings.md over two experiments the batch had skipped): plan
+# order is a SOFT dependency. A task whose own depends_on is empty does not start while a task
+# BEFORE it among its siblings (or inside such a sibling) waits (held for the owner, blocked,
+# paused), is still running, or was skipped by the run (``excluded``: lab-held tasks, model
+# experiments the batch stopped at). A FAILED task does NOT hold later work (§4UL review M1: one
+# failure silently stopped the whole plan); it is reported, and the owner re-runs it. A task that declares its
+# own depends_on is governed by that list only; a task the plan declared independent
+# (``depends_on: []`` in decompose/task_update → project metadata ``independent_tasks``) is never
+# held by order. In the owner's own run the held tasks are counted as PENDING for the pick, so the
+# owner's run takes them first instead of stopping behind them.
+SOFT_ORDER_STOPS = frozenset({TaskStatus.NEEDS_USER, TaskStatus.BLOCKED,
+                              TaskStatus.PAUSED, TaskStatus.IN_PROGRESS})
+
+
+def independent_task_ids(project_meta) -> set:
+    """The ids declared independent of plan order (project metadata ``independent_tasks``)."""
+    try:
+        return {str(x) for x in ((project_meta or {}).get("independent_tasks") or [])}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def soft_order_blocked(plan_or_tree, excluded=(), independent=()) -> set:
+    """Ids held back by plan order (see SOFT_ORDER_STOPS above): every task (and its subtree)
+    after a sibling that waits, runs or is ``excluded`` (never one that merely failed), unless it
+    declares its own depends_on or is ``independent``."""
+    return set(soft_order_stoppers(plan_or_tree, excluded, independent))
+
+
+def soft_order_stoppers(plan_or_tree, excluded=(), independent=()) -> Dict[str, set]:
+    """§4UL review M1: the same plan-order rule as :func:`soft_order_blocked`, keyed by the held
+    id, with the EARLIER sibling(s) that hold it (at its own level or an ancestor's) as the value,
+    so a caller can say WHAT a held task waits behind (the stuck-project check)."""
+    tree = getattr(plan_or_tree, "tree", plan_or_tree)
+    nodes = getattr(tree, "nodes", None) or {}
+    excluded, independent = set(excluded or ()), set(independent or ())
+    memo: Dict[str, bool] = {}
+
+    def stops(nid: str, seen=None) -> bool:
+        if nid in memo:
+            return memo[nid]
+        seen = set(seen or ()) | {nid}
+        n = nodes.get(nid)
+        r = bool(n is not None and (nid in excluded or n.status in SOFT_ORDER_STOPS or any(
+            stops(c, seen) for c in n.children if c in nodes and c not in seen)))
+        memo[nid] = r
+        return r
+
+    def subtree(nid: str) -> List[str]:
+        out, stack = [], [nid]
+        seen: set = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen or cur not in nodes:
+                continue
+            seen.add(cur)
+            out.append(cur)
+            stack.extend(nodes[cur].children)
+        return out
+
+    groups: Dict[Optional[str], List[str]] = {}
+    for nid, n in nodes.items():                       # insertion = plan order (depth, position)
+        pid = n.parent_id if n.parent_id in nodes else None
+        groups.setdefault(pid, []).append(nid)
+    held: Dict[str, set] = {}
+    for sibs in groups.values():
+        stoppers: set = set()
+        for nid in sibs:
+            n = nodes[nid]
+            if stoppers and not n.depends_on and nid not in independent:
+                for d in subtree(nid):
+                    held.setdefault(d, set()).update(stoppers)
+                continue
+            if n.status != TaskStatus.DONE and stops(nid):
+                stoppers = stoppers | {nid}
+    return held
+
+
+def later_done_dependents(plan_or_tree, task_id: str, independent=()) -> List[str]:
+    """§4UL: the DONE tasks that were built on ``task_id`` before it closed — the ones that
+    declare it in depends_on, and the later siblings that run in plan order (no depends_on of
+    their own, not independent). Their work may predate this close: re-check them."""
+    tree = getattr(plan_or_tree, "tree", plan_or_tree)
+    nodes = getattr(tree, "nodes", None) or {}
+    me = nodes.get(task_id)
+    if me is None:
+        return []
+    independent = set(independent or ())
+    out: List[str] = [nid for nid, n in nodes.items()
+                      if nid != task_id and n.status == TaskStatus.DONE and task_id in (n.depends_on or [])]
+    pid = me.parent_id if me.parent_id in nodes else None
+    sibs = [nid for nid, n in nodes.items() if (n.parent_id if n.parent_id in nodes else None) == pid]
+    after = sibs[sibs.index(task_id) + 1:] if task_id in sibs else []
+    for nid in after:
+        n = nodes[nid]
+        if (n.status == TaskStatus.DONE and not n.depends_on and nid not in independent
+                and nid not in out):
+            out.append(nid)
+    return out

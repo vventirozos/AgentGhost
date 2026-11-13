@@ -1,9 +1,17 @@
 name: pg-single
-description: One PostgreSQL 18 server (superuser postgres / lab), no internet
+description: "One PostgreSQL 18 server (superuser postgres / lab), no internet. Keepable as a database service: lab keep fills in the app (member pg1, port 5432, TCP health) and a watchdog keeps postgres running; kept, it is reached as host:port over TCP (no URL). The kept database lives in /data/pg and is backed up with postgres stopped for the copy (a consistent copy; a few seconds offline), so keep it BEFORE loading data — the disposable lab's data is not carried over"
 egress: none
 # a bare `psql` connects as the superuser (the exec user is root; local auth is trust)
 env: {PGUSER: postgres}
 members:
   # ready: the UNIX socket a bare `psql` uses (the lab's readiness below asks TCP)
-  - {name: pg1, image: "ghost-lab/pg:18", mem_mb: 768, cpus: 1.0, ready: "pg_isready -q"}
+  - {name: pg1, image: "ghost-lab/pg:18", mem_mb: 512, cpus: 1.0, ready: "pg_isready -q"}
 readiness: {member: pg1, cmd: "pg_isready -h localhost", timeout_s: 90}
+app:
+  member: pg1
+  port: 5432
+  service: true
+  build: none
+  health: {http: null, tcp: true}
+  # restarts postgres if it died; never while initdb (a fresh /data) still runs
+  cmd: "sleep 20; while :; do pg_isready -q -h localhost || pgrep -x postgres >/dev/null || pgrep -x initdb >/dev/null || (setsid bash /etc/lab/start.d/10-postgres.sh >> /var/log/lab/10-postgres.log 2>&1 < /dev/null &); sleep 10; done"

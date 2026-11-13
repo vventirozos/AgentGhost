@@ -4,15 +4,43 @@ not answered yet") and the system answered with the preview's question —
 the designed behaviour — yet the stream printed "Execution Fail" and
 "turn outcome failed". The forget / reset_all confirm refusals are a
 DESIGNED stop, like the project's `confirm_dead_end`: no strike, no failed
-turn, no corpus failure flag."""
+turn, no corpus failure flag.
+
+§4UL: the §4PN takeover that produced `forget_wait_shown` is gone with
+§4UK's previews; the codes stay designed stops for rows already recorded,
+and a `forget_not_confirmed` wall refusal is the model's to explain."""
 from __future__ import annotations
 
 from ghost_agent.distill.outcome_heuristics import (DESIGNED_STOP_REASONS as H, is_designed_stop,
                                                     tool_failure_flags)
 from ghost_agent.tools.outcome import DESIGNED_STOP_REASONS as T, ToolOutcome as TO
-from tests.test_4pn_confirm_wait import _batches, real_kb  # noqa: F401 — fixture
+from ghost_agent.core.strikes import StrikeLedger
+from ghost_agent.utils.logging import request_id_context
 
 WAIT = "NOT deleted: the user has not answered yet — show them the list and wait for their reply."
+
+
+async def _batches(batches, tools, rid="web-4ps-1"):
+    """Run each batch through the REAL dispatch, sharing one turn's rows."""
+    import tests.test_4jj_search_yield_steer as H
+    agent = H._agent()
+    agent.available_tools = tools
+    from ghost_agent.utils.logging import conversation_key_context
+    tok = request_id_context.set(rid)
+    ck = conversation_key_context.set("conv-4ps")
+    rows = []
+    try:
+        for calls in batches:
+            ts = H._ts(calls, StrikeLedger(), set())
+            ts.tools_run_this_turn[:] = rows
+            await agent._dispatch_and_process_tool_batch(ts)
+            rows = list(ts.tools_run_this_turn)
+            if ts.force_stop:
+                break
+    finally:
+        conversation_key_context.reset(ck)
+        request_id_context.reset(tok)
+    return ts
 
 
 def test_only_an_answered_wait_is_a_designed_stop():
@@ -41,20 +69,13 @@ def test_the_census_class_is_asked_user():
                        "result": WAIT + "\n[designed stop: forget_wait_shown]"}) == "asked_user"
 
 
-async def test_a_wait_the_takeover_declines_stays_a_strike():
-    """r1 MAJOR: two previews → the model writes the reply (it said "deleted"
-    3/3 in §4PN), so the refusal keeps its failure flag and its strike."""
-    from tests.test_4pn_confirm_wait import _pv
-    a = _pv("A", main=("fact 'a'",)).replace("tok1", "aaaa1111")
-    b = _pv("B", main=("fact 'b'",)).replace("tok1", "bbbb2222")
-
+async def test_a_wall_refused_forget_is_the_models_to_explain():
+    """§4UL: no system takeover is left — a forget a wall refused keeps its
+    failure flag and its strike, and the model writes the reply."""
     async def kb(**kw):
-        if kw.get("confirm"):
-            return TO.rejected(WAIT, reason_code="forget_not_confirmed")
-        return a if kw.get("target") == "A" else b
-    ts = await _batches([[("knowledge_base", {"action": "forget", "target": "A"}),
-                          ("knowledge_base", {"action": "forget", "target": "B"})],
-                         [("knowledge_base", {"action": "forget", "confirm": "aaaa1111", "items": "all"})]],
+        return TO.rejected("NOT deleted: a background turn may not delete. That list is withdrawn.",
+                           reason_code="forget_not_confirmed")
+    ts = await _batches([[("knowledge_base", {"action": "forget", "confirm": "aaaa1111", "items": "all"})]],
                         {"knowledge_base": kb})
     assert not ts.force_stop and ts.execution_failure_count == 1
     assert ts.tools_run_this_turn[-1]["content"].reason_code == "forget_not_confirmed"

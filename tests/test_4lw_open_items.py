@@ -90,16 +90,16 @@ async def test_the_turn_loop_stops_calling_tools_after_a_dead_end():
     assert "retry" not in ts.final_ai_content.lower()
 
 
-async def test_a_confirm_dead_end_lets_the_model_ask_the_user():
+async def test_a_wall_dead_end_lets_the_model_say_why():
     from ghost_agent.core.strikes import StrikeLedger
     import tests.test_4jj_search_yield_steer as H
     agent = H._agent()
 
     async def refuse(**kw):
-        return ToolOutcome.rejected("Error: NOT done: the user has not answered yet. STOP calling it.",
-                                    world_changed=False, reason_code="confirm_dead_end")
-    agent.available_tools = {"manage_projects": refuse}
-    ts = H._ts([("manage_projects", {"action": "delete", "project_id": "x", "confirm_token": "t"})],
+        return ToolOutcome.rejected("NOT deleted: a background turn may not delete. That list is withdrawn.",
+                                    world_changed=False, reason_code="forget_not_confirmed")
+    agent.available_tools = {"knowledge_base": refuse}
+    ts = H._ts([("knowledge_base", {"action": "forget", "confirm": "aaaa1111"})],
                StrikeLedger(), set())
     await agent._dispatch_and_process_tool_batch(ts)
     assert ts.force_final_response is True and not ts.force_stop

@@ -138,3 +138,44 @@ def test_a_refused_forget_cannot_run_later_with_a_placeholder_token(tmp_path, as
         assert ("ektoras", "WORKS_AT", "acme") in _edges(gm)
     finally:
         conversation_key_context.reset(ct)
+
+
+def test_a_list_made_after_reading_a_page_never_runs_even_from_a_clean_request(tmp_path, as_rid, monkeypatch):
+    """Review r3 MAJOR: items='list' in a request that read a page stored a live token, and a clean later
+    request ran it. Fails in that world."""
+    import ghost_agent.utils.provenance as PV
+    monkeypatch.setattr(PV, "untrusted_seen", lambda rid=None: ["web page"] if rid == "req-page" else [])
+    pm, gm = _family(tmp_path)
+    as_rid("req-page")
+    listed = str(_kb(pm, gm, action="forget", target="ektoras", items="list"))
+    assert listed.startswith("LIST")
+    as_rid("req-clean")
+    out = str(_kb(pm, gm, action="forget", confirm=_token(listed), items="all"))
+    assert "outside content" in out and ("ektoras", "WORKS_AT", "acme") in _edges(gm)
+
+
+def test_a_wrong_number_keeps_the_list_and_shows_its_token(tmp_path, as_rid):
+    """Review r3 m1: "the token still works" was said about a dropped, never-shown token. Fails in that world."""
+    as_rid("req-the-user")
+    pm, gm = _family(tmp_path)
+    out = str(_kb(pm, gm, action="forget", target="ektoras", items="99"))
+    assert "not on the list" in out and "The list (token " in out and ("ektoras", "WORKS_AT", "acme") in _edges(gm)
+    tok = out.split("The list (token ", 1)[1].split(")", 1)[0]
+    done = str(_kb(pm, gm, action="forget", confirm=tok, items="1"))
+    assert "✅" in done
+
+
+def test_a_token_refused_by_a_wall_is_withdrawn(tmp_path, as_rid, monkeypatch):
+    """Review r4: a confirm refused because the request read a page left the list live, and a clean later
+    request ran it. Fails in that world."""
+    import ghost_agent.utils.provenance as PV
+    seen = {"req-one": []}
+    monkeypatch.setattr(PV, "untrusted_seen", lambda rid=None: seen.get(rid, []))
+    pm, gm = _family(tmp_path)
+    as_rid("req-one")
+    listed = str(_kb(pm, gm, action="forget", target="ektoras", items="list"))
+    seen["req-one"] = ["browser"]                                    # the page is read after the list
+    assert "outside content" in str(_kb(pm, gm, action="forget", confirm=_token(listed), items="all"))
+    as_rid("req-two")
+    out = str(_kb(pm, gm, action="forget", confirm=_token(listed), items="all"))
+    assert "✅" not in out and ("ektoras", "WORKS_AT", "acme") in _edges(gm)

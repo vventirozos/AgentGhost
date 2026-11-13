@@ -64,7 +64,8 @@ H=(-H "X-Labs-Key: $KEY" -H "X-Labs-Origin: owner" -H "Content-Type: application
 curl "${H[@]}" $B/v1/health
 curl "${H[@]}" $B/v1/templates
 curl "${H[@]}" -X POST $B/v1/labs -d '{"template":"patroni-3","owner":"project:p1","label":"failover test"}'
-curl "${H[@]}" -X POST $B/v1/labs -d '{"members":[{"name":"a","image":"ghost-lab/base:1","mem_mb":512}],"egress":"none"}'
+curl "${H[@]}" -X POST $B/v1/labs -d '{"members":[{"name":"a","image":"ghost-lab/base:1","mem_mb":512}],"egress":"none"}'   # owner only (§4UL)
+curl "${H[@]}" -X POST $B/v1/labs -d '{"template":"python-pg","overrides":{"mem_mb":{"app":1024},"ports":{"app":[8080,5000]}}}'  # owner only
 curl "${H[@]}" $B/v1/labs                       # ?owner=project:p1
 curl "${H[@]}" $B/v1/labs/lab_1234abcd
 curl "${H[@]}" -X POST $B/v1/labs/lab_1234abcd/exec -d '{"member":"pg1","cmd":"psql -c \"select 1\"","timeout_s":60}'
@@ -84,7 +85,8 @@ curl "${H[@]}" -X DELETE "$B/v1/labs?owner=project:p1"   # disposable labs of an
 curl "${H[@]}" -X POST $B/v1/gc                          # owner only: reap once + prune dangling images/build cache
 # kept machines (owner origin only)
 curl "${H[@]}" -X POST $B/v1/labs/lab_1234abcd/keep -d '{"app":{"name":"chess","member":"app","cmd":"python3 app.py","port":8080,"health":{"http":"/"}},"secrets":["APP_KEY"],"data":"shared","lan":false}'
-curl "${H[@]}" -X POST $B/v1/labs/lab_1234abcd/deploy -d '{"archive_b64":"<tgz>","requirements":{"pip":["flask"]},"data_seed":["saves"]}'
+curl "${H[@]}" -X POST $B/v1/labs/lab_1234abcd/deploy -d '{"archive_b64":"<tgz>","requirements":{"pip":["flask"],"build":"none"},"data_seed":["saves"]}'
+curl "${H[@]}" -X PUT $B/v1/labs/lab_1234abcd/app/config -d '{"cmd":"gunicorn -b 0.0.0.0:8080 app:app","port":8080}'   # cmd|health|port|workdir|build|subdir
 curl "${H[@]}" -X POST $B/v1/labs/lab_1234abcd/app/restart       # start|stop|restart (start leaves crashloop)
 curl "${H[@]}" -X POST $B/v1/labs/lab_1234abcd/rehearse
 curl "${H[@]}" -X POST $B/v1/labs/lab_v2/switch -d '{"from_lab":"lab_v1"}'
@@ -106,12 +108,14 @@ Errors: `{"error","message","hint",...}` with the codes in `ghost_labs/errors.py
 ## Templates
 
 Shipped templates are read from the code's own `templates/` folder (`/opt/ghost-labs/templates/`), so syncing the
-code deploys them (shipped: blank-dev, web, python-app, mysql-single = tor; pg-single, patroni-3 = none).
+code deploys them (shipped: blank-dev, web, python-app, node-app, python-pg, mysql-single = tor; pg-single, patroni-3,
+static-site = none).
 `/etc/ghost-labs/templates/` holds only templates you add: a file there whose `name` is a shipped one is NOT loaded,
 and the service logs a warning at start (rename it). A file there that does not load, for any reason, is also skipped with a
 warning; it never stops the service (a shipped template that does not parse does). Two files there with one
 name: the first (by file name) is loaded, the other is named in a warning. `install.sh` removes old identical copies of shipped ones there.
-Keys: `name, description, egress, members[{name,image,mem_mb,cpus,ports,cap_add,env}], env, readiness{member,cmd,check,timeout_s}, params`.
+Keys: `name, description, egress, members[{name,image,mem_mb,cpus,ports,cap_add,env,ready}], env, readiness{member,cmd,check,timeout_s}, params,
+app{member,port,cmd,health,build,service}` (§4UL: `app` fills what a keep leaves out; `service: true` = runs with nothing deployed).
 `check` is `exit_code` or a predicate registered with `@ready_check` in `ghost_labs/labs.py`. Add a file, then
 `systemctl restart ghost-labs`. Images must be `ghost-lab/*` and built (add `images/<name>/Dockerfile` + an entry in `cli.IMAGES`).
 
@@ -140,9 +144,19 @@ Reboot: `make itest-reboot-pre`, reboot, `make itest-reboot-post`.
   moves; a failure there is reported as `lease_error` (+ `last_error`) without undoing the switch.
 - If the service dies mid-move, nothing is moved at the next start: both versions get a `last_error` saying so,
   and `switch` (to the version you want, `from_lab` = the other) works even when no version is live.
-- Restore needs a mounted version, snapshots the restored member first (`pre_restore`) and streams from the file;
-  on failure the app is `stopped` and **held** (no restart, not even after a reboot) with the snapshot id in
-  `last_error`; `POST app/start` releases the hold.
+- Restore needs a mounted version, snapshots the restored member first (`pre_restore`) and streams from the file.
+  A failure that did not touch `/data` puts the app back as it was (`touched: false`, `restarted` = whether it runs
+  again). A failure after `/data` was touched leaves the app `stopped` and **held** (no restart, no keeper, no daily
+  backup, not even after a reboot) with the step, the backup and the pre-restore snapshots in `last_error`. If the
+  member's `/data` was cleared and not refilled, it carries the marker `/data/.ghost-restore-incomplete` (written
+  before the clear, kept by it, removed only by a restore that completed): the pg image's `10-postgres.sh` then
+  neither runs `initdb` nor starts postgres, even after a container restart, and `POST app/start` is refused
+  (`not_ready`, `restore_incomplete`). Release: restore a good backup (it clears the marker), or
+  `POST app/start?reinit=true` — removes the marker and starts postgres on what `/data` holds (an empty data dir is
+  initialised — an EMPTY database only if the restore never got the files in); the protected snapshots stay protected
+  for 7 days (`protected_until`, released by the first daily backup after it). A hold whose restore completed is
+  released by a plain `app/start`. Why the app is held is in `hold_reason` (its own field, shown by the view; added to,
+  never replaced by a later note).
 - Backups: a failed copy leaves no file; the daily backup is retried after 1 h, not every tick. The final backup
   (delete with `drop_data`) covers every member, stops the app (also with a hook) and the lab goes in the same lock.
   A version with no data mounted (staged / switched out) never removes data volumes.
@@ -313,3 +327,93 @@ contents are redacted as in `GET /files`. `GET /files` of a directory now adds `
 - A crash during a rollback's snapshot restores is reported as an interrupted move; the pre-restore snapshot ids
   live only in the response; find them with `GET /backups` (kind `pre_restore`).
 - Mutation battery: `python3 scripts/mutate_4sx_labs.py` (in the agent repo) — copies this tree, runs the unit suite per mutant.
+
+## Templates, build step, in-place deploy (§4UL, 2026-11-12)
+
+- New images `ghost-lab/static:1` (nginx on 8080 serving `/app`, no listing, dotfiles 404) and `ghost-lab/node-app:1`
+  (Debian nodejs + npm), both FROM base. Build them on the host after syncing: `sudo ghost-labs build-images static`,
+  `sudo ghost-labs build-images node-app`.
+- New templates `static-site`, `node-app`, `python-pg`; `pg-single` is keepable (a watchdog service app).
+- `POST /v1/labs` takes `overrides {mem_mb, ports, cap_add, cpus, egress}` (plain or `{member: value}`) on a template;
+  `members` / `overrides` are owner-origin only.
+- Deploy runs the app's build in `<workdir>.new` before the swap (`kept.AUTO_BUILD`: requirements.txt → `pip --target .deps`;
+  package.json → `npm ci`/`npm install` + `npm run build --if-present`); `requirements.build` overrides per deploy, `"none"` = off.
+  A failed build is `build_failed` (422) and the running version is untouched. The app starts with `kept.DEPS_PREFIX`.
+- A deploy of an app that was `up` whose new version exits or answers ≥400 on its health path puts the previous version
+  back: `<workdir>.prev` (the folder as it ran, no build; its `requirements.pip` reinstalled into `/opt/venv`), else its
+  saved built folder, else its archive built again. Answers `rolled_back`, `failed_probe`, `data_note` (the old code runs on
+  `/data` as the failed version left it; `pre_deploy_backup` names the backup from before, when the app had one)
+  (+ `rollback_error`, `pip_note`). A live process not answering yet is `still_starting`. `built_not_saved`: the built
+  folder was not saved (over `BUILT_MAX` or a docker error) — a switch/rollback/rehearse of it builds again.
+- `PUT /v1/labs/{id}/app/config` changes cmd/health/port/workdir/build/subdir of a kept app (port moves the keyed lease;
+  cmd/health/port/workdir restart it). Kept apps get `PORT` and `DATA_DIR=/data` in their env.
+- Tests: `tests/unit/test_4ul_kept.py`.
+
+### Review fixes (§4UL, 2026-11-12)
+
+- The automatic revert reads `was_up` before the pre-deploy backup (a hook-less backup restarts the app) and puts
+  `<workdir>.prev` back (the swap keeps the replaced folder) — no build. Each deploy saves the built folder as
+  `<archive>.built.tar` (≤ `BUILT_MAX`); switch / reverse / rollback / rehearse / the twin unpack it instead of building
+  again over Tor. Archives from before this have none and are built again once.
+- Backups copy `/data` of every member; a `ghost-lab/pg:*` member has postgres stopped for its copy (`PG_STOP`/`PG_START`)
+  — with a backup hook too (the hook runs first; re-review). A restore of a pg member stops postgres, restores the files,
+  starts it and checks `pg_isready`; a failure names its `step`. Round 3: once a restore (single or set) has put back
+  any pg member's files, the hook's `restore_cmd` is NOT run (its dump is older than the stopped copy) — `hook_note`
+  says so; it runs only when no pg files were restored. `POST /restore` restores a whole set (same ts/kind), the app
+  member last, and answers `pre_restore_by_member`; a failure holds the app only when `/data` was touched (an earlier
+  member done, or past this member's snapshot/postgres stop — `touched` in the error) and records the member, the
+  backup and the pre-restore snapshots in `last_error`; an untouched failure leaves the app as it was.
+- Round 4: with ANY pg member in the lab, `restore_cmd` never runs (single, set, undo, rollback; `hook_note`); an
+  `only_member` snapshot of a non-app member runs no hook; a failing hook never blocks a copy (`hook_error`, the file
+  copy is taken); a restore opens its archive before the snapshot and `/data` clear, and the rotation never deletes
+  its target/set or the ids in `protected_backups`; `held`/`watch_held` stop the keeper and daily backups until the app is
+  started; a pending unserve is retried alone (after 1, 2, 4, 8, 16, 32 min; gives up after 6 failed retries), never by re-leasing; rollback
+  undo goes db first.
+- Round 5: a held database is held in the container too (the `/data` marker above; `10-postgres.sh` also refuses
+  `initdb` during a restore — `GHOST_PG_RESTORING=1` — so a cluster-less archive fails instead of becoming an empty
+  database; the restore installs the current script into the member first — round 6: mandatory and checked). `watch_held` is set with `held`, before
+  `/data` is touched. Deploy on a held app installs without starting it (`held` in the answer says how to release);
+  `rehearse` and `switch` refuse a held app (`not_ready`). A failed final backup (delete with `drop_data`) puts
+  postgres, the keeper and the app back, sets `last_error` and the delete answers the failure — nothing is deleted.
+  Protected snapshot ids live in `protected_backups` (not parsed from `last_error`); while held, a backup's note is
+  appended to `last_error`. `hook_error` is passed through deploy/switch/restore/delete. A set restore opens and
+  validates every member's archive before anything stops. A TCP app whose unserve retries gave up shows no stale
+  name; `serve_failed` is not retried (the hint says so: use the port link). The untouched-restore error carries
+  `restarted` (what happened), not `was_running`.
+- Round 6: a pg restore first installs `images/pg/10-postgres.sh` into the member and checks it landed (sha256 of
+  the file + executable) — a failure ends the restore UNTOUCHED (`step: install start script`, nothing stopped,
+  marked or cleared). Then the keeper stops, `PG_QUIESCE` kills any running `start.d/10-postgres.sh` and its `initdb`
+  (TERM, then KILL, bounded; still running = the restore fails untouched), postgres stops, `PG_QUIESCE` again, then
+  the marker (a failed touch is untouched too: the marker is removed again and `restore_incomplete` put back) and the
+  clear. `10-postgres.sh` checks the marker again right before `initdb` and before it starts postgres;
+  `images/mysql/10-mysql.sh` refuses to start (or initialise) mysqld while the marker exists. An untouched failure
+  puts every hold field back (`protected_backups` too). `restore_running` marks a restore under way. A successful
+  member restore while another member is still `restore_incomplete` keeps the hold and its reason and does not wait
+  for an app it cannot start. `rollback` of a held version needs `restore_snapshot: true`; `switch` checks the hold
+  again inside its locks; a held app rotates no backups (any kind). Deploy on a held app keeps the build log
+  (`probe.build_log`) and says there is NO automatic revert at the later start (deploy the previous version again).
+- Round 7: a held app takes no pre-deploy copy (`pre_deploy_note`), and a restore retried while held reuses the
+  pre-restore copy taken since the hold began (`hold_pre`, protected) instead of copying half-restored data. The clear
+  runs `pgrep -x postgres && exit 3` in the same shell first: postgres back = the restore fails untouched (`step: check
+  postgres is stopped`, the marker removed). The app is saved as soon as the marker is gone (`restore_incomplete`
+  cleared; later errors are `step: finish`). The host's own `10-postgres.sh` must name the marker, else the restore
+  fails untouched ("the host has an old 10-postgres.sh — redeploy images/").
+- Known: `mysql`/`patroni` kept members are tarred live (only `ghost-lab/pg:*` is stopped), not crash-consistent.
+- Round 3 also: an HTTP app's publish turns a TCP serve off; HTTP↔TCP unserve is decided from the live version too, a
+  failed `unserve_service` keeps the name and is retried by `ensure_leases`; the keeper survives an owner stop and
+  comes back on a member restart unless `watch_held` (a failed db restore); the -I note covers -E and keep/update_app.
+- A saved built folder is unpacked whatever its single top folder is called (a workdir renamed since); another shape is
+  built again from the archive (logged). The db keeper (`watch`) counts its pid only while it is still the keeper
+  (`/proc/<pid>/environ`), the entrypoint clears `watch.pid`, and a watched member that restarts alone gets its keeper back.
+- Unpacks run `chmod -R a+rX` (`tar --no-same-owner`). The build gets the app env (PORT, DATA_DIR, secrets). A cmd with
+  `python -I` gets a deploy `note` (isolated mode ignores `.deps`).
+- An app with no HTTP health path is published as raw TCP (`tailscale serve --tcp=<port> tcp://127.0.0.1:<port>`),
+  answers `address` (host:port) instead of `url`, and gets no Service name; the restart reconcile keeps it TCP.
+- Template `app` blocks may carry `wait_for` (host:port the app's start waits for, 90 s) and `watch` ([{member, cmd}]
+  keepers in other members). python-pg uses both. Sizes: python-pg 256 + 512, pg-single 512, python-app 384 MB.
+- `update_app`: a workdir move is checked (exists / nested) before anything stops; a failed port move puts the old lease
+  back. The rehearsal twin copies member env/ready/ports.
+- Deploy: sync, `sudo ghost-labs build-images base`, then `pg`, `static`, `node-app` (built on base; `mysql` too — its own base, round 6's marker check; the entrypoint
+  clears `watch.pid`; the `pg` image carries the round-5 marker check — a running kept pg member keeps its old
+  script until it is recreated or restored, since a restore installs the current one), `sudo systemctl restart
+  ghost-labs`, then the agent. Tests: `tests/unit/test_4ul_review_kept.py`.

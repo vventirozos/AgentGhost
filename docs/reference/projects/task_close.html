@@ -37,6 +37,7 @@
       <a href="project_research.html">Project research (core.project_research)</a>
       <a href="project_safety.html">Project safety (core.project_safety)</a>
       <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="project_turns.html">Project task turns (core.project_turns)</a>
       <a href="projects_routes.html">Projects API (api.projects_routes)</a>
       <a href="projects_tool.html">Projects tool (tools.projects)</a>
       <a class="current" href="task_close.html">Closing tasks (core.task_close)</a>
@@ -108,6 +109,11 @@
     <li>A rewrite that drops the declared path no longer re-appends "→ old path" when a deliverable waiver of 12+ characters is given <em>in the call that first closes the task and uses the waiver</em> (the waiver is recorded there); in any other call, or when the file exists and no waiver was needed, the old path is kept (review r1 MAJOR 2, r2 m2).</li>
     <li><code>gate_model_run</code> reads the kind through <code>_trusted_kind</code> (<code>planned_kind</code>).</li>
     <li>The visual-evidence gate applies only to code: with a declared deliverable, only a code suffix (<code>_VISUAL_CODE_SUFFIXES</code>) needs a screenshot; with none, research and write tasks are exempt.</li>
+  </ul>
+
+  <h2 id="4ul">&sect;4UL: the dependency fix says what to do (2026-11-12)</h2>
+  <ul>
+    <li><code>gate_dependencies</code>' fix text no longer tells the model to stop or ask: a dependency held from an unattended run (<code>wait_on="owner_turn"</code>) is "held from an unattended run — do it now (or task_update it back to PENDING)"; a BLOCKED one is "remove the cause yourself if you can, else say what only the owner can give"; one waiting on the owner "waits for something only the owner has — say what, in one line".</li>
   </ul>
 
 </main>

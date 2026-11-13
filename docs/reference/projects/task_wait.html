@@ -37,6 +37,7 @@
       <a href="project_research.html">Project research (core.project_research)</a>
       <a href="project_safety.html">Project safety (core.project_safety)</a>
       <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="project_turns.html">Project task turns (core.project_turns)</a>
       <a href="projects_routes.html">Projects API (api.projects_routes)</a>
       <a href="projects_tool.html">Projects tool (tools.projects)</a>
       <a href="task_close.html">Closing tasks (core.task_close)</a>
@@ -68,7 +69,7 @@
   <p>A waiting task (stored status <code>NEEDS_USER</code> or <code>BLOCKED</code>) carries:</p>
   <div class="scroll"><table>
     <tr><th>column</th><th>values</th><th>meaning</th></tr>
-    <tr><td><code>wait_on</code></td><td><code>owner</code></td><td>the owner must decide, approve or do it; nothing runs it until they do</td></tr>
+    <tr><td><code>wait_on</code></td><td><code>owner</code></td><td>something only the owner has (a file, a login, an answer); nothing runs it until they give it (&sect;4UK: never an approval)</td></tr>
     <tr><td></td><td><code>owner_turn</code></td><td>a <strong>hold</strong>: never run unattended; the owner's own run takes it back and runs it</td></tr>
     <tr><td></td><td><code>dependency</code></td><td>another task (a failed child, an open <code>depends_on</code>)</td></tr>
     <tr><td><code>wait_code</code></td><td><code>human_gate</code>, <code>review</code>, <code>rollup_&lt;gate&gt;</code>, a hold kind (<code>unverified_build</code>, <code>model_experiment</code>, <code>gate_form</code>, <code>refused_&lt;gate&gt;</code>, <code>held</code>&hellip;), <code>child_failed</code> (the failure cascade's block, the only one lifted automatically), <code>blocked</code> (any other block), <code>asked</code>, <code>paused</code></td><td>what kind of wait</td></tr>

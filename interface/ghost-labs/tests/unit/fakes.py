@@ -237,3 +237,18 @@ def runner_ok(fw_present=True, route_gw=None):
         return subprocess.CompletedProcess(cmd, 0, out, "")
     run.calls = calls
     return run
+
+
+def _one_file_tar() -> bytes:
+    """A real (tiny) tar: §4UL round 5 restores open and check a backup before touching /data."""
+    import io
+    import tarfile
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w") as t:
+        ti = tarfile.TarInfo("data/x")
+        ti.size = 1
+        t.addfile(ti, io.BytesIO(b"x"))
+    return b.getvalue()
+
+
+TAR = _one_file_tar()

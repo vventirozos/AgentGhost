@@ -20,6 +20,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from enum import Enum
 from pathlib import Path
 
@@ -247,6 +248,102 @@ def _inside_sandbox(store, ws: Path) -> bool:
         return False
 
 
+# §4UL (2e): the DONE clean-up sweeps a request deferred to its end —
+# {request_id: [(store, project_id, queued_at)]}. The agent's turn end calls
+# flush_deferred_sweeps(request_id); a request that never flushes (an API
+# route, a crash) is swept by the next deferral or flush once
+# DEFERRED_SWEEP_MAX_AGE_S have passed.
+_DEFERRED_SWEEPS: Dict[str, List[tuple]] = {}
+_DEFERRED_LOCK = threading.Lock()
+#: §4UL review m4: a deferral is swept without its request's flush only after this long — longer than any
+#: request runs (the 180-min deadline cap), so it never fires under a request that is still working. A
+#: request ends through handle_chat's finally (which flushes); this is only the net for one that did not. The
+#: queue is in memory: a crash loses it (the project's scratch files then stay until its next DONE).
+DEFERRED_SWEEP_MAX_AGE_S = 4 * 3600.0
+
+#: §4UL review M5: a project task's turn (``sub-ptask-…``, `core/project_turns`) runs INSIDE the owner's request
+#: (or alone, for idle autopilot). {child request id: the request it runs in} — the child's DONE sweeps wait for
+#: that request's end, and a write the outer request makes after the child closed the project's last task is the
+#: same work. Bounded (the oldest entries go); never cleared at the child's end (the outer request reads it later).
+_REQUEST_PARENTS: "OrderedDict[str, str]" = OrderedDict()
+_REQUEST_PARENTS_MAX = 512
+
+
+def set_request_parent(child: str, parent: str) -> None:
+    """Record that request ``child`` runs inside request ``parent`` (§4UL review M5). Never raises."""
+    child, parent = str(child or ""), str(parent or "")
+    if not child or not parent or child == parent or parent == "SYSTEM":
+        return
+    with _DEFERRED_LOCK:
+        _REQUEST_PARENTS[child] = parent
+        _REQUEST_PARENTS.move_to_end(child)
+        while len(_REQUEST_PARENTS) > _REQUEST_PARENTS_MAX:
+            _REQUEST_PARENTS.popitem(last=False)
+
+
+def request_root(rid: str) -> str:
+    """The outermost request ``rid`` runs in (itself when it runs alone)."""
+    cur, seen = str(rid or ""), set()
+    with _DEFERRED_LOCK:
+        while cur in _REQUEST_PARENTS and cur not in seen and len(seen) < 8:
+            seen.add(cur)
+            cur = _REQUEST_PARENTS[cur]
+    return cur
+
+
+def _sweep_request_id() -> str:
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+    return "" if rid in ("", "SYSTEM") else request_root(rid)
+
+
+def _run_deferred(items) -> int:
+    n = 0
+    for store, pid, _t in items:
+        try:
+            # a later write in the same request may have reopened it — the
+            # next DONE fires again
+            if str((store.get_project(pid) or {}).get("status") or "").upper() != "DONE":
+                continue
+            store._run_project_done(pid)
+            n += 1
+        except Exception:  # noqa: BLE001
+            logger.warning("deferred DONE sweep failed for %s", pid, exc_info=True)
+    return n
+
+
+def _flush_stale_sweeps(exclude: str = "") -> int:
+    cutoff = time.time() - DEFERRED_SWEEP_MAX_AGE_S
+    stale: List[tuple] = []
+    with _DEFERRED_LOCK:
+        for rid in list(_DEFERRED_SWEEPS):
+            if rid == exclude:
+                continue
+            keep = [x for x in _DEFERRED_SWEEPS[rid] if x[2] >= cutoff]
+            stale += [x for x in _DEFERRED_SWEEPS[rid] if x[2] < cutoff]
+            if keep:
+                _DEFERRED_SWEEPS[rid] = keep
+            else:
+                _DEFERRED_SWEEPS.pop(rid, None)
+    return _run_deferred(stale)
+
+
+def flush_deferred_sweeps(request_id: str) -> int:
+    """§4UL (2e): run the DONE clean-up sweeps ``request_id`` deferred (a
+    project that is no longer DONE is skipped). Called at the end of every
+    agent turn; never raises. Returns how many sweeps ran."""
+    try:
+        with _DEFERRED_LOCK:
+            items = _DEFERRED_SWEEPS.pop(str(request_id or ""), [])
+        return _run_deferred(items) + _flush_stale_sweeps()
+    except Exception:  # noqa: BLE001
+        logger.warning("deferred sweeps not flushed for %s", request_id, exc_info=True)
+        return 0
+
+
 class ProjectStore:
     """SQLite-backed store for projects, tasks, artifacts, and events.
 
@@ -284,6 +381,23 @@ class ProjectStore:
         never propagate back into the status-transition path that triggered
         it. No-op when no hook is wired.
         """
+        cb = getattr(self, "on_project_done", None)
+        if cb is None:
+            return
+        # §4UL (2e): inside a request the sweep waits for the request's end
+        # (flush_deferred_sweeps) — a roll-up mid-turn swept files the turn
+        # was still writing; outside any request it runs now
+        rid = _sweep_request_id()
+        if rid:
+            with _DEFERRED_LOCK:
+                _q = _DEFERRED_SWEEPS.setdefault(rid, [])
+                if not any(s is self and p == project_id for s, p, _t in _q):
+                    _q.append((self, project_id, time.time()))
+            _flush_stale_sweeps(exclude=rid)
+            return
+        self._run_project_done(project_id)
+
+    def _run_project_done(self, project_id: str) -> None:
         cb = getattr(self, "on_project_done", None)
         if cb is None:
             return
@@ -648,11 +762,16 @@ class ProjectStore:
                 # to BE ghost") kept replaying into every request for 4 days
                 # after the work closed — polluting new artifacts and driving
                 # verifier refutes whose follow-up tasks reopened the project,
-                # a self-feeding loop. DONE retires them; a verifier-refute
-                # reopen does NOT resurrect them; the user restating one
-                # re-arms it (see the create-merge path in tools.projects).
+                # a self-feeding loop. DONE retires them; since §4UL any
+                # reopen of the project re-arms what DONE retired (the change
+                # is still the owner's project); the user restating one
+                # re-arms it too (see the create-merge path in tools.projects).
                 self.retire_constraints(project_id, reason="project completed")
                 self._fire_project_done(project_id)
+            elif ((prev_status or "").upper() == ProjectStatus.DONE.value and status_norm
+                  and status_norm not in (ProjectStatus.DONE.value, ProjectStatus.ARCHIVED.value,
+                                          ProjectStatus.RELEASED.value)):
+                self.rearm_done_constraints(project_id, reason="project reopened")   # §4UL
         return updated
 
     def retire_constraints(self, project_id: str, reason: str = "",
@@ -688,6 +807,19 @@ class ProjectStore:
                 meta["constraints"] = keeping
                 # Bounded: this is an audit trail, not a working set.
                 meta["constraints_retired"] = prior[-20:]
+                # §4UL: what the DONE close retired comes back on a reopen
+                # (rearm_done_constraints); a retire for any other reason
+                # (the owner's constraint_retire) stays retired
+                _auto = _constraint_list(meta.get("constraints_done_retired"))
+                _mk = {c.lower() for c in moving}
+                if reason == "project completed":
+                    _auto += [c for c in moving if c.lower() not in {a.lower() for a in _auto}]
+                else:
+                    _auto = [c for c in _auto if c.lower() not in _mk]
+                if _auto:
+                    meta["constraints_done_retired"] = _auto[-20:]
+                else:
+                    meta.pop("constraints_done_retired", None)
                 return meta
 
             # Success is the WRITE landing, not the mutator running: a
@@ -706,6 +838,41 @@ class ProjectStore:
                          project_id, exc_info=True)
             return []
         return moved
+
+    def rearm_done_constraints(self, project_id: str, reason: str = "reopened") -> List[str]:
+        """§4UL: a DONE project that reopens (a task added or revived, a
+        write into its folder, a status change) gets back the constraints
+        its DONE close retired — the owner's requirements still hold for the
+        change. Constraints the owner retired stay retired. Never raises."""
+        back: List[str] = []
+        try:
+            def _mut(meta):
+                auto = _constraint_list(meta.get("constraints_done_retired"))
+                if not auto:
+                    return meta
+                active = _constraint_list(meta.get("constraints"))
+                keys = {c.lower() for c in active}
+                for c in auto:
+                    if c.lower() not in keys:
+                        active.append(c)
+                        keys.add(c.lower())
+                        back.append(c)
+                ak = {c.lower() for c in auto}
+                meta["constraints"] = active
+                meta["constraints_retired"] = [
+                    c for c in _constraint_list(meta.get("constraints_retired"))
+                    if c.lower() not in ak]
+                meta.pop("constraints_done_retired", None)
+                return meta
+            if self._atomic_metadata_update(project_id, _mut) is None:
+                return []
+            if back:
+                self.log_event(project_id, None, "constraints_rearmed",
+                               {"constraints": back[:10], "reason": reason})
+        except Exception:  # noqa: BLE001
+            logger.debug("rearm_done_constraints skipped for %s", project_id, exc_info=True)
+            return []
+        return back
 
     def delete_project(self, project_id: str, hard: bool = False) -> bool:
         """Archive (soft) or delete (hard) a project.
@@ -1000,6 +1167,7 @@ class ProjectStore:
             self.log_event(project_id, task_id, "project_reopened",
                            {"reason": f"new task added to a {reopened_from} project",
                             "from_status": reopened_from})
+            self.rearm_done_constraints(project_id, reason="task added")      # §4UL
         return task_id
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -1216,6 +1384,7 @@ class ProjectStore:
                 self.log_event(row["project_id"], task_id, "project_reopened",
                                {"reason": f"task re-opened on a {reopened_from} project",
                                 "from_status": reopened_from})
+                self.rearm_done_constraints(row["project_id"], reason="task re-opened")   # §4UL
             if task_reopened_args:
                 # §4PJ: the event stays (project history); the hook that fed
                 # it to the calibration corpus was removed with the corpus.

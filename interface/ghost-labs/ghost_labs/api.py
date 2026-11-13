@@ -75,7 +75,8 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
             out.append({"name": t["name"], "description": t["description"], "egress": t["egress"],
                         "members": [{"name": m["name"], "image": m["image"], "mem_mb": m["mem_mb"]} for m in t["members"]],
                         "total_mem_mb": sum(m["mem_mb"] for m in t["members"]),
-                        "ports": sorted({p for m in t["members"] for p in m["ports"]}), "params": t["params"]})
+                        "ports": sorted({p for m in t["members"] for p in m["ports"]}), "params": t["params"],
+                        **({"app": t["app"]} if t.get("app") else {})})
         return {"templates": out, "images": sorted(mgr.catalog_images())}
 
     @app.post("/v1/gc")
@@ -256,8 +257,14 @@ def create_app(svc: Service, api_key: str) -> FastAPI:
         return kept_call(lab_id, "restore", x_origin, lambda o: svc.kept.restore(lab_id, str(body.get("backup_id") or "")))
 
     @app.post("/v1/labs/{lab_id}/app/{action}")
-    def app_action(lab_id: str, action: str, x_origin: Optional[str] = O):
-        return kept_call(lab_id, f"app_{action}", x_origin, lambda o: svc.kept.app_action(lab_id, action))
+    def app_action(lab_id: str, action: str, reinit: bool = False, x_origin: Optional[str] = O):
+        # §4UL round 5: reinit=true accepts /data after a restore that did not complete (the owner's choice)
+        return kept_call(lab_id, f"app_{action}", x_origin, lambda o: svc.kept.app_action(lab_id, action, reinit))
+
+    @app.put("/v1/labs/{lab_id}/app/config")
+    def app_config(lab_id: str, body: Dict[str, Any] = Body(...), x_origin: Optional[str] = O):
+        # §4UL: a kept app's cmd/health/port/workdir/build change in place (a second keep used to be refused)
+        return kept_call(lab_id, "app_config", x_origin, lambda o: svc.kept.update_app(lab_id, body))
 
     @app.put("/v1/labs/{lab_id}/secrets")
     def put_secrets(lab_id: str, body: Dict[str, Any] = Body(...), x_origin: Optional[str] = O):
@@ -312,7 +319,10 @@ def create_apps_page(svc: Service) -> FastAPI:
         app_rows = "".join(
             f"<tr><td>{html.escape(a.get('app', ''))}</td><td class='s-{html.escape(a.get('state', ''))}'>"
             f"{html.escape(a.get('state', ''))}</td><td>{link(a.get('name_url'))}<br>{link(a.get('url'))}"
-            + (f"<br>{link(a.get('lan_url'))} <small>no login: home network only</small>" if a.get('lan_url') else "")
+            # §4UL: a TCP app (a database) has a host:port, not a link
+            + (f"<code>{html.escape(a['address'])}</code> <small>TCP</small>" if a.get('address') else "")
+            + (f"<br>{link(a.get('lan_url')) if str(a['lan_url']).startswith('http') else html.escape(a['lan_url'])}"
+               " <small>no login: home network only</small>" if a.get('lan_url') else "")
             + f"</td><td><code>{html.escape(a.get('lab_id', ''))}</code></td></tr>" for a in rows["apps"]) \
             or "<tr><td colspan=4>No apps yet.</td></tr>"
         prev_rows = "".join(

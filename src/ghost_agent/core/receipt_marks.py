@@ -1,7 +1,7 @@
 """§4QO — ONE home for the caveat literals a tool result carries.
 
 The tool that emits a marker imports it from here, and any code that reads
-it (the §4PN confirm-wait takeover, the image notes, a future check) matches
+it (the image notes, a future check) matches
 it from here — two copies of one literal is how a check goes dark
 (`reply_shape_check.FALLBACK_HEADS`). The turn RECORD that first motivated
 this module was measured null and removed (journal §4QO); the literals stay.
@@ -35,11 +35,7 @@ OVERVIEW_HEALTH_LINE = (
     "without it, do not call the system healthy, green or fine.")
 #: system_utility(check_health): the first line of a live health check
 HEALTH_CHECK_HEAD = "--- SYSTEM HEALTH DIAGNOSTICS ---"
-#: memory/projects confirm gate: the preview's owner has not answered yet
-NOT_ANSWERED_YET = "the user has not answered yet"
 #: file_system write/append of a document: cited links this request never read
 LINK_CHECK_HEAD = "LINK CHECK: "
 #: the banner the turn loop prepends to a failed tool result it records
 FAILURE_BANNER = "[FAILURE BANNER]"
-#: §4PN: the head of the system-written confirm-wait reply (`agent._confirm_wait_reply`)
-CONFIRM_WAIT_REPLY_HEAD = "Nothing has been deleted yet."

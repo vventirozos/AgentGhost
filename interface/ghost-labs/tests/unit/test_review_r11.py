@@ -446,10 +446,11 @@ def test_secrets_env_with_a_quote_in_a_value_is_redacted_when_read(kept, env, mo
     monkeypatch.setattr(m, "_put_bytes", lambda c, path, data, mode: written.update({path: data}))
     kept._write_secrets_file("lab_q", app_of(m, "lab_q"))
     body = written["/run/ghost/secrets.env"]
-    assert body == f"export PASS={shlex.quote(value)}\n".encode()
+    # §4UL: the app's PORT and DATA_DIR ride along (not secrets: never redacted)
+    assert body == f"export DATA_DIR=/data\nexport PASS={shlex.quote(value)}\nexport PORT=8080\n".encode()
     monkeypatch.setattr(m, "read_raw", lambda *a, **k: body)
     out = base64.b64decode(m.get_file("lab_q", "m1", "/run/ghost/secrets.env", "owner")["content_b64"])
-    assert out == b"export PASS=<secret:PASS>\n"
+    assert out == b"export DATA_DIR=/data\nexport PASS=<secret:PASS>\nexport PORT=8080\n"
     assert "secret-value" not in redact.apply(body.decode(), m.redactor())
 
 

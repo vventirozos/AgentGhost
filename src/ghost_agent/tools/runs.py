@@ -294,7 +294,9 @@ async def _probe_app(context, row, origin) -> Tuple[str, str, Dict[str, Any]]:
         bits.append("stopped by the owner")
     if staged:
         bits.append(f"next version {', '.join(staged)} staged")
-    detail = {"lab_id": srv.get("lab_id"), "url": a.get("url") or "", "port": a.get("port"),
+    # §4UL: a TCP app (a kept database) has a host:port `address` instead of an https url
+    detail = {"lab_id": srv.get("lab_id"), "url": a.get("url") or "", "address": a.get("address") or "",
+              "port": a.get("port"),
               "member": a.get("member"), "restarts": a.get("restarts"), "app_state": a.get("state"),
               "last_error": a.get("last_error"), "stopped_by_owner": bool(a.get("stopped_by_owner")),
               "staged": staged}
@@ -339,6 +341,8 @@ async def _app_op(context, reg, row, origin, op: str) -> ToolOutcome:
     pretty_log("Run App", f"{row['name']} {op} on {lab_id} → {a.get('state')} by {origin}", icon=Icons.STOP)
     ok = (new == "app_stopped") if op == "stop" else (new == "running" and probe.get("ok") is not False)
     url = a.get("url") or detail.get("url") or ""
+    if not url and (a.get("address") or detail.get("address")):
+        url = f"TCP {a.get('address') or detail.get('address')}"
     return _out(("" if ok else "RUN ERROR (app_not_up): ") + f"[run {row['name']} app {op}] {a.get('state') or '?'}"
                 + (f" — {url}" if url and op != "stop" else "")
                 + ("" if ok else f" — the check did not pass: "
@@ -359,6 +363,8 @@ def _line(row, state, note, detail) -> str:
     bits = [f"{row['name']}", row["lifetime"], row["place"], state + (f" ({note})" if note else "")]
     if detail.get("url"):
         bits.append(str(detail["url"]))               # an `app` run's stable address
+    elif detail.get("address"):
+        bits.append(f"TCP {detail['address']}")       # §4UL: a kept database
     elif port:
         bits.append(f":{port}")
     return "  " + "  ".join(bits) + f"  [{row['run_id']}]"
@@ -1420,6 +1426,10 @@ async def _app_url(context, reg, row, origin) -> ToolOutcome:
     if state == "unknown":
         return _out(f"RUN ERROR: could not read {row['name']!r}'s address — {note}.", OutcomeStatus.UNRESOLVED,
                     changed=False, code="run_unreachable")
+    if not detail.get("url") and detail.get("address"):
+        return _out(f"{row['name']}: TCP {detail['address']} (stable tailnet host:port, not a web URL — e.g. psql -h "
+                    f"{str(detail['address']).rsplit(':', 1)[0]} -p {str(detail['address']).rsplit(':', 1)[-1]}; "
+                    f"{state}" + (f", {note}" if note else "") + ")", OutcomeStatus.OK, changed=False)
     if not detail.get("url"):
         return _out(f"{row['name']}: {state}" + (f" ({note})" if note else "") + " — no published address.",
                     OutcomeStatus.OK, changed=False)

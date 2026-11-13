@@ -94,6 +94,11 @@ for _live_var, _live_default in (
         ("GHOST_STT_LANGUAGE", ""),
         ("GHOST_STT_WINDOW_S", ""),
         ("GHOST_STT_WINDOW_OVERLAP_S", ""),
+        # §4UL: production runs a project task as a full agent turn
+        # (core/project_turns.py); the executor/advancer pins keep the build
+        # path they were written for — tests/test_4ul_autopilot_turns.py
+        # turns it on and pins the default.
+        ("GHOST_PROJECT_TASK_TURNS", "0"),
 ):
     os.environ[_live_var] = _live_default
 

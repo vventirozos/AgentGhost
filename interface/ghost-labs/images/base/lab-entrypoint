@@ -2,9 +2,9 @@
 # PID 1 is Docker's init (containers run with init=true). Services are ordinary
 # background processes the agent may stop and start without killing the container.
 # a container restart keeps /run and /var/log (neither is a tmpfs here): a pid file of the previous start
-# would point at a reused pid. Cleared: the app's pid, the foreground execs' pid/stdin files and every
+# would point at a reused pid. Cleared: the app's pid, the db keeper's pid (watch.pid), the foreground execs' pid/stdin files and every
 # detached job's pid file. Kept: each job's .log and .rc (its output and exit code stay readable).
-rm -f /run/ghost/app.pid /var/log/lab/jobs/*.pid; rm -rf /run/ghost-exec
+rm -f /run/ghost/app.pid /run/ghost/watch.pid /var/log/lab/jobs/*.pid; rm -rf /run/ghost-exec
 mkdir -p /var/log/lab/jobs /etc/lab/start.d /run/ghost-exec
 if command -v cron >/dev/null 2>&1; then cron 2>/dev/null || true; fi
 for s in /etc/lab/start.d/*.sh; do

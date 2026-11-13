@@ -76,13 +76,67 @@ KEPT_ACTIONS = frozenset({"keep", "deploy", "rehearse", "switch", "rollback", "b
 DEPLOY_MAX_BYTES = 20 * 1024 * 1024
 #: never shipped to a lab (secrets in .env*, caches, VCS)
 DEPLOY_EXCLUDE = (".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache")
+#: §4UL review: credential files and folders — never shipped either, like .env*: not by params.dotfiles, not by a
+#: `!` line in .deployignore, not by a folder `put`
+DEPLOY_SECRETS = (".npmrc", ".netrc", ".git-credentials", ".pgpass", ".pypirc", ".ssh", ".aws", ".docker", ".gnupg",
+                  ".kube", ".azure", ".config/gcloud", ".config/gh", "credentials.json", ".vault-token", ".s3cfg")
+#: re-review: credential NAME patterns (any depth, case-insensitive): private keys and cloud credential files
+DEPLOY_SECRET_GLOBS = ("id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", "*.pem", "*.key", ".cargo/credentials*")
+
+
+def _secret_path(rel: str, name: str) -> bool:
+    """A credential file/folder (DEPLOY_SECRETS, DEPLOY_SECRET_GLOBS, .env*) at any depth, any letter case:
+    `.docker/config.json` goes with `.docker`."""
+    import fnmatch
+    rel_l, name_l = rel.lower(), name.lower()
+    if name_l.startswith(".env") or name_l in DEPLOY_SECRETS:
+        return True
+    if any(rel_l == s or rel_l.endswith("/" + s) for s in DEPLOY_SECRETS if "/" in s):
+        return True
+    for g in DEPLOY_SECRET_GLOBS:
+        if "/" in g:
+            if fnmatch.fnmatchcase(rel_l, g) or fnmatch.fnmatchcase(rel_l, "*/" + g):
+                return True
+        elif fnmatch.fnmatchcase(name_l, g):
+            return True
+    return False
+#: §4UL: what a DEPLOY leaves out on top of DEPLOY_EXCLUDE (a folder `put` ships them): dotfiles and dot-folders
+#: (unless params.dotfiles or a `!` line in .deployignore), the agent's own working files at the folder's top, and
+#: OS litter anywhere. `.well-known` is the one dot-folder a site serves on purpose.
+DEPLOY_ARTEFACTS_TOP = ("PROJECT_MAP.md", "WORK_LOG.md", "work_log.md", "browser_runner.py", "verify*.png",
+                        "verify*.jpg", "final-check*.png", "final_check*.png", "final-check*.jpg", "screenshot*.png",
+                        "*.work_log", "deploy-check*.png")
+DEPLOY_LITTER = (".DS_Store", "Thumbs.db", "desktop.ini")
+DEPLOY_DOT_ALLOWED = (".well-known",)
+DEPLOYIGNORE = ".deployignore"
 APP_OPS = ("start", "stop", "restart")
 #: req a3514318: the refusal for a keep with no app.cmd — with the recipe that works for a static site
 _KEEP_NEEDS_CMD = (
     "keep needs params.app.cmd — the process labs starts in the app's workdir (/app, where `deploy` unpacks "
-    "the folder), probes on app.port and restarts. A STATIC site (HTML/JS/CSS): create a `python-app` lab and "
-    "keep it with app {name, member: \"app\", port: 8080, cmd: \"python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app\"}. "
+    "the folder), probes on app.port and restarts (e.g. \"gunicorn -b 0.0.0.0:$PORT app:app\", \"npm start\"). "
+    "A STATIC site (HTML/JS/CSS): create a `static-site` lab — keep {app: {name}} fills the rest. "
     "A `web` lab's nginx serves /srv/www, holds port 80 and is not an app: deploy does not change what it serves")
+#: §4UL (2c): what a repeated keep may change on a kept app (the host's APP_UPDATABLE)
+_APP_UPDATABLE = ("cmd", "health", "port", "workdir", "build", "subdir")
+
+
+def _norm_cfg(k: str, v: Any) -> Any:
+    """A kept app's config value as the host stores it (so an unchanged keep is not sent as a change)."""
+    if k == "port":
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return v
+    if k == "subdir":
+        return str(v or "").strip().strip("/")
+    if k == "build":
+        t = "" if v is False else str(v).strip() if v is not None else None
+        return None if t is None or t.lower() == "auto" else "" if t.lower() in ("", "none", "off", "false") else t
+    if k == "health":
+        return v if isinstance(v, dict) else {"http": "/", "tcp": True} if v is None else v
+    if k == "workdir":
+        return str(v or "/app")
+    return v
 MEMBER_OPS = ("stop", "start", "restart", "kill", "pause", "unpause", "isolate", "rejoin")
 _LAB_ID_RE = re.compile(r"^lab_[0-9a-f]{8}$")
 #: a member name — the service's own NAME_RE (ghost_labs/templates.py). It goes
@@ -402,7 +456,20 @@ def _service_reply(status: int, reply: Any, context=None, lab_id: str = "") -> T
         msg = json.dumps(body["detail"], ensure_ascii=False)[:400]
     hint = str(body.get("hint") or "")
     extra = ""
-    for k in ("members", "live_labs", "templates", "needed_mb", "available_mb", "state", "field"):
+    if body.get("touched") is False and not body.get("restored_before"):
+        msg += " — nothing in /data was changed" + ("; the app runs as before" if body.get("restarted") else "")
+    elif body.get("restored_before") or body.get("pre_restore_by_member"):
+        msg += (" — UNDO: restore the pre-restore snapshots (pre_restore_by_member) one by one, the app member "
+                "last; the app is held until you start it")
+    if body.get("restore_incomplete"):
+        # §4UL round 5: a member whose /data was cleared and not refilled stays down (a /data marker the image honours)
+        msg += (" — HELD: `app start` alone will not start it; restore a good backup (that releases it), or "
+                "`app start` with params.reinit: true — postgres then starts on whatever /data holds now (an empty "
+                "database only if the restore never got the files in)")
+    for k in ("members", "live_labs", "templates", "needed_mb", "available_mb", "state", "field",
+              # re-review: a failed restore names its step, the member and the snapshots to go back to
+              "step", "failed_member", "pre_restore", "pre_restore_all", "restored_before", "pre_restore_by_member",
+              "restore_incomplete", "hold_reason"):
         if body.get(k) not in (None, "", [], {}):
             extra += f"\n{k}: {json.dumps(body[k], ensure_ascii=False)[:400]}"
     if code == "unknown_lab" and lab_id and context is not None:
@@ -1104,26 +1171,120 @@ def _open_inside(base: Path, root: Path) -> int:
     return fd
 
 
+class _DeployFilter:
+    """§4UL: what a deploy leaves out. ``.deployignore`` (at the deployed folder's top) is gitignore-like: one glob
+    per line, ``#`` comments, a trailing ``/`` = folders only, a leading ``/`` = the top only, ``!`` re-includes
+    (also a dotfile). The last matching line wins; DEPLOY_EXCLUDE and ``.env*`` never go, whatever it says."""
+
+    def __init__(self, dotfiles: bool = False, ignore_text: str = ""):
+        self.dotfiles = dotfiles
+        self.rules: List[Tuple[bool, bool, bool, str]] = []      # (negate, dir_only, anchored, glob)
+        self.left_out: List[str] = []
+        #: round 3: credential files/folders the walk dropped (never shipped) — named to the model, which may have
+        #: meant to serve one (a public certificate) and can `put` it
+        self.secret_out: List[str] = []
+        self.load(ignore_text)
+
+    def load(self, ignore_text: str) -> None:
+        self.rules = []
+        for ln in (ignore_text or "").splitlines()[:500]:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            neg = ln.startswith("!")
+            ln = ln[1:] if neg else ln
+            dir_only = ln.endswith("/")
+            # re-review: anchored is read from the line AS WRITTEN — `/build/` is the top folder only, `build/` any
+            # folder named build (stripping the slashes first made `/build/` match app/build too)
+            body = ln.rstrip("/")
+            anchored = body.startswith("/") or "/" in body
+            ln = body.strip("/")
+            if ln:
+                self.rules.append((neg, dir_only, anchored, ln))
+
+    def skip(self, rel: str, name: str, is_dir: bool) -> bool:
+        import fnmatch
+        top = "/" not in rel
+        out = False
+        if name in DEPLOY_LITTER or (top and name == DEPLOYIGNORE):
+            out = True
+        elif top and not is_dir and any(fnmatch.fnmatchcase(name, g) for g in DEPLOY_ARTEFACTS_TOP):
+            out = True
+        elif name.startswith(".") and not self.dotfiles and name not in DEPLOY_DOT_ALLOWED:
+            out = True
+        for neg, dir_only, anchored, g in self.rules:
+            if dir_only and not is_dir:
+                continue
+            hit = _glob_path(rel, g) if anchored else fnmatch.fnmatchcase(name, g)
+            if hit:
+                out = not neg
+        if out:
+            self.left_out.append(rel + ("/" if is_dir else ""))
+        return out
+
+
+def _glob_path(rel: str, g: str) -> bool:
+    """An anchored .deployignore glob, gitignore-like: `*`, `?` and `[..]` never cross a `/` (fnmatch's do: `/docs/*.md`
+    left out docs/sub/x.md too — §4UL review); `**` spans any number of folders."""
+    import fnmatch
+    rp, gp = rel.split("/"), g.split("/")        # walk paths are POSIX (os.path.join on macOS/Linux)
+
+    def m(i: int, j: int) -> bool:
+        if j == len(gp):
+            return i == len(rp)
+        if gp[j] == "**":
+            return any(m(k, j + 1) for k in range(i, len(rp) + 1))
+        return i < len(rp) and fnmatch.fnmatchcase(rp[i], gp[j]) and m(i + 1, j + 1)
+    return m(0, 0)
+
+
+def _read_deployignore(root: Path, top: Optional[int]) -> str:
+    """The folder's own .deployignore (never through a symlink; at most 64 KB)."""
+    try:
+        if top is not None:
+            fd = os.open(DEPLOYIGNORE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                         dir_fd=top)
+        else:
+            fd = os.open(str(Path(root) / DEPLOYIGNORE),
+                         os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return ""
+    try:
+        import stat as _stat
+        from .file_system import _block_if_regular
+        if not _stat.S_ISREG(_block_if_regular(fd).st_mode):     # a FIFO stays non-blocking and is refused
+            return ""
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            return fh.read(65536).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
 def tar_folder(root: Path, base: Optional[Path] = None, max_entries: Optional[int] = None,
-               with_dirs: bool = False) -> Tuple[bytes, List[str], str]:
+               with_dirs: bool = False, deploy: Optional["_DeployFilter"] = None) -> Tuple[bytes, List[str], str]:
     """(tar.gz bytes, skipped, error) of a workspace folder for `lab deploy` (§4SX D3 r1 M9). Walks with dir fds and
     never follows a symlink (the workspace is writable by sandboxed code: a link swapped in mid-walk cannot make the
     agent read a host file); symlinks, devices and fifos are skipped and listed; DEPLOY_EXCLUDE and `.env*` never go.
-    ``base`` (the workspace root): the folder is opened from it component by component (code r1 #4)."""
+    ``base`` (the workspace root): the folder is opened from it component by component (code r1 #4).
+    ``deploy``: a deploy's filter (§4UL) — it reads the folder's .deployignore and lists what it left out."""
     import io
     buf = io.BytesIO()
     skipped: List[str] = []
     total = 0
     top = _open_inside(Path(base), Path(root)) if base is not None else None
     try:
-        return _tar_walk(buf, skipped, total, root, top, max_entries, with_dirs)
+        if deploy is not None:
+            deploy.load(_read_deployignore(root, top))
+        return _tar_walk(buf, skipped, total, root, top, max_entries, with_dirs, deploy)
     finally:
         if top is not None:
             os.close(top)
 
 
 def _tar_walk(buf, skipped, total, root, top, max_entries: Optional[int] = None,
-              with_dirs: bool = False) -> Tuple[bytes, List[str], str]:
+              with_dirs: bool = False, deploy: Optional[_DeployFilter] = None) -> Tuple[bytes, List[str], str]:
     import io
     import stat as _stat
     from .file_system import _block_if_regular
@@ -1137,7 +1298,13 @@ def _tar_walk(buf, skipped, total, root, top, max_entries: Optional[int] = None,
             rel_dir = os.path.relpath(dirpath, start)
             keep_dirs = []
             for d in dirnames:
-                if d in DEPLOY_EXCLUDE or d.startswith(".env"):
+                if d in DEPLOY_EXCLUDE:
+                    continue
+                if _secret_path(os.path.normpath(os.path.join(rel_dir, d)), d):
+                    if deploy is not None:
+                        deploy.secret_out.append(os.path.normpath(os.path.join(rel_dir, d)) + "/")
+                    continue
+                if deploy is not None and deploy.skip(os.path.normpath(os.path.join(rel_dir, d)), d, True):
                     continue
                 try:
                     st = os.stat(d, dir_fd=dfd, follow_symlinks=False)
@@ -1162,7 +1329,13 @@ def _tar_walk(buf, skipped, total, root, top, max_entries: Optional[int] = None,
             dirnames[:] = keep_dirs
             for f in filenames:
                 rel = os.path.normpath(os.path.join(rel_dir, f))
-                if f.startswith(".env") or f in DEPLOY_EXCLUDE:
+                if f in DEPLOY_EXCLUDE:
+                    continue
+                if _secret_path(rel, f):
+                    if deploy is not None:
+                        deploy.secret_out.append(rel)
+                    continue
+                if deploy is not None and deploy.skip(rel, f, False):
                     continue
                 try:
                     # O_NONBLOCK: a file swapped for a FIFO cannot hang the open (code r1 #5); fstat decides
@@ -1194,7 +1367,9 @@ def _tar_walk(buf, skipped, total, root, top, max_entries: Optional[int] = None,
                     return b"", skipped, (f"the folder has more than {max_entries} "
                                           + ("files and folders" if with_dirs else "files"))
                 ti = tarfile.TarInfo(rel)
-                ti.size, ti.mode, ti.mtime = len(data), st.st_mode & 0o755, int(st.st_mtime)
+                # §4UL review MAJOR 3: modes normalised — readable by everyone (a 0600 file from the workspace
+                # answered 403 from the site's nginx); executable stays executable
+                ti.size, ti.mode, ti.mtime = len(data), (0o755 if st.st_mode & 0o111 else 0o644), int(st.st_mtime)
                 tar.addfile(ti, io.BytesIO(data))
     out = buf.getvalue()
     if len(out) > DEPLOY_MAX_BYTES:
@@ -1233,8 +1408,20 @@ def _app_view(a: Dict[str, Any]) -> str:
     bits = [f"app {a.get('name')} {a.get('state')}"]
     if a.get("url"):
         bits.append(str(a["url"]))
+    elif a.get("address"):
+        # §4UL: a database (TCP health) is published as raw TCP — a host:port for psql & co, not a web URL
+        bits.append(f"TCP {a['address']} (not a web URL: e.g. psql -h {str(a['address']).rsplit(':', 1)[0]} "
+                    f"-p {str(a['address']).rsplit(':', 1)[-1]})")
     if a.get("last_error") and a.get("state") != "up":
         bits.append(f"last error: {str(a['last_error'])[:200]}")
+    if a.get("held"):
+        # §4UL round 6: why it is held lives in its own field (last_error may be any later note)
+        hr = str(a.get("hold_reason") or "")
+        # round 7: the LAST 400 characters — a hold reason grows by appending, the newest failure is at the end
+        bits.append("HELD" + (f": {'…' + hr[-400:] if len(hr) > 400 else hr}" if hr else "")
+                    + (f" (restore incomplete: {', '.join(map(str, a['restore_incomplete']))} — restore a good "
+                       "backup, or `app start` with params.reinit: true)" if a.get("restore_incomplete")
+                       else " (check /data, then `app start`)"))
     return " — ".join(bits)
 
 
@@ -1344,8 +1531,10 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
 
     if action == "keep":
         app = p.get("app")
-        if not isinstance(app, dict) or not app.get("name") or not app.get("member") or not app.get("port"):
-            return bad("keep needs params.app {name, member, port, cmd} (and optional health, workdir)")
+        if not isinstance(app, dict) or not app.get("name"):
+            return bad("keep needs params.app {name, member, port, cmd} (optional health, workdir, build, subdir; "
+                       "a template with app defaults — static-site, node-app, pg-single, python-app, python-pg — "
+                       "fills member/port/cmd it knows)")
         if "lineage" in p:
             return bad("lineage is set by the system (the lab's project) — leave it out")
         if "secret_values" in p:
@@ -1370,13 +1559,50 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
             # code r1 #3: kept already (an earlier keep the agent never heard back from) — make sure `run` knows it
             note = await _record_app_run(context, str(det.get("origin") or origin), det)
             _no_expiry(context, lab_id)
-            return ToolOutcome(f"{lab_id} is already KEPT: {_app_view(det.get('app'))}{note}. Use `lab deploy` / "
-                               "`lab app` on it.", status=OutcomeStatus.OK, world_changed=False)
+            have = det["app"]
+            if str(app.get("name")) != str(have.get("name")):
+                return bad(f"{lab_id} is already KEPT as app {have.get('name')!r} — an app's name does not change; "
+                           "create a new lab for another app")
+            # §4UL (2c): a keep repeated with a changed run config UPDATES the kept app (and restarts it)
+            # (build/subdir: an app kept before §4UL has none stored = the defaults; the rest: only what the host shows)
+            change = {k: app[k] for k in _APP_UPDATABLE
+                      if k in app and (k in have or k in ("build", "subdir"))
+                      and _norm_cfg(k, app[k]) != _norm_cfg(k, have.get(k))}
+            if not change:
+                return ToolOutcome(f"{lab_id} is already KEPT with this config: {_app_view(have)}{note}. "
+                                   "`lab deploy` ships new code.", status=OutcomeStatus.OK, world_changed=False)
+            try:
+                st, out = await _long_call(context, "PUT", f"/v1/labs/{lab_id}/app/config", origin, change)
+            except LabsNoAnswer as e:
+                return no_answer("app config update", e)
+            if st != 200:
+                return _service_reply(st, out, context, lab_id)
+            probe = out.get("probe")
+            ok = not isinstance(probe, dict) or probe.get("ok") is not False
+            return ToolOutcome(("" if ok else "LAB ERROR (app_not_up): ")
+                               + f"{lab_id} was already KEPT — its config is updated "
+                               f"({', '.join(map(str, out.get('changed') or sorted(change)))}): "
+                               f"{_app_view(out.get('app'))}; {_probe_view(probe)}{note}"
+                               + (f". Note: {str(out['note'])[:300]}" if out.get("note") else ""),
+                               status=OutcomeStatus.OK if ok else OutcomeStatus.FAILED,
+                               reason_code=None if ok else "lab_app_not_up", world_changed=True)
         lab_owner = str(det.get("owner") or "")
         if not lab_owner.startswith("project:"):
             return bad(f"{lab_id} belongs to {lab_owner or 'no project'} — a kept machine is a project's: switch to "
                        "the project and create the lab there first")
-        if not str(app.get("cmd") or "").strip():
+        tpl_app: Dict[str, Any] = {}
+        if not (str(app.get("cmd") or "").strip() and app.get("member") and app.get("port")) and det.get("template"):
+            # §4UL: the lab's template may say how its app runs (the host fills what is left out)
+            try:
+                _st, _tl = await _call(context, "GET", "/v1/templates", origin=origin, timeout=15)
+            except (LabsNoAnswer, LabsUnreachable):
+                _st, _tl = 0, {}
+            for t in (_tl.get("templates") or []) if _st == 200 and isinstance(_tl, dict) else []:
+                if isinstance(t, dict) and t.get("name") == det.get("template") and isinstance(t.get("app"), dict):
+                    tpl_app = t["app"]
+        if not (app.get("member") or tpl_app.get("member")) or not (app.get("port") or tpl_app.get("port")):
+            return bad("keep needs params.app member and port (this lab's template does not name them)")
+        if not str(app.get("cmd") or tpl_app.get("cmd") or "").strip():
             # req a3514318: a kept app with no cmd is never up — labs starts, watches and restarts the
             # cmd's process; the template's own server (the `web` lab's nginx on /srv/www) is not the app,
             # and deploy unpacks into the app's workdir (/app), which that server does not serve. (After the
@@ -1389,7 +1615,8 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
         if clash is not None and clash["backend"] != "labs_app":
             return bad(f"a run named {app['name']!r} is already {clash['state']} in this project — stop it or "
                        "name the app differently")
-        body = {"app": {k: app[k] for k in ("name", "member", "port", "cmd", "health", "workdir") if k in app},
+        body = {"app": {k: app[k] for k in ("name", "member", "port", "cmd", "health", "workdir", "build", "subdir")
+                        if k in app},
                 "lineage": lab_owner.split(":", 1)[1]}             # design r1 H1: never the model's
         for k in ("data", "secrets", "cron", "backup"):
             if k in p:
@@ -1417,26 +1644,54 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                            + (" It is a STAGED next version — `lab deploy` it, then `lab switch` it in."
                               if a2.get("state") == "staged" else " Next: `lab deploy` the app's folder.")
                            + (f" Secrets {', '.join(sec)} hold generated values; the operator sets real ones."
-                              if sec else ""), status=OutcomeStatus.OK, world_changed=True)
+                              if sec else "")
+                           + (f" Note: {str(det2['note'])[:300]}" if det2.get("note") else ""),
+                           status=OutcomeStatus.OK, world_changed=True)
 
     if action == "deploy":
         folder = str(p.get("folder") or "").strip()
         if not folder:
             return bad("deploy needs params.folder — the workspace folder holding the app")
-        root, err = _sandbox_path(context, folder)
+        _root0, err = _sandbox_path(context, folder)
+        if err:
+            return bad(err)
+        if not _root0.is_dir():
+            return bad(f"{shown_path(context, _root0)} is not a folder in the workspace")
+        _app_p = p.get("app") if isinstance(p.get("app"), dict) else {}
+        subdir = p.get("subdir", _app_p.get("subdir"))
+        if subdir is None:
+            # §4UL: the subfolder the app was kept with (a site's dist/) — the host keeps it, the agent ships it
+            try:
+                _st, _det = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin, timeout=15)
+            except (LabsNoAnswer, LabsUnreachable):
+                _st, _det = 0, {}
+            if _st == 200 and isinstance(_det.get("app"), dict):
+                subdir = _det["app"].get("subdir")
+        subdir = str(subdir or "").strip().strip("/")
+        if subdir and (subdir.startswith(".") or "/." in subdir or "\\" in subdir):
+            return bad("subdir must be a folder inside params.folder, like dist")
+        root, err = _sandbox_path(context, f"{folder.rstrip('/')}/{subdir}" if subdir else folder)
         if err:
             return bad(err)
         if not root.is_dir():
-            return bad(f"{shown_path(context, root)} is not a folder in the workspace")
+            return bad(f"{shown_path(context, root)} is not a folder in the workspace"
+                       + (" (the app's subdir: build it first, or pass params.subdir \"\" to ship the whole folder)"
+                          if subdir else ""))
+        flt = _DeployFilter(dotfiles=bool(_truthy(p.get("dotfiles"))))
         try:
-            data, skipped, err = await asyncio.to_thread(tar_folder, root, Path(context.sandbox_dir).resolve())
+            data, skipped, err = await asyncio.to_thread(tar_folder, root, Path(context.sandbox_dir).resolve(),
+                                                         None, False, flt)
         except OSError as e:                    # code r1 #5: the folder changed under the walk
             return bad(f"{folder} could not be read ({type(e).__name__}: {e}) — try again")
         if err:
-            return bad(f"{folder}: {err} — deploy only what the app needs")
+            return bad(f"{folder}: {err} — deploy only what the app needs (a .deployignore at its top leaves "
+                       "more out)")
         body = {"archive_b64": base64.b64encode(data).decode()}
         if isinstance(p.get("requirements"), dict):
             body["requirements"] = {k: [str(x) for x in (p["requirements"].get(k) or [])] for k in ("pip", "apt")}
+        if "build" in p:
+            # §4UL: the per-deploy build (default: requirements.txt into the folder; npm ci + npm run build)
+            body.setdefault("requirements", {})["build"] = "none" if p["build"] in (None, False, "") else str(p["build"])
         if isinstance(p.get("data_seed"), list):
             body["data_seed"] = [str(x) for x in p["data_seed"]]
         try:
@@ -1446,11 +1701,49 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
         if st != 200:
             return _service_reply(st, out, context, lab_id)
         probe = out.get("probe")
+        shipped = f"{folder.rstrip('/')}/{subdir}" if subdir else folder
+        tail = ((f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else "")
+                + (f". Left out: {', '.join(_q(x) for x in flt.left_out[:12])}"
+                   + (f" (+{len(flt.left_out) - 12} more)" if len(flt.left_out) > 12 else "")
+                   + " (dotfiles, agent files; .deployignore / params.dotfiles change it)" if flt.left_out else "")
+                + (f". Left out (credential pattern, never shipped): {', '.join(_q(x) for x in flt.secret_out[:12])}"
+                   + (f" (+{len(flt.secret_out) - 12} more)" if len(flt.secret_out) > 12 else "")
+                   + " — if one is public (a certificate the site serves), add it with `lab put`"
+                   if flt.secret_out else "")
+                + (f". Note: {str(out['note'])[:300]}" if out.get("note") else "")
+                + (f". Note: {str(out['built_not_saved'])[:200]}" if out.get("built_not_saved") else "")
+                + (f". WARNING: {str(out['hook_error'])[:300]}" if out.get("hook_error") else "")
+                + (f". Note: {str(out['pre_deploy_note'])[:200]}" if out.get("pre_deploy_note") else "")
+                + ". Only /data survives a deploy and is backed up — the app folder is replaced each time")
+        if out.get("rolled_back"):
+            back = isinstance(probe, dict) and probe.get("ok") is True
+            return ToolOutcome(f"LAB ERROR (rolled_back): {lab_id}: the new version of {shipped} did not come up — "
+                               f"{str(out['rolled_back'])[:300]} — so it was rolled back: "
+                               + ("the previous version serves again (probe OK)" if back and not out.get("rollback_error")
+                                  else f"and the previous version did NOT come back either: "
+                                       f"{str(out.get('rollback_error') or _probe_view(probe))[:300]}")
+                               + (f". Data: {str(out['data_note'])[:300]}" if out.get("data_note") else "")
+                               + (f". {str(probe.get('pip_note'))[:200]}" if isinstance(probe, dict)
+                                  and probe.get("pip_note") else "")
+                               + f". {_app_view(out.get('app'))}. Read `lab logs lab_id={lab_id}` for the failed "
+                               "start, fix it and deploy again" + tail,
+                               status=OutcomeStatus.FAILED, reason_code="lab_rolled_back", world_changed=True)
+        if out.get("held"):
+            return ToolOutcome(f"{lab_id}: deployed {shipped} ({len(data)} bytes) — {str(out['held'])[:400]}"
+                               + (f". Held because: {str(out['hold_reason'])[:300]}" if out.get("hold_reason") else "")
+                               + tail, status=OutcomeStatus.PARTIAL, reason_code="lab_app_held", world_changed=True)
+        if out.get("still_starting"):
+            return ToolOutcome(f"{lab_id}: deployed {shipped} ({len(data)} bytes) — still starting (the host keeps "
+                               f"checking): {_probe_view(probe)}. `lab status lab_id={lab_id}` shows when it is up"
+                               + tail, status=OutcomeStatus.PARTIAL, reason_code="lab_app_starting",
+                               world_changed=True)
         ok = not isinstance(probe, dict) or probe.get("ok") is not False
+        built = str(probe.get("build_log") or "").strip() if isinstance(probe, dict) else ""
         return ToolOutcome(("" if ok else "LAB ERROR (app_not_up): ")
-                           + f"{lab_id}: deployed {folder} ({len(data)} bytes) — {_app_view(out.get('app'))}; "
+                           + f"{lab_id}: deployed {shipped} ({len(data)} bytes) — {_app_view(out.get('app'))}; "
                            f"{_probe_view(probe)}"
-                           + (f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else ""),
+                           + (f". Build: …{built[-300:]}" if built and not ok else "")
+                           + tail,
                            status=OutcomeStatus.OK if ok else OutcomeStatus.FAILED,
                            reason_code=None if ok else "lab_app_not_up", world_changed=True)
 
@@ -1487,7 +1780,8 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                                    status=OutcomeStatus.FAILED, reason_code="lab_switch_failed", world_changed=True)
             return ToolOutcome(f"{lab_id} serves now (from {out.get('from_lab')}): {_app_view(out.get('app'))}; "
                                f"{_probe_view(out.get('probe'))}. `lab rollback lab_id={lab_id}` returns to the old "
-                               f"version until {_when(out.get('rollback_until'))}.",
+                               f"version until {_when(out.get('rollback_until'))}."
+                               + (f" WARNING: {str(out['hook_error'])[:300]}" if out.get("hook_error") else ""),
                                status=OutcomeStatus.OK, world_changed=True)
         if action == "rollback":
             if out.get("rolled_back") is False:
@@ -1499,12 +1793,28 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                                f"{_app_view(out.get('app'))}; {_probe_view(out.get('probe'))}.",
                                status=OutcomeStatus.OK, world_changed=True)
         if action == "backup":
-            return ToolOutcome(f"{lab_id}: backup {out.get('backup_id')} ({out.get('kind')}, {out.get('bytes')} bytes)",
+            mems = [m for m in (out.get("members") or []) if isinstance(m, dict)]
+            return ToolOutcome(f"{lab_id}: backup {out.get('backup_id')} ({out.get('kind')}, {out.get('bytes')} bytes)"
+                               + (" — every member: " + ", ".join(f"{m.get('member')} {m.get('backup_id')}"
+                                                                    for m in mems) if len(mems) > 1 else "")
+                               + (f". WARNING: {str(out['hook_error'])[:300]}" if out.get("hook_error") else ""),
                                status=OutcomeStatus.OK, world_changed=True)
         if action == "restore":
-            return ToolOutcome(f"{lab_id}: restored {out.get('restored')} (a pre-restore backup "
-                               f"{(out.get('pre_restore') or {}).get('backup_id') if isinstance(out.get('pre_restore'), dict) else out.get('pre_restore')} "
-                               f"was taken) — {_app_view(out.get('app'))}; {_probe_view(out.get('probe'))}",
+            per = out.get("pre_restore_by_member") if isinstance(out.get("pre_restore_by_member"), dict) else {}
+            pre1 = (out.get('pre_restore') or {}).get('backup_id') if isinstance(out.get('pre_restore'), dict) \
+                else out.get('pre_restore')
+            # round-3 MINOR 1: a set restore names each member's pre-restore snapshot and how to undo it
+            snaps = (" (pre-restore snapshots, one per member: "
+                     + ", ".join(f"{m} {b}" for m, b in per.items())
+                     + " — each was taken alone, so to undo, restore EACH of those ids, the app member's last)"
+                     if len(per) > 1 else f" (a pre-restore backup {pre1} was taken)")
+            return ToolOutcome(f"{lab_id}: restored {out.get('restored')}"
+                               + (f" with the backups taken with it ({', '.join(map(str, out['restored_set']))}; "
+                                  "the app member last)" if len(out.get("restored_set") or []) > 1 else "")
+                               + snaps
+                               + (f". {str(out['hook_note'])[:300]}" if out.get("hook_note") else "")
+                               + (f". WARNING: {str(out['hook_error'])[:300]}" if out.get("hook_error") else "")
+                               + f" — {_app_view(out.get('app'))}; {_probe_view(out.get('probe'))}",
                                status=OutcomeStatus.OK, world_changed=True)
         twin = out.get("twin") if isinstance(out.get("twin"), dict) else {}
         tp = twin.get("probe")
@@ -1520,8 +1830,11 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
     if op not in APP_OPS:
         return bad(f"app needs op one of {', '.join(APP_OPS)} — the app's state is in `lab status` "
                    f"(lab_id) or `run status` (name)")
+    # §4UL round 5: reinit accepts /data after a restore that did not complete (an empty database is initialised)
+    reinit = op != "stop" and _truthy((p or {}).get("reinit"))
     try:
-        st, out = await _call(context, "POST", f"/v1/labs/{lab_id}/app/{op}", origin=origin, timeout=120)
+        st, out = await _call(context, "POST", f"/v1/labs/{lab_id}/app/{op}", origin=origin, timeout=120,
+                              params={"reinit": "true"} if reinit else None)
     except LabsNoAnswer as e:
         return no_answer(f"app {op}", e)
     if st != 200:
@@ -1598,7 +1911,12 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
             out.append(f"- {t.get('name')}: {t.get('description') or ''} — members {mems}; "
                        f"{t.get('total_mem_mb')} MB; egress {t.get('egress')}"
                        + (f"; ports {t.get('ports')}" if t.get("ports") else "")
-                       + (f"; params {json.dumps(t.get('params'))}" if t.get("params") else ""))
+                       + (f"; params {json.dumps(t.get('params'))}" if t.get("params") else "")
+                       + (f"; keep fills app {json.dumps({k: v for k, v in t['app'].items() if k != 'cmd'})}"
+                          + (" + its cmd" if t["app"].get("cmd") else "")
+                          if isinstance(t.get("app"), dict) and t["app"] else ""))
+        if body.get("images"):
+            out.append(f"Images (the owner's params.members): {', '.join(map(str, body['images']))}")
         return ToolOutcome("\n".join(out), status=OutcomeStatus.OK, world_changed=False)
 
     if action == "create":
@@ -2008,7 +2326,8 @@ def kept_data_note(body: Dict[str, Any]) -> str:
     """What the host did with a kept lab's data, from its DELETE answer."""
     gone = body.get("data_volumes_removed") or []
     if gone:
-        return f"Its data went with it ({len(gone)} volume(s); final backup {body.get('final_backup')})."
+        return (f"Its data went with it ({len(gone)} volume(s); final backup {body.get('final_backup')})."
+                + (f" WARNING: {str(body['hook_error'])[:300]}" if body.get("hook_error") else ""))
     return f"Its data was KEPT ({body.get('note') or 'no data volume was removed'})."
 
 
@@ -2065,11 +2384,12 @@ async def _host_id(context, origin: str) -> str:
     return hid
 
 
+#: §4UL: what an OWNER's create may compose beyond a template (the host's OVERRIDE_KEYS, plus `members`)
+_COMPOSE_KEYS = ("mem_mb", "ports", "cap_add", "cpus", "egress")
+
+
 async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
     template = str(a["template"] or "").strip()
-    if not template:
-        return ToolOutcome("LAB ERROR (bad_request): create needs template — `lab templates` lists them.",
-                           status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
     params = a["params"]
     if isinstance(params, str):
         try:
@@ -2079,10 +2399,43 @@ async def _create(context, origin: str, owner: str, a: Dict[str, Any]) -> str:
     if params is None:
         params = {}
     if not isinstance(params, dict):
-        return ToolOutcome("LAB ERROR (bad_request): params must be an object like {\"version\": \"18\"}",
+        return ToolOutcome("LAB ERROR (bad_request): params must be an object — the template's own params "
+                           "(`lab templates` lists them), and for the owner mem_mb / ports / cap_add / cpus / egress "
+                           "/ members", status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
+    params = dict(params)
+    members = params.pop("members", None)
+    overrides = {k: params.pop(k) for k in _COMPOSE_KEYS if k in params}
+    if (members is not None or overrides) and origin != "owner":
+        return ToolOutcome("LAB ERROR (owner_only): a custom lab composition (members, mem_mb, ports, cap_add, cpus, "
+                           "egress) is made in the owner's own turns — create from a template as it is.",
+                           status=OutcomeStatus.REJECTED, reason_code="lab_owner_only", world_changed=False)
+    if members is not None:
+        if template:
+            return ToolOutcome("LAB ERROR (bad_request): give template OR params.members, not both (to change a "
+                               "template's members use params mem_mb / ports / cap_add / cpus / egress).",
+                               status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
+        if set(overrides) - {"egress"}:
+            return ToolOutcome("LAB ERROR (bad_request): with params.members, give mem_mb / ports / cap_add / cpus "
+                               "inside each member (only egress is the lab's).", status=OutcomeStatus.REJECTED,
+                               reason_code="lab_bad_request", world_changed=False)
+        if not isinstance(members, list) or not members:
+            return ToolOutcome("LAB ERROR (bad_request): params.members is a list like [{\"name\": \"app\", "
+                               "\"image\": \"ghost-lab/node-app:1\", \"mem_mb\": 512, \"ports\": [8080]}] "
+                               "(`lab templates` lists the images)", status=OutcomeStatus.REJECTED,
+                               reason_code="lab_bad_request", world_changed=False)
+    elif not template:
+        return ToolOutcome("LAB ERROR (bad_request): create needs template — `lab templates` lists them.",
                            status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
-    body: Dict[str, Any] = {"template": template, "params": params or {}, "label": a["label"] or "",
-                            "purpose": a["purpose"] or "", "owner": owner, "wait": False}
+    body: Dict[str, Any] = {"label": a["label"] or "", "purpose": a["purpose"] or "", "owner": owner, "wait": False}
+    if members is not None:
+        body.update(members=members, egress=overrides.get("egress", "tor"))
+        if isinstance(params.get("readiness"), dict):
+            body["readiness"] = params.pop("readiness")
+        template = "custom"
+    else:
+        body.update(template=template, params=params)
+        if overrides:
+            body["overrides"] = overrides
     _ttl, _terr = ttl_arg(a["ttl_idle_s"])
     if _terr:
         return ToolOutcome(f"LAB ERROR (bad_request): {_terr}", status=OutcomeStatus.REJECTED,
@@ -2639,26 +2992,37 @@ LAB_TOOL_DEFINITION = {
     "function": {
         "name": "lab",
         "description": (
-            "Disposable MACHINES on the labs host for the system under test: databases, clusters, servers, "
-            "anything that needs root, ports or network faults. You build in the workspace (file_system/execute) "
-            "and RUN systems in a lab; labs expire, so save recipes and results to the workspace (`spec`, `get`). "
-            "The workspace and the browser cannot reach a lab — use exec/http here. Start with `templates`, then "
-            "`create`; every exec names lab_id + member (`cancel` ends one that is still running; `screenshot` saves a "
-            "picture of a member's web page to a workspace .png); `destroy` when "
-            "done. A PROJECT's lab can be KEPT as production "
-            "(the owner's call only): `keep` (params.app {name, member, port, cmd} — cmd is the app's process, run in "
-            "/app where deploy unpacks; a static site = a python-app lab, port 8080, cmd "
-            "`python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app`) → `deploy` (params.folder) → it "
-            "serves on a stable tailnet URL; a new version = a second kept lab, `deploy`, then `switch` "
-            "(params.from_lab = the one serving); `rollback`, `backup`/`backups`/`restore` (params.backup_id), "
-            "`app` op=start|stop|restart, `rehearse`."),
+            "Disposable MACHINES on the labs host for the system under test: databases, clusters, servers, root, "
+            "ports, network faults. Build in the workspace, RUN here; labs expire, so save recipes and results to the "
+            "workspace (`spec`, `get`). The workspace and the browser cannot reach a lab: use exec/http. `templates` "
+            "→ `create`; each exec names lab_id + member (`cancel` stops one; `screenshot` → a "
+            "workspace .png); `destroy` when done. Templates: python-app, node-app, static-site, pg-single, python-pg "
+            "(app + postgres, DATABASE_URL set), web, blank-dev, mysql-single, patroni-3. The OWNER may compose: "
+            "params mem_mb / ports / cap_add / cpus / egress (a value, or {member: value}), or params.members "
+            "[{name, image, mem_mb, ports}] with no template. A PROJECT's lab can be KEPT as production (owner origin "
+            "only): `keep` (params.app {name, member, port, cmd, health {http: path|null, tcp}, workdir, build, "
+            "subdir}; templates fill what they know) → `deploy` (params.folder; params.subdir ships e.g. "
+            "dist/ only) → a stable tailnet URL (a TCP app such as pg-single: host:port). The app gets $PORT and "
+            "DATA_DIR=/data: ONLY /data survives a deploy and is backed up (every member's; postgres is stopped for "
+            "the copy; a restore puts it back — with postgres a hook's restore_cmd never runs); params.data_seed "
+            "moves listed paths there on the first deploy. Deploy ships the folder minus "
+            "dotfiles, credentials, agent files and what .deployignore lists (params.dotfiles: true ships dotfiles), "
+            "then builds IN THE NEW folder: requirements.txt → pip into .deps (run plain python3: -I/-E ignore it), "
+            "package.json → npm ci + npm run build (params.build: a command, or \"none\"); a failed build changes "
+            "nothing. A new version that exits or answers an HTTP error while the old one was up is rolled back "
+            "automatically. params.requirements {pip, apt} install into the machine. A repeated keep with changed app "
+            "fields updates it. Also `rollback`, `backup`/`backups`/`restore` "
+            "(params.backup_id), `app` op=start|stop|restart (a failed restore: restore a good backup, or "
+            "params.reinit: true = use /data as it is), `rehearse`; `switch` (params.from_lab) moves the app "
+            "to another kept lab (no rebuild)."),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": list(ACTIONS)},
                 "lab_id": {"type": "string", "description": "lab_xxxxxxxx (all actions but templates/create/list)"},
                 "template": {"type": "string", "description": "create: a template name from `templates`"},
-                "params": {"type": "object", "description": "create: template params, e.g. {\"version\": \"18\"}; "
+                "params": {"type": "object", "description": "create: the template's params (`templates` lists "
+                           "them) — the owner also mem_mb/ports/cap_add/cpus/egress/members; "
                            "keep/deploy/switch/rollback/restore: that action's inputs"},
                 "label": {"type": "string"},
                 "purpose": {"type": "string", "description": "create: one line, why this lab exists"},

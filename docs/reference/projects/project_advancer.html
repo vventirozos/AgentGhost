@@ -37,6 +37,7 @@
       <a href="project_research.html">Project research (core.project_research)</a>
       <a href="project_safety.html">Project safety (core.project_safety)</a>
       <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="project_turns.html">Project task turns (core.project_turns)</a>
       <a href="projects_routes.html">Projects API (api.projects_routes)</a>
       <a href="projects_tool.html">Projects tool (tools.projects)</a>
       <a href="task_close.html">Closing tasks (core.task_close)</a>
@@ -61,7 +62,7 @@
   <h1>core / project_advancer.py</h1>
   <p class="subtitle">Single autoadvance tick for long-running projects. Classifies the next task, runs one constrained step, and bookkeeps budget / runtime / contradictions.</p>
 
-  <h2 id="no-confirmations">No confirmations <span class="tag">2026-11-12 &sect;4UJ</span></h2>
+  <h2 id="no-confirmations">No confirmations <span class="tag">2026-11-12 &sect;4UK</span></h2>
   <p class="note">Operator: "i want all confirmations, everywhere to be removed. i don't wanna be asked for anything. that's why everything is sandboxed" (clarifying questions stay). This supersedes the preview/confirm_token, human-gate and gate-word sections further down.</p>
   <ul>
     <li><code>manage_projects</code> release / unrelease / delete run in the call; <code>confirm_token</code> is accepted and ignored. <code>_lifecycle_confirmation</code> only refuses a non-user turn (background, scheduled, probe — a probe may still act on its own probe-created project) and a request that read outside content.</li>
@@ -69,6 +70,16 @@
     <li>Gate words ("approve", "publish", "send", "confirm") no longer hold or park a task; the classifier answers only coding / research.</li>
     <li>A constraint override (<code>override={"constraints": "&lt;why&gt;"}</code>) goes through in the owner's own turn and is recorded (<code>constraint_override</code> event + ledger line); an unattended turn still cannot go over a constraint.</li>
     <li>Kept: an explicit <code>kind: owner</code> task (it needs something only the owner has), and the unattended verify / model-experiment holds (they are not approvals).</li>
+  </ul>
+
+  <h2 id="4ul">Daily allowance, plan order, holds <span class="tag">2026-11-12 &sect;4UL</span></h2>
+  <p class="note">Operator (batch-3 decisions): "3. B. i don't want to be asked" — a daily cap on unattended work only, no pauses or asks, the owner's runs never capped; and "proceed with all batches" (plan order as a soft dependency, holds only for builds that did not verify). This supersedes the step budget, check-in and pause wording in the &sect;4MQ section below.</p>
+  <ul>
+    <li><strong>Owner runs are never capped.</strong> <code>_advance_once_body</code> no longer checks <code>steps_cap</code>; <code>steps_used</code> is a record (<code>_increment_budget</code> sets no default cap; <code>DEFAULT_STEPS_CAP</code> caps nothing). The owner's own lifetime <code>runtime_cap_seconds</code> / <code>tool_call_cap</code> (only if set) still apply to unattended runs.</li>
+    <li><strong>A daily unattended allowance.</strong> <code>advance_unattended</code> rolls the day (<code>_roll_day</code>: <code>unattended_day</code>, <code>unattended_steps_today</code>, <code>unattended_runtime_seconds</code>, <code>no_progress_streak</code> reset on a new local date) and books every step that worked on a task. At <code>daily_cap(meta)</code> tasks (<code>DAILY_UNATTENDED_TASKS</code> = 30, or <code>unattended_per_day</code>), at the runtime cap, or after <code>NO_PROGRESS_PAUSE_AT</code> (3) steps in a row without progress, the project <em>rests</em> (<code>_rest_today</code>): the tick returns <code>blocked</code> "resting until tomorrow — …", one <code>autopilot_resting</code> event per day and kind, autopilot stays ON, no notification. The next day it continues by itself. A batch that meets a rest stops with <code>budget_or_inactive</code>.</li>
+    <li><strong>No check-in by default.</strong> <code>DEFAULT_CHECKPOINT_EVERY = 0</code>; only an owner who set <code>checkpoint_every &gt; 0</code> (<code>action=budget</code>) gets the check-in pause. A project stuck behind failed work still pauses and says which task (<code>_pause_if_stuck</code>).</li>
+    <li><strong>The verify-word hold is for a check nothing ran.</strong> <code>_unattended_close(…, unverified_build=)</code>: the coding path passes <code>not cres.verified</code>, so a build whose verification command ran and passed closes DONE even when its task says "test" or "verify" (the live autopilot log had 34 such holds against 1 failure). Without a build (research path) the hold stays. <code>verify_task</code> joined <code>HOLD_KINDS_RECHECKED</code>: the owner's run re-checks a <em>build's</em> verify hold by its files on disk; a verify hold from the research path is run again (the check is what was missing).</li>
+    <li><strong>Plan order is a soft dependency.</strong> The claim in <code>advance_once</code> skips <code>planning.soft_order_blocked(plan, excluded, independent_task_ids(meta))</code>: a task with no <code>depends_on</code> of its own does not start while a sibling <em>before</em> it (or a task inside such a sibling) is NEEDS_USER, BLOCKED, PAUSED or IN_PROGRESS, or was skipped (a FAILED one does not hold it: review M1; the next turn sees the failure and a retry flags the tasks built on it. A parent whose child failed rolls up BLOCKED, so a failure inside a phase still holds the next phase) by the run (<code>exclude_ids</code>: model experiments a batch stopped at; lab-held tasks). A task with declared <code>depends_on</code> follows that list only; a task in the project's <code>independent_tasks</code> (declared with <code>depends_on: []</code>) is never held by order. In the owner's run the held tasks count as PENDING for the pick, so the owner's run takes them first. With nothing else to pick the tick says "N task(s) wait behind an earlier task that waits or is running (plan order)"; when every open task is held by failed work (depends_on, a BLOCKED ancestor, or plan order behind a sibling blocked by a failure: <code>planning.soft_order_stoppers</code>) <code>_pause_if_stuck</code> pauses autopilot once and names the failed tasks; the batch reports <code>open_but_waiting</code> / <code>project_failed</code> / <code>needs_user</code> as before.</li>
   </ul>
   <h2>API</h2>
   <div class="scroll"><table>
@@ -98,8 +109,8 @@
   context stays bounded no matter how many tasks run — the antidote to one chat
   turn grinding the whole tree and flooding the context window. The loop stops
   at the FIRST of: <strong>project_done</strong> · <strong>count_reached</strong>
-  · <strong>needs_user</strong> (a human-gate task — only with <code>stop_on_fail=True</code>; the owner's batch goes past it, <a href="#4sr">&sect;4SR</a>) · <strong>budget_or_inactive</strong>
-  (step budget exhausted) · <strong>failed</strong> (a task FAILED, when
+  · <strong>needs_user</strong> (only with <code>stop_on_fail=True</code>; the owner's batch goes past a waiting task, <a href="#4sr">&sect;4SR</a>) · <strong>budget_or_inactive</strong>
+  (not ACTIVE, or an unattended run's daily allowance is used, <a href="#4ul">&sect;4UL</a>) · <strong>failed</strong> (a task FAILED, when
   <code>stop_on_fail</code>) · <strong>hard_cap</strong>
   (<code>ADVANCE_ALL_HARD_CAP=40</code>, a backstop for an uncapped project).</p>
   <p><strong>Coding executor (2026-06-20).</strong> A tick's coding path is the
@@ -181,7 +192,7 @@
   Covered by <code>tests/test_project_readside_plumbing.py</code>.</p>
 
   <h2>Budget enforcement</h2>
-  <p><code>_get_budget()</code> reads <code>steps_cap / steps_used</code> from project metadata; <code>_increment_budget()</code> bumps after each tick. Checked via <a href="project_safety.html">check_budget()</a> across <code>steps</code>, <code>runtime</code>, and <code>tool_calls</code>.</p>
+  <p><code>_get_budget()</code> reads <code>steps_cap / steps_used</code> from project metadata; <code>_increment_budget()</code> bumps <code>steps_used</code> after each tick. Since &sect;4UL that count is a record, not a cap: <a href="project_safety.html">check_budget()</a> runs without the step keys, on unattended runs only, for the owner-set <code>runtime</code> and <code>tool_calls</code> caps. The unattended limit is the daily allowance (<a href="#4ul">&sect;4UL</a>).</p>
 
   <h2>AdvanceResult</h2>
   <pre><code>AdvanceResult(ok: bool, task_id: str, classification: str, summary: str, artifact_id: Optional[str])</code></pre>
@@ -278,16 +289,16 @@
   <p>A request that needs hours or days runs as a project on autopilot, one short step at a time. The idle loop's only entry is <code>advance_unattended(context, project_id)</code>, which wraps <code>advance_once(…, owner_requested=False)</code> in its gates. It runs only on a project whose autopilot is <em>on</em>, so a paused project is never stepped by a scheduled task or sub-agent either. It runs one step per project at a time: a second concurrent step is refused, not charged. Every gate that stops work turns autopilot <em>off</em>, records why in <code>metadata.autopilot_paused</code> and a <code>autopilot_paused</code> event, and sends you one notification (severity notify: a Slack DM outside quiet hours) — only on the on→off transition, never again while it stays paused. The pause also appears in the next chat's "while you were away" digest. Only your own turn turns it back on.</p>
   <ul>
     <li><strong>Progress gate.</strong> A step moved forward only when the task it worked on is now DONE. A written file, a summary or a held task is not progress. After <code>NO_PROGRESS_PAUSE_AT</code> (3) steps in a row with no progress, autopilot pauses. A tick that claimed no task is not scored. A task held for you (NEEDS_USER) is neither progress nor failure: the hold already told you, and it stops the project.</li>
-    <li><strong>Check-ins.</strong> After <code>checkpoint_every</code> steps that moved forward (default 10; 0 turns check-ins off), autopilot pauses so you can look before more runs.</li>
+    <li><strong>Check-ins.</strong> After <code>checkpoint_every</code> steps that moved forward, autopilot pauses so you can look before more runs — only when you set <code>checkpoint_every</code> (&sect;4UL: default 0, no check-in).</li>
     <li><strong>Wall cap per step.</strong> A step that runs past <code>UNATTENDED_STEP_TIMEOUT_S</code> (45 min) is cancelled, and so is a step that raises. Only <em>its own</em> claimed task goes back to READY (<code>advance_once(claim_sink=…)</code> reports the claim), and the step is charged and counted as no progress. A step that finished during the cancel grace is scored as it ended, not charged twice. Cancelling does not stop a sandbox command already running; that command ends on its own timeout. A step that <em>returns</em> with its leaf still claimed has that leaf put back to READY too (§4MR). A crashed coding executor now reopens its task (it used to stay IN_PROGRESS, so no tick could retry it and the gate never paused).</li>
     <li><strong>A step lost to a restart is charged.</strong> <code>metadata.step_in_flight</code> carries the process's boot id. It is set before a step and cleared after it, but only by the step that set it. If a tick finds a marker from <em>another</em> boot, that process died mid-step: the step is charged and counted as no progress, and the boot reaper has already put its task back to READY. A marker from this boot means a step is still running. Your resume does not clear it (§4MR: clearing it let a second step run beside the first).</li>
     <li><strong>Unattended runtime allowance.</strong> Unattended steps add their wall time to <code>unattended_runtime_seconds</code>. Your own runs do not, and every resume resets it. At <code>unattended_runtime_cap_seconds</code> (set by <code>action=budget runtime_cap_hours</code>; default <code>DEFAULT_UNATTENDED_RUNTIME_CAP_S</code>, 6 h) autopilot pauses. The project's lifetime <code>runtime_cap_seconds</code> (an older knob that <code>action=budget</code> does not set, and no live project carries) is separate and would also limit your own runs.</li>
-    <li><strong>Step budget.</strong> An exhausted <code>steps_cap</code> (it counts every advancer step, your batches too), or the lifetime runtime/tool-call caps, is a pause like the others: autopilot off, you are told once (§4MR — it used to block every tick silently with autopilot left on).</li>
+    <li><strong>Step budget</strong> (removed &sect;4UL). <code>steps_cap</code> no longer limits anything; the daily allowance replaced it, and reaching it (or the runtime cap, or the no-progress count) rests the project until the next day instead of pausing it (<a href="#4ul">&sect;4UL</a>).</li>
   </ul>
   <p><code>advance_many</code>, the batch behind "do the next N" / "finish it":</p>
   <ul>
     <li>A batch run by a scheduled task, sub-agent or probe goes through the same gates. It does not run when autopilot is off (<code>autopilot_off</code>), checks again before every step (so "stop all" stops it; a step already running finishes first), and stops with <code>autopilot_paused</code> when a gate pauses, or <code>busy</code> when another step on the project is running.</li>
-    <li>Any batch stops with <code>step_crashed</code> when a build crashes. It never reports <code>project_done</code> while a task is still IN_PROGRESS (<code>in_progress</code>).</li>
+    <li>Any batch stops with <code>step_crashed</code> when a build crashes, and with <code>model_server_failed</code> when a task turn's model server failed (the task is reopened; &sect;4UL round 7). It never reports <code>project_done</code> while a task is still IN_PROGRESS (<code>in_progress</code>).</li>
     <li>Every batch stops <em>before</em> a step that would end inside the request's report reserve (<code>deadline</code>). It uses the longest step of this batch so far as the estimate, and <code>FIRST_STEP_ESTIMATE_S</code> (120 s) before the first step (§4MR: the first step used to run unchecked). It is still a lower bound: a short research step says nothing about a following build. Before this, nothing checked the clock between up to 40 builds in one tool call.</li>
   </ul>
 

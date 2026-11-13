@@ -8,17 +8,14 @@ and by pytest in tests — the caller injects a ``tool_runner`` and an
 ``llm_classifier`` (both optional; sensible defaults are used when
 omitted).
 
-Budget model:
-  project metadata carries two budget knobs:
-    - ``steps_cap``  — the total number of advancer steps allowed for
-      this project. Defaults to :data:`DEFAULT_STEPS_CAP` when unset.
-    - ``steps_used`` — incremented after every completed tick.
-  When ``steps_used >= steps_cap`` the advancer refuses to proceed and
-  logs a ``budget_exhausted`` event (unattended: autopilot pauses and the
-  owner is told, §4MR). Only the owner raises the cap (``manage_projects``
-  action=budget, §4MQ — the model's ``metadata=`` cannot) — budgets are a
-  hard stop, not a soft warning. The cap counts EVERY advancer step, the
-  owner's batches too.
+Budget model (§4UL, operator 11-12: "i don't want to be asked"):
+  the owner's own runs are never capped. Unattended work has a DAILY
+  allowance (:data:`DAILY_UNATTENDED_TASKS` tasks and the unattended
+  runtime cap, per project per day); when it is used, autopilot RESTS until
+  the next day — it stays on, nobody is asked to look or raise anything.
+  ``steps_used`` still counts every step, as a record. The owner may change
+  the allowance (``manage_projects action=budget`` unattended_per_day /
+  runtime_cap_hours) and may opt in to a check-in (checkpoint_every).
 
 The classifier is intentionally a keyword heuristic. An LLM classifier
 can be plugged in later by passing ``llm_classifier=...``; the tests
@@ -392,6 +389,9 @@ class AdvanceResult:
     classification: str
     summary: str
     artifact_id: Optional[str] = None
+    #: §4UL round 5 M3: set by a step that knows whether it did work (a task turn: any tool call ran) — the daily
+    #: allowance is then booked from this, exactly once; None = judge by the classification (a deferral did none)
+    worked: Optional[bool] = None
 
 
 ToolRunner = Callable[[str, Dict[str, Any]], Awaitable[str]]
@@ -642,8 +642,7 @@ def _increment_budget(store, project_id: str) -> None:
         # ONE atomic read-modify-write (§4LZ C2): a whole-dict write-back
         # put stale values back over keys merged in between
         def _bump(meta):
-            meta["steps_used"] = int(meta.get("steps_used", 0) or 0) + 1
-            meta.setdefault("steps_cap", DEFAULT_STEPS_CAP)
+            meta["steps_used"] = int(meta.get("steps_used", 0) or 0) + 1      # a record, no cap (§4UL)
             meta["last_autoadvance_ts"] = time.time()
             return meta
         if callable(getattr(store, "_atomic_metadata_update", None)):
@@ -652,7 +651,6 @@ def _increment_budget(store, project_id: str) -> None:
         budget = _get_budget(store, project_id)
         new_meta = dict(budget["meta"])
         new_meta["steps_used"] = budget["used"] + 1
-        new_meta.setdefault("steps_cap", budget["cap"])
         # Stamp when this project was last autonomously advanced so the idle
         # scheduler can round-robin across ACTIVE projects (least-recently-
         # advanced first) instead of repeatedly picking whichever project sorts
@@ -756,7 +754,8 @@ def _research_output_usable(output) -> bool:
 #: §4SU Phase 5: the kind of each hold, recorded in its
 #: ``autoadvance_needs_user`` event — what the owner's run re-CHECKS (the
 #: work already happened) rather than re-runs
-HOLD_KINDS_RECHECKED = frozenset({"unverified_build", "undelivered", "unrun_experiment"})
+#: §4UL: verify_task too — the work happened; the owner's run re-checks the files instead of rebuilding them
+HOLD_KINDS_RECHECKED = frozenset({"unverified_build", "undelivered", "unrun_experiment", "verify_task"})
 
 
 def _hold_kind_of(why: str) -> str:
@@ -792,8 +791,11 @@ async def _recheck_held(context, store, plan, project_id, nxt, held_summary):
             files = [str(a.get("payload") or "").strip() for a in (store.list_artifacts(task_id=nxt.id) or [])
                      if str(a.get("kind") or "") == "file"]
             files = [f for f in files if f]
-        if kind == "unverified_build" and not files:
-            return None
+        if kind in ("unverified_build", "verify_task") and not files:
+            return None                       # §4UL: a check with nothing on disk is run, never closed here
+        if kind == "verify_task" and str(pl.get("tool") or "code_executor") != "code_executor":
+            return None                       # §4UL: only a BUILD's verify hold is re-checked; a check that
+                                              # never ran (research path) is what was missing — it runs
         for rel in files:
             p = (ws / rel)
             try:
@@ -852,7 +854,7 @@ async def _recheck_held(context, store, plan, project_id, nxt, held_summary):
 
 
 def _unattended_close(owner_requested: bool, description: str,
-                      evidence_ok: bool = True, unverified_build: bool = False):
+                      evidence_ok: bool = True, unverified_build=None):
     """(status, note) for closing a leaf (§4LP, operator: "go with your
     recommendations"). Unattended (the idle loop) a task that asks to
     verify / test / check is not done because a file was written ("Verify
@@ -863,7 +865,9 @@ def _unattended_close(owner_requested: bool, description: str,
     from .planning import TaskStatus
     if owner_requested:
         return TaskStatus.DONE, ""
-    if _VERIFY_TASK_RE.search(str(description or "")[:400]):
+    # §4UL (review: 34 holds / 1 failure in the live autopilot log): a build whose verification command
+    # RAN and passed is the real check — the word hold is only for a check nothing ran
+    if unverified_build is not False and _VERIFY_TASK_RE.search(str(description or "")[:400]):
         return TaskStatus.NEEDS_USER, f"needs a real check — {_HELD_MARK}"
     if not evidence_ok:
         return (TaskStatus.NEEDS_USER,
@@ -901,6 +905,9 @@ LAB_GAVE_UP_PREFIX = "code build gave up waiting for the labs host (task waits f
 #: review 11-05 P-m4: no lab, and the claimed task was an OWNER HOLD — it went back to that hold. Its own prefix (the
 #: r4 rule): under LAB_WAIT_PREFIX the batch told the owner it "starts again by itself"
 LAB_NO_LAB_HELD_PREFIX = "code build got no lab (task back to its owner hold)"
+#: §4UL round 7: a task turn whose model server failed (task reopened) — a batch stops on it (`model_server_failed`),
+#: never spends its count re-picking the same task while the server is down
+MODEL_SERVER_FAILED_PREFIX = "the model server failed during the task's turn"
 
 
 def _experiment_gate_build(store, project_id, nxt, cres):
@@ -1445,18 +1452,13 @@ async def _advance_once_body(
             f"waiting on dependency project "
             f"'{(_dp or {}).get('title') or _dep}' ({_dep_status or 'missing'})")
 
-    budget = _get_budget(store, project_id)
-    if budget["used"] >= budget["cap"]:
-        _log_budget_exhausted(store, project_id,
-                              {"used": budget["used"], "cap": budget["cap"]})
-        _stamp_autoadvanced(store, project_id)
-        return AdvanceResult(True, None, "blocked",
-                             f"budget exhausted: {budget['used']}/{budget['cap']}")
-
-    # Secondary rails: runtime + tool-call caps (optional per project).
+    # §4UL (decision 3B): the owner's own runs are never capped; the unattended limits (a daily task
+    # allowance, runtime) are checked by `_advance_unattended_body`. `steps_used` still counts, as a record.
     from .project_safety import check_budget, record_runtime
-    secondary = check_budget(proj.get("metadata") or {})
-    if not secondary.allowed:
+    secondary = (check_budget({k: v for k, v in (proj.get("metadata") or {}).items()
+                               if k not in ("steps_cap", "steps_used")})
+                 if not owner_requested else None)
+    if secondary is not None and not secondary.allowed:
         _log_budget_exhausted(store, project_id, dict(secondary.remaining))
         _stamp_autoadvanced(store, project_id)
         return AdvanceResult(True, None, "blocked", secondary.reason)
@@ -1466,7 +1468,7 @@ async def _advance_once_body(
     # Lazy import: ProjectPlan lives in planning.py which also owns
     # TaskTree logic; importing at module top would pull the planning
     # graph into every scheduler tick which is wasteful.
-    from .planning import ProjectPlan, TaskStatus
+    from .planning import ProjectPlan, TaskStatus, independent_task_ids, soft_order_blocked
 
     # Atomically claim the next leaf. The original code marked IN_PROGRESS
     # only AFTER `await llm_classifier(...)`, so on a single event loop
@@ -1502,9 +1504,12 @@ async def _advance_once_body(
         # independent work; a task depending on them is still not ready
         _base_skip = None if owner_requested else _is_unrequested_task
         _ex = set(exclude_ids or ()) | _lab_held
+        # §4UL (review: c6b9f65d built findings.md over two skipped experiments): plan order is a soft
+        # dependency — a task does not start while an EARLIER sibling waits, runs or was skipped (a
+        # FAILED one does not hold it: review M1)
+        _soft = soft_order_blocked(plan, _ex, independent_task_ids(proj.get("metadata")))
         nxt = plan.next_ready_leaf(
-            skip=(_base_skip if not _ex else
-                  (lambda n: n.id in _ex or bool(_base_skip and _base_skip(n)))))
+            skip=(lambda n: n.id in _ex or n.id in _soft or bool(_base_skip and _base_skip(n))))
         for _n in _held:
             if _n is not nxt:
                 _n.status = TaskStatus.NEEDS_USER
@@ -1534,6 +1539,10 @@ async def _advance_once_body(
         if _lab_held:
             return AdvanceResult(True, None, "idle",
                                  f"no READY/PENDING leaf; {len(_lab_held)} task(s) waiting for the labs host")
+        if _soft:
+            return AdvanceResult(True, None, "idle",
+                                 f"no READY/PENDING leaf; {len(_soft)} task(s) wait behind an earlier "
+                                 "task that waits or is running (plan order)")
         return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
     if nxt.id in _lab_holds:
         from .lab_waits import clear_holds
@@ -1643,6 +1652,20 @@ async def _advance_once_body(
         _increment_budget(store, project_id)
         return AdvanceResult(True, nxt.id, "needs_user",
                              "task requires human input")
+
+    # §4UL (decision 1A): a build or research task runs as ONE full agent turn
+    # (core/project_turns.py) — every tool, the briefing, the task_update close
+    # gates; the build executor below is the fallback when that turn cannot be built
+    if classification in ("coding", "research"):
+        from .project_turns import run_task_turn_for_advance, wants_task_turn
+        if wants_task_turn(context, coding_executor):
+            _tt = await run_task_turn_for_advance(
+                context, store, project_id, nxt, classification, owner_requested,
+                idle=bool(getattr(coding_executor, "_ghost_idle_executor", False)),
+                started_at=_tick_started_at)
+            if _tt is not None:
+                return _tt
+            logger.warning("task turn unavailable for %s — the build executor runs it", nxt.id)
 
     # STRONG coding path: when a coding_executor is wired, BUILD the leaf for
     # real (write files + verify) and finalize from its structured result —
@@ -2242,16 +2265,60 @@ def idle_candidates(store) -> list:
 
 # ------------------------------------------------------------------ §4MQ
 # Multi-day work = many short, bounded UNATTENDED steps on an autopilot
-# project. Each step must move the plan forward, or autopilot pauses and the
-# owner is told once; it never runs past its own wall cap; a step lost to a
-# crash is charged; and every `checkpoint_every` steps that moved forward the
-# owner is asked to look before more run. Every pause turns autopilot OFF —
-# only the owner's own turn turns it back on (§4LQ).
+# project. It never runs past its own wall cap; a step lost to a crash is
+# charged. §4UL (decision 3B): the limits are a daily allowance — tasks
+# (DAILY_UNATTENDED_TASKS), runtime, and NO_PROGRESS_PAUSE_AT steps in a row
+# that moved nothing — and reaching one makes the project REST until the next
+# day (autopilot stays on, nobody is asked). A check-in pause happens only when
+# the owner set `checkpoint_every`; a project stuck behind failed work still
+# pauses and says so (`_pause_if_stuck`).
 
-#: consecutive unattended steps that moved nothing forward → autopilot pauses
+#: consecutive unattended steps that moved nothing forward → autopilot rests until tomorrow (§4UL)
 NO_PROGRESS_PAUSE_AT = 3
-#: unattended steps that moved forward between owner check-ins (owner may change)
-DEFAULT_CHECKPOINT_EVERY = 10
+#: §4UL (operator 11-12, decision 3B "i don't want to be asked"): no check-in pause by default — an owner
+#: who WANTS one sets checkpoint_every > 0 with action=budget
+DEFAULT_CHECKPOINT_EVERY = 0
+#: §4UL: unattended tasks a project may run per day; then it simply waits for the next day (no pause, no
+#: message). The owner's own runs never count toward it. action=budget unattended_per_day changes it.
+DAILY_UNATTENDED_TASKS = 30
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _roll_day(m):
+    """§4UL: a new day starts a fresh unattended allowance — tasks, runtime and the no-progress streak."""
+    if m.get("unattended_day") != _today():
+        m["unattended_day"] = _today()
+        m["unattended_steps_today"] = 0
+        m["unattended_runtime_seconds"] = 0
+        m["no_progress_streak"] = 0
+    return m
+
+
+def daily_cap(meta) -> int:
+    try:
+        v = meta.get("unattended_per_day")
+        return DAILY_UNATTENDED_TASKS if v is None else max(0, int(v))
+    except (TypeError, ValueError):
+        return DAILY_UNATTENDED_TASKS
+
+
+def _rest_today(store, project_id, kind: str, detail: str) -> "AdvanceResult":
+    """§4UL: an unattended stop that needs nobody — autopilot stays ON and the project continues tomorrow.
+    Logged once per day per kind (a quiet line in the project's events/status)."""
+    try:
+        _last = store.list_events(project_id, limit=1, event_type="autopilot_resting")
+        _pl = (_last[0].get("payload") or {}) if _last else {}
+        if not (_pl.get("day") == _today() and _pl.get("kind") == kind):
+            store.log_event(project_id, None, "autopilot_resting", {"day": _today(), "kind": kind,
+                                                                      "detail": str(detail)[:200]})
+    except Exception:  # noqa: BLE001
+        pass
+    if kind == "owner_cap":
+        return AdvanceResult(True, None, "blocked", f"stopped at a cap the owner set — {detail}")
+    return AdvanceResult(True, None, "blocked", f"resting until tomorrow — {detail}")
 #: one unattended step's wall cap (a build that verifies can run long; a
 #: sandbox job is promoted and survives its turn on its own)
 UNATTENDED_STEP_TIMEOUT_S = 45 * 60
@@ -2266,7 +2333,8 @@ BUDGET_METADATA_KEYS = (
     "steps_cap", "steps_used", "runtime_cap_seconds", "runtime_used_seconds",
     "tool_call_cap", "tool_call_used", "checkpoint_every", "no_progress_streak",
     "steps_since_checkpoint", "step_in_flight", "autopilot_paused", "last_autoadvance_ts",
-    "unattended_runtime_seconds", "unattended_runtime_cap_seconds")
+    "unattended_runtime_seconds", "unattended_runtime_cap_seconds",
+    "unattended_day", "unattended_steps_today", "unattended_per_day")    # §4UL decision 3B
 
 #: this process — a `step_in_flight` stamped by another boot is a step that
 #: died with its process; one stamped by this boot is a step still running
@@ -2421,7 +2489,7 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
             m["no_progress_streak"] = int(m.get("no_progress_streak") or 0) + 1
         m["step_in_flight"] = _mine
         return m
-    meta = _bump_meta(store, project_id, _enter)
+    meta = _bump_meta(store, project_id, lambda m: _roll_day(_enter(m)))
     if _claim["busy"]:
         return AdvanceResult(True, None, "blocked", "another unattended step on this project is running")
     try:
@@ -2432,28 +2500,22 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
                                 {"streak": meta.get("no_progress_streak")})
             except Exception:  # noqa: BLE001
                 pass
-            if int(meta.get("no_progress_streak") or 0) >= NO_PROGRESS_PAUSE_AT:
-                pause_autopilot(context, project_id, "no progress",
-                                f"{NO_PROGRESS_PAUSE_AT} steps in a row moved nothing forward "
-                                "(one was lost to a restart)")
-                return AdvanceResult(True, None, "blocked", "autopilot paused: no progress")
-        # §4MR: an exhausted step budget (or the lifetime runtime / tool-call
-        # caps) blocked every tick silently with autopilot left ON — it is a
-        # pause like the others: autopilot off, the owner told once
-        _bud = _get_budget(store, project_id)
-        if _bud["used"] >= _bud["cap"]:
-            pause_autopilot(context, project_id, "step budget used",
-                            f"{_bud['used']}/{_bud['cap']} steps — the owner raises it with action=budget")
-            return AdvanceResult(True, None, "blocked", "autopilot paused: step budget")
+        # §4UL (decision 3B): every unattended limit is a REST until tomorrow — autopilot stays on, nobody
+        # is asked to look or raise anything. The owner's own runs are never limited here.
+        if int(meta.get("no_progress_streak") or 0) >= NO_PROGRESS_PAUSE_AT:
+            return _rest_today(store, project_id, "no_progress",
+                               f"{NO_PROGRESS_PAUSE_AT} steps in a row moved nothing forward")
+        _cap = daily_cap(meta)
+        if int(meta.get("unattended_steps_today") or 0) >= _cap:
+            return _rest_today(store, project_id, "daily_cap", f"{_cap} unattended tasks today")
         from .project_safety import check_budget as _check_budget
-        _sec = _check_budget(meta)
+        # the lifetime step counter is no cap any more (§4UL); the owner's own runtime / tool-call caps are
+        _sec = _check_budget({k: v for k, v in meta.items() if k not in ("steps_cap", "steps_used")})
         if not _sec.allowed:
-            pause_autopilot(context, project_id, "budget used", _sec.reason)
-            return AdvanceResult(True, None, "blocked", "autopilot paused: " + _sec.reason)
+            return _rest_today(store, project_id, "owner_cap", _sec.reason)
         if float(meta.get("unattended_runtime_seconds") or 0) >= _unattended_cap_s(meta):
-            pause_autopilot(context, project_id, "runtime budget used",
-                            f"{_unattended_cap_s(meta) / 3600:.1f} h of unattended work since your last look")
-            return AdvanceResult(True, None, "blocked", "autopilot paused: runtime budget")
+            return _rest_today(store, project_id, "runtime",
+                               f"{_unattended_cap_s(meta) / 3600:.1f} h of unattended work today")
         t0 = time.time()
         timeout = UNATTENDED_STEP_TIMEOUT_S if step_timeout_s is None else float(step_timeout_s)
         claimed: list = []
@@ -2492,8 +2554,18 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
                     except Exception:  # noqa: BLE001
                         logger.debug("left-claimed leaf not reset", exc_info=True)
         _elapsed = time.time() - t0
-        _bump_meta(store, project_id, lambda m: {**m, "unattended_runtime_seconds": float(
-            m.get("unattended_runtime_seconds") or 0) + _elapsed})
+        # review m2: a deferral (the owner's request took the slot; the task reopened) did no work — it does not
+        # spend the daily allowance
+        _worked = (bool(res.task_id or res.classification in ("timeout", "error"))
+                   and res.classification != "deferred") if getattr(res, "worked", None) is None else bool(res.worked)
+
+        def _book(m):
+            m = _roll_day(m)
+            m["unattended_runtime_seconds"] = float(m.get("unattended_runtime_seconds") or 0) + _elapsed
+            if _worked:                                   # §4UL: the daily allowance counts tasks worked on
+                m["unattended_steps_today"] = int(m.get("unattended_steps_today") or 0) + 1
+            return m
+        _bump_meta(store, project_id, _book)
     finally:
         def _leave(m):
             cur = m.get("step_in_flight")
@@ -2525,14 +2597,16 @@ async def _advance_unattended_body(context, project_id: str, *, step_timeout_s: 
         return m
     meta = _bump_meta(store, project_id, _score)
     if int(meta.get("no_progress_streak") or 0) >= NO_PROGRESS_PAUSE_AT:
-        pause_autopilot(context, project_id, "no progress",
-                        f"{NO_PROGRESS_PAUSE_AT} steps in a row moved nothing forward (last: {res.summary[:120]})")
+        # §4UL: rests until tomorrow (the next tick says so), never turned off waiting for the owner
+        _rest_today(store, project_id, "no_progress",
+                    f"{NO_PROGRESS_PAUSE_AT} steps in a row moved nothing forward (last: {res.summary[:120]})")
     else:
         every = meta.get("checkpoint_every")
         every = DEFAULT_CHECKPOINT_EVERY if every is None else int(every)
+        # only an owner who SET checkpoint_every > 0 gets a check-in (§4UL: none by default)
         if score == "moved" and every > 0 and int(meta.get("steps_since_checkpoint") or 0) >= every:
             pause_autopilot(context, project_id, "check-in",
-                            f"{every} steps done since your last look — review the project before more run")
+                            f"{every} steps done since your last look (the check-in you set)")
     return res
 
 
@@ -2549,10 +2623,12 @@ def _request_id_now() -> str:
 def _pause_if_stuck(context, store, project_id) -> None:
     """§4SU Phase 0 (audit): nothing could be handed out, yet open work
     remains and none is running, and EVERY open leaf is held by a FAILED task
-    (through its ``depends_on`` chain or a BLOCKED ancestor). The idle tick
-    was never scored, so autopilot ticked on such a project forever and told
-    no one. Pause it and name the failed task(s). A leaf waiting on the
-    owner, or one that could still run, is not "stuck" (r1). Never raises."""
+    (through its ``depends_on`` chain, a BLOCKED ancestor, or — §4UL review
+    M1 — plan order behind an earlier sibling that is blocked on failed work).
+    The idle tick was never scored, so autopilot ticked on such a project
+    forever and told no one. Pause it and name the failed task(s). A leaf
+    waiting on the owner (or behind one that does), or one that could still
+    run, is not "stuck" (r1). Never raises."""
     try:
         tasks = store.list_tasks(project_id) or []
         st = lambda t: str(t.get("status") or "").upper()      # noqa: E731
@@ -2564,6 +2640,31 @@ def _pause_if_stuck(context, store, project_id) -> None:
             return
         parents = {t.get("parent_id") for t in tasks if t.get("parent_id")}
         open_leaves = [t for t in tasks if st(t) in ("PENDING", "READY") and t["id"] not in parents]
+        kids: dict = {}
+        for t in tasks:
+            if t.get("parent_id"):
+                kids.setdefault(t["parent_id"], []).append(t["id"])
+        try:                                       # §4UL review M1: what plan order holds, and behind what
+            from .planning import ProjectPlan, independent_task_ids, soft_order_stoppers
+            _meta = (store.get_project(project_id) or {}).get("metadata")
+            order_held = soft_order_stoppers(ProjectPlan(store, project_id), (), independent_task_ids(_meta))
+        except Exception:  # noqa: BLE001
+            logger.debug("plan order not read for the stuck check", exc_info=True)
+            order_held = {}
+
+        class _NotStuck(Exception):
+            pass
+
+        def _sub(i) -> list:
+            out, stack, seen = [], [i], set()
+            while stack:
+                c = stack.pop()
+                if c in seen or c not in by_id:
+                    continue
+                seen.add(c)
+                out.append(c)
+                stack.extend(kids.get(c, ()))
+            return out
 
         def _under(i, anc) -> bool:
             seen, p = set(), by_id.get(i, {}).get("parent_id")
@@ -2576,7 +2677,8 @@ def _pause_if_stuck(context, store, project_id) -> None:
 
         def _held(t, seen) -> set:
             """The FAILED tasks ``t`` waits on (r2: one helper, one signature —
-            a rebound lambda crashed every chain longer than one link)."""
+            a rebound lambda crashed every chain longer than one link).
+            Raises _NotStuck when ``t`` waits behind the owner or running work."""
             out = set()
             p, anc_seen = t.get("parent_id"), set()
             while p and p in by_id and p not in anc_seen:          # a BLOCKED ancestor
@@ -2585,6 +2687,14 @@ def _pause_if_stuck(context, store, project_id) -> None:
                     out |= {i for i in failed_ids if _under(i, p)}
                     break
                 p = by_id[p].get("parent_id")
+            for s_id in sorted(order_held.get(t["id"], ())):        # plan order (§4UL review M1)
+                sub = _sub(s_id)
+                if any(st(by_id[i]) in ("NEEDS_USER", "PAUSED", "IN_PROGRESS") for i in sub):
+                    raise _NotStuck()                               # waits behind the owner
+                f = {i for i in sub if i in failed_ids}
+                if not f:
+                    raise _NotStuck()                               # held by something we can't name
+                out |= f
             for d in (t.get("depends_on") or []):                  # the depends_on chain
                 if d in seen:
                     continue
@@ -2596,7 +2706,10 @@ def _pause_if_stuck(context, store, project_id) -> None:
             return out
         culprits = set()
         for t in open_leaves:
-            h = _held(t, set())
+            try:
+                h = _held(t, set())
+            except _NotStuck:
+                return
             if not h:
                 return                 # this leaf could still run, or waits on the owner
             culprits |= h
@@ -2883,6 +2996,16 @@ async def advance_many(
                              "status": (store.get_task(res.task_id) or {}).get("status"),
                              "summary": res.summary})
             stop_reason = "step_crashed"          # §4MR: was reported as a budget stop
+            break
+        if cls == "blocked" and res.task_id and res.summary.startswith(MODEL_SERVER_FAILED_PREFIX):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "model_server_failed"   # §4UL round 7: not a budget stop, not a retry of the same task
+            if (store.get_task(res.task_id) or {}).get("wait_on") == "owner_turn":
+                _held.append(res.task_id)         # round 8: a claimed owner hold went back to it
+            if res.worked is False:
+                _not_run.add(res.task_id)         # round 8: no call ran — not one of the tasks that ran
             break
         if cls == "blocked":
             # budget exhaustion, a non-ACTIVE project, or a project that just

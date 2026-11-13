@@ -11,6 +11,7 @@ from ghost_labs.errors import LabError
 from ghost_labs.kept import Kept, _docker_ts, valid_workdir
 from ghost_labs.store import dumps, loads
 
+from .fakes import TAR  # noqa: E402
 from .test_core import add_lab, env  # noqa: F401
 
 
@@ -242,12 +243,20 @@ def test_final_backup_covers_every_member(kept, env, monkeypatch):  # noqa: F811
         asked.append(m)
         return SimpleNamespace(get_archive=lambda p: (_Stream([m.encode()]), {}))
     monkeypatch.setattr(env, "container", cont)
-    out = kept._backup_locked("lab_a", "final", all_members=True)
+    sh = []
+    monkeypatch.setattr(kept, "_sh", lambda lab, m, cmd, *a, **k: sh.append((m, cmd)) or
+                        {"exit_code": 0, "stdout": "was-running", "stderr": ""})
+    out = kept._backup_locked("lab_a", "final", all_members=True, restart=False)
     assert asked == ["m1", "db"] and [x["member"] for x in out["members"]] == ["m1", "db"]
     assert {r["member"] for r in env.store.q("SELECT member FROM backups WHERE kind='final'")} == {"m1", "db"}
+    # the final backup: postgres is stopped for the copy and NOT started again (nothing may write after it)
+    assert [m for m, c in sh if "pg_ctl" in c] == ["db"] and not [c for m, c in sh if "10-postgres.sh" in c]
     asked.clear()
+    sh.clear()
+    # §4UL: every backup covers every member (python-pg's database is in db), postgres started again after
     kept._backup_locked("lab_a", "manual")
-    assert asked == ["m1"]
+    assert asked == ["m1", "db"]
+    assert [c for m, c in sh if m == "db"][0].count("pg_ctl") and "10-postgres.sh" in [c for m, c in sh if m == "db"][-1]
 
 
 def test_drop_data_final_backup_covers_every_member(kept, env, monkeypatch):  # noqa: F811
@@ -271,7 +280,7 @@ def test_restore_refuses_unmounted(kept, env):  # noqa: F811
 def test_restore_failure_snapshots_first_and_marks_stopped(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up")
     bk = tmp_path / "bk.tar"
-    bk.write_bytes(b"tar")
+    bk.write_bytes(TAR)                    # §4UL round 5: a restore checks the backup is a readable tar first
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_1", "p", "chess", "m1", time.time(), str(bk), "manual"))
     monkeypatch.setattr(kept, "_backup_locked", lambda lab, kind, **k: {"backup_id": "bk_pre"})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
@@ -283,7 +292,7 @@ def test_restore_failure_snapshots_first_and_marks_stopped(kept, env, monkeypatc
         kept._restore_locked("lab_a", "bk_1")
     assert e.value.extra["pre_restore"] == "bk_pre"
     a = app_of(env, "lab_a")
-    assert sent == [b"tar"]
+    assert sent == [TAR]
     assert a["state"] == "stopped" and "bk_pre" in a["last_error"] and "failed" in a["last_error"]
 
 
@@ -672,7 +681,7 @@ def test_reconcile_resets_interrupted_switch_state(env):  # noqa: F811
 def test_rollback_restore_failure_undoes_the_restore_then_reverses(kept, env, monkeypatch, tmp_path):  # noqa: F811
     _two_versions(env, kept, monkeypatch, tmp_path)
     bk = tmp_path / "s.tar"
-    bk.write_bytes(b"s")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_snap", "p", "chess", "m1", 1.0, str(bk), "pre_switch"))
     a = app_of(env, "lab_v2")
     a.update(mounted=True, state="up", switched_from="lab_v1", switch_snapshot="bk_snap", switch_snapshots=["bk_snap"])
@@ -680,7 +689,7 @@ def test_rollback_restore_failure_undoes_the_restore_then_reverses(kept, env, mo
     monkeypatch.setattr(kept, "_move_data", lambda to, fr, arch: ({"ok": True}, app_of(env, to)))
     restores = []
 
-    def restore(lab, bid, snapshot=True, start=True):
+    def restore(lab, bid, snapshot=True, start=True, **k):
         restores.append((lab, bid, snapshot))
         if bid == "bk_snap":
             raise LabError("internal", "put_archive failed", pre_restore="bk_pre")
@@ -714,13 +723,15 @@ def test_restore_snapshots_the_restored_member(kept, env, monkeypatch, tmp_path)
     env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18", "mem_mb": 256,
                           "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     bk = tmp_path / "db.tar"
-    bk.write_bytes(b"t")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_db", "p", "chess", "db", 1.0, str(bk), "final"))
     asked = []
     monkeypatch.setattr(kept, "_backup_locked", lambda lab, kind, **k: asked.append(k.get("only_member")) or {"backup_id": "x"})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
     monkeypatch.setattr(kept, "_must", lambda *a, **k: {"exit_code": 0})
     monkeypatch.setattr(env, "container", lambda lab, m: SimpleNamespace(put_archive=lambda p, f: True))
+    monkeypatch.setattr(kept, "_sh", lambda *a, **k: {"exit_code": 0, "stdout": "", "stderr": ""})
+    monkeypatch.setattr(env, "_put_bytes", lambda *a: None)
     kept._restore_locked("lab_a", "bk_db", start=False)
     assert asked == ["db"]
 
@@ -765,7 +776,10 @@ def test_backup_without_restart_leaves_app_stopped(kept, env, monkeypatch):  # n
     started = []
     monkeypatch.setattr(kept, "_start_app", lambda *a, **k: started.append(1))
     kept._backup_locked("lab_a", "final", restart=False)
-    assert started == []
+    assert started == [] and app_of(env, "lab_a")["state"] == "stopped"     # §4UL round 4: the stop is recorded
+    a = app_of(env, "lab_a")
+    a["state"] = "up"
+    kept._save("lab_a", a)
     kept._backup_locked("lab_a", "manual")
     assert started == [1]
 
@@ -790,7 +804,7 @@ def test_failed_reverse_leaves_no_marker(kept, env, monkeypatch, tmp_path):  # n
 def test_rollback_undo_failure_does_not_reverse(kept, env, monkeypatch, tmp_path):  # noqa: F811
     _two_versions(env, kept, monkeypatch, tmp_path)
     bk = tmp_path / "s.tar"
-    bk.write_bytes(b"s")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_snap", "p", "chess", "m1", 1.0, str(bk), "pre_switch"))
     a = app_of(env, "lab_v2")
     a.update(mounted=True, state="up", switched_from="lab_v1", switch_snapshot="bk_snap", switch_snapshots=["bk_snap"])
@@ -798,7 +812,7 @@ def test_rollback_undo_failure_does_not_reverse(kept, env, monkeypatch, tmp_path
     monkeypatch.setattr(kept, "_move_data", lambda to, fr, arch: ({"ok": True}, app_of(env, to)))
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
 
-    def restore(lab, bid, snapshot=True, start=True):
+    def restore(lab, bid, snapshot=True, start=True, **k):
         raise LabError("internal", "disk full", pre_restore="bk_pre" if snapshot else None)
     monkeypatch.setattr(kept, "_restore_locked", restore)
     monkeypatch.setattr(kept, "_reverse", lambda *a: pytest.fail("must not reverse onto wiped data"))
@@ -826,7 +840,7 @@ def test_staged_post_swap_failure_stays_staged(kept, env, monkeypatch):  # noqa:
 def test_restore_without_start_marks_stopped(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up")
     bk = tmp_path / "b.tar"
-    bk.write_bytes(b"t")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_1", "p", "chess", "m1", 1.0, str(bk), "manual"))
     monkeypatch.setattr(kept, "_backup_locked", lambda *a, **k: {"backup_id": "x"})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
@@ -980,7 +994,7 @@ def test_mount_keeps_its_own_seed_list(kept, env, monkeypatch):  # noqa: F811
 def test_failed_restore_is_held_against_restarts(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up")
     bk = tmp_path / "b.tar"
-    bk.write_bytes(b"t")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_1", "p", "chess", "m1", 1.0, str(bk), "manual"))
     monkeypatch.setattr(kept, "_backup_locked", lambda *a, **k: {"backup_id": "bk_pre"})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
@@ -994,7 +1008,7 @@ def test_failed_restore_is_held_against_restarts(kept, env, monkeypatch, tmp_pat
 def test_rollback_undo_failure_is_held(kept, env, monkeypatch, tmp_path):  # noqa: F811
     _two_versions(env, kept, monkeypatch, tmp_path)
     bk = tmp_path / "s.tar"
-    bk.write_bytes(b"s")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_snap", "p", "chess", "m1", 1.0, str(bk), "pre_switch"))
     a = app_of(env, "lab_v2")
     a.update(mounted=True, state="up", switched_from="lab_v1", switch_snapshot="bk_snap", switch_snapshots=["bk_snap"])
@@ -1002,7 +1016,7 @@ def test_rollback_undo_failure_is_held(kept, env, monkeypatch, tmp_path):  # noq
     monkeypatch.setattr(kept, "_move_data", lambda to, fr, arch: ({"ok": True}, app_of(env, to)))
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
 
-    def restore(lab, bid, snapshot=True, start=True):
+    def restore(lab, bid, snapshot=True, start=True, **k):
         raise LabError("internal", "disk full", pre_restore="bk_pre" if snapshot else None)
     monkeypatch.setattr(kept, "_restore_locked", restore)
     kept.rollback("lab_v2", restore_snapshot=True)
@@ -1085,7 +1099,7 @@ def test_recovery_switch_works_with_nothing_mounted(kept, env, monkeypatch, tmp_
 def test_restore_hold_is_saved_before_data_is_cleared(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up")
     bk = tmp_path / "b.tar"
-    bk.write_bytes(b"t")
+    bk.write_bytes(TAR)
     env.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", ("bk_1", "p", "chess", "m1", 1.0, str(bk), "manual"))
     monkeypatch.setattr(kept, "_backup_locked", lambda *a, **k: {"backup_id": "bk_pre"})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
@@ -1143,7 +1157,7 @@ def test_recover_unmounts_stops_and_unretires_both(kept, env, monkeypatch, tmp_p
 
 
 def test_missing_seed_refused_before_the_app_stops(kept, env, monkeypatch):  # noqa: F811
-    app = make_kept(env, "lab_a", state="up", data_seed=["saves"])
+    app = make_kept(env, "lab_a", state="up", data_seed=["saves"], build="")     # §4UL: no build step here
     _deploy_stubs(kept, env, monkeypatch)
     monkeypatch.setattr(kept, "_sh", lambda lab, m, cmd, *a, **k: {"exit_code": 1, "stdout": "", "stderr": ""})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: pytest.fail("the running app must not stop"))

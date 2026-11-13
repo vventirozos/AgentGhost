@@ -83,8 +83,9 @@ class TestCreateAfterDelete:
             "against me")
         res2 = json.loads(await tool_manage_projects(
             context, action="create", title="Chess Game"))
-        assert "CORRECTION CONTEXT" in res2["agent_instruction"]
-        assert "DELETED" in res2["agent_instruction"]
+        # §4UL: neutral wording — a delete is not always a rejection
+        assert "EARLIER ATTEMPT" in res2["agent_instruction"]
+        assert "deleted" in res2["agent_instruction"]
         proj = store.get_project(res2["created"])
         assert proj["metadata"]["correction_of"] == pid
         assert any("random AI" in c

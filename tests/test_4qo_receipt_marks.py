@@ -35,14 +35,6 @@ def test_the_write_tools_link_check_uses_the_shared_head():
     assert note.lstrip().startswith(RM.LINK_CHECK_HEAD)
 
 
-def test_the_confirm_wait_reply_starts_with_the_shared_head():
-    from ghost_agent.core.agent import _confirm_wait_reply
-    from ghost_agent.tools.outcome import ToolOutcome as TO
-    from tests.test_4pn_confirm_wait import _pv, WAIT
-    out = _confirm_wait_reply(WAIT, [{"name": "knowledge_base", "content": TO.ok(_pv())}], {"confirm": "tok1"})
-    assert out.startswith(RM.CONFIRM_WAIT_REPLY_HEAD)
-
-
 def test_the_marks_module_imports_nothing():
     import ast, inspect
     tree = ast.parse(inspect.getsource(RM))

@@ -9,6 +9,7 @@ as `crashloop` after crashloop.max failures in window_s.
 from __future__ import annotations
 
 import base64
+import hashlib
 import contextlib
 import os
 import logging
@@ -20,7 +21,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config as C
 from . import net
@@ -46,6 +47,114 @@ WORKDIR_RE = re.compile(r"^(/[A-Za-z0-9_.-]+)+$")
 WORKDIR_DENY_TREES = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/run",
                       "/sbin", "/sys", "/usr", "/var", "/data", "/tmp")
 WORKDIR_DENY_EXACT = ("/opt", "/home", "/root", "/srv", "/mnt", "/media", "/opt/venv")
+
+
+#: §4UL: an app's dependencies live in its own folder (installed by the deploy's build step: .deps, node_modules),
+#: and the app's process sees them first. The folder is NOT on /data: a container recreate (switch, rollback,
+#: rehearse) loses it, so every deploy saves the BUILT folder next to its archive on the host
+#: (<archive>.built.tar) and those paths put it back without building again (no network). Only a version
+#: deployed before that (no saved build) is built again there. `python3 -I` ignores PYTHONPATH, so .deps.
+DEPS_PREFIX =('[ -d .deps ] && export PYTHONPATH="$PWD/.deps${PYTHONPATH:+:$PYTHONPATH}" PATH="$PWD/.deps/bin:$PATH"; '
+               '[ -d node_modules/.bin ] && export PATH="$PWD/node_modules/.bin:$PATH"; ')
+#: the build a deploy runs in the NEW folder when the app names none: Python requirements into .deps, a Node
+#: package's dependencies and its `build` script. Nothing to do for a plain static site. pip and npm keep their caches
+#: in the container (~/.cache/pip, ~/.npm), so a redeploy of the same requirements is quick.
+AUTO_BUILD = ('set -e; '
+              'if [ -f requirements.txt ]; then '
+              'if [ -x /opt/venv/bin/pip ]; then P=/opt/venv/bin/pip; else P="python3 -m pip"; fi; '
+              '$P install -q --disable-pip-version-check --break-system-packages --target .deps '
+              '-r requirements.txt; fi; '
+              'if [ -f package.json ]; then '
+              'if command -v npm >/dev/null; then '
+              'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi; '
+              'npm run build --if-present; '
+              'else echo "package.json skipped: this lab has no npm (a node-app lab builds it)"; fi; fi')
+
+
+#: the biggest built folder saved on the host (node_modules can be large); a bigger one is built again on restore
+BUILT_MAX = 768 * 1024 * 1024
+#: `python3 -I …` / `python -I …` in an app cmd: isolated mode ignores PYTHONPATH (the .deps a build installs)
+#: re-review: any python path (/opt/venv/bin/python3 -I), and other options before it (-u -I, -X dev -I).
+#: Round 3: -E too (ignores every PYTHON* variable, PYTHONPATH with them), alone or combined (-IE, -sE)
+ISOLATED_PY_RE = re.compile(r"(?:^|[\s;&|(/])python(?:3(?:\.\d+)?)?(?:\s+-(?:[XW]\s+\S+|[A-Za-z]+))*?"
+                            r"\s+-[A-Za-z]*[IE][A-Za-z]*(?![\w.-])")
+ISOLATED_NOTE = ("app.cmd runs python with -I or -E: it ignores PYTHONPATH, so the packages the build put in the "
+                 "folder's .deps are not seen — drop the flag if the app needs them")
+#: round-5 M1: written in a member's /data BEFORE a restore clears it, removed only when the restore completed. The pg
+#: image's 10-postgres.sh neither initialises nor starts postgres while it exists (any container start)
+RESTORE_MARKER = "/data/.ghost-restore-incomplete"
+PG_SCRIPT = Path(__file__).resolve().parents[1] / "images" / "pg" / "10-postgres.sh"
+PG_SCRIPT_DEST = "/etc/lab/start.d/10-postgres.sh"
+#: round-6 M2: a 10-postgres.sh the keeper started survives the watch's stop and may sit in `chown -R` past its
+#: marker check, then initdb mid-extract — every one (and its initdb) is killed before the marker and the clear. The
+#: [s]/[b] brackets keep the pattern from matching this shell's own command line
+PG_QUIESCE = ("P='[s]tart\\.d/10-postgres\\.sh|[b]in/initdb'; pkill -TERM -f \"$P\"; "
+              'for i in $(seq 1 20); do pgrep -f "$P" >/dev/null || exit 0; sleep 0.5; done; pkill -KILL -f "$P"; '
+              'for i in $(seq 1 10); do pgrep -f "$P" >/dev/null || exit 0; sleep 0.5; done; '
+              'echo "still running: $(pgrep -af "$P" | head -3)"; exit 1')
+#: round-6: reinit keeps the protected snapshots this long (or until the next good daily backup after the start)
+REINIT_PROTECT_S = 7 * 86400
+#: round 7: the exit code of the clear when postgres is running again (nothing was cleared)
+PG_BACK = 3
+#: round-3 MINOR 5: the last_error of a Service name that could not be unserved (cleared by the retry that works)
+UNSERVE_FAILED = "could not unserve the Service name"
+#: round-4 M5: unserve retries (waits 1, 2, 4, 8, 16, 32 min) before the host gives up and says so
+UNSERVE_TRIES = 6
+#: round-3 MAJOR 1: why a restore did not run the app's restore_cmd
+HOOK_RESTORE_SKIPPED = ("hook restore skipped: the database was restored from its stopped file copy (newer than the "
+                        "hook's dump, which ran live just before it); the hook's dump is in /data if you need it")
+#: the data members whose files are only consistent with the server stopped: a backup or restore stops postgres
+PG_IMAGES = ("ghost-lab/pg:",)
+PG_STOP = ('BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1); D="${PGDATA:-/data/pg}"; '
+           'if pgrep -x postgres >/dev/null; then '
+           'sudo -u postgres "$BIN/pg_ctl" -D "$D" -m fast -w -t 120 stop >/dev/null || exit 1; echo was-running; fi; '
+           'for i in $(seq 1 60); do pgrep -x postgres >/dev/null || exit 0; sleep 1; done; exit 1')
+PG_START = ('mkdir -p /var/log/lab; (setsid bash /etc/lab/start.d/10-postgres.sh >> /var/log/lab/10-postgres.log 2>&1 '
+            '< /dev/null &); for i in $(seq 1 90); do pg_isready -q -h localhost && exit 0; sleep 1; done; exit 1')
+
+
+def wait_for_cmd(target: str) -> str:
+    """The app's start waits (90 s at most) until host:port accepts a connection (python-pg: the db)."""
+    host, _, port = str(target).rpartition(":")
+    return (f"for i in $(seq 1 90); do (exec 3<>/dev/tcp/{shlex.quote(host)}/{int(port)}) 2>/dev/null && break; "
+            f"sleep 1; done; ")
+
+
+#: the run config a kept app can change in place (§4UL re-keep)
+APP_UPDATABLE = ("cmd", "health", "port", "workdir", "build", "subdir")
+#: the folder a deploy ships from: the agent tars <folder>/<subdir> (e.g. a site's dist/); kept here so a later
+#: deploy and a re-keep see it — the host itself never reads it
+SUBDIR_RE = re.compile(r"^(?!.*(?:^|/)\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+
+
+def _subdir_of(v: Any) -> str:
+    t = str(v or "").strip().strip("/")
+    if t in ("", "."):
+        return ""
+    if len(t) > 200 or not SUBDIR_RE.match(t):
+        raise LabError("bad_request", "app.subdir must be a relative folder inside the deployed folder (like dist)",
+                       field="app.subdir")
+    return t
+
+
+def _build_of(v: Any) -> Optional[str]:
+    """The app's build setting: None/"auto" = the automatic build, ""/"none"/false = none, else the command."""
+    if v is None:
+        return None
+    if v is False:
+        return ""
+    t = str(v).strip()
+    if t.lower() == "auto":
+        return None
+    if t.lower() in ("", "none", "off", "false"):
+        return ""
+    if "\n" in t or len(t) > 1000:
+        raise LabError("bad_request", "build must be one command line (1000 characters at most)", field="build")
+    return t
+
+
+def build_command(build: Optional[str]) -> str:
+    return AUTO_BUILD if build is None else build
 
 
 def check_seeds(paths: List[str]) -> List[str]:
@@ -91,6 +200,11 @@ def valid_workdir(wd: str) -> bool:
 KEEPABLE_STATES = ("ready", "unready")
 
 
+def is_tcp_app(app: Dict[str, Any]) -> bool:
+    """A kept app with no HTTP health path (pg-single: {http: null, tcp: true}) is published as raw TCP."""
+    return not (app.get("health") or {}).get("http")
+
+
 def data_volume_name(lineage: str, app: str, member: str, lab_id: str = "") -> str:
     base = f"ghost-labdata-{lineage}-{app}-{member}"
     return f"{base}-{lab_id}" if lab_id else base
@@ -106,6 +220,11 @@ def _docker_ts(s: str) -> float:
         f = re.split(r"[+-]", f)[0]
         frac = float("0." + f) if f.isdigit() else 0.0
     return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp() + frac
+
+
+def _built_of(archive) -> Optional[str]:
+    """The saved built folder of an `_archive_for` tuple (None: an archive from before §4UL — built again)."""
+    return archive[3] if archive is not None and len(archive) > 3 else None
 
 
 def _msg(e: BaseException) -> str:
@@ -167,6 +286,9 @@ class Kept:
     def _env(self, lab_id: str, app: Dict[str, Any]) -> Dict[str, str]:
         row = self.store.lab(lab_id)
         env = dict(self.store.secrets(app.get("lineage") or row["lineage"], app["name"]))
+        # §4UL: the app's port and the one folder that survives a deploy (the `run` tool's apps get $PORT too)
+        env.setdefault("PORT", str(app.get("port") or ""))
+        env.setdefault("DATA_DIR", "/data")
         if row["agent_api_url"]:
             env["GHOST_API"] = f"http://agent-api:{SIDECAR_PORT}"
         return env
@@ -175,9 +297,10 @@ class Kept:
         return self.mgr._exec(lab_id, member, cmd, timeout_s=timeout_s, env=env)
 
     def _must(self, lab_id: str, member: str, cmd: str, what: str, timeout_s: int = 300,
-              env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+              env: Optional[Dict[str, str]] = None, allow: Tuple[int, ...] = ()) -> Dict[str, Any]:
+        """Run cmd; raise unless it exits 0 (or with one of ``allow``: the caller reads that code)."""
         r = self._sh(lab_id, member, cmd, timeout_s, env)
-        if r["exit_code"] != 0:
+        if r["exit_code"] != 0 and r["exit_code"] not in allow:
             raise LabError("internal", f"{what} failed (exit {r['exit_code']}): {(r['stderr'] or r['stdout'])[-600:]}",
                            hint="read the output, fix the archive or requirements, and retry")
         return r
@@ -191,7 +314,7 @@ class Kept:
     def _keep(self, lab_id: str, body: Dict[str, Any], origin: str = "owner") -> Dict[str, Any]:
         row = self.mgr.get(lab_id)
         if row["lifetime"] == "kept":
-            raise LabError("already_kept", f"lab {lab_id} is already kept", hint="use deploy / app actions")
+            raise LabError("already_kept", f"lab {lab_id} is already kept", hint="deploy updates its code; a keep with a changed cmd/health/port/workdir/build updates its config (PUT /app/config)")
         if not row["owner"].startswith("project:"):
             raise LabError("bad_request", "only a project's lab can be kept", field="owner")
         lineage = str(body.get("lineage") or row["lineage"] or row["owner"].split(":", 1)[1])
@@ -209,6 +332,11 @@ class Kept:
                 raise LabError("owner_only", f"lineage {lineage!r} holds a kept lab this caller may not touch",
                                field="lineage")
         a = dict(body.get("app") or {})
+        # §4UL: what the lab's template says about its app fills what the caller left out
+        tpl = (getattr(self.mgr, "templates", None) or {}).get(str(row.get("template") or "")) or {}
+        for k, v in (tpl.get("app") or {}).items():
+            if a.get(k) in (None, ""):
+                a[k] = v
         name = str(a.get("name") or "")
         if not APP_NAME_RE.match(name):
             raise LabError("bad_request", "app.name must match ^[a-z][a-z0-9-]{0,30}$", field="app.name")
@@ -266,6 +394,11 @@ class Kept:
             if member != oapp.get("member"):
                 raise LabError("bad_request", f"the live version runs in member {oapp.get('member')!r}; a second "
                                "version must use the same app.member", field="app.member", live_lab=other)
+        from .templates import WAIT_FOR_RE, watch_list
+        wait_for = str(a.get("wait_for") or "")
+        if wait_for and not WAIT_FOR_RE.match(wait_for):
+            raise LabError("bad_request", "app.wait_for must be host:port", field="app.wait_for")
+        watch = watch_list(a.get("watch"), sorted(members), "app") if a.get("watch") else []
         need = sum(m["mem_mb"] for m in members.values())
         probe_tier = origin == "probe"
         with self.mgr.locked(lab_id, timeout=60):
@@ -275,7 +408,7 @@ class Kept:
             if cur is None:
                 self.mgr.get(lab_id)          # raises unknown_lab
             if cur["lifetime"] == "kept":
-                raise LabError("already_kept", f"lab {lab_id} is already kept", hint="use deploy / app actions")
+                raise LabError("already_kept", f"lab {lab_id} is already kept", hint="deploy updates its code; a keep with a changed cmd/health/port/workdir/build updates its config (PUT /app/config)")
             if cur["state"] not in KEEPABLE_STATES:
                 # review r13 C: a lab being torn down (destroying), still building (creating) or failed became
                 # production — the reaper never reaps a kept lab, and the next restart called it "unready"
@@ -287,6 +420,8 @@ class Kept:
                 raise LabError("busy", "another version of this app changed state meanwhile", hint="retry")
             staged = bool(other)
             app = {"name": name, "lineage": lineage, "member": member, "cmd": str(a.get("cmd") or ""), "port": port, "health": health,
+                   "build": _build_of(a.get("build")), "service": bool(a.get("service")),
+                   "subdir": _subdir_of(a.get("subdir")), "wait_for": wait_for, "watch": watch,
                    "workdir": workdir, "data": data, "secrets": sorted(set(names) | set(values)),
                    "cron": cron, "backup": backup, "lan": lan, "state": "staged" if staged else "stopped",
                    "mounted": not staged, "restarts": 0, "fails": 0, "crash_times": [], "last_probe_at": None,
@@ -330,7 +465,11 @@ class Kept:
                 if app["cmd"] and self._has_code(lab_id, app):
                     self._start_app(lab_id, app, count=False)
             self._save(lab_id, app)
-        return self.mgr.detail(lab_id)
+            note = self._isolated_note(lab_id, app) if app["cmd"] else None
+        out = self.mgr.detail(lab_id)
+        if note:
+            out["note"] = note
+        return out
 
     # ------------------------------------------------------------ the probe namespace (review 11-05 CRIT 2)
     def _claim(self, kind: str, key: str, lab_id: str) -> None:
@@ -452,10 +591,23 @@ class Kept:
         self.mgr._create_member(lab_id, sm, mem["ip"], gw, spec, row["owner"], row["origin"], lifetime="kept",
                                 lineage=row["lineage"], volumes=vols, extra_env=extra)
 
+    def _served_as_http(self, lab_id: str, app: Dict[str, Any]) -> bool:
+        """Round-3 MINOR 4: whether this app's Service name is (or may still be) served — from the LIVE version (the
+        lab that held the lease) as well as this one: a staged version switched in never served its own name."""
+        apps = [app]
+        for h in self.store.q("SELECT lab_id FROM ports WHERE lease_key=?", (app["lease_key"],)):
+            hr = self.store.lab(h["lab_id"]) if h["lab_id"] and h["lab_id"] != lab_id else None
+            if hr and hr["app_json"]:
+                apps.append(loads(hr["app_json"]))
+        # a TCP version keeps no url/name fields (its lease clears them), so any of them = it was served as HTTP
+        return any(a.get("name_unserve_pending") or a.get("url") or a.get("name_url") or a.get("name_state")
+                   for a in apps)
+
     def _lease(self, lab_id: str, app: Dict[str, Any], move: bool) -> None:
         row = self.store.lab(lab_id)
         if not move:
             return
+        was_http = bool(self.cfg.ts_services) and is_tcp_app(app) and self._served_as_http(lab_id, app)
         for h in self.store.q("SELECT lab_id FROM ports WHERE lease_key=?", (app["lease_key"],)):
             if h["lab_id"] and h["lab_id"] != lab_id:
                 hr = self.store.lab(h["lab_id"])
@@ -469,13 +621,59 @@ class Kept:
                 self.store.x("DELETE FROM ports WHERE port=?", (p["port"],))
         port = self.mgr.ports.lease(lab_id, app["member"], app["port"], lease_key=app["lease_key"], lan=app["lan"])
         ip = self.mgr.member(lab_id, app["member"])["ip"]
-        self.mgr.ports.publish(port, ip, app["port"], lan=app["lan"])
-        if self.cfg.ts_services:
-            self.mgr.ports.serve_service(app["name"], port)
+        tcp = is_tcp_app(app)
+        if app.get("host_port") == port and bool(app.get("published_tcp")) != tcp:
+            self.mgr.ports.unpublish(port)        # the health changed between HTTP and TCP: the old entry goes
+        self.mgr.ports.publish(port, ip, app["port"], lan=app["lan"], tcp=tcp)
         app["host_port"] = port
-        app["url"] = self.mgr.ports.url(port)
+        app["published_tcp"] = tcp
         app["lan_url"] = self.mgr.ports.lan_url(port) if app["lan"] else None
-        name_url = self._name_url(app["name"]) if self.cfg.ts_services else None
+        if tcp:
+            # §4UL: a database (TCP health) is reached as host:port; no https URL and no Service name (an HTTPS
+            # name in front of postgres answers nothing). Re-review MINOR 5: an app that WAS HTTP (this version or
+            # the live one it replaces) had its Service served — unserved, or the name kept pointing at a port that
+            # now answers raw TCP. Round 3: a failed unserve keeps the name fields and is retried at the next lease
+            app.update(url=None, address=self.mgr.ports.address(port))
+            app.pop("name_hint", None)
+            unserved = True
+            if was_http:
+                try:
+                    unserved = self.mgr.ports.unserve_service(app["name"]) is not False
+                except Exception as e:  # noqa: BLE001
+                    unserved = False
+                    log.warning("unserve %s (now TCP): %s", app["name"], _msg(e))
+            if unserved:
+                for k in ("name_unserve_pending", "unserve_tries", "unserve_retry_at"):
+                    app.pop(k, None)
+                app.update(name_url=None, name_state=None)
+                if str(app.get("last_error") or "").startswith(UNSERVE_FAILED):
+                    app["last_error"] = None
+            else:
+                app.update(name_unserve_pending=True, unserve_tries=0, unserve_retry_at=time.time() + 60)
+                app["last_error"] = (f"{UNSERVE_FAILED} svc:{app['name']} after the app became TCP; retried with "
+                                     "backoff (1, 2, 4 … min)")
+            if app["lan_url"]:
+                app["lan_url"] = app["lan_url"].replace("http://", "").rstrip("/")
+            return
+        app.pop("address", None)
+        # round 5: back to HTTP — the name is served again below; a pending removal of it is moot
+        for k in ("name_unserve_pending", "unserve_tries", "unserve_retry_at"):
+            app.pop(k, None)
+        if str(app.get("last_error") or "").startswith(UNSERVE_FAILED):
+            app["last_error"] = None
+        served = False
+        if self.cfg.ts_services:
+            try:
+                served = self.mgr.ports.serve_service(app["name"], port) is not False
+            except Exception as e:  # noqa: BLE001
+                log.warning("serve %s: %s", app["name"], _msg(e))
+        app["url"] = self.mgr.ports.url(port)
+        name_url = self._name_url(app["name"]) if served else None
+        if self.cfg.ts_services and not served:
+            # round 4: the name fields only once tailscale took the Service; the port URL works meanwhile
+            app.update(name_url=None, name_state="serve_failed",
+                       name_hint=f"tailscale did not serve svc:{app['name']}; it is not retried automatically — use the "
+                                 "port link")
         if name_url and app.get("name_url") != name_url:
             # reported only once it answers (v2 §12: propagation takes up to ~1 min; the
             # name must also be defined in the Tailscale console by the owner)
@@ -502,7 +700,8 @@ class Kept:
                     row = self.store.lab(lab_id)
                     if row and row["app_json"]:
                         a = loads(row["app_json"])
-                        if a.get("name") == name:
+                        # re-review MINOR 5: an app that became TCP while this check ran has no name to mark live
+                        if a.get("name") == name and not is_tcp_app(a):
                             a["name_url"], a["name_state"] = url, "live"
                             self._save(lab_id, a)
                 return True
@@ -511,7 +710,7 @@ class Kept:
             row = self.store.lab(lab_id)
             if row and row["app_json"]:
                 a = loads(row["app_json"])
-                if a.get("name") == name and not a.get("name_url"):
+                if a.get("name") == name and not a.get("name_url") and not is_tcp_app(a):
                     a["name_state"] = "unreachable"
                     a["name_hint"] = (f"define the Service '{name}' (tcp:443, tag:labs-app) in the Tailscale admin console; "
                                       f"the port link works meanwhile")
@@ -527,6 +726,8 @@ class Kept:
 
     # ------------------------------------------------------------ app process
     def _has_code(self, lab_id: str, app: Dict[str, Any]) -> bool:
+        if app.get("service"):
+            return True        # §4UL: a template's own server (pg-single) runs with nothing deployed
         r = self._sh(lab_id, app["member"], f"test -d {shlex.quote(app['workdir'])} && ls -A {shlex.quote(app['workdir'])} | head -1", 20)
         return r["exit_code"] == 0 and bool(r["stdout"].strip())
 
@@ -538,12 +739,26 @@ class Kept:
         self.mgr._put_bytes(c, f"{RUN}/secrets.env", body.encode(), 0o600)
 
     def _start_app(self, lab_id: str, app: Dict[str, Any], count: bool) -> None:
+        if app.get("restore_incomplete"):
+            # round-5 M1: a restore that did not complete is never released by a start — restore a good backup, or
+            # `app start` with reinit (app_action) to accept what /data holds now
+            app["last_error"] = (f"not started: the restore into {', '.join(app['restore_incomplete'])} did not "
+                                 "complete — restore a good backup, or start with reinit to accept /data as it is")
+            return
+        # starting the app is the owner's "I checked /data": the holds end (before the no-cmd return: round 5)
+        for k in ("watch_held", "held", "hold_reason", "restore_running", "hold_pre"):
+            app.pop(k, None)
+        if float(app.get("protected_until") or 0) <= time.time():
+            # round 6: after a reinit the snapshots stay protected until a good daily backup (or 7 days)
+            app.pop("protected_backups", None)
+            app.pop("protected_until", None)
         if not app["cmd"]:
             app["state"], app["last_error"] = "stopped", "no app.cmd"
             return
         self._stop_proc(lab_id, app)
         self._write_secrets_file(lab_id, app)
-        env = {**self._env(lab_id, app), "GHOST_APP_CMD": app["cmd"]}
+        pre = wait_for_cmd(app["wait_for"]) if app.get("wait_for") else ""
+        env = {**self._env(lab_id, app), "GHOST_APP_CMD": pre + DEPS_PREFIX + app["cmd"]}
         wd = shlex.quote(app["workdir"])
         script = (f"mkdir -p {RUN} /var/log/lab; cd {wd} || exit 3; "
                   f"setsid bash -c 'c=\"$GHOST_APP_CMD\"; unset GHOST_APP_CMD; exec bash -lc \"$c\"' >> /var/log/lab/app.log 2>&1 < /dev/null & "
@@ -556,6 +771,69 @@ class Kept:
         if count:
             app["restarts"] = int(app.get("restarts") or 0) + 1
         app.update(state="starting", started_at=time.time(), fails=0, next_restart_at=None)
+        self._start_watch(lab_id, app)
+
+    def _start_watch(self, lab_id: str, app: Dict[str, Any], only: Optional[List[str]] = None) -> None:
+        """app.watch: the keeper of another member (python-pg's db: restart postgres if it died). Its own session,
+        so stopping the app (a crash, a restart, the owner's stop) leaves it running; started once (pid file)."""
+        if app.get("watch_held"):
+            return       # round-4 M3: a database that did not come back is not restarted (initdb'd empty) by anyone
+        for w in app.get("watch") or []:
+            if only is not None and w.get("member") not in only:
+                continue
+            try:
+                c = self.mgr.container(lab_id, w["member"])
+                # re-review MINOR 4: the pid counts only while it is still OUR keeper (its environ carries
+                # GHOST_WATCH_CMD) — a container restart keeps /run, and a reused pid left the database unwatched
+                c.exec_run(["bash", "-c", f"mkdir -p {RUN} /var/log/lab; p=$(cat {RUN}/watch.pid 2>/dev/null) && "
+                                          f"kill -0 $p 2>/dev/null && tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null "
+                                          f"| grep -q '^GHOST_WATCH_CMD=' && exit 0; setsid bash -c \"$GHOST_WATCH_CMD\" "
+                                          f">> /var/log/lab/watch.log 2>&1 < /dev/null & echo $! > {RUN}/watch.pid"],
+                           environment={"GHOST_WATCH_CMD": w["cmd"]})
+            except Exception:  # noqa: BLE001 — the member is down: its next start of the app starts it
+                log.warning("watch in %s/%s not started", lab_id, w.get("member"))
+
+    def _stop_watch(self, lab_id: str, app: Dict[str, Any], only: Optional[List[str]] = None) -> None:
+        for w in app.get("watch") or []:
+            if only is not None and w.get("member") not in only:
+                continue
+            try:
+                self.mgr.container(lab_id, w["member"]).exec_run(
+                    ["bash", "-c", f"p=$(cat {RUN}/watch.pid 2>/dev/null) || exit 0; kill -TERM -- -$p 2>/dev/null; "
+                                   f"rm -f {RUN}/watch.pid; true"])
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _pg_members(self, lab_id: str, members: List[str]) -> List[str]:
+        """The listed members that run postgres (their /data is consistent only with the server stopped)."""
+        img = {x["name"]: str(x["image"] or "") for x in self.store.members(lab_id)}
+        return [m for m in members if img.get(m, "").startswith(PG_IMAGES)]
+
+    def _pg_stop(self, lab_id: str, member: str) -> Optional[bool]:
+        """Stop postgres in the member for a copy of /data. True: it ran (start it again after); False: it was not
+        running; None: the member itself is not running (its files are at rest). Raises when it does not stop."""
+        try:
+            r = self._sh(lab_id, member, PG_STOP, 180)
+        except LabError as e:
+            if e.code == "not_ready":
+                return None
+            raise
+        if r["exit_code"] != 0:
+            raise LabError("internal", f"postgres in {member} did not stop for the copy of /data (nothing was copied "
+                           f"or changed): {(r['stderr'] or r['stdout'])[-300:]}", hint="read the member's logs; retry")
+        return "was-running" in r["stdout"]
+
+    def _pg_start(self, lab_id: str, member: str, restoring: bool = False) -> Optional[str]:
+        """Start postgres again and wait until it answers. None when it does; else why not. ``restoring``: the
+        restore's own start — past the restore marker, never an initdb (round 5)."""
+        try:
+            r = self._sh(lab_id, member, ("export GHOST_PG_RESTORING=1; " if restoring else "") + PG_START, 150)
+        except LabError as e:
+            return _msg(e)
+        if r["exit_code"] != 0:
+            t = self._sh(lab_id, member, "tail -n 20 /var/log/lab/10-postgres.log 2>/dev/null", 20)
+            return f"postgres in {member} did not answer within 90 s: {(t.get('stdout') or '')[-400:]}"
+        return None
 
     def _stop_proc(self, lab_id: str, app: Dict[str, Any]) -> None:
         try:
@@ -705,7 +983,9 @@ class Kept:
                         if app["fails"] >= FAILS_TO_RESTART:
                             self._stop_proc(lab_id, app)
                             self._record_crash(lab_id, app, res.get("why") or res.get("error") or f"health probe failed {FAILS_TO_RESTART}×")
-                if app.get("mounted") and now - float(app.get("last_backup_at") or 0) > 86400 \
+                # round-4 M3: no daily backup of a held app — its rotation would push the good copies out
+                if app.get("mounted") and not app.get("held") and not app.get("watch_held") \
+                        and now - float(app.get("last_backup_at") or 0) > 86400 \
                         and now - float(app.get("last_backup_attempt_at") or 0) > BACKUP_RETRY_S:
                     app["last_backup_attempt_at"] = now
                     # its own thread (review 11-05 #16: a hook may run 1800 s, and run here it stalled crash
@@ -752,6 +1032,9 @@ class Kept:
                 row = self.store.lab(lab_id)
                 if not row or row["lifetime"] != "kept" or not row["app_json"] or not loads(row["app_json"]).get("mounted"):
                     return
+                a = loads(row["app_json"])
+                if a.get("held") or a.get("watch_held"):
+                    return                    # round-4 M3: held — checked again under the lock
                 self._backup_locked(lab_id, "daily")
         except Exception:  # noqa: BLE001
             log.exception("daily backup failed for %s", lab_id)
@@ -814,11 +1097,23 @@ class Kept:
             and app.get("last_error") != "secrets_lost"
 
     def on_member_start(self, lab_id: str, member: str) -> None:
-        """A kept member started (reboot, Docker restart): start its app without counting a crash."""
+        """A kept member started (reboot, Docker restart): start its app without counting a crash. A member the app
+        watches (python-pg's db) gets its keeper back (re-review MINOR 4: a db restarted alone ran unwatched)."""
         row = self.store.lab(lab_id)
         if not row or row["lifetime"] != "kept" or not row["app_json"]:
             return
-        if not self._startable(loads(row["app_json"]), member):
+        a0 = loads(row["app_json"])
+        if member != a0.get("member") and any(w.get("member") == member for w in a0.get("watch") or []):
+            with self.mgr.locked(lab_id, timeout=60):
+                row = self.store.lab(lab_id)
+                app = loads(row["app_json"]) if row and row["app_json"] else {}
+                # round-3 MINOR 9: the keeper is independent of the app's own run state — an owner stop or a
+                # crash loop never stops it — so it comes back unless a failed restore held it (watch_held: the
+                # database did not come back; starting the app after checking /data releases it)
+                if app.get("mounted") and app.get("state") != "staged" and not app.get("watch_held"):
+                    self._start_watch(lab_id, app, [member])
+            return
+        if not self._startable(a0, member):
             return
         with self.mgr.locked(lab_id, timeout=60):
             row = self.store.lab(lab_id)
@@ -838,15 +1133,36 @@ class Kept:
             if row["lifetime"] == "kept" and row["app_json"]:
                 a = loads(row["app_json"])
                 out.append({"lab_id": row["lab_id"], "app": a.get("name"), "state": a.get("state"),
-                            "url": a.get("url"), "name_url": a.get("name_url"), "lan_url": a.get("lan_url"),
+                            "url": a.get("url"), "address": a.get("address"), "name_url": a.get("name_url"),
+                            "lan_url": a.get("lan_url"),
                             "restarts": a.get("restarts", 0), "last_error": a.get("last_error")})
         return out
 
-    def app_action(self, lab_id: str, action: str) -> Dict[str, Any]:
+    def app_action(self, lab_id: str, action: str, reinit: bool = False) -> Dict[str, Any]:
         if action not in ("start", "stop", "restart"):
             raise LabError("bad_request", "action must be start|stop|restart", field="action")
         with self.mgr.locked(lab_id, timeout=60):
             app = self._app(lab_id)
+            if action != "stop" and app.get("restore_incomplete"):
+                if not reinit:
+                    raise LabError("not_ready", f"a restore into {', '.join(app['restore_incomplete'])} did not "
+                                   "complete: /data may be empty or partial, and postgres is kept from starting",
+                                   hint="restore a good backup (it clears this), or start with reinit: true — postgres "
+                                        "then starts on whatever /data holds now (an empty database only if the "
+                                        "restore never got the files in)",
+                                   state="held", restore_incomplete=app["restore_incomplete"],
+                                   hold_reason=app.get("hold_reason"))
+                # round-5 M1: the owner accepts /data as it is — the markers go, postgres may initialise
+                for mem in app["restore_incomplete"]:
+                    self._must(lab_id, mem, f"rm -f {RESTORE_MARKER}", "remove the restore marker")
+                    if self._pg_members(lab_id, [mem]):
+                        why = self._pg_start(lab_id, mem)
+                        if why:
+                            app["last_error"] = f"reinit: {why[:300]}"
+                app.pop("restore_incomplete", None)
+                # round 6: the good copies stay protected (rotation) until a good daily backup after this start,
+                # or 7 days — daily copies of an empty database must not rotate them out
+                app["protected_until"] = time.time() + REINIT_PROTECT_S
             if app.get("state") == "staged":
                 raise LabError("not_ready", "this version is staged (not switched in)", hint="switch to it first",
                                state="staged")
@@ -861,10 +1177,113 @@ class Kept:
             self._save(lab_id, app)
         return {"lab_id": lab_id, "app": self._view(app), "probe": res}
 
+    def update_app(self, lab_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """§4UL: change an already-kept app's run config (cmd, health, port, workdir, build) and restart it —
+        a keep repeated with a new config used to answer `already_kept` and leave the old one running."""
+        if not isinstance(body, dict):
+            raise LabError("bad_request", "body must be an object of app fields", field="app")
+        unknown = sorted(set(body) - set(APP_UPDATABLE))
+        if unknown:
+            raise LabError("bad_request", f"cannot change {', '.join(unknown)} on a kept app",
+                           field="app", hint=f"changeable: {', '.join(APP_UPDATABLE)}; the rest needs a new keep")
+        name = self._app(lab_id)["name"]
+        with self._app_locked(name), self.mgr.locked(lab_id, timeout=60):
+            app = self._app(lab_id)
+            new: Dict[str, Any] = {}
+            if "cmd" in body:
+                cmd = str(body["cmd"] or "")
+                if "\n" in cmd or len(cmd) > 2000:
+                    raise LabError("bad_request", "app.cmd must be one line", field="app.cmd")
+                new["cmd"] = cmd
+            if "health" in body:
+                h = body["health"]
+                h = dict(h) if isinstance(h, dict) else {"http": "/", "tcp": True} if h is None else None
+                if h is None or (h.get("http") is not None and not str(h["http"]).startswith("/")):
+                    raise LabError("bad_request", "app.health must be {http: <path>|null, tcp: bool}", field="app.health")
+                new["health"] = h
+            if "port" in body:
+                try:
+                    port = int(body["port"])
+                except (TypeError, ValueError):
+                    port = 0
+                if not 1 <= port <= 65535:
+                    raise LabError("bad_request", "app.port must be 1..65535", field="app.port")
+                new["port"] = port
+            if "workdir" in body:
+                wd = str(body["workdir"] or "")
+                if not valid_workdir(wd):
+                    raise LabError("bad_request", "app.workdir must be an absolute path outside system dirs and /data",
+                                   field="app.workdir")
+                new["workdir"] = wd
+            if "build" in body:
+                new["build"] = _build_of(body["build"])
+            if "subdir" in body:
+                new["subdir"] = _subdir_of(body["subdir"])
+            changed = sorted(k for k, v in new.items() if app.get(k) != v)
+            if not changed:
+                return {"lab_id": lab_id, "app": self._view(app), "changed": []}
+            staged = app.get("state") == "staged" or not app.get("mounted")
+            # build and subdir act on the NEXT deploy: nothing to restart for them alone
+            restart = not staged and not app.get("stopped_by_owner") and bool(new.get("cmd", app.get("cmd"))) \
+                and bool({"cmd", "health", "port", "workdir"} & set(changed))
+            q = shlex.quote
+            if "workdir" in changed:
+                # §4UL review: checked BEFORE anything stops — a refused move leaves the app exactly as it was
+                ow, nw = app["workdir"], new["workdir"]
+                if nw.startswith(ow + "/") or ow.startswith(nw + "/"):
+                    raise LabError("bad_request", f"app.workdir {nw} is inside {ow} (or holds it): pick a folder "
+                                   "beside it", field="app.workdir")
+                if self._sh(lab_id, app["member"], f"[ ! -e {q(nw)} ]", 20)["exit_code"] != 0:
+                    raise LabError("bad_request", f"{nw} already exists in member {app['member']}: pick a new folder "
+                                   "(its contents are never replaced by a move)", field="app.workdir")
+            target = {**app, **{k: new[k] for k in changed}}
+            if not staged and ("port" in changed or is_tcp_app(target) != is_tcp_app(app)):
+                # the port/forwarder moves FIRST: a failure puts the old lease back and changes nothing else
+                try:
+                    self._lease(lab_id, target, move=True)
+                except Exception:
+                    try:
+                        self._lease(lab_id, app, move=True)
+                    except Exception:  # noqa: BLE001
+                        log.exception("the old lease of %s was not put back", lab_id)
+                    self._save(lab_id, app)
+                    raise
+            if "workdir" in changed:
+                # moved while the old process still runs (it keeps its open folder): a failed move stops nothing
+                ow, nw = q(app["workdir"]), q(new["workdir"])
+                self._must(lab_id, app["member"], f"if [ -d {ow} ]; then mkdir -p $(dirname {nw}) && mv {ow} {nw}; fi; "
+                           f"rm -rf {ow}.prev", "move the workdir")
+            if restart or "workdir" in changed:
+                self._stop_proc(lab_id, app)
+            app = target
+            res: Dict[str, Any] = {"ok": None, "note": "saved; applies from the next deploy" if not
+                                   {"cmd", "health", "port", "workdir"} & set(changed) else
+                                   "saved; not started (staged, stopped by the owner, no cmd, or nothing deployed yet)"}
+            if restart and self._has_code(lab_id, app):
+                app.update(crash_times=[], fails=0)
+                self._start_app(lab_id, app, count=False)
+                res = self.wait_up(lab_id, app, 60)
+            elif not staged and "workdir" in changed and app.get("state") in ("up", "starting", "restarting"):
+                app["state"] = "stopped"
+            self._save(lab_id, app)
+            note = self._isolated_note(lab_id, app) if "cmd" in changed else None
+        out = {"lab_id": lab_id, "app": self._view(app), "probe": res, "changed": changed}
+        if note:
+            out["note"] = note
+        return out
+
     def _view(self, app: Dict[str, Any]) -> Dict[str, Any]:
-        return {k: app.get(k) for k in ("name", "member", "state", "port", "host_port", "url", "name_url", "name_state",
-                                        "name_hint", "lan_url",
-                                        "restarts", "last_probe_at", "last_error", "data", "secrets")}
+        v = {k: app.get(k) for k in ("name", "member", "state", "port", "host_port", "url", "address", "name_url",
+                                     "name_state",
+                                     "name_hint", "lan_url",
+                                     "restarts", "last_probe_at", "last_error", "data", "secrets")}
+        if app.get("name_unserve_pending"):
+            v.update(name_url=None, name_state="removing name")   # round 4: not a name a client should use
+        # round 6: why the app is held, in its own field (last_error may be any later note)
+        for k in ("held", "hold_reason", "restore_incomplete", "restore_running"):
+            if app.get(k):
+                v[k] = app[k]
+        return v
 
     def rotate_secrets(self, lab_id: str, values: Dict[str, str]) -> Dict[str, Any]:
         with self.mgr.locked(lab_id, timeout=60):
@@ -909,24 +1328,151 @@ class Kept:
                 raise LabError("bad_request", "archive_b64 or archive_member_path is required", field="archive_b64")
             req = dict(body.get("requirements") or {})
             seed = check_seeds([str(p) for p in (body.get("data_seed") or [])])
-            if app.get("mounted") and app.get("last_backup_at"):
-                self._backup_locked(lab_id, "pre_deploy")
+            # §4UL review MAJOR 1: read BEFORE the pre-deploy backup — a backup with no hook stops and starts the
+            # app, which leaves it "starting", and the automatic revert never fired for an app that had a backup
+            was_up = app.get("state") == "up" and bool(app.get("mounted"))
+            pre_deploy = None
+            hook_error = None
+            held = bool(app.get("held") or app.get("restore_incomplete"))
+            # round 7: a held app runs nothing, so /data cannot change before the start — no pre-deploy copy (a copy
+            # of empty or half-restored data is no restore point)
+            if app.get("mounted") and app.get("last_backup_at") and not held:
+                pb = self._backup_locked(lab_id, "pre_deploy")
+                pre_deploy, hook_error = pb["backup_id"], pb.get("hook_error")
                 app = self._app(lab_id)
-            res = self._deploy_into(lab_id, app, data, req, seed)
-            app["archive_ts"] = self._keep_archive(row["lineage"], app["name"], data, req, app.get("data_seed") or seed)
+            res = self._deploy_into(lab_id, app, data, req, seed, start=not held)
+            out: Dict[str, Any] = {"lab_id": lab_id}
+            if hook_error:
+                out["hook_error"] = hook_error
+            if held:
+                # round-5 M1: installed, not started — starting would run on /data the owner has not checked
+                # round 6: the build log is kept; there is NO automatic revert at the later start (the swap's
+                # <workdir>.prev is replaced by the next deploy) — said here, not discovered then
+                res = {"ok": None, "note": "installed, NOT started: the app is held after a failed restore",
+                       **({"build_log": res["build_log"]} if isinstance(res, dict) and res.get("build_log") else {})}
+                out["held"] = ("installed but not started: the app is held after a failed restore — "
+                               + ("restore a good backup, or `app start` with reinit: true"
+                                  if app.get("restore_incomplete") else "check /data, then `app start`")
+                               + ". No automatic revert at that start: if this version does not come up then, "
+                                 "deploy the previous one again")
+                if app.get("hold_reason"):
+                    out["hold_reason"] = app["hold_reason"]
+            if pre_deploy:
+                out["pre_deploy_backup"] = pre_deploy
+            elif held and app.get("mounted"):
+                out["pre_deploy_note"] = "no pre-deploy copy: the app is held, nothing runs on /data"
+            note = self._isolated_note(lab_id, app)
+            if note:
+                out["note"] = note
+            failed = self._deploy_failed(res)
+            prev = self._archive_for(lab_id) if failed and was_up else None   # store still names the old archive
+            built_saved: List[bool] = []
+            new_ts = self._keep_archive(row["lineage"], app["name"], data, req, app.get("data_seed") or seed,
+                                        built_from=(lab_id, app), saved=built_saved)
+            if built_saved and not built_saved[0]:
+                # re-review MINOR 3: said, not only logged — a switch/rollback/rehearse of it builds again (network)
+                out["built_not_saved"] = ("the built folder could not be saved (over the size cap or a docker error): "
+                                          "a switch, rollback or rehearse of this version builds it again")
+            if prev:
+                # §4UL: in place is the default deploy, so a version that does not come up is replaced by the
+                # one that was running (it stays archived for a later look); /data is left as the new version left it.
+                # The previous folder is put back as it ran (<workdir>.prev): no build, no network
+                out.update(rolled_back=failed, failed_probe=res)
+                # re-review MINOR 2: what the revert did NOT undo, and where the data from before it is
+                out["data_note"] = ("the previous code runs on /data as the failed version left it"
+                                    + (f"; /data from before this deploy is backup {pre_deploy} (restore it if the "
+                                       f"failed version changed the data)" if pre_deploy else
+                                       "; no pre-deploy backup was taken (this app had no backup yet)"))
+                try:
+                    res = self._revert_in_place(lab_id, app, prev, failed_req=req)
+                except LabError as e:
+                    out["rollback_error"] = _msg(e)[:400]
+                    app["archive_ts"] = new_ts
+                else:
+                    if not res.get("ok"):
+                        out["rollback_error"] = "the previous version did not come up either: " + str(res.get("why") or "")
+            else:
+                app["archive_ts"] = new_ts
+                if res.get("ok") is False and res.get("alive"):
+                    out["still_starting"] = True     # the host's tick keeps probing; its crash rules apply
             self._save(lab_id, app)
-        return {"lab_id": lab_id, "app": self._view(app), "probe": res}
+        out.update(app=self._view(app), probe=res)
+        return out
+
+    def _isolated_note(self, lab_id: str, app: Dict[str, Any]) -> Optional[str]:
+        """The -I/-E note — only when the folder HAS packages a build installs (.deps / requirements.txt). Deploy,
+        keep and update_app all ask (round 3: a cmd set by keep/update_app was never checked)."""
+        if not ISOLATED_PY_RE.search(str(app.get("cmd") or "")):
+            return None
+        try:
+            r = self._sh(lab_id, app["member"], f"cd {shlex.quote(app['workdir'])} 2>/dev/null && "
+                                                f"{{ [ -e requirements.txt ] || [ -d .deps ]; }}", 20)
+        except Exception:  # noqa: BLE001 — a member that is not running: no note, nothing else changes
+            return None
+        return ISOLATED_NOTE if r["exit_code"] == 0 else None
+
+    def _revert_in_place(self, lab_id: str, app: Dict[str, Any], prev, failed_req=None) -> Dict[str, Any]:
+        """Put the version that ran before this deploy back: its folder as it ran (<workdir>.prev, kept by the
+        swap), else its saved built folder, else (a version from before §4UL) a deploy of its archive."""
+        m = app["member"]
+        wd = shlex.quote(app["workdir"])
+        if self._sh(lab_id, m, f"test -d {wd}.prev", 20)["exit_code"] == 0:
+            self._stop_proc(lab_id, app)
+            self._must(lab_id, m, f"rm -rf {wd} && mv {wd}.prev {wd}", "put the previous version back")
+            # re-review MINOR 1: requirements.pip go into the shared /opt/venv, not the folder — the failed version
+            # may have upgraded one, so the restored version's own list is installed again (best effort: a package
+            # the failed version ADDED stays; the folder's .deps / node_modules came back with the folder)
+            pip_note = None
+            pip = (prev[1] or {}).get("pip") if prev is not None and len(prev) > 1 else None
+            failed_pip = (failed_req or {}).get("pip")
+            if failed_pip and not pip:
+                # round-3 MINOR 7: nothing to reinstall — what the failed version installed stays
+                pip_note = ("the packages the failed version installed or upgraded through requirements.pip ("
+                            + ", ".join(map(str, failed_pip))[:200] + ") stay in /opt/venv")
+            if pip:
+                pk = " ".join(shlex.quote(str(p)) for p in pip)
+                r = self._sh(lab_id, m, f"[ -x /opt/venv/bin/pip ] || python3 -m venv /opt/venv; "
+                                        f"/opt/venv/bin/pip install -q {pk}", 1800)
+                if r["exit_code"] != 0:
+                    pip_note = ("the previous version's requirements.pip did not reinstall: "
+                                + (r["stderr"] or r["stdout"]).strip()[-300:])
+            if app.get("mounted"):
+                self._install_cron(lab_id, app)
+            app.update(crash_times=[], stopped_by_owner=False)
+            self._start_app(lab_id, app, count=False)
+            res = self.wait_up(lab_id, app, 90)
+            res["reverted_from"] = "the previous folder"
+            if pip_note:
+                res["pip_note"] = pip_note
+            return res
+        return self._deploy_into(lab_id, app, prev[0], prev[1], [], built=_built_of(prev))
+
+    @staticmethod
+    def _deploy_failed(res: Dict[str, Any]) -> Optional[str]:
+        """Why a just-deployed version counts as failed: the process exited, or the health path answered an
+        error status. A live process whose port does not answer yet is still starting, not failed."""
+        if res.get("ok") is not False:
+            return None
+        if not res.get("alive"):
+            return str(res.get("why") or "the app process exited")
+        st = res.get("http_status")
+        if st is not None and int(st) >= 400:
+            return str(res.get("why") or f"the health path answered HTTP {st}")
+        return None
 
     def _deploy_into(self, lab_id: str, app: Dict[str, Any], data: bytes, req: Dict[str, Any],
-                     seed: List[str], start: bool = True) -> Dict[str, Any]:
+                     seed: List[str], start: bool = True, built: Optional[str] = None) -> Dict[str, Any]:
         """Validate → unpack to <wd>.new and install deps while the running version keeps
         serving → stop → swap → link data → start. A failure before the swap leaves the
-        running app untouched (the staging dir is removed)."""
+        running app untouched (the staging dir is removed). The swap keeps the replaced folder as <wd>.prev
+        (the automatic revert puts it back). ``built``: the version's saved BUILT folder (a recreated container:
+        switch, rollback, rehearse) — unpacked as it is, the build step skipped (§4UL: no rebuild over Tor)."""
         m = app["member"]
         q = shlex.quote
         c = self.mgr.container(lab_id, m)
         wd = q(app["workdir"])
         seeded = False
+        build_tail = ""
         marked: List[str] = []
         paths: List[str] = []
         if app.get("mounted"):
@@ -949,9 +1495,17 @@ class Kept:
                                hint="omit data_seed", seeded=sorted(fixed))
             app["data_seed"] = check_seeds(seed)
         try:
-            self.mgr._put_bytes(c, "/tmp/ghost-deploy.tgz", data, 0o600)
-            self._must(lab_id, m, f"rm -rf {wd}.new && mkdir -p {wd}.new && tar -xzf /tmp/ghost-deploy.tgz -C {wd}.new",
-                       "unpack")
+            if built and Path(built).exists():
+                if not self._unpack_built(lab_id, app, c, built, paths):
+                    built = None                     # unexpected shape: built again from the archive (logged)
+            else:
+                built = None
+            if not built:
+                self.mgr._put_bytes(c, "/tmp/ghost-deploy.tgz", data, 0o600)
+                # a+rX: a site's files must be readable by the server's own user (nginx runs as www-data) whatever
+                # mode the archive carried (§4UL review MAJOR 3: 0600 files answered 403)
+                self._must(lab_id, m, f"rm -rf {wd}.new && mkdir -p {wd}.new && tar -xzf /tmp/ghost-deploy.tgz "
+                                      f"--no-same-owner -C {wd}.new && chmod -R a+rX {wd}.new", "unpack")
             if req.get("apt"):
                 pk = " ".join(q(str(p)) for p in req["apt"])
                 self._must(lab_id, m, f"DEBIAN_FRONTEND=noninteractive apt-get update -q && "
@@ -960,6 +1514,18 @@ class Kept:
                 pk = " ".join(q(str(p)) for p in req["pip"])
                 self._must(lab_id, m, f"[ -x /opt/venv/bin/pip ] || python3 -m venv /opt/venv; /opt/venv/bin/pip install -q {pk}",
                            "pip install", 1800)
+            build = _build_of(req.get("build")) if "build" in req else app.get("build")
+            bcmd = "" if built else build_command(build)
+            if bcmd:
+                # §4UL: dependencies and the build go INTO the new folder (.deps, node_modules, the build output), and
+                # a failed build leaves the running version untouched. It sees the app's own env: $PORT, DATA_DIR and
+                # the app's secrets (a build that reads an API key or bakes the port in)
+                r = self._sh(lab_id, m, f"cd {wd}.new && {bcmd}", 1800, env=self._env(lab_id, app))
+                build_tail = (r["stderr"] + "\n" + r["stdout"]).strip()[-600:]
+                if r["exit_code"] != 0:
+                    raise LabError("build_failed", f"the build failed (exit {r['exit_code']}) — the running version "
+                                   f"is untouched: {(r['stderr'] + chr(10) + r['stdout']).strip()[-1200:]}",
+                                   hint="fix the build (requirements.txt / package.json / params.build) and deploy again")
             for p in paths:
                 # a seed path must exist in /data or in the new archive — checked BEFORE the running app stops (r5 #6)
                 r = self._sh(lab_id, m, f"[ -e {q('/data/' + p)} ] || [ -e {q(app['workdir'] + '.new/' + p)} ]", 20)
@@ -971,7 +1537,9 @@ class Kept:
             raise
         self._stop_proc(lab_id, app)
         try:
-            self._must(lab_id, m, f"rm -rf {wd} && mv {wd}.new {wd} && rm -f /tmp/ghost-deploy.tgz", "swap")
+            # the replaced folder stays as <wd>.prev until the next deploy: the automatic revert moves it back
+            self._must(lab_id, m, f"rm -rf {wd}.prev && if [ -e {wd} ]; then mv {wd} {wd}.prev; fi && "
+                                  f"mv {wd}.new {wd} && rm -f /tmp/ghost-deploy.tgz", "swap")
             for p in paths:
                 self._must(lab_id, m, seed_link_cmd(app["workdir"], p), f"seed and link {p}")
             if paths and sorted(marked) != sorted(paths):
@@ -994,9 +1562,72 @@ class Kept:
             return {"ok": None, "note": "staged: installed, not started (switch to start it)"}
         app.update(crash_times=[], stopped_by_owner=False)
         self._start_app(lab_id, app, count=False)
-        return self.wait_up(lab_id, app, 90)
+        res = self.wait_up(lab_id, app, 90)
+        if build_tail:
+            res["build_log"] = build_tail
+        if built:
+            res["from_saved_build"] = True
+        return res
 
-    def _keep_archive(self, lineage: str, app: str, data: bytes, req: Dict[str, Any], seed: List[str]) -> float:
+    def _unpack_built(self, lab_id: str, app: Dict[str, Any], c, built: str, paths: List[str]) -> bool:
+        """Unpack a saved built folder into <wd>.new. The tar holds ONE top folder named after the workdir it was
+        saved from — which need not be this app's workdir now (re-review MAJOR 1: an update_app workdir rename, then
+        rollback/rehearse, failed "mv: cannot stat"). Whatever that single folder is called, it becomes <wd>.new.
+        Any other shape (several entries, a file, a link) → False: the caller builds from the archive instead."""
+        m = app["member"]
+        q = shlex.quote
+        wd = q(app["workdir"])
+        self._must(lab_id, m, f"rm -rf {wd}.new {wd}.x && mkdir -p {wd}.x", "prepare the built folder")
+        try:
+            with open(built, "rb") as f:
+                ok = c.put_archive(app["workdir"] + ".x", f)
+        except Exception as e:  # noqa: BLE001 — round-3 MINOR 6: a docker/file error falls back like a bad shape
+            ok, why = False, _msg(e)
+        else:
+            why = "docker refused it"
+        if not ok:
+            log.warning("saved built folder %s of %s not put back (%s): building from the archive", built, lab_id, why)
+            self._sh(lab_id, m, f"rm -rf {wd}.new {wd}.x", 60)
+            return False
+        # the saved folder carries the seed links into /data: removed here, linked again after the swap
+        unlink = "".join(f"if [ -L {q(app['workdir'] + '.new/' + p)} ]; then rm -f {q(app['workdir'] + '.new/' + p)}; fi; "
+                         for p in paths)
+        r = self._sh(lab_id, m, f"cd {wd}.x && set -- * .[!.]* ..?*; n=0; for e in \"$@\"; do "
+                                f"[ -e \"$e\" ] || [ -L \"$e\" ] && n=$((n+1)) && top=$e; done; "
+                                f"[ \"$n\" = 1 ] && [ -d \"$top\" ] && [ ! -L \"$top\" ] || exit 3; cd / && "
+                                f"mv {wd}.x/\"$top\" {wd}.new && rm -rf {wd}.x && {unlink}chmod -R a+rX {wd}.new", 300)
+        if r["exit_code"] == 0:
+            return True
+        log.warning("saved built folder %s of %s has an unexpected shape (exit %s: %s): building from the archive",
+                    built, lab_id, r["exit_code"], (r["stderr"] or r["stdout"]).strip()[-200:])
+        self._sh(lab_id, m, f"rm -rf {wd}.new {wd}.x", 60)
+        return False
+
+    def _save_built(self, lab_id: str, app: Dict[str, Any], dst: Path) -> bool:
+        """The deployed folder AS BUILT (with .deps / node_modules / the build output), saved next to its archive:
+        what switch, rollback and rehearse unpack into a recreated container instead of building again. Best effort:
+        a folder over BUILT_MAX or a docker error saves nothing (that version is then built again there)."""
+        tmp = dst.with_name(dst.name + ".part")
+        try:
+            stream, _ = self.mgr.container(lab_id, app["member"]).get_archive(app["workdir"])
+            n = 0
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                for chunk in stream:
+                    n += len(chunk)
+                    if n > BUILT_MAX:
+                        raise ValueError(f"the built folder is over {BUILT_MAX // (1024 * 1024)} MB")
+                    f.write(chunk)
+            os.replace(tmp, dst)
+            return True
+        except Exception as e:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            log.warning("built folder of %s not saved (%s): it is built again on a switch/rollback/rehearse",
+                        lab_id, _msg(e))
+            return False
+
+    def _keep_archive(self, lineage: str, app: str, data: bytes, req: Dict[str, Any], seed: List[str],
+                      built_from=None, saved: Optional[List[bool]] = None) -> float:
         d = self.archive_root / lineage / app
         d.mkdir(parents=True, exist_ok=True)
         ts = time.time()
@@ -1004,6 +1635,10 @@ class Kept:
         fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+        if built_from:
+            ok = self._save_built(built_from[0], built_from[1], Path(str(p) + ".built.tar"))
+            if saved is not None:
+                saved.append(ok)
         self.store.x("INSERT INTO archives VALUES (?,?,?,?,?,?)", (lineage, app, ts, str(p), dumps(req), dumps(seed)))
         rows = self.store.q("SELECT ts, path FROM archives WHERE lineage=? AND app=? ORDER BY ts DESC", (lineage, app))
         pinned = {ts}
@@ -1016,6 +1651,7 @@ class Kept:
             if float(r["ts"]) in pinned:
                 continue
             Path(r["path"]).unlink(missing_ok=True)
+            Path(str(r["path"]) + ".built.tar").unlink(missing_ok=True)
             self.store.x("DELETE FROM archives WHERE lineage=? AND app=? AND ts=?", (lineage, app, r["ts"]))
         return ts
 
@@ -1029,11 +1665,15 @@ class Kept:
         with self.mgr.locked(lab_id, timeout=60):
             return self._backup_locked(lab_id, kind)
 
-    def _backup_locked(self, lab_id: str, kind: str, all_members: bool = False, only_member: str = "",
-                       restart: bool = True) -> Dict[str, Any]:
-        """Tar /data of the app member (all_members: of every member; only_member: of that one).
+    def _backup_locked(self, lab_id: str, kind: str, all_members: bool = True, only_member: str = "",
+                       restart: bool = True, protect: Optional[set] = None) -> Dict[str, Any]:
+        """Tar /data of every member (§4UL: always — all_members is kept for the callers; only_member: of that one),
+        app member first; a member running postgres has it stopped for its copy and started again after.
         A failed copy leaves no partial file and no row. restart=False leaves the app stopped
-        (the final backup before a delete: nothing may write after it)."""
+        (the final backup before a delete: nothing may write after it).
+        Round 4: a failing hook never blocks the copy — it becomes ``hook_error`` (and last_error for a daily or the
+        owner's backup) and the file copy is taken as if there were no hook; a snapshot of one non-app member runs no
+        hook. ``protect``: backup ids the rotation must never delete (a restore's own target)."""
         app = self._app(lab_id)
         row = self.store.lab(lab_id)
         if not app.get("mounted"):
@@ -1041,40 +1681,107 @@ class Kept:
         m = app["member"]
         hook = app.get("backup") or None
         was_running = app.get("state") in ("up", "starting")
+        # round 6: a held app rotates nothing at all — its copies (pre_deploy, pre_restore, the owner's) may be of
+        # empty or half-restored data, and must not push the good ones out
+        held_now = bool(app.get("held") or app.get("watch_held") or app.get("restore_incomplete"))
+        # §4UL: EVERY member's /data (python-pg's database lives in db, not in the app member) — one set, one ts
+        members = [only_member] if only_member else [m] + [x["name"] for x in self.store.members(lab_id)
+                                                           if x["name"] != m]
+        # §4UL: postgres stopped for the copy (a tar of a running cluster is not a backup). Re-review MAJOR 2: with a
+        # hook too — the hook (a dump, say) still runs first, but the files copied after it were a live cluster
+        pg = self._pg_members(lab_id, members)
+        stopped_app = False
+        hook_error = None
+        if hook and only_member and only_member != m:
+            hook = None                               # round 4: the hook is the app member's; this copy is not
         if hook:
-            self._must(lab_id, m, hook["cmd"], "backup hook", 1800, env=self._env(lab_id, app))
-            if not restart:
-                self._stop_proc(lab_id, app)          # the final backup: nothing may write after it (r3 #6)
-        elif was_running:
-            self._stop_proc(lab_id, app)
-        members = [only_member] if only_member else \
-            [m] + ([x["name"] for x in self.store.members(lab_id) if x["name"] != m] if all_members else [])
+            try:
+                self._must(lab_id, m, hook["cmd"], "backup hook", 1800, env=self._env(lab_id, app))
+            except Exception as e:  # noqa: BLE001 — round-4 M4: a broken hook must not block recovery
+                hook_error = f"the backup hook failed ({_msg(e)[:240]}); the file copy was taken without it"
+                log.warning("backup hook of %s failed: %s", lab_id, _msg(e))
+                hook = None                           # copied like an app with no hook: the app stopped for it
+        if hook and not restart:
+            self._stop_proc(lab_id, app)              # the final backup: nothing may write after it (r3 #6)
+            stopped_app = was_running
+        elif was_running and (not hook or pg):
+            self._stop_proc(lab_id, app)              # a hook app keeps serving unless its database stops
+            stopped_app = True
+        pg_restart: List[str] = []
         done: List[Dict[str, Any]] = []
+        failed = False
         try:
+            for mem in pg:
+                self._stop_watch(lab_id, app, [mem])
+                if self._pg_stop(lab_id, mem):
+                    pg_restart.append(mem)
             for mem in members:
                 done.append(self._copy_data(lab_id, row["lineage"], app["name"], mem, kind))
-        except Exception:
+        except Exception as e:
+            failed = True
             for d in done:
                 Path(d["path"]).unlink(missing_ok=True)
+            self._note(app, f"the {kind} backup failed ({_msg(e)[:240]})"
+                       + ("; nothing was deleted and the services were started again" if not restart else ""))
             raise
         finally:
-            if not hook and was_running and restart:
-                self._start_app(lab_id, app, count=False)
+            # round-5 M2: a FAILED final backup (restart=False) puts everything back too — postgres, its keeper and
+            # the app: the delete it was for does not happen
+            if restart or failed:
+                for mem in pg_restart:
+                    why = self._pg_start(lab_id, mem)
+                    if why:
+                        log.warning("after the backup of %s: %s", lab_id, why)
+                        self._note(app, f"after the backup: {why[:300]}")
+                if pg:
+                    self._start_watch(lab_id, app, pg)
+                if stopped_app:
+                    self._start_app(lab_id, app, count=False)
+            else:
+                app["state"] = "stopped"              # round 4: the final backup's stop is recorded
+            if failed:
+                # round-3 MINOR 8: the state/last_error the cleanup just set is kept (the error re-raises next)
+                try:
+                    self._save(lab_id, app)
+                except Exception:  # noqa: BLE001
+                    log.exception("saving %s after a failed backup", lab_id)
         ts = time.time()
+        # round-4 M2: the rotation never deletes a restore's own target, nor a snapshot a held app names
+        keep_ids = set(protect or ()) | set(app.get("protected_backups") or [])
         for d in done:
             self.store.x("INSERT INTO backups VALUES (?,?,?,?,?,?,?)",
                          (d["backup_id"], row["lineage"], app["name"], d["member"], ts, d["path"], kind))
+            if held_now:
+                continue
             rows = self.store.q("SELECT backup_id, path FROM backups WHERE lineage=? AND app=? AND kind=? AND member=? "
                                 "ORDER BY ts DESC", (row["lineage"], app["name"], kind, d["member"]))
+            rows = [r for r in rows if r["backup_id"] not in keep_ids]
             for r in rows[int(self.cfg.backup_keep):]:
                 Path(r["path"]).unlink(missing_ok=True)
                 self.store.x("DELETE FROM backups WHERE backup_id=?", (r["backup_id"],))
         app["last_backup_at"] = ts
+        if (kind == "daily" and not held_now and app.get("protected_until")
+                and float(app["protected_until"]) <= ts):
+            # round 6: a reinit's protection ends at the first good daily backup after its 7 days
+            app.pop("protected_until", None)
+            app.pop("protected_backups", None)
+        if hook_error and kind in ("daily", "manual"):
+            self._note(app, hook_error)
         self._save(lab_id, app)
         main = done[0]
-        return {"lab_id": lab_id, "backup_id": main["backup_id"], "kind": kind, "bytes": main["bytes"], "ts": ts,
-                "hook": bool(hook), "members": [{"member": d["member"], "backup_id": d["backup_id"],
-                                                 "bytes": d["bytes"]} for d in done]}
+        out = {"lab_id": lab_id, "backup_id": main["backup_id"], "kind": kind, "bytes": main["bytes"], "ts": ts,
+               "hook": bool(hook), "members": [{"member": d["member"], "backup_id": d["backup_id"],
+                                                "bytes": d["bytes"]} for d in done]}
+        if hook_error:
+            out["hook_error"] = hook_error
+        return out
+
+    @staticmethod
+    def _note(app: Dict[str, Any], msg: str) -> None:
+        """last_error = msg — appended instead while the app is held: the hold's own explanation (what failed, the
+        snapshots to go back to) must not be replaced by a later backup's note (round 5)."""
+        cur = str(app.get("last_error") or "")
+        app["last_error"] = f"{cur}; {msg}"[-1200:] if app.get("held") and cur else msg
 
     def _copy_data(self, lab_id: str, lineage: str, app_name: str, member: str, kind: str) -> Dict[str, Any]:
         bid = "bk_" + uuid.uuid4().hex[:10]
@@ -1100,10 +1807,99 @@ class Kept:
                                                if Path(r["path"]).exists() else None} for r in rows]}
 
     def restore(self, lab_id: str, backup_id: str) -> Dict[str, Any]:
+        """Restore one backup — and, when it was taken as a set (every member at once, §4UL), the whole set: the
+        other members first (held), the app member last (it starts the app), so the app never runs on a database
+        from another moment."""
         with self.mgr.locked(lab_id, timeout=60):
-            return self._restore_locked(lab_id, backup_id)
+            ids = self._backup_set(lab_id, backup_id)
+            if len(ids) == 1:
+                return self._restore_locked(lab_id, backup_id)
+            # round 5: every member's file opened and checked BEFORE anything is snapshotted or cleared
+            files: Dict[str, Any] = {}
+            try:
+                for sid in ids:
+                    files[sid] = self._open_backup(sid, self._backup_path(sid) or "")
+                return self._restore_set(lab_id, backup_id, ids, files)
+            finally:
+                for f in files.values():
+                    f.close()
 
-    def _restore_locked(self, lab_id: str, backup_id: str, snapshot: bool = True, start: bool = True) -> Dict[str, Any]:
+    def _restore_set(self, lab_id: str, backup_id: str, ids: List[str], files: Dict[str, Any]) -> Dict[str, Any]:
+        pres: List[str] = []
+        hook_errors: List[str] = []
+        pre_by_member: Dict[str, str] = {}
+        out: Dict[str, Any] = {}
+        pg_restored = False
+        for i, sid in enumerate(ids):
+            mem = (self.store.q("SELECT member FROM backups WHERE backup_id=?", (sid,)) or [{"member": "?"}])[0]["member"]
+            try:
+                out = self._restore_locked(lab_id, sid, start=(i == len(ids) - 1), pg_restored=pg_restored,
+                                           protect=set(ids), fh=files[sid])
+            except Exception as e:  # noqa: BLE001 — re-review MINOR 6: a docker error too (pre-restore copy)
+                err = e if isinstance(e, LabError) else LabError("internal", f"restore of {sid} failed: {_msg(e)[:300]}")
+                err.extra["restored_before"] = ids[:i]
+                err.extra["failed_member"] = mem
+                err.extra["pre_restore_all"] = pres + ([err.extra["pre_restore"]] if err.extra.get("pre_restore") else [])
+                err.extra["pre_restore_by_member"] = {**pre_by_member, **(
+                    {mem: err.extra["pre_restore"]} if err.extra.get("pre_restore") else {})}
+                # round-3 MAJOR 2: held only when /data was touched — an earlier member restored, or this one
+                # failed past its snapshot/stop. A failure before that leaves a running app as it was
+                if i == 0 and not err.extra.get("touched"):
+                    if err is e:
+                        raise
+                    raise err from e
+                try:
+                    app = self._app(lab_id)
+                    snaps = ", ".join(x for x in err.extra["pre_restore_all"] if x) or "none"
+                    why = (f"set restore of {backup_id} failed at member {mem!r} (backup {sid}): {_msg(err)[:300]}; "
+                           f"restored before: {ids[:i] or 'none'}; pre-restore snapshots: {snaps}")
+                    self._hold(app, why, set(ids) | set(err.extra["pre_restore_all"]))
+                    app["last_error"] = why + "; held"
+                    self._save(lab_id, app)
+                except Exception:  # noqa: BLE001
+                    log.exception("recording the failed set restore of %s", lab_id)
+                if err is e:
+                    raise
+                raise err from e
+            pres.append(out["pre_restore"])
+            if out.get("hook_error"):
+                hook_errors.append(out["hook_error"])
+            if out.get("pre_restore"):
+                pre_by_member[mem] = out["pre_restore"]
+            pg_restored = pg_restored or bool(self._pg_members(lab_id, [mem]))
+        out.update(restored=backup_id, restored_set=ids, pre_restore_all=pres, pre_restore_by_member=pre_by_member)
+        if hook_errors:
+            out["hook_error"] = hook_errors[0]
+        return out
+
+    def _backup_set(self, lab_id: str, backup_id: str) -> List[str]:
+        """The backups taken with this one (same app, kind and time), app member LAST; just [backup_id] alone."""
+        app = self._app(lab_id)
+        row = self.store.lab(lab_id)
+        r = self.store.q("SELECT ts, kind FROM backups WHERE backup_id=? AND lineage=? AND app=?",
+                         (backup_id, row["lineage"], app["name"]))
+        if not r:
+            return [backup_id]
+        here = {x["name"] for x in self.store.members(lab_id)}
+        sib = self.store.q("SELECT backup_id, member FROM backups WHERE lineage=? AND app=? AND ts=? AND kind=?",
+                           (row["lineage"], app["name"], r[0]["ts"], r[0]["kind"]))
+        sib = [x for x in sib if x["member"] in here and Path(self._backup_path(x["backup_id"]) or "").exists()]
+        if len(sib) < 2:
+            return [backup_id]
+        return [x["backup_id"] for x in sib if x["member"] != app["member"]] + \
+            [x["backup_id"] for x in sib if x["member"] == app["member"]]
+
+    def _backup_path(self, backup_id: str) -> Optional[str]:
+        r = self.store.q("SELECT path FROM backups WHERE backup_id=?", (backup_id,))
+        return r[0]["path"] if r else None
+
+    def _restore_locked(self, lab_id: str, backup_id: str, snapshot: bool = True, start: bool = True,
+                        pg_restored: bool = False, protect: Optional[set] = None, fh=None) -> Dict[str, Any]:
+        """Put one member's /data back. Round-4 M1: when the lab has ANY postgres member the hook's restore_cmd never
+        runs (single, set, undo, rollback): postgres's stopped file copy is the database backup and the hook only
+        leaves a dump file in /data. ``pg_restored`` is kept for the callers. Round-4 M2: the archive is opened
+        before the pre-restore snapshot (whose rotation never deletes this target, nor ``protect``) and before /data
+        is cleared. Errors carry ``touched`` (whether /data was changed) and ``was_running``."""
         app = self._app(lab_id)
         row = self.store.lab(lab_id)
         if not app.get("mounted"):
@@ -1116,45 +1912,240 @@ class Kept:
         m = rows[0]["member"]
         if m not in {x["name"] for x in self.store.members(lab_id)}:
             raise LabError("bad_request", f"backup {backup_id} is of member {m!r}, not in this lab", field="backup_id")
-        pre = self._backup_locked(lab_id, "pre_restore", only_member=m)["backup_id"] if snapshot else None
-        app = self._app(lab_id)
-        self._stop_proc(lab_id, app)
-        # held from before /data is touched: a crash mid-restore must not restart the app on wiped data (r5 #2);
-        # success below releases it
-        app.update(state="stopped", stopped_by_owner=True,
-                   last_error=f"restore of {backup_id} in progress (pre-restore snapshot {pre})")
-        self._save(lab_id, app)
+        own = fh is None
+        if own:
+            fh = self._open_backup(backup_id, rows[0]["path"])
         try:
-            self._must(lab_id, m, "find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} +", "clear /data")
-            with open(rows[0]["path"], "rb") as f:
-                if not self.mgr.container(lab_id, m).put_archive("/", f):
-                    raise LabError("internal", "docker refused the backup archive", hint=f"pre-restore snapshot {pre}")
+            return self._restore_open(lab_id, backup_id, m, fh, snapshot, start, set(protect or ()) | {backup_id})
+        finally:
+            if own:
+                fh.close()
+
+    @staticmethod
+    def _open_backup(backup_id: str, path: str):
+        """Open a backup and check it is a readable tar with at least one entry (round 5) — before anything is
+        snapshotted or cleared. Held open by the caller: nothing can take it away from under the restore."""
+        import tarfile
+        try:
+            fh = open(path, "rb")
+        except OSError as e:
+            raise LabError("unknown_backup", f"backup {backup_id} cannot be read: {e}", hint="list backups") from e
+        try:
+            with tarfile.open(fileobj=fh, mode="r:") as t:
+                if t.next() is None:
+                    raise LabError("unknown_backup", f"backup {backup_id} is an empty archive", hint="list backups")
+            fh.seek(0)
+        except LabError:
+            fh.close()
+            raise
+        except Exception as e:  # noqa: BLE001 — tarfile.ReadError, a truncated file …
+            fh.close()
+            raise LabError("unknown_backup", f"backup {backup_id} is not a readable archive: {_msg(e)[:200]}",
+                           hint="list backups; restore another") from e
+        return fh
+
+    #: the restore steps that run before /data is changed: a failure there leaves the app as it was (round 6)
+    UNTOUCHED_STEPS = ("install start script", "stop postgres", "write the marker", "check postgres is stopped")
+
+    def _restore_open(self, lab_id: str, backup_id: str, m: str, fh, snapshot: bool, start: bool,
+                      protect: set) -> Dict[str, Any]:
+        app0 = self._app(lab_id)
+        # round 7: a retry while held reuses the pre-restore copy taken since the hold began (protected) — a new
+        # one would copy the empty or half-restored /data a failed attempt left
+        kept_pre = (app0.get("hold_pre") or {}).get(m) if app0.get("held") or app0.get("restore_incomplete") else None
+        pb = self._backup_locked(lab_id, "pre_restore", only_member=m, protect=protect) \
+            if snapshot and not kept_pre else {}
+        pre, pre_hook_error = pb.get("backup_id") or (kept_pre if snapshot else None), pb.get("hook_error")
+        app = self._app(lab_id)
+        # round 6: the hold fields too — an untouched failure puts them back exactly (no ids left protected)
+        before = {k: app.get(k) for k in ("state", "stopped_by_owner", "last_error", "held", "watch_held",
+                                          "restore_incomplete", "protected_backups", "hold_reason", "restore_running",
+                                          "hold_pre")}
+        was_running = before["state"] in ("up", "starting") and not before["stopped_by_owner"]
+        self._stop_proc(lab_id, app)
+        pg = self._pg_members(lab_id, [m])
+        lab_pg = bool(self._pg_members(lab_id, [x["name"] for x in self.store.members(lab_id)]))
+        hook_note = None
+        # held from before /data is touched: a crash mid-restore must not restart the app on wiped data (r5 #2);
+        # success below releases it. Round 5: the keeper too (watch_held), and the snapshots are protected.
+        # Round 6: `restore_running` says a restore is under way (a crash leaves it, and the view shows it)
+        if pre and not kept_pre:
+            app["hold_pre"] = {**(app.get("hold_pre") or {}), m: pre}
+        app.update(state="stopped", stopped_by_owner=True, held=True, restore_running=backup_id,
+                   last_error=f"restore of {backup_id} in progress (pre-restore snapshot {pre})",
+                   protected_backups=sorted(set(app.get("protected_backups") or []) | {backup_id} | ({pre} if pre else set())))
+        if pg:
+            app["watch_held"] = True
+        self._save(lab_id, app)
+        step = "install start script"
+        try:
+            if pg:
+                # round-6 M1: mandatory and checked — an old script ignores the marker and initdb's mid-restore
+                self._install_pg_script(lab_id, m)
+            step = "stop postgres"
+            # files with postgres stopped, then postgres started and checked; a failure names its step
+            if pg:
+                self._stop_watch(lab_id, app, pg)
+                # round-6 M2: a start script the keeper launched outlives the watch's stop (its own session) and
+                # may be past its marker check — killed (with its initdb) before and after postgres stops
+                self._must(lab_id, m, PG_QUIESCE, "stop the running postgres start script", 60)
+                self._pg_stop(lab_id, m)
+                self._must(lab_id, m, PG_QUIESCE, "stop the running postgres start script", 60)
+            step = "write the marker"
+            # round-5 M1: the marker goes in BEFORE /data is cleared (and survives the clear) — recorded first, so
+            # a ghost-labs kill from now on still knows; the start scripts refuse initdb/start while it exists
+            app["restore_incomplete"] = sorted(set(app.get("restore_incomplete") or []) | {m})
+            self._save(lab_id, app)
+            self._must(lab_id, m, f"touch {RESTORE_MARKER}", "write the restore marker")
+            step = "check postgres is stopped" if pg else "replace /data"
+            clear = f"find /data -mindepth 1 -maxdepth 1 ! -name {Path(RESTORE_MARKER).name} -exec rm -rf {{}} +"
+            # round 7: in the same shell as the clear — a postgres that came back meanwhile stops it before a file goes
+            r = self._must(lab_id, m, (f"pgrep -x postgres >/dev/null && exit {PG_BACK}; " if pg else "") + clear,
+                           "clear /data", 300, allow=(PG_BACK,) if pg else ())
+            if pg and r.get("exit_code") == PG_BACK:
+                raise LabError("internal", f"postgres is running again in {m}: nothing in /data was cleared",
+                               hint="retry the restore (the keeper or a container restart started it)")
+            step = "replace /data"
+            fh.seek(0)
+            if not self.mgr.container(lab_id, m).put_archive("/", fh):
+                raise LabError("internal", "docker refused the backup archive", hint=f"pre-restore snapshot {pre}")
+            if pg:
+                step = "start postgres"
+                why = self._pg_start(lab_id, m, restoring=True)
+                if why:
+                    raise LabError("internal", f"the restored database does not start: {why}",
+                                   hint=f"pre-restore snapshot {pre}")
+            # the files are back (and postgres answers): the marker goes
+            self._must(lab_id, m, f"rm -f {RESTORE_MARKER}", "remove the restore marker")
+            rest = [x for x in app.get("restore_incomplete") or [] if x != m]
+            if rest:
+                app["restore_incomplete"] = rest
+            else:
+                app.pop("restore_incomplete", None)
+            # round 7: recorded at once — a later error must not leave a good restore marked incomplete
+            self._save(lab_id, app)
+            step = "finish"
+            if pg:
+                app.pop("watch_held", None)
+                self._start_watch(lab_id, app, pg)
             hook = app.get("backup") or {}
             if hook.get("restore_cmd") and m == app["member"]:
-                self._must(lab_id, m, hook["restore_cmd"], "restore hook", 1800, env=self._env(lab_id, app))
+                if lab_pg:
+                    hook_note = HOOK_RESTORE_SKIPPED
+                else:
+                    step = "restore hook"
+                    self._must(lab_id, m, hook["restore_cmd"], "restore hook", 1800, env=self._env(lab_id, app))
         except Exception as e:
             msg = e.message if isinstance(e, LabError) else f"{type(e).__name__}: {e}"
+            msg = f"[{step}] {msg}"
+            if step in self.UNTOUCHED_STEPS:
+                restarted = self._untouched(lab_id, app, m, pg, before, was_running, step)
+                if isinstance(e, LabError):
+                    e.extra.update(pre_restore=pre, step=step, touched=False, restarted=restarted)
+                    if not e.message.startswith("["):
+                        e.message = f"[{step}] {e.message}"
+                    raise
+                raise LabError("internal", f"restore of {backup_id} failed: {msg[:300]}", pre_restore=pre, step=step,
+                               touched=False, restarted=restarted) from e
+            if pg and step in ("replace /data", "start postgres"):
+                app["watch_held"] = True          # the keeper stays off a database that did not come back
+            app.pop("restore_running", None)
             # held (stopped_by_owner): nothing may restart it on wiped data, not even a reboot (r4 #3)
-            app.update(state="stopped", stopped_by_owner=True,
-                       last_error=f"restore of {backup_id} failed: {msg[:300]}"
-                                  + (f" (pre-restore snapshot {pre})" if pre else "") + "; held: start it after checking /data")
+            self._hold(app, f"restore of {backup_id} into {m} failed: {msg[:300]}"
+                            + (f" (pre-restore snapshot {pre})" if pre else ""))
+            app["last_error"] = f"restore of {backup_id} failed: {msg[:300]}" + (f" (pre-restore snapshot {pre})" if pre else "")
             self._save(lab_id, app)
             if isinstance(e, LabError):
-                e.extra["pre_restore"] = pre
+                e.extra.update(pre_restore=pre, step=step, touched=True, restarted=False)
+                if not e.message.startswith("["):
+                    e.message = f"[{step}] {e.message}"
                 raise
-            raise LabError("internal", f"restore of {backup_id} failed: {msg[:300]}", pre_restore=pre) from e
+            raise LabError("internal", f"restore of {backup_id} failed: {msg[:300]}", pre_restore=pre, step=step,
+                           touched=True, restarted=False) from e
         res: Dict[str, Any] = {"ok": None}
-        app["last_error"] = None
-        if not start:
+        app.pop("restore_running", None)
+        if app.get("restore_incomplete"):
+            # round 6: another member's restore is still incomplete — its explanation stays, nothing starts
+            app["last_error"] = (f"restored {backup_id} into {m}; still held: the restore into "
+                                 f"{', '.join(app['restore_incomplete'])} did not complete")
+            app["state"] = "stopped"
+        elif not start:
             # the process is stopped: a later backup must not restart it (r3 #5); the hold stays until the
             # caller starts the app (rollback: the last restore)
+            app["last_error"] = None
             app["state"] = "stopped"
-        if start:
+        else:
+            app["last_error"] = None
             app.update(crash_times=[], stopped_by_owner=False)
-            self._start_app(lab_id, app, count=False)
+            self._start_app(lab_id, app, count=False)    # a completed restore: the holds and protections end
             res = self.wait_up(lab_id, app, 90)
         self._save(lab_id, app)
-        return {"lab_id": lab_id, "restored": backup_id, "pre_restore": pre, "probe": res, "app": self._view(app)}
+        out = {"lab_id": lab_id, "restored": backup_id, "pre_restore": pre, "probe": res, "app": self._view(app)}
+        if hook_note:
+            out["hook_note"] = hook_note
+        if pre_hook_error:
+            out["hook_error"] = pre_hook_error
+        return out
+
+    @staticmethod
+    def _hold(app: Dict[str, Any], reason: str, ids=()) -> None:
+        """Round 6: hold the app with its explanation in its own field (``hold_reason``) — added to, never
+        truncated or replaced by a later note (last_error can be anything); ``ids`` are protected from rotation."""
+        prev = str(app.get("hold_reason") or "") if app.get("held") or app.get("restore_incomplete") else ""
+        app.update(state="stopped", stopped_by_owner=True, held=True,
+                   hold_reason=f"{prev} | {reason}" if prev and reason not in prev else (prev or reason))
+        if ids:
+            app["protected_backups"] = sorted(set(app.get("protected_backups") or []) | {x for x in ids if x})
+
+    def _untouched(self, lab_id: str, app: Dict[str, Any], m: str, pg: List[str], before: Dict[str, Any],
+                   was_running: bool, step: str) -> bool:
+        """A restore that failed before /data changed: the app goes back as it was — not held, its hold fields and
+        protected ids as before (round 6), and never left "restore in progress", even when starting it again fails
+        (round 4). True when the app was started again."""
+        if step in ("write the marker", "check postgres is stopped"):
+            try:      # the touch may have half-worked: no marker may stay on data that was never cleared
+                self._sh(lab_id, m, f"rm -f {RESTORE_MARKER}", 30)
+            except Exception:  # noqa: BLE001
+                log.warning("restore marker of %s/%s not removed after a failed touch", lab_id, m)
+        for k, v in before.items():
+            if v is None and k not in ("state", "stopped_by_owner", "last_error"):
+                app.pop(k, None)          # a hold field this restore added goes (protected ids too: round 6)
+            else:
+                app[k] = v
+        restarted = False
+        try:
+            if pg and step != "install start script":
+                why = self._pg_start(lab_id, m)       # postgres was stopped (or its start script killed)
+                if why:
+                    log.warning("after an untouched restore of %s: %s", lab_id, why)
+            self._start_watch(lab_id, app, pg)
+            if was_running:
+                self._start_app(lab_id, app, count=False)
+                restarted = app.get("state") == "starting"
+        except Exception as e2:  # noqa: BLE001
+            app.update(state="stopped", last_error=f"a restore stopped before changing /data ({step}), and the app "
+                                                   f"did not start again: {_msg(e2)[:200]}")
+        self._save(lab_id, app)
+        return restarted
+
+    def _install_pg_script(self, lab_id: str, member: str) -> None:
+        """Round 5: the pg member gets the current 10-postgres.sh (marker-aware) before a restore touches /data —
+        a member created from an older image would otherwise initdb an empty cluster on its next start.
+        Round-6 M1: mandatory — it raises unless the installed file is the marker-aware one."""
+        try:
+            data = PG_SCRIPT.read_bytes()
+        except OSError as e:
+            raise LabError("internal", f"the marker-aware postgres start script is missing on the host ({PG_SCRIPT})",
+                           hint="sync the labs service's images/ folder") from e
+        if Path(RESTORE_MARKER).name.encode() not in data:
+            # round 7: a checksum only proves the copy — not that the host's own file knows the marker
+            raise LabError("internal", f"the host has an old 10-postgres.sh ({PG_SCRIPT}) that ignores the restore "
+                                       "marker — redeploy images/", hint="sync the labs service's images/ folder")
+        self.mgr._put_bytes(self.mgr.container(lab_id, member), PG_SCRIPT_DEST, data, 0o755)
+        # the file in the member must be exactly this one (a failed or partial copy keeps the old, marker-blind one)
+        digest = hashlib.sha256(data).hexdigest()
+        self._must(lab_id, member, f"echo '{digest}  {PG_SCRIPT_DEST}' | sha256sum -c --status - && "
+                                   f"test -x {PG_SCRIPT_DEST}", "check the installed postgres start script", 30)
 
     def backup_sqlite(self) -> Optional[str]:
         try:
@@ -1182,11 +2173,13 @@ class Kept:
         last = self._archive_for(lab_id)
         if not last:
             raise LabError("not_ready", "nothing deployed to this lab yet", hint="deploy first", state=app.get("state"))
-        data, req, seed = last
         spec = loads(row["spec_json"], {})
         with self.mgr.locked(lab_id, timeout=60):
             app = self._app(lab_id)
-            data, req, seed = self._archive_for(lab_id) or last
+            self._refuse_if_held(lab_id, app, "rehearse")
+            last = self._archive_for(lab_id) or last
+            data, req = last[0], last[1]
+            built = _built_of(last)
             self.store.update_lab(lab_id, state="rehearsing")
             try:
                 snap = self._backup_locked(lab_id, "pre_rehearse", all_members=True) if app.get("mounted") else None
@@ -1196,7 +2189,7 @@ class Kept:
                     for m in self.store.members(lab_id):
                         self._recreate(lab_id, m["name"], mount=bool(app.get("mounted")))
                     self._lease(lab_id, app, move=bool(app.get("mounted")))
-                    main = self._deploy_into(lab_id, app, data, req, [], start=True)
+                    main = self._deploy_into(lab_id, app, data, req, [], start=True, built=built)
                 except Exception as e:
                     app.update(state="stopped" if app.get("mounted") else "staged",
                                last_error=f"rehearse failed: {_msg(e)}"
@@ -1206,12 +2199,15 @@ class Kept:
                 self._save(lab_id, app)
             finally:
                 self.store.update_lab(lab_id, state="ready")
-        twin = self._twin(row, spec, app, data, req)
+        twin = self._twin(row, spec, app, data, req, built)
         return {"lab_id": lab_id, "snapshot": snap, "recreated": main, "twin": twin, "app": self._view(app)}
 
     def _twin(self, row: Dict[str, Any], spec: Dict[str, Any], app: Dict[str, Any], data: bytes,
-              req: Dict[str, Any]) -> Dict[str, Any]:
-        body = {"members": [{k: m[k] for k in ("name", "image", "mem_mb", "cpus", "cap_add")} for m in spec["members"]],
+              req: Dict[str, Any], built: Optional[str] = None) -> Dict[str, Any]:
+        # the members as the lab has them — env (python-pg's DATABASE_URL), readiness and ports too (§4UL review:
+        # a twin without env tested an app that could not find its database)
+        body = {"members": [{k: m[k] for k in ("name", "image", "mem_mb", "cpus", "cap_add", "env", "ready", "ports")
+                             if k in m} for m in spec["members"]],
                 "egress": spec["egress"], "readiness": spec["readiness"], "owner": row["owner"],
                 "purpose": f"rehearsal twin of {row['lab_id']}", "label": "twin", "wait": True}
         twin = self.mgr.create(body, "owner", pool="kept")
@@ -1224,24 +2220,64 @@ class Kept:
             tapp = {**app, "lineage": tlin, "mounted": False, "state": "stopped", "data_seed": [], "cron": [],
                     "backup": None}
             self._must(tid, tapp["member"], "mkdir -p /data", "twin /data")
-            res = self._deploy_into(tid, tapp, data, req, [], start=False)
+            res = self._deploy_into(tid, tapp, data, req, [], start=False, built=built)
+            seed_notes = self._twin_seeds(tid, tapp, data, app.get("data_seed") or [])
             tapp["mounted"] = True
             tapp["state"] = "stopped"
             self.store.update_lab(tid, app_json=dumps(tapp))
             self._start_app(tid, tapp, count=False)
             res = self.wait_up(tid, tapp, 90)
-            return {"lab_id": tid, "probe": res, "last_error": tapp.get("last_error")}
+            out = {"lab_id": tid, "probe": res, "last_error": tapp.get("last_error")}
+            if seed_notes:
+                out["seed_notes"] = seed_notes
+            return out
         except LabError as e:
             return {"lab_id": tid, "probe": {"ok": False}, "error": e.code, "message": e.message}
         finally:
             self.store.x("DELETE FROM secrets WHERE lineage=?", (tlin,))
             self.mgr.destroy(tid, reason="deleted", by="system", origin="owner", _force=True)
 
+    def _twin_seeds(self, tid: str, tapp: Dict[str, Any], data: bytes, seeds: List[str]) -> List[str]:
+        """Re-review MINOR 7: the app's seeded paths, linked into the TWIN's own /data. A saved built folder carries
+        the live app's links (into a /data the twin does not have): each link is dropped, the path is taken from
+        the archive and seeded into the twin's /data. A path the archive does not have (the live app made it in
+        /data) is left out and listed — the twin never sees the real data."""
+        if not seeds:
+            return []
+        q = shlex.quote
+        m = tapp["member"]
+        wd = tapp["workdir"]
+        notes: List[str] = []
+        c = self.mgr.container(tid, m)
+        self.mgr._put_bytes(c, "/tmp/twin-seed.tgz", data, 0o600)
+        self._must(tid, m, "rm -rf /tmp/twin-seed && mkdir -p /tmp/twin-seed && tar -xzf /tmp/twin-seed.tgz "
+                           "--no-same-owner -C /tmp/twin-seed", "unpack the archive for the seeds")
+        for p in check_seeds(seeds):
+            ap, src = q(f"{wd}/{p}"), q(f"/tmp/twin-seed/{p}")
+            r = self._sh(tid, m, f"if [ -L {ap} ]; then rm -f {ap}; fi; "
+                                 f"if [ ! -e {ap} ] && [ -e {src} ] && [ ! -L {src} ]; then "
+                                 f"mkdir -p $(dirname {ap}) && cp -a {src} {ap}; fi; " + seed_link_cmd(wd, p), 120)
+            if r["exit_code"] != 0:
+                notes.append(f"{p}: not seeded in the twin ({(r['stderr'] or r['stdout']).strip()[-160:]})")
+        self._sh(tid, m, "rm -rf /tmp/twin-seed /tmp/twin-seed.tgz", 60)
+        return notes
+
     # ------------------------------------------------------------ switch / rollback
+    def _refuse_if_held(self, lab_id: str, app: Dict[str, Any], what: str) -> None:
+        """Round-5 M1: a held app (a failed restore) is not recreated or moved — that would start postgres on /data
+        the owner has not checked."""
+        if app.get("held") or app.get("restore_incomplete"):
+            how = ("restore a good backup, or `app start` with reinit: true" if app.get("restore_incomplete")
+                   else "check /data, then `app start` (it releases the hold)")
+            raise LabError("not_ready", f"{lab_id} is held after a failed restore: no {what} until it is released",
+                           hint=how, state="held", hold_reason=app.get("hold_reason"))
+
     def switch(self, lab_id: str, from_lab: str) -> Dict[str, Any]:
         if not from_lab or from_lab == lab_id:
             raise LabError("bad_request", "from_lab must be the live version's lab id", field="from_lab")
         new, old = self._app(lab_id), self._app(from_lab)
+        self._refuse_if_held(from_lab, old, "switch")
+        self._refuse_if_held(lab_id, new, "switch")
         rn, ro = self.store.lab(lab_id), self.store.lab(from_lab)
         if (rn["lineage"], new["name"]) != (ro["lineage"], old["name"]):
             raise LabError("bad_request", "from_lab runs a different app", field="from_lab")
@@ -1268,6 +2304,9 @@ class Kept:
             if self._app(lab_id).get("mounted") or (not self._app(from_lab).get("mounted")
                                                     and self._live_holder(rn["lineage"], new["name"], lab_id)):
                 raise LabError("busy", "the versions changed state meanwhile", hint="read both labs and retry")
+            # round 6: a restore may have failed (and held) while this waited for the locks
+            self._refuse_if_held(from_lab, self._app(from_lab), "switch")
+            self._refuse_if_held(lab_id, self._app(lab_id), "switch")
             last = self._archive_for(lab_id) or last          # a deploy may have landed while we waited (r3 #11)
             return self._switch_locked(lab_id, from_lab, last)
 
@@ -1296,11 +2335,13 @@ class Kept:
             if not app.get("mounted") or not app.get("lease_key"):
                 continue
             lab_id = row["lab_id"]
+            if app.get("name_unserve_pending") and time.time() >= float(app.get("unserve_retry_at") or 0):
+                self._retry_unserve(lab_id)
             if time.time() < float(app.get("lease_retry_at") or 0):
                 continue
             r = self.store.q("SELECT lab_id, member FROM ports WHERE lease_key=?", (app["lease_key"],))
             # lease_pending: a move that failed after the row moved (publish/serve timed out) — the row alone
-            # would look fine (r6 #1)
+            # would look fine (r6 #1). Round 4: never re-published when the lease did not move
             if r and r[0]["lab_id"] == lab_id and r[0]["member"] == app["member"] and not app.get("lease_pending"):
                 continue
             lk = self.mgr.lock(lab_id)
@@ -1330,6 +2371,52 @@ class Kept:
             finally:
                 lk.release()
         return out
+
+    def _retry_unserve(self, lab_id: str) -> None:
+        """Round-4 M5: retry ONLY the unserve of a name left behind by an HTTP → TCP change — never the lease
+        (re-publishing restarts the forwarder and drops the database's clients). The first retry 1 min after the
+        failed unserve, then 2, 4, 8, 16, 32 min after each failed retry; the UNSERVE_TRIES-th failed retry gives up
+        and says so in last_error."""
+        lk = self.mgr.lock(lab_id)
+        if not lk.acquire(blocking=False):
+            return
+        try:
+            row = self.store.lab(lab_id)
+            a = loads(row["app_json"]) if row and row["app_json"] else {}
+            if not a.get("name_unserve_pending"):
+                return
+            if not is_tcp_app(a):
+                # round 5: it went back to HTTP meanwhile — its name is meant to be served: nothing to remove
+                for k in ("name_unserve_pending", "unserve_tries", "unserve_retry_at"):
+                    a.pop(k, None)
+                self._save(lab_id, a)
+                return
+            try:
+                ok = self.mgr.ports.unserve_service(a["name"]) is not False
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                log.warning("unserve %s retry: %s", a["name"], _msg(e))
+            if ok:
+                for k in ("name_unserve_pending", "unserve_tries", "unserve_retry_at"):
+                    a.pop(k, None)
+                a.update(name_url=None, name_state=None)
+                if str(a.get("last_error") or "").startswith(UNSERVE_FAILED):
+                    a["last_error"] = None
+            else:
+                n = int(a.get("unserve_tries") or 0) + 1
+                a["unserve_tries"] = n
+                if n >= UNSERVE_TRIES:
+                    a.pop("name_unserve_pending", None)
+                    a.pop("unserve_retry_at", None)
+                    a.update(name_url=None, name_state=None)   # round 5: a TCP app has no name to show
+                    a["last_error"] = (f"{UNSERVE_FAILED} svc:{a['name']} after {n} tries: clear it by hand "
+                                       f"(tailscale serve clear svc:{a['name']}) — the app itself is reached as "
+                                       f"{a.get('address')}")
+                else:
+                    a["unserve_retry_at"] = time.time() + 60 * (2 ** n)     # after 1 min, then 2, 4, 8, 16, 32
+            self._save(lab_id, a)
+        finally:
+            lk.release()
 
     def _lease_or_note(self, lab_id: str, app: Dict[str, Any], what: str) -> Optional[str]:
         """Move the port/name to the live version. A failure here (tailscale or systemctl hanging) does not
@@ -1361,7 +2448,7 @@ class Kept:
         self._save(to_lab, to_app)
         for m in self.store.members(to_lab):
             self._recreate(to_lab, m["name"], mount=True)
-        res = self._deploy_into(to_lab, to_app, archive[0], archive[1], [], start=True)
+        res = self._deploy_into(to_lab, to_app, archive[0], archive[1], [], start=True, built=_built_of(archive))
         self._save(to_lab, to_app)
         return res, to_app
 
@@ -1448,6 +2535,8 @@ class Kept:
                 lease_err = self._lease_or_note(lab_id, new, "switched")
                 out = {"lab_id": lab_id, "switched": True, "from_lab": from_lab, "probe": res,
                        "snapshot": snap["backup_id"], "app": self._view(new), "rollback_until": time.time() + 86400}
+                if snap.get("hook_error"):
+                    out["hook_error"] = snap["hook_error"]
                 if lease_err:
                     out["lease_error"] = lease_err
                 return out
@@ -1478,8 +2567,10 @@ class Kept:
             r = self.store.q("SELECT * FROM archives WHERE lineage=? AND app=? AND ts=?",
                              (row["lineage"], app["name"], app["archive_ts"]))
             if r and Path(r[0]["path"]).exists():
+                bt = Path(str(r[0]["path"]) + ".built.tar")
+                # (archive bytes, requirements, data_seed, the saved BUILT folder or None)
                 return Path(r[0]["path"]).read_bytes(), loads(r[0]["requirements_json"], {}), \
-                    loads(r[0]["data_seed_json"], []) or []
+                    loads(r[0]["data_seed_json"], []) or [], (str(bt) if bt.exists() else None)
         return None
 
     def _snapshot_ids(self, app: Dict[str, Any]) -> List[str]:
@@ -1497,6 +2588,9 @@ class Kept:
             raise LabError("no_rollback", "this version is not live", hint="roll back from the live version")
         if not self._archive_for(from_lab):
             raise LabError("no_rollback", "the previous version's archive is gone", hint="deploy it again instead")
+        if not restore_snapshot:
+            # round 6: a held version's /data is unchecked — moving it to the old version would start that on it
+            self._refuse_if_held(lab_id, new, "rollback without restore_snapshot: true")
         snaps = self._snapshot_ids(new) if restore_snapshot else []
         if restore_snapshot:
             for sid in snaps or [""]:
@@ -1508,6 +2602,8 @@ class Kept:
         with self._app_locked(new["name"]), self.mgr.locked(first, timeout=60), self.mgr.locked(second, timeout=60):
             if not self._app(lab_id).get("mounted"):
                 raise LabError("busy", "this version changed state meanwhile", hint="read the lab and retry")
+            if not restore_snapshot:
+                self._refuse_if_held(lab_id, self._app(lab_id), "rollback without restore_snapshot: true")
             self.store.update_lab(lab_id, state="switching")
             try:
                 old_last, new_last = self._archive_for(from_lab), self._archive_for(lab_id)
@@ -1515,7 +2611,7 @@ class Kept:
                 try:
                     res, old = self._move_data(from_lab, lab_id, old_last)
                     for i, sid in enumerate(snaps):
-                        r = self._restore_locked(from_lab, sid, start=(i == len(snaps) - 1))
+                        r = self._restore_locked(from_lab, sid, start=(i == len(snaps) - 1), protect=set(snaps))
                         pres.append(r["pre_restore"])
                         res = r["probe"]
                     old = self._app(from_lab)
@@ -1539,7 +2635,7 @@ class Kept:
                         out["lease_error"] = lease_err
                     return out
                 # put the data back as it was before any snapshot restore, then the new version back on it
-                for pre in reversed([p for p in pres if p]):
+                for pre in [p for p in pres if p]:     # round 4: the restore order — db members first, app last
                     try:
                         self._restore_locked(from_lab, pre, snapshot=False, start=False)
                     except Exception as e:  # noqa: BLE001
@@ -1550,8 +2646,9 @@ class Kept:
                     # empty data. Both stay stopped for the owner (r3 #2)
                     o = self._app(from_lab)
                     self._stop_proc(from_lab, o)
-                    o.update(state="stopped", stopped_by_owner=True, last_error=f"rollback failed and {note}; held; pre-restore snapshots: "
-                                                         f"{', '.join(p for p in pres if p)}")
+                    why = f"rollback failed and {note}; pre-restore snapshots: {', '.join(p for p in pres if p)}"
+                    self._hold(o, why, pres)
+                    o["last_error"] = why + "; held"
                     self._save(from_lab, o)
                     return {"lab_id": lab_id, "rolled_back": False, "reversed": False, "probe": res, "error": err,
                             "data_note": note, "pre_restore": [p for p in pres if p],
@@ -1686,7 +2783,14 @@ class Kept:
                 shared_with = sharing
             elif app.get("mounted"):
                 # the app stays stopped after this backup and the lab goes in the same lock: nothing writes after it
-                final = self._backup_locked(lab_id, "final", all_members=True, restart=False)
+                try:
+                    final = self._backup_locked(lab_id, "final", all_members=True, restart=False)
+                except Exception as e:
+                    # round-5 M2: nothing is deleted; the backup put the services back
+                    err = e if isinstance(e, LabError) else LabError("internal", _msg(e)[:300])
+                    err.message = f"the final backup before the delete failed — nothing was deleted: {err.message}"
+                    err.hint = err.hint or "free space / read the lab's logs, then delete again"
+                    raise err from e
                 for m in self.store.members(lab_id):
                     vols.append(data_volume_name(row["lineage"], app["name"], m["name"],
                                                  lab_id if app["data"] == "fresh" else ""))
@@ -1715,6 +2819,8 @@ class Kept:
                 pass
         out["data_volumes_removed"] = removed
         out["final_backup"] = final["backup_id"] if final else None
+        if final and final.get("hook_error"):
+            out["hook_error"] = final["hook_error"]
         out["final_backups"] = final["members"] if final else []
         if note:
             out["note"] = note

@@ -1362,7 +1362,10 @@ async def lifespan(app):
             # error can't eat the ping.
             try:
                 from .utils.logging import request_id_context
-                if request_id_context.get() in ("", "SYSTEM", None):
+                # §4UL review M3: an idle autopilot task's turn (`sub-ptask-…` with no request around it)
+                # has no foreground finalize that would deliver — it is the idle loop's own completion
+                from .core.project_turns import project_done_hook_delivers
+                if project_done_hook_delivers(request_id_context.get()):
                     from .core.notify_promise import fire_promise_if_settled
                     fire_promise_if_settled(
                         _store,

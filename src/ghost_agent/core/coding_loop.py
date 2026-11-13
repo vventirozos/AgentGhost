@@ -494,23 +494,44 @@ LEAF_LAB_DESTROY_BOUND_S = 150.0
 async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bool,
                         max_turns: int = LEAF_MAX_TURNS,
                         timeout_s: float = LEAF_TIMEOUT_S,
-                        project_id: Optional[str] = None) -> str:
+                        project_id: Optional[str] = None,
+                        allowed_tools=LEAF_ALLOWED_TOOLS,
+                        origin: Optional[str] = None,
+                        request_id: Optional[str] = None,
+                        label: Optional[str] = None,
+                        leaf_end: bool = True,
+                        prepare_agent: Optional[Callable[[Any], None]] = None) -> str:
     """One bounded agentic run; returns the final reply text. Tool surface
-    is contained the same way `run_subagent` does it (fail CLOSED)."""
+    is contained the same way `run_subagent` does it (fail CLOSED).
+
+    §4UL (project task turns, `core/project_turns.py`): ``allowed_tools=None``
+    keeps the FULL tool surface; ``origin`` / ``request_id`` / ``label``
+    replace the leaf's; ``prepare_agent(agent)`` wraps tools before the turn
+    (it raising stops the run); ``leaf_end=False`` neither tags the turn's
+    labs/runs as a leaf's nor ends them after it (an owner's run keeps what
+    it started, like any owner turn)."""
     from .agent import GhostAgent
     iso = build_leaf_context(context, leaf_id=leaf_id, project_id=project_id)
+    if label:
+        iso.turn_origin_label = label
+        iso.trajectory_task_kind = label
+    if allowed_tools is None:
+        iso._subagent_allowed_tools = None
     if is_background and getattr(iso, "llm_client", None) is not None:
         iso.llm_client = _BackgroundOnlyLLM(iso.llm_client)
     agent = GhostAgent(iso)
-    allow = set(LEAF_ALLOWED_TOOLS)
-    try:
-        from ..tools.registry import TOOL_DEFINITIONS
-        advertised = {t["function"]["name"] for t in TOOL_DEFINITIONS}
-        agent.disabled_tools = (advertised | set(agent.available_tools)) - allow
-        agent.available_tools = {k: v for k, v in agent.available_tools.items() if k in allow}
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"leaf tool containment failed ({type(e).__name__}: {e})") from e
+    if allowed_tools is not None:
+        allow = set(allowed_tools)
+        try:
+            from ..tools.registry import TOOL_DEFINITIONS
+            advertised = {t["function"]["name"] for t in TOOL_DEFINITIONS}
+            agent.disabled_tools = (advertised | set(agent.available_tools)) - allow
+            agent.available_tools = {k: v for k, v in agent.available_tools.items() if k in allow}
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"leaf tool containment failed ({type(e).__name__}: {e})") from e
     agent.max_turns_override = max(2, int(max_turns))
+    if prepare_agent is not None:
+        prepare_agent(agent)
     body = {"model": getattr(iso.args, "model", "default"),
             "messages": [{"role": "user", "content": prompt}], "stream": False}
     # §4SX B0 (r2 #7): the leaf's turn runs under a pre-built scope holding
@@ -518,10 +539,10 @@ async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bo
     # reads THAT object, not a ContextVar from inside the awaited task
     from .request_scope import RequestScope, ORIGIN_LEAF
     _want = project_id or getattr(context, "current_project_id", None)
-    leaf_scope = RequestScope(project_id=_want, origin=ORIGIN_LEAF)
+    leaf_scope = RequestScope(project_id=_want, origin=origin or ORIGIN_LEAF)
     # §4SX D4 review r2 #5/#7: the leaf's labs and its "no lab" answers are tagged with THIS leaf / build
     from .lab_waits import BUILD_KEY, LEAF_ID, RUNNING_LEAVES
-    _tk = (BUILD_KEY.set(str(leaf_id).rsplit("-a", 1)[0]), LEAF_ID.set(str(leaf_id)))
+    _tk = ((BUILD_KEY.set(str(leaf_id).rsplit("-a", 1)[0]), LEAF_ID.set(str(leaf_id))) if leaf_end else None)
     # §4UD F1: THIS turn's deadline, where the lab tool reads what is left (`tools/labs._time_left_s`) — never past
     # a caller's own (the unattended step's cap). It was not set, so a leaf with 4 minutes left sent `lab exec
     # timeout_s=900`: the command outlived the turn, held its lab, and the leaf-end destroy was refused.
@@ -531,22 +552,24 @@ async def run_leaf_turn(context, *, leaf_id: str, prompt: str, is_background: bo
     _mine = time.monotonic() + _turn_s
     _tk_dl = _ldc.set(min(_mine, _outer) if _outer > 0 else _mine)
     # the leaf counts as running until its end clean-up below has finished (the periodic leaf sweep skips it)
-    RUNNING_LEAVES.add(str(leaf_id))
+    if leaf_end:
+        RUNNING_LEAVES.add(str(leaf_id))
     _end_pending = False
     try:
         content, _, _ = await asyncio.wait_for(
-            agent.handle_chat(body, background_tasks=None, request_id=f"sub-leaf-{leaf_id}",
+            agent.handle_chat(body, background_tasks=None, request_id=request_id or f"sub-leaf-{leaf_id}",
                               scope=leaf_scope),
             timeout=_turn_s)
     finally:
         _ldc.reset(_tk_dl)
-        BUILD_KEY.reset(_tk[0])
-        LEAF_ID.reset(_tk[1])
+        if _tk is not None:
+            BUILD_KEY.reset(_tk[0])
+            LEAF_ID.reset(_tk[1])
         # §4SX D4: a leaf's labs are disposable and end with the leaf (a timeout or a crash too); bounded, and a
         # cancel that lands during it is re-raised (review r2 #11)
-        if not _want:
+        if leaf_end and not _want:
             RUNNING_LEAVES.discard(str(leaf_id))
-        if _want:
+        if leaf_end and _want:
             _t_end = None
             try:
                 from ..tools.labs import destroy_leaf_labs

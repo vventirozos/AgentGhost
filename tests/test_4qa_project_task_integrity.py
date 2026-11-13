@@ -893,7 +893,10 @@ async def test_an_unattended_tick_holds_the_experiment_for_the_owner(tmp_path):
     assert t["status"] == "NEEDS_USER" and t["result_summary"].endswith(pa._HELD_MARK)
     assert "probe_model" in t["result_summary"]
     res2 = await pa.advance_once(ctx, pid, tool_runner=runner, llm_classifier=cls, owner_requested=False)
-    assert res2.task_id == t2                                  # the independent leaf runs
+    assert res2.task_id is None and "plan order" in res2.summary   # §4UL: the next task waits behind it
+    store.update_project(pid, metadata={"independent_tasks": [t2]})
+    res2 = await pa.advance_once(ctx, pid, tool_runner=runner, llm_classifier=cls, owner_requested=False)
+    assert res2.task_id == t2                                  # a leaf declared independent runs
 
 
 async def test_the_owners_turn_keeps_the_hold_until_it_runs_the_experiment(tmp_path):

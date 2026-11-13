@@ -714,7 +714,9 @@ class Manager:
                 raise LabError("unknown_template", f"no template {name!r}", hint="list templates",
                                templates=sorted(self.templates))
             spec = T.substitute(self.templates[name], {str(k): str(v) for k, v in (body.get("params") or {}).items()})
-            spec = {**spec, "template": name}
+            spec = {**T.apply_overrides(spec, body.get("overrides")), "template": name}
+        elif body.get("overrides"):
+            raise LabError("bad_request", "overrides change a template: give template too", field="overrides")
         elif body.get("members"):
             doc = {"name": "adhoc", "egress": body.get("egress", "tor"), "members": body["members"],
                    "readiness": body.get("readiness"), "env": body.get("env") or {}}
@@ -753,6 +755,10 @@ class Manager:
             raise LabError("bad_request", "owner must be project:<id> or conversation:<key>", field="owner")
         label = str(body.get("label") or "")[:80]
         purpose = str(body.get("purpose") or "")[:120]
+        if origin != "owner" and (body.get("members") or body.get("overrides")):
+            # §4UL: composing a lab (its own members, more memory, ports, capabilities, egress) is the owner's
+            raise LabError("owner_only", "a custom lab composition (members / overrides) is an owner action",
+                           hint="create from a template as it is")
         spec = self.resolve_spec(body)
         cls = self._owner_class(owner, origin)
         ttl = self.cfg.ttl[cls]
@@ -2199,7 +2205,7 @@ class Manager:
             for p in self.ports.leases(lab["lab_id"]):
                 try:
                     ip = self.member(lab["lab_id"], p["member"])["ip"]
-                    self.ports.publish(p["port"], ip, p["cport"], lan=bool(p["lan"]))
+                    self.ports.publish(p["port"], ip, p["cport"], lan=bool(p["lan"]), tcp=_kept_tcp_lease(lab, p))
                 except LabError:
                     pass
         wanted = [p["port"] for p in self.store.q("SELECT port FROM ports WHERE lab_id != ''")]
@@ -2245,6 +2251,19 @@ class Manager:
             if lid and (n.attrs.get("Options") or {}).get(net.BRIDGE_OPT) != net.lab_bridge(lid):
                 out.append(lid)
         return sorted(out)
+
+
+def _kept_tcp_lease(lab, p) -> bool:
+    """§4UL: a kept app's keyed lease is published as raw TCP when the app has no HTTP health path (a database) —
+    the restart reconcile must not turn it back into an HTTPS proxy."""
+    try:
+        if not p["lease_key"] or not lab["app_json"]:
+            return False
+        from .kept import is_tcp_app
+        a = loads(lab["app_json"]) or {}
+        return a.get("member") == p["member"] and int(a.get("port") or 0) == int(p["cport"]) and is_tcp_app(a)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
 
 
 def _started_at(c) -> str:

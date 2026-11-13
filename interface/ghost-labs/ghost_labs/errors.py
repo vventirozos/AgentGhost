@@ -9,7 +9,7 @@ STATUS = {
     "not_ready": 409, "busy": 409, "owner_active": 409, "data_exists": 409, "not_kept": 409,
     "no_rollback": 409, "ports_exhausted": 409, "already_kept": 409, "owner_only": 403,
     "not_supported": 501, "internal": 500, "tor_unavailable": 503, "firewall_missing": 503,
-    "disk_low": 507, "unknown_job": 404,
+    "disk_low": 507, "unknown_job": 404, "build_failed": 422,
 }
 
 

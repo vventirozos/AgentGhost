@@ -7782,7 +7782,66 @@ QUARANTINE_OPS = frozenset({"quarantine_list", "quarantine_inspect", "quarantine
 ACCEPTED_OPS = ADVERTISED_OPS + ("list", "ls", "dir", "tree", "list_dir", "list_directory")
 
 
+#: §4UL: operations that put work into a file (the projects hook below)
+_PROJECT_WRITE_OPS = frozenset({"write", "append", "append_file", "write_append", "edit", "replace",
+                                "move", "rename", "copy"})
+
+
+def note_project_write_hook(sandbox_dir, path) -> str:
+    """§4UL (projects hook): a successful write whose file lies inside
+    ``projects/<id>/`` of the workspace is the project's work, whichever
+    project the turn has pinned (none, or another) — handed to
+    `tools.projects.note_project_write(context, rel)` with the path relative
+    to the workspace root. The request's context comes from its scope.
+    Returns the hook's note for the tool result ("" = none). Guarded: an
+    absent hook or any error = nothing happens."""
+    try:
+        if not path:
+            return ""
+        from ..core.request_scope import current_scope
+        sc = current_scope()
+        ctx = getattr(sc, "context", None) if sc is not None else None
+        root = getattr(ctx, "sandbox_dir", None) if ctx is not None else None
+        if not root or sandbox_dir is None:
+            return ""
+        from . import projects as _pj
+        fn = getattr(_pj, "note_project_write", None)
+        if fn is None:
+            return ""
+        p = Path(str(path))
+        full = (p if p.is_absolute() else Path(sandbox_dir) / p).resolve()
+        rel = full.relative_to(Path(root).resolve())
+        if len(rel.parts) >= 3 and rel.parts[0] == "projects":
+            return str(fn(ctx, rel.as_posix()) or "")
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a write
+        import logging as _logging
+        _logging.getLogger("GhostAgent").debug("project write not noted", exc_info=True)
+    return ""
+
+
 async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
+    res = await _tool_file_system_impl(operation=operation, sandbox_dir=sandbox_dir, path=path, content=content,
+                                       replace_with=replace_with, destination=destination, pattern=pattern,
+                                       max_context=max_context, read_budget=read_budget, **kwargs)
+    try:
+        _op = str(operation or "").strip().lower()
+        if _op in _PROJECT_WRITE_OPS:
+            _st = getattr(getattr(res, "status", None), "value", None)
+            _ok = (_st in ("ok", "partial") if _st is not None
+                   else not str(res or "").lstrip().lower().startswith(("error", "system instruction")))
+            if _ok:
+                _target = destination if _op in ("move", "rename", "copy") else path
+                _note = note_project_write_hook(sandbox_dir,
+                                                _target or kwargs.get("filename") or kwargs.get("file"))
+                if _note:
+                    res = append_note(res, "\n" + _note)
+    except Exception:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger("GhostAgent").debug("project write hook skipped", exc_info=True)
+    return res
+
+
+async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
     # §4LL: "Read" / " write " are the same operations (the read-only set
     # already lowercased; the dispatch did not)
     if isinstance(operation, str):

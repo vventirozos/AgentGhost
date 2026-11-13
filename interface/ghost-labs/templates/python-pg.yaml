@@ -1,0 +1,19 @@
+name: python-pg
+description: "A Python web app plus its own PostgreSQL 18: member app (/opt/venv with flask + gunicorn, port 8080, Tor egress) and member db (postgres / lab). The app gets DATABASE_URL=postgresql://postgres:lab@db:5432/postgres. Kept: the app waits for the db at start, a watchdog keeps postgres running, and both members' /data (the database in db's /data/pg) are backed up together with the app and postgres stopped for the copy; every deploy installs requirements.txt into the app folder (.deps — run the app with plain python3, not python3 -I, which ignores it)"
+egress: tor
+members:
+  - {name: app, image: "ghost-lab/python-app:1", mem_mb: 256, cpus: 1.0, ports: [8080],
+     env: {DATABASE_URL: "postgresql://postgres:lab@db:5432/postgres"}}
+  - {name: db, image: "ghost-lab/pg:18", mem_mb: 512, cpus: 1.0, ready: "pg_isready -q",
+     env: {PGUSER: postgres}}
+readiness: {member: db, cmd: "pg_isready -h localhost", timeout_s: 90}
+app:
+  member: app
+  port: 8080
+  health: {http: "/"}
+  # the app's start waits (up to 90 s) until the db answers
+  wait_for: "db:5432"
+  # restarts postgres in db if it died; never while initdb (a fresh /data) still runs
+  watch:
+    - member: db
+      cmd: "sleep 20; while :; do pg_isready -q -h localhost || pgrep -x postgres >/dev/null || pgrep -x initdb >/dev/null || (setsid bash /etc/lab/start.d/10-postgres.sh >> /var/log/lab/10-postgres.log 2>&1 < /dev/null &); sleep 10; done"

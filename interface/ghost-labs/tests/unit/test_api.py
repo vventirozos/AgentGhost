@@ -84,7 +84,7 @@ def test_a_probe_reaches_kept_actions_only_on_a_lab_it_made(env):  # noqa: F811
     svc = Svc(m)
 
     class _K:
-        def app_action(self, lab_id, action):
+        def app_action(self, lab_id, action, reinit=False):
             return {"lab_id": lab_id, "acted": action}
     svc.kept = _K()
     c = TestClient(create_app(svc, "k" * 64))

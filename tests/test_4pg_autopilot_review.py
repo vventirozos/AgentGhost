@@ -210,8 +210,9 @@ async def test_a_research_write_failure_counts_toward_the_pause_and_pushes_once(
     store = _store(tmp_path)
     pid = store.create_project("R", kind="GENERAL"); store.update_project(pid, metadata={"autopilot": True})
     plan = ProjectPlan(store, pid)
-    for i in range(4):
-        plan.add_task(f"Research topic {i}")
+    _ids = [plan.add_task(f"Research topic {i}") for i in range(4)]
+    # §4UL: independent of each other — else plan order holds the rest behind the first hold
+    store.update_project(pid, metadata={"independent_tasks": _ids})
     from ghost_agent.core import project_research as PR
     async def _persist(ctx, pid_, topic, output, task_id=None):
         return SimpleNamespace(ok=False, path=None, summary="", error="no workspace for project")
@@ -226,7 +227,9 @@ async def test_a_research_write_failure_counts_toward_the_pause_and_pushes_once(
     for _ in range(4):
         await PA.advance_unattended(_ctx(store), pid, tool_runner=runner, llm_classifier=classify)
     meta = store.get_project(pid)["metadata"]
-    assert not meta.get("autopilot") and (meta.get("autopilot_paused") or {}).get("reason") == "no progress"
+    # §4UL (decision 3B): three steps without progress REST the project until tomorrow — no pause
+    assert meta.get("autopilot") and int(meta.get("no_progress_streak") or 0) >= 3
+    assert store.list_events(pid, event_type="autopilot_resting")
 
 
 def test_a_needs_user_push_fires_once_per_task(monkeypatch):

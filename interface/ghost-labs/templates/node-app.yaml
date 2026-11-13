@@ -1,0 +1,11 @@
+name: node-app
+description: "One Node.js app box (Debian nodejs + npm), port 8080 published, Tor egress (npm works, no proxy settings). The app must listen on 0.0.0.0:$PORT (8080). Kept: every deploy runs npm ci (npm install without a lockfile) and npm run build --if-present in the NEW folder before the switch; node_modules is never shipped. Default cmd: npm start"
+egress: tor
+members:
+  - {name: app, image: "ghost-lab/node-app:1", mem_mb: 512, cpus: 1.0, ports: [8080]}
+readiness: {member: app, cmd: "node --version", timeout_s: 30}
+app:
+  member: app
+  port: 8080
+  cmd: "npm start"
+  health: {http: "/"}

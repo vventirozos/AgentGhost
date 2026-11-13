@@ -203,7 +203,8 @@ async def test_deploy_size_limit_and_failed_probe_and_no_answer(ctx, fake, scope
     (d / "a.bin").write_bytes(os.urandom(2048))
     monkeypatch.setattr(L, "DEPLOY_MAX_BYTES", 1024)
     out = await _lab(ctx, action="deploy", lab_id=LAB, params={"folder": "/workspace/site"})
-    assert "over" in str(out) and fake.calls == []
+    # §4UL: only the read of the app's kept subdir went out — nothing was deployed
+    assert "over" in str(out) and [c.method for c in fake.calls] in ([], ["GET"])
     monkeypatch.setattr(L, "DEPLOY_MAX_BYTES", 20 * 1024 * 1024)
     fake.on("POST", f"/v1/labs/{LAB}/deploy", (200, {"lab_id": LAB, "app": _app(state="crashloop",
                                                                                 last_error="exit 1"),
@@ -501,8 +502,9 @@ async def test_keep_of_an_already_kept_lab_records_its_app(ctx, fake, scope):
     """r1 #3: a keep whose answer was lost — the retry records the row instead of failing with already_kept."""
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(app=_app())))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080, "cmd": "./run.sh"}})
-    assert "already KEPT" in str(out) and not [c for c in fake.calls if c.method == "POST"]
+    # (the same config the lost keep sent — §4UL: a CHANGED config updates the kept app, test_4ul_labs)
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080, "cmd": "python3 app.py"}})
+    assert "already KEPT" in str(out) and not [c for c in fake.calls if c.method in ("POST", "PUT")]
     assert [r["backend_ref"] for r in _reg(ctx).rows(OWN, live_only=True)] == [f"{PID}/shop"]
 
 
@@ -669,7 +671,8 @@ async def test_keep_with_no_cmd_is_refused_with_the_static_site_recipe(ctx, fake
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(lifetime="disposable")))
     out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "webos", "member": "web1", "port": 80}})
     assert out.status == OutcomeStatus.REJECTED
-    assert "params.app.cmd" in str(out) and "python3 -I -m http.server 8080 --bind 0.0.0.0 --directory /app" in str(out)
+    # §4UL: the static-site template is the recipe now (keep fills its app)
+    assert "params.app.cmd" in str(out) and "static-site" in str(out) and "/srv/www" in str(out)
     assert not [c for c in fake.calls if c.path.endswith("/keep")]           # nothing reached the host
 
 
@@ -691,7 +694,7 @@ async def test_a_lab_kept_before_the_cmd_rule_is_still_adopted(ctx, fake, scope)
     """review m1: the cmd check runs after the already-kept branch."""
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(app=_app(state="stopped"))))
-    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 80}})
+    out = await _lab(ctx, action="keep", lab_id=LAB, params={"app": {"name": "shop", "member": "web", "port": 8080}})
     assert "already KEPT" in str(out), out
 
 
